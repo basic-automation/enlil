@@ -3,7 +3,7 @@
 //! Tracks memory allocations across guests, ensures no overlap,
 //! and provides the foundation for EPT/NPT mapping.
 
-use crate::error::EnlilError;
+use crate::error::Error;
 use std::collections::BTreeMap;
 
 /// Configuration for a guest's memory region.
@@ -40,18 +40,18 @@ impl MemoryManager {
             total_bytes: total_mb * 1024 * 1024,
             reserved_bytes,
             regions: BTreeMap::new(),
-            next_base: reserved_bytes, // hypervisor gets the low region
+            next_base: reserved_bytes,
         }
     }
 
     /// Allocate a contiguous memory region for a guest.
     /// Returns the host base address of the allocated region.
-    pub fn allocate(&mut self, guest_id: &str, size_mb: u64) -> Result<u64, EnlilError> {
+    pub fn allocate(&mut self, guest_id: &str, size_mb: u64) -> Result<u64, Error> {
         let size = size_mb * 1024 * 1024;
         let base = self.next_base;
 
         if base + size > self.total_bytes {
-            return Err(EnlilError::Memory(format!(
+            return Err(Error::Memory(format!(
                 "cannot allocate {}MB for '{}': only {}MB remaining",
                 size_mb,
                 guest_id,
@@ -59,11 +59,10 @@ impl MemoryManager {
             )));
         }
 
-        // Check for overlap with existing regions
         for (existing_base, region) in &self.regions {
             let existing_end = existing_base + region.size;
             if base < existing_end && base + size > *existing_base {
-                return Err(EnlilError::Memory(format!(
+                return Err(Error::Memory(format!(
                     "region for '{}' overlaps with '{}'",
                     guest_id, region.guest_id
                 )));
@@ -103,7 +102,7 @@ mod tests {
 
     #[test]
     fn allocate_two_guests() {
-        let mut mm = MemoryManager::new(32768, 512); // 32GB total, 512MB reserved
+        let mut mm = MemoryManager::new(32768, 512);
         let base1 = mm.allocate("linux1", 8192).unwrap();
         let base2 = mm.allocate("linux2", 8192).unwrap();
         assert_ne!(base1, base2);
@@ -112,8 +111,8 @@ mod tests {
 
     #[test]
     fn reject_overcommit() {
-        let mut mm = MemoryManager::new(1024, 256); // 1GB total, 256MB reserved
+        let mut mm = MemoryManager::new(1024, 256);
         mm.allocate("guest1", 512).unwrap();
-        assert!(mm.allocate("guest2", 512).is_err()); // only 256MB left
+        assert!(mm.allocate("guest2", 512).is_err());
     }
 }

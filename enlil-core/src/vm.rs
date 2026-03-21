@@ -1,6 +1,6 @@
 //! VM instance management.
 
-use crate::error::EnlilError;
+use crate::error::Error;
 use crate::memory::GuestMemoryConfig;
 use crate::vcpu::{SchedulingPolicy, VcpuManager};
 use std::fmt;
@@ -51,12 +51,12 @@ pub struct Vm {
 
 impl Vm {
     /// Create a new VM from configuration.
-    pub fn new(config: VmConfig) -> Result<Self, EnlilError> {
+    pub fn new(config: VmConfig) -> Result<Self, Error> {
         if config.cpus.is_empty() {
-            return Err(EnlilError::Vm("guest must have at least one CPU".into()));
+            return Err(Error::Vm("guest must have at least one CPU".into()));
         }
         if config.memory.size_mb == 0 {
-            return Err(EnlilError::Memory("guest memory must be > 0".into()));
+            return Err(Error::Memory("guest memory must be > 0".into()));
         }
 
         let vcpu_manager = VcpuManager::new(&config.cpus, config.scheduling.clone());
