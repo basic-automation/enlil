@@ -1,0 +1,10 @@
+[package]
+name = "enlil-boot"
+version = "0.1.0"
+edition = "2024"
+description = "UEFI boot payload — bare-metal target (Phase 5+)"
+
+[dependencies]
+log = "0.4"
+# UEFI deps will be added in Phase 5
+# uefi = "0.32"

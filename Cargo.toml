@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "enlil-core",
+    "enlil-devices",
+    "enlil-config",
+    "enlil-mgmt",
+    "enlil-boot",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/enlil-hypervisor/enlil"
+
+[workspace.dependencies]
+# RustVMM ecosystem (Linux-only, gated behind cfg)
+kvm-ioctls = "0.19"
+kvm-bindings = { version = "0.10", features = ["fam-wrappers"] }
+vm-memory = { version = "0.16", features = ["backend-mmap"] }
+vm-superio = "0.8"
+linux-loader = { version = "0.12", features = ["bzimage", "elf"] }
+vm-allocator = "0.1"
+event-manager = "0.4"
+vm-device = "0.1"
+
+# Cross-platform dependencies
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"

@@ -1,0 +1,22 @@
+[hypervisor]
+reserved_memory_mb = 512
+log_level = "info"
+management_port = 9100
+
+[guest.linux1]
+name = "Linux Workstation"
+cpus = [0, 1, 2, 3]
+memory_mb = 8192
+kernel = "/path/to/bzImage"
+initrd = "/path/to/initramfs"
+cmdline = "console=ttyS0 root=/dev/vda"
+scheduling = "dedicated"
+
+[guest.linux2]
+name = "Linux Dev"
+cpus = [4, 5, 6, 7]
+memory_mb = 8192
+kernel = "/path/to/bzImage2"
+initrd = "/path/to/initramfs2"
+cmdline = "console=ttyS0 root=/dev/vda"
+scheduling = "dedicated"
