@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "enlil-platform",
     "enlil-core",
     "enlil-devices",
     "enlil-config",

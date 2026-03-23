@@ -19,6 +19,9 @@ pub struct HypervisorConfig {
     /// Memory reserved for the hypervisor itself (MB).
     #[serde(default = "default_reserved_memory")]
     pub reserved_memory_mb: u64,
+    /// Total host memory available (MB). If 0, auto-detect.
+    #[serde(default)]
+    pub total_memory_mb: u64,
     /// Log level: trace, debug, info, warn, error.
     #[serde(default = "default_log_level")]
     pub log_level: String,
@@ -31,6 +34,7 @@ impl Default for HypervisorConfig {
     fn default() -> Self {
         Self {
             reserved_memory_mb: default_reserved_memory(),
+            total_memory_mb: 0,
             log_level: default_log_level(),
             management_port: default_mgmt_port(),
         }
@@ -63,6 +67,9 @@ pub struct GuestConfig {
     /// Block devices.
     #[serde(default)]
     pub disks: Vec<DiskConfig>,
+    /// Serial console configuration.
+    #[serde(default)]
+    pub serial: SerialPortConfig,
 }
 
 fn default_cmdline() -> String { "console=ttyS0".into() }
@@ -89,3 +96,26 @@ pub struct DiskConfig {
     #[serde(default)]
     pub readonly: bool,
 }
+
+/// Serial port configuration for a guest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerialPortConfig {
+    /// Whether serial console is enabled.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Output mode: "stdout", "pty", "file:<path>", "null".
+    #[serde(default = "default_serial_output")]
+    pub output: String,
+}
+
+impl Default for SerialPortConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            output: default_serial_output(),
+        }
+    }
+}
+
+fn default_true() -> bool { true }
+fn default_serial_output() -> String { "stdout".into() }

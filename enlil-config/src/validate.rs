@@ -86,6 +86,7 @@ mod tests {
             cmdline: "console=ttyS0".into(),
             scheduling: SchedulingMode::Dedicated,
             disks: vec![],
+            serial: SerialPortConfig::default(),
         });
         EnlilConfig {
             hypervisor: HypervisorConfig::default(),
@@ -112,6 +113,7 @@ mod tests {
             cmdline: "console=ttyS0".into(),
             scheduling: SchedulingMode::Dedicated,
             disks: vec![],
+            serial: SerialPortConfig::default(),
         });
         let errors = validate_config(&config);
         assert!(errors.iter().any(|e| e.contains("CPU 1 already assigned")));

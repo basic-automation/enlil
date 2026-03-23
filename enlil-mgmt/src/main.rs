@@ -29,6 +29,17 @@ enum Commands {
     Stop,
 }
 
+fn parse_serial_output(output: &str) -> enlil_core::serial::SerialOutputMode {
+    match output {
+        "null" => enlil_core::serial::SerialOutputMode::Null,
+        "buffer" => enlil_core::serial::SerialOutputMode::Buffer,
+        s if s.starts_with("file:") => {
+            enlil_core::serial::SerialOutputMode::File(s[5..].to_string())
+        }
+        _ => enlil_core::serial::SerialOutputMode::Stdout,
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     let cli = Cli::parse();
@@ -41,16 +52,32 @@ fn main() -> anyhow::Result<()> {
             println!("Configuration is valid.");
             for (id, guest) in &config.guest {
                 println!(
-                    "  Guest '{}': {} — {} vCPUs, {}MB RAM",
+                    "  Guest '{}': {} — {} vCPUs, {}MB RAM, scheduling={}",
                     id,
                     guest.name,
                     guest.cpus.len(),
-                    guest.memory_mb
+                    guest.memory_mb,
+                    match guest.scheduling {
+                        enlil_config::SchedulingMode::Dedicated => "dedicated",
+                        enlil_config::SchedulingMode::Timeslice => "timeslice",
+                        enlil_config::SchedulingMode::Auto => "auto",
+                    }
                 );
             }
         }
         Commands::Start => {
             println!("Starting guests...");
+
+            // Determine total memory (use configured or default 16GB)
+            let total_mem = if config.hypervisor.total_memory_mb > 0 {
+                config.hypervisor.total_memory_mb * 1024 * 1024
+            } else {
+                16 * 1024 * 1024 * 1024 // 16 GB default
+            };
+            let reserved = config.hypervisor.reserved_memory_mb * 1024 * 1024;
+
+            let mut hypervisor = enlil_core::vm::Hypervisor::new(total_mem, reserved);
+
             for (id, guest) in &config.guest {
                 println!("  Initializing '{}' ({})...", id, guest.name);
                 let vm_config = enlil_core::vm::VmConfig {
@@ -73,8 +100,11 @@ fn main() -> anyhow::Result<()> {
                             enlil_core::vcpu::SchedulingPolicy::Auto
                         }
                     },
+                    serial_output: parse_serial_output(&guest.serial.output),
                 };
-                let vm = enlil_core::vm::Vm::new(vm_config)?;
+
+                let idx = hypervisor.add_vm(vm_config)?;
+                let vm = hypervisor.vm(idx).unwrap();
                 println!(
                     "    Created VM '{}' with {} vCPUs [{}]",
                     vm.name(),
@@ -82,6 +112,13 @@ fn main() -> anyhow::Result<()> {
                     vm.state()
                 );
             }
+
+            println!(
+                "\nHypervisor ready: {} VMs, {:.0} MB allocated, {:.0} MB available",
+                hypervisor.vm_count(),
+                hypervisor.memory_manager().allocated_bytes() as f64 / (1024.0 * 1024.0),
+                hypervisor.memory_manager().available_bytes() as f64 / (1024.0 * 1024.0),
+            );
         }
         Commands::Status => {
             println!("Status: not yet implemented (requires runtime state)");
