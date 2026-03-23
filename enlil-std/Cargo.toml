@@ -1,0 +1,16 @@
+[package]
+name = "enlil-std"
+version = "0.1.0"
+edition = "2024"
+description = "Enlil standard library compatibility layer — std-like APIs backed by enlil-platform"
+
+[features]
+default = ["platform-linux"]
+platform-linux = ["enlil-platform/platform-linux"]
+platform-baremetal = ["enlil-platform/platform-baremetal"]
+
+[dependencies]
+enlil-platform = { path = "../enlil-platform", default-features = false }
+
+[dev-dependencies]
+env_logger = "0.11"

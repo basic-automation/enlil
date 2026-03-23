@@ -9,6 +9,7 @@ members = [
     "enlil-boot",
     "enlil-hal",
     "enlil-setup",
+    "enlil-std",
 ]
 
 [workspace.package]
