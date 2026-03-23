@@ -308,6 +308,272 @@ unsafe impl GlobalAlloc for PlatformAllocator {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Physical / Virtual Address Types
+// ---------------------------------------------------------------------------
+
+use std::fmt;
+use std::hash::Hash;
+use std::ops::{Add, Sub};
+
+/// Page size constant (4KB).
+const PAGE_SIZE: u64 = 4096;
+
+/// Newtype wrapper around `u64` for physical addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PhysAddr(u64);
+
+impl PhysAddr {
+    /// Create a new physical address.
+    pub fn new(addr: u64) -> Self {
+        Self(addr)
+    }
+
+    /// Return the raw `u64` value.
+    pub fn as_u64(&self) -> u64 {
+        self.0
+    }
+
+    /// Check whether the address is aligned to `align`.
+    pub fn is_aligned(&self, align: u64) -> bool {
+        assert!(align.is_power_of_two(), "alignment must be a power of two");
+        self.0 & (align - 1) == 0
+    }
+
+    /// Round the address up to the next multiple of `align`.
+    pub fn align_up(&self, align: u64) -> PhysAddr {
+        assert!(align.is_power_of_two(), "alignment must be a power of two");
+        PhysAddr((self.0 + align - 1) & !(align - 1))
+    }
+
+    /// Round the address down to the previous multiple of `align`.
+    pub fn align_down(&self, align: u64) -> PhysAddr {
+        assert!(align.is_power_of_two(), "alignment must be a power of two");
+        PhysAddr(self.0 & !(align - 1))
+    }
+
+    /// Offset within a 4KB page.
+    pub fn page_offset(&self) -> u64 {
+        self.0 & (PAGE_SIZE - 1)
+    }
+}
+
+impl fmt::Display for PhysAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PhysAddr({:#x})", self.0)
+    }
+}
+
+impl Add<u64> for PhysAddr {
+    type Output = PhysAddr;
+
+    fn add(self, rhs: u64) -> PhysAddr {
+        PhysAddr(self.0 + rhs)
+    }
+}
+
+impl Sub<u64> for PhysAddr {
+    type Output = PhysAddr;
+
+    fn sub(self, rhs: u64) -> PhysAddr {
+        PhysAddr(self.0 - rhs)
+    }
+}
+
+/// Newtype wrapper around `u64` for virtual addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct VirtAddr(u64);
+
+impl VirtAddr {
+    /// Create a new virtual address.
+    pub fn new(addr: u64) -> Self {
+        Self(addr)
+    }
+
+    /// Return the raw `u64` value.
+    pub fn as_u64(&self) -> u64 {
+        self.0
+    }
+
+    /// Check whether the address is aligned to `align`.
+    pub fn is_aligned(&self, align: u64) -> bool {
+        assert!(align.is_power_of_two(), "alignment must be a power of two");
+        self.0 & (align - 1) == 0
+    }
+
+    /// Round the address up to the next multiple of `align`.
+    pub fn align_up(&self, align: u64) -> VirtAddr {
+        assert!(align.is_power_of_two(), "alignment must be a power of two");
+        VirtAddr((self.0 + align - 1) & !(align - 1))
+    }
+
+    /// Round the address down to the previous multiple of `align`.
+    pub fn align_down(&self, align: u64) -> VirtAddr {
+        assert!(align.is_power_of_two(), "alignment must be a power of two");
+        VirtAddr(self.0 & !(align - 1))
+    }
+
+    /// Offset within a 4KB page.
+    pub fn page_offset(&self) -> u64 {
+        self.0 & (PAGE_SIZE - 1)
+    }
+}
+
+impl fmt::Display for VirtAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "VirtAddr({:#x})", self.0)
+    }
+}
+
+impl Add<u64> for VirtAddr {
+    type Output = VirtAddr;
+
+    fn add(self, rhs: u64) -> VirtAddr {
+        VirtAddr(self.0 + rhs)
+    }
+}
+
+impl Sub<u64> for VirtAddr {
+    type Output = VirtAddr;
+
+    fn sub(self, rhs: u64) -> VirtAddr {
+        VirtAddr(self.0 - rhs)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Physical Frame
+// ---------------------------------------------------------------------------
+
+/// Represents a 4KB physical page frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PhysFrame {
+    /// Frame number (physical address / PAGE_SIZE).
+    number: u64,
+}
+
+impl PhysFrame {
+    /// Return the frame that contains the given physical address.
+    pub fn containing_address(addr: PhysAddr) -> PhysFrame {
+        PhysFrame {
+            number: addr.as_u64() / PAGE_SIZE,
+        }
+    }
+
+    /// Return the start physical address of this frame.
+    pub fn start_address(&self) -> PhysAddr {
+        PhysAddr::new(self.number * PAGE_SIZE)
+    }
+
+    /// Create a frame from a raw frame number.
+    pub fn from_number(n: u64) -> PhysFrame {
+        PhysFrame { number: n }
+    }
+
+    /// Return the frame number.
+    pub fn number(&self) -> u64 {
+        self.number
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bitmap Frame Allocator
+// ---------------------------------------------------------------------------
+
+/// Physical frame allocator backed by a bitmap.
+///
+/// Each bit in the bitmap represents one 4KB frame. A set bit means the
+/// frame is allocated; a clear bit means it is free.
+pub struct BitmapFrameAllocator {
+    /// Bitmap storage — each `u64` tracks 64 frames.
+    bitmap: Vec<u64>,
+    /// Frame number of the first frame managed by this allocator.
+    base_frame: u64,
+    /// Total number of frames managed.
+    total_frames: usize,
+    /// Number of currently free frames.
+    free_count: usize,
+}
+
+impl BitmapFrameAllocator {
+    /// Create a new bitmap frame allocator.
+    ///
+    /// `base` is the starting physical address (must be page-aligned).
+    /// `size` is the total region size in bytes.
+    pub fn new(base: PhysAddr, size: usize) -> Self {
+        assert!(
+            base.is_aligned(PAGE_SIZE),
+            "base address must be page-aligned"
+        );
+        let total_frames = size / PAGE_SIZE as usize;
+        let bitmap_words = (total_frames + 63) / 64;
+        Self {
+            bitmap: vec![0u64; bitmap_words],
+            base_frame: base.as_u64() / PAGE_SIZE,
+            total_frames,
+            free_count: total_frames,
+        }
+    }
+
+    /// Allocate a single physical frame.
+    pub fn allocate_frame(&mut self) -> Option<PhysFrame> {
+        for (word_idx, word) in self.bitmap.iter_mut().enumerate() {
+            if *word == u64::MAX {
+                continue; // all 64 bits set — no free frame here
+            }
+            // Find the first zero bit.
+            let bit = (!*word).trailing_zeros() as usize;
+            let frame_idx = word_idx * 64 + bit;
+            if frame_idx >= self.total_frames {
+                return None;
+            }
+            *word |= 1u64 << bit;
+            self.free_count -= 1;
+            return Some(PhysFrame::from_number(self.base_frame + frame_idx as u64));
+        }
+        None
+    }
+
+    /// Deallocate a previously allocated frame.
+    pub fn deallocate_frame(&mut self, frame: PhysFrame) {
+        let frame_idx = (frame.number() - self.base_frame) as usize;
+        assert!(
+            frame_idx < self.total_frames,
+            "frame outside managed region"
+        );
+        let word_idx = frame_idx / 64;
+        let bit = frame_idx % 64;
+        assert!(
+            self.bitmap[word_idx] & (1u64 << bit) != 0,
+            "double free of frame {}",
+            frame.number()
+        );
+        self.bitmap[word_idx] &= !(1u64 << bit);
+        self.free_count += 1;
+    }
+
+    /// Number of currently free frames.
+    pub fn free_frames(&self) -> usize {
+        self.free_count
+    }
+
+    /// Total number of managed frames.
+    pub fn total_frames(&self) -> usize {
+        self.total_frames
+    }
+
+    /// Check whether a given frame is currently allocated.
+    pub fn is_allocated(&self, frame: PhysFrame) -> bool {
+        let frame_idx = (frame.number() - self.base_frame) as usize;
+        if frame_idx >= self.total_frames {
+            return false;
+        }
+        let word_idx = frame_idx / 64;
+        let bit = frame_idx % 64;
+        self.bitmap[word_idx] & (1u64 << bit) != 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,5 +671,135 @@ mod tests {
         let ptr = unsafe { PlatformAllocator.alloc(layout) };
         assert!(!ptr.is_null());
         unsafe { PlatformAllocator.dealloc(ptr, layout) };
+    }
+
+    #[test]
+    fn physaddr_basic() {
+        let addr = PhysAddr::new(0x1000);
+        assert_eq!(addr.as_u64(), 0x1000);
+
+        // Alignment checks.
+        assert!(addr.is_aligned(4096));
+        assert!(addr.is_aligned(256));
+        assert!(!PhysAddr::new(0x1001).is_aligned(4096));
+
+        // align_up / align_down.
+        let unaligned = PhysAddr::new(0x1234);
+        assert_eq!(unaligned.align_up(4096), PhysAddr::new(0x2000));
+        assert_eq!(unaligned.align_down(4096), PhysAddr::new(0x1000));
+
+        // page_offset.
+        assert_eq!(PhysAddr::new(0x1234).page_offset(), 0x234);
+        assert_eq!(PhysAddr::new(0x3000).page_offset(), 0);
+
+        // Add / Sub.
+        assert_eq!(addr + 0x500, PhysAddr::new(0x1500));
+        assert_eq!(addr - 0x100, PhysAddr::new(0x0F00));
+
+        // Display.
+        let s = format!("{}", addr);
+        assert!(s.contains("0x1000"));
+    }
+
+    #[test]
+    fn virtaddr_basic() {
+        let addr = VirtAddr::new(0x1000);
+        assert_eq!(addr.as_u64(), 0x1000);
+
+        // Alignment checks.
+        assert!(addr.is_aligned(4096));
+        assert!(addr.is_aligned(256));
+        assert!(!VirtAddr::new(0x1001).is_aligned(4096));
+
+        // align_up / align_down.
+        let unaligned = VirtAddr::new(0x1234);
+        assert_eq!(unaligned.align_up(4096), VirtAddr::new(0x2000));
+        assert_eq!(unaligned.align_down(4096), VirtAddr::new(0x1000));
+
+        // page_offset.
+        assert_eq!(VirtAddr::new(0x1234).page_offset(), 0x234);
+        assert_eq!(VirtAddr::new(0x3000).page_offset(), 0);
+
+        // Add / Sub.
+        assert_eq!(addr + 0x500, VirtAddr::new(0x1500));
+        assert_eq!(addr - 0x100, VirtAddr::new(0x0F00));
+
+        // Display.
+        let s = format!("{}", addr);
+        assert!(s.contains("0x1000"));
+    }
+
+    #[test]
+    fn physframe_containing_address() {
+        // Exact page boundary.
+        let frame = PhysFrame::containing_address(PhysAddr::new(0x5000));
+        assert_eq!(frame.number(), 5);
+        assert_eq!(frame.start_address(), PhysAddr::new(0x5000));
+
+        // Mid-page address rounds down.
+        let frame = PhysFrame::containing_address(PhysAddr::new(0x5ABC));
+        assert_eq!(frame.number(), 5);
+        assert_eq!(frame.start_address(), PhysAddr::new(0x5000));
+
+        // from_number round-trip.
+        let frame = PhysFrame::from_number(42);
+        assert_eq!(frame.number(), 42);
+        assert_eq!(frame.start_address(), PhysAddr::new(42 * 4096));
+    }
+
+    #[test]
+    fn bitmap_allocator_basic() {
+        // 16 frames = 64KB region.
+        let mut alloc = BitmapFrameAllocator::new(PhysAddr::new(0x10_0000), 16 * 4096);
+        assert_eq!(alloc.total_frames(), 16);
+        assert_eq!(alloc.free_frames(), 16);
+
+        // Allocate one frame.
+        let frame = alloc.allocate_frame().expect("alloc failed");
+        assert_eq!(alloc.free_frames(), 15);
+        assert!(alloc.is_allocated(frame));
+
+        // Free it.
+        alloc.deallocate_frame(frame);
+        assert_eq!(alloc.free_frames(), 16);
+        assert!(!alloc.is_allocated(frame));
+
+        // Allocate several, free in reverse.
+        let mut frames = Vec::new();
+        for _ in 0..8 {
+            frames.push(alloc.allocate_frame().expect("alloc failed"));
+        }
+        assert_eq!(alloc.free_frames(), 8);
+
+        for f in frames.into_iter().rev() {
+            alloc.deallocate_frame(f);
+        }
+        assert_eq!(alloc.free_frames(), 16);
+    }
+
+    #[test]
+    fn bitmap_allocator_exhaustion() {
+        let num_frames = 4;
+        let mut alloc =
+            BitmapFrameAllocator::new(PhysAddr::new(0x20_0000), num_frames * 4096);
+        assert_eq!(alloc.total_frames(), num_frames);
+        assert_eq!(alloc.free_frames(), num_frames);
+
+        // Allocate all frames.
+        let mut frames = Vec::new();
+        for _ in 0..num_frames {
+            frames.push(alloc.allocate_frame().expect("alloc failed"));
+        }
+        assert_eq!(alloc.free_frames(), 0);
+
+        // Next allocation must return None.
+        assert!(alloc.allocate_frame().is_none());
+
+        // Free one, allocate again — should succeed.
+        alloc.deallocate_frame(frames.pop().unwrap());
+        assert_eq!(alloc.free_frames(), 1);
+        let reclaimed = alloc.allocate_frame().expect("alloc after free failed");
+        assert!(alloc.is_allocated(reclaimed));
+        assert_eq!(alloc.free_frames(), 0);
     }
 }

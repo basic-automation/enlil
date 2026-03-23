@@ -1,0 +1,11 @@
+[package]
+name = "enlil-setup"
+version.workspace = true
+edition.workspace = true
+description = "Enlil first-run setup wizard — hardware detection, resource allocation, guest configuration"
+
+[dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }

@@ -135,6 +135,135 @@ impl Default for Executor {
 }
 
 // ---------------------------------------------------------------------------
+// TaskPriority
+// ---------------------------------------------------------------------------
+
+/// Priority level for tasks spawned on a [`PriorityExecutor`].
+///
+/// Ordering: `High > Normal > Low`. The executor always drains higher-priority
+/// queues before moving on to lower ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TaskPriority {
+    /// Lowest priority — runs only when no Normal or High tasks are pending.
+    Low = 0,
+    /// Default priority.
+    Normal = 1,
+    /// Highest priority — always serviced first.
+    High = 2,
+}
+
+// ---------------------------------------------------------------------------
+// PriorityExecutor
+// ---------------------------------------------------------------------------
+
+/// A priority-aware single-threaded async executor.
+///
+/// Maintains three internal task queues (one per [`TaskPriority`] level).
+/// When polling, it fully drains the High queue before touching Normal,
+/// and Normal before Low, ensuring strict priority ordering.
+pub struct PriorityExecutor {
+    high: Arc<TaskQueue>,
+    normal: Arc<TaskQueue>,
+    low: Arc<TaskQueue>,
+}
+
+impl PriorityExecutor {
+    /// Create a new priority executor.
+    pub fn new() -> Self {
+        Self {
+            high: Arc::new(TaskQueue::new()),
+            normal: Arc::new(TaskQueue::new()),
+            low: Arc::new(TaskQueue::new()),
+        }
+    }
+
+    /// Spawn a future with the given priority.
+    pub fn spawn(
+        &self,
+        future: impl Future<Output = ()> + Send + 'static,
+        priority: TaskPriority,
+    ) {
+        let queue = self.queue_for(priority);
+        let task = Arc::new(Task {
+            future: Mutex::new(Box::pin(future)),
+            queue: queue.clone(),
+        });
+        queue.push(task);
+    }
+
+    /// Spawn a future at [`TaskPriority::Normal`].
+    pub fn spawn_default(&self, future: impl Future<Output = ()> + Send + 'static) {
+        self.spawn(future, TaskPriority::Normal);
+    }
+
+    /// Run the executor until all queues are empty.
+    ///
+    /// Tasks are polled in strict priority order: all High tasks are drained
+    /// before any Normal task is polled, and all Normal tasks before any Low.
+    pub fn run(&self) {
+        loop {
+            // Always restart from the highest priority queue.
+            if let Some(task) = self.high.pop() {
+                Self::poll_task(task);
+                continue;
+            }
+            if let Some(task) = self.normal.pop() {
+                Self::poll_task(task);
+                continue;
+            }
+            if let Some(task) = self.low.pop() {
+                Self::poll_task(task);
+                continue;
+            }
+            // All queues empty.
+            break;
+        }
+    }
+
+    /// Poll one task from the highest non-empty queue.
+    ///
+    /// Returns `true` if there are still pending tasks in any queue.
+    pub fn poll_once(&self) -> bool {
+        if let Some(task) = self.high.pop() {
+            Self::poll_task(task);
+        } else if let Some(task) = self.normal.pop() {
+            Self::poll_task(task);
+        } else if let Some(task) = self.low.pop() {
+            Self::poll_task(task);
+        }
+        !self.is_idle()
+    }
+
+    /// Returns `true` if all three queues are empty.
+    pub fn is_idle(&self) -> bool {
+        self.high.is_empty() && self.normal.is_empty() && self.low.is_empty()
+    }
+
+    // -- private helpers ----------------------------------------------------
+
+    fn queue_for(&self, priority: TaskPriority) -> &Arc<TaskQueue> {
+        match priority {
+            TaskPriority::High => &self.high,
+            TaskPriority::Normal => &self.normal,
+            TaskPriority::Low => &self.low,
+        }
+    }
+
+    fn poll_task(task: Arc<Task>) {
+        let waker = Waker::from(task.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut future = task.future.lock().unwrap();
+        let _ = future.as_mut().poll(&mut cx);
+    }
+}
+
+impl Default for PriorityExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Reactor (stub)
 // ---------------------------------------------------------------------------
 
@@ -271,5 +400,61 @@ mod tests {
         let reactor = Reactor::new();
         let token = reactor.register(0);
         assert_eq!(token, 0); // Stub returns 0.
+    }
+
+    // -- PriorityExecutor tests ---------------------------------------------
+
+    #[test]
+    fn priority_executor_respects_order() {
+        let exec = PriorityExecutor::new();
+        let order = Arc::new(Mutex::new(Vec::new()));
+
+        // Spawn in reverse priority order: Low, Normal, High.
+        let o = order.clone();
+        exec.spawn(async move { o.lock().unwrap().push("low"); }, TaskPriority::Low);
+
+        let o = order.clone();
+        exec.spawn(async move { o.lock().unwrap().push("normal"); }, TaskPriority::Normal);
+
+        let o = order.clone();
+        exec.spawn(async move { o.lock().unwrap().push("high"); }, TaskPriority::High);
+
+        exec.run();
+
+        let result = order.lock().unwrap();
+        assert_eq!(*result, vec!["high", "normal", "low"]);
+    }
+
+    #[test]
+    fn priority_executor_mixed() {
+        let exec = PriorityExecutor::new();
+        let order = Arc::new(Mutex::new(Vec::new()));
+
+        // Interleaved spawn order.
+        let o = order.clone();
+        exec.spawn(async move { o.lock().unwrap().push("normal-1"); }, TaskPriority::Normal);
+
+        let o = order.clone();
+        exec.spawn(async move { o.lock().unwrap().push("low-1"); }, TaskPriority::Low);
+
+        let o = order.clone();
+        exec.spawn(async move { o.lock().unwrap().push("high-1"); }, TaskPriority::High);
+
+        let o = order.clone();
+        exec.spawn(async move { o.lock().unwrap().push("high-2"); }, TaskPriority::High);
+
+        let o = order.clone();
+        exec.spawn(async move { o.lock().unwrap().push("low-2"); }, TaskPriority::Low);
+
+        let o = order.clone();
+        exec.spawn(async move { o.lock().unwrap().push("normal-2"); }, TaskPriority::Normal);
+
+        exec.run();
+
+        let result = order.lock().unwrap();
+        assert_eq!(
+            *result,
+            vec!["high-1", "high-2", "normal-1", "normal-2", "low-1", "low-2"]
+        );
     }
 }

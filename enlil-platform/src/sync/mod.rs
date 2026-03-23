@@ -1,6 +1,6 @@
 //! Synchronization Primitives
 //!
-//! Platform-abstracted Mutex, RwLock, and Condvar.
+//! Platform-abstracted Mutex, RwLock, Condvar, and Channel.
 //!
 //! - **Linux:** Delegates to `std::sync` (pthread-backed).
 //! - **Bare-metal:** Uses `spin` crate for spinlock-based implementations.
@@ -12,7 +12,7 @@ use core::ops::{Deref, DerefMut};
 // ===========================================================================
 
 /// A platform-abstracted mutual exclusion lock.
-pub struct Mutex<T: ?Sized> {
+pub struct Mutex<T> {
     #[cfg(feature = "platform-linux")]
     inner: std::sync::Mutex<T>,
     #[cfg(feature = "platform-baremetal")]
@@ -20,8 +20,8 @@ pub struct Mutex<T: ?Sized> {
 }
 
 // Safety: inner types are already Send + Sync where T: Send.
-unsafe impl<T: ?Sized + Send> Send for Mutex<T> {}
-unsafe impl<T: ?Sized + Send> Sync for Mutex<T> {}
+unsafe impl<T: Send> Send for Mutex<T> {}
+unsafe impl<T: Send> Sync for Mutex<T> {}
 
 impl<T> Mutex<T> {
     /// Creates a new mutex wrapping the given value.
@@ -35,7 +35,7 @@ impl<T> Mutex<T> {
     }
 }
 
-impl<T: ?Sized> Mutex<T> {
+impl<T> Mutex<T> {
     /// Acquires the mutex, blocking until available.
     pub fn lock(&self) -> MutexGuard<'_, T> {
         #[cfg(feature = "platform-linux")]
@@ -70,18 +70,18 @@ impl<T: ?Sized> Mutex<T> {
 }
 
 /// RAII guard for `Mutex`.
-pub struct MutexGuard<'a, T: ?Sized> {
+pub struct MutexGuard<'a, T> {
     inner: MutexGuardInner<'a, T>,
 }
 
-enum MutexGuardInner<'a, T: ?Sized> {
+enum MutexGuardInner<'a, T> {
     #[cfg(feature = "platform-linux")]
     Linux(std::sync::MutexGuard<'a, T>),
     #[cfg(feature = "platform-baremetal")]
     Baremetal(spin::MutexGuard<'a, T>),
 }
 
-impl<T: ?Sized> Deref for MutexGuard<'_, T> {
+impl<T> Deref for MutexGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
         match &self.inner {
@@ -93,7 +93,7 @@ impl<T: ?Sized> Deref for MutexGuard<'_, T> {
     }
 }
 
-impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
+impl<T> DerefMut for MutexGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         match &mut self.inner {
             #[cfg(feature = "platform-linux")]
@@ -109,15 +109,15 @@ impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
 // ===========================================================================
 
 /// A platform-abstracted reader-writer lock.
-pub struct RwLock<T: ?Sized> {
+pub struct RwLock<T> {
     #[cfg(feature = "platform-linux")]
     inner: std::sync::RwLock<T>,
     #[cfg(feature = "platform-baremetal")]
     inner: spin::RwLock<T>,
 }
 
-unsafe impl<T: ?Sized + Send> Send for RwLock<T> {}
-unsafe impl<T: ?Sized + Send + Sync> Sync for RwLock<T> {}
+unsafe impl<T: Send> Send for RwLock<T> {}
+unsafe impl<T: Send + Sync> Sync for RwLock<T> {}
 
 impl<T> RwLock<T> {
     pub fn new(value: T) -> Self {
@@ -130,7 +130,7 @@ impl<T> RwLock<T> {
     }
 }
 
-impl<T: ?Sized> RwLock<T> {
+impl<T> RwLock<T> {
     /// Acquires a shared read lock.
     pub fn read(&self) -> RwLockReadGuard<'_, T> {
         #[cfg(feature = "platform-linux")]
@@ -197,18 +197,18 @@ impl<T: ?Sized> RwLock<T> {
 }
 
 /// RAII guard for shared read access.
-pub struct RwLockReadGuard<'a, T: ?Sized> {
+pub struct RwLockReadGuard<'a, T> {
     inner: RwLockReadGuardInner<'a, T>,
 }
 
-enum RwLockReadGuardInner<'a, T: ?Sized> {
+enum RwLockReadGuardInner<'a, T> {
     #[cfg(feature = "platform-linux")]
     Linux(std::sync::RwLockReadGuard<'a, T>),
     #[cfg(feature = "platform-baremetal")]
     Baremetal(spin::RwLockReadGuard<'a, T>),
 }
 
-impl<T: ?Sized> Deref for RwLockReadGuard<'_, T> {
+impl<T> Deref for RwLockReadGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
         match &self.inner {
@@ -221,18 +221,18 @@ impl<T: ?Sized> Deref for RwLockReadGuard<'_, T> {
 }
 
 /// RAII guard for exclusive write access.
-pub struct RwLockWriteGuard<'a, T: ?Sized> {
+pub struct RwLockWriteGuard<'a, T> {
     inner: RwLockWriteGuardInner<'a, T>,
 }
 
-enum RwLockWriteGuardInner<'a, T: ?Sized> {
+enum RwLockWriteGuardInner<'a, T> {
     #[cfg(feature = "platform-linux")]
     Linux(std::sync::RwLockWriteGuard<'a, T>),
     #[cfg(feature = "platform-baremetal")]
     Baremetal(spin::RwLockWriteGuard<'a, T>),
 }
 
-impl<T: ?Sized> Deref for RwLockWriteGuard<'_, T> {
+impl<T> Deref for RwLockWriteGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
         match &self.inner {
@@ -244,7 +244,7 @@ impl<T: ?Sized> Deref for RwLockWriteGuard<'_, T> {
     }
 }
 
-impl<T: ?Sized> DerefMut for RwLockWriteGuard<'_, T> {
+impl<T> DerefMut for RwLockWriteGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         match &mut self.inner {
             #[cfg(feature = "platform-linux")]
@@ -283,20 +283,45 @@ impl Condvar {
     /// Blocks the current thread until notified.
     ///
     /// The mutex guard is released while waiting and re-acquired before returning.
+    ///
+    /// On Linux: delegates to `std::sync::Condvar::wait` by extracting the inner
+    /// `std::sync::MutexGuard`, waiting, and rewrapping.
+    ///
+    /// On bare-metal: immediately returns the guard (spin-wait semantics).
+    /// Callers should use `wait` inside a loop that checks a predicate.
     #[cfg(feature = "platform-linux")]
     pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
-        // We need to extract the std guard, wait on it, then rewrap.
-        // This is tricky because our MutexGuard wraps the std one.
-        // For the Linux backend, we provide a direct std::sync path.
-        //
-        // In practice, code using Condvar should use the platform Mutex.
-        // The wait implementation here is a pragmatic approach.
-        let _ = guard;
-        // Note: A full implementation would need to unwrap the inner guard,
-        // pass it to std::sync::Condvar::wait, and rewrap. This requires
-        // unsafe or restructuring. For Phase 1, we provide the API surface
-        // and a working notify mechanism. Real condvar wait is Phase 6.
-        todo!("Condvar::wait requires inner guard extraction — deferred to Phase 6")
+        match guard.inner {
+            MutexGuardInner::Linux(std_guard) => {
+                let std_guard = self.inner.wait(std_guard).unwrap();
+                MutexGuard {
+                    inner: MutexGuardInner::Linux(std_guard),
+                }
+            }
+        }
+    }
+
+    /// Blocks the current thread until notified (bare-metal: spin-wait, returns immediately).
+    #[cfg(feature = "platform-baremetal")]
+    pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+        // Phase 1: immediately return the guard.
+        // Callers must use wait in a loop checking a predicate.
+        core::hint::spin_loop();
+        guard
+    }
+
+    /// Blocks until the predicate returns `true`.
+    ///
+    /// This is the preferred way to use a condition variable — it handles
+    /// spurious wakeups automatically.
+    pub fn wait_while<'a, T, F>(&self, mut guard: MutexGuard<'a, T>, mut predicate: F) -> MutexGuard<'a, T>
+    where
+        F: FnMut(&T) -> bool,
+    {
+        while predicate(&*guard) {
+            guard = self.wait(guard);
+        }
+        guard
     }
 
     /// Wakes one waiting thread.
@@ -317,6 +342,348 @@ impl Default for Condvar {
         Self::new()
     }
 }
+
+// ===========================================================================
+// Channel — Bounded MPSC
+// ===========================================================================
+
+use std::collections::VecDeque;
+use std::fmt;
+use std::sync::Arc;
+
+/// Internal shared state for a bounded channel.
+struct ChannelInner<T> {
+    buffer: VecDeque<T>,
+    capacity: usize,
+    closed: bool,
+    /// Number of active senders. When this drops to 0, the channel is disconnected.
+    sender_count: usize,
+}
+
+/// Shared state wrapped for thread-safe access.
+///
+/// On Linux: uses `std::sync::Mutex` + `std::sync::Condvar` directly for
+/// correct blocking semantics without needing to unwrap our platform Mutex.
+///
+/// On bare-metal: uses our platform `Mutex` + `Condvar` (spin-based).
+struct Shared<T> {
+    #[cfg(feature = "platform-linux")]
+    state: std::sync::Mutex<ChannelInner<T>>,
+    #[cfg(feature = "platform-linux")]
+    not_empty: std::sync::Condvar,
+    #[cfg(feature = "platform-linux")]
+    not_full: std::sync::Condvar,
+
+    #[cfg(feature = "platform-baremetal")]
+    state: Mutex<ChannelInner<T>>,
+    #[cfg(feature = "platform-baremetal")]
+    not_empty: Condvar,
+    #[cfg(feature = "platform-baremetal")]
+    not_full: Condvar,
+}
+
+// ---------------------------------------------------------------------------
+// Error types
+// ---------------------------------------------------------------------------
+
+/// Error returned by `Sender::send` when the channel is closed.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SendError<T>(pub T);
+
+impl<T> fmt::Display for SendError<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "sending on a closed channel")
+    }
+}
+
+/// Error returned by `Sender::try_send`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TrySendError<T> {
+    /// The channel buffer is full.
+    Full(T),
+    /// The channel is closed (receiver dropped).
+    Closed(T),
+}
+
+impl<T> fmt::Display for TrySendError<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TrySendError::Full(_) => write!(f, "channel is full"),
+            TrySendError::Closed(_) => write!(f, "sending on a closed channel"),
+        }
+    }
+}
+
+/// Error returned by `Receiver::recv` when all senders are dropped and the
+/// buffer is empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecvError;
+
+impl fmt::Display for RecvError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "receiving on a closed channel")
+    }
+}
+
+/// Error returned by `Receiver::try_recv`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TryRecvError {
+    /// The channel buffer is empty but senders still exist.
+    Empty,
+    /// All senders have been dropped and the buffer is empty.
+    Disconnected,
+}
+
+impl fmt::Display for TryRecvError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TryRecvError::Empty => write!(f, "channel is empty"),
+            TryRecvError::Disconnected => write!(f, "channel is disconnected"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sender
+// ---------------------------------------------------------------------------
+
+/// The sending half of a bounded channel. Cloneable (multiple producers).
+pub struct Sender<T> {
+    shared: Arc<Shared<T>>,
+}
+
+// Sender is Clone — this is the "MP" in MPSC.
+impl<T> Clone for Sender<T> {
+    fn clone(&self) -> Self {
+        #[cfg(feature = "platform-linux")]
+        {
+            let mut inner = self.shared.state.lock().unwrap();
+            inner.sender_count += 1;
+        }
+        #[cfg(feature = "platform-baremetal")]
+        {
+            let mut inner = self.shared.state.lock();
+            inner.sender_count += 1;
+        }
+        Sender {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+impl<T> Drop for Sender<T> {
+    fn drop(&mut self) {
+        #[cfg(feature = "platform-linux")]
+        {
+            let mut inner = self.shared.state.lock().unwrap();
+            inner.sender_count -= 1;
+            if inner.sender_count == 0 {
+                inner.closed = true;
+                // Wake the receiver so it can observe disconnection.
+                self.shared.not_empty.notify_all();
+            }
+        }
+        #[cfg(feature = "platform-baremetal")]
+        {
+            let mut inner = self.shared.state.lock();
+            inner.sender_count -= 1;
+            if inner.sender_count == 0 {
+                inner.closed = true;
+                self.shared.not_empty.notify_all();
+            }
+        }
+    }
+}
+
+impl<T> Sender<T> {
+    /// Sends a value, blocking until space is available.
+    ///
+    /// Returns `Err(SendError(value))` if the channel is closed (receiver dropped).
+    pub fn send(&self, value: T) -> Result<(), SendError<T>> {
+        #[cfg(feature = "platform-linux")]
+        {
+            let mut inner = self.shared.state.lock().unwrap();
+            loop {
+                if inner.closed {
+                    return Err(SendError(value));
+                }
+                if inner.buffer.len() < inner.capacity {
+                    inner.buffer.push_back(value);
+                    self.shared.not_empty.notify_one();
+                    return Ok(());
+                }
+                inner = self.shared.not_full.wait(inner).unwrap();
+            }
+        }
+        #[cfg(feature = "platform-baremetal")]
+        {
+            loop {
+                {
+                    let mut inner = self.shared.state.lock();
+                    if inner.closed {
+                        return Err(SendError(value));
+                    }
+                    if inner.buffer.len() < inner.capacity {
+                        inner.buffer.push_back(value);
+                        self.shared.not_empty.notify_one();
+                        return Ok(());
+                    }
+                }
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    /// Attempts to send without blocking.
+    pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
+        #[cfg(feature = "platform-linux")]
+        let mut inner = self.shared.state.lock().unwrap();
+        #[cfg(feature = "platform-baremetal")]
+        let mut inner = self.shared.state.lock();
+
+        if inner.closed {
+            return Err(TrySendError::Closed(value));
+        }
+        if inner.buffer.len() >= inner.capacity {
+            return Err(TrySendError::Full(value));
+        }
+        inner.buffer.push_back(value);
+        self.shared.not_empty.notify_one();
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Receiver
+// ---------------------------------------------------------------------------
+
+/// The receiving half of a bounded channel. NOT cloneable (single consumer).
+pub struct Receiver<T> {
+    shared: Arc<Shared<T>>,
+}
+
+impl<T> Drop for Receiver<T> {
+    fn drop(&mut self) {
+        #[cfg(feature = "platform-linux")]
+        {
+            let mut inner = self.shared.state.lock().unwrap();
+            inner.closed = true;
+            // Wake all blocked senders so they can observe the closure.
+            self.shared.not_full.notify_all();
+        }
+        #[cfg(feature = "platform-baremetal")]
+        {
+            let mut inner = self.shared.state.lock();
+            inner.closed = true;
+            self.shared.not_full.notify_all();
+        }
+    }
+}
+
+impl<T> Receiver<T> {
+    /// Receives a value, blocking until one is available.
+    ///
+    /// Returns `Err(RecvError)` if all senders have been dropped and the buffer
+    /// is empty.
+    pub fn recv(&self) -> Result<T, RecvError> {
+        #[cfg(feature = "platform-linux")]
+        {
+            let mut inner = self.shared.state.lock().unwrap();
+            loop {
+                if let Some(val) = inner.buffer.pop_front() {
+                    self.shared.not_full.notify_one();
+                    return Ok(val);
+                }
+                if inner.closed {
+                    return Err(RecvError);
+                }
+                inner = self.shared.not_empty.wait(inner).unwrap();
+            }
+        }
+        #[cfg(feature = "platform-baremetal")]
+        {
+            loop {
+                {
+                    let mut inner = self.shared.state.lock();
+                    if let Some(val) = inner.buffer.pop_front() {
+                        self.shared.not_full.notify_one();
+                        return Ok(val);
+                    }
+                    if inner.closed {
+                        return Err(RecvError);
+                    }
+                }
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    /// Attempts to receive without blocking.
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+        #[cfg(feature = "platform-linux")]
+        let mut inner = self.shared.state.lock().unwrap();
+        #[cfg(feature = "platform-baremetal")]
+        let mut inner = self.shared.state.lock();
+
+        if let Some(val) = inner.buffer.pop_front() {
+            self.shared.not_full.notify_one();
+            Ok(val)
+        } else if inner.closed {
+            Err(TryRecvError::Disconnected)
+        } else {
+            Err(TryRecvError::Empty)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Constructor
+// ---------------------------------------------------------------------------
+
+/// Creates a bounded MPSC channel with the given capacity.
+///
+/// Returns a `(Sender<T>, Receiver<T>)` pair.
+///
+/// # Panics
+///
+/// Panics if `capacity` is 0.
+pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+    assert!(capacity > 0, "channel capacity must be > 0");
+
+    let inner = ChannelInner {
+        buffer: VecDeque::with_capacity(capacity),
+        capacity,
+        closed: false,
+        sender_count: 1,
+    };
+
+    let shared = Arc::new(Shared {
+        #[cfg(feature = "platform-linux")]
+        state: std::sync::Mutex::new(inner),
+        #[cfg(feature = "platform-linux")]
+        not_empty: std::sync::Condvar::new(),
+        #[cfg(feature = "platform-linux")]
+        not_full: std::sync::Condvar::new(),
+
+        #[cfg(feature = "platform-baremetal")]
+        state: Mutex::new(inner),
+        #[cfg(feature = "platform-baremetal")]
+        not_empty: Condvar::new(),
+        #[cfg(feature = "platform-baremetal")]
+        not_full: Condvar::new(),
+    });
+
+    let sender = Sender {
+        shared: Arc::clone(&shared),
+    };
+    let receiver = Receiver { shared };
+
+    (sender, receiver)
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
 
 #[cfg(test)]
 mod tests {
@@ -395,5 +762,91 @@ mod tests {
         let cv = Condvar::new();
         cv.notify_one();
         cv.notify_all();
+    }
+
+    #[test]
+    fn condvar_wait_notify() {
+        let pair = Arc::new((Mutex::new(false), Condvar::new()));
+        let pair2 = Arc::clone(&pair);
+
+        let handle = std::thread::spawn(move || {
+            let (lock, cvar) = &*pair2;
+            let mut started = lock.lock();
+            *started = true;
+            cvar.notify_one();
+        });
+
+        let (lock, cvar) = &*pair;
+        let guard = lock.lock();
+        let guard = cvar.wait_while(guard, |started| !*started);
+        assert!(*guard);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn channel_basic() {
+        let (tx, rx) = channel(8);
+        tx.send(42).unwrap();
+        tx.send(99).unwrap();
+        assert_eq!(rx.recv().unwrap(), 42);
+        assert_eq!(rx.recv().unwrap(), 99);
+    }
+
+    #[test]
+    fn channel_bounded_blocking() {
+        let (tx, rx) = channel(2);
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        // Buffer is full — try_send should fail.
+        assert!(matches!(tx.try_send(3), Err(TrySendError::Full(3))));
+        // Drain one, then try_send should succeed.
+        assert_eq!(rx.recv().unwrap(), 1);
+        tx.try_send(3).unwrap();
+        assert_eq!(rx.recv().unwrap(), 2);
+        assert_eq!(rx.recv().unwrap(), 3);
+    }
+
+    #[test]
+    fn channel_mpsc() {
+        let (tx, rx) = channel(64);
+        let mut handles = vec![];
+
+        for i in 0..4 {
+            let tx = tx.clone();
+            handles.push(std::thread::spawn(move || {
+                for j in 0..25 {
+                    tx.send(i * 25 + j).unwrap();
+                }
+            }));
+        }
+        // Drop the original sender so the channel closes when threads finish.
+        drop(tx);
+
+        let mut received = vec![];
+        while let Ok(val) = rx.recv() {
+            received.push(val);
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        received.sort();
+        assert_eq!(received, (0..100).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn channel_recv_disconnected() {
+        let (tx, rx) = channel::<i32>(4);
+        drop(tx);
+        assert_eq!(rx.recv(), Err(RecvError));
+    }
+
+    #[test]
+    fn channel_try_recv_empty() {
+        let (tx, rx) = channel::<i32>(4);
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+        drop(tx);
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Disconnected));
     }
 }

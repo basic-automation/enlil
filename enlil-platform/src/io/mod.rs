@@ -320,6 +320,89 @@ impl log::Log for PlatformLogger {
 }
 
 // ===========================================================================
+// Structured logging — per-subsystem tags
+// ===========================================================================
+
+/// Subsystem identifier for structured logging.
+///
+/// Used to tag log messages with their originating component,
+/// e.g., `[vcpu:0]`, `[usb]`, `[fabric]`, `[memory]`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Subsystem {
+    /// vCPU with index
+    Vcpu(usize),
+    /// Memory management
+    Memory,
+    /// USB subsystem
+    Usb,
+    /// Network
+    Net,
+    /// Storage / block devices
+    Storage,
+    /// Compute fabric
+    Fabric,
+    /// Management console
+    Mgmt,
+    /// Platform internals
+    Platform,
+    /// Custom subsystem
+    Custom(String),
+}
+
+impl std::fmt::Display for Subsystem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Subsystem::Vcpu(id) => write!(f, "vcpu:{}", id),
+            Subsystem::Memory => write!(f, "memory"),
+            Subsystem::Usb => write!(f, "usb"),
+            Subsystem::Net => write!(f, "net"),
+            Subsystem::Storage => write!(f, "storage"),
+            Subsystem::Fabric => write!(f, "fabric"),
+            Subsystem::Mgmt => write!(f, "mgmt"),
+            Subsystem::Platform => write!(f, "platform"),
+            Subsystem::Custom(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+/// Log a message with a subsystem tag.
+/// Usage: `subsystem_log!(Level::Info, Subsystem::Vcpu(0), "started execution");`
+#[macro_export]
+macro_rules! subsystem_log {
+    ($level:expr, $subsystem:expr, $($arg:tt)*) => {
+        log::log!($level, "[{}] {}", $subsystem, format_args!($($arg)*))
+    };
+}
+
+#[macro_export]
+macro_rules! platform_info {
+    ($subsystem:expr, $($arg:tt)*) => {
+        $crate::subsystem_log!(log::Level::Info, $subsystem, $($arg)*)
+    };
+}
+
+#[macro_export]
+macro_rules! platform_debug {
+    ($subsystem:expr, $($arg:tt)*) => {
+        $crate::subsystem_log!(log::Level::Debug, $subsystem, $($arg)*)
+    };
+}
+
+#[macro_export]
+macro_rules! platform_warn {
+    ($subsystem:expr, $($arg:tt)*) => {
+        $crate::subsystem_log!(log::Level::Warn, $subsystem, $($arg)*)
+    };
+}
+
+#[macro_export]
+macro_rules! platform_error {
+    ($subsystem:expr, $($arg:tt)*) => {
+        $crate::subsystem_log!(log::Level::Error, $subsystem, $($arg)*)
+    };
+}
+
+// ===========================================================================
 // Macros
 // ===========================================================================
 
@@ -418,5 +501,34 @@ mod tests {
             .target("test")
             .build();
         assert!(!logger.enabled(&meta_debug));
+    }
+
+    #[test]
+    fn subsystem_display() {
+        assert_eq!(Subsystem::Vcpu(0).to_string(), "vcpu:0");
+        assert_eq!(Subsystem::Vcpu(3).to_string(), "vcpu:3");
+        assert_eq!(Subsystem::Memory.to_string(), "memory");
+        assert_eq!(Subsystem::Usb.to_string(), "usb");
+        assert_eq!(Subsystem::Net.to_string(), "net");
+        assert_eq!(Subsystem::Storage.to_string(), "storage");
+        assert_eq!(Subsystem::Fabric.to_string(), "fabric");
+        assert_eq!(Subsystem::Mgmt.to_string(), "mgmt");
+        assert_eq!(Subsystem::Platform.to_string(), "platform");
+        assert_eq!(
+            Subsystem::Custom("gpu".to_string()).to_string(),
+            "gpu"
+        );
+    }
+
+    #[test]
+    fn subsystem_vcpu_display() {
+        let vcpu0 = Subsystem::Vcpu(0);
+        assert_eq!(format!("{}", vcpu0), "vcpu:0");
+
+        let vcpu7 = Subsystem::Vcpu(7);
+        assert_eq!(format!("{}", vcpu7), "vcpu:7");
+
+        // Verify it formats correctly inside brackets (as used in log output).
+        assert_eq!(format!("[{}]", vcpu0), "[vcpu:0]");
     }
 }

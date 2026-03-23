@@ -200,6 +200,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "enlil-hal"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "enlil-mgmt"
 version = "0.1.0"
 dependencies = [
@@ -218,6 +225,16 @@ dependencies = [
  "env_logger",
  "log",
  "spin",
+]
+
+[[package]]
+name = "enlil-setup"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "toml",
 ]
 
 [[package]]

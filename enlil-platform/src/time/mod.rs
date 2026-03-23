@@ -146,6 +146,62 @@ pub fn tsc_frequency() -> u64 {
     TSC_FREQ_HZ.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Calibrate TSC frequency using CPUID leaf 0x15 (Time Stamp Counter and
+/// Nominal Core Crystal Clock Information).
+///
+/// CPUID.15H:
+///   EAX = denominator of TSC/core crystal clock ratio
+///   EBX = numerator of TSC/core crystal clock ratio  
+///   ECX = nominal frequency of the core crystal clock in Hz (may be 0)
+///
+/// TSC frequency = ECX * EBX / EAX (if ECX != 0)
+/// If ECX == 0, the crystal clock frequency must be determined from the processor model.
+///
+/// Returns Some(frequency_hz) on success, None if CPUID 0x15 is not supported
+/// or the values are zero.
+///
+/// On Linux backend, this reads from the actual CPU. On bare-metal, same.
+/// This is architecture-specific (x86_64 only).
+#[cfg(target_arch = "x86_64")]
+pub fn calibrate_tsc_from_cpuid() -> Option<u64> {
+    // Check if CPUID leaf 0x15 is supported
+    let max_leaf = core::arch::x86_64::__cpuid(0x0).eax;
+    if max_leaf < 0x15 {
+        return None;
+    }
+    
+    let cpuid = core::arch::x86_64::__cpuid(0x15);
+    let denominator = cpuid.eax as u64;
+    let numerator = cpuid.ebx as u64;
+    let crystal_hz = cpuid.ecx as u64;
+    
+    if denominator == 0 || numerator == 0 {
+        return None;
+    }
+    
+    if crystal_hz != 0 {
+        // Direct calculation
+        Some(crystal_hz * numerator / denominator)
+    } else {
+        // Crystal clock not reported — would need model-specific lookup
+        // Common values: 24 MHz (Skylake+), 25 MHz (Atom), 19.2 MHz (some mobile)
+        // For now, return None and fall back to other calibration methods
+        None
+    }
+}
+
+/// Attempt to calibrate TSC and store the result.
+/// Tries CPUID 0x15 first, falls back to a default estimate.
+#[cfg(target_arch = "x86_64")]  
+pub fn calibrate_tsc() {
+    if let Some(freq) = calibrate_tsc_from_cpuid() {
+        set_tsc_frequency(freq);
+        log::info!("TSC frequency calibrated via CPUID 0x15: {} Hz ({:.2} GHz)", freq, freq as f64 / 1e9);
+    } else {
+        log::warn!("CPUID 0x15 TSC calibration not available; TSC frequency must be set manually");
+    }
+}
+
 /// Read the TSC register.
 #[cfg(feature = "platform-baremetal")]
 fn read_tsc() -> u64 {
@@ -293,5 +349,19 @@ mod tests {
         set_tsc_frequency(3_000_000_000);
         assert_eq!(tsc_frequency(), 3_000_000_000);
         set_tsc_frequency(old); // restore
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn tsc_calibration_from_cpuid() {
+        // This may return None on older CPUs or VMs without CPUID 0x15 support.
+        // We just verify it doesn't panic.
+        let result = calibrate_tsc_from_cpuid();
+        if let Some(freq) = result {
+            assert!(freq > 0, "TSC frequency should be positive");
+            // Sanity: should be between 100 MHz and 10 GHz
+            assert!(freq > 100_000_000, "TSC frequency suspiciously low: {}", freq);
+            assert!(freq < 10_000_000_000, "TSC frequency suspiciously high: {}", freq);
+        }
     }
 }
