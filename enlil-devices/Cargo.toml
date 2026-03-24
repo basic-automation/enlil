@@ -12,6 +12,8 @@ async-trait = "0.1"
 tokio = { version = "1", features = ["fs", "io-util", "sync", "rt"] }
 byteorder = "1"
 bitflags = "2"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { version = "1.0.149", features = ["std"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["fs", "io-util", "sync", "rt", "macros"] }
