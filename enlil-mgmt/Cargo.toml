@@ -1,13 +1,27 @@
 [package]
 name = "enlil-mgmt"
 version = "0.1.0"
-edition = "2024"
-description = "Management console — CLI/TUI for live VM control"
+edition = "2021"
+description = "TUI management console for the Enlil hypervisor"
+
+[[bin]]
+name = "enlil-mgmt"
+path = "src/main.rs"
 
 [dependencies]
-enlil-config = { path = "../enlil-config" }
-enlil-core = { path = "../enlil-core" }
+ratatui = "0.29"
+crossterm = "0.28"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
 log = "0.4"
 env_logger = "0.11"
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+enlil-config = { path = "../enlil-config" }
+enlil-core = { path = "../enlil-core" }
+
+[dev-dependencies]
+tempfile = "3"
