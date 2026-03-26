@@ -51,6 +51,11 @@ pub struct SharedFsManager {
 }
 
 impl SharedFsManager {
+    /// Creates a new `SharedFsManager` with the given configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backing directory layout cannot be initialized.
     pub fn new(config: SharedFsConfig) -> std::io::Result<Self> {
         Self::init_layout(&config.backing_path)?;
         Ok(SharedFsManager {
@@ -71,6 +76,11 @@ impl SharedFsManager {
         Ok(())
     }
 
+    /// Stages a file to the clipboard directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be copied to the clipboard directory.
     pub fn stage_clipboard(&self, src: &Path) -> std::io::Result<PathBuf> {
         let dest = self.config.backing_path
             .join(SharedFsLayout::Clipboard.subdir())
@@ -79,6 +89,11 @@ impl SharedFsManager {
         Ok(dest)
     }
 
+    /// Stages a file to the drag-drop directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be copied to the drag-drop directory.
     pub fn stage_dragdrop(&self, src: &Path) -> std::io::Result<PathBuf> {
         let dest = self.config.backing_path
             .join(SharedFsLayout::Dragdrop.subdir())
@@ -105,6 +120,11 @@ impl SharedFsManager {
         self.transfers.get(id)
     }
 
+    /// Cleans temporary directories by removing all files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if directories cannot be read or files cannot be removed.
     pub fn clean_temp_dirs(&self) -> std::io::Result<()> {
         for layout in [
             SharedFsLayout::Clipboard,
@@ -125,6 +145,11 @@ impl SharedFsManager {
         Ok(())
     }
 
+    /// Checks the total space used by files in the backing directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backing directory cannot be read.
     pub fn check_space(&self) -> std::io::Result<u64> {
         let mut total = 0;
         for entry in fs::read_dir(&self.config.backing_path)? {
@@ -137,6 +162,11 @@ impl SharedFsManager {
         Ok(total)
     }
 
+    /// Calculates the available space remaining before the max size is reached.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if space usage cannot be determined.
     pub fn available_space(&self) -> std::io::Result<u64> {
         let used = self.check_space()?;
         Ok(self.config.max_size.saturating_sub(used))
@@ -149,7 +179,7 @@ mod tests {
     use std::io::Write;
 
     fn setup_test(name: &str) -> (PathBuf, SharedFsConfig) {
-        let root = std::env::temp_dir().join(format!("enlil_test_{}", name));
+        let root = std::env::temp_dir().join(format!("enlil_test_{name}"));
         let cfg = SharedFsConfig {
             mount_point: root.join("mnt"),
             backing_path: root.join("backing"),

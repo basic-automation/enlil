@@ -15,7 +15,7 @@ use std::sync::Arc;
 pub enum Priority {
     /// vCPU tasks — VMLAUNCH/VMRESUME. Always run first.
     Critical = 0,
-    /// Device I/O — VirtIO backends, USB polling, GPU commands.
+    /// Device I/O — `VirtIO` backends, USB polling, GPU commands.
     High = 1,
     /// Compute — Fabric JIT compilation, SPIR-V analysis.
     Normal = 2,
@@ -26,7 +26,8 @@ pub enum Priority {
 impl Priority {
     pub const COUNT: usize = 4;
 
-    pub fn as_index(self) -> usize {
+    #[must_use]
+    pub const fn as_index(self) -> usize {
         self as usize
     }
 }
@@ -56,7 +57,7 @@ impl std::fmt::Debug for SchedulerTask {
         f.debug_struct("SchedulerTask")
             .field("id", &self.id)
             .field("priority", &self.priority)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -75,7 +76,8 @@ pub struct RunQueue {
 
 impl RunQueue {
     /// Create a new empty run queue for the given CPU.
-    pub fn new(cpu_id: usize) -> Self {
+    #[must_use]
+    pub const fn new(cpu_id: usize) -> Self {
         Self {
             queues: [
                 std::sync::Mutex::new(VecDeque::new()),
@@ -89,6 +91,10 @@ impl RunQueue {
     }
 
     /// Push a task onto this run queue.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a queue mutex is poisoned.
     pub fn push(&self, task: SchedulerTask) {
         let idx = task.priority.as_index();
         self.queues[idx].lock().unwrap().push_back(task);
@@ -96,9 +102,17 @@ impl RunQueue {
     }
 
     /// Pop the highest-priority task from this run queue.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a queue mutex is poisoned.
     pub fn pop(&self) -> Option<SchedulerTask> {
         for queue in &self.queues {
-            if let Some(task) = queue.lock().unwrap().pop_front() {
+            let task = {
+                let mut q = queue.lock().unwrap();
+                q.pop_front()
+            };
+            if let Some(task) = task {
                 self.len.fetch_sub(1, Ordering::Relaxed);
                 return Some(task);
             }
@@ -110,9 +124,17 @@ impl RunQueue {
     ///
     /// Steals from the back of the lowest-priority non-empty queue
     /// to minimize impact on the owning core's hot tasks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a queue mutex is poisoned.
     pub fn steal(&self) -> Option<SchedulerTask> {
         for queue in self.queues.iter().rev() {
-            if let Some(task) = queue.lock().unwrap().pop_back() {
+            let task = {
+                let mut q = queue.lock().unwrap();
+                q.pop_back()
+            };
+            if let Some(task) = task {
                 self.len.fetch_sub(1, Ordering::Relaxed);
                 return Some(task);
             }
@@ -131,7 +153,7 @@ impl RunQueue {
     }
 
     /// Returns the CPU ID this queue belongs to.
-    pub fn cpu_id(&self) -> usize {
+    pub const fn cpu_id(&self) -> usize {
         self.cpu_id
     }
 }
@@ -150,6 +172,7 @@ pub struct Scheduler {
 
 impl Scheduler {
     /// Create a new scheduler with the given number of CPUs.
+    #[must_use]
     pub fn new(num_cpus: usize) -> Self {
         let run_queues = (0..num_cpus)
             .map(|cpu| Arc::new(RunQueue::new(cpu)))
@@ -181,8 +204,7 @@ impl Scheduler {
             .iter()
             .enumerate()
             .min_by_key(|(_, rq)| rq.len())
-            .map(|(i, _)| i)
-            .unwrap_or(0)
+            .map_or(0, |(i, _)| i)
     }
 
     /// Attempt to steal a task for the given CPU from another CPU's queue.
@@ -199,7 +221,7 @@ impl Scheduler {
             .collect();
 
         // Sort by load descending — steal from busiest first.
-        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        candidates.sort_by_key(|a| std::cmp::Reverse(a.1));
 
         for (cpu, _) in candidates {
             if let Some(task) = self.run_queues[cpu].steal() {
@@ -215,7 +237,7 @@ impl Scheduler {
     }
 
     /// Returns the number of CPUs this scheduler manages.
-    pub fn num_cpus(&self) -> usize {
+    pub const fn num_cpus(&self) -> usize {
         self.run_queues.len()
     }
 

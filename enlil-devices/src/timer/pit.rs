@@ -349,6 +349,6 @@ mod tests {
         pit.write_port(0x40, (1193 & 0xFF) as u8);
         pit.write_port(0x40, ((1193 >> 8) & 0xFF) as u8);
         let freq = pit.channel0_frequency();
-        assert!(freq >= 999 && freq <= 1001);
+        assert!((999..=1001).contains(&freq));
     }
 }

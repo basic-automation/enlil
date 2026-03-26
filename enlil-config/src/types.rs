@@ -41,9 +41,9 @@ impl Default for HypervisorConfig {
     }
 }
 
-fn default_reserved_memory() -> u64 { 512 }
+const fn default_reserved_memory() -> u64 { 512 }
 fn default_log_level() -> String { "info".into() }
-fn default_mgmt_port() -> u16 { 9100 }
+const fn default_mgmt_port() -> u16 { 9100 }
 
 /// Configuration for a single guest VM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,16 +75,13 @@ pub struct GuestConfig {
 fn default_cmdline() -> String { "console=ttyS0".into() }
 
 /// CPU scheduling strategy.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SchedulingMode {
     Dedicated,
     Timeslice,
+    #[default]
     Auto,
-}
-
-impl Default for SchedulingMode {
-    fn default() -> Self { Self::Auto }
 }
 
 /// Block device configuration.
@@ -117,5 +114,5 @@ impl Default for SerialPortConfig {
     }
 }
 
-fn default_true() -> bool { true }
+const fn default_true() -> bool { true }
 fn default_serial_output() -> String { "stdout".into() }

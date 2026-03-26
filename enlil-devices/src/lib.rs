@@ -1,3 +1,5 @@
+#![deny(clippy::all, clippy::pedantic, clippy::nursery)]
+
 //! enlil-devices: Virtual device backends
 //!
 //! This crate implements the virtual hardware layer that guests interact with:

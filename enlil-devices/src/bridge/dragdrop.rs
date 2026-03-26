@@ -9,7 +9,7 @@ pub struct DragPayload {
 }
 
 impl DragPayload {
-    pub fn new(file_uris: Vec<String>, mime_types: Vec<String>) -> Self {
+    pub const fn new(file_uris: Vec<String>, mime_types: Vec<String>) -> Self {
         Self {
             file_uris,
             mime_types,
@@ -40,20 +40,20 @@ pub enum DragState {
 }
 
 impl DragState {
-    pub fn is_idle(&self) -> bool {
-        matches!(self, DragState::Idle)
+    pub const fn is_idle(&self) -> bool {
+        matches!(self, Self::Idle)
     }
 
-    pub fn is_dragging(&self) -> bool {
-        matches!(self, DragState::Dragging { .. })
+    pub const fn is_dragging(&self) -> bool {
+        matches!(self, Self::Dragging { .. })
     }
 
-    pub fn is_hovering(&self) -> bool {
-        matches!(self, DragState::Hovering { .. })
+    pub const fn is_hovering(&self) -> bool {
+        matches!(self, Self::Hovering { .. })
     }
 
-    pub fn is_dropped(&self) -> bool {
-        matches!(self, DragState::Dropped)
+    pub const fn is_dropped(&self) -> bool {
+        matches!(self, Self::Dropped)
     }
 }
 
@@ -77,13 +77,17 @@ impl DragDropManager {
     }
 
     /// Start drag from a guest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state is not Idle or if the source guest is not registered.
     pub fn start_drag(&mut self, source_guest: String, payload: DragPayload) -> Result<(), String> {
         if !matches!(self.state, DragState::Idle) {
             return Err("Cannot start drag: state is not Idle".to_string());
         }
 
         if !self.guest_capabilities.contains_key(&source_guest) {
-            return Err(format!("Guest '{}' not registered", source_guest));
+            return Err(format!("Guest '{source_guest}' not registered"));
         }
 
         self.state = DragState::Dragging {
@@ -94,6 +98,11 @@ impl DragDropManager {
     }
 
     /// Move hover to target guest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state is not Dragging, if the target guest is not registered,
+    /// if the target is the same as the source, or if the target does not support the payload MIME types.
     pub fn hover(&mut self, target_guest: String) -> Result<(), String> {
         match &self.state {
             DragState::Dragging {
@@ -101,7 +110,7 @@ impl DragDropManager {
                 payload,
             } => {
                 if !self.guest_capabilities.contains_key(&target_guest) {
-                    return Err(format!("Guest '{}' not registered", target_guest));
+                    return Err(format!("Guest '{target_guest}' not registered"));
                 }
 
                 if source_guest == &target_guest {
@@ -129,6 +138,10 @@ impl DragDropManager {
     }
 
     /// Complete the drag-and-drop operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state is not Hovering.
     pub fn drop(&mut self) -> Result<(String, String, DragPayload), String> {
         match &self.state {
             DragState::Hovering {
@@ -149,13 +162,23 @@ impl DragDropManager {
     }
 
     /// Reset to idle state.
+    ///
+    /// # Errors
+    ///
+    /// This function does not currently return errors.
     pub fn cancel(&mut self) -> Result<(), String> {
         self.state = DragState::Idle;
         Ok(())
     }
 
-    pub fn state(&self) -> &DragState {
+    pub const fn state(&self) -> &DragState {
         &self.state
+    }
+}
+
+impl Default for DragDropManager {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -194,7 +217,7 @@ mod tests {
         );
 
         assert!(mgr.state().is_idle());
-        mgr.start_drag("guest1".to_string(), payload.clone()).unwrap();
+        mgr.start_drag("guest1".to_string(), payload).unwrap();
         assert!(mgr.state().is_dragging());
         mgr.hover("guest2".to_string()).unwrap();
         assert!(mgr.state().is_hovering());
@@ -222,7 +245,7 @@ mod tests {
         let mut mgr = DragDropManager::new();
         mgr.register_guest("guest1".to_string(), vec!["text/plain".to_string()]);
 
-        let payload = DragPayload::new(vec![], vec!["text/plain".to_string()]);
+        let _payload = DragPayload::new(vec![], vec!["text/plain".to_string()]);
 
         let result = mgr.hover("guest1".to_string());
         assert!(result.is_err());

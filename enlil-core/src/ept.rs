@@ -19,7 +19,7 @@ pub const PAGE_SIZE_2M: u64 = 2 * 1024 * 1024;
 pub const PAGE_SIZE_1G: u64 = 1024 * 1024 * 1024;
 
 /// EPT permission flags.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EptPermissions {
     pub read: bool,
     pub write: bool,
@@ -39,21 +39,20 @@ impl Default for EptPermissions {
 }
 
 /// Memory type for EPT entries (PAT-like).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum EptMemoryType {
     Uncacheable = 0,
     WriteCombining = 1,
     WriteThrough = 4,
     WriteProtected = 5,
+    #[default]
     WriteBack = 6,
 }
 
-impl Default for EptMemoryType {
-    fn default() -> Self { Self::WriteBack }
-}
 
 /// Page size used for a mapping.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageSize {
     Page4K,
     Page2M,
@@ -61,7 +60,8 @@ pub enum PageSize {
 }
 
 impl PageSize {
-    pub fn bytes(&self) -> u64 {
+    #[must_use]
+    pub const fn bytes(&self) -> u64 {
         match self {
             Self::Page4K => PAGE_SIZE_4K,
             Self::Page2M => PAGE_SIZE_2M,
@@ -101,7 +101,8 @@ pub struct EptMapping {
 
 impl EptMapping {
     /// Effective permissions considering write-protection override.
-    pub fn effective_permissions(&self) -> EptPermissions {
+    #[must_use]
+    pub const fn effective_permissions(&self) -> EptPermissions {
         if self.write_protected {
             EptPermissions {
                 write: false,
@@ -148,6 +149,7 @@ pub struct EptStats {
 
 impl EptManager {
     /// Create a new EPT manager for a guest.
+    #[must_use]
     pub fn new(guest_id: &str) -> Self {
         Self {
             guest_id: guest_id.to_string(),
@@ -159,11 +161,13 @@ impl EptManager {
         }
     }
 
+    #[must_use]
     pub fn guest_id(&self) -> &str {
         &self.guest_id
     }
 
-    pub fn stats(&self) -> &EptStats {
+    #[must_use]
+    pub const fn stats(&self) -> &EptStats {
         &self.stats
     }
 
@@ -181,10 +185,10 @@ impl EptManager {
         let size = page_size.bytes();
 
         // Alignment checks
-        if gpa % size != 0 {
+        if !gpa.is_multiple_of(size) {
             return Err(EptError::MisalignedGpa { gpa, required_alignment: size });
         }
-        if hpa % size != 0 {
+        if !hpa.is_multiple_of(size) {
             return Err(EptError::MisalignedHpa { hpa, required_alignment: size });
         }
 
@@ -232,8 +236,8 @@ impl EptManager {
             let hpa = hpa_base + offset;
 
             // Try 2MB page if aligned and enough space
-            let page_size = if gpa % PAGE_SIZE_2M == 0
-                && hpa % PAGE_SIZE_2M == 0
+            let page_size = if gpa.is_multiple_of(PAGE_SIZE_2M)
+                && hpa.is_multiple_of(PAGE_SIZE_2M)
                 && remaining >= PAGE_SIZE_2M
             {
                 PageSize::Page2M
@@ -268,6 +272,7 @@ impl EptManager {
     }
 
     /// Look up a mapping by GPA.
+    #[must_use]
     pub fn lookup(&self, gpa: u64) -> Option<&EptMapping> {
         self.mappings.get(&gpa)
     }
@@ -346,6 +351,7 @@ impl EptManager {
     }
 
     /// Check if a page is write-protected.
+    #[must_use]
     pub fn is_write_protected(&self, gpa: u64) -> bool {
         self.write_protected_pages.contains_key(&gpa)
     }
@@ -355,7 +361,7 @@ impl EptManager {
     // -----------------------------------------------------------------------
 
     /// Enable dirty page tracking.
-    pub fn enable_dirty_tracking(&mut self) {
+    pub const fn enable_dirty_tracking(&mut self) {
         self.dirty_tracking_enabled = true;
     }
 
@@ -407,6 +413,7 @@ impl EptManager {
     }
 
     /// Number of currently dirty pages.
+    #[must_use]
     pub fn dirty_page_count(&self) -> usize {
         self.dirty_pages.len()
     }
@@ -416,12 +423,14 @@ impl EptManager {
     // -----------------------------------------------------------------------
 
     /// Total number of mapped pages.
+    #[must_use]
     pub fn mapping_count(&self) -> usize {
         self.mappings.len()
     }
 
     /// Total mapped bytes.
-    pub fn total_mapped_bytes(&self) -> u64 {
+    #[must_use]
+    pub const fn total_mapped_bytes(&self) -> u64 {
         self.stats.total_mapped_bytes
     }
 
@@ -459,7 +468,7 @@ impl EptManager {
 }
 
 /// EPT operation errors.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EptError {
     MisalignedGpa { gpa: u64, required_alignment: u64 },
     MisalignedHpa { hpa: u64, required_alignment: u64 },
@@ -472,15 +481,15 @@ impl fmt::Display for EptError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MisalignedGpa { gpa, required_alignment } =>
-                write!(f, "GPA {:#x} not aligned to {:#x}", gpa, required_alignment),
+                write!(f, "GPA {gpa:#x} not aligned to {required_alignment:#x}"),
             Self::MisalignedHpa { hpa, required_alignment } =>
-                write!(f, "HPA {:#x} not aligned to {:#x}", hpa, required_alignment),
+                write!(f, "HPA {hpa:#x} not aligned to {required_alignment:#x}"),
             Self::AlreadyMapped { gpa } =>
-                write!(f, "GPA {:#x} already mapped", gpa),
+                write!(f, "GPA {gpa:#x} already mapped"),
             Self::NotMapped { gpa } =>
-                write!(f, "GPA {:#x} not mapped", gpa),
+                write!(f, "GPA {gpa:#x} not mapped"),
             Self::OverlappingMapping { gpa, existing_gpa } =>
-                write!(f, "GPA {:#x} overlaps with existing mapping at {:#x}", gpa, existing_gpa),
+                write!(f, "GPA {gpa:#x} overlaps with existing mapping at {existing_gpa:#x}"),
         }
     }
 }
@@ -593,7 +602,7 @@ mod tests {
 
         // Get and clear bitmap
         let mut dirty = ept.ept_get_and_clear_dirty_bitmap();
-        dirty.sort();
+        dirty.sort_unstable();
         assert_eq!(dirty, vec![0x0, PAGE_SIZE_4K]);
         assert_eq!(ept.dirty_page_count(), 0);
 

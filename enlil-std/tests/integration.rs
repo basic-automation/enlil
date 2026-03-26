@@ -35,9 +35,7 @@ fn mutex_shared_across_threads() {
 
 #[test]
 fn vec_and_hashmap() {
-    let mut v: Vec<String> = Vec::new();
-    v.push("hello".into());
-    v.push("enlil".into());
+    let v: Vec<String> = vec!["hello".into(), "enlil".into()];
     assert_eq!(v.len(), 2);
 
     let mut map: HashMap<String, i32> = HashMap::new();

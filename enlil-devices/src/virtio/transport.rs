@@ -102,9 +102,9 @@ impl MmioTransport {
             regs::VENDOR_ID => self.vendor_id as u64,
             regs::DEVICE_FEATURES => {
                 if self.device_features_sel == 0 {
-                    (self.device_features & 0xFFFF_FFFF) as u64
+                    self.device_features & 0xFFFF_FFFF
                 } else {
-                    (self.device_features >> 32) as u64
+                    self.device_features >> 32
                 }
             }
             regs::QUEUE_NUM_MAX => {

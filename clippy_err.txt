@@ -1,0 +1,627 @@
+    Checking enlil-platform v0.1.0 (D:\Development\enlil\enlil-platform)
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> enlil-devices\src\display\mod.rs:120:13
+    |
+120 |     frames: Arc<RwLock<VecDeque<(u64, Vec<u8>)>>>,
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#type_complexity
+    = note: `#[warn(clippy::type_complexity)]` on by default
+
+warning: field assignment outside of initializer for an instance created with Default::default()
+   --> enlil-devices\src\display\mod.rs:798:9
+    |
+798 |         config.width = 1920;
+    |         ^^^^^^^^^^^^^^^^^^^^
+    |
+note: consider initializing the variable with `display::DisplayConfig { width: 1920, height: 1080, ..Default::default() }` and removing relevant reassignments
+   --> enlil-devices\src\display\mod.rs:797:9
+    |
+797 |         let mut config = DisplayConfig::default();
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#field_reassign_with_default
+    = note: `#[warn(clippy::field_reassign_with_default)]` on by default
+
+warning: `enlil-devices` (lib) generated 1 warning
+warning: `enlil-devices` (lib test) generated 2 warnings (1 duplicate)
+warning: field assignment outside of initializer for an instance created with Default::default()
+   --> enlil-core\src\vcpu.rs:539:9
+    |
+539 |         ctx.rip = 0xDEADBEEF;
+    |         ^^^^^^^^^^^^^^^^^^^^^
+    |
+note: consider initializing the variable with `vcpu::VcpuContext { rip: 0xDEADBEEF, ..Default::default() }` and removing relevant reassignments
+   --> enlil-core\src\vcpu.rs:538:9
+    |
+538 |         let mut ctx = VcpuContext::default();
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#field_reassign_with_default
+    = note: `#[warn(clippy::field_reassign_with_default)]` on by default
+
+warning: `enlil-core` (lib test) generated 1 warning
+error: this method could have a `#[must_use]` attribute
+  --> enlil-platform\src\threading\mod.rs:53:12
+   |
+53 |     pub fn from_u8(v: u8) -> Option<Self> {
+   |            ^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#must_use_candidate
+note: the lint level is defined here
+  --> enlil-platform\src\lib.rs:1:24
+   |
+ 1 | #![forbid(clippy::all, clippy::pedantic, clippy::nursery)]
+   |                        ^^^^^^^^^^^^^^^^
+   = note: `#[forbid(clippy::must_use_candidate)]` implied by `#[forbid(clippy::pedantic)]`
+help: add the attribute
+   |
+53 ~     #[must_use]
+54 ~     pub fn from_u8(v: u8) -> Option<Self> {
+   |
+
+error: this could be a `const fn`
+  --> enlil-platform\src\threading\mod.rs:53:5
+   |
+53 | /     pub fn from_u8(v: u8) -> Option<Self> {
+54 | |         match v {
+55 | |             0 => Some(Priority::Critical),
+56 | |             1 => Some(Priority::High),
+...  |
+61 | |     }
+   | |_____^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#missing_const_for_fn
+note: the lint level is defined here
+  --> enlil-platform\src\lib.rs:1:42
+   |
+ 1 | #![forbid(clippy::all, clippy::pedantic, clippy::nursery)]
+   |                                          ^^^^^^^^^^^^^^^
+   = note: `#[forbid(clippy::missing_const_for_fn)]` implied by `#[forbid(clippy::nursery)]`
+help: make the function `const`
+   |
+53 |     pub const fn from_u8(v: u8) -> Option<Self> {
+   |         +++++
+
+error: unnecessary structure name repetition
+  --> enlil-platform\src\threading\mod.rs:55:23
+   |
+55 |             0 => Some(Priority::Critical),
+   |                       ^^^^^^^^ help: use the applicable keyword: `Self`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#use_self
+   = note: `#[forbid(clippy::use_self)]` implied by `#[forbid(clippy::nursery)]`
+
+error: unnecessary structure name repetition
+  --> enlil-platform\src\threading\mod.rs:56:23
+   |
+56 |             1 => Some(Priority::High),
+   |                       ^^^^^^^^ help: use the applicable keyword: `Self`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#use_self
+
+error: unnecessary structure name repetition
+  --> enlil-platform\src\threading\mod.rs:57:23
+   |
+57 |             2 => Some(Priority::Normal),
+   |                       ^^^^^^^^ help: use the applicable keyword: `Self`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#use_self
+
+error: unnecessary structure name repetition
+  --> enlil-platform\src\threading\mod.rs:58:23
+   |
+58 |             3 => Some(Priority::Low),
+   |                       ^^^^^^^^ help: use the applicable keyword: `Self`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#use_self
+
+error: this `impl` can be derived
+  --> enlil-platform\src\threading\mod.rs:64:1
+   |
+64 | / impl Default for Priority {
+65 | |     fn default() -> Self {
+66 | |         Priority::Normal
+67 | |     }
+68 | | }
+   | |_^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#derivable_impls
+note: the lint level is defined here
+  --> enlil-platform\src\lib.rs:1:11
+   |
+ 1 | #![forbid(clippy::all, clippy::pedantic, clippy::nursery)]
+   |           ^^^^^^^^^^^
+   = note: `#[forbid(clippy::derivable_impls)]` implied by `#[forbid(clippy::all)]`
+help: replace the manual implementation with a derive attribute and mark the default variant
+   |
+37 + #[derive(Default)]
+38 | pub enum Priority {
+39 |     /// vCPU execution — must pre-empt everything else.
+...
+43 |     /// General compute work (default).
+44 ~     #[default]
+45 ~     Normal = 2,
+   |
+
+error: unnecessary structure name repetition
+  --> enlil-platform\src\threading\mod.rs:66:9
+   |
+66 |         Priority::Normal
+   |         ^^^^^^^^ help: use the applicable keyword: `Self`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#use_self
+
+error: unnecessary structure name repetition
+  --> enlil-platform\src\threading\mod.rs:73:13
+   |
+73 |             Priority::Critical => write!(f, "critical"),
+   |             ^^^^^^^^ help: use the applicable keyword: `Self`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#use_self
+
+error: unnecessary structure name repetition
+  --> enlil-platform\src\threading\mod.rs:74:13
+   |
+74 |             Priority::High => write!(f, "high"),
+   |             ^^^^^^^^ help: use the applicable keyword: `Self`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#use_self
+
+error: unnecessary structure name repetition
+  --> enlil-platform\src\threading\mod.rs:75:13
+   |
+75 |             Priority::Normal => write!(f, "normal"),
+   |             ^^^^^^^^ help: use the applicable keyword: `Self`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#use_self
+
+error: unnecessary structure name repetition
+  --> enlil-platform\src\threading\mod.rs:76:13
+   |
+76 |             Priority::Low => write!(f, "low"),
+   |             ^^^^^^^^ help: use the applicable keyword: `Self`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#use_self
+
+error: this `impl` can be derived
+   --> enlil-platform\src\threading\mod.rs:96:1
+    |
+ 96 | / impl Default for CpuAffinity {
+ 97 | |     fn default() -> Self {
+ 98 | |         CpuAffinity::Any
+ 99 | |     }
+100 | | }
+    | |_^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#derivable_impls
+help: replace the manual implementation with a derive attribute and mark the default variant
+    |
+ 87 + #[derive(Default)]
+ 88 | pub enum CpuAffinity {
+ 89 |     /// The scheduler may place the task on any CPU.
+ 90 ~     #[default]
+ 91 ~     Any,
+    |
+
+error: unnecessary structure name repetition
+  --> enlil-platform\src\threading\mod.rs:98:9
+   |
+98 |         CpuAffinity::Any
+   |         ^^^^^^^^^^^ help: use the applicable keyword: `Self`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#use_self
+
+error: unnecessary structure name repetition
+   --> enlil-platform\src\threading\mod.rs:126:9
+    |
+126 |         Task {
+    |         ^^^^ help: use the applicable keyword: `Self`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#use_self
+
+error: this method could have a `#[must_use]` attribute
+   --> enlil-platform\src\threading\mod.rs:157:12
+    |
+157 |     pub fn is_pending(&self) -> bool {
+    |            ^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#must_use_candidate
+help: add the attribute
+    |
+157 ~     #[must_use]
+158 ~     pub fn is_pending(&self) -> bool {
+    |
+
+error: manual `Debug` impl does not include all fields
+   --> enlil-platform\src\threading\mod.rs:162:1
+    |
+162 | / impl fmt::Debug for Task {
+163 | |     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+164 | |         f.debug_struct("Task")
+165 | |             .field("name", &self.name)
+...   |
+171 | | }
+    | |_^
+    |
+note: this field is unused
+   --> enlil-platform\src\threading\mod.rs:117:5
+    |
+117 |     work: Option<Box<dyn FnOnce() + Send + 'static>>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: consider including all fields in this `Debug` impl
+    = help: consider calling `.finish_non_exhaustive()` if you intend to ignore fields
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#missing_fields_in_debug
+    = note: `#[forbid(clippy::missing_fields_in_debug)]` implied by `#[forbid(clippy::pedantic)]`
+
+error: this method could have a `#[must_use]` attribute
+   --> enlil-platform\src\threading\mod.rs:193:12
+    |
+193 |     pub fn new(cpu: usize) -> Self {
+    |            ^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#must_use_candidate
+help: add the attribute
+    |
+193 ~     #[must_use]
+194 ~     pub fn new(cpu: usize) -> Self {
+    |
+
+error: this could be a `const fn`
+   --> enlil-platform\src\threading\mod.rs:193:5
+    |
+193 | /     pub fn new(cpu: usize) -> Self {
+194 | |         RunQueue {
+195 | |             cpu,
+196 | |             queues: [
+...   |
+203 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#missing_const_for_fn
+help: make the function `const`
+    |
+193 |     pub const fn new(cpu: usize) -> Self {
+    |         +++++
+
+error: unnecessary structure name repetition
+   --> enlil-platform\src\threading\mod.rs:194:9
+    |
+194 |         RunQueue {
+    |         ^^^^^^^^ help: use the applicable keyword: `Self`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#use_self
+
+error: it is more concise to loop over references to containers instead of using explicit iteration methods
+   --> enlil-platform\src\threading\mod.rs:214:18
+    |
+214 |         for q in self.queues.iter_mut() {
+    |                  ^^^^^^^^^^^^^^^^^^^^^^ help: to write this more concisely, try: `&mut self.queues`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#explicit_iter_loop
+    = note: `#[forbid(clippy::explicit_iter_loop)]` implied by `#[forbid(clippy::pedantic)]`
+
+error: this method could have a `#[must_use]` attribute
+   --> enlil-platform\src\threading\mod.rs:237:12
+    |
+237 |     pub fn len(&self) -> usize {
+    |            ^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#must_use_candidate
+help: add the attribute
+    |
+237 ~     #[must_use]
+238 ~     pub fn len(&self) -> usize {
+    |
+
+error: redundant closure
+   --> enlil-platform\src\threading\mod.rs:238:32
+    |
+238 |         self.queues.iter().map(|q| q.len()).sum()
+    |                                ^^^^^^^^^^^ help: replace the closure with the method itself: `std::collections::VecDeque::len`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#redundant_closure_for_method_calls
+    = note: `#[forbid(clippy::redundant_closure_for_method_calls)]` implied by `#[forbid(clippy::pedantic)]`
+
+error: this method could have a `#[must_use]` attribute
+   --> enlil-platform\src\threading\mod.rs:242:12
+    |
+242 |     pub fn is_empty(&self) -> bool {
+    |            ^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#must_use_candidate
+help: add the attribute
+    |
+242 ~     #[must_use]
+243 ~     pub fn is_empty(&self) -> bool {
+    |
+
+error: this method could have a `#[must_use]` attribute
+   --> enlil-platform\src\threading\mod.rs:277:12
+    |
+277 |     pub fn new(cpu_id: usize) -> Self {
+    |            ^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#must_use_candidate
+help: add the attribute
+    |
+277 ~     #[must_use]
+278 ~     pub fn new(cpu_id: usize) -> Self {
+    |
+
+error: this could be a `const fn`
+   --> enlil-platform\src\threading\mod.rs:277:5
+    |
+277 | /     pub fn new(cpu_id: usize) -> Self {
+278 | |         CpuLocal { cpu_id, ticks: 0 }
+279 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#missing_const_for_fn
+help: make the function `const`
+    |
+277 |     pub const fn new(cpu_id: usize) -> Self {
+    |         +++++
+
+error: unnecessary structure name repetition
+   --> enlil-platform\src\threading\mod.rs:278:9
+    |
+278 |         CpuLocal { cpu_id, ticks: 0 }
+    |         ^^^^^^^^ help: use the applicable keyword: `Self`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#use_self
+
+error: variables can be used directly in the `format!` string
+   --> enlil-platform\src\threading\mod.rs:294:5
+    |
+294 |     log::debug!("cpu_local initialised for cpu {}", cpu_id);
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+    = note: `#[forbid(clippy::uninlined_format_args)]` implied by `#[forbid(clippy::pedantic)]`
+help: change this to
+    |
+294 -     log::debug!("cpu_local initialised for cpu {}", cpu_id);
+294 +     log::debug!("cpu_local initialised for cpu {cpu_id}");
+    |
+
+error: this function could have a `#[must_use]` attribute
+   --> enlil-platform\src\threading\mod.rs:298:8
+    |
+298 | pub fn current_cpu_id() -> usize {
+    |        ^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#must_use_candidate
+help: add the attribute
+    |
+298 + #[must_use]
+299 | pub fn current_cpu_id() -> usize {
+    |
+
+error: this function could have a `#[must_use]` attribute
+   --> enlil-platform\src\threading\mod.rs:303:8
+    |
+303 | pub fn tick() -> u64 {
+    |        ^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#must_use_candidate
+help: add the attribute
+    |
+303 + #[must_use]
+304 | pub fn tick() -> u64 {
+    |
+
+error: docs for function which may panic missing `# Panics` section
+   --> enlil-platform\src\threading\mod.rs:319:1
+    |
+319 | pub fn spawn_hosted(task: Task) -> std::thread::JoinHandle<()> {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+note: first possible panic found here
+   --> enlil-platform\src\threading\mod.rs:328:29
+    |
+328 |         .unwrap_or_else(|e| panic!("failed to spawn thread for task '{}': {}", name, e))
+    |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#missing_panics_doc
+    = note: `#[forbid(clippy::missing_panics_doc)]` implied by `#[forbid(clippy::pedantic)]`
+
+error: this function could have a `#[must_use]` attribute
+   --> enlil-platform\src\threading\mod.rs:319:8
+    |
+319 | pub fn spawn_hosted(task: Task) -> std::thread::JoinHandle<()> {
+    |        ^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#must_use_candidate
+help: add the attribute
+    |
+319 + #[must_use]
+320 | pub fn spawn_hosted(task: Task) -> std::thread::JoinHandle<()> {
+    |
+
+error: variables can be used directly in the `format!` string
+   --> enlil-platform\src\threading\mod.rs:328:29
+    |
+328 |         .unwrap_or_else(|e| panic!("failed to spawn thread for task '{}': {}", name, e))
+    |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+    |
+328 -         .unwrap_or_else(|e| panic!("failed to spawn thread for task '{}': {}", name, e))
+328 +         .unwrap_or_else(|e| panic!("failed to spawn thread for task '{name}': {e}"))
+    |
+
+error: this method could have a `#[must_use]` attribute
+   --> enlil-platform\src\threading\mod.rs:347:12
+    |
+347 |     pub fn new(num_cpus: usize) -> Self {
+    |            ^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#must_use_candidate
+help: add the attribute
+    |
+347 ~     #[must_use]
+348 ~     pub fn new(num_cpus: usize) -> Self {
+    |
+
+error: unnecessary structure name repetition
+   --> enlil-platform\src\threading\mod.rs:351:9
+    |
+351 |         BareMetalScheduler {
+    |         ^^^^^^^^^^^^^^^^^^ help: use the applicable keyword: `Self`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#use_self
+
+error: docs for function which may panic missing `# Panics` section
+   --> enlil-platform\src\threading\mod.rs:357:5
+    |
+357 |     pub fn submit(&self, task: Task) -> Result<(), &'static str> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+note: first possible panic found here
+   --> enlil-platform\src\threading\mod.rs:372:31
+    |
+372 |                     let len = self.queues[cpu].lock().unwrap().len();
+    |                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#missing_panics_doc
+
+error: docs for function returning `Result` missing `# Errors` section
+   --> enlil-platform\src\threading\mod.rs:357:5
+    |
+357 |     pub fn submit(&self, task: Task) -> Result<(), &'static str> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#missing_errors_doc
+    = note: `#[forbid(clippy::missing_errors_doc)]` implied by `#[forbid(clippy::pedantic)]`
+
+error: docs for function which may panic missing `# Panics` section
+   --> enlil-platform\src\threading\mod.rs:406:5
+    |
+406 |     pub fn run_one(&self, cpu: usize) -> bool {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+note: first possible panic found here
+   --> enlil-platform\src\threading\mod.rs:409:25
+    |
+409 |             let mut q = self.queues[cpu].lock().unwrap();
+    |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#missing_panics_doc
+
+error: this method could have a `#[must_use]` attribute
+   --> enlil-platform\src\threading\mod.rs:406:12
+    |
+406 |     pub fn run_one(&self, cpu: usize) -> bool {
+    |            ^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#must_use_candidate
+help: add the attribute
+    |
+406 ~     #[must_use]
+407 ~     pub fn run_one(&self, cpu: usize) -> bool {
+    |
+
+error: this method could have a `#[must_use]` attribute
+   --> enlil-platform\src\threading\mod.rs:444:12
+    |
+444 |     pub fn num_cpus(&self) -> usize {
+    |            ^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#must_use_candidate
+help: add the attribute
+    |
+444 ~     #[must_use]
+445 ~     pub fn num_cpus(&self) -> usize {
+    |
+
+error: docs for function which may panic missing `# Panics` section
+   --> enlil-platform\src\threading\mod.rs:449:5
+    |
+449 |     pub fn total_pending(&self) -> usize {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+note: first possible panic found here
+   --> enlil-platform\src\threading\mod.rs:452:22
+    |
+452 |             .map(|q| q.lock().unwrap().len())
+    |                      ^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#missing_panics_doc
+
+error: this method could have a `#[must_use]` attribute
+   --> enlil-platform\src\threading\mod.rs:449:12
+    |
+449 |     pub fn total_pending(&self) -> usize {
+    |            ^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#must_use_candidate
+help: add the attribute
+    |
+449 ~     #[must_use]
+450 ~     pub fn total_pending(&self) -> usize {
+    |
+
+error: could not compile `enlil-platform` (lib) due to 42 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: variables can be used directly in the `format!` string
+   --> enlil-platform\src\threading\mod.rs:519:19
+    |
+519 |         let dbg = format!("{:?}", task);
+    |                   ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+    |
+519 -         let dbg = format!("{:?}", task);
+519 +         let dbg = format!("{task:?}");
+    |
+
+error: variables can be used directly in the `format!` string
+   --> enlil-platform\src\threading\mod.rs:584:19
+    |
+584 |         let dbg = format!("{:?}", rq);
+    |                   ^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+    |
+584 -         let dbg = format!("{:?}", rq);
+584 +         let dbg = format!("{rq:?}");
+    |
+
+error: variables can be used directly in the `format!` string
+   --> enlil-platform\src\threading\mod.rs:620:36
+    |
+620 |             let task = Task::spawn(format!("task-{}", i), move || {
+    |                                    ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+    |
+620 -             let task = Task::spawn(format!("task-{}", i), move || {
+620 +             let task = Task::spawn(format!("task-{i}"), move || {
+    |
+
+error: variables can be used directly in the `format!` string
+   --> enlil-platform\src\threading\mod.rs:699:21
+    |
+699 |                     format!("ws-{}", i),
+    |                     ^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+    |
+699 -                     format!("ws-{}", i),
+699 +                     format!("ws-{i}"),
+    |
+
+error: variables can be used directly in the `format!` string
+   --> enlil-platform\src\threading\mod.rs:717:19
+    |
+717 |         let dbg = format!("{:?}", sched);
+    |                   ^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+help: change this to
+    |
+717 -         let dbg = format!("{:?}", sched);
+717 +         let dbg = format!("{sched:?}");
+    |
+
+error: could not compile `enlil-platform` (lib test) due to 47 previous errors

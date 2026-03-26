@@ -114,10 +114,13 @@ impl FramebufferSource for IvshmemSource {
     }
 }
 
+/// Shared frame buffer: list of `(frame_id, pixel_data)` pairs.
+type FrameQueue = Arc<RwLock<VecDeque<(u64, Vec<u8>)>>>;
+
 /// VirtIO-GPU framebuffer source
 #[derive(Debug)]
 pub struct VirtioGpuSource {
-    frames: Arc<RwLock<VecDeque<(u64, Vec<u8>)>>>,
+    frames: FrameQueue,
     current_frame: Arc<Mutex<Option<FrameRef>>>,
     format: PixelFormat,
     max_frames: usize,
@@ -598,8 +601,8 @@ impl DisplayCompositor {
                 continue;
             }
 
-            if let Some(source) = sources.get(&zone.id) {
-                if let Some(data) = source.current_frame().and_then(|f| source.get_frame_data(f.id)) {
+            if let Some(source) = sources.get(&zone.id)
+                && let Some(data) = source.current_frame().and_then(|f| source.get_frame_data(f.id)) {
                     // Simple copy composition
                     let bytes_per_pixel = 4;
                     for y in 0..zone.height.min(config.height.saturating_sub(zone.y)) {
@@ -613,7 +616,6 @@ impl DisplayCompositor {
                         }
                     }
                 }
-            }
         }
 
         Some(composite_buffer)
@@ -795,9 +797,11 @@ mod tests {
 
     #[test]
     fn test_compositor_resize() {
-        let mut config = DisplayConfig::default();
-        config.width = 1920;
-        config.height = 1080;
+        let config = DisplayConfig {
+            width: 1920,
+            height: 1080,
+            ..DisplayConfig::default()
+        };
         let compositor = DisplayCompositor::new(config);
 
         compositor.resize(2560, 1440);

@@ -1,4 +1,4 @@
-//! Memory Subsystem — GlobalAlloc implementation
+//! Memory Subsystem — `GlobalAlloc` implementation
 //!
 //! Provides the memory allocation infrastructure for the Enlil hypervisor.
 //!
@@ -24,6 +24,7 @@ pub struct AllocStats {
 }
 
 impl AllocStats {
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             allocated: AtomicUsize::new(0),
@@ -48,6 +49,7 @@ impl AllocStats {
 static STATS: AllocStats = AllocStats::new();
 
 /// Returns a reference to the global allocation statistics.
+#[must_use]
 pub fn stats() -> &'static AllocStats {
     &STATS
 }
@@ -59,7 +61,7 @@ pub fn stats() -> &'static AllocStats {
 /// Order-based buddy allocator for physical memory management.
 ///
 /// Manages memory in power-of-two blocks from 4KB (order 0) up to
-/// 2^MAX_ORDER * 4KB. Used as the GlobalAlloc backend on bare-metal.
+/// `2^MAX_ORDER` * 4KB. Used as the `GlobalAlloc` backend on bare-metal.
 pub struct BuddyAllocator {
     /// Free lists per order. Each entry is a linked list of free blocks.
     free_lists: [Vec<usize>; Self::MAX_ORDER + 1],
@@ -70,12 +72,13 @@ pub struct BuddyAllocator {
 }
 
 impl BuddyAllocator {
-    /// Maximum order (2^MAX_ORDER * 4KB = 4GB max block).
+    /// Maximum order (`2^MAX_ORDER` * 4KB = 4GB max block).
     pub const MAX_ORDER: usize = 20;
     /// Minimum block size (4KB page).
     pub const MIN_BLOCK_SIZE: usize = 4096;
 
     /// Create a new buddy allocator managing the given memory region.
+    #[must_use]
     pub fn new(base: usize, size: usize) -> Self {
         let mut alloc = Self {
             free_lists: Default::default(),
@@ -159,7 +162,7 @@ impl BuddyAllocator {
     }
 
     /// Convert a size to the minimum buddy order that can hold it.
-    fn size_to_order(size: usize) -> usize {
+    const fn size_to_order(size: usize) -> usize {
         let mut order = 0;
         let mut block_size = Self::MIN_BLOCK_SIZE;
         while block_size < size {
@@ -170,6 +173,7 @@ impl BuddyAllocator {
     }
 
     /// Returns total free bytes across all orders.
+    #[must_use]
     pub fn free_bytes(&self) -> usize {
         self.free_lists
             .iter()
@@ -179,12 +183,14 @@ impl BuddyAllocator {
     }
 
     /// Returns the base address of the managed region.
-    pub fn base(&self) -> usize {
+    #[must_use]
+    pub const fn base(&self) -> usize {
         self.base
     }
 
     /// Returns the total size of the managed region.
-    pub fn size(&self) -> usize {
+    #[must_use]
+    pub const fn size(&self) -> usize {
         self.size
     }
 }
@@ -196,7 +202,7 @@ impl BuddyAllocator {
 /// Slab allocator for fixed-size small objects.
 ///
 /// Reduces fragmentation and improves performance for frequently
-/// allocated/freed objects of known sizes (e.g., vCPU contexts, VirtIO
+/// allocated/freed objects of known sizes (e.g., vCPU contexts, `VirtIO`
 /// descriptors, task structs).
 pub struct SlabCache {
     /// Object size for this cache.
@@ -209,6 +215,15 @@ pub struct SlabCache {
 
 impl SlabCache {
     /// Create a new slab cache for objects of the given size.
+    ///
+    ///
+    /// # Panics
+    ///
+    /// Panics if `object_size` is less than 8.
+    /// # Panics
+    ///
+    /// Panics if `object_size` is less than 8.
+    #[must_use]
     pub fn new(object_size: usize) -> Self {
         assert!(object_size >= 8, "minimum slab object size is 8 bytes");
         Self {
@@ -255,12 +270,14 @@ impl SlabCache {
     }
 
     /// Returns the object size for this cache.
-    pub fn object_size(&self) -> usize {
+    #[must_use]
+    pub const fn object_size(&self) -> usize {
         self.object_size
     }
 
     /// Returns the number of free objects available.
-    pub fn free_count(&self) -> usize {
+    #[must_use]
+    pub const fn free_count(&self) -> usize {
         self.free_list.len()
     }
 }
@@ -272,7 +289,7 @@ impl SlabCache {
 /// The platform allocator — dispatches to the appropriate backend.
 ///
 /// On Linux: wraps the system allocator.
-/// On bare-metal: wraps BuddyAllocator + SlabCache.
+/// On bare-metal: wraps `BuddyAllocator` + `SlabCache`.
 pub struct PlatformAllocator;
 
 unsafe impl GlobalAlloc for PlatformAllocator {
@@ -325,35 +342,65 @@ pub struct PhysAddr(u64);
 
 impl PhysAddr {
     /// Create a new physical address.
-    pub fn new(addr: u64) -> Self {
+    #[must_use]
+    pub const fn new(addr: u64) -> Self {
         Self(addr)
     }
 
     /// Return the raw `u64` value.
-    pub fn as_u64(&self) -> u64 {
+    ///
+    /// # Panics
+    ///
+    /// Panics if `align` is not a power of two.
+    #[must_use]
+    pub const fn as_u64(&self) -> u64 {
         self.0
     }
 
     /// Check whether the address is aligned to `align`.
+    #[must_use]
+    ///
+    /// # Panics
+    ///
+    ///
+    /// # Panics
+    ///
+    /// Panics if `align` is not a power of two.
+    /// Panics if `align` is not a power of two.
     pub fn is_aligned(&self, align: u64) -> bool {
         assert!(align.is_power_of_two(), "alignment must be a power of two");
         self.0 & (align - 1) == 0
     }
 
     /// Round the address up to the next multiple of `align`.
-    pub fn align_up(&self, align: u64) -> PhysAddr {
+    ///
+    /// # Panics
+    ///
+    /// Panics if `align` is not a power of two.
+    #[must_use]
+    ///
+    /// # Panics
+    ///
+    /// Panics if `align` is not a power of two.
+    pub fn align_up(&self, align: u64) -> Self {
         assert!(align.is_power_of_two(), "alignment must be a power of two");
-        PhysAddr((self.0 + align - 1) & !(align - 1))
+        Self((self.0 + align - 1) & !(align - 1))
     }
 
     /// Round the address down to the previous multiple of `align`.
-    pub fn align_down(&self, align: u64) -> PhysAddr {
+    #[must_use]
+    ///
+    /// # Panics
+    ///
+    /// Panics if `align` is not a power of two.
+    pub fn align_down(&self, align: u64) -> Self {
         assert!(align.is_power_of_two(), "alignment must be a power of two");
-        PhysAddr(self.0 & !(align - 1))
+        Self(self.0 & !(align - 1))
     }
 
     /// Offset within a 4KB page.
-    pub fn page_offset(&self) -> u64 {
+    #[must_use]
+    pub const fn page_offset(&self) -> u64 {
         self.0 & (PAGE_SIZE - 1)
     }
 }
@@ -365,56 +412,86 @@ impl fmt::Display for PhysAddr {
 }
 
 impl Add<u64> for PhysAddr {
-    type Output = PhysAddr;
+    type Output = Self;
 
-    fn add(self, rhs: u64) -> PhysAddr {
-        PhysAddr(self.0 + rhs)
+    fn add(self, rhs: u64) -> Self {
+        Self(self.0 + rhs)
     }
 }
 
 impl Sub<u64> for PhysAddr {
-    type Output = PhysAddr;
+    type Output = Self;
 
-    fn sub(self, rhs: u64) -> PhysAddr {
-        PhysAddr(self.0 - rhs)
+    fn sub(self, rhs: u64) -> Self {
+        Self(self.0 - rhs)
     }
 }
 
 /// Newtype wrapper around `u64` for virtual addresses.
+///
+/// # Panics
+///
+/// Panics if `align` is not a power of two.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VirtAddr(u64);
 
 impl VirtAddr {
     /// Create a new virtual address.
-    pub fn new(addr: u64) -> Self {
+    ///
+    /// # Panics
+    ///
+    /// Panics if `align` is not a power of two.
+    #[must_use]
+    pub const fn new(addr: u64) -> Self {
         Self(addr)
     }
 
     /// Return the raw `u64` value.
-    pub fn as_u64(&self) -> u64 {
+    ///
+    /// # Panics
+    ///
+    /// Panics if `align` is not a power of two.
+    #[must_use]
+    pub const fn as_u64(&self) -> u64 {
         self.0
     }
 
     /// Check whether the address is aligned to `align`.
+    #[must_use]
+    ///
+    /// # Panics
+    ///
+    /// Panics if `align` is not a power of two.
     pub fn is_aligned(&self, align: u64) -> bool {
         assert!(align.is_power_of_two(), "alignment must be a power of two");
         self.0 & (align - 1) == 0
     }
 
     /// Round the address up to the next multiple of `align`.
-    pub fn align_up(&self, align: u64) -> VirtAddr {
+    #[must_use]
+    ///
+    /// # Panics
+    ///
+    /// Panics if `align` is not a power of two.
+    pub fn align_up(&self, align: u64) -> Self {
         assert!(align.is_power_of_two(), "alignment must be a power of two");
-        VirtAddr((self.0 + align - 1) & !(align - 1))
+        Self((self.0 + align - 1) & !(align - 1))
     }
 
     /// Round the address down to the previous multiple of `align`.
-    pub fn align_down(&self, align: u64) -> VirtAddr {
+    #[must_use]
+    ///
+    /// # Panics
+    ///
+    /// Panics if `align` is not a power of two.
+    pub fn align_down(&self, align: u64) -> Self {
         assert!(align.is_power_of_two(), "alignment must be a power of two");
-        VirtAddr(self.0 & !(align - 1))
+        Self(self.0 & !(align - 1))
     }
 
     /// Offset within a 4KB page.
-    pub fn page_offset(&self) -> u64 {
+    #[must_use]
+    pub const fn page_offset(&self) -> u64 {
         self.0 & (PAGE_SIZE - 1)
     }
 }
@@ -426,18 +503,18 @@ impl fmt::Display for VirtAddr {
 }
 
 impl Add<u64> for VirtAddr {
-    type Output = VirtAddr;
+    type Output = Self;
 
-    fn add(self, rhs: u64) -> VirtAddr {
-        VirtAddr(self.0 + rhs)
+    fn add(self, rhs: u64) -> Self {
+        Self(self.0 + rhs)
     }
 }
 
 impl Sub<u64> for VirtAddr {
-    type Output = VirtAddr;
+    type Output = Self;
 
-    fn sub(self, rhs: u64) -> VirtAddr {
-        VirtAddr(self.0 - rhs)
+    fn sub(self, rhs: u64) -> Self {
+        Self(self.0 - rhs)
     }
 }
 
@@ -448,30 +525,38 @@ impl Sub<u64> for VirtAddr {
 /// Represents a 4KB physical page frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PhysFrame {
-    /// Frame number (physical address / PAGE_SIZE).
+    /// Frame number (physical address / `PAGE_SIZE`).
     number: u64,
 }
 
 impl PhysFrame {
     /// Return the frame that contains the given physical address.
-    pub fn containing_address(addr: PhysAddr) -> PhysFrame {
-        PhysFrame {
+    #[must_use]
+    pub const fn containing_address(addr: PhysAddr) -> Self {
+        Self {
             number: addr.as_u64() / PAGE_SIZE,
         }
     }
 
     /// Return the start physical address of this frame.
-    pub fn start_address(&self) -> PhysAddr {
+    #[must_use]
+    pub const fn start_address(&self) -> PhysAddr {
         PhysAddr::new(self.number * PAGE_SIZE)
     }
 
     /// Create a frame from a raw frame number.
-    pub fn from_number(n: u64) -> PhysFrame {
-        PhysFrame { number: n }
+    #[must_use]
+    pub const fn from_number(n: u64) -> Self {
+        Self { number: n }
     }
 
     /// Return the frame number.
-    pub fn number(&self) -> u64 {
+    ///
+    /// # Panics
+    ///
+    /// Panics if `base` is not page-aligned.
+    #[must_use]
+    pub const fn number(&self) -> u64 {
         self.number
     }
 }
@@ -500,13 +585,22 @@ impl BitmapFrameAllocator {
     ///
     /// `base` is the starting physical address (must be page-aligned).
     /// `size` is the total region size in bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `base` is not page-aligned or if size is not a multiple of `PAGE_SIZE`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the frame is outside the managed region or was not allocated.
+    #[must_use]
     pub fn new(base: PhysAddr, size: usize) -> Self {
         assert!(
             base.is_aligned(PAGE_SIZE),
             "base address must be page-aligned"
         );
-        let total_frames = size / PAGE_SIZE as usize;
-        let bitmap_words = (total_frames + 63) / 64;
+        let total_frames = size / usize::try_from(PAGE_SIZE).expect("PAGE_SIZE exceeds usize");
+        let bitmap_words = total_frames.div_ceil(64);
         Self {
             bitmap: vec![0u64; bitmap_words],
             base_frame: base.as_u64() / PAGE_SIZE,
@@ -535,8 +629,12 @@ impl BitmapFrameAllocator {
     }
 
     /// Deallocate a previously allocated frame.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the frame is outside the managed region.
     pub fn deallocate_frame(&mut self, frame: PhysFrame) {
-        let frame_idx = (frame.number() - self.base_frame) as usize;
+        let frame_idx = usize::try_from(frame.number() - self.base_frame).expect("frame index exceeds usize");
         assert!(
             frame_idx < self.total_frames,
             "frame outside managed region"
@@ -553,18 +651,25 @@ impl BitmapFrameAllocator {
     }
 
     /// Number of currently free frames.
-    pub fn free_frames(&self) -> usize {
+    #[must_use]
+    pub const fn free_frames(&self) -> usize {
         self.free_count
     }
 
     /// Total number of managed frames.
-    pub fn total_frames(&self) -> usize {
+    #[must_use]
+    pub const fn total_frames(&self) -> usize {
         self.total_frames
     }
 
     /// Check whether a given frame is currently allocated.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the frame index cannot be represented as a `usize`.
+    #[must_use]
     pub fn is_allocated(&self, frame: PhysFrame) -> bool {
-        let frame_idx = (frame.number() - self.base_frame) as usize;
+        let frame_idx = usize::try_from(frame.number() - self.base_frame).expect("frame index exceeds usize");
         if frame_idx >= self.total_frames {
             return false;
         }
@@ -697,7 +802,7 @@ mod tests {
         assert_eq!(addr - 0x100, PhysAddr::new(0x0F00));
 
         // Display.
-        let s = format!("{}", addr);
+        let s = format!("{addr}");
         assert!(s.contains("0x1000"));
     }
 
@@ -725,7 +830,7 @@ mod tests {
         assert_eq!(addr - 0x100, VirtAddr::new(0x0F00));
 
         // Display.
-        let s = format!("{}", addr);
+        let s = format!("{addr}");
         assert!(s.contains("0x1000"));
     }
 

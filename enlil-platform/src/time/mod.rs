@@ -23,6 +23,7 @@ pub struct Instant {
 
 impl Instant {
     /// Returns the current instant.
+    #[must_use]
     pub fn now() -> Self {
         #[cfg(feature = "platform-linux")]
         {
@@ -43,12 +44,14 @@ impl Instant {
     }
 
     /// Returns the duration elapsed since this instant.
+    #[must_use]
     pub fn elapsed(&self) -> Duration {
         Self::now().duration_since(self)
     }
 
     /// Returns the duration from `earlier` to `self`.
-    pub fn duration_since(&self, earlier: &Instant) -> Duration {
+    #[must_use]
+    pub fn duration_since(&self, earlier: &Self) -> Duration {
         #[cfg(feature = "platform-linux")]
         {
             self.inner.duration_since(earlier.inner)
@@ -67,7 +70,7 @@ impl Instant {
 }
 
 impl std::ops::Add<Duration> for Instant {
-    type Output = Instant;
+    type Output = Self;
 
     fn add(self, dur: Duration) -> Self::Output {
         #[cfg(feature = "platform-linux")]
@@ -93,7 +96,7 @@ impl std::ops::Add<Duration> for Instant {
 impl std::ops::Sub for Instant {
     type Output = Duration;
 
-    fn sub(self, other: Instant) -> Duration {
+    fn sub(self, other: Self) -> Duration {
         self.duration_since(&other)
     }
 }
@@ -133,7 +136,7 @@ impl Ord for Instant {
 // ---------------------------------------------------------------------------
 
 /// TSC frequency in Hz. Calibrated at boot time on bare-metal.
-/// On Linux this is unused (we delegate to clock_gettime).
+/// On Linux this is unused (we delegate to `clock_gettime`).
 static TSC_FREQ_HZ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Set the TSC frequency (called during bare-metal boot calibration).
@@ -151,18 +154,19 @@ pub fn tsc_frequency() -> u64 {
 ///
 /// CPUID.15H:
 ///   EAX = denominator of TSC/core crystal clock ratio
-///   EBX = numerator of TSC/core crystal clock ratio  
+///   EBX = numerator of TSC/core crystal clock ratio\
 ///   ECX = nominal frequency of the core crystal clock in Hz (may be 0)
 ///
 /// TSC frequency = ECX * EBX / EAX (if ECX != 0)
 /// If ECX == 0, the crystal clock frequency must be determined from the processor model.
 ///
-/// Returns Some(frequency_hz) on success, None if CPUID 0x15 is not supported
+/// Returns `Some(frequency_hz)` on success, None if CPUID 0x15 is not supported
 /// or the values are zero.
 ///
 /// On Linux backend, this reads from the actual CPU. On bare-metal, same.
-/// This is architecture-specific (x86_64 only).
+/// This is architecture-specific (`x86_64` only).
 #[cfg(target_arch = "x86_64")]
+#[must_use]
 pub fn calibrate_tsc_from_cpuid() -> Option<u64> {
     // Check if CPUID leaf 0x15 is supported
     let max_leaf = core::arch::x86_64::__cpuid(0x0).eax;
@@ -171,9 +175,9 @@ pub fn calibrate_tsc_from_cpuid() -> Option<u64> {
     }
     
     let cpuid = core::arch::x86_64::__cpuid(0x15);
-    let denominator = cpuid.eax as u64;
-    let numerator = cpuid.ebx as u64;
-    let crystal_hz = cpuid.ecx as u64;
+    let denominator = u64::from(cpuid.eax);
+    let numerator = u64::from(cpuid.ebx);
+    let crystal_hz = u64::from(cpuid.ecx);
     
     if denominator == 0 || numerator == 0 {
         return None;
@@ -196,7 +200,9 @@ pub fn calibrate_tsc_from_cpuid() -> Option<u64> {
 pub fn calibrate_tsc() {
     if let Some(freq) = calibrate_tsc_from_cpuid() {
         set_tsc_frequency(freq);
-        log::info!("TSC frequency calibrated via CPUID 0x15: {} Hz ({:.2} GHz)", freq, freq as f64 / 1e9);
+        let ghz_int = freq / 1_000_000_000;
+        let ghz_frac = (freq % 1_000_000_000) / 10_000_000;
+        log::info!("TSC frequency calibrated via CPUID 0x15: {freq} Hz ({ghz_int}.{ghz_frac:02} GHz)");
     } else {
         log::warn!("CPUID 0x15 TSC calibration not available; TSC frequency must be set manually");
     }
@@ -263,6 +269,7 @@ pub struct Stopwatch {
 
 impl Stopwatch {
     /// Start a new stopwatch with a label.
+    #[must_use]
     pub fn start(label: &'static str) -> Self {
         Self {
             start: Instant::now(),
@@ -271,11 +278,13 @@ impl Stopwatch {
     }
 
     /// Returns elapsed duration without stopping.
+    #[must_use]
     pub fn elapsed(&self) -> Duration {
         self.start.elapsed()
     }
 
     /// Stop and log the elapsed time.
+    #[must_use]
     pub fn stop(self) -> Duration {
         let elapsed = self.start.elapsed();
         log::debug!("[{}] elapsed: {:?}", self.label, elapsed);
@@ -360,8 +369,8 @@ mod tests {
         if let Some(freq) = result {
             assert!(freq > 0, "TSC frequency should be positive");
             // Sanity: should be between 100 MHz and 10 GHz
-            assert!(freq > 100_000_000, "TSC frequency suspiciously low: {}", freq);
-            assert!(freq < 10_000_000_000, "TSC frequency suspiciously high: {}", freq);
+            assert!(freq > 100_000_000, "TSC frequency suspiciously low: {freq}");
+            assert!(freq < 10_000_000_000, "TSC frequency suspiciously high: {freq}");
         }
     }
 }

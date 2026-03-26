@@ -1,3 +1,4 @@
+#![deny(clippy::all, clippy::pedantic, clippy::nursery)]
 //! enlil-boot: UEFI boot payload (Phase 5+)
 //!
 //! This crate will contain the UEFI application that boots Enlil

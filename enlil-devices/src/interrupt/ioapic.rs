@@ -6,6 +6,7 @@
 use super::DeliveryMode;
 
 /// I/O APIC base address.
+#[allow(dead_code)]
 pub const IOAPIC_BASE: u64 = 0xFEC0_0000;
 
 /// I/O APIC register select (IOREGSEL) offset.
@@ -218,7 +219,7 @@ impl IoApic {
                 if entry_idx >= NUM_IOAPIC_PINS {
                     return 0;
                 }
-                if index % 2 == 0 {
+                if index.is_multiple_of(2) {
                     self.entries[entry_idx].low()
                 } else {
                     self.entries[entry_idx].high()
@@ -237,7 +238,7 @@ impl IoApic {
                 if entry_idx >= NUM_IOAPIC_PINS {
                     return;
                 }
-                if index % 2 == 0 {
+                if index.is_multiple_of(2) {
                     self.entries[entry_idx].set_low(value);
                 } else {
                     self.entries[entry_idx].set_high(value);
@@ -410,5 +411,10 @@ mod tests {
         // EOI clears remote_irr
         ioapic.eoi(0x33);
         assert!(!ioapic.entries[3].remote_irr);
+    }
+
+    #[test]
+    fn ioapic_base_address() {
+        assert_eq!(IOAPIC_BASE, 0xFEC0_0000);
     }
 }

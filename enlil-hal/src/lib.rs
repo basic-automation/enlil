@@ -1,3 +1,5 @@
+#![deny(clippy::all, clippy::pedantic, clippy::nursery)]
+
 //! # enlil-hal
 //!
 //! Hardware Abstraction Layer for the Enlil hypervisor.
@@ -101,14 +103,14 @@ pub enum VmExit {
 impl fmt::Display for VmExit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            VmExit::IoIn { port, size } => write!(f, "IoIn(port=0x{port:04x}, size={size})"),
-            VmExit::IoOut { port, size, data } => {
+            Self::IoIn { port, size } => write!(f, "IoIn(port=0x{port:04x}, size={size})"),
+            Self::IoOut { port, size, data } => {
                 write!(f, "IoOut(port=0x{port:04x}, size={size}, data=0x{data:08x})")
             }
-            VmExit::MmioRead { address, size } => {
+            Self::MmioRead { address, size } => {
                 write!(f, "MmioRead(addr=0x{address:016x}, size={size})")
             }
-            VmExit::MmioWrite {
+            Self::MmioWrite {
                 address,
                 size,
                 data,
@@ -116,9 +118,9 @@ impl fmt::Display for VmExit {
                 f,
                 "MmioWrite(addr=0x{address:016x}, size={size}, data=0x{data:016x})"
             ),
-            VmExit::Hlt => write!(f, "Hlt"),
-            VmExit::Shutdown => write!(f, "Shutdown"),
-            VmExit::Unknown(code) => write!(f, "Unknown({code})"),
+            Self::Hlt => write!(f, "Hlt"),
+            Self::Shutdown => write!(f, "Shutdown"),
+            Self::Unknown(code) => write!(f, "Unknown({code})"),
         }
     }
 }
@@ -142,20 +144,42 @@ pub trait HypervisorBackend: Send + Sync {
     type InterruptController: Send;
 
     /// Create a new vCPU with the given configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if vCPU creation fails (e.g., insufficient resources,
+    /// unsupported configuration).
     fn create_vcpu(&self, config: &VCpuConfig) -> HalResult<Self::VCpu>;
 
     /// Enter the guest and run until the next VM exit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the vCPU execution fails (e.g., hardware error,
+    /// invalid state).
     fn run_vcpu(&self, vcpu: &mut Self::VCpu) -> HalResult<VmExit>;
 
     /// Process a VM exit, returning `true` if the guest should continue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the exit handler fails (e.g., invalid operation,
+    /// unsupported exit reason).
     fn handle_exit(&self, vcpu: &mut Self::VCpu, exit: &VmExit) -> HalResult<bool>;
 
     /// Map a region of guest physical memory.
+    ///
+    /// # Arguments
     ///
     /// * `guest_addr` — guest physical base address (page-aligned).
     /// * `host_addr`  — host virtual address backing the region.
     /// * `size`       — region size in bytes (page-aligned).
     /// * `writable`   — whether the guest may write to this region.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if memory mapping fails (e.g., invalid address,
+    /// insufficient memory).
     fn map_guest_memory(
         &self,
         page_table: &mut Self::PageTable,
@@ -167,7 +191,14 @@ pub trait HypervisorBackend: Send + Sync {
 
     /// Inject an interrupt / exception into the vCPU.
     ///
+    /// # Arguments
+    ///
     /// * `irq` — interrupt vector number.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if interrupt injection fails (e.g., invalid vector,
+    /// vCPU in unsupported state).
     fn inject_interrupt(
         &self,
         vcpu: &mut Self::VCpu,
@@ -249,7 +280,7 @@ mod tests {
 
     // -- Trait object-safety check ------------------------------------------
 
-    /// Compile-time proof that HypervisorBackend is usable as a trait bound.
+    /// Compile-time proof that `HypervisorBackend` is usable as a trait bound.
     /// We define a dummy backend and exercise it.
     struct DummyVCpu;
     struct DummyPageTable;
@@ -299,11 +330,11 @@ mod tests {
     }
 
     // Verify Send + Sync bounds are satisfied.
-    fn _assert_send_sync<T: Send + Sync>() {}
+    fn assert_send_sync<T: Send + Sync>() {}
 
     #[test]
     fn dummy_backend_is_send_sync() {
-        _assert_send_sync::<DummyBackend>();
+        assert_send_sync::<DummyBackend>();
     }
 
     #[test]

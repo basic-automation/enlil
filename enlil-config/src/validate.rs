@@ -2,6 +2,7 @@ use crate::EnlilConfig;
 use std::collections::HashSet;
 
 /// Validate an Enlil configuration. Returns a list of errors (empty = valid).
+#[must_use]
 pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
     let mut errors = Vec::new();
 
@@ -9,14 +10,14 @@ pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
     let mut global_cpus: HashSet<u32> = HashSet::new();
     for (id, guest) in &config.guest {
         if guest.cpus.is_empty() {
-            errors.push(format!("Guest '{}': no CPUs assigned", id));
+            errors.push(format!("Guest '{id}': no CPUs assigned"));
         }
 
         // Check for duplicates within this guest
         let mut local = HashSet::new();
         for &cpu in &guest.cpus {
             if !local.insert(cpu) {
-                errors.push(format!("Guest '{}': duplicate CPU {}", id, cpu));
+                errors.push(format!("Guest '{id}': duplicate CPU {cpu}"));
             }
         }
 
@@ -27,8 +28,7 @@ pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
             for &cpu in &guest.cpus {
                 if !global_cpus.insert(cpu) {
                     errors.push(format!(
-                        "Guest '{}': CPU {} already assigned to another guest",
-                        id, cpu
+                        "Guest '{id}': CPU {cpu} already assigned to another guest"
                     ));
                 }
             }
@@ -41,15 +41,14 @@ pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
     // Warn if total exceeds 256GB (sanity check)
     if total_with_hypervisor > 256 * 1024 {
         errors.push(format!(
-            "Total memory {}MB exceeds 256GB sanity limit",
-            total_with_hypervisor
+            "Total memory {total_with_hypervisor}MB exceeds 256GB sanity limit"
         ));
     }
 
     // Check each guest has at least some memory
     for (id, guest) in &config.guest {
         if guest.memory_mb == 0 {
-            errors.push(format!("Guest '{}': memory_mb cannot be 0", id));
+            errors.push(format!("Guest '{id}': memory_mb cannot be 0"));
         }
         if guest.memory_mb < 64 {
             errors.push(format!(
@@ -62,7 +61,7 @@ pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
     // Check guest names are non-empty
     for (id, guest) in &config.guest {
         if guest.name.trim().is_empty() {
-            errors.push(format!("Guest '{}': name cannot be empty", id));
+            errors.push(format!("Guest '{id}': name cannot be empty"));
         }
     }
 
@@ -98,7 +97,7 @@ mod tests {
     fn valid_config_passes() {
         let config = minimal_config();
         let errors = validate_config(&config);
-        assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
+        assert!(errors.is_empty(), "Expected no errors, got: {errors:?}");
     }
 
     #[test]

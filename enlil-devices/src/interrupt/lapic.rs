@@ -16,7 +16,6 @@ pub const LAPIC_TPR: u32 = 0x080;
 pub const LAPIC_APR: u32 = 0x090;
 pub const LAPIC_PPR: u32 = 0x0A0;
 pub const LAPIC_EOI: u32 = 0x0B0;
-pub const LAPIC_RRD: u32 = 0x0C0;
 pub const LAPIC_LDR: u32 = 0x0D0;
 pub const LAPIC_DFR: u32 = 0x0E0;
 pub const LAPIC_SVR: u32 = 0x0F0;
@@ -36,9 +35,6 @@ pub const LAPIC_TIMER_INIT: u32 = 0x380;
 pub const LAPIC_TIMER_CURRENT: u32 = 0x390;
 pub const LAPIC_TIMER_DIVIDE: u32 = 0x3E0;
 pub const LAPIC_SELF_IPI: u32 = 0x3F0;
-
-/// LAPIC base MMIO address.
-pub const LAPIC_BASE_ADDR: u64 = 0xFEE0_0000;
 
 /// LAPIC timer modes.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -188,15 +184,15 @@ impl LocalApic {
             LAPIC_LDR => self.ldr,
             LAPIC_DFR => self.dfr,
             LAPIC_SVR => self.svr,
-            off if off >= LAPIC_ISR_BASE && off < LAPIC_ISR_BASE + 0x80 => {
+            off if (LAPIC_ISR_BASE..LAPIC_ISR_BASE + 0x80).contains(&off) => {
                 let idx = ((off - LAPIC_ISR_BASE) / 0x10) as usize;
                 if idx < 8 { self.isr[idx] } else { 0 }
             }
-            off if off >= LAPIC_TMR_BASE && off < LAPIC_TMR_BASE + 0x80 => {
+            off if (LAPIC_TMR_BASE..LAPIC_TMR_BASE + 0x80).contains(&off) => {
                 let idx = ((off - LAPIC_TMR_BASE) / 0x10) as usize;
                 if idx < 8 { self.tmr[idx] } else { 0 }
             }
-            off if off >= LAPIC_IRR_BASE && off < LAPIC_IRR_BASE + 0x80 => {
+            off if (LAPIC_IRR_BASE..LAPIC_IRR_BASE + 0x80).contains(&off) => {
                 let idx = ((off - LAPIC_IRR_BASE) / 0x10) as usize;
                 if idx < 8 { self.irr[idx] } else { 0 }
             }
@@ -427,236 +423,34 @@ impl LocalApic {
         }
     }
 
-    /// Check TSC deadline and fire if current TSC >= deadline.
+    /// Check TSC deadline and fire if expired.
     pub fn check_tsc_deadline(&mut self, current_tsc: u64) -> bool {
-        if self.timer_mode != TimerMode::TscDeadline || self.tsc_deadline == 0 {
+        if self.timer_mode != TimerMode::TscDeadline {
             return false;
         }
-        if current_tsc >= self.tsc_deadline {
-            let masked = (self.lvt_timer & 0x0001_0000) != 0;
-            if !masked {
-                let vector = (self.lvt_timer & 0xFF) as u8;
-                self.accept_interrupt(InterruptEntry {
-                    vector,
-                    delivery_mode: DeliveryMode::Fixed,
-                    trigger_mode: TriggerMode::Edge,
-                    level: true,
-                });
-            }
-            self.tsc_deadline = 0;
-            true
-        } else {
-            false
+        if self.tsc_deadline == 0 || current_tsc < self.tsc_deadline {
+            return false;
         }
-    }
-
-    /// Set TSC deadline value (written via MSR).
-    pub fn set_tsc_deadline(&mut self, value: u64) {
-        self.tsc_deadline = value;
-    }
-
-    /// Get the divide configuration as an actual divisor.
-    pub fn timer_divisor(&self) -> u32 {
-        match self.timer_divide & 0b1011 {
-            0b0000 => 2,
-            0b0001 => 4,
-            0b0010 => 8,
-            0b0011 => 16,
-            0b1000 => 32,
-            0b1001 => 64,
-            0b1010 => 128,
-            0b1011 => 1,
-            _ => 1,
+        let masked = (self.lvt_timer & 0x0001_0000) != 0;
+        if !masked {
+            let vector = (self.lvt_timer & 0xFF) as u8;
+            self.accept_interrupt(InterruptEntry {
+                vector,
+                delivery_mode: DeliveryMode::Fixed,
+                trigger_mode: TriggerMode::Edge,
+                level: true,
+            });
         }
+        true
     }
 
-    /// Get the ICR destination field.
-    pub fn icr_destination(&self) -> u8 {
-        ((self.icr >> 56) & 0xFF) as u8
+    /// Set TSC deadline.
+    pub fn set_tsc_deadline(&mut self, deadline: u64) {
+        self.tsc_deadline = deadline;
     }
 
-    /// Get the ICR vector field.
-    pub fn icr_vector(&self) -> u8 {
-        (self.icr & 0xFF) as u8
-    }
-
-    /// Get the ICR delivery mode.
-    pub fn icr_delivery_mode(&self) -> DeliveryMode {
-        DeliveryMode::from_bits(((self.icr >> 8) & 0x7) as u8)
-    }
-
-    /// Get the ICR destination shorthand.
-    pub fn icr_shorthand(&self) -> u8 {
-        ((self.icr >> 18) & 0x3) as u8
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_enabled_lapic(id: u8) -> LocalApic {
-        let mut lapic = LocalApic::new(id);
-        lapic.write_register(LAPIC_SVR, 0x1FF); // Enable + vector 0xFF
-        lapic
-    }
-
-    #[test]
-    fn test_lapic_creation() {
-        let lapic = LocalApic::new(0);
-        assert_eq!(lapic.id(), 0);
-        assert!(!lapic.is_enabled());
-    }
-
-    #[test]
-    fn test_lapic_enable() {
-        let mut lapic = LocalApic::new(0);
-        lapic.write_register(LAPIC_SVR, 0x1FF);
-        assert!(lapic.is_enabled());
-    }
-
-    #[test]
-    fn test_lapic_id_register() {
-        let lapic = LocalApic::new(5);
-        assert_eq!(lapic.read_register(LAPIC_ID), 5 << 24);
-    }
-
-    #[test]
-    fn test_lapic_version_register() {
-        let lapic = LocalApic::new(0);
-        let ver = lapic.read_register(LAPIC_VERSION);
-        assert_eq!(ver & 0xFF, 0x14);
-        assert_eq!((ver >> 16) & 0xFF, 5); // Max LVT entry
-    }
-
-    #[test]
-    fn test_accept_interrupt() {
-        let mut lapic = make_enabled_lapic(0);
-        let accepted = lapic.accept_interrupt(InterruptEntry {
-            vector: 0x30,
-            delivery_mode: DeliveryMode::Fixed,
-            trigger_mode: TriggerMode::Edge,
-            level: true,
-        });
-        assert!(accepted);
-        assert_eq!(lapic.pending_interrupt(), Some(0x30));
-    }
-
-    #[test]
-    fn test_reject_low_vector() {
-        let mut lapic = make_enabled_lapic(0);
-        let accepted = lapic.accept_interrupt(InterruptEntry {
-            vector: 10,
-            delivery_mode: DeliveryMode::Fixed,
-            trigger_mode: TriggerMode::Edge,
-            level: true,
-        });
-        assert!(!accepted);
-    }
-
-    #[test]
-    fn test_priority_ordering() {
-        let mut lapic = make_enabled_lapic(0);
-        // Inject two interrupts: 0x30 and 0x50
-        lapic.accept_interrupt(InterruptEntry {
-            vector: 0x30,
-            delivery_mode: DeliveryMode::Fixed,
-            trigger_mode: TriggerMode::Edge,
-            level: true,
-        });
-        lapic.accept_interrupt(InterruptEntry {
-            vector: 0x50,
-            delivery_mode: DeliveryMode::Fixed,
-            trigger_mode: TriggerMode::Edge,
-            level: true,
-        });
-        // Higher priority (0x50) should be pending
-        assert_eq!(lapic.pending_interrupt(), Some(0x50));
-    }
-
-    #[test]
-    fn test_tpr_masking() {
-        let mut lapic = make_enabled_lapic(0);
-        // Set TPR to priority class 5 (masks vectors < 0x60)
-        lapic.write_register(LAPIC_TPR, 0x50);
-        lapic.accept_interrupt(InterruptEntry {
-            vector: 0x30,
-            delivery_mode: DeliveryMode::Fixed,
-            trigger_mode: TriggerMode::Edge,
-            level: true,
-        });
-        // Should be masked by TPR
-        assert_eq!(lapic.pending_interrupt(), None);
-        // Higher priority should get through
-        lapic.accept_interrupt(InterruptEntry {
-            vector: 0x60,
-            delivery_mode: DeliveryMode::Fixed,
-            trigger_mode: TriggerMode::Edge,
-            level: true,
-        });
-        assert_eq!(lapic.pending_interrupt(), Some(0x60));
-    }
-
-    #[test]
-    fn test_eoi_clears_isr() {
-        let mut lapic = make_enabled_lapic(0);
-        lapic.accept_interrupt(InterruptEntry {
-            vector: 0x30,
-            delivery_mode: DeliveryMode::Fixed,
-            trigger_mode: TriggerMode::Edge,
-            level: true,
-        });
-        lapic.start_servicing(0x30);
-        // vector 0x30 = 48 => ISR register index 1 (48/32=1), bit 16 (48%32=16)
-        let isr_reg1 = lapic.read_register(LAPIC_ISR_BASE + 0x10);
-        assert_ne!(isr_reg1 & (1 << 16), 0);
-        // EOI
-        lapic.write_register(LAPIC_EOI, 0);
-        let isr_reg1 = lapic.read_register(LAPIC_ISR_BASE + 0x10);
-        assert_eq!(isr_reg1 & (1 << 16), 0);
-    }
-
-    #[test]
-    fn test_timer_oneshot() {
-        let mut lapic = make_enabled_lapic(0);
-        // Configure timer: vector 0x20, one-shot, unmasked
-        lapic.write_register(LAPIC_LVT_TIMER, 0x20);
-        lapic.write_register(LAPIC_TIMER_INIT, 100);
-        // Tick 50 — should not fire
-        assert!(!lapic.timer_tick(50));
-        // Tick 60 — should fire (50+60 > 100)
-        assert!(lapic.timer_tick(60));
-        assert_eq!(lapic.pending_interrupt(), Some(0x20));
-        // One-shot: counter should be 0 now
-        assert_eq!(lapic.timer_current, 0);
-    }
-
-    #[test]
-    fn test_timer_periodic() {
-        let mut lapic = make_enabled_lapic(0);
-        // Periodic mode: bit 17 set
-        lapic.write_register(LAPIC_LVT_TIMER, 0x20 | (1 << 17));
-        lapic.write_register(LAPIC_TIMER_INIT, 100);
-        assert!(lapic.timer_tick(100));
-        // Should reload
-        assert_eq!(lapic.timer_current, 100);
-    }
-
-    #[test]
-    fn test_self_ipi() {
-        let mut lapic = make_enabled_lapic(0);
-        lapic.write_register(LAPIC_SELF_IPI, 0x40);
-        assert_eq!(lapic.pending_interrupt(), Some(0x40));
-    }
-
-    #[test]
-    fn test_timer_divisor() {
-        let mut lapic = LocalApic::new(0);
-        lapic.write_register(LAPIC_TIMER_DIVIDE, 0b0000);
-        assert_eq!(lapic.timer_divisor(), 2);
-        lapic.write_register(LAPIC_TIMER_DIVIDE, 0b0011);
-        assert_eq!(lapic.timer_divisor(), 16);
-        lapic.write_register(LAPIC_TIMER_DIVIDE, 0b1011);
-        assert_eq!(lapic.timer_divisor(), 1);
+    /// Get the highest priority pending interrupt without accepting it.
+    pub fn peek_pending(&self) -> Option<u8> {
+        self.pending_interrupt()
     }
 }

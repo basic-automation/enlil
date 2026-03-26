@@ -12,6 +12,7 @@ use super::virtqueue::Virtqueue;
 use std::collections::VecDeque;
 
 /// Device status bits (VirtIO 1.2, Section 2.1).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceStatus {
     Reset = 0,
@@ -48,9 +49,9 @@ pub struct VirtioNetDevice {
     merge_rxbuf: bool,
     /// Device status.
     status: u8,
-    /// TX virtqueue (guest → host).
+    /// TX virtqueue (guest â†’ host).
     tx_queue: Virtqueue,
-    /// RX virtqueue (host → guest).
+    /// RX virtqueue (host â†’ guest).
     rx_queue: Virtqueue,
     /// Queue size.
     #[allow(dead_code)]
@@ -326,5 +327,15 @@ mod tests {
     fn test_backend_name() {
         let dev = make_device();
         assert_eq!(dev.backend_name(), "null");
+    }
+
+    #[test]
+    fn device_status_values() {
+        assert_eq!(DeviceStatus::Reset as u8, 0);
+        assert_eq!(DeviceStatus::Acknowledge as u8, 1);
+        assert_eq!(DeviceStatus::Driver as u8, 2);
+        assert_eq!(DeviceStatus::DriverOk as u8, 4);
+        assert_eq!(DeviceStatus::FeaturesOk as u8, 8);
+        assert_eq!(DeviceStatus::Failed as u8, 128);
     }
 }

@@ -29,7 +29,7 @@ pub trait NetBackend: Send {
 }
 
 // ---------------------------------------------------------------------------
-// Null Backend — cross-platform, for testing
+// Null Backend â€” cross-platform, for testing
 // ---------------------------------------------------------------------------
 
 /// A null network backend that drops all transmitted frames
@@ -89,15 +89,17 @@ impl NetBackend for NullBackend {
 }
 
 // ---------------------------------------------------------------------------
-// Loopback Backend — for testing inter-guest communication
+// Loopback Backend â€” for testing inter-guest communication
 // ---------------------------------------------------------------------------
 
 /// A loopback backend that echoes transmitted frames back as received frames.
-/// Useful for testing the full TX→RX path.
+/// Useful for testing the full TXâ†’RX path.
+#[allow(dead_code)]
 pub struct LoopbackBackend {
     queue: VecDeque<Vec<u8>>,
 }
 
+#[allow(dead_code)]
 impl LoopbackBackend {
     pub fn new() -> Self {
         Self {
@@ -138,18 +140,20 @@ impl NetBackend for LoopbackBackend {
 }
 
 // ---------------------------------------------------------------------------
-// Shared pipe backend — for connecting two endpoints in tests
+// Shared pipe backend â€” for connecting two endpoints in tests
 // ---------------------------------------------------------------------------
 
 /// One end of a shared-memory pipe for connecting two net devices in tests.
 /// Frames sent on one end appear as received on the other.
+#[allow(dead_code)]
 pub struct PipeBackend {
     /// Frames we send go into the peer's rx queue.
     peer_rx: Arc<Mutex<VecDeque<Vec<u8>>>>,
-    /// Our rx queue — the peer sends into this.
+    /// Our rx queue â€” the peer sends into this.
     our_rx: Arc<Mutex<VecDeque<Vec<u8>>>>,
 }
 
+#[allow(dead_code)]
 impl PipeBackend {
     /// Create a connected pair of pipe backends.
     pub fn pair() -> (Self, Self) {
@@ -192,5 +196,30 @@ impl NetBackend for PipeBackend {
 
     fn backend_name(&self) -> &str {
         "pipe"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_backend_roundtrip() {
+        let mut lb = LoopbackBackend::new();
+        let data = b"hello loopback";
+        assert!(lb.send(data).is_ok());
+        let mut buf = [0u8; 64];
+        let n = lb.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], data);
+    }
+
+    #[test]
+    fn pipe_backend_pair() {
+        let (mut a, mut b) = PipeBackend::pair();
+        let data = b"pipe test";
+        assert!(a.send(data).is_ok());
+        let mut buf = [0u8; 64];
+        let n = b.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], data);
     }
 }

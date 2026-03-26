@@ -7,13 +7,14 @@ use std::collections::HashSet;
 use std::fmt;
 
 /// Represents a CPU affinity mask — the set of physical cores a thread may run on.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AffinityMask {
     cores: HashSet<u32>,
 }
 
 impl AffinityMask {
     /// Create an empty mask (no cores).
+    #[must_use]
     pub fn empty() -> Self {
         Self {
             cores: HashSet::new(),
@@ -21,6 +22,7 @@ impl AffinityMask {
     }
 
     /// Create a mask with a single core.
+    #[must_use]
     pub fn single(core: u32) -> Self {
         let mut cores = HashSet::new();
         cores.insert(core);
@@ -28,6 +30,7 @@ impl AffinityMask {
     }
 
     /// Create a mask from a list of cores.
+    #[must_use]
     pub fn from_cores(cores: &[u32]) -> Self {
         Self {
             cores: cores.iter().copied().collect(),
@@ -45,24 +48,28 @@ impl AffinityMask {
     }
 
     /// Check if a core is in the mask.
+    #[must_use]
     pub fn contains(&self, core: u32) -> bool {
         self.cores.contains(&core)
     }
 
     /// Number of cores in the mask.
+    #[must_use]
     pub fn count(&self) -> usize {
         self.cores.len()
     }
 
     /// Whether the mask is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.cores.is_empty()
     }
 
     /// Get the cores as a sorted vec.
+    #[must_use]
     pub fn cores(&self) -> Vec<u32> {
         let mut v: Vec<u32> = self.cores.iter().copied().collect();
-        v.sort();
+        v.sort_unstable();
         v
     }
 }
@@ -75,14 +82,14 @@ impl fmt::Display for AffinityMask {
             if i > 0 {
                 write!(f, ", ")?;
             }
-            write!(f, "{}", c)?;
+            write!(f, "{c}")?;
         }
         write!(f, "]")
     }
 }
 
 /// Result of a pin operation.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PinResult {
     /// Successfully pinned to the requested core(s).
     Pinned(AffinityMask),
@@ -95,11 +102,13 @@ pub enum PinResult {
 /// Pin the current thread to a single physical core.
 ///
 /// On Linux, calls `sched_setaffinity`. On other platforms, returns `Unsupported`.
+#[must_use]
 pub fn pin_current_thread(core: u32) -> PinResult {
     pin_current_thread_to_mask(&AffinityMask::single(core))
 }
 
 /// Pin the current thread to a set of cores.
+#[must_use]
 pub fn pin_current_thread_to_mask(mask: &AffinityMask) -> PinResult {
     if mask.is_empty() {
         return PinResult::Failed("empty affinity mask".into());
@@ -113,15 +122,15 @@ pub fn pin_current_thread_to_mask(mask: &AffinityMask) -> PinResult {
     #[cfg(not(target_os = "linux"))]
     {
         log::warn!(
-            "CPU pinning not supported on this platform; requested cores: {}",
-            mask
+            "CPU pinning not supported on this platform; requested cores: {mask}"
         );
         PinResult::Unsupported
     }
 }
 
 /// Get the affinity mask of the current thread.
-pub fn get_current_affinity() -> PinResult {
+#[must_use]
+pub const fn get_current_affinity() -> PinResult {
     #[cfg(target_os = "linux")]
     {
         get_affinity_linux()
@@ -134,13 +143,14 @@ pub fn get_current_affinity() -> PinResult {
 }
 
 /// Query the number of online CPUs.
+#[must_use]
 pub fn online_cpu_count() -> usize {
     std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
+        .map_or(1, std::num::NonZero::get)
 }
 
 /// Get a list of all online CPU IDs (0-based).
+#[must_use]
 pub fn online_cpus() -> Vec<u32> {
     (0..online_cpu_count() as u32).collect()
 }
@@ -238,8 +248,8 @@ pub struct VcpuThread {
 
 /// Launch a vCPU thread pinned to a physical core.
 ///
-/// The `run_fn` closure is the vCPU's main loop (KVM_RUN loop on Linux,
-/// VMLAUNCH loop on bare-metal). It receives the guest_id and vcpu_id.
+/// The `run_fn` closure is the vCPU's main loop (`KVM_RUN` loop on Linux,
+/// VMLAUNCH loop on bare-metal). It receives the `guest_id` and `vcpu_id`.
 pub fn launch_vcpu_thread<F>(config: VcpuThreadConfig, run_fn: F) -> VcpuThread
 where
     F: FnOnce(&str, u32) + Send + 'static,
@@ -252,26 +262,23 @@ where
     let (tx, rx) = std::sync::mpsc::channel();
 
     let handle = std::thread::Builder::new()
-        .name(format!("{}-vcpu{}", guest_id, vcpu_id))
+        .name(format!("{guest_id}-vcpu{vcpu_id}"))
         .spawn(move || {
             let result = pin_current_thread(core);
             match &result {
                 PinResult::Pinned(mask) => {
                     log::info!(
-                        "[{}/vcpu{}] pinned to core(s): {}",
-                        guest_id, vcpu_id, mask
+                        "[{guest_id}/vcpu{vcpu_id}] pinned to core(s): {mask}"
                     );
                 }
                 PinResult::Unsupported => {
                     log::warn!(
-                        "[{}/vcpu{}] CPU pinning not supported, running unpinned",
-                        guest_id, vcpu_id
+                        "[{guest_id}/vcpu{vcpu_id}] CPU pinning not supported, running unpinned"
                     );
                 }
                 PinResult::Failed(e) => {
                     log::error!(
-                        "[{}/vcpu{}] failed to pin to core {}: {}",
-                        guest_id, vcpu_id, core, e
+                        "[{guest_id}/vcpu{vcpu_id}] failed to pin to core {core}: {e}"
                     );
                 }
             }
@@ -331,7 +338,7 @@ mod tests {
     #[test]
     fn affinity_mask_display() {
         let mask = AffinityMask::from_cores(&[3, 1, 7]);
-        assert_eq!(format!("{}", mask), "[1, 3, 7]");
+        assert_eq!(format!("{mask}"), "[1, 3, 7]");
     }
 
     #[test]

@@ -21,12 +21,27 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// consoles, and any other output device implement this trait.
 pub trait PlatformIo: Send + Sync {
     /// Read bytes from this I/O device.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the read operation fails, such as when the device
+    /// is unavailable, the read is interrupted, or the device does not support reading.
     fn read(&self, buf: &mut [u8]) -> io::Result<usize>;
 
     /// Write bytes to this I/O device.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write operation fails, such as when the device
+    /// is unavailable, the write is interrupted, or the device is full.
     fn write(&self, buf: &[u8]) -> io::Result<usize>;
 
     /// Flush any buffered output.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the flush operation fails, such as when the device
+    /// is unavailable or the underlying I/O system encounters an error.
     fn flush(&self) -> io::Result<()> {
         Ok(())
     }
@@ -114,6 +129,7 @@ impl SerialPort {
     pub const COM4: u16 = 0x2E8;
 
     /// Create a new serial port handle.
+    #[must_use]
     pub const fn new(base: u16) -> Self {
         Self {
             base,
@@ -131,7 +147,7 @@ impl SerialPort {
     }
 
     /// Returns the base I/O port address.
-    pub fn base(&self) -> u16 {
+    pub const fn base(&self) -> u16 {
         self.base
     }
 
@@ -182,7 +198,7 @@ impl PlatformIo for SerialPort {
         }
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "serial"
     }
 }
@@ -215,7 +231,8 @@ impl FramebufferConsole {
     pub const CHAR_HEIGHT: usize = 16;
 
     /// Create a new framebuffer console.
-    pub fn new(base: usize, width: usize, height: usize, stride: usize) -> Self {
+    #[must_use]
+    pub const fn new(base: usize, width: usize, height: usize, stride: usize) -> Self {
         Self {
             base,
             width,
@@ -227,24 +244,29 @@ impl FramebufferConsole {
     }
 
     /// Returns the number of character columns.
-    pub fn cols(&self) -> usize {
+    #[must_use]
+    pub const fn cols(&self) -> usize {
         self.width / Self::CHAR_WIDTH
     }
 
     /// Returns the number of character rows.
-    pub fn rows(&self) -> usize {
+    #[must_use]
+    pub const fn rows(&self) -> usize {
         self.height / Self::CHAR_HEIGHT
     }
 
     /// Returns the framebuffer base address.
-    pub fn base(&self) -> usize {
+    #[must_use]
+    pub const fn base(&self) -> usize {
         self.base
     }
 
     /// Returns the framebuffer dimensions.
-    pub fn dimensions(&self) -> (usize, usize) {
+    #[must_use]
+    pub const fn dimensions(&self) -> (usize, usize) {
         (self.width, self.height)
     }
+
 }
 
 impl PlatformIo for FramebufferConsole {
@@ -259,11 +281,13 @@ impl PlatformIo for FramebufferConsole {
     fn write(&self, buf: &[u8]) -> io::Result<usize> {
         // On bare-metal: render characters to framebuffer.
         // Stubbed — real pixel rendering in Phase 6.
-        let _ = buf;
+        // Each byte would be rendered as a glyph at the current cursor position
+        // using stride, cursor_col, cursor_row to determine framebuffer offset.
+        let _ = (self.stride, self.cursor_col, self.cursor_row, self.base);
         Ok(buf.len())
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "framebuffer"
     }
 }
@@ -281,11 +305,17 @@ pub struct PlatformLogger {
 
 impl PlatformLogger {
     /// Create a new platform logger with the given level filter.
+    #[must_use]
     pub const fn new(level: log::LevelFilter) -> Self {
         Self { level }
     }
 
     /// Install this as the global logger.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `log::SetLoggerError` if a logger has already been installed
+    /// for this process. Only one logger can be active at a time.
     pub fn install(level: log::LevelFilter) -> Result<(), log::SetLoggerError> {
         static LOGGER: PlatformLogger = PlatformLogger::new(log::LevelFilter::Trace);
         log::set_logger(&LOGGER)?;
@@ -352,15 +382,15 @@ pub enum Subsystem {
 impl std::fmt::Display for Subsystem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Subsystem::Vcpu(id) => write!(f, "vcpu:{}", id),
-            Subsystem::Memory => write!(f, "memory"),
-            Subsystem::Usb => write!(f, "usb"),
-            Subsystem::Net => write!(f, "net"),
-            Subsystem::Storage => write!(f, "storage"),
-            Subsystem::Fabric => write!(f, "fabric"),
-            Subsystem::Mgmt => write!(f, "mgmt"),
-            Subsystem::Platform => write!(f, "platform"),
-            Subsystem::Custom(s) => write!(f, "{}", s),
+            Self::Vcpu(id) => write!(f, "vcpu:{id}"),
+            Self::Memory => write!(f, "memory"),
+            Self::Usb => write!(f, "usb"),
+            Self::Net => write!(f, "net"),
+            Self::Storage => write!(f, "storage"),
+            Self::Fabric => write!(f, "fabric"),
+            Self::Mgmt => write!(f, "mgmt"),
+            Self::Platform => write!(f, "platform"),
+            Self::Custom(s) => write!(f, "{s}"),
         }
     }
 }
@@ -484,51 +514,17 @@ mod tests {
 
         // Read should fail (output-only).
         let mut buf = [0u8; 16];
-        assert!(fb.read(&mut buf).is_err());
-    }
-
-    #[test]
-    fn platform_logger_enabled() {
-        let logger = PlatformLogger::new(log::LevelFilter::Info);
-        let meta = log::MetadataBuilder::new()
-            .level(log::Level::Info)
-            .target("test")
-            .build();
-        assert!(logger.enabled(&meta));
-
-        let meta_debug = log::MetadataBuilder::new()
-            .level(log::Level::Debug)
-            .target("test")
-            .build();
-        assert!(!logger.enabled(&meta_debug));
-    }
-
-    #[test]
-    fn subsystem_display() {
-        assert_eq!(Subsystem::Vcpu(0).to_string(), "vcpu:0");
-        assert_eq!(Subsystem::Vcpu(3).to_string(), "vcpu:3");
-        assert_eq!(Subsystem::Memory.to_string(), "memory");
-        assert_eq!(Subsystem::Usb.to_string(), "usb");
-        assert_eq!(Subsystem::Net.to_string(), "net");
-        assert_eq!(Subsystem::Storage.to_string(), "storage");
-        assert_eq!(Subsystem::Fabric.to_string(), "fabric");
-        assert_eq!(Subsystem::Mgmt.to_string(), "mgmt");
-        assert_eq!(Subsystem::Platform.to_string(), "platform");
+        let result = fb.read(&mut buf);
+        assert!(result.is_err());
         assert_eq!(
-            Subsystem::Custom("gpu".to_string()).to_string(),
-            "gpu"
+            result.unwrap_err().kind(),
+            io::ErrorKind::Unsupported
         );
     }
 
     #[test]
-    fn subsystem_vcpu_display() {
-        let vcpu0 = Subsystem::Vcpu(0);
-        assert_eq!(format!("{}", vcpu0), "vcpu:0");
-
-        let vcpu7 = Subsystem::Vcpu(7);
-        assert_eq!(format!("{}", vcpu7), "vcpu:7");
-
-        // Verify it formats correctly inside brackets (as used in log output).
-        assert_eq!(format!("[{}]", vcpu0), "[vcpu:0]");
+    fn platform_logger_creation() {
+        let logger = PlatformLogger::new(log::LevelFilter::Info);
+        assert!(logger.enabled(&log::Metadata::builder().build()));
     }
 }

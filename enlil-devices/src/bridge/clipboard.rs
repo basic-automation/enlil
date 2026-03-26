@@ -12,23 +12,21 @@ pub enum ClipboardContent {
 }
 
 impl ClipboardContent {
-    pub fn size(&self) -> usize {
+    pub const fn size(&self) -> usize {
         match self {
-            ClipboardContent::Text(s) => s.len(),
-            ClipboardContent::Image(data) => data.len(),
-            ClipboardContent::FileRef(path) => path.len(),
-            ClipboardContent::Html(s) => s.len(),
-            ClipboardContent::RichText(data) => data.len(),
+            Self::Text(s) | Self::Html(s) => s.len(),
+            Self::Image(data) | Self::RichText(data) => data.len(),
+            Self::FileRef(path) => path.len(),
         }
     }
 
-    pub fn content_type(&self) -> &'static str {
+    pub const fn content_type(&self) -> &'static str {
         match self {
-            ClipboardContent::Text(_) => "text",
-            ClipboardContent::Image(_) => "image",
-            ClipboardContent::FileRef(_) => "fileref",
-            ClipboardContent::Html(_) => "html",
-            ClipboardContent::RichText(_) => "richtext",
+            Self::Text(_) => "text",
+            Self::Image(_) => "image",
+            Self::FileRef(_) => "fileref",
+            Self::Html(_) => "html",
+            Self::RichText(_) => "richtext",
         }
     }
 }
@@ -44,7 +42,7 @@ pub struct ClipboardPolicy {
 
 impl Default for ClipboardPolicy {
     fn default() -> Self {
-        ClipboardPolicy {
+        Self {
             allowed_types: vec!["text".to_string()],
             max_size: 1024 * 1024,
             read_allowed: true,
@@ -54,9 +52,9 @@ impl Default for ClipboardPolicy {
 }
 
 impl ClipboardPolicy {
-    pub fn new(allowed_types: Vec<&str>, max_size: usize) -> Self {
-        ClipboardPolicy {
-            allowed_types: allowed_types.iter().map(|s| s.to_string()).collect(),
+    pub fn new(allowed_types: &[&str], max_size: usize) -> Self {
+        Self {
+            allowed_types: allowed_types.iter().copied().map(String::from).collect(),
             max_size,
             read_allowed: true,
             write_allowed: true,
@@ -70,11 +68,25 @@ impl ClipboardPolicy {
 }
 
 /// Clipboard entry with sequence number
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct ClipboardEntry {
     content: ClipboardContent,
     sequence: u64,
     source_guest: u32,
+}
+
+#[allow(dead_code)]
+impl ClipboardEntry {
+    /// Returns the sequence number of this entry.
+    fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Returns the source guest ID that created this entry.
+    fn source_guest(&self) -> u32 {
+        self.source_guest
+    }
 }
 
 /// Clipboard hub routing and history
@@ -87,7 +99,7 @@ pub struct ClipboardHub {
 
 impl ClipboardHub {
     pub fn new(max_history: usize) -> Self {
-        ClipboardHub {
+        Self {
             history: Arc::new(Mutex::new(VecDeque::new())),
             sequence: Arc::new(Mutex::new(0)),
             max_history,
@@ -101,6 +113,12 @@ impl ClipboardHub {
         }
     }
 
+    /// Writes clipboard content from a guest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock is poisoned or if write is not allowed for the guest,
+    /// or if the content violates the policy constraints.
     pub fn write(&self, guest_id: u32, content: ClipboardContent) -> Result<u64, &'static str> {
         let policies = self.policies.lock().map_err(|_| "Lock poisoned")?;
         let default_policy = ClipboardPolicy::default();
@@ -117,6 +135,7 @@ impl ClipboardHub {
         let mut seq_guard = self.sequence.lock().map_err(|_| "Lock poisoned")?;
         let seq = *seq_guard;
         *seq_guard = seq.wrapping_add(1);
+        drop(seq_guard);
 
         let entry = ClipboardEntry {
             content,
@@ -129,10 +148,16 @@ impl ClipboardHub {
         if hist.len() > self.max_history {
             hist.pop_front();
         }
+        drop(hist);
 
         Ok(seq)
     }
 
+    /// Reads the most recent clipboard content accessible to a guest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock is poisoned or if read is not allowed for the guest.
     pub fn read(&self, guest_id: u32) -> Result<Option<ClipboardContent>, &'static str> {
         let policies = self.policies.lock().map_err(|_| "Lock poisoned")?;
         let default_policy = ClipboardPolicy::default();
@@ -147,10 +172,20 @@ impl ClipboardHub {
         Ok(hist.back().map(|e| e.content.clone()))
     }
 
+    /// Returns the number of entries in the clipboard history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock is poisoned.
     pub fn history_len(&self) -> Result<usize, &'static str> {
         self.history.lock().map(|h| h.len()).map_err(|_| "Lock poisoned")
     }
 
+    /// Returns the current clipboard sequence number.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock is poisoned.
     pub fn get_sequence(&self) -> Result<u64, &'static str> {
         self.sequence.lock().map(|s| *s).map_err(|_| "Lock poisoned")
     }
@@ -186,7 +221,7 @@ mod tests {
 
     #[test]
     fn test_policy_allows() {
-        let policy = ClipboardPolicy::new(vec!["text"], 50);
+        let policy = ClipboardPolicy::new(&["text"], 50);
         assert!(policy.allows(&ClipboardContent::Text("hi".into())));
         assert!(!policy.allows(&ClipboardContent::Image(vec![0u8; 100])));
     }
@@ -206,7 +241,7 @@ mod tests {
     #[test]
     fn test_hub_policy_enforcement() {
         let hub = ClipboardHub::new(10);
-        let restricted = ClipboardPolicy::new(vec!["text"], 10);
+        let restricted = ClipboardPolicy::new(&["text"], 10);
         hub.set_policy(2, restricted);
 
         let large_text = ClipboardContent::Text("x".repeat(100));
@@ -225,5 +260,16 @@ mod tests {
         
         hub.write(1, ClipboardContent::Text("d".into())).unwrap();
         assert_eq!(hub.history_len().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_clipboard_entry_fields() {
+        let entry = ClipboardEntry {
+            content: ClipboardContent::Text("test".into()),
+            sequence: 42,
+            source_guest: 5,
+        };
+        assert_eq!(entry.sequence(), 42);
+        assert_eq!(entry.source_guest(), 5);
     }
 }

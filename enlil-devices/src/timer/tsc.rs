@@ -142,6 +142,11 @@ impl TscManager {
         self.vcpu_states.len()
     }
 
+    /// Host TSC value at VM creation time.
+    pub const fn creation_tsc(&self) -> u64 {
+        self.creation_tsc
+    }
+
     /// Read the host TSC.
     #[cfg(target_arch = "x86_64")]
     fn read_host_tsc() -> u64 {

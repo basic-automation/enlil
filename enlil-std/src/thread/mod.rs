@@ -13,6 +13,15 @@ pub struct JoinHandle<T> {
 
 impl<T> JoinHandle<T> {
     /// Block until the thread finishes and return its result.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the spawned thread panicked.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the result mutex is poisoned or the thread completed
+    /// without producing a result (should not happen in normal operation).
     pub fn join(self) -> Result<T, Box<dyn std::any::Any + Send>> {
         self.inner.join()?;
         let val = self.result.lock().unwrap().take()
@@ -26,6 +35,10 @@ impl<T> JoinHandle<T> {
 /// This mirrors `std::thread::spawn` but routes through `enlil_platform::threading`.
 /// On the linux backend, this ultimately uses `std::thread` under the hood.
 /// On bare-metal, it would use the platform scheduler.
+///
+/// # Panics
+///
+/// Panics if the result mutex is poisoned when the thread completes.
 pub fn spawn<F, T>(f: F) -> JoinHandle<T>
 where
     F: FnOnce() -> T + Send + 'static,
@@ -55,8 +68,9 @@ pub fn sleep(dur: std::time::Duration) {
 }
 
 /// Get the current thread's ID (delegates to std on linux backend).
+#[must_use]
 pub fn current_thread_name() -> Option<String> {
-    std::thread::current().name().map(|s| s.to_string())
+    std::thread::current().name().map(std::string::ToString::to_string)
 }
 
 #[cfg(test)]
@@ -71,7 +85,7 @@ mod tests {
 
     #[test]
     fn spawn_with_move() {
-        let data = vec![1, 2, 3];
+        let data = [1, 2, 3];
         let handle = spawn(move || data.iter().sum::<i32>());
         assert_eq!(handle.join().unwrap(), 6);
     }

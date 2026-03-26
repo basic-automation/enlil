@@ -34,12 +34,14 @@ pub use scheduler::Scheduler;
 /// Lower numeric value == higher urgency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum Priority {
     /// vCPU execution — must pre-empt everything else.
     Critical = 0,
     /// Device I/O completions and interrupt bottom-halves.
     High = 1,
     /// General compute work (default).
+    #[default]
     Normal = 2,
     /// Background / management housekeeping.
     Low = 3,
@@ -50,30 +52,26 @@ impl Priority {
     pub const COUNT: usize = 4;
 
     /// Convert from a raw `u8`. Returns `None` for out-of-range values.
-    pub fn from_u8(v: u8) -> Option<Self> {
+    #[must_use]
+    pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
-            0 => Some(Priority::Critical),
-            1 => Some(Priority::High),
-            2 => Some(Priority::Normal),
-            3 => Some(Priority::Low),
+            0 => Some(Self::Critical),
+            1 => Some(Self::High),
+            2 => Some(Self::Normal),
+            3 => Some(Self::Low),
             _ => None,
         }
     }
 }
 
-impl Default for Priority {
-    fn default() -> Self {
-        Priority::Normal
-    }
-}
 
 impl fmt::Display for Priority {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Priority::Critical => write!(f, "critical"),
-            Priority::High => write!(f, "high"),
-            Priority::Normal => write!(f, "normal"),
-            Priority::Low => write!(f, "low"),
+            Self::Critical => write!(f, "critical"),
+            Self::High => write!(f, "high"),
+            Self::Normal => write!(f, "normal"),
+            Self::Low => write!(f, "low"),
         }
     }
 }
@@ -84,8 +82,10 @@ impl fmt::Display for Priority {
 
 /// Specifies which CPU(s) a task may run on.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub enum CpuAffinity {
     /// The scheduler may place the task on any CPU.
+    #[default]
     Any,
     /// Pin to a specific CPU index.
     Pinned(usize),
@@ -93,11 +93,6 @@ pub enum CpuAffinity {
     Set(Vec<usize>),
 }
 
-impl Default for CpuAffinity {
-    fn default() -> Self {
-        CpuAffinity::Any
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Task
@@ -123,7 +118,7 @@ impl Task {
     where
         F: FnOnce() + Send + 'static,
     {
-        Task {
+        Self {
             name: name.into(),
             priority,
             affinity,
@@ -154,6 +149,7 @@ impl Task {
     }
 
     /// Returns `true` if the closure has not yet been consumed.
+    #[must_use]
     pub fn is_pending(&self) -> bool {
         self.work.is_some()
     }
@@ -166,7 +162,7 @@ impl fmt::Debug for Task {
             .field("priority", &self.priority)
             .field("affinity", &self.affinity)
             .field("pending", &self.is_pending())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -190,8 +186,9 @@ pub struct RunQueue {
 
 impl RunQueue {
     /// Create an empty run queue for the given CPU.
-    pub fn new(cpu: usize) -> Self {
-        RunQueue {
+    #[must_use]
+    pub const fn new(cpu: usize) -> Self {
+        Self {
             cpu,
             queues: [
                 VecDeque::new(),
@@ -211,7 +208,7 @@ impl RunQueue {
 
     /// Pop the highest-priority task from the front.
     pub fn pop(&mut self) -> Option<Task> {
-        for q in self.queues.iter_mut() {
+        for q in &mut self.queues {
             if let Some(task) = q.pop_front() {
                 return Some(task);
             }
@@ -234,11 +231,13 @@ impl RunQueue {
     }
 
     /// Total number of pending tasks across all priority levels.
+    #[must_use]
     pub fn len(&self) -> usize {
-        self.queues.iter().map(|q| q.len()).sum()
+        self.queues.iter().map(std::collections::VecDeque::len).sum()
     }
 
     /// Returns `true` if there are no pending tasks.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -274,14 +273,15 @@ pub struct CpuLocal {
 }
 
 impl CpuLocal {
-    pub fn new(cpu_id: usize) -> Self {
-        CpuLocal { cpu_id, ticks: 0 }
+    #[must_use]
+    pub const fn new(cpu_id: usize) -> Self {
+        Self { cpu_id, ticks: 0 }
     }
 }
 
 // Hosted fallback: ordinary thread-local.
 thread_local! {
-    static CPU_LOCAL: std::cell::RefCell<CpuLocal> = std::cell::RefCell::new(CpuLocal::new(0));
+    static CPU_LOCAL: std::cell::RefCell<CpuLocal> = const { std::cell::RefCell::new(CpuLocal::new(0)) };
 }
 
 /// Initialise thread-local CPU context for the calling thread.
@@ -291,15 +291,17 @@ pub fn init_cpu_local(cpu_id: usize) {
         local.cpu_id = cpu_id;
         local.ticks = 0;
     });
-    log::debug!("cpu_local initialised for cpu {}", cpu_id);
+    log::debug!("cpu_local initialised for cpu {cpu_id}");
 }
 
 /// Read the current CPU id from thread-local storage.
+#[must_use]
 pub fn current_cpu_id() -> usize {
     CPU_LOCAL.with(|c| c.borrow().cpu_id)
 }
 
 /// Increment the tick counter and return the new value.
+#[must_use]
 pub fn tick() -> u64 {
     CPU_LOCAL.with(|c| {
         let mut local = c.borrow_mut();
@@ -316,6 +318,11 @@ pub fn tick() -> u64 {
 ///
 /// This is the backend used when running under a hosted OS (Linux, Windows,
 /// macOS).  Each task gets its own `std::thread`.
+///
+/// # Panics
+///
+/// Panics if the OS thread cannot be spawned.
+#[must_use]
 pub fn spawn_hosted(task: Task) -> std::thread::JoinHandle<()> {
     let name = task.name.clone();
     std::thread::Builder::new()
@@ -325,7 +332,7 @@ pub fn spawn_hosted(task: Task) -> std::thread::JoinHandle<()> {
             log::debug!("hosted: running task '{}'", t.name);
             t.run();
         })
-        .unwrap_or_else(|e| panic!("failed to spawn thread for task '{}': {}", name, e))
+        .unwrap_or_else(|e| panic!("failed to spawn thread for task '{name}': {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -344,16 +351,26 @@ pub struct BareMetalScheduler {
 
 impl BareMetalScheduler {
     /// Create a scheduler with `num_cpus` run queues.
+    #[must_use]
     pub fn new(num_cpus: usize) -> Self {
         let queues: Vec<Mutex<RunQueue>> = (0..num_cpus)
             .map(|i| Mutex::new(RunQueue::new(i)))
             .collect();
-        BareMetalScheduler {
+        Self {
             queues: Arc::new(queues),
         }
     }
 
     /// Submit a task, respecting its affinity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pinned CPU index is out of range or
+    /// no valid CPU exists in the affinity set.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a queue mutex is poisoned.
     pub fn submit(&self, task: Task) -> Result<(), &'static str> {
         let target = match &task.affinity {
             CpuAffinity::Pinned(cpu) => {
@@ -403,6 +420,11 @@ impl BareMetalScheduler {
     ///
     /// If the local queue is empty, attempts to steal from the busiest
     /// neighbour.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a queue mutex is poisoned.
+    #[must_use]
     pub fn run_one(&self, cpu: usize) -> bool {
         // Try local queue first.
         {
@@ -441,11 +463,17 @@ impl BareMetalScheduler {
     }
 
     /// Number of CPUs.
+    #[must_use]
     pub fn num_cpus(&self) -> usize {
         self.queues.len()
     }
 
     /// Total pending tasks across all CPUs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a queue mutex is poisoned.
+    #[must_use]
     pub fn total_pending(&self) -> usize {
         self.queues
             .iter()
@@ -516,7 +544,7 @@ mod tests {
     #[test]
     fn task_debug_format() {
         let task = Task::spawn("dbg-test", || {});
-        let dbg = format!("{:?}", task);
+        let dbg = format!("{task:?}");
         assert!(dbg.contains("dbg-test"));
         assert!(dbg.contains("Normal"));
     }
@@ -581,7 +609,7 @@ mod tests {
     #[test]
     fn runqueue_debug() {
         let rq = RunQueue::new(7);
-        let dbg = format!("{:?}", rq);
+        let dbg = format!("{rq:?}");
         assert!(dbg.contains("cpu: 7"));
     }
 
@@ -617,7 +645,7 @@ mod tests {
 
         for i in 0..4 {
             let c = counter.clone();
-            let task = Task::spawn(format!("task-{}", i), move || {
+            let task = Task::spawn(format!("task-{i}"), move || {
                 c.fetch_add(1, Ordering::SeqCst);
             });
             sched.submit(task).unwrap();
@@ -696,7 +724,7 @@ mod tests {
             let c = counter.clone();
             sched
                 .submit(Task::new(
-                    format!("ws-{}", i),
+                    format!("ws-{i}"),
                     Priority::Normal,
                     CpuAffinity::Pinned(0),
                     move || {
@@ -714,7 +742,7 @@ mod tests {
     #[test]
     fn bare_metal_debug() {
         let sched = BareMetalScheduler::new(2);
-        let dbg = format!("{:?}", sched);
+        let dbg = format!("{sched:?}");
         assert!(dbg.contains("BareMetalScheduler"));
         assert!(dbg.contains("num_cpus: 2"));
     }

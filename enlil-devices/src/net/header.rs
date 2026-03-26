@@ -36,6 +36,7 @@ pub mod flags {
     /// The device has validated the received data checksum.
     pub const DATA_VALID: u8 = 2;
     /// Reports number of coalesced RSC segments.
+    #[allow(dead_code)]
     pub const RSC_INFO: u8 = 4;
 }
 
@@ -237,5 +238,12 @@ mod tests {
         assert_eq!(GsoType::from_u8(4), Some(GsoType::TcpV6));
         assert_eq!(GsoType::from_u8(0x80), Some(GsoType::TcpEcn));
         assert_eq!(GsoType::from_u8(0xFF), None);
+    }
+
+    #[test]
+    fn flag_constants_are_defined() {
+        assert_eq!(flags::NEEDS_CSUM, 1);
+        assert_eq!(flags::DATA_VALID, 2);
+        assert_eq!(flags::RSC_INFO, 4);
     }
 }

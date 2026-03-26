@@ -1,3 +1,5 @@
+#![deny(clippy::all, clippy::pedantic, clippy::nursery)]
+
 //! Enlil Management Console
 //!
 //! CLI tool for managing the Enlil hypervisor — loading configs,

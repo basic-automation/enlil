@@ -16,7 +16,7 @@ pub struct InterruptController {
 impl InterruptController {
     /// Create a new interrupt controller with the given number of vCPUs.
     pub fn new(num_vcpus: u8) -> Self {
-        let lapics = (0..num_vcpus).map(|id| LocalApic::new(id)).collect();
+        let lapics = (0..num_vcpus).map(LocalApic::new).collect();
         Self {
             lapics,
             ioapic: IoApic::new(0),
@@ -166,7 +166,7 @@ mod tests {
     fn test_deliver_msi() {
         let mut ctrl = make_controller(2);
         let msg = MsiMessage {
-            address: (0 << 12) | 0xFEE0_0000, // dest 0, physical
+            address: 0xFEE0_0000, // dest 0, physical
             data: 0x30, // vector 0x30, fixed delivery
             delivery_mode: DeliveryMode::Fixed,
         };

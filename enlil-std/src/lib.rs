@@ -1,3 +1,5 @@
+#![deny(clippy::all, clippy::pedantic, clippy::nursery)]
+
 //! # enlil-std — Standard Library Compatibility Layer
 //!
 //! This crate provides `std`-compatible APIs backed by `enlil-platform`.

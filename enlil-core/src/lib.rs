@@ -1,3 +1,5 @@
+#![deny(clippy::all, clippy::pedantic, clippy::nursery)]
+
 //! Enlil hypervisor core — VMM entry, vCPU management, memory partitioning.
 
 pub mod affinity;

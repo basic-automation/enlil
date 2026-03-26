@@ -117,9 +117,10 @@ pub struct SerialOutput {
 
 impl SerialOutput {
     /// Create a new output sink for the named guest.
+    #[must_use]
     pub fn new(guest_name: &str, mode: SerialOutputMode) -> Self {
         Self {
-            prefix: format!("[{}] ", guest_name),
+            prefix: format!("[{guest_name}] "),
             mode,
             line_buf: Vec::with_capacity(256),
             file: None,
@@ -128,6 +129,7 @@ impl SerialOutput {
     }
 
     /// Convenience: create a Stdout-mode output (backwards compatible).
+    #[must_use]
     pub fn new_stdout(guest_name: &str) -> Self {
         Self::new(guest_name, SerialOutputMode::Stdout)
     }
@@ -172,7 +174,7 @@ impl SerialOutput {
                                     self.file = Some(f);
                                 }
                                 Err(e) => {
-                                    log::error!("serial: failed to open {}: {}", path, e);
+                                    log::error!("serial: failed to open {path}: {e}");
                                 }
                             }
                         }
@@ -214,6 +216,7 @@ impl SerialOutput {
     }
 
     /// Return all bytes collected in Buffer mode. Empty for other modes.
+    #[must_use]
     pub fn buffer_contents(&self) -> &[u8] {
         &self.mem_buf
     }
@@ -253,7 +256,7 @@ pub struct UartState {
     pub msr: u8,
     /// Scratch Register.
     pub scr: u8,
-    /// Divisor latch (when DLAB=1, DATA_REG and IER_REG access this).
+    /// Divisor latch (when DLAB=1, `DATA_REG` and `IER_REG` access this).
     pub divisor: u16,
     /// Receive buffer — bytes injected by the host for the guest to read.
     rx_fifo: VecDeque<u8>,
@@ -263,6 +266,7 @@ pub struct UartState {
 
 impl UartState {
     /// Create a new UART with the given output sink.
+    #[must_use]
     pub fn new(output: SerialOutput) -> Self {
         Self {
             ier: 0,
@@ -307,11 +311,11 @@ impl UartState {
 
         match offset {
             DATA_REG if dlab => {
-                self.divisor = (self.divisor & 0xFF00) | value as u16;
+                self.divisor = (self.divisor & 0xFF00) | u16::from(value);
             }
             DATA_REG => self.write_data(value),
             IER_REG if dlab => {
-                self.divisor = (self.divisor & 0x00FF) | ((value as u16) << 8);
+                self.divisor = (self.divisor & 0x00FF) | (u16::from(value) << 8);
             }
             IER_REG => self.ier = value & 0x0F,
             IIR_REG => { /* FCR write — acknowledge but ignore for now */ }
@@ -364,17 +368,19 @@ impl UartState {
     }
 
     /// Check whether the RX FIFO has data available.
+    #[must_use]
     pub fn has_input(&self) -> bool {
         !self.rx_fifo.is_empty()
     }
 
     /// Return a reference to the underlying output sink.
-    pub fn output(&self) -> &SerialOutput {
+    #[must_use]
+    pub const fn output(&self) -> &SerialOutput {
         &self.output
     }
 
     /// Return a mutable reference to the underlying output sink.
-    pub fn output_mut(&mut self) -> &mut SerialOutput {
+    pub const fn output_mut(&mut self) -> &mut SerialOutput {
         &mut self.output
     }
 }
@@ -397,6 +403,7 @@ pub struct SerialMultiplexer {
 
 impl SerialMultiplexer {
     /// Create an empty multiplexer.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             guests: HashMap::new(),
@@ -428,7 +435,7 @@ impl SerialMultiplexer {
         if let Some(uart) = self.guests.get_mut(guest_id) {
             uart.write_register(offset, value);
         } else {
-            log::warn!("serial: write to unknown guest '{}'", guest_id);
+            log::warn!("serial: write to unknown guest '{guest_id}'");
         }
     }
 
@@ -439,7 +446,7 @@ impl SerialMultiplexer {
         if let Some(uart) = self.guests.get_mut(guest_id) {
             uart.read_register(offset)
         } else {
-            log::warn!("serial: read from unknown guest '{}'", guest_id);
+            log::warn!("serial: read from unknown guest '{guest_id}'");
             0xFF
         }
     }
@@ -452,6 +459,7 @@ impl SerialMultiplexer {
     }
 
     /// Get a reference to a guest's UART state.
+    #[must_use]
     pub fn get_uart(&self, guest_id: &str) -> Option<&UartState> {
         self.guests.get(guest_id)
     }
@@ -462,6 +470,7 @@ impl SerialMultiplexer {
     }
 
     /// Return the number of registered guests.
+    #[must_use]
     pub fn guest_count(&self) -> usize {
         self.guests.len()
     }
@@ -477,6 +486,7 @@ impl Default for SerialMultiplexer {
 pub type SharedSerialMultiplexer = Arc<Mutex<SerialMultiplexer>>;
 
 /// Create a new shared multiplexer.
+#[must_use]
 pub fn shared_multiplexer() -> SharedSerialMultiplexer {
     Arc::new(Mutex::new(SerialMultiplexer::new()))
 }
@@ -553,8 +563,7 @@ mod tests {
         let contents = std::fs::read_to_string(&path).expect("file should exist");
         assert!(
             contents.contains("[guest0] hello from guest"),
-            "file contents: {:?}",
-            contents
+            "file contents: {contents:?}"
         );
 
         let _ = std::fs::remove_file(&path);

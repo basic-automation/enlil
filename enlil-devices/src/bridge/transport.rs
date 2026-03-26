@@ -11,13 +11,13 @@ use std::sync::{Arc, Mutex};
 pub struct GuestId(u16);
 
 impl GuestId {
-    /// Create a new GuestId.
-    pub fn new(id: u16) -> Self {
-        GuestId(id)
+    /// Create a new `GuestId`.
+    pub const fn new(id: u16) -> Self {
+        Self(id)
     }
 
     /// Get the numeric ID.
-    pub fn id(&self) -> u16 {
+    pub const fn id(&self) -> u16 {
         self.0
     }
 }
@@ -45,7 +45,7 @@ pub enum BridgeChannel {
 
 impl BridgeChannel {
     /// Get all channel variants.
-    pub fn all() -> &'static [BridgeChannel] {
+    pub const fn all() -> &'static [BridgeChannel] {
         &[
             BridgeChannel::Clipboard,
             BridgeChannel::DragDrop,
@@ -59,7 +59,7 @@ impl BridgeChannel {
     }
 
     /// Get the queue index for this channel.
-    pub fn queue_index(&self) -> usize {
+    pub const fn queue_index(&self) -> usize {
         *self as usize
     }
 }
@@ -83,14 +83,14 @@ pub struct MessageHeader {
 
 impl MessageHeader {
     /// Create a new message header.
-    pub fn new(
+    pub const fn new(
         src: GuestId,
         dst: GuestId,
         channel: BridgeChannel,
         payload_len: u32,
         seq: u64,
     ) -> Self {
-        MessageHeader {
+        Self {
             src,
             dst,
             channel,
@@ -115,6 +115,10 @@ impl MessageHeader {
     }
 
     /// Deserialize header from bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the channel index is invalid.
     pub fn from_bytes(buf: &[u8; 32]) -> Result<Self, String> {
         let src = GuestId(u16::from_le_bytes([buf[0], buf[1]]));
         let dst = GuestId(u16::from_le_bytes([buf[2], buf[3]]));
@@ -137,7 +141,7 @@ impl MessageHeader {
         ]);
         let flags = buf[18];
 
-        Ok(MessageHeader {
+        Ok(Self {
             src,
             dst,
             channel,
@@ -159,6 +163,10 @@ pub struct BridgeMessage {
 
 impl BridgeMessage {
     /// Create a new bridge message.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the payload length does not match the header payload_len field.
     pub fn new(header: MessageHeader, payload: Vec<u8>) -> Result<Self, String> {
         if header.payload_len as usize != payload.len() {
             return Err(format!(
@@ -167,11 +175,11 @@ impl BridgeMessage {
                 payload.len()
             ));
         }
-        Ok(BridgeMessage { header, payload })
+        Ok(Self { header, payload })
     }
 
     /// Get total frame size (header + payload).
-    pub fn frame_size(&self) -> usize {
+    pub const fn frame_size(&self) -> usize {
         32 + self.payload.len()
     }
 
@@ -184,6 +192,10 @@ impl BridgeMessage {
     }
 
     /// Deserialize from bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the buffer is too short for the header or payload.
     pub fn from_bytes(buf: &[u8]) -> Result<Self, String> {
         if buf.len() < 32 {
             return Err(format!(
@@ -206,7 +218,7 @@ impl BridgeMessage {
         }
 
         let payload = buf[32..32 + payload_len].to_vec();
-        BridgeMessage::new(header, payload)
+        Self::new(header, payload)
     }
 }
 
@@ -215,6 +227,10 @@ impl BridgeMessage {
 pub trait BridgeTransport: Send + Sync {
     /// Send a message through the transport.
     /// Returns true if enqueued successfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the queue is full or the lock is poisoned.
     fn send(&self, msg: BridgeMessage) -> Result<(), String>;
 
     /// Receive a message from the transport (non-blocking).
@@ -225,25 +241,29 @@ pub trait BridgeTransport: Send + Sync {
     fn is_ready(&self) -> bool;
 
     /// Flush any pending messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the flush operation fails.
     fn flush(&self) -> Result<(), String>;
 
     /// Get queue depth for a specific channel.
     fn queue_depth(&self, channel: BridgeChannel) -> usize;
 }
 
-/// Local VirtIO-based transport implementation.
+/// Local `VirtIO`-based transport implementation.
 /// Implements direct queue dispatch within a single machine.
 pub struct LocalVirtioTransport {
-    /// 8 queues, one per BridgeChannel
+    /// 8 queues, one per `BridgeChannel`
     queues: [Arc<Mutex<VecDeque<BridgeMessage>>>; 8],
     /// Maximum queue depth per channel
     max_queue_depth: usize,
 }
 
 impl LocalVirtioTransport {
-    /// Create a new LocalVirtioTransport with specified max queue depth.
+    /// Create a new `LocalVirtioTransport` with specified max queue depth.
     pub fn new(max_queue_depth: usize) -> Self {
-        LocalVirtioTransport {
+        Self {
             queues: [
                 Arc::new(Mutex::new(VecDeque::new())),
                 Arc::new(Mutex::new(VecDeque::new())),
@@ -267,13 +287,14 @@ impl LocalVirtioTransport {
 impl BridgeTransport for LocalVirtioTransport {
     fn send(&self, msg: BridgeMessage) -> Result<(), String> {
         let queue = self.get_queue(msg.header.channel);
-        let mut q = queue.lock().map_err(|e| format!("Queue lock poisoned: {}", e))?;
+        let mut q = queue.lock().map_err(|e| format!("Queue lock poisoned: {e}"))?;
 
         if q.len() >= self.max_queue_depth {
             return Err("Queue full".to_string());
         }
 
         q.push_back(msg);
+        drop(q);
         Ok(())
     }
 
@@ -281,11 +302,10 @@ impl BridgeTransport for LocalVirtioTransport {
         // Round-robin across all queues
         for channel in BridgeChannel::all() {
             let queue = self.get_queue(*channel);
-            if let Ok(mut q) = queue.lock() {
-                if let Some(msg) = q.pop_front() {
+            if let Ok(mut q) = queue.lock()
+                && let Some(msg) = q.pop_front() {
                     return Some(msg);
                 }
-            }
         }
         None
     }
@@ -294,10 +314,10 @@ impl BridgeTransport for LocalVirtioTransport {
         // Transport is ready if at least one queue has space
         for channel in BridgeChannel::all() {
             let queue = self.get_queue(*channel);
-            if let Ok(q) = queue.lock() {
-                if q.len() < self.max_queue_depth {
-                    return true;
-                }
+            if let Ok(q) = queue.lock()
+                && q.len() < self.max_queue_depth
+            {
+                return true;
             }
         }
         false
@@ -310,22 +330,26 @@ impl BridgeTransport for LocalVirtioTransport {
 
     fn queue_depth(&self, channel: BridgeChannel) -> usize {
         let queue = self.get_queue(channel);
-        queue.lock().map(|q| q.len()).unwrap_or(0)
+        queue.lock().map_or(0, |q| q.len())
     }
 }
 
-/// VirtIO Bridge Device with 8 queues for guest communication.
+/// `VirtIO` Bridge Device with 8 queues for guest communication.
 pub struct VirtioBridgeDevice {
     transport: Arc<dyn BridgeTransport>,
 }
 
 impl VirtioBridgeDevice {
-    /// Create a new VirtIO Bridge Device with a transport.
+    /// Create a new `VirtIO` Bridge Device with a transport.
     pub fn new(transport: Arc<dyn BridgeTransport>) -> Self {
-        VirtioBridgeDevice { transport }
+        Self { transport }
     }
 
     /// Send a message via the device.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transport send operation fails.
     pub fn send(&self, msg: BridgeMessage) -> Result<(), String> {
         self.transport.send(msg)
     }
@@ -377,7 +401,7 @@ mod tests {
             GuestId::new(2),
             BridgeChannel::Clipboard,
             100,
-            0x0102030405060708,
+            0x0102_0304_0506_0708,
         );
 
         let bytes = header.to_bytes();
@@ -388,7 +412,7 @@ mod tests {
         assert_eq!(header2.dst, GuestId::new(2));
         assert_eq!(header2.channel, BridgeChannel::Clipboard);
         assert_eq!(header2.payload_len, 100);
-        assert_eq!(header2.seq, 0x0102030405060708);
+        assert_eq!(header2.seq, 0x0102_0304_0506_0708);
     }
 
     #[test]
@@ -462,110 +486,66 @@ mod tests {
         );
         let msg = BridgeMessage::new(header, vec![1, 2, 3]).unwrap();
 
-        assert!(transport.send(msg.clone()).is_ok());
-        let received = transport.recv();
-        assert!(received.is_some());
-
-        let received_msg = received.unwrap();
-        assert_eq!(received_msg.header.src, GuestId::new(1));
-        assert_eq!(received_msg.header.dst, GuestId::new(2));
-        assert_eq!(received_msg.payload, vec![1, 2, 3]);
+        assert!(transport.send(msg).is_ok());
+        let received = transport.recv().unwrap();
+        assert_eq!(received.header.src, GuestId::new(1));
+        assert_eq!(received.header.dst, GuestId::new(2));
+        assert_eq!(received.payload, vec![1, 2, 3]);
     }
 
     #[test]
     fn test_local_virtio_transport_queue_full() {
-        let transport = LocalVirtioTransport::new(2);
+        let transport = LocalVirtioTransport::new(1);
+        let msg1 = BridgeMessage::new(
+            MessageHeader::new(
+                GuestId::new(1),
+                GuestId::new(2),
+                BridgeChannel::Clipboard,
+                1,
+                0,
+            ),
+            vec![1],
+        )
+        .unwrap();
+        let msg2 = BridgeMessage::new(
+            MessageHeader::new(
+                GuestId::new(1),
+                GuestId::new(2),
+                BridgeChannel::Clipboard,
+                1,
+                1,
+            ),
+            vec![2],
+        )
+        .unwrap();
 
-        let header1 = MessageHeader::new(
-            GuestId::new(1),
-            GuestId::new(2),
-            BridgeChannel::DragDrop,
-            1,
-            0,
-        );
-        let msg1 = BridgeMessage::new(header1, vec![1]).unwrap();
         assert!(transport.send(msg1).is_ok());
-
-        let header2 = MessageHeader::new(
-            GuestId::new(1),
-            GuestId::new(2),
-            BridgeChannel::DragDrop,
-            1,
-            1,
-        );
-        let msg2 = BridgeMessage::new(header2, vec![2]).unwrap();
-        assert!(transport.send(msg2).is_ok());
-
-        let header3 = MessageHeader::new(
-            GuestId::new(1),
-            GuestId::new(2),
-            BridgeChannel::DragDrop,
-            1,
-            2,
-        );
-        let msg3 = BridgeMessage::new(header3, vec![3]).unwrap();
-        assert!(transport.send(msg3).is_err());
+        assert!(transport.send(msg2).is_err());
     }
 
     #[test]
-    fn test_local_virtio_transport_queue_depth() {
+    fn test_local_virtio_transport_round_robin() {
         let transport = LocalVirtioTransport::new(10);
 
-        let header = MessageHeader::new(
-            GuestId::new(1),
-            GuestId::new(2),
-            BridgeChannel::Notify,
-            1,
-            0,
-        );
-        let msg = BridgeMessage::new(header, vec![42]).unwrap();
-
-        assert_eq!(transport.queue_depth(BridgeChannel::Notify), 0);
-        transport.send(msg).unwrap();
-        assert_eq!(transport.queue_depth(BridgeChannel::Notify), 1);
-        transport.recv();
-        assert_eq!(transport.queue_depth(BridgeChannel::Notify), 0);
-    }
-
-    #[test]
-    fn test_virtio_bridge_device() {
-        let transport = Arc::new(LocalVirtioTransport::new(10));
-        let device = VirtioBridgeDevice::new(transport);
-
-        let header = MessageHeader::new(
-            GuestId::new(3),
-            GuestId::new(4),
-            BridgeChannel::SharedFs,
-            4,
-            0,
-        );
-        let msg = BridgeMessage::new(header, vec![10, 20, 30, 40]).unwrap();
-
-        assert!(device.send(msg).is_ok());
-        let received = device.recv();
-        assert!(received.is_some());
-
-        let received_msg = received.unwrap();
-        assert_eq!(received_msg.header.src, GuestId::new(3));
-        assert_eq!(received_msg.header.dst, GuestId::new(4));
-        assert_eq!(received_msg.header.channel, BridgeChannel::SharedFs);
-    }
-
-    #[test]
-    fn test_transport_is_ready() {
-        let transport = LocalVirtioTransport::new(2);
-        assert!(transport.is_ready());
-
-        let header = MessageHeader::new(
-            GuestId::new(1),
-            GuestId::new(2),
-            BridgeChannel::ControlTx,
-            1,
-            0,
-        );
-        let msg1 = BridgeMessage::new(header, vec![1]).unwrap();
+        let msg1 = BridgeMessage::new(
+            MessageHeader::new(
+                GuestId::new(1),
+                GuestId::new(2),
+                BridgeChannel::Clipboard,
+                1,
+                0,
+            ),
+            vec![1],
+        )
+        .unwrap();
         let msg2 = BridgeMessage::new(
-            MessageHeader::new(GuestId::new(1), GuestId::new(2), BridgeChannel::ControlTx, 1, 1),
+            MessageHeader::new(
+                GuestId::new(1),
+                GuestId::new(2),
+                BridgeChannel::DragDrop,
+                1,
+                1,
+            ),
             vec![2],
         )
         .unwrap();
@@ -573,7 +553,96 @@ mod tests {
         transport.send(msg1).unwrap();
         transport.send(msg2).unwrap();
 
-        // Queue is full for ControlTx, but other channels have space
+        let received1 = transport.recv().unwrap();
+        assert_eq!(received1.header.channel, BridgeChannel::Clipboard);
+
+        let received2 = transport.recv().unwrap();
+        assert_eq!(received2.header.channel, BridgeChannel::DragDrop);
+    }
+
+    #[test]
+    fn test_local_virtio_transport_queue_depth() {
+        let transport = LocalVirtioTransport::new(10);
+        assert_eq!(transport.queue_depth(BridgeChannel::Clipboard), 0);
+
+        let msg = BridgeMessage::new(
+            MessageHeader::new(
+                GuestId::new(1),
+                GuestId::new(2),
+                BridgeChannel::Clipboard,
+                1,
+                0,
+            ),
+            vec![1],
+        )
+        .unwrap();
+        transport.send(msg).unwrap();
+        assert_eq!(transport.queue_depth(BridgeChannel::Clipboard), 1);
+    }
+
+    #[test]
+    fn test_local_virtio_transport_is_ready() {
+        let transport = LocalVirtioTransport::new(1);
         assert!(transport.is_ready());
+
+        let msg = BridgeMessage::new(
+            MessageHeader::new(
+                GuestId::new(1),
+                GuestId::new(2),
+                BridgeChannel::Clipboard,
+                1,
+                0,
+            ),
+            vec![1],
+        )
+        .unwrap();
+        transport.send(msg).unwrap();
+
+        assert!(transport.is_ready()); // DragDrop queue is empty
+    }
+
+    #[test]
+    fn test_local_virtio_transport_all_queues_full() {
+        let transport = LocalVirtioTransport::new(1);
+
+        for channel in BridgeChannel::all() {
+            let msg = BridgeMessage::new(
+                MessageHeader::new(
+                    GuestId::new(1),
+                    GuestId::new(2),
+                    *channel,
+                    1,
+                    0,
+                ),
+                vec![1],
+            )
+            .unwrap();
+            let _ = transport.send(msg);
+        }
+
+        assert!(!transport.is_ready());
+    }
+
+    #[test]
+    fn test_virtio_bridge_device_send_recv() {
+        let transport = Arc::new(LocalVirtioTransport::new(10));
+        let device = VirtioBridgeDevice::new(transport);
+
+        let msg = BridgeMessage::new(
+            MessageHeader::new(
+                GuestId::new(1),
+                GuestId::new(2),
+                BridgeChannel::Notify,
+                5,
+                0,
+            ),
+            vec![1, 2, 3, 4, 5],
+        )
+        .unwrap();
+
+        assert!(device.send(msg).is_ok());
+        let received = device.recv().unwrap();
+        assert_eq!(received.header.channel, BridgeChannel::Notify);
+        assert_eq!(received.payload.len(), 5);
     }
 }

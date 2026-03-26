@@ -1,6 +1,6 @@
-//! Synchronization primitives — std::sync compatible API backed by enlil-platform.
+//! Synchronization primitives — `std::sync` compatible API backed by enlil-platform.
 //!
-//! Re-exports platform Mutex, RwLock, Condvar, and mpsc channels.
+//! Re-exports platform Mutex, `RwLock`, Condvar, and mpsc channels.
 //! Also provides Arc and atomic types from std (these are compiler intrinsics,
 //! not OS-dependent).
 

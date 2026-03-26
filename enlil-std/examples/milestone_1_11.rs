@@ -20,10 +20,7 @@ fn main() {
 
     // --- 1. Vec and HashMap (collections through platform allocator) ---
     enlil_std::println!("[1/6] Collections (Vec, HashMap)...");
-    let mut v: Vec<String> = Vec::new();
-    v.push("hello".into());
-    v.push("from".into());
-    v.push("enlil".into());
+    let v: Vec<String> = vec!["hello".into(), "from".into(), "enlil".into()];
     assert_eq!(v.len(), 3);
     assert_eq!(v.join(" "), "hello from enlil");
 

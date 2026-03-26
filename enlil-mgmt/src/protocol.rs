@@ -1,3 +1,5 @@
+#![deny(clippy::all, clippy::pedantic, clippy::nursery)]
+
 //! Communication protocol between enlil-core and enlil-mgmt.
 //!
 //! Messages are length-prefixed JSON: `[4-byte LE length][JSON payload]`.

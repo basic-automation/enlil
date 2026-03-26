@@ -1,0 +1,537 @@
+    Checking enlil-platform v0.1.0 (D:\Development\enlil\enlil-platform)
+    Checking enlil-hal v0.1.0 (D:\Development\enlil\enlil-hal)
+    Checking enlil-devices v0.1.0 (D:\Development\enlil\enlil-devices)
+warning: field assignment outside of initializer for an instance created with Default::default()
+   --> enlil-core\src\vcpu.rs:539:9
+    |
+539 |         ctx.rip = 0xDEADBEEF;
+    |         ^^^^^^^^^^^^^^^^^^^^^
+    |
+note: consider initializing the variable with `vcpu::VcpuContext { rip: 0xDEADBEEF, ..Default::default() }` and removing relevant reassignments
+   --> enlil-core\src\vcpu.rs:538:9
+    |
+538 |         let mut ctx = VcpuContext::default();
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#field_reassign_with_default
+    = note: `#[warn(clippy::field_reassign_with_default)]` on by default
+
+warning: `enlil-core` (lib test) generated 1 warning
+warning: method `write_byte` is never used
+   --> enlil-platform\src\io\mod.rs:275:8
+    |
+228 | impl FramebufferConsole {
+    | ----------------------- method in this implementation
+...
+275 |     fn write_byte(&mut self, byte: u8) {
+    |        ^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+error: docs for function which may panic missing `# Panics` section
+   --> enlil-platform\src\memory\mod.rs:667:5
+    |
+667 |     pub fn is_allocated(&self, frame: PhysFrame) -> bool {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+note: first possible panic found here
+   --> enlil-platform\src\memory\mod.rs:668:25
+    |
+668 |         let frame_idx = usize::try_from(frame.number() - self.base_frame).expect("frame index exceeds usize");
+    |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#missing_panics_doc
+note: the lint level is defined here
+   --> enlil-platform\src\lib.rs:1:24
+    |
+  1 | #![forbid(clippy::all, clippy::pedantic, clippy::nursery)]
+    |                        ^^^^^^^^^^^^^^^^
+    = note: `#[forbid(clippy::missing_panics_doc)]` implied by `#[forbid(clippy::pedantic)]`
+
+error: manual `Debug` impl does not include all fields
+   --> enlil-platform\src\threading\mod.rs:158:1
+    |
+158 | / impl fmt::Debug for Task {
+159 | |     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+160 | |         f.debug_struct("Task")
+161 | |             .field("name", &self.name)
+...   |
+167 | | }
+    | |_^
+    |
+note: this field is unused
+   --> enlil-platform\src\threading\mod.rs:112:5
+    |
+112 |     work: Option<Box<dyn FnOnce() + Send + 'static>>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: consider including all fields in this `Debug` impl
+    = help: consider calling `.finish_non_exhaustive()` if you intend to ignore fields
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#missing_fields_in_debug
+    = note: `#[forbid(clippy::missing_fields_in_debug)]` implied by `#[forbid(clippy::pedantic)]`
+
+error: docs for function which may panic missing `# Panics` section
+   --> enlil-platform\src\threading\mod.rs:322:1
+    |
+322 | pub fn spawn_hosted(task: Task) -> std::thread::JoinHandle<()> {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+note: first possible panic found here
+   --> enlil-platform\src\threading\mod.rs:331:29
+    |
+331 |         .unwrap_or_else(|e| panic!("failed to spawn thread for task '{name}': {e}"))
+    |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#missing_panics_doc
+
+error: docs for function which may panic missing `# Panics` section
+   --> enlil-platform\src\threading\mod.rs:361:5
+    |
+361 |     pub fn submit(&self, task: Task) -> Result<(), &'static str> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+note: first possible panic found here
+   --> enlil-platform\src\threading\mod.rs:376:31
+    |
+376 |                     let len = self.queues[cpu].lock().unwrap().len();
+    |                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#missing_panics_doc
+
+error: docs for function returning `Result` missing `# Errors` section
+   --> enlil-platform\src\threading\mod.rs:361:5
+    |
+361 |     pub fn submit(&self, task: Task) -> Result<(), &'static str> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#missing_errors_doc
+    = note: `#[forbid(clippy::missing_errors_doc)]` implied by `#[forbid(clippy::pedantic)]`
+
+error: docs for function which may panic missing `# Panics` section
+   --> enlil-platform\src\threading\mod.rs:411:5
+    |
+411 |     pub fn run_one(&self, cpu: usize) -> bool {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+note: first possible panic found here
+   --> enlil-platform\src\threading\mod.rs:414:25
+    |
+414 |             let mut q = self.queues[cpu].lock().unwrap();
+    |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#missing_panics_doc
+
+error: docs for function which may panic missing `# Panics` section
+   --> enlil-platform\src\threading\mod.rs:456:5
+    |
+456 |     pub fn total_pending(&self) -> usize {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+note: first possible panic found here
+   --> enlil-platform\src\threading\mod.rs:459:22
+    |
+459 |             .map(|q| q.lock().unwrap().len())
+    |                      ^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#missing_panics_doc
+
+error: docs for function which may panic missing `# Panics` section
+  --> enlil-platform\src\sync\mod.rs:40:5
+   |
+40 |     pub fn lock(&self) -> MutexGuard<'_, T> {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+note: first possible panic found here
+  --> enlil-platform\src\sync\mod.rs:44:47
+   |
+44 |                 inner: MutexGuardInner::Linux(self.inner.lock().unwrap()),
+   |                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#missing_panics_doc
+
+error: docs for function which may panic missing `# Panics` section
+   --> enlil-platform\src\sync\mod.rs:135:5
+    |
+135 |     pub fn read(&self) -> RwLockReadGuard<'_, T> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+note: first possible panic found here
+   --> enlil-platform\src\sync\mod.rs:139:52
+    |
+139 |                 inner: RwLockReadGuardInner::Linux(self.inner.read().unwrap()),
+    |                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#missing_panics_doc
+
+error: docs for function which may panic missing `# Panics` section
+   --> enlil-platform\src\sync\mod.rs:151:5
+    |
+151 |     pub fn write(&self) -> RwLockWriteGuard<'_, T> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+note: first possible panic found here
+   --> enlil-platform\src\sync\mod.rs:155:53
+    |
+155 |                 inner: RwLockWriteGuardInner::Linux(self.inner.write().unwrap()),
+    |                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#missing_panics_doc
+
+error: docs for function which may panic missing `# Panics` section
+   --> enlil-platform\src\sync\mod.rs:294:5
+    |
+294 |     pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+note: first possible panic found here
+   --> enlil-platform\src\sync\mod.rs:297:33
+    |
+297 |                 let std_guard = self.inner.wait(std_guard).unwrap();
+    |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#missing_panics_doc
+
+error: temporary with significant `Drop` can be early dropped
+   --> enlil-platform\src\sync\mod.rs:479:21
+    |
+478 | /         {
+479 | |             let mut inner = self.shared.state.lock().unwrap();
+    | |                     ^^^^^
+480 | |             inner.sender_count -= 1;
+481 | |             if inner.sender_count == 0 {
+...   |
+486 | |         }
+    | |_________- temporary `inner` is currently being dropped at the end of its contained scope
+    |
+    = note: this might lead to unnecessary resource contention
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#significant_drop_tightening
+note: the lint level is defined here
+   --> enlil-platform\src\lib.rs:1:42
+    |
+  1 | #![forbid(clippy::all, clippy::pedantic, clippy::nursery)]
+    |                                          ^^^^^^^^^^^^^^^
+    = note: `#[forbid(clippy::significant_drop_tightening)]` implied by `#[forbid(clippy::nursery)]`
+help: drop the temporary after the end of its last usage
+    |
+482 ~                 inner.closed = true;
+483 +                 drop(inner);
+    |
+
+error: temporary with significant `Drop` can be early dropped
+   --> enlil-platform\src\sync\mod.rs:556:17
+    |
+554 |       pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
+    |  _____________________________________________________________________-
+555 | |         #[cfg(feature = "platform-linux")]
+556 | |         let mut inner = self.shared.state.lock().unwrap();
+    | |                 ^^^^^
+557 | |         #[cfg(feature = "platform-baremetal")]
+...   |
+568 | |         Ok(())
+569 | |     }
+    | |_____- temporary `inner` is currently being dropped at the end of its contained scope
+    |
+    = note: this might lead to unnecessary resource contention
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#significant_drop_tightening
+help: drop the temporary after the end of its last usage
+    |
+566 ~         inner.buffer.push_back(value);
+567 +         drop(inner);
+    |
+
+warning: constant `LAPIC_RRD` is never used
+  --> enlil-devices\src\interrupt\lapic.rs:19:11
+   |
+19 | pub const LAPIC_RRD: u32 = 0x0C0;
+   |           ^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `LoopbackBackend` is never constructed
+  --> enlil-devices\src\net\backend.rs:97:12
+   |
+97 | pub struct LoopbackBackend {
+   |            ^^^^^^^^^^^^^^^
+
+warning: associated function `new` is never used
+   --> enlil-devices\src\net\backend.rs:102:12
+    |
+101 | impl LoopbackBackend {
+    | -------------------- associated function in this implementation
+102 |     pub fn new() -> Self {
+    |            ^^^
+
+warning: struct `PipeBackend` is never constructed
+   --> enlil-devices\src\net\backend.rs:146:12
+    |
+146 | pub struct PipeBackend {
+    |            ^^^^^^^^^^^
+
+warning: associated function `pair` is never used
+   --> enlil-devices\src\net\backend.rs:155:12
+    |
+153 | impl PipeBackend {
+    | ---------------- associated function in this implementation
+154 |     /// Create a connected pair of pipe backends.
+155 |     pub fn pair() -> (Self, Self) {
+    |            ^^^^
+
+warning: struct `MsiCapability` is never constructed
+  --> enlil-devices\src\interrupt\msi.rs:66:12
+   |
+66 | pub struct MsiCapability {
+   |            ^^^^^^^^^^^^^
+
+warning: associated items `new`, `is_vector_masked`, and `message_for_vector` are never used
+   --> enlil-devices\src\interrupt\msi.rs:91:12
+    |
+ 83 | impl MsiCapability {
+    | ------------------ associated items in this implementation
+...
+ 91 |     pub fn new(is_64bit: bool, per_vector_masking: bool) -> Self {
+    |            ^^^
+...
+109 |     pub fn is_vector_masked(&self, vector_idx: u8) -> bool {
+    |            ^^^^^^^^^^^^^^^^
+...
+122 |     pub fn message_for_vector(&self, vector_idx: u8) -> MsiMessage {
+    |            ^^^^^^^^^^^^^^^^^^
+
+warning: constant `LAPIC_BASE_ADDR` is never used
+  --> enlil-devices\src\interrupt\lapic.rs:41:11
+   |
+41 | pub const LAPIC_BASE_ADDR: u64 = 0xFEE0_0000;
+   |           ^^^^^^^^^^^^^^^
+
+warning: constant `IOAPIC_BASE` is never used
+ --> enlil-devices\src\interrupt\ioapic.rs:9:11
+  |
+9 | pub const IOAPIC_BASE: u64 = 0xFEC0_0000;
+  |           ^^^^^^^^^^^
+
+warning: fields `sequence` and `source_guest` are never read
+  --> enlil-devices\src\bridge\clipboard.rs:74:5
+   |
+72 | struct ClipboardEntry {
+   |        -------------- fields in this struct
+73 |     content: ClipboardContent,
+74 |     sequence: u64,
+   |     ^^^^^^^^
+75 |     source_guest: u32,
+   |     ^^^^^^^^^^^^
+   |
+   = note: `ClipboardEntry` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: constant `RSC_INFO` is never used
+  --> enlil-devices\src\net\header.rs:39:15
+   |
+39 |     pub const RSC_INFO: u8 = 4;
+   |               ^^^^^^^^
+
+warning: variants `Reset`, `Acknowledge`, `Driver`, `FeaturesOk`, and `Failed` are never constructed
+  --> enlil-devices\src\net\device.rs:17:5
+   |
+16 | pub enum DeviceStatus {
+   |          ------------ variants in this enum
+17 |     Reset = 0,
+   |     ^^^^^
+18 |     Acknowledge = 1,
+   |     ^^^^^^^^^^^
+19 |     Driver = 2,
+   |     ^^^^^^
+20 |     DriverOk = 4,
+21 |     FeaturesOk = 8,
+   |     ^^^^^^^^^^
+22 |     Failed = 128,
+   |     ^^^^^^
+   |
+   = note: `DeviceStatus` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+error: variables can be used directly in the `format!` string
+   --> enlil-platform\src\time\mod.rs:205:9
+    |
+205 |         log::info!("TSC frequency calibrated via CPUID 0x15: {} Hz ({}.{:02} GHz)", freq, ghz_int, ghz_frac);
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
+    = note: `#[forbid(clippy::uninlined_format_args)]` implied by `#[forbid(clippy::pedantic)]`
+help: change this to
+    |
+205 -         log::info!("TSC frequency calibrated via CPUID 0x15: {} Hz ({}.{:02} GHz)", freq, ghz_int, ghz_frac);
+205 +         log::info!("TSC frequency calibrated via CPUID 0x15: {freq} Hz ({ghz_int}.{ghz_frac:02} GHz)");
+    |
+
+error: this could be a `const fn`
+   --> enlil-platform\src\io\mod.rs:275:5
+    |
+275 | /     fn write_byte(&mut self, byte: u8) {
+276 | |         // Calculate pixel position from character cell position
+277 | |         let pixel_x = self.cursor_col * Self::CHAR_WIDTH;
+278 | |         let pixel_y = self.cursor_row * Self::CHAR_HEIGHT;
+...   |
+290 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#missing_const_for_fn
+    = note: `#[forbid(clippy::missing_const_for_fn)]` implied by `#[forbid(clippy::nursery)]`
+help: make the function `const`
+    |
+275 |     const fn write_byte(&mut self, byte: u8) {
+    |     +++++
+
+error: this parameter is a mutable reference but is not used mutably
+   --> enlil-platform\src\io\mod.rs:275:19
+    |
+275 |     fn write_byte(&mut self, byte: u8) {
+    |                   ^----^^^^
+    |                    |
+    |                    help: consider removing this `mut`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#needless_pass_by_ref_mut
+    = note: `#[forbid(clippy::needless_pass_by_ref_mut)]` implied by `#[forbid(clippy::nursery)]`
+
+warning: `enlil-platform` (lib) generated 1 warning
+error: could not compile `enlil-platform` (lib) due to 16 previous errors; 1 warning emitted
+warning: build failed, waiting for other jobs to finish...
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> enlil-devices\src\display\mod.rs:120:13
+    |
+120 |     frames: Arc<RwLock<VecDeque<(u64, Vec<u8>)>>>,
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#type_complexity
+    = note: `#[warn(clippy::type_complexity)]` on by default
+
+error: temporary with significant `Drop` can be early dropped
+   --> enlil-platform\src\sync\mod.rs:819:13
+    |
+807 |       fn condvar_wait_notify() {
+    |  ______________________________-
+808 | |         let pair = Arc::new((Mutex::new(false), Condvar::new()));
+809 | |         let pair2 = Arc::clone(&pair);
+...   |
+819 | |         let guard = lock.lock();
+    | |             ^^^^^
+...   |
+822 | |         handle.join().unwrap();
+823 | |     }
+    | |_____- temporary `guard` is currently being dropped at the end of its contained scope
+    |
+    = note: this might lead to unnecessary resource contention
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#significant_drop_tightening
+help: merge the temporary construction with its single usage
+    |
+819 ~         
+820 +         let guard = lock.lock().wait_while(guard, |started| !*started);
+821 ~         
+    |
+
+error: temporary with significant `Drop` can be early dropped
+   --> enlil-platform\src\sync\mod.rs:820:13
+    |
+807 |       fn condvar_wait_notify() {
+    |  ______________________________-
+808 | |         let pair = Arc::new((Mutex::new(false), Condvar::new()));
+809 | |         let pair2 = Arc::clone(&pair);
+...   |
+820 | |         let guard = cvar.wait_while(guard, |started| !*started);
+    | |             ^^^^^
+821 | |         assert!(*guard);
+822 | |         handle.join().unwrap();
+823 | |     }
+    | |_____- temporary `guard` is currently being dropped at the end of its contained scope
+    |
+    = note: this might lead to unnecessary resource contention
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#significant_drop_tightening
+help: drop the temporary after the end of its last usage
+    |
+821 ~         assert!(*guard)
+822 ~         drop(guard);;
+    |
+
+error: temporary with significant `Drop` can be early dropped
+   --> enlil-platform\src\sync\mod.rs:813:21
+    |
+811 |           let handle = std::thread::spawn(move || {
+    |  _________________________________________________-
+812 | |             let (lock, cvar) = &*pair2;
+813 | |             let mut started = lock.lock();
+    | |                     ^^^^^^^
+814 | |             *started = true;
+815 | |             cvar.notify_one();
+816 | |         });
+    | |_________- temporary `started` is currently being dropped at the end of its contained scope
+    |
+    = note: this might lead to unnecessary resource contention
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#significant_drop_tightening
+help: drop the temporary after the end of its last usage
+    |
+814 ~             *started = true;
+815 +             drop(started);
+    |
+
+error: temporary with significant `Drop` can be early dropped
+   --> enlil-platform\src\async_rt\mod.rs:448:13
+    |
+432 |       fn priority_executor_respects_order() {
+    |  ___________________________________________-
+433 | |         let exec = PriorityExecutor::new();
+434 | |         let order = Arc::new(Mutex::new(Vec::new()));
+...   |
+448 | |         let result = order.lock().unwrap();
+    | |             ^^^^^^
+449 | |         assert_eq!(*result, vec!["high", "normal", "low"]);
+450 | |     }
+    | |_____- temporary `result` is currently being dropped at the end of its contained scope
+    |
+    = note: this might lead to unnecessary resource contention
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#significant_drop_tightening
+help: drop the temporary after the end of its last usage
+   --> C:\Users\physi\.rustup\toolchains\nightly-x86_64-pc-windows-msvc\lib/rustlib/src/rust\library\core\src\macros\mod.rs:54:10
+    |
+ 54 ~         }
+ 55 +         drop(result);
+    |
+
+error: temporary with significant `Drop` can be early dropped
+   --> enlil-platform\src\async_rt\mod.rs:478:13
+    |
+453 |       fn priority_executor_mixed() {
+    |  __________________________________-
+454 | |         let exec = PriorityExecutor::new();
+455 | |         let order = Arc::new(Mutex::new(Vec::new()));
+...   |
+478 | |         let result = order.lock().unwrap();
+    | |             ^^^^^^
+...   |
+482 | |         );
+483 | |     }
+    | |_____- temporary `result` is currently being dropped at the end of its contained scope
+    |
+    = note: this might lead to unnecessary resource contention
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#significant_drop_tightening
+help: drop the temporary after the end of its last usage
+   --> C:\Users\physi\.rustup\toolchains\nightly-x86_64-pc-windows-msvc\lib/rustlib/src/rust\library\core\src\macros\mod.rs:54:10
+    |
+ 54 ~         }
+ 55 +         drop(result);
+    |
+
+warning: `enlil-platform` (lib test) generated 1 warning (1 duplicate)
+error: could not compile `enlil-platform` (lib test) due to 21 previous errors; 1 warning emitted
+warning: `enlil-devices` (lib) generated 13 warnings
+warning: field `pending_bits` is never read
+  --> enlil-devices\src\interrupt\msi.rs:80:9
+   |
+66 | pub struct MsiCapability {
+   |            ------------- field in this struct
+...
+80 |     pub pending_bits: u32,
+   |         ^^^^^^^^^^^^
+   |
+   = note: `MsiCapability` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field assignment outside of initializer for an instance created with Default::default()
+   --> enlil-devices\src\display\mod.rs:798:9
+    |
+798 |         config.width = 1920;
+    |         ^^^^^^^^^^^^^^^^^^^^
+    |
+note: consider initializing the variable with `display::DisplayConfig { width: 1920, height: 1080, ..Default::default() }` and removing relevant reassignments
+   --> enlil-devices\src\display\mod.rs:797:9
+    |
+797 |         let mut config = DisplayConfig::default();
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#field_reassign_with_default
+    = note: `#[warn(clippy::field_reassign_with_default)]` on by default
+
+warning: `enlil-devices` (lib test) generated 5 warnings (3 duplicates)

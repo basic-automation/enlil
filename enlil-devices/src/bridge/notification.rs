@@ -20,6 +20,11 @@ pub struct Notification {
 }
 
 impl Notification {
+    /// Creates a new notification with the current system time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the system time is before the UNIX epoch.
     pub fn new(
         id: u64,
         source_guest: String,
@@ -81,6 +86,12 @@ pub struct NotificationRouter {
     notification_history: HashMap<String, Vec<u64>>,
 }
 
+impl Default for NotificationRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NotificationRouter {
     pub fn new() -> Self {
         Self {
@@ -91,10 +102,15 @@ impl NotificationRouter {
 
     pub fn set_policy(&mut self, guest: String, policy: NotificationPolicy) {
         self.policies.insert(guest.clone(), policy);
-        self.notification_history.entry(guest).or_insert_with(Vec::new);
+        self.notification_history.entry(guest).or_default();
     }
 
-    pub fn route(&mut self, notif: Notification) -> Vec<String> {
+    /// Routes a notification to eligible guests.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the system time is before the UNIX epoch.
+    pub fn route(&mut self, notif: &Notification) -> Vec<String> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -105,13 +121,13 @@ impl NotificationRouter {
             if guest == &notif.source_guest {
                 continue;
             }
-            if !policy.is_allowed(&notif) {
+            if !policy.is_allowed(notif) {
                 continue;
             }
 
             let history = self.notification_history.get_mut(guest).unwrap();
             let recent = history.iter().filter(|&&ts| now - ts < 60).count();
-            if recent as u32 >= policy.max_per_minute {
+            if u32::try_from(recent).unwrap_or(u32::MAX) >= policy.max_per_minute {
                 continue;
             }
 
@@ -183,7 +199,7 @@ mod tests {
         router.set_policy("guest2".to_string(), NotificationPolicy::new(Urgency::Critical, 100));
         
         let notif = Notification::new(1, "sender".to_string(), "t".to_string(), "b".to_string(), Urgency::Normal, "app".to_string());
-        let recipients = router.route(notif);
+        let recipients = router.route(&notif);
         
         assert_eq!(recipients.len(), 1);
         assert_eq!(recipients[0], "guest1");
@@ -192,16 +208,16 @@ mod tests {
     #[test]
     fn test_router_respects_max_per_minute() {
         let mut router = NotificationRouter::new();
-        let mut policy = NotificationPolicy::new(Urgency::Low, 1);
+        let policy = NotificationPolicy::new(Urgency::Low, 1);
         router.set_policy("guest1".to_string(), policy);
         
         let notif1 = Notification::new(1, "sender".to_string(), "t".to_string(), "b".to_string(), Urgency::Normal, "app".to_string());
         let notif2 = Notification::new(2, "sender".to_string(), "t".to_string(), "b".to_string(), Urgency::Normal, "app".to_string());
         
-        let r1 = router.route(notif1);
+        let r1 = router.route(&notif1);
         assert_eq!(r1.len(), 1);
         
-        let r2 = router.route(notif2);
+        let r2 = router.route(&notif2);
         assert_eq!(r2.len(), 0);
     }
 }

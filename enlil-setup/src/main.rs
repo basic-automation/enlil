@@ -1,3 +1,5 @@
+#![deny(clippy::all, clippy::pedantic, clippy::nursery)]
+
 //! Enlil first-run setup wizard.
 //!
 //! Runs as the first guest (tiny Linux initramfs) and walks the user through
@@ -54,6 +56,7 @@ fn format_list(items: &[String]) -> String {
 ///
 /// On Linux this will eventually read from `/sys` and `/proc`.
 /// Everywhere else it returns dummy data for development.
+#[must_use]
 pub fn detect_hardware() -> HardwareInfo {
     #[cfg(target_os = "linux")]
     {
@@ -124,6 +127,7 @@ pub struct SetupConfig {
 /// Interactive wizard that walks the user through resource allocation.
 ///
 /// Phase 0: returns a hard-coded two-guest example.
+#[must_use]
 pub fn run_wizard(hw: &HardwareInfo) -> SetupConfig {
     // TODO: actual TUI prompts
     let _ = hw;
@@ -153,6 +157,10 @@ pub fn run_wizard(hw: &HardwareInfo) -> SetupConfig {
 }
 
 /// Serialize a [`SetupConfig`] to TOML.
+///
+/// # Errors
+///
+/// Returns an error if TOML serialization fails.
 pub fn generate_config(config: &SetupConfig) -> Result<String> {
     Ok(toml::to_string_pretty(config)?)
 }

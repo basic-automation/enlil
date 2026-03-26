@@ -145,7 +145,7 @@ impl VirtualSwitch {
         self.learn(src_mac, src_port);
 
         // Age out old entries periodically (cheap check).
-        if self.stats.frames_in % 1000 == 0 {
+        if self.stats.frames_in.is_multiple_of(1000) {
             self.age_entries();
         }
 

@@ -1,0 +1,448 @@
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 3 tests
+test validate::tests::detects_cpu_overlap ... ok
+test validate::tests::detects_zero_memory ... ok
+test validate::tests::valid_config_passes ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 97 tests
+test affinity::tests::affinity_mask_basics ... ok
+test affinity::tests::affinity_mask_add_remove ... ok
+test affinity::tests::pin_empty_mask_fails ... ok
+test affinity::tests::affinity_mask_from_cores ... ok
+test affinity::tests::pin_unsupported_on_non_linux ... ok
+test affinity::tests::affinity_mask_display ... ok
+test cpuid::tests::custom_vendor_string ... ok
+test cpuid::tests::filter_with_topology ... ok
+test cpuid::tests::generate_topology_entries_per_vcpu ... ok
+test affinity::tests::online_cpus_nonzero ... ok
+test cpuid::tests::hides_hypervisor_leaves ... ok
+test ept::tests::dirty_tracking ... ok
+test cpuid::tests::leaf_0xb_topology ... ok
+test ept::tests::reject_duplicate_mapping ... ok
+test ept::tests::reject_misaligned_gpa ... ok
+test ept::tests::unmap ... ok
+test memory::tests::accounting_after_deallocate ... ok
+test cpuid::tests::hides_hypervisor_bit ... ok
+test ept::tests::dirty_tracking_disabled_by_default ... ok
+test ept::tests::handle_ept_violation_cow ... ok
+test ept::tests::idempotent_write_protect ... ok
+test ept::tests::map_2mb_page ... ok
+test ept::tests::map_range_falls_back_to_4k ... ok
+test ept::tests::map_range_uses_large_pages ... ok
+test memory::tests::allocate_after_deallocate_reuses_space ... ok
+test memory::tests::allocate_exact_remaining ... ok
+test ept::tests::stats_tracking ... ok
+test memory::tests::allocate_one_byte_over_fails ... ok
+test cpuid::tests::topology_simple_creation ... ok
+test ept::tests::write_protect_all_and_clear_all ... ok
+test ept::tests::write_protect_and_clear ... ok
+test ept::tests::basic_map_and_lookup ... ok
+test memory::tests::allocate_two_guests ... ok
+test memory::tests::align_up_basics ... ok
+test cpuid::tests::reports_correct_cpu_count ... ok
+test affinity::tests::launch_vcpu_thread_runs ... ok
+test cpuid::tests::show_hypervisor_when_not_hidden ... [guest0] test line
+ok
+test memory::tests::allocation_size_rounded_to_2mb ... ok
+test memory::tests::allocate_single_guest ... ok
+test memory::tests::accounting_consistent ... ok
+test memory::tests::deallocate_and_reallocate_larger_falls_back_to_bump ... ok
+test memory::tests::deallocate_frees_memory ... ok
+test memory::tests::deallocate_nonexistent_errors ... ok
+test memory::tests::free_list_coalescing ... ok
+test memory::tests::get_region_found ... ok
+test memory::tests::get_region_not_found ... ok
+test memory::tests::memory_map_created_on_allocate ... ok
+test memory::tests::memory_map_removed_on_deallocate ... ok
+test memory::tests::memory_map_translate_gpa_to_hpa ... ok
+test memory::tests::multiple_guests_isolated_address_spaces ... ok
+test memory::tests::page_size_constant ... ok
+test memory::tests::reject_duplicate_guest_id ... ok
+test memory::tests::reject_overcommit ... ok
+test memory::tests::reserved_bytes_aligned ... ok
+test memory::tests::zero_size_allocation_rounds_to_large_page ... ok
+test serial::tests::test_buffer_mode_collects_bytes ... ok
+test serial::tests::test_buffer_take ... ok
+test serial::tests::test_multiplexer_add_remove_guest ... ok
+test serial::tests::test_multiplexer_guest_isolation ... ok
+test serial::tests::test_multiplexer_inject_and_drain ... ok
+test serial::tests::test_multiplexer_routes_rx_to_correct_guest ... ok
+test serial::tests::test_multiplexer_routes_tx_to_correct_guest ... ok
+test serial::tests::test_multiplexer_unknown_guest_returns_ff ... ok
+test serial::tests::test_null_mode_discards_output ... ok
+test serial::tests::test_shared_multiplexer ... ok
+test serial::tests::test_stdout_mode_does_not_panic ... ok
+test serial::tests::test_uart_divisor_latch ... ok
+test serial::tests::test_uart_ier_masked_to_4_bits ... ok
+test serial::tests::test_uart_lcr_roundtrip ... ok
+test serial::tests::test_uart_lsr_reports_rx_available ... ok
+test serial::tests::test_uart_lsr_reports_tx_ready ... ok
+test serial::tests::test_uart_read_data_returns_zero_when_empty ... ok
+test serial::tests::test_uart_rx_fifo_ordering ... ok
+test serial::tests::test_uart_scratch_register ... ok
+test serial::tests::test_uart_tx_goes_to_output ... ok
+test serial::tests::test_file_mode_writes_to_file ... ok
+test vcpu::tests::create_vcpu_manager ... ok
+test vcpu::tests::explicit_dedicated_policy ... ok
+test vcpu::tests::explicit_timeslice_policy ... ok
+test vcpu::tests::initial_state_is_created ... ok
+test vcpu::tests::plan_is_stored ... ok
+test vcpu::tests::resolve_dedicated_when_cores_available ... ok
+test vcpu::tests::resolve_timeslice_when_cores_unavailable ... ok
+test vcpu::tests::start_all_stop_all ... ok
+test vcpu::tests::start_pause_stop_lifecycle ... ok
+test vcpu::tests::timeslice_scheduler_add_remove ... ok
+test vcpu::tests::timeslice_scheduler_context_save_restore ... ok
+test vcpu::tests::timeslice_scheduler_empty_queue ... ok
+test vcpu::tests::timeslice_scheduler_round_robin ... ok
+test vcpu::tests::vcpu_context_default ... ok
+test vm::tests::create_vm ... ok
+test vm::tests::hypervisor_manages_multiple_vms ... ok
+test vm::tests::hypervisor_serial_routing ... ok
+test vm::tests::reject_empty_cpus ... ok
+test vm::tests::reject_zero_memory ... ok
+test vm::tests::vm_exposes_physical_cores ... ok
+test vm::tests::vm_state_transitions ... ok
+
+test result: ok. 97 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 159 tests
+test block::tests::test_config_read ... ok
+test block::tests::test_get_id ... ok
+test block::tests::test_unsupported_request ... ok
+test bridge::clipboard::tests::test_clipboard_content_type ... ok
+test bridge::clipboard::tests::test_hub_write_and_read ... ok
+test block::tests::test_readonly_device ... ok
+test bridge::clipboard::tests::test_clipboard_content_size ... ok
+test bridge::dragdrop::tests::test_drag_state_transitions ... ok
+test bridge::dragdrop::tests::test_invalid_state_transitions ... ok
+test bridge::notification::tests::test_notification_creation ... ok
+test bridge::notification::tests::test_policy_urgency_threshold ... ok
+test bridge::clipboard::tests::test_hub_policy_enforcement ... ok
+test block::tests::test_read_write ... ok
+test bridge::clipboard::tests::test_policy_default ... ok
+test bridge::dragdrop::tests::test_drag_payload_creation ... ok
+test block::tests::test_flush ... ok
+test bridge::dragdrop::tests::test_hover_validation_mime_type ... ok
+test block::tests::test_discard ... ok
+test bridge::transport::tests::test_bridge_message_creation ... ok
+test bridge::transport::tests::test_bridge_message_length_mismatch ... ok
+test bridge::notification::tests::test_policy_blocked_and_allowed_apps ... ok
+test bridge::notification::tests::test_router_respects_max_per_minute ... ok
+test bridge::clipboard::tests::test_hub_history_ring_buffer ... ok
+test bridge::notification::tests::test_router_routes_by_policy ... ok
+test bridge::notification::tests::test_urgency_ordering ... ok
+test bridge::clipboard::tests::test_policy_allows ... ok
+test bridge::transport::tests::test_bridge_channel_all ... ok
+test block::tests::test_stats ... ok
+test bridge::transport::tests::test_bridge_channel_queue_index ... ok
+test bridge::dragdrop::tests::test_payload_with_thumbnail ... ok
+test bridge::transport::tests::test_bridge_message_serialization ... ok
+test bridge::clipboard::tests::test_clipboard_entry_fields ... ok
+test bridge::transport::tests::test_guest_id_creation ... ok
+test bridge::transport::tests::test_local_virtio_transport_is_ready ... ok
+test bridge::transport::tests::test_local_virtio_transport_all_queues_full ... ok
+test bridge::transport::tests::test_local_virtio_transport_queue_full ... ok
+test bridge::transport::tests::test_local_virtio_transport_queue_depth ... ok
+test bridge::transport::tests::test_local_virtio_transport_round_robin ... ok
+test bridge::transport::tests::test_local_virtio_transport_send_recv ... ok
+test bridge::transport::tests::test_message_header_invalid_channel ... ok
+test bridge::transport::tests::test_message_header_serialization ... ok
+test interrupt::ioapic::tests::ioapic_masked_irq_not_delivered ... ok
+test bridge::transport::tests::test_virtio_bridge_device_send_recv ... ok
+test interrupt::ioapic::tests::ioapic_unmasked_irq_delivered ... ok
+test display::tests::test_display_mode_transitions ... ok
+test display::tests::test_display_config_serde ... ok
+test display::tests::test_focus_state ... ok
+test display::tests::test_ivshmem_source ... ok
+test display::tests::test_input_router ... ok
+test display::tests::test_mouse_position_tracking ... ok
+test display::tests::test_picture_in_picture ... ok
+test display::tests::test_pixel_format_bytes ... ok
+test display::tests::test_virtio_gpu_source ... ok
+test display::tests::test_source_registration ... ok
+test display::tests::test_zone_contains_point ... ok
+test display::tests::test_zone_layout ... ok
+test display::tests::test_zone_layout_engine ... ok
+test interrupt::controller::tests::test_create_controller ... ok
+test interrupt::controller::tests::test_deliver_msi ... ok
+test interrupt::controller::tests::test_eoi ... ok
+test interrupt::ioapic::tests::ioapic_base_address ... ok
+test interrupt::ioapic::tests::ioapic_default_entries_masked ... ok
+test interrupt::ioapic::tests::ioapic_level_triggered_eoi ... ok
+test interrupt::ioapic::tests::ioapic_read_version ... ok
+test display::tests::test_compositor_resize ... ok
+test display::tests::test_frame_ref_creation ... ok
+test interrupt::msi::tests::test_msi_capability_message_for_vector ... ok
+test interrupt::ioapic::tests::ioapic_write_read_rte ... ok
+test interrupt::msi::tests::test_msi_capability_creation ... ok
+test interrupt::msi::tests::test_msi_capability_vector_masking ... ok
+test interrupt::msi::tests::test_msi_message_fields ... ok
+test interrupt::msi::tests::test_msi_message_logical_dest ... ok
+test interrupt::msi::tests::test_msix_capability ... ok
+test interrupt::msi::tests::test_msix_pending_bits ... ok
+test interrupt::msi::tests::test_msix_table_entry_vector_control ... ok
+test net::backend::tests::loopback_backend_roundtrip ... ok
+test net::backend::tests::pipe_backend_pair ... ok
+test net::device::tests::device_status_values ... ok
+test net::device::tests::test_activate_and_reset ... ok
+test net::device::tests::test_backend_name ... ok
+test net::device::tests::test_create_device ... ok
+test net::device::tests::test_inject_rx ... ok
+test net::device::tests::test_tx_processing ... ok
+test net::device::tests::test_tx_too_short ... ok
+test net::features::tests::default_features ... ok
+test net::features::tests::display ... ok
+test net::features::tests::negotiate_features ... ok
+test net::features::tests::with_and_without ... ok
+test net::header::tests::empty_header_roundtrip ... ok
+test net::header::tests::flag_constants_are_defined ... ok
+test net::header::tests::gso_type_roundtrip ... ok
+test net::header::tests::header_with_csum ... ok
+test net::header::tests::header_without_merge ... ok
+test net::header::tests::parse_too_short ... ok
+test net::switch::tests::add_and_remove_ports ... ok
+test net::switch::tests::broadcast_floods_all_ports ... ok
+test net::switch::tests::flush_fdb ... ok
+test net::switch::tests::short_frame_dropped ... ok
+test net::switch::tests::unicast_learning_and_forwarding ... ok
+test bridge::shared_fs::tests::test_add_and_get_transfer ... ok
+test net::virtqueue::tests::basic_push_pop ... ok
+test net::virtqueue::tests::queue_empty ... ok
+test net::virtqueue::tests::queue_full ... ok
+test net::virtqueue::tests::reset ... ok
+test net::virtqueue::tests::used_ring ... ok
+test storage::tests::memory_backend_capacity ... ok
+test storage::tests::memory_backend_read_past_end ... ok
+test storage::qcow::tests::parse_qcow2_header ... ok
+test storage::tests::memory_backend_read_write ... ok
+test storage::tests::memory_backend_readonly ... ok
+test storage::tests::memory_backend_trim ... ok
+test storage::tests::memory_backend_write_past_end ... ok
+test timer::hpet::tests::test_counter_advances_when_enabled ... ok
+test timer::hpet::tests::test_counter_halted_when_disabled ... ok
+test timer::hpet::tests::test_counter_not_writable_when_running ... ok
+test timer::hpet::tests::test_counter_writable_when_halted ... ok
+test bridge::shared_fs::tests::test_manager_creation ... ok
+test timer::hpet::tests::test_hpet_creation ... ok
+test timer::hpet::tests::test_hpet_enable_disable ... ok
+test timer::hpet::tests::test_interrupt_status_clear ... ok
+test timer::hpet::tests::test_legacy_routing ... ok
+test timer::hpet::tests::test_one_shot_timer ... ok
+test timer::hpet::tests::test_periodic_timer ... ok
+test timer::hpet::tests::test_read_capabilities ... ok
+test timer::hpet::tests::test_reset ... ok
+test timer::paravirt::tests::hyperv_tsc_invalidate ... ok
+test timer::paravirt::tests::hyperv_tsc_scale ... ok
+test timer::paravirt::tests::hyperv_tsc_update ... ok
+test timer::paravirt::tests::kvm_clock_mul_shift ... ok
+test timer::paravirt::tests::kvm_clock_update ... ok
+test timer::paravirt::tests::kvm_clock_version_increments ... ok
+test timer::pit::tests::test_pit_channel0_frequency ... ok
+test timer::pit::tests::test_pit_command_write ... ok
+test timer::pit::tests::test_pit_count_write ... ok
+test timer::pit::tests::test_pit_creation ... ok
+test bridge::shared_fs::tests::test_space_tracking ... ok
+test timer::pit::tests::test_pit_latch ... ok
+test timer::pit::tests::test_pit_tick_generates_irq ... ok
+test timer::tsc::tests::test_invalid_vcpu ... ok
+test timer::tsc::tests::test_set_guest_tsc ... ok
+test timer::tsc::tests::test_tsc_manager_creation ... ok
+test timer::tsc::tests::test_tsc_no_scaling ... ok
+test timer::tsc::tests::test_tsc_with_scaling ... ok
+test timer::tsc::tests::test_vmcs_offset ... ok
+test virtio::transport::tests::device_id_and_vendor ... ok
+test virtio::transport::tests::feature_negotiation ... ok
+test bridge::shared_fs::tests::test_stage_clipboard ... ok
+test virtio::transport::tests::interrupt_handling ... ok
+test virtio::transport::tests::magic_and_version ... ok
+test virtio::transport::tests::queue_configuration ... ok
+test virtio::transport::tests::status_lifecycle ... ok
+test bridge::shared_fs::tests::test_clean_temp_dirs ... ok
+test storage::raw::tests::test_open_readonly ... ok
+test storage::raw::tests::test_create_and_rw ... ok
+test display::tests::test_compositor_owned_source ... ok
+test storage::qcow::tests::read_allocated_cluster ... ok
+test storage::qcow::tests::write_rejected ... ok
+test storage::qcow::tests::read_unallocated_returns_zeroes ... ok
+test storage::qcow::tests::invalid_magic_rejected ... ok
+
+test result: ok. 159 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 9 tests
+test tests::dummy_backend_create_and_run ... ok
+test tests::dummy_backend_inject_interrupt ... ok
+test tests::vcpu_config_defaults ... ok
+test tests::dummy_backend_map_memory ... ok
+test tests::hal_error_display ... ok
+test tests::vcpu_config_clone ... ok
+test tests::dummy_backend_is_send_sync ... ok
+test tests::vm_exit_display ... ok
+test tests::vm_exit_equality ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 74 tests
+test output
+hello serialtest async_rt::tests::block_on_resolves_immediately ... ok
+test async_rt::tests::executor_runs_simple_task ... ok
+test async_rt::tests::priority_executor_respects_order ... ok
+test async_rt::tests::executor_is_idle_after_completion ... ok
+test io::tests::framebuffer_console_creation ... ok
+test io::tests::console_init ... ok
+test io::tests::console_write ... ok
+test async_rt::tests::priority_executor_mixed ... ok
+test io::tests::serial_port_io_trait ... ok
+test memory::tests::bitmap_allocator_basic ... ok
+test memory::tests::buddy_allocator_large_block ... ok
+test memory::tests::buddy_allocator_multiple ... ok
+test memory::tests::slab_cache_basic ... ok
+test io::tests::serial_port_creation ... ok
+test sync::tests::channel_basic ... ok
+test sync::tests::channel_recv_disconnected ... ok
+test memory::tests::buddy_allocator_basic ... ok
+test memory::tests::physaddr_basic ... ok
+test memory::tests::physframe_containing_address ... ok
+test memory::tests::platform_allocator_stats ... ok
+test io::tests::platform_logger_creation ... ok
+test memory::tests::slab_cache_multiple ... ok
+test memory::tests::virtaddr_basic ... ok
+test sync::tests::rwlock_basic ... ok
+test sync::tests::channel_bounded_blocking ... ok
+test sync::tests::channel_try_recv_empty ... ok
+test async_rt::tests::executor_runs_multiple_tasks ... ok
+test memory::tests::bitmap_allocator_exhaustion ... ok
+test sync::tests::mutex_basic ... ok
+test sync::tests::mutex_try_lock ... ok
+test threading::scheduler::tests::least_loaded_balancing ... ok
+test async_rt::tests::reactor_creation ... ok
+test sync::tests::condvar_notify ... ok
+test io::tests::framebuffer_io_trait ... ok
+test sync::tests::channel_mpsc ... ok
+test sync::tests::condvar_wait_notify ... ok
+test threading::scheduler::tests::run_queue_priority_ordering ... ok
+test threading::scheduler::tests::scheduler_lifecycle ... ok
+test threading::tests::bare_metal_debug ... ok
+test threading::tests::bare_metal_pinned_affinity ... ok
+test threading::tests::bare_metal_pinned_out_of_range ... ok
+test threading::tests::bare_metal_set_affinity ... ok
+test threading::scheduler::tests::run_queue_fifo_within_priority ... ok
+test threading::scheduler::tests::task_execution ... ok
+test threading::scheduler::tests::work_stealing ... ok
+test threading::tests::affinity_default_is_any ... ok
+test threading::scheduler::tests::steal_respects_threshold ... ok
+test sync::tests::mutex_threaded ... ok
+test threading::tests::bare_metal_submit_and_run ... ok
+test sync::tests::rwlock_concurrent_readers ... ok
+test threading::tests::bare_metal_work_stealing ... ok
+test threading::tests::cpu_local_init_and_read ... ok
+test threading::tests::cpu_local_tick ... ok
+test threading::tests::priority_default_is_normal ... ok
+test threading::tests::priority_display ... ok
+test threading::tests::priority_from_u8_roundtrip ... ok
+test threading::tests::priority_ordering ... ok
+test threading::tests::runqueue_debug ... ok
+test threading::tests::runqueue_fifo_within_priority ... ok
+test threading::tests::runqueue_push_pop_priority_order ... ok
+test threading::tests::runqueue_steal_prefers_low_priority ... ok
+test threading::tests::runqueue_steal_takes_from_back ... ok
+test threading::tests::task_debug_format ... ok
+test threading::tests::task_run_once ... ok
+test threading::tests::spawn_hosted_runs_closure ... ok
+test time::tests::instant_add_duration ... ok
+test time::tests::instant_now_is_monotonic ... ok
+test time::tests::tsc_calibration_from_cpuid ... ok
+test time::tests::tsc_frequency_default_zero ... ok
+test time::tests::instant_elapsed ... ok
+test time::tests::instant_duration_since ... ok
+test time::tests::instant_sub ... ok
+test time::tests::stopwatch_basic ... ok
+test time::tests::sleep_works ... ok
+
+test result: ok. 74 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+
+running 7 tests
+test tests::detect_hardware_returns_valid_info ... ok
+test tests::format_list_items ... ok
+test tests::format_list_empty ... ok
+test tests::hardware_info_display ... ok
+test tests::wizard_allocations_fit_hardware ... ok
+test tests::wizard_produces_guests ... ok
+test tests::generate_config_produces_valid_toml ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 4 tests
+test thread::tests::spawn_and_join ... ok
+test thread::tests::spawn_string_result ... ok
+test thread::tests::spawn_with_move ... ok
+test thread::tests::spawn_multiple_threads ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 7 tests
+Phase 1.11 milestone: println! works through platform layer
+test async_await_block_on ... ok
+test println_works ... ok
+test channel_communication ... ok
+test vec_and_hashmap ... ok
+test thread_spawn_and_join ... ok
+test mutex_shared_across_threads ... ok
+test instant_monotonic ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

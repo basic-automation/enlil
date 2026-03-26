@@ -7,21 +7,18 @@ use std::collections::HashMap;
 use std::fmt;
 
 /// How vCPUs are scheduled onto physical cores.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub enum SchedulingPolicy {
     /// 1:1 pinning — each vCPU gets an exclusive physical core.
     Dedicated,
     /// Multiple vCPUs share a physical core with time-slicing.
     TimeSlice { quantum_ms: u32 },
     /// Dedicate when possible, timeslice the remainder.
+    #[default]
     Auto,
 }
 
-impl Default for SchedulingPolicy {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
 
 /// Default time-slice quantum in milliseconds.
 pub const DEFAULT_QUANTUM_MS: u32 = 10;
@@ -36,7 +33,7 @@ pub struct VcpuConfig {
 }
 
 /// Runtime state of a vCPU.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VcpuState {
     Created,
     Running,
@@ -56,7 +53,7 @@ impl fmt::Display for VcpuState {
 }
 
 /// Describes how a vCPU is bound to a physical core.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AffinityBinding {
     /// Exclusive 1:1 pin to a physical core.
     Pinned { physical_core: u32 },
@@ -145,15 +142,16 @@ pub struct TimeSliceScheduler {
     pub physical_core: u32,
     /// Time quantum per vCPU in milliseconds.
     pub quantum_ms: u32,
-    /// Queue of (guest_id, vcpu_id) waiting to run.
+    /// Queue of (`guest_id`, `vcpu_id`) waiting to run.
     run_queue: Vec<(String, u32)>,
     /// Index of the currently running vCPU in the queue.
     current: usize,
-    /// Saved contexts for each vCPU, keyed by (guest_id, vcpu_id).
+    /// Saved contexts for each vCPU, keyed by (`guest_id`, `vcpu_id`).
     contexts: HashMap<(String, u32), VcpuContext>,
 }
 
 impl TimeSliceScheduler {
+    #[must_use]
     pub fn new(physical_core: u32, quantum_ms: u32) -> Self {
         Self {
             physical_core,
@@ -189,6 +187,7 @@ impl TimeSliceScheduler {
     }
 
     /// Get the currently scheduled vCPU.
+    #[must_use]
     pub fn current_vcpu(&self) -> Option<&(String, u32)> {
         self.run_queue.get(self.current)
     }
@@ -209,12 +208,14 @@ impl TimeSliceScheduler {
     }
 
     /// Get saved context for a vCPU.
+    #[must_use]
     pub fn get_context(&self, guest_id: &str, vcpu_id: u32) -> Option<&VcpuContext> {
         self.contexts.get(&(guest_id.to_string(), vcpu_id))
     }
 
     /// Number of vCPUs sharing this core.
-    pub fn vcpu_count(&self) -> usize {
+    #[must_use]
+    pub const fn vcpu_count(&self) -> usize {
         self.run_queue.len()
     }
 }
@@ -230,6 +231,7 @@ pub struct VcpuManager {
 
 impl VcpuManager {
     /// Create a new vCPU manager from a list of physical core assignments.
+    #[must_use]
     pub fn new(guest_id: &str, cores: &[u32], policy: SchedulingPolicy) -> Self {
         let configs: Vec<VcpuConfig> = cores
             .iter()
@@ -249,23 +251,28 @@ impl VcpuManager {
         }
     }
 
+    #[must_use]
     pub fn guest_id(&self) -> &str {
         &self.guest_id
     }
 
-    pub fn count(&self) -> usize {
+    #[must_use]
+    pub const fn count(&self) -> usize {
         self.configs.len()
     }
 
-    pub fn policy(&self) -> &SchedulingPolicy {
+    #[must_use]
+    pub const fn policy(&self) -> &SchedulingPolicy {
         &self.policy
     }
 
+    #[must_use]
     pub fn configs(&self) -> &[VcpuConfig] {
         &self.configs
     }
 
     /// Get the state of a specific vCPU.
+    #[must_use]
     pub fn get_state(&self, vcpu_id: u32) -> Option<VcpuState> {
         self.states.get(vcpu_id as usize).copied()
     }
@@ -273,35 +280,35 @@ impl VcpuManager {
     /// Transition a vCPU to Running.
     pub fn start_vcpu(&mut self, vcpu_id: u32) -> Result<(), String> {
         let state = self.states.get_mut(vcpu_id as usize)
-            .ok_or_else(|| format!("vCPU {} not found", vcpu_id))?;
+            .ok_or_else(|| format!("vCPU {vcpu_id} not found"))?;
         match *state {
             VcpuState::Created | VcpuState::Paused => {
                 *state = VcpuState::Running;
                 Ok(())
             }
             VcpuState::Running => Ok(()), // already running
-            VcpuState::Stopped => Err(format!("vCPU {} is stopped, cannot start", vcpu_id)),
+            VcpuState::Stopped => Err(format!("vCPU {vcpu_id} is stopped, cannot start")),
         }
     }
 
     /// Pause a running vCPU.
     pub fn pause_vcpu(&mut self, vcpu_id: u32) -> Result<(), String> {
         let state = self.states.get_mut(vcpu_id as usize)
-            .ok_or_else(|| format!("vCPU {} not found", vcpu_id))?;
+            .ok_or_else(|| format!("vCPU {vcpu_id} not found"))?;
         match *state {
             VcpuState::Running => {
                 *state = VcpuState::Paused;
                 Ok(())
             }
             VcpuState::Paused => Ok(()),
-            _ => Err(format!("vCPU {} in state {}, cannot pause", vcpu_id, state)),
+            _ => Err(format!("vCPU {vcpu_id} in state {state}, cannot pause")),
         }
     }
 
     /// Stop a vCPU.
     pub fn stop_vcpu(&mut self, vcpu_id: u32) -> Result<(), String> {
         let state = self.states.get_mut(vcpu_id as usize)
-            .ok_or_else(|| format!("vCPU {} not found", vcpu_id))?;
+            .ok_or_else(|| format!("vCPU {vcpu_id} not found"))?;
         *state = VcpuState::Stopped;
         Ok(())
     }
@@ -323,12 +330,13 @@ impl VcpuManager {
     }
 
     /// Get the set of physical cores this guest uses.
+    #[must_use]
     pub fn physical_cores(&self) -> Vec<u32> {
         self.configs.iter().filter_map(|c| c.pinned_core).collect()
     }
 
     /// Resolve scheduling policy given the available physical cores on the system.
-    /// For Auto mode: if we have enough cores, use Dedicated; otherwise TimeSlice.
+    /// For Auto mode: if we have enough cores, use Dedicated; otherwise `TimeSlice`.
     pub fn resolve_scheduling(&mut self, available_cores: &[u32]) -> SchedulingPlan {
         let requested = &self.configs;
         let plan = match &self.policy {
@@ -359,7 +367,7 @@ impl VcpuManager {
             SchedulingPolicy::Auto => {
                 // Check if we have enough dedicated cores
                 let can_dedicate = requested.iter().all(|cfg| {
-                    cfg.pinned_core.map_or(false, |c| available_cores.contains(&c))
+                    cfg.pinned_core.is_some_and(|c| available_cores.contains(&c))
                 });
 
                 if can_dedicate {
@@ -400,7 +408,8 @@ impl VcpuManager {
     }
 
     /// Get the resolved scheduling plan, if any.
-    pub fn plan(&self) -> Option<&SchedulingPlan> {
+    #[must_use]
+    pub const fn plan(&self) -> Option<&SchedulingPlan> {
         self.plan.as_ref()
     }
 }
@@ -538,8 +547,10 @@ mod tests {
         let mut sched = TimeSliceScheduler::new(0, 10);
         sched.add_vcpu("guest1", 0);
 
-        let mut ctx = VcpuContext::default();
-        ctx.rip = 0xDEADBEEF;
+        let mut ctx = VcpuContext {
+            rip: 0xDEADBEEF,
+            ..VcpuContext::default()
+        };
         ctx.gp_regs.rax = 42;
         sched.save_context("guest1", 0, ctx);
 

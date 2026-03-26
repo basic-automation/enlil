@@ -36,7 +36,8 @@ pub struct GuestTopology {
 
 impl GuestTopology {
     /// Create a simple topology: N cores, 1 thread each, 1 package.
-    pub fn simple(core_count: u32) -> Self {
+    #[must_use]
+    pub const fn simple(core_count: u32) -> Self {
         Self {
             logical_cpus: core_count,
             cores_per_package: core_count,
@@ -60,7 +61,8 @@ pub struct CpuidFilter {
 }
 
 impl CpuidFilter {
-    pub fn new(guest_cpu_count: u32) -> Self {
+    #[must_use]
+    pub const fn new(guest_cpu_count: u32) -> Self {
         Self {
             topology: GuestTopology::simple(guest_cpu_count),
             hide_hypervisor: true,
@@ -69,7 +71,8 @@ impl CpuidFilter {
     }
 
     /// Create a filter with full topology control.
-    pub fn with_topology(topology: GuestTopology) -> Self {
+    #[must_use]
+    pub const fn with_topology(topology: GuestTopology) -> Self {
         Self {
             topology,
             hide_hypervisor: true,
@@ -78,21 +81,23 @@ impl CpuidFilter {
     }
 
     /// Set whether to hide the hypervisor present bit.
-    pub fn set_hide_hypervisor(&mut self, hide: bool) {
+    pub const fn set_hide_hypervisor(&mut self, hide: bool) {
         self.hide_hypervisor = hide;
     }
 
     /// Set a custom vendor string (must be exactly 12 ASCII bytes).
-    pub fn set_vendor(&mut self, vendor: [u8; 12]) {
+    pub const fn set_vendor(&mut self, vendor: [u8; 12]) {
         self.custom_vendor = Some(vendor);
     }
 
-    pub fn topology(&self) -> &GuestTopology {
+    #[must_use]
+    pub const fn topology(&self) -> &GuestTopology {
         &self.topology
     }
 
     /// Filter a CPUID entry for guest consumption.
     /// Returns None if the leaf should be hidden entirely.
+    #[must_use]
     pub fn filter(&self, entry: &CpuidEntry) -> Option<CpuidEntry> {
         let mut out = entry.clone();
 
@@ -145,7 +150,7 @@ impl CpuidFilter {
                 match entry.index {
                     0 => {
                         // SMT level: threads per core
-                        let shift = if self.topology.threads_per_core > 1 { 1u32 } else { 0 };
+                        let shift = u32::from(self.topology.threads_per_core > 1);
                         out.eax = (out.eax & 0xFFFFFFE0) | (shift & 0x1F);
                         out.ebx = (out.ebx & 0xFFFF0000)
                             | (self.topology.threads_per_core & 0xFFFF);
@@ -172,11 +177,10 @@ impl CpuidFilter {
                 }
             }
             // Leaf 0x40000000-0x400000FF: Hypervisor leaves
-            0x40000000..=0x400000FF => {
-                if self.hide_hypervisor {
+            0x40000000..=0x400000FF
+                if self.hide_hypervisor => {
                     return None; // hide all hypervisor-specific leaves
                 }
-            }
             _ => {}
         }
 
@@ -185,6 +189,7 @@ impl CpuidFilter {
 
     /// Generate a complete set of topology-related CPUID entries for a vCPU.
     /// `apic_id` is the initial APIC ID for this specific vCPU.
+    #[must_use]
     pub fn generate_topology_entries(&self, apic_id: u32) -> Vec<CpuidEntry> {
         let mut entries = Vec::new();
 
@@ -202,13 +207,13 @@ impl CpuidFilter {
 
         // Leaf 0xB sub-leaves
         // SMT level
-        let smt_shift = if self.topology.threads_per_core > 1 { 1u32 } else { 0 };
+        let smt_shift = u32::from(self.topology.threads_per_core > 1);
         entries.push(CpuidEntry {
             function: 0xB,
             index: 0,
             eax: smt_shift,
             ebx: self.topology.threads_per_core,
-            ecx: (1 << 8) | 0, // level type = SMT, level number = 0
+            ecx: (1 << 8), // level type = SMT, level number = 0
             edx: apic_id,
         });
 

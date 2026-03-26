@@ -81,6 +81,7 @@ impl MemoryMap {
 
     /// Translate a guest physical address to a host physical address.
     /// Returns `None` if the GPA is not mapped.
+    #[must_use]
     pub fn translate(&self, gpa: u64) -> Option<u64> {
         for entry in &self.entries {
             if gpa >= entry.gpa && gpa < entry.gpa + entry.size {
@@ -91,16 +92,19 @@ impl MemoryMap {
     }
 
     /// The guest identifier this map belongs to.
+    #[must_use]
     pub fn guest_id(&self) -> &str {
         &self.guest_id
     }
 
     /// Iterate over all mapping entries.
+    #[must_use]
     pub fn entries(&self) -> &[MemoryMapEntry] {
         &self.entries
     }
 
     /// Total mapped bytes.
+    #[must_use]
     pub fn mapped_bytes(&self) -> u64 {
         self.entries.iter().map(|e| e.size).sum()
     }
@@ -132,10 +136,11 @@ pub struct MemoryManager {
 impl MemoryManager {
     /// Create a new `MemoryManager`.
     ///
-    /// `total_mb` — total host memory the hypervisor may use.  
+    /// `total_mb` — total host memory the hypervisor may use.\
     /// `reserved_mb` — memory reserved for the hypervisor itself (at the
     /// start of the range). Both values are rounded up to 2 MB alignment.
-    pub fn new(total_mb: u64, reserved_mb: u64) -> Self {
+    #[must_use]
+    pub const fn new(total_mb: u64, reserved_mb: u64) -> Self {
         let reserved_bytes = align_up(reserved_mb * 1024 * 1024, LARGE_PAGE_SIZE);
         let total_bytes = align_up(total_mb * 1024 * 1024, LARGE_PAGE_SIZE);
         Self {
@@ -158,8 +163,7 @@ impl MemoryManager {
         // Reject duplicate guest ids.
         if self.regions.values().any(|r| r.guest_id == guest_id) {
             return Err(Error::Memory(format!(
-                "guest '{}' already has an allocated region",
-                guest_id,
+                "guest '{guest_id}' already has an allocated region",
             )));
         }
 
@@ -219,7 +223,7 @@ impl MemoryManager {
             .find(|r| r.guest_id == guest_id)
             .map(|r| r.host_base)
             .ok_or_else(|| {
-                Error::Memory(format!("no region found for guest '{}'", guest_id))
+                Error::Memory(format!("no region found for guest '{guest_id}'"))
             })?;
 
         let region = self.regions.remove(&base).unwrap();
@@ -233,21 +237,25 @@ impl MemoryManager {
     }
 
     /// Look up the allocated [`MemoryRegion`] for `guest_id`.
+    #[must_use]
     pub fn get_region(&self, guest_id: &str) -> Option<&MemoryRegion> {
         self.regions.values().find(|r| r.guest_id == guest_id)
     }
 
     /// Get the [`MemoryMap`] (GPA→HPA) for `guest_id`.
+    #[must_use]
     pub fn get_memory_map(&self, guest_id: &str) -> Option<&MemoryMap> {
         self.memory_maps.get(guest_id)
     }
 
     /// Returns total allocated memory in bytes.
+    #[must_use]
     pub fn allocated_bytes(&self) -> u64 {
         self.regions.values().map(|r| r.size).sum()
     }
 
     /// Returns available memory in bytes (excluding reserved).
+    #[must_use]
     pub fn available_bytes(&self) -> u64 {
         self.total_bytes
             .saturating_sub(self.reserved_bytes)
@@ -260,6 +268,7 @@ impl MemoryManager {
     }
 
     /// The 2 MB alignment constant used for all allocations.
+    #[must_use]
     pub const fn page_size() -> u64 {
         LARGE_PAGE_SIZE
     }

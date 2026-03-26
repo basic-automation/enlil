@@ -48,7 +48,7 @@ struct TaskQueue {
 }
 
 impl TaskQueue {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             queue: Mutex::new(VecDeque::new()),
         }
@@ -81,6 +81,7 @@ pub struct Executor {
 
 impl Executor {
     /// Create a new executor.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             queue: Arc::new(TaskQueue::new()),
@@ -99,6 +100,10 @@ impl Executor {
     /// Run the executor until all spawned tasks complete.
     ///
     /// This blocks the current thread.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a task's [`Mutex`] is poisoned.
     pub fn run(&self) {
         while let Some(task) = self.queue.pop() {
             let waker = Waker::from(task.clone());
@@ -112,6 +117,11 @@ impl Executor {
     }
 
     /// Run the executor, polling once. Returns true if there are still pending tasks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a task's [`Mutex`] is poisoned.
+    #[must_use]
     pub fn poll_once(&self) -> bool {
         if let Some(task) = self.queue.pop() {
             let waker = Waker::from(task.clone());
@@ -123,6 +133,7 @@ impl Executor {
     }
 
     /// Returns true if there are no pending tasks.
+    #[must_use]
     pub fn is_idle(&self) -> bool {
         self.queue.is_empty()
     }
@@ -169,6 +180,7 @@ pub struct PriorityExecutor {
 
 impl PriorityExecutor {
     /// Create a new priority executor.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             high: Arc::new(TaskQueue::new()),
@@ -200,19 +212,23 @@ impl PriorityExecutor {
     ///
     /// Tasks are polled in strict priority order: all High tasks are drained
     /// before any Normal task is polled, and all Normal tasks before any Low.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a task's [`Mutex`] is poisoned.
     pub fn run(&self) {
         loop {
             // Always restart from the highest priority queue.
             if let Some(task) = self.high.pop() {
-                Self::poll_task(task);
+                Self::poll_task(&task);
                 continue;
             }
             if let Some(task) = self.normal.pop() {
-                Self::poll_task(task);
+                Self::poll_task(&task);
                 continue;
             }
             if let Some(task) = self.low.pop() {
-                Self::poll_task(task);
+                Self::poll_task(&task);
                 continue;
             }
             // All queues empty.
@@ -223,25 +239,31 @@ impl PriorityExecutor {
     /// Poll one task from the highest non-empty queue.
     ///
     /// Returns `true` if there are still pending tasks in any queue.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a task's [`Mutex`] is poisoned.
+    #[must_use]
     pub fn poll_once(&self) -> bool {
         if let Some(task) = self.high.pop() {
-            Self::poll_task(task);
+            Self::poll_task(&task);
         } else if let Some(task) = self.normal.pop() {
-            Self::poll_task(task);
+            Self::poll_task(&task);
         } else if let Some(task) = self.low.pop() {
-            Self::poll_task(task);
+            Self::poll_task(&task);
         }
         !self.is_idle()
     }
 
     /// Returns `true` if all three queues are empty.
+    #[must_use]
     pub fn is_idle(&self) -> bool {
         self.high.is_empty() && self.normal.is_empty() && self.low.is_empty()
     }
 
     // -- private helpers ----------------------------------------------------
 
-    fn queue_for(&self, priority: TaskPriority) -> &Arc<TaskQueue> {
+    const fn queue_for(&self, priority: TaskPriority) -> &Arc<TaskQueue> {
         match priority {
             TaskPriority::High => &self.high,
             TaskPriority::Normal => &self.normal,
@@ -249,7 +271,7 @@ impl PriorityExecutor {
         }
     }
 
-    fn poll_task(task: Arc<Task>) {
+    fn poll_task(task: &Arc<Task>) {
         let waker = Waker::from(task.clone());
         let mut cx = Context::from_waker(&waker);
         let mut future = task.future.lock().unwrap();
@@ -279,22 +301,24 @@ pub struct Reactor {
 
 impl Reactor {
     /// Create a new reactor.
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self { _private: () }
     }
 
     /// Register interest in an I/O source. Returns a token for later use.
-    pub fn register(&self, _fd: usize) -> usize {
+    #[must_use]
+    pub const fn register(&self, _fd: usize) -> usize {
         // Stub — returns a dummy token.
         0
     }
 
     /// Wait for I/O events, waking associated tasks.
-    pub fn wait(&self, _timeout_ms: Option<u64>) {
+    pub fn wait(&self, timeout_ms: Option<u64>) {
         // Stub — does nothing yet.
         #[cfg(feature = "platform-linux")]
         {
-            if let Some(ms) = _timeout_ms {
+            if let Some(ms) = timeout_ms {
                 std::thread::sleep(std::time::Duration::from_millis(ms));
             }
         }
@@ -329,7 +353,7 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
-/// Create a no-op waker (for block_on).
+/// Create a no-op waker (for `block_on`).
 fn noop_waker() -> Waker {
     struct NoopWake;
     impl Wake for NoopWake {
@@ -423,6 +447,7 @@ mod tests {
 
         let result = order.lock().unwrap();
         assert_eq!(*result, vec!["high", "normal", "low"]);
+        drop(result);
     }
 
     #[test]
@@ -456,5 +481,6 @@ mod tests {
             *result,
             vec!["high-1", "high-2", "normal-1", "normal-2", "low-1", "low-2"]
         );
+        drop(result);
     }
 }

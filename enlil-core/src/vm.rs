@@ -21,7 +21,7 @@ pub struct VmConfig {
 }
 
 /// Runtime state of a VM.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmState {
     Created,
     Booting,
@@ -53,6 +53,7 @@ pub struct Hypervisor {
 
 impl Hypervisor {
     /// Create a new hypervisor with the given total host memory and reserved bytes.
+    #[must_use]
     pub fn new(total_host_memory: u64, reserved_bytes: u64) -> Self {
         Self {
             vms: Vec::new(),
@@ -67,7 +68,7 @@ impl Hypervisor {
 
         // Allocate memory
         self.memory_manager
-            .allocate(&guest_id, config.memory.size_mb as u64 * 1024 * 1024)
+            .allocate(&guest_id, config.memory.size_mb * 1024 * 1024)
             .map_err(|e| Error::Memory(e.to_string()))?;
 
         // Register serial output
@@ -83,6 +84,7 @@ impl Hypervisor {
         Ok(idx)
     }
 
+    #[must_use]
     pub fn vm(&self, index: usize) -> Option<&Vm> {
         self.vms.get(index)
     }
@@ -91,15 +93,17 @@ impl Hypervisor {
         self.vms.get_mut(index)
     }
 
-    pub fn vm_count(&self) -> usize {
+    #[must_use]
+    pub const fn vm_count(&self) -> usize {
         self.vms.len()
     }
 
-    pub fn memory_manager(&self) -> &MemoryManager {
+    #[must_use]
+    pub const fn memory_manager(&self) -> &MemoryManager {
         &self.memory_manager
     }
 
-    pub fn serial_mux(&mut self) -> &mut SerialMultiplexer {
+    pub const fn serial_mux(&mut self) -> &mut SerialMultiplexer {
         &mut self.serial_mux
     }
 }
@@ -131,34 +135,40 @@ impl Vm {
         })
     }
 
+    #[must_use]
     pub fn name(&self) -> &str {
         &self.config.name
     }
 
-    pub fn state(&self) -> VmState {
+    #[must_use]
+    pub const fn state(&self) -> VmState {
         self.state
     }
 
-    pub fn set_state(&mut self, state: VmState) {
+    pub const fn set_state(&mut self, state: VmState) {
         self.state = state;
     }
 
-    pub fn vcpu_count(&self) -> usize {
+    #[must_use]
+    pub const fn vcpu_count(&self) -> usize {
         self.vcpu_manager.count()
     }
 
-    pub fn config(&self) -> &VmConfig {
+    #[must_use]
+    pub const fn config(&self) -> &VmConfig {
         &self.config
     }
 
-    pub fn vcpu_manager(&self) -> &VcpuManager {
+    #[must_use]
+    pub const fn vcpu_manager(&self) -> &VcpuManager {
         &self.vcpu_manager
     }
 
-    pub fn vcpu_manager_mut(&mut self) -> &mut VcpuManager {
+    pub const fn vcpu_manager_mut(&mut self) -> &mut VcpuManager {
         &mut self.vcpu_manager
     }
 
+    #[must_use]
     pub fn physical_cores(&self) -> Vec<u32> {
         self.vcpu_manager.physical_cores()
     }

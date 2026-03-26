@@ -1,0 +1,231 @@
+    Checking enlil-devices v0.1.0 (D:\Development\enlil\enlil-devices)
+warning: constant `RSC_INFO` is never used
+  --> enlil-devices\src\net\header.rs:39:15
+   |
+39 |     pub const RSC_INFO: u8 = 4;
+   |               ^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `creation_tsc` is never read
+  --> enlil-devices\src\timer\tsc.rs:42:5
+   |
+34 | pub struct TscManager {
+   |            ---------- field in this struct
+...
+42 |     creation_tsc: u64,
+   |     ^^^^^^^^^^^^
+
+warning: fields `sequence` and `source_guest` are never read
+  --> enlil-devices\src\bridge\clipboard.rs:74:5
+   |
+72 | struct ClipboardEntry {
+   |        -------------- fields in this struct
+73 |     content: ClipboardContent,
+74 |     sequence: u64,
+   |     ^^^^^^^^
+75 |     source_guest: u32,
+   |     ^^^^^^^^^^^^
+   |
+   = note: `ClipboardEntry` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: struct `LoopbackBackend` is never constructed
+  --> enlil-devices\src\net\backend.rs:97:12
+   |
+97 | pub struct LoopbackBackend {
+   |            ^^^^^^^^^^^^^^^
+
+warning: variants `Reset`, `Acknowledge`, `Driver`, `FeaturesOk`, and `Failed` are never constructed
+  --> enlil-devices\src\net\device.rs:17:5
+   |
+16 | pub enum DeviceStatus {
+   |          ------------ variants in this enum
+17 |     Reset = 0,
+   |     ^^^^^
+18 |     Acknowledge = 1,
+   |     ^^^^^^^^^^^
+19 |     Driver = 2,
+   |     ^^^^^^
+20 |     DriverOk = 4,
+21 |     FeaturesOk = 8,
+   |     ^^^^^^^^^^
+22 |     Failed = 128,
+   |     ^^^^^^
+   |
+   = note: `DeviceStatus` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: associated function `new` is never used
+   --> enlil-devices\src\net\backend.rs:102:12
+    |
+101 | impl LoopbackBackend {
+    | -------------------- associated function in this implementation
+102 |     pub fn new() -> Self {
+    |            ^^^
+
+warning: constant `IOAPIC_BASE` is never used
+ --> enlil-devices\src\interrupt\ioapic.rs:9:11
+  |
+9 | pub const IOAPIC_BASE: u64 = 0xFEC0_0000;
+  |           ^^^^^^^^^^^
+
+warning: constant `LAPIC_RRD` is never used
+  --> enlil-devices\src\interrupt\lapic.rs:19:11
+   |
+19 | pub const LAPIC_RRD: u32 = 0x0C0;
+   |           ^^^^^^^^^
+
+warning: struct `PipeBackend` is never constructed
+   --> enlil-devices\src\net\backend.rs:146:12
+    |
+146 | pub struct PipeBackend {
+    |            ^^^^^^^^^^^
+
+warning: struct `MsiCapability` is never constructed
+  --> enlil-devices\src\interrupt\msi.rs:66:12
+   |
+66 | pub struct MsiCapability {
+   |            ^^^^^^^^^^^^^
+
+warning: associated function `pair` is never used
+   --> enlil-devices\src\net\backend.rs:155:12
+    |
+153 | impl PipeBackend {
+    | ---------------- associated function in this implementation
+154 |     /// Create a connected pair of pipe backends.
+155 |     pub fn pair() -> (Self, Self) {
+    |            ^^^^
+
+warning: constant `LAPIC_BASE_ADDR` is never used
+  --> enlil-devices\src\interrupt\lapic.rs:41:11
+   |
+41 | pub const LAPIC_BASE_ADDR: u64 = 0xFEE0_0000;
+   |           ^^^^^^^^^^^^^^^
+
+warning: associated items `new`, `is_vector_masked`, and `message_for_vector` are never used
+   --> enlil-devices\src\interrupt\msi.rs:91:12
+    |
+ 83 | impl MsiCapability {
+    | ------------------ associated items in this implementation
+...
+ 91 |     pub fn new(is_64bit: bool, per_vector_masking: bool) -> Self {
+    |            ^^^
+...
+109 |     pub fn is_vector_masked(&self, vector_idx: u8) -> bool {
+    |            ^^^^^^^^^^^^^^^^
+...
+122 |     pub fn message_for_vector(&self, vector_idx: u8) -> MsiMessage {
+    |            ^^^^^^^^^^^^^^^^^^
+
+warning: this `if` statement can be collapsed
+   --> enlil-devices\src\bridge\transport.rs:316:13
+    |
+316 | /             if let Ok(q) = queue.lock() {
+317 | |                 if q.len() < self.max_queue_depth {
+318 | |                     return true;
+319 | |                 }
+320 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#collapsible_if
+    = note: `#[warn(clippy::collapsible_if)]` on by default
+help: collapse nested if block
+    |
+316 ~             if let Ok(q) = queue.lock()
+317 ~                 && q.len() < self.max_queue_depth {
+318 |                     return true;
+319 ~                 }
+    |
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> enlil-devices\src\display\mod.rs:120:13
+    |
+120 |     frames: Arc<RwLock<VecDeque<(u64, Vec<u8>)>>>,
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#type_complexity
+    = note: `#[warn(clippy::type_complexity)]` on by default
+
+warning: this `if` statement can be collapsed
+   --> enlil-devices\src\display\mod.rs:601:13
+    |
+601 | /             if let Some(source) = sources.get(&zone.id) {
+602 | |                 if let Some(data) = source.current_frame().and_then(|f| source.get_frame_data(f.id)) {
+603 | |                     // Simple copy composition
+604 | |                     let bytes_per_pixel = 4;
+...   |
+616 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#collapsible_if
+help: collapse nested if block
+    |
+601 ~             if let Some(source) = sources.get(&zone.id)
+602 ~                 && let Some(data) = source.current_frame().and_then(|f| source.get_frame_data(f.id)) {
+603 |                     // Simple copy composition
+...
+614 |                     }
+615 ~                 }
+    |
+
+warning: manual `Range::contains` implementation
+   --> enlil-devices\src\interrupt\lapic.rs:191:20
+    |
+191 |             off if off >= LAPIC_ISR_BASE && off < LAPIC_ISR_BASE + 0x80 => {
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(LAPIC_ISR_BASE..LAPIC_ISR_BASE + 0x80).contains(&off)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#manual_range_contains
+    = note: `#[warn(clippy::manual_range_contains)]` on by default
+
+warning: manual `Range::contains` implementation
+   --> enlil-devices\src\interrupt\lapic.rs:195:20
+    |
+195 |             off if off >= LAPIC_TMR_BASE && off < LAPIC_TMR_BASE + 0x80 => {
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(LAPIC_TMR_BASE..LAPIC_TMR_BASE + 0x80).contains(&off)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#manual_range_contains
+
+warning: manual `Range::contains` implementation
+   --> enlil-devices\src\interrupt\lapic.rs:199:20
+    |
+199 |             off if off >= LAPIC_IRR_BASE && off < LAPIC_IRR_BASE + 0x80 => {
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(LAPIC_IRR_BASE..LAPIC_IRR_BASE + 0x80).contains(&off)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#manual_range_contains
+
+warning: redundant closure
+  --> enlil-devices\src\interrupt\controller.rs:19:41
+   |
+19 |         let lapics = (0..num_vcpus).map(|id| LocalApic::new(id)).collect();
+   |                                         ^^^^^^^^^^^^^^^^^^^^^^^ help: replace the closure with the associated function itself: `LocalApic::new`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#redundant_closure
+   = note: `#[warn(clippy::redundant_closure)]` on by default
+
+warning: manual implementation of `.is_multiple_of()`
+   --> enlil-devices\src\net\switch.rs:148:12
+    |
+148 |         if self.stats.frames_in % 1000 == 0 {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `self.stats.frames_in.is_multiple_of(1000)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#manual_is_multiple_of
+    = note: `#[warn(clippy::manual_is_multiple_of)]` on by default
+
+warning: casting to the same type is unnecessary (`u64` -> `u64`)
+   --> enlil-devices\src\virtio\transport.rs:105:21
+    |
+105 |                     (self.device_features & 0xFFFF_FFFF) as u64
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `(self.device_features & 0xFFFF_FFFF)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#unnecessary_cast
+    = note: `#[warn(clippy::unnecessary_cast)]` on by default
+
+warning: casting to the same type is unnecessary (`u64` -> `u64`)
+   --> enlil-devices\src\virtio\transport.rs:107:21
+    |
+107 |                     (self.device_features >> 32) as u64
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `(self.device_features >> 32)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#unnecessary_cast
+
+warning: `enlil-devices` (lib) generated 23 warnings (run `cargo clippy --fix --lib -p enlil-devices -- ` to apply 9 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.62s

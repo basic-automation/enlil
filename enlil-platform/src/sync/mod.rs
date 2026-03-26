@@ -1,6 +1,6 @@
 //! Synchronization Primitives
 //!
-//! Platform-abstracted Mutex, RwLock, Condvar, and Channel.
+//! Platform-abstracted Mutex, `RwLock`, Condvar, and Channel.
 //!
 //! - **Linux:** Delegates to `std::sync` (pthread-backed).
 //! - **Bare-metal:** Uses `spin` crate for spinlock-based implementations.
@@ -25,7 +25,7 @@ unsafe impl<T: Send> Sync for Mutex<T> {}
 
 impl<T> Mutex<T> {
     /// Creates a new mutex wrapping the given value.
-    pub fn new(value: T) -> Self {
+    pub const fn new(value: T) -> Self {
         Self {
             #[cfg(feature = "platform-linux")]
             inner: std::sync::Mutex::new(value),
@@ -37,6 +37,10 @@ impl<T> Mutex<T> {
 
 impl<T> Mutex<T> {
     /// Acquires the mutex, blocking until available.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying mutex is poisoned (Linux).
     pub fn lock(&self) -> MutexGuard<'_, T> {
         #[cfg(feature = "platform-linux")]
         {
@@ -120,7 +124,7 @@ unsafe impl<T: Send> Send for RwLock<T> {}
 unsafe impl<T: Send + Sync> Sync for RwLock<T> {}
 
 impl<T> RwLock<T> {
-    pub fn new(value: T) -> Self {
+    pub const fn new(value: T) -> Self {
         Self {
             #[cfg(feature = "platform-linux")]
             inner: std::sync::RwLock::new(value),
@@ -132,6 +136,10 @@ impl<T> RwLock<T> {
 
 impl<T> RwLock<T> {
     /// Acquires a shared read lock.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying lock is poisoned (Linux).
     pub fn read(&self) -> RwLockReadGuard<'_, T> {
         #[cfg(feature = "platform-linux")]
         {
@@ -148,6 +156,10 @@ impl<T> RwLock<T> {
     }
 
     /// Acquires an exclusive write lock.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying lock is poisoned (Linux).
     pub fn write(&self) -> RwLockWriteGuard<'_, T> {
         #[cfg(feature = "platform-linux")]
         {
@@ -271,7 +283,8 @@ pub struct Condvar {
 }
 
 impl Condvar {
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             #[cfg(feature = "platform-linux")]
             inner: std::sync::Condvar::new(),
@@ -281,6 +294,10 @@ impl Condvar {
     }
 
     /// Blocks the current thread until notified.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying condvar wait returns a poisoned error.
     ///
     /// The mutex guard is released while waiting and re-acquired before returning.
     ///
@@ -408,8 +425,8 @@ pub enum TrySendError<T> {
 impl<T> fmt::Display for TrySendError<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TrySendError::Full(_) => write!(f, "channel is full"),
-            TrySendError::Closed(_) => write!(f, "sending on a closed channel"),
+            Self::Full(_) => write!(f, "channel is full"),
+            Self::Closed(_) => write!(f, "sending on a closed channel"),
         }
     }
 }
@@ -437,8 +454,8 @@ pub enum TryRecvError {
 impl fmt::Display for TryRecvError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TryRecvError::Empty => write!(f, "channel is empty"),
-            TryRecvError::Disconnected => write!(f, "channel is disconnected"),
+            Self::Empty => write!(f, "channel is empty"),
+            Self::Disconnected => write!(f, "channel is disconnected"),
         }
     }
 }
@@ -465,7 +482,7 @@ impl<T> Clone for Sender<T> {
             let mut inner = self.shared.state.lock();
             inner.sender_count += 1;
         }
-        Sender {
+        Self {
             shared: Arc::clone(&self.shared),
         }
     }
@@ -480,6 +497,7 @@ impl<T> Drop for Sender<T> {
             if inner.sender_count == 0 {
                 inner.closed = true;
                 // Wake the receiver so it can observe disconnection.
+                drop(inner);
                 self.shared.not_empty.notify_all();
             }
         }
@@ -489,6 +507,7 @@ impl<T> Drop for Sender<T> {
             inner.sender_count -= 1;
             if inner.sender_count == 0 {
                 inner.closed = true;
+                drop(inner);
                 self.shared.not_empty.notify_all();
             }
         }
@@ -498,7 +517,13 @@ impl<T> Drop for Sender<T> {
 impl<T> Sender<T> {
     /// Sends a value, blocking until space is available.
     ///
+    /// # Errors
+    ///
     /// Returns `Err(SendError(value))` if the channel is closed (receiver dropped).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying mutex is poisoned (Linux mode).
     pub fn send(&self, value: T) -> Result<(), SendError<T>> {
         #[cfg(feature = "platform-linux")]
         {
@@ -535,6 +560,15 @@ impl<T> Sender<T> {
     }
 
     /// Attempts to send without blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(TrySendError::Closed(value))` if the channel is closed, or
+    /// `Err(TrySendError::Full(value))` if the buffer is at capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying mutex is poisoned (Linux mode).
     pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
         #[cfg(feature = "platform-linux")]
         let mut inner = self.shared.state.lock().unwrap();
@@ -548,6 +582,7 @@ impl<T> Sender<T> {
             return Err(TrySendError::Full(value));
         }
         inner.buffer.push_back(value);
+        drop(inner);
         self.shared.not_empty.notify_one();
         Ok(())
     }
@@ -566,8 +601,10 @@ impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         #[cfg(feature = "platform-linux")]
         {
-            let mut inner = self.shared.state.lock().unwrap();
-            inner.closed = true;
+            {
+                let mut inner = self.shared.state.lock().unwrap();
+                inner.closed = true;
+            }
             // Wake all blocked senders so they can observe the closure.
             self.shared.not_full.notify_all();
         }
@@ -583,8 +620,14 @@ impl<T> Drop for Receiver<T> {
 impl<T> Receiver<T> {
     /// Receives a value, blocking until one is available.
     ///
+    /// # Errors
+    ///
     /// Returns `Err(RecvError)` if all senders have been dropped and the buffer
     /// is empty.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying mutex is poisoned (Linux mode).
     pub fn recv(&self) -> Result<T, RecvError> {
         #[cfg(feature = "platform-linux")]
         {
@@ -619,20 +662,34 @@ impl<T> Receiver<T> {
     }
 
     /// Attempts to receive without blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(TryRecvError::Disconnected)` if the channel is closed, or
+    /// `Err(TryRecvError::Empty)` if no values are available.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying mutex is poisoned (Linux mode).
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
         #[cfg(feature = "platform-linux")]
         let mut inner = self.shared.state.lock().unwrap();
         #[cfg(feature = "platform-baremetal")]
         let mut inner = self.shared.state.lock();
 
-        if let Some(val) = inner.buffer.pop_front() {
-            self.shared.not_full.notify_one();
-            Ok(val)
-        } else if inner.closed {
-            Err(TryRecvError::Disconnected)
-        } else {
-            Err(TryRecvError::Empty)
-        }
+        inner.buffer.pop_front().map_or_else(
+            || {
+                if inner.closed {
+                    Err(TryRecvError::Disconnected)
+                } else {
+                    Err(TryRecvError::Empty)
+                }
+            },
+            |val| {
+                self.shared.not_full.notify_one();
+                Ok(val)
+            },
+        )
     }
 }
 
@@ -647,6 +704,7 @@ impl<T> Receiver<T> {
 /// # Panics
 ///
 /// Panics if `capacity` is 0.
+#[must_use]
 pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     assert!(capacity > 0, "channel capacity must be > 0");
 
@@ -773,13 +831,14 @@ mod tests {
             let (lock, cvar) = &*pair2;
             let mut started = lock.lock();
             *started = true;
+            drop(started);
             cvar.notify_one();
         });
 
         let (lock, cvar) = &*pair;
-        let guard = lock.lock();
-        let guard = cvar.wait_while(guard, |started| !*started);
+        let guard = cvar.wait_while(lock.lock(), |started| !*started);
         assert!(*guard);
+        drop(guard);
         handle.join().unwrap();
     }
 
@@ -831,7 +890,7 @@ mod tests {
             h.join().unwrap();
         }
 
-        received.sort();
+        received.sort_unstable();
         assert_eq!(received, (0..100).collect::<Vec<_>>());
     }
 

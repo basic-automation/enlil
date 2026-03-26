@@ -1,3 +1,4 @@
+#![deny(clippy::all, clippy::pedantic, clippy::nursery)]
 //! Enlil Platform Layer
 //!
 //! This crate provides the foundational platform abstractions that enable
@@ -38,7 +39,8 @@ pub fn init() {
 }
 
 /// Returns the name of the active platform backend.
-pub fn backend_name() -> &'static str {
+#[must_use]
+pub const fn backend_name() -> &'static str {
     #[cfg(feature = "platform-linux")]
     { "linux" }
     #[cfg(feature = "platform-baremetal")]
