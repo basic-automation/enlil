@@ -37,7 +37,7 @@ pub const LAPIC_TIMER_DIVIDE: u32 = 0x3E0;
 pub const LAPIC_SELF_IPI: u32 = 0x3F0;
 
 /// LAPIC timer modes.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimerMode {
     OneShot = 0,
     Periodic = 1,
@@ -58,7 +58,7 @@ pub struct LocalApic {
     dfr: u32,
     /// Spurious Interrupt Vector Register.
     svr: u32,
-    /// In-Service Register (256 bits = 8 x u32).
+    /// In-Service Register (256 bits = 8 x `u32`).
     isr: [u32; 8],
     /// Trigger Mode Register (256 bits).
     tmr: [u32; 8],
@@ -68,17 +68,17 @@ pub struct LocalApic {
     esr: u32,
     /// Interrupt Command Register (64 bits).
     icr: u64,
-    /// LVT Timer.
+    /// `LVT` Timer.
     lvt_timer: u32,
-    /// LVT Thermal Sensor.
+    /// `LVT` Thermal Sensor.
     lvt_thermal: u32,
-    /// LVT Performance Counter.
+    /// `LVT` Performance Counter.
     lvt_perf: u32,
-    /// LVT LINT0.
+    /// `LVT` LINT0.
     lvt_lint0: u32,
-    /// LVT LINT1.
+    /// `LVT` LINT1.
     lvt_lint1: u32,
-    /// LVT Error.
+    /// `LVT` Error.
     lvt_error: u32,
     /// Timer initial count.
     timer_initial: u32,
@@ -95,8 +95,9 @@ pub struct LocalApic {
 }
 
 impl LocalApic {
-    /// Create a new LAPIC with the given APIC ID.
-    pub fn new(id: u8) -> Self {
+    /// Create a new `LocalApic` with the given APIC ID.
+    #[must_use]
+    pub const fn new(id: u8) -> Self {
         Self {
             id,
             enabled: false,
@@ -125,55 +126,59 @@ impl LocalApic {
     }
 
     /// APIC ID.
-    pub fn id(&self) -> u8 {
+    #[must_use]
+    pub const fn id(&self) -> u8 {
         self.id
     }
 
-    /// Whether the LAPIC is software-enabled (bit 8 of SVR).
-    pub fn is_enabled(&self) -> bool {
+    /// Whether the `LocalApic` is software-enabled (bit 8 of `SVR`).
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
         self.enabled
     }
 
     /// Get the Task Priority Register value.
-    pub fn get_tpr(&self) -> u8 {
+    #[must_use]
+    pub const fn get_tpr(&self) -> u8 {
         (self.tpr & 0xFF) as u8
     }
 
     /// Set the Task Priority Register value.
     pub fn set_tpr(&mut self, value: u8) {
-        self.tpr = value as u32;
+        self.tpr = u32::from(value);
     }
 
-    /// Signal end-of-interrupt (public wrapper around handle_eoi).
+    /// Signal end-of-interrupt (public wrapper around `handle_eoi`).
     pub fn signal_eoi(&mut self) {
         self.handle_eoi();
     }
 
     /// Check if there's a pending interrupt that can be delivered.
+    #[must_use]
     pub fn has_pending_interrupt(&self) -> bool {
         self.pending_interrupt().is_some()
     }
 
     /// Get the highest priority pending interrupt vector, if any.
+    #[must_use]
     pub fn pending_vector(&self) -> Option<u8> {
         self.pending_interrupt()
     }
 
-    /// Accept the highest priority pending interrupt (move from IRR to ISR).
+    /// Accept the highest priority pending interrupt (move from `IRR` to `ISR`).
     /// Returns the vector that was accepted, if any.
+    #[must_use]
     pub fn accept_highest_interrupt(&mut self) -> Option<u8> {
-        if let Some(vector) = self.pending_interrupt() {
-            self.start_servicing(vector);
-            Some(vector)
-        } else {
-            None
-        }
+        let vector = self.pending_interrupt()?;
+        self.start_servicing(vector);
+        Some(vector)
     }
 
     /// Read a LAPIC register by offset.
+    #[must_use]
     pub fn read_register(&self, offset: u32) -> u32 {
         match offset {
-            LAPIC_ID => (self.id as u32) << 24,
+            LAPIC_ID => u32::from(self.id) << 24,
             LAPIC_VERSION => {
                 // Version 0x14 (Pentium 4+), max LVT entry = 5 (6 entries: 0-5)
                 0x14 | (5 << 16)
@@ -197,6 +202,7 @@ impl LocalApic {
                 if idx < 8 { self.irr[idx] } else { 0 }
             }
             LAPIC_ESR => self.esr,
+            #[allow(clippy::cast_possible_truncation)]
             LAPIC_ICR_LOW => self.icr as u32,
             LAPIC_ICR_HIGH => (self.icr >> 32) as u32,
             LAPIC_LVT_TIMER => self.lvt_timer,
@@ -225,30 +231,35 @@ impl LocalApic {
             }
             LAPIC_EOI => self.handle_eoi(),
             LAPIC_ESR => {
-                // Writing to ESR clears it, then re-reads show accumulated errors
+                // Writing to `ESR` clears it, then re-reads show accumulated errors
                 self.esr = 0;
             }
             LAPIC_ICR_LOW => {
-                self.icr = (self.icr & 0xFFFF_FFFF_0000_0000) | value as u64;
-                // Writing ICR_LOW triggers IPI delivery
+                self.icr = (self.icr & 0xFFFF_FFFF_0000_0000) | u64::from(value);
+                // Writing `ICR_LOW` triggers IPI delivery
             }
             LAPIC_ICR_HIGH => {
-                self.icr = (self.icr & 0x0000_0000_FFFF_FFFF) | ((value as u64) << 32);
+                self.icr = (self.icr & 0x0000_0000_FFFF_FFFF) | (u64::from(value) << 32);
             }
             LAPIC_LVT_TIMER => {
                 self.lvt_timer = value;
                 self.timer_mode = match (value >> 17) & 0x3 {
-                    0 => TimerMode::OneShot,
                     1 => TimerMode::Periodic,
                     2 => TimerMode::TscDeadline,
                     _ => TimerMode::OneShot,
                 };
             }
-            LAPIC_LVT_THERMAL => self.lvt_thermal = value,
-            LAPIC_LVT_PERF => self.lvt_perf = value,
-            LAPIC_LVT_LINT0 => self.lvt_lint0 = value,
-            LAPIC_LVT_LINT1 => self.lvt_lint1 = value,
-            LAPIC_LVT_ERROR => self.lvt_error = value,
+            LAPIC_LVT_THERMAL | LAPIC_LVT_PERF | LAPIC_LVT_LINT0 | LAPIC_LVT_LINT1
+            | LAPIC_LVT_ERROR => {
+                match offset {
+                    LAPIC_LVT_THERMAL => self.lvt_thermal = value,
+                    LAPIC_LVT_PERF => self.lvt_perf = value,
+                    LAPIC_LVT_LINT0 => self.lvt_lint0 = value,
+                    LAPIC_LVT_LINT1 => self.lvt_lint1 = value,
+                    LAPIC_LVT_ERROR => self.lvt_error = value,
+                    _ => unreachable!(),
+                }
+            }
             LAPIC_TIMER_INIT => {
                 self.timer_initial = value;
                 self.timer_current = value;
@@ -257,7 +268,7 @@ impl LocalApic {
             LAPIC_SELF_IPI => {
                 // x2APIC self-IPI: inject vector to self
                 let vector = (value & 0xFF) as u8;
-                self.accept_interrupt(InterruptEntry {
+                let _ = self.accept_interrupt(&InterruptEntry {
                     vector,
                     delivery_mode: DeliveryMode::Fixed,
                     trigger_mode: TriggerMode::Edge,
@@ -269,8 +280,9 @@ impl LocalApic {
     }
 
     /// Accept an interrupt from the IOAPIC or IPI.
-    /// Sets the corresponding bit in IRR.
-    pub fn accept_interrupt(&mut self, entry: InterruptEntry) -> bool {
+    /// Sets the corresponding bit in `IRR`.
+    #[must_use]
+    pub fn accept_interrupt(&mut self, entry: &InterruptEntry) -> bool {
         if !self.enabled {
             return false;
         }
@@ -298,8 +310,9 @@ impl LocalApic {
     }
 
     /// Accept an interrupt by vector number only (Fixed delivery, edge-triggered).
+    #[must_use]
     pub fn accept_interrupt_vector(&mut self, vector: u8) -> bool {
-        self.accept_interrupt(InterruptEntry {
+        self.accept_interrupt(&InterruptEntry {
             vector,
             delivery_mode: DeliveryMode::Fixed,
             trigger_mode: TriggerMode::Edge,
@@ -309,27 +322,29 @@ impl LocalApic {
 
     /// Check if there's a pending interrupt that can be delivered.
     /// Returns the vector if one is ready, considering TPR masking.
+    #[must_use]
     pub fn pending_interrupt(&self) -> Option<u8> {
         if !self.enabled {
             return None;
         }
 
-        let highest_irr = self.highest_bit_in_register(&self.irr)?;
-        let highest_isr = self.highest_bit_in_register(&self.isr).unwrap_or(0);
+        let pending_vec = Self::highest_bit_in_register(&self.irr)?;
+        let servicing_vec = Self::highest_bit_in_register(&self.isr).unwrap_or(0);
+        #[allow(clippy::cast_possible_truncation)]
         let ppr = self.compute_ppr() as u8;
 
         // Interrupt priority class = vector >> 4
         // Can deliver if IRR priority > PPR priority
-        if (highest_irr >> 4) > (ppr >> 4) && (highest_irr >> 4) > (highest_isr >> 4) {
-            Some(highest_irr)
+        if (pending_vec >> 4) > (ppr >> 4) && (pending_vec >> 4) > (servicing_vec >> 4) {
+            Some(pending_vec)
         } else {
             None
         }
     }
 
-    /// Mark an interrupt as being serviced (move from IRR to ISR).
+    /// Mark an interrupt as being serviced (move from `IRR` to `ISR`).
     /// Call this when actually injecting the interrupt into the vCPU.
-    pub fn start_servicing(&mut self, vector: u8) {
+    pub const fn start_servicing(&mut self, vector: u8) {
         let reg_idx = (vector / 32) as usize;
         let bit = 1u32 << (vector % 32);
 
@@ -339,13 +354,14 @@ impl LocalApic {
     }
 
     /// Get and clear the pending injection vector.
-    pub fn take_pending_injection(&mut self) -> Option<u8> {
+    #[must_use]
+    pub const fn take_pending_injection(&mut self) -> Option<u8> {
         self.pending_injection.take()
     }
 
-    /// Handle EOI write — clear the highest priority ISR bit.
+    /// Handle EOI write — clear the highest priority `ISR` bit.
     fn handle_eoi(&mut self) {
-        if let Some(vector) = self.highest_bit_in_register(&self.isr) {
+        if let Some(vector) = Self::highest_bit_in_register(&self.isr) {
             let reg_idx = (vector / 32) as usize;
             let bit = 1u32 << (vector % 32);
             self.isr[reg_idx] &= !bit;
@@ -356,11 +372,11 @@ impl LocalApic {
     }
 
     /// Compute Arbitration Priority Register.
+    #[must_use]
     fn compute_apr(&self) -> u32 {
         // APR = max(TPR, highest ISR priority)
-        let isr_prio = self.highest_bit_in_register(&self.isr)
-            .map(|v| (v >> 4) as u32)
-            .unwrap_or(0);
+        let isr_prio = Self::highest_bit_in_register(&self.isr)
+            .map_or(0, |v| u32::from(v >> 4));
         let tpr_prio = self.tpr >> 4;
         if tpr_prio >= isr_prio {
             self.tpr
@@ -370,8 +386,9 @@ impl LocalApic {
     }
 
     /// Compute Processor Priority Register.
+    #[must_use]
     fn compute_ppr(&self) -> u32 {
-        let isrv = self.highest_bit_in_register(&self.isr).unwrap_or(0) as u32;
+        let isrv = u32::from(Self::highest_bit_in_register(&self.isr).unwrap_or(0));
         let tpr = self.tpr;
         if (tpr >> 4) >= (isrv >> 4) {
             tpr
@@ -381,10 +398,12 @@ impl LocalApic {
     }
 
     /// Find the highest set bit across an 8-register (256-bit) bitmap.
-    fn highest_bit_in_register(&self, regs: &[u32; 8]) -> Option<u8> {
+    #[must_use]
+    fn highest_bit_in_register(regs: &[u32; 8]) -> Option<u8> {
         for i in (0..8).rev() {
             if regs[i] != 0 {
-                let bit = 31 - regs[i].leading_zeros();
+                let bit = regs[i].ilog2();
+                #[allow(clippy::cast_possible_truncation)]
                 return Some((i as u8) * 32 + bit as u8);
             }
         }
@@ -392,7 +411,8 @@ impl LocalApic {
     }
 
     /// Timer tick — decrement current count and fire interrupt if needed.
-    /// Returns true if a timer interrupt was generated.
+    /// Returns `true` if a timer interrupt was generated.
+    #[must_use]
     pub fn timer_tick(&mut self, ticks: u32) -> bool {
         if self.timer_initial == 0 || self.timer_mode == TimerMode::TscDeadline {
             return false;
@@ -403,7 +423,7 @@ impl LocalApic {
             let masked = (self.lvt_timer & 0x0001_0000) != 0;
             if !masked {
                 let vector = (self.lvt_timer & 0xFF) as u8;
-                self.accept_interrupt(InterruptEntry {
+                let _ = self.accept_interrupt(&InterruptEntry {
                     vector,
                     delivery_mode: DeliveryMode::Fixed,
                     trigger_mode: TriggerMode::Edge,
@@ -416,6 +436,7 @@ impl LocalApic {
             } else {
                 self.timer_current = 0;
             }
+
             true
         } else {
             self.timer_current -= ticks;
@@ -423,34 +444,155 @@ impl LocalApic {
         }
     }
 
-    /// Check TSC deadline and fire if expired.
-    pub fn check_tsc_deadline(&mut self, current_tsc: u64) -> bool {
-        if self.timer_mode != TimerMode::TscDeadline {
-            return false;
-        }
-        if self.tsc_deadline == 0 || current_tsc < self.tsc_deadline {
-            return false;
-        }
-        let masked = (self.lvt_timer & 0x0001_0000) != 0;
-        if !masked {
-            let vector = (self.lvt_timer & 0xFF) as u8;
-            self.accept_interrupt(InterruptEntry {
-                vector,
-                delivery_mode: DeliveryMode::Fixed,
-                trigger_mode: TriggerMode::Edge,
-                level: true,
-            });
-        }
-        true
+    /// Check if a timer interrupt is pending (not masked).
+    #[must_use]
+    pub const fn timer_interrupt_pending(&self) -> bool {
+        (self.lvt_timer & 0x0001_0000) == 0
     }
 
-    /// Set TSC deadline.
-    pub fn set_tsc_deadline(&mut self, deadline: u64) {
-        self.tsc_deadline = deadline;
+    /// TSC deadline value for TSC-deadline timer mode.
+    #[must_use]
+    pub const fn tsc_deadline(&self) -> u64 {
+        self.tsc_deadline
     }
 
-    /// Get the highest priority pending interrupt without accepting it.
-    pub fn peek_pending(&self) -> Option<u8> {
-        self.pending_interrupt()
+    /// Set TSC deadline value.
+    pub const fn set_tsc_deadline(&mut self, value: u64) {
+        self.tsc_deadline = value;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lapic_new() {
+        let lapic = LocalApic::new(42);
+        assert_eq!(lapic.id(), 42);
+        assert!(!lapic.is_enabled());
+    }
+
+    #[test]
+    fn test_enable_disable() {
+        let mut lapic = LocalApic::new(1);
+        lapic.write_register(LAPIC_SVR, 0x1FF); // Set bit 8 to enable
+        assert!(lapic.is_enabled());
+
+        lapic.write_register(LAPIC_SVR, 0x0FF); // Clear bit 8
+        assert!(!lapic.is_enabled());
+    }
+
+    #[test]
+    fn test_accept_interrupt() {
+        let mut lapic = LocalApic::new(1);
+        lapic.write_register(LAPIC_SVR, 0x1FF); // Enable
+        lapic.set_tpr(0);
+
+        let entry = InterruptEntry {
+            vector: 0x80,
+            delivery_mode: DeliveryMode::Fixed,
+            trigger_mode: TriggerMode::Edge,
+            level: true,
+        };
+
+        assert!(lapic.accept_interrupt(&entry));
+        assert!(lapic.has_pending_interrupt());
+        assert_eq!(lapic.pending_vector(), Some(0x80));
+    }
+
+    #[test]
+    fn test_vector_15_rejected() {
+        let mut lapic = LocalApic::new(1);
+        lapic.write_register(LAPIC_SVR, 0x1FF);
+
+        let entry = InterruptEntry {
+            vector: 15,
+            delivery_mode: DeliveryMode::Fixed,
+            trigger_mode: TriggerMode::Edge,
+            level: true,
+        };
+
+        assert!(!lapic.accept_interrupt(&entry));
+    }
+
+    #[test]
+    fn test_priority_masking() {
+        let mut lapic = LocalApic::new(1);
+        lapic.write_register(LAPIC_SVR, 0x1FF);
+        lapic.set_tpr(0x80); // Set TPR to priority class 8
+
+        let entry = InterruptEntry {
+            vector: 0x70, // Priority class 7, lower than TPR
+            delivery_mode: DeliveryMode::Fixed,
+            trigger_mode: TriggerMode::Edge,
+            level: true,
+        };
+
+        assert!(lapic.accept_interrupt(&entry));
+        assert!(!lapic.has_pending_interrupt()); // Masked by TPR
+    }
+
+    #[test]
+    fn test_eoi() {
+        let mut lapic = LocalApic::new(1);
+        lapic.write_register(LAPIC_SVR, 0x1FF);
+
+        let entry = InterruptEntry {
+            vector: 0x80,
+            delivery_mode: DeliveryMode::Fixed,
+            trigger_mode: TriggerMode::Edge,
+            level: true,
+        };
+
+        let _ = lapic.accept_interrupt(&entry);
+        let vec = lapic.accept_highest_interrupt();
+        assert_eq!(vec, Some(0x80));
+
+        lapic.signal_eoi();
+        assert!(!lapic.has_pending_interrupt());
+    }
+
+    #[test]
+    fn test_simultaneous_priorities() {
+        let mut lapic = LocalApic::new(1);
+        lapic.write_register(LAPIC_SVR, 0x1FF);
+        lapic.set_tpr(0);
+
+        let entry1 = InterruptEntry {
+            vector: 0x80,
+            delivery_mode: DeliveryMode::Fixed,
+            trigger_mode: TriggerMode::Edge,
+            level: true,
+        };
+
+        let entry2 = InterruptEntry {
+            vector: 0x90,
+            delivery_mode: DeliveryMode::Fixed,
+            trigger_mode: TriggerMode::Edge,
+            level: true,
+        };
+
+        let _ = lapic.accept_interrupt(&entry1);
+        let _ = lapic.accept_interrupt(&entry2);
+
+        // Should prefer higher vector
+        assert_eq!(lapic.pending_vector(), Some(0x90));
+    }
+
+    #[test]
+    fn test_timer_one_shot() {
+        let mut lapic = LocalApic::new(1);
+        lapic.write_register(LAPIC_SVR, 0x1FF);
+
+        lapic.write_register(LAPIC_LVT_TIMER, 0x20040); // Vector 0x40, one-shot
+        lapic.write_register(LAPIC_TIMER_INIT, 10);
+
+        assert!(!lapic.timer_tick(5));
+        assert!(!lapic.has_pending_interrupt()); // Not fired yet
+
+        assert!(lapic.timer_tick(10)); // Remaining 5 < 10
+        assert!(lapic.has_pending_interrupt());
+        assert_eq!(lapic.pending_vector(), Some(0x40));
     }
 }

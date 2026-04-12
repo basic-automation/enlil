@@ -25,6 +25,7 @@ impl Notification {
     /// # Panics
     ///
     /// Panics if the system time is before the UNIX epoch.
+    #[must_use]
     pub fn new(
         id: u64,
         source_guest: String,
@@ -58,6 +59,7 @@ pub struct NotificationPolicy {
 }
 
 impl NotificationPolicy {
+    #[must_use]
     pub fn new(urgency_threshold: Urgency, max_per_minute: u32) -> Self {
         Self {
             urgency_threshold,
@@ -67,6 +69,7 @@ impl NotificationPolicy {
         }
     }
 
+    #[must_use]
     pub fn is_allowed(&self, notif: &Notification) -> bool {
         if notif.urgency < self.urgency_threshold {
             return false;
@@ -93,6 +96,7 @@ impl Default for NotificationRouter {
 }
 
 impl NotificationRouter {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             policies: HashMap::new(),

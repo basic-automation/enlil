@@ -59,7 +59,7 @@ pub struct Virtqueue {
 impl Virtqueue {
     /// Create a new virtqueue with the given name and capacity.
     ///
-    /// Standard VirtIO queue sizes are powers of 2, max 32768.
+    /// Standard `VirtIO` queue sizes are powers of 2, max 32768.
     pub fn new(name: impl Into<String>, capacity: u16) -> Self {
         Self {
             name: name.into(),
@@ -72,36 +72,41 @@ impl Virtqueue {
     }
 
     /// Enable the queue (guest has configured it).
-    pub fn enable(&mut self) {
+    pub const fn enable(&mut self) {
         self.enabled = true;
     }
 
     /// Disable the queue.
-    pub fn disable(&mut self) {
+    pub const fn disable(&mut self) {
         self.enabled = false;
     }
 
     /// Whether the queue is enabled.
-    pub fn is_enabled(&self) -> bool {
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
         self.enabled
     }
 
     /// Queue name.
+    #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
     /// Queue capacity.
-    pub fn capacity(&self) -> u16 {
+    #[must_use]
+    pub const fn capacity(&self) -> u16 {
         self.capacity
     }
 
     /// Number of available (pending) descriptors.
+    #[must_use]
     pub fn available_count(&self) -> usize {
         self.available.len()
     }
 
     /// Number of used (completed) descriptors.
+    #[must_use]
     pub fn used_count(&self) -> usize {
         self.used.len()
     }
@@ -110,6 +115,10 @@ impl Virtqueue {
     ///
     /// For TX: the guest places a frame to send.
     /// For RX: the guest provides an empty buffer for the device to fill.
+    ///
+    /// # Errors
+    ///
+    /// Returns `VirtqueueError::QueueFull` if the queue is at capacity.
     pub fn push_available(&mut self, data: Vec<u8>, writable: bool) -> Result<u16, VirtqueueError> {
         if self.available.len() >= self.capacity as usize {
             return Err(VirtqueueError::QueueFull {
@@ -130,11 +139,16 @@ impl Virtqueue {
     }
 
     /// Pop the next available descriptor (device processing).
+    ///
+    /// # Errors
+    ///
+    /// Returns `VirtqueueError::QueueEmpty` if no descriptors available.
     pub fn pop_available(&mut self) -> Result<VirtqDesc, VirtqueueError> {
         self.available.pop_front().ok_or(VirtqueueError::QueueEmpty)
     }
 
     /// Peek at the next available descriptor without removing it.
+    #[must_use]
     pub fn peek_available(&self) -> Option<&VirtqDesc> {
         self.available.front()
     }
@@ -145,16 +159,22 @@ impl Virtqueue {
     }
 
     /// Pop a completed descriptor from the used ring (guest consumption).
+    ///
+    /// # Errors
+    ///
+    /// Returns `VirtqueueError::QueueEmpty` if no used descriptors available.
     pub fn pop_used(&mut self) -> Result<VirtqDesc, VirtqueueError> {
         self.used.pop_front().ok_or(VirtqueueError::QueueEmpty)
     }
 
     /// Check if there are available descriptors to process.
+    #[must_use]
     pub fn has_available(&self) -> bool {
         !self.available.is_empty()
     }
 
     /// Check if there are used descriptors to consume.
+    #[must_use]
     pub fn has_used(&self) -> bool {
         !self.used.is_empty()
     }
@@ -176,7 +196,7 @@ impl fmt::Debug for Virtqueue {
             .field("available", &self.available.len())
             .field("used", &self.used.len())
             .field("enabled", &self.enabled)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

@@ -1,7 +1,7 @@
 //! Virtual I/O APIC emulation.
 //!
 //! Implements the Intel 82093AA I/O APIC with 24 redirection table entries.
-//! Accessible via MMIO at 0xFEC00000.
+//! Accessible via MMIO at `0xFEC00000`.
 
 use super::DeliveryMode;
 
@@ -9,9 +9,9 @@ use super::DeliveryMode;
 #[allow(dead_code)]
 pub const IOAPIC_BASE: u64 = 0xFEC0_0000;
 
-/// I/O APIC register select (IOREGSEL) offset.
+/// I/O APIC register select (`IOREGSEL`) offset.
 const IOREGSEL: u64 = 0x00;
-/// I/O APIC data window (IOWIN) offset.
+/// I/O APIC data window (`IOWIN`) offset.
 const IOWIN: u64 = 0x10;
 
 /// I/O APIC register indices.
@@ -28,22 +28,23 @@ const IOAPIC_VERSION: u32 = 0x11;
 
 /// Redirection Table Entry.
 #[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct RedirectionEntry {
     /// Interrupt vector (0-255).
     pub vector: u8,
     /// Delivery mode.
     pub delivery_mode: DeliveryMode,
-    /// Destination mode: false = physical, true = logical.
+    /// Destination mode: `false` = physical, `true` = logical.
     pub dest_logical: bool,
-    /// Delivery status (read-only): false = idle, true = send pending.
+    /// Delivery status (read-only): `false` = idle, `true` = send pending.
     pub delivery_pending: bool,
-    /// Polarity: false = active high, true = active low.
+    /// Polarity: `false` = active high, `true` = active low.
     pub active_low: bool,
     /// Remote IRR (for level-triggered, read-only).
     pub remote_irr: bool,
-    /// Trigger mode: false = edge, true = level.
+    /// Trigger mode: `false` = edge, `true` = level.
     pub level_triggered: bool,
-    /// Mask: true = masked (disabled).
+    /// Mask: `true` = masked (disabled).
     pub masked: bool,
     /// Destination field (APIC ID or logical destination).
     pub destination: u8,
@@ -67,7 +68,8 @@ impl Default for RedirectionEntry {
 
 impl RedirectionEntry {
     /// Encode the low 32 bits of the RTE.
-    pub fn low(&self) -> u32 {
+    #[must_use]
+    pub const fn low(&self) -> u32 {
         let mut val = self.vector as u32;
         val |= (self.delivery_mode as u32 & 0x7) << 8;
         if self.dest_logical {
@@ -92,12 +94,14 @@ impl RedirectionEntry {
     }
 
     /// Encode the high 32 bits of the RTE.
-    pub fn high(&self) -> u32 {
+    #[must_use]
+    pub const fn high(&self) -> u32 {
         (self.destination as u32) << 24
     }
 
     /// Decode low 32 bits into the RTE fields.
-    pub fn set_low(&mut self, val: u32) {
+    #[allow(clippy::cast_possible_truncation)]
+    pub const fn set_low(&mut self, val: u32) {
         self.vector = (val & 0xFF) as u8;
         self.delivery_mode = DeliveryMode::from_bits(((val >> 8) & 0x7) as u8);
         self.dest_logical = (val >> 11) & 1 != 0;
@@ -109,59 +113,65 @@ impl RedirectionEntry {
     }
 
     /// Decode high 32 bits.
-    pub fn set_high(&mut self, val: u32) {
+    #[allow(clippy::cast_possible_truncation)]
+    pub const fn set_high(&mut self, val: u32) {
         self.destination = ((val >> 24) & 0xFF) as u8;
     }
 
     // --- Accessor methods used by controller.rs ---
 
     /// Whether this entry is masked.
-    pub fn masked(&self) -> bool {
+    #[must_use]
+    pub const fn masked(&self) -> bool {
         self.masked
     }
 
     /// Get the interrupt vector.
-    pub fn vector(&self) -> u8 {
+    #[must_use]
+    pub const fn vector(&self) -> u8 {
         self.vector
     }
 
-    /// Get the delivery mode as a u8 value.
-    pub fn delivery_mode(&self) -> u8 {
+    /// Get the delivery mode as a `u8` value.
+    #[must_use]
+    pub const fn delivery_mode(&self) -> u8 {
         self.delivery_mode as u8
     }
 
     /// Get the destination field.
-    pub fn destination(&self) -> u8 {
+    #[must_use]
+    pub const fn destination(&self) -> u8 {
         self.destination
     }
 
     /// Whether destination mode is logical.
-    pub fn destination_mode_logical(&self) -> bool {
+    #[must_use]
+    pub const fn destination_mode_logical(&self) -> bool {
         self.dest_logical
     }
 
     /// Set the interrupt vector.
-    pub fn set_vector(&mut self, vector: u8) {
+    pub const fn set_vector(&mut self, vector: u8) {
         self.vector = vector;
     }
 
-    /// Set the delivery mode from a u8 value.
-    pub fn set_delivery_mode(&mut self, mode: u8) {
+    /// Set the delivery mode from a `u8` value.
+    pub const fn set_delivery_mode(&mut self, mode: u8) {
         self.delivery_mode = DeliveryMode::from_bits(mode);
     }
 
     /// Set the destination field.
-    pub fn set_destination(&mut self, dest: u8) {
+    pub const fn set_destination(&mut self, dest: u8) {
         self.destination = dest;
     }
 
     /// Set the destination mode to logical.
-    pub fn set_destination_mode_logical(&mut self, logical: bool) {
+    pub const fn set_destination_mode_logical(&mut self, logical: bool) {
         self.dest_logical = logical;
     }
 
     /// Set the mask bit.
-    pub fn set_masked(&mut self, masked: bool) {
+    pub const fn set_masked(&mut self, masked: bool) {
         self.masked = masked;
     }
 }
@@ -170,7 +180,7 @@ impl RedirectionEntry {
 pub struct IoApic {
     /// APIC ID.
     id: u8,
-    /// Currently selected register (via IOREGSEL).
+    /// Currently selected register (via `IOREGSEL`).
     reg_select: u8,
     /// Redirection table entries.
     entries: [RedirectionEntry; NUM_IOAPIC_PINS],
@@ -179,25 +189,38 @@ pub struct IoApic {
 }
 
 impl IoApic {
-    pub fn new(id: u8) -> Self {
+    /// Create a new I/O APIC with the given ID.
+    #[must_use]
+    pub const fn new(id: u8) -> Self {
         Self {
             id,
             reg_select: 0,
-            entries: [RedirectionEntry::default(); NUM_IOAPIC_PINS],
+            entries: [RedirectionEntry {
+                vector: 0,
+                delivery_mode: DeliveryMode::Fixed,
+                dest_logical: false,
+                delivery_pending: false,
+                active_low: false,
+                remote_irr: false,
+                level_triggered: false,
+                masked: true,
+                destination: 0,
+            }; NUM_IOAPIC_PINS],
             irq_level: [false; NUM_IOAPIC_PINS],
         }
     }
 
-    /// Handle MMIO read at the given offset from IOAPIC_BASE.
+    /// Handle MMIO read at the given offset from `IOAPIC_BASE`.
+    #[must_use]
     pub fn mmio_read(&self, offset: u64) -> u32 {
         match offset {
-            IOREGSEL => self.reg_select as u32,
+            IOREGSEL => u32::from(self.reg_select),
             IOWIN => self.read_register(self.reg_select),
             _ => 0,
         }
     }
 
-    /// Handle MMIO write at the given offset from IOAPIC_BASE.
+    /// Handle MMIO write at the given offset from `IOAPIC_BASE`.
     pub fn mmio_write(&mut self, offset: u64, value: u32) {
         match offset {
             IOREGSEL => self.reg_select = (value & 0xFF) as u8,
@@ -206,15 +229,15 @@ impl IoApic {
         }
     }
 
+    #[must_use]
     fn read_register(&self, reg: u8) -> u32 {
         match reg {
-            IOAPIC_REG_ID => (self.id as u32) << 24,
+            IOAPIC_REG_ID | IOAPIC_REG_ARB => u32::from(self.id) << 24,
             IOAPIC_REG_VER => {
-                IOAPIC_VERSION | (((NUM_IOAPIC_PINS - 1) as u32) << 16)
+                IOAPIC_VERSION | (u32::from(u8::try_from(NUM_IOAPIC_PINS - 1).unwrap_or(0)) << 16)
             }
-            IOAPIC_REG_ARB => (self.id as u32) << 24,
             r if r >= IOAPIC_REG_REDTBL_BASE => {
-                let index = (r - IOAPIC_REG_REDTBL_BASE) as usize;
+                let index = usize::from(r - IOAPIC_REG_REDTBL_BASE);
                 let entry_idx = index / 2;
                 if entry_idx >= NUM_IOAPIC_PINS {
                     return 0;
@@ -233,7 +256,7 @@ impl IoApic {
         match reg {
             IOAPIC_REG_ID => self.id = ((value >> 24) & 0xF) as u8,
             r if r >= IOAPIC_REG_REDTBL_BASE => {
-                let index = (r - IOAPIC_REG_REDTBL_BASE) as usize;
+                let index = usize::from(r - IOAPIC_REG_REDTBL_BASE);
                 let entry_idx = index / 2;
                 if entry_idx >= NUM_IOAPIC_PINS {
                     return;
@@ -249,7 +272,7 @@ impl IoApic {
     }
 
     /// Assert an IRQ line. Returns the routing info if the interrupt should be delivered.
-    pub fn set_irq(&mut self, irq: usize) -> Option<InterruptRoute> {
+    pub const fn set_irq(&mut self, irq: usize) -> Option<InterruptRoute> {
         if irq >= NUM_IOAPIC_PINS {
             return None;
         }
@@ -278,14 +301,14 @@ impl IoApic {
     }
 
     /// Deassert an IRQ line (for level-triggered interrupts).
-    pub fn clear_irq(&mut self, irq: usize) {
+    pub const fn clear_irq(&mut self, irq: usize) {
         if irq < NUM_IOAPIC_PINS {
             self.irq_level[irq] = false;
         }
     }
 
     /// Handle EOI broadcast for a given vector.
-    /// Clears remote_irr on matching level-triggered entries.
+    /// Clears `remote_irr` on matching level-triggered entries.
     pub fn eoi(&mut self, vector: u8) {
         for (i, entry) in self.entries.iter_mut().enumerate() {
             if entry.level_triggered && entry.remote_irr && entry.vector == vector {
@@ -304,18 +327,30 @@ impl IoApic {
     }
 
     /// Get a copy of a redirection table entry by IRQ number.
-    pub fn get_rte(&self, irq: u8) -> RedirectionEntry {
+    ///
+    /// # Panics
+    /// Panics if `irq >= 24`.
+    #[must_use]
+    pub const fn get_rte(&self, irq: u8) -> RedirectionEntry {
         self.entries[irq as usize]
     }
 
     /// Get a mutable reference to a redirection table entry by IRQ number.
-    pub fn get_rte_mut(&mut self, irq: u8) -> &mut RedirectionEntry {
+    ///
+    /// # Panics
+    /// Panics if `irq >= 24`.
+    pub const fn get_rte_mut(&mut self, irq: u8) -> &mut RedirectionEntry {
         &mut self.entries[irq as usize]
     }
 
     /// Get a reference to a redirection entry.
-    pub fn entry(&self, irq: usize) -> Option<&RedirectionEntry> {
-        self.entries.get(irq)
+    #[must_use]
+    pub const fn entry(&self, irq: usize) -> Option<&RedirectionEntry> {
+        if irq < self.entries.len() {
+            Some(&self.entries[irq])
+        } else {
+            None
+        }
     }
 }
 
@@ -344,10 +379,13 @@ mod tests {
     #[test]
     fn ioapic_read_version() {
         let mut ioapic = IoApic::new(0);
-        ioapic.mmio_write(IOREGSEL, IOAPIC_REG_VER as u32);
+        ioapic.mmio_write(IOREGSEL, u32::from(IOAPIC_REG_VER));
         let ver = ioapic.mmio_read(IOWIN);
         assert_eq!(ver & 0xFF, IOAPIC_VERSION);
-        assert_eq!((ver >> 16) & 0xFF, (NUM_IOAPIC_PINS - 1) as u32);
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            assert_eq!((ver >> 16) & 0xFF, (NUM_IOAPIC_PINS - 1) as u32);
+        }
     }
 
     #[test]
@@ -356,20 +394,20 @@ mod tests {
 
         // Write low word of RTE 0: vector=0x30, delivery=Fixed, unmasked
         let rte_reg = IOAPIC_REG_REDTBL_BASE;
-        ioapic.mmio_write(IOREGSEL, rte_reg as u32);
+        ioapic.mmio_write(IOREGSEL, u32::from(rte_reg));
         ioapic.mmio_write(IOWIN, 0x0000_0030); // vector 0x30, unmasked
 
         // Write high word: destination APIC ID = 1
-        ioapic.mmio_write(IOREGSEL, (rte_reg + 1) as u32);
+        ioapic.mmio_write(IOREGSEL, u32::from(rte_reg + 1));
         ioapic.mmio_write(IOWIN, 0x0100_0000); // dest = 1
 
         // Read back
-        ioapic.mmio_write(IOREGSEL, rte_reg as u32);
+        ioapic.mmio_write(IOREGSEL, u32::from(rte_reg));
         let low = ioapic.mmio_read(IOWIN);
         assert_eq!(low & 0xFF, 0x30);
         assert_eq!((low >> 16) & 1, 0); // unmasked
 
-        ioapic.mmio_write(IOREGSEL, (rte_reg + 1) as u32);
+        ioapic.mmio_write(IOREGSEL, u32::from(rte_reg + 1));
         let high = ioapic.mmio_read(IOWIN);
         assert_eq!((high >> 24) & 0xFF, 1);
     }

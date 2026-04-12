@@ -15,6 +15,7 @@ pub struct InterruptController {
 
 impl InterruptController {
     /// Create a new interrupt controller with the given number of vCPUs.
+    #[must_use]
     pub fn new(num_vcpus: u8) -> Self {
         let lapics = (0..num_vcpus).map(LocalApic::new).collect();
         Self {
@@ -76,12 +77,12 @@ impl InterruptController {
                     .filter(|(_, l)| l.id() == dest && l.is_enabled())
                     .min_by_key(|(_, l)| l.get_tpr());
                 if let Some((idx, _)) = target {
-                    self.lapics[idx].accept_interrupt(entry);
+                    let _ = self.lapics[idx].accept_interrupt(&entry);
                 }
             }
             _ => {
                 if let Some(lapic) = self.lapics.iter_mut().find(|l| l.id() == dest) {
-                    lapic.accept_interrupt(entry);
+                    let _ = lapic.accept_interrupt(&entry);
                 }
             }
         }
@@ -96,13 +97,13 @@ impl InterruptController {
                     .filter(|(_, l)| l.is_enabled())
                     .min_by_key(|(_, l)| l.get_tpr());
                 if let Some((idx, _)) = target {
-                    self.lapics[idx].accept_interrupt(entry);
+                    let _ = self.lapics[idx].accept_interrupt(&entry);
                 }
             }
             _ => {
                 for lapic in &mut self.lapics {
                     if lapic.is_enabled() {
-                        lapic.accept_interrupt(entry);
+                        let _ = lapic.accept_interrupt(&entry);
                     }
                 }
             }
@@ -118,18 +119,19 @@ impl InterruptController {
     }
 
     /// Check if a vCPU has a pending interrupt.
+    #[must_use]
     pub fn has_pending(&self, vcpu_id: u8) -> bool {
         self.lapics.iter()
             .find(|l| l.id() == vcpu_id)
-            .map(|l| l.has_pending_interrupt())
-            .unwrap_or(false)
+            .is_some_and(LocalApic::has_pending_interrupt)
     }
 
     /// Get the pending interrupt vector for a vCPU.
+    #[must_use]
     pub fn pending_vector(&self, vcpu_id: u8) -> Option<u8> {
         self.lapics.iter()
             .find(|l| l.id() == vcpu_id)
-            .and_then(|l| l.pending_vector())
+            .and_then(LocalApic::pending_vector)
     }
 
     /// Get a mutable reference to a LAPIC by vCPU ID.
@@ -138,6 +140,7 @@ impl InterruptController {
     }
 
     /// Get a reference to a LAPIC by vCPU ID.
+    #[must_use]
     pub fn lapic(&self, vcpu_id: u8) -> Option<&LocalApic> {
         self.lapics.iter().find(|l| l.id() == vcpu_id)
     }

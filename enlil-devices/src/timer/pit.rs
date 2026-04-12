@@ -14,7 +14,7 @@ pub const PIT_FREQUENCY: u32 = 1_193_182;
 const NS_PER_TICK: u64 = 838;
 
 /// PIT channel operating modes.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelMode {
     InterruptOnTerminalCount = 0,
     HardwareRetriggerable = 1,
@@ -25,9 +25,10 @@ pub enum ChannelMode {
 }
 
 impl ChannelMode {
-    fn from_bits(bits: u8) -> Self {
+    /// Create a `ChannelMode` from bit representation.
+    #[must_use]
+    const fn from_bits(bits: u8) -> Self {
         match bits & 0x7 {
-            0 => Self::InterruptOnTerminalCount,
             1 => Self::HardwareRetriggerable,
             2 => Self::RateGenerator,
             3 => Self::SquareWave,
@@ -39,7 +40,7 @@ impl ChannelMode {
 }
 
 /// Access mode for reading/writing channel count.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessMode {
     Latch = 0,
     LoByte = 1,
@@ -48,9 +49,10 @@ pub enum AccessMode {
 }
 
 impl AccessMode {
-    fn from_bits(bits: u8) -> Self {
+    /// Create an `AccessMode` from bit representation.
+    #[must_use]
+    const fn from_bits(bits: u8) -> Self {
         match bits & 0x3 {
-            0 => Self::Latch,
             1 => Self::LoByte,
             2 => Self::HiByte,
             3 => Self::LoHiByte,
@@ -60,6 +62,7 @@ impl AccessMode {
 }
 
 /// A single PIT channel.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct PitChannel {
     pub count: u16,
@@ -75,7 +78,9 @@ pub struct PitChannel {
 }
 
 impl PitChannel {
-    fn new() -> Self {
+    /// Create a new `PitChannel` with default state.
+    #[must_use]
+    const fn new() -> Self {
         Self {
             count: 0,
             reload: 0,
@@ -93,7 +98,7 @@ impl PitChannel {
     fn read_data(&mut self) -> u8 {
         let value = self.latched_count.unwrap_or(self.count);
         match self.access {
-            AccessMode::LoByte => (value & 0xFF) as u8,
+            AccessMode::LoByte | AccessMode::Latch => (value & 0xFF) as u8,
             AccessMode::HiByte => ((value >> 8) & 0xFF) as u8,
             AccessMode::LoHiByte => {
                 if self.read_hi {
@@ -105,27 +110,26 @@ impl PitChannel {
                     (value & 0xFF) as u8
                 }
             }
-            AccessMode::Latch => (value & 0xFF) as u8,
         }
     }
 
     fn write_data(&mut self, val: u8) {
         match self.access {
             AccessMode::LoByte => {
-                self.reload = (self.reload & 0xFF00) | val as u16;
+                self.reload = (self.reload & 0xFF00) | u16::from(val);
                 self.load_count();
             }
             AccessMode::HiByte => {
-                self.reload = (self.reload & 0x00FF) | ((val as u16) << 8);
+                self.reload = (self.reload & 0x00FF) | (u16::from(val) << 8);
                 self.load_count();
             }
             AccessMode::LoHiByte => {
                 if self.write_hi {
-                    self.reload = (self.reload & 0x00FF) | ((val as u16) << 8);
+                    self.reload = (self.reload & 0x00FF) | (u16::from(val) << 8);
                     self.write_hi = false;
                     self.load_count();
                 } else {
-                    self.reload = (self.reload & 0xFF00) | val as u16;
+                    self.reload = (self.reload & 0xFF00) | u16::from(val);
                     self.write_hi = true;
                 }
             }
@@ -133,14 +137,15 @@ impl PitChannel {
         }
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn load_count(&mut self) {
-        let effective = if self.reload == 0 { 0x10000u32 } else { self.reload as u32 };
+        let effective = if self.reload == 0 { 0x0001_0000_u32 } else { u32::from(self.reload) };
         self.count = effective as u16;
         self.enabled = true;
         self.output = false;
     }
 
-    fn tick(&mut self) -> bool {
+    const fn tick(&mut self) -> bool {
         if !self.enabled || !self.gate {
             return false;
         }
@@ -202,7 +207,9 @@ pub struct Pit {
 }
 
 impl Pit {
-    pub fn new() -> Self {
+    /// Create a new `Pit` with all channels in default state.
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             channels: [PitChannel::new(), PitChannel::new(), PitChannel::new()],
             accumulator_ns: 0,
@@ -210,6 +217,7 @@ impl Pit {
     }
 
     /// Read from a PIT I/O port (0x40-0x42).
+    #[must_use]
     pub fn read_port(&mut self, port: u16) -> u8 {
         let channel = (port & 0x3) as usize;
         if channel < 3 {
@@ -254,7 +262,9 @@ impl Pit {
     }
 
     /// Advance the PIT by `ns` nanoseconds.
-    /// Returns true if channel 0 generated an interrupt (IRQ 0).
+    ///
+    /// Returns `true` if channel 0 generated an interrupt (IRQ 0).
+    #[must_use]
     pub fn tick(&mut self, ns: u64) -> bool {
         self.accumulator_ns += ns;
         let ticks = self.accumulator_ns / NS_PER_TICK;
@@ -272,12 +282,13 @@ impl Pit {
     }
 
     /// Get the current frequency of channel 0 in Hz.
+    #[must_use]
     pub fn channel0_frequency(&self) -> u32 {
         let reload = self.channels[0].reload;
         if reload == 0 {
-            PIT_FREQUENCY / 65536
+            PIT_FREQUENCY / 65_536
         } else {
-            PIT_FREQUENCY / reload as u32
+            PIT_FREQUENCY / u32::from(reload)
         }
     }
 }
@@ -346,8 +357,8 @@ mod tests {
         let mut pit = Pit::new();
         pit.write_port(0x43, 0x34);
         // Set reload to 1193 (approximately 1000 Hz)
-        pit.write_port(0x40, (1193 & 0xFF) as u8);
-        pit.write_port(0x40, ((1193 >> 8) & 0xFF) as u8);
+        pit.write_port(0x40, (0x4A9 & 0xFF) as u8);
+        pit.write_port(0x40, ((0x4A9 >> 8) & 0xFF) as u8);
         let freq = pit.channel0_frequency();
         assert!((999..=1001).contains(&freq));
     }

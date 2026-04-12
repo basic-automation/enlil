@@ -1,7 +1,7 @@
-//! VirtIO network header.
+//! `VirtIO` network header.
 //!
 //! Every packet transmitted or received through a VirtIO-net device is
-//! prefixed with this header. Defined in VirtIO 1.2, Section 5.1.6.
+//! prefixed with this header. Defined in `VirtIO` 1.2, Section 5.1.6.
 
 use std::fmt;
 
@@ -17,7 +17,7 @@ pub enum GsoType {
 }
 
 impl GsoType {
-    pub fn from_u8(v: u8) -> Option<Self> {
+    pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Self::None),
             1 => Some(Self::TcpV4),
@@ -40,7 +40,7 @@ pub mod flags {
     pub const RSC_INFO: u8 = 4;
 }
 
-/// VirtIO network header (12 bytes, or 10 without mergeable rx buffers).
+/// `VirtIO` network header (12 bytes, or 10 without mergeable rx buffers).
 ///
 /// This header precedes every Ethernet frame in the virtqueue.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -56,15 +56,15 @@ pub struct VirtioNetHeader {
     pub gso_size: u16,
     /// Checksum start offset from the beginning of the packet.
     pub csum_start: u16,
-    /// Checksum offset from csum_start to place the checksum.
+    /// Checksum offset from `csum_start` to place the checksum.
     pub csum_offset: u16,
-    /// Number of merged buffers (only with VIRTIO_NET_F_MRG_RXBUF).
+    /// Number of merged buffers (only with `VIRTIO_NET_F_MRG_RXBUF`).
     pub num_buffers: u16,
 }
 
-/// Size of the header without the num_buffers field.
+/// Size of the header without the `num_buffers` field.
 pub const VIRTIO_NET_HDR_SIZE: usize = 10;
-/// Size of the header with the num_buffers field (mergeable rx buffers).
+/// Size of the header with the `num_buffers` field (mergeable rx buffers).
 pub const VIRTIO_NET_HDR_SIZE_MRG: usize = 12;
 
 impl VirtioNetHeader {
@@ -82,6 +82,7 @@ impl VirtioNetHeader {
     /// Parse a header from a byte slice.
     ///
     /// If `merge_rxbuf` is true, expects 12 bytes; otherwise 10.
+    #[must_use]
     pub fn from_bytes(data: &[u8], merge_rxbuf: bool) -> Option<Self> {
         let min_len = if merge_rxbuf {
             VIRTIO_NET_HDR_SIZE_MRG
@@ -109,6 +110,7 @@ impl VirtioNetHeader {
     }
 
     /// Serialize the header to bytes.
+    #[must_use]
     pub fn to_bytes(&self, merge_rxbuf: bool) -> Vec<u8> {
         let mut buf = Vec::with_capacity(if merge_rxbuf {
             VIRTIO_NET_HDR_SIZE_MRG
@@ -128,6 +130,7 @@ impl VirtioNetHeader {
     }
 
     /// Size of this header in bytes.
+    #[must_use]
     pub const fn wire_size(merge_rxbuf: bool) -> usize {
         if merge_rxbuf {
             VIRTIO_NET_HDR_SIZE_MRG
@@ -137,17 +140,20 @@ impl VirtioNetHeader {
     }
 
     /// Check if checksum offload is requested.
-    pub fn needs_csum(&self) -> bool {
+    #[must_use]
+    pub const fn needs_csum(&self) -> bool {
         (self.flags & flags::NEEDS_CSUM) != 0
     }
 
     /// Check if received data checksum has been validated.
-    pub fn data_valid(&self) -> bool {
+    #[must_use]
+    pub const fn data_valid(&self) -> bool {
         (self.flags & flags::DATA_VALID) != 0
     }
 
     /// Get the GSO type.
-    pub fn gso(&self) -> Option<GsoType> {
+    #[must_use]
+    pub const fn gso(&self) -> Option<GsoType> {
         GsoType::from_u8(self.gso_type)
     }
 }

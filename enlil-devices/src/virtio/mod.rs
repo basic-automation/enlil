@@ -1,16 +1,16 @@
-//! VirtIO device definitions and virtqueue types.
+//! `VirtIO` device definitions and virtqueue types.
 //!
-//! Provides the core types shared across VirtIO device implementations
+//! Provides the core types shared across `VirtIO` device implementations
 //! and the MMIO transport layer.
 
 pub mod transport;
 
 use bitflags::bitflags;
 
-/// Magic value identifying a VirtIO MMIO device ("virt" in little-endian).
-pub const VIRTIO_MMIO_MAGIC: u32 = 0x74726976;
+/// Magic value identifying a `VirtIO` MMIO device ("virt" in little-endian).
+pub const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976;
 
-/// VirtIO device type identifiers.
+/// `VirtIO` device type identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum VirtioDeviceType {
@@ -78,6 +78,7 @@ pub struct VirtqAvail {
 }
 
 impl VirtqAvail {
+    #[must_use]
     pub fn new(queue_size: u16) -> Self {
         Self {
             flags: 0,
@@ -107,6 +108,7 @@ pub struct VirtqUsed {
 }
 
 impl VirtqUsed {
+    #[must_use]
     pub fn new(queue_size: u16) -> Self {
         Self {
             flags: 0,

@@ -1,4 +1,4 @@
-//! VirtIO network device emulation.
+//! `VirtIO` network device emulation.
 //!
 //! Implements a VirtIO-net device with TX/RX virtqueues, a pluggable
 //! network backend, and basic statistics.
@@ -11,7 +11,7 @@ use super::virtqueue::Virtqueue;
 
 use std::collections::VecDeque;
 
-/// Device status bits (VirtIO 1.2, Section 2.1).
+/// Device status bits (`VirtIO` 1.2, Section 2.1).
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceStatus {
@@ -34,7 +34,7 @@ pub struct NetDeviceStats {
     pub rx_drops: u64,
 }
 
-/// A VirtIO network device.
+/// A `VirtIO` network device.
 ///
 /// Contains TX and RX virtqueues, a pluggable backend, MAC address,
 /// feature negotiation, and packet statistics.
@@ -49,9 +49,9 @@ pub struct VirtioNetDevice {
     merge_rxbuf: bool,
     /// Device status.
     status: u8,
-    /// TX virtqueue (guest â†’ host).
+    /// TX virtqueue (guest → host).
     tx_queue: Virtqueue,
-    /// RX virtqueue (host â†’ guest).
+    /// RX virtqueue (host → guest).
     rx_queue: Virtqueue,
     /// Queue size.
     #[allow(dead_code)]
@@ -65,8 +65,9 @@ pub struct VirtioNetDevice {
 }
 
 impl VirtioNetDevice {
-    /// Create a new VirtIO network device.
-    pub fn new(config: NetDeviceConfig, backend: Box<dyn NetBackend>) -> Self {
+    /// Create a new `VirtIO` network device.
+    #[must_use]
+    pub fn new(config: &NetDeviceConfig, backend: Box<dyn NetBackend>) -> Self {
         let queue_size: u16 = 256; // default virtqueue size
         Self {
             name: config.name.clone(),
@@ -84,32 +85,37 @@ impl VirtioNetDevice {
     }
 
     /// Get the device name.
+    #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
     /// Get the MAC address.
-    pub fn mac(&self) -> MacAddress {
+    #[must_use]
+    pub const fn mac(&self) -> MacAddress {
         self.mac
     }
 
     /// Get negotiated features.
-    pub fn features(&self) -> NetFeatures {
+    #[must_use]
+    pub const fn features(&self) -> NetFeatures {
         self.features
     }
 
     /// Get device statistics.
-    pub fn stats(&self) -> &NetDeviceStats {
+    #[must_use]
+    pub const fn stats(&self) -> &NetDeviceStats {
         &self.stats
     }
 
     /// Get device status.
-    pub fn status(&self) -> u8 {
+    #[must_use]
+    pub const fn status(&self) -> u8 {
         self.status
     }
 
     /// Activate the device with negotiated features.
-    pub fn activate(&mut self, features: NetFeatures) {
+    pub const fn activate(&mut self, features: NetFeatures) {
         self.features = features;
         self.merge_rxbuf = features.contains(NetFeatures::MRG_RXBUF);
         self.status = DeviceStatus::DriverOk as u8;
@@ -137,10 +143,7 @@ impl VirtioNetDevice {
         }
 
         while self.tx_queue.has_available() {
-            let desc = match self.tx_queue.pop_available() {
-                Ok(d) => d,
-                Err(_) => break,
-            };
+            let Ok(desc) = self.tx_queue.pop_available() else { break };
 
             // The descriptor data contains: [VirtioNetHeader][Ethernet frame]
             let hdr_size = VirtioNetHeader::wire_size(self.merge_rxbuf);
@@ -181,7 +184,7 @@ impl VirtioNetDevice {
                 break;
             }
             match self.backend.recv(&mut buf) {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(n) => {
                     // Prepend VirtIO net header
                     let hdr = VirtioNetHeader::EMPTY;
@@ -190,7 +193,6 @@ impl VirtioNetDevice {
                     self.rx_pending.push_back(frame);
                     received += 1;
                 }
-                Err(_) => break,
             }
         }
 
@@ -199,10 +201,7 @@ impl VirtioNetDevice {
             if !self.rx_queue.has_available() {
                 break;
             }
-            let mut desc = match self.rx_queue.pop_available() {
-                Ok(d) => d,
-                Err(_) => break,
-            };
+            let Ok(mut desc) = self.rx_queue.pop_available() else { break };
 
             if desc.data.len() < frame.len() {
                 self.stats.rx_drops += 1;
@@ -231,21 +230,25 @@ impl VirtioNetDevice {
     }
 
     /// Get number of pending RX frames.
+    #[must_use]
     pub fn pending_rx_count(&self) -> usize {
         self.rx_pending.len()
     }
 
     /// Check if there are used TX descriptors ready for the guest.
+    #[must_use]
     pub fn has_tx_completions(&self) -> bool {
         self.tx_queue.has_used()
     }
 
     /// Check if there are used RX descriptors ready for the guest.
+    #[must_use]
     pub fn has_rx_completions(&self) -> bool {
         self.rx_queue.has_used()
     }
 
     /// Get backend name.
+    #[must_use]
     pub fn backend_name(&self) -> &str {
         self.backend.backend_name()
     }
@@ -259,7 +262,7 @@ mod tests {
     fn make_device() -> VirtioNetDevice {
         let config = NetDeviceConfig::new("test0", MacAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]));
         let backend = Box::new(NullBackend::new());
-        VirtioNetDevice::new(config, backend)
+        VirtioNetDevice::new(&config, backend)
     }
 
     #[test]

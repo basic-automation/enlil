@@ -14,11 +14,17 @@ use std::sync::{Arc, Mutex};
 pub trait NetBackend: Send {
     /// Send an Ethernet frame out through this backend.
     /// Returns the number of bytes written, or an error.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     fn send(&mut self, frame: &[u8]) -> std::io::Result<usize>;
 
     /// Receive an Ethernet frame from this backend.
     /// Returns `Ok(n)` with n bytes written into `buf`, or
     /// `Ok(0)` if no frame is available (non-blocking).
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
     fn recv(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
 
     /// Returns true if this backend has a frame ready to read.
@@ -29,7 +35,7 @@ pub trait NetBackend: Send {
 }
 
 // ---------------------------------------------------------------------------
-// Null Backend â€” cross-platform, for testing
+// Null Backend – cross-platform, for testing
 // ---------------------------------------------------------------------------
 
 /// A null network backend that drops all transmitted frames
@@ -42,7 +48,8 @@ pub struct NullBackend {
 }
 
 impl NullBackend {
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             tx_count: 0,
             tx_bytes: 0,
@@ -50,12 +57,14 @@ impl NullBackend {
     }
 
     /// Number of frames sent (dropped) through this backend.
-    pub fn tx_count(&self) -> u64 {
+    #[must_use]
+    pub const fn tx_count(&self) -> u64 {
         self.tx_count
     }
 
     /// Total bytes sent (dropped) through this backend.
-    pub fn tx_bytes(&self) -> u64 {
+    #[must_use]
+    pub const fn tx_bytes(&self) -> u64 {
         self.tx_bytes
     }
 }
@@ -83,17 +92,17 @@ impl NetBackend for NullBackend {
         false
     }
 
-    fn backend_name(&self) -> &str {
+    fn backend_name(&self) -> &'static str {
         "null"
     }
 }
 
 // ---------------------------------------------------------------------------
-// Loopback Backend â€” for testing inter-guest communication
+// Loopback Backend – for testing inter-guest communication
 // ---------------------------------------------------------------------------
 
 /// A loopback backend that echoes transmitted frames back as received frames.
-/// Useful for testing the full TXâ†’RX path.
+/// Useful for testing the full TX→RX path.
 #[allow(dead_code)]
 pub struct LoopbackBackend {
     queue: VecDeque<Vec<u8>>,
@@ -101,7 +110,7 @@ pub struct LoopbackBackend {
 
 #[allow(dead_code)]
 impl LoopbackBackend {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             queue: VecDeque::new(),
         }
@@ -121,26 +130,24 @@ impl NetBackend for LoopbackBackend {
     }
 
     fn recv(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if let Some(frame) = self.queue.pop_front() {
+        self.queue.pop_front().map_or(Ok(0), |frame| {
             let len = frame.len().min(buf.len());
             buf[..len].copy_from_slice(&frame[..len]);
             Ok(len)
-        } else {
-            Ok(0)
-        }
+        })
     }
 
     fn has_pending_rx(&self) -> bool {
         !self.queue.is_empty()
     }
 
-    fn backend_name(&self) -> &str {
+    fn backend_name(&self) -> &'static str {
         "loopback"
     }
 }
 
 // ---------------------------------------------------------------------------
-// Shared pipe backend â€” for connecting two endpoints in tests
+// Shared pipe backend – for connecting two endpoints in tests
 // ---------------------------------------------------------------------------
 
 /// One end of a shared-memory pipe for connecting two net devices in tests.
@@ -149,7 +156,7 @@ impl NetBackend for LoopbackBackend {
 pub struct PipeBackend {
     /// Frames we send go into the peer's rx queue.
     peer_rx: Arc<Mutex<VecDeque<Vec<u8>>>>,
-    /// Our rx queue â€” the peer sends into this.
+    /// Our rx queue – the peer sends into this.
     our_rx: Arc<Mutex<VecDeque<Vec<u8>>>>,
 }
 
@@ -181,20 +188,19 @@ impl NetBackend for PipeBackend {
     }
 
     fn recv(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if let Some(frame) = self.our_rx.lock().unwrap().pop_front() {
+        let value = self.our_rx.lock().unwrap().pop_front();
+        value.map_or(Ok(0), |frame| {
             let len = frame.len().min(buf.len());
             buf[..len].copy_from_slice(&frame[..len]);
             Ok(len)
-        } else {
-            Ok(0)
-        }
+        })
     }
 
     fn has_pending_rx(&self) -> bool {
         !self.our_rx.lock().unwrap().is_empty()
     }
 
-    fn backend_name(&self) -> &str {
+    fn backend_name(&self) -> &'static str {
         "pipe"
     }
 }

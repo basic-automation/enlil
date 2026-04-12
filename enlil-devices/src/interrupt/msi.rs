@@ -2,7 +2,7 @@
 
 use super::DeliveryMode;
 
-/// MSI message â€” address + data pair that encodes an interrupt.
+/// MSI message — address + data pair that encodes an interrupt.
 #[derive(Debug, Clone, Copy)]
 pub struct MsiMessage {
     /// MSI address register value.
@@ -21,7 +21,7 @@ impl MsiMessage {
     /// * `address` - MSI address register value
     /// * `data` - MSI data register value
     #[must_use]
-    pub fn new(address: u64, data: u32) -> Self {
+    pub const fn new(address: u64, data: u32) -> Self {
         let dm = DeliveryMode::from_bits(((data >> 8) & 0x7) as u8);
         Self {
             address,
@@ -32,31 +32,31 @@ impl MsiMessage {
 
     /// Get the interrupt vector from the data register.
     #[must_use]
-    pub fn vector(&self) -> u8 {
+    pub const fn vector(&self) -> u8 {
         (self.data & 0xFF) as u8
     }
 
     /// Get the destination APIC ID from the address register.
     #[must_use]
-    pub fn destination_id(&self) -> u8 {
+    pub const fn destination_id(&self) -> u8 {
         ((self.address >> 12) & 0xFF) as u8
     }
 
     /// Whether destination mode is logical (vs physical).
     #[must_use]
-    pub fn destination_mode_logical(&self) -> bool {
+    pub const fn destination_mode_logical(&self) -> bool {
         (self.address & (1 << 2)) != 0
     }
 
     /// Whether this is a level-triggered MSI.
     #[must_use]
-    pub fn is_level(&self) -> bool {
+    pub const fn is_level(&self) -> bool {
         (self.data & (1 << 15)) != 0
     }
 
     /// Whether this is an assert (vs deassert) for level-triggered.
     #[must_use]
-    pub fn is_assert(&self) -> bool {
+    pub const fn is_assert(&self) -> bool {
         (self.data & (1 << 14)) != 0
     }
 }
@@ -90,7 +90,7 @@ impl MsiCapability {
     /// * `is_64bit` - Whether 64-bit addressing is supported
     /// * `per_vector_masking` - Whether per-vector masking is supported
     #[must_use]
-    pub fn new(is_64bit: bool, per_vector_masking: bool) -> Self {
+    pub const fn new(is_64bit: bool, per_vector_masking: bool) -> Self {
         Self {
             enabled: false,
             num_vectors: 1,
@@ -114,7 +114,7 @@ impl MsiCapability {
     ///
     /// * `vector_idx` - Vector index to check
     #[must_use]
-    pub fn is_vector_masked(&self, vector_idx: u8) -> bool {
+    pub const fn is_vector_masked(&self, vector_idx: u8) -> bool {
         if !self.per_vector_masking {
             return false;
         }
@@ -127,7 +127,8 @@ impl MsiCapability {
     ///
     /// * `vector_idx` - Vector index
     #[must_use]
-    pub fn message_for_vector(&self, vector_idx: u8) -> MsiMessage {
+    #[allow(clippy::cast_lossless)]
+    pub const fn message_for_vector(&self, vector_idx: u8) -> MsiMessage {
         let mut msg = self.message;
         msg.data = (msg.data & !0xFF) | ((msg.data & 0xFF).wrapping_add(vector_idx as u32) & 0xFF);
         msg
@@ -139,7 +140,7 @@ impl MsiCapability {
 pub struct MsixCapability {
     /// Whether MSI-X is enabled.
     pub enabled: bool,
-    /// Function mask â€” masks all vectors when set.
+    /// Function mask — masks all vectors when set.
     pub function_mask: bool,
     /// Table size (number of entries, 1-2048).
     pub table_size: u16,
@@ -222,7 +223,7 @@ pub struct MsixTableEntry {
     pub address: u64,
     /// Message data.
     pub data: u32,
-    /// Vector control â€” bit 0 is mask bit.
+    /// Vector control — bit 0 is mask bit.
     pub masked: bool,
 }
 
@@ -239,8 +240,8 @@ impl Default for MsixTableEntry {
 impl MsixTableEntry {
     /// Read the vector control register.
     #[must_use]
-    pub fn vector_control(&self) -> u32 {
-        u32::from(self.masked)
+    pub const fn vector_control(&self) -> u32 {
+        self.masked as u32
     }
 
     /// Write the vector control register.
@@ -248,7 +249,7 @@ impl MsixTableEntry {
     /// # Arguments
     ///
     /// * `val` - Value to write (bit 0 is the mask bit)
-    pub fn set_vector_control(&mut self, val: u32) {
+    pub const fn set_vector_control(&mut self, val: u32) {
         self.masked = (val & 1) != 0;
     }
 }

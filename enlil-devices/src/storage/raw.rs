@@ -17,6 +17,10 @@ pub struct RawFileBackend {
 
 impl RawFileBackend {
     /// Open a raw disk image file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file operation fails.
     pub fn open(path: &str, readonly: bool) -> Result<Self> {
         let file = if readonly {
             File::open(path)?
@@ -32,6 +36,10 @@ impl RawFileBackend {
     }
 
     /// Create a new raw disk image of the given size.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file operation fails.
     pub fn create(path: &str, size_bytes: u64) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
@@ -49,26 +57,32 @@ impl RawFileBackend {
 }
 
 impl StorageBackend for RawFileBackend {
+    #[allow(clippy::cast_possible_truncation)]
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        let mut file = self.file.lock().map_err(|e| anyhow::anyhow!("lock: {}", e))?;
+        let mut file = self.file.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         file.seek(SeekFrom::Start(offset))?;
         let n = file.read(buf)?;
+        drop(file);
         Ok(n)
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize> {
         if self.readonly {
             anyhow::bail!("backend is read-only");
         }
-        let mut file = self.file.lock().map_err(|e| anyhow::anyhow!("lock: {}", e))?;
+        let mut file = self.file.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         file.seek(SeekFrom::Start(offset))?;
         let n = file.write(buf)?;
+        drop(file);
         Ok(n)
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn flush(&self) -> Result<()> {
-        let file = self.file.lock().map_err(|e| anyhow::anyhow!("lock: {}", e))?;
+        let file = self.file.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         file.sync_all()?;
+        drop(file);
         Ok(())
     }
 

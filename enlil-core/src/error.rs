@@ -24,6 +24,9 @@ pub enum Error {
     #[error("cpuid error: {0}")]
     Cpuid(String),
 
+    #[error("hypervisor error: {0}")]
+    HypervisorError(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }

@@ -10,7 +10,7 @@
 //! - Phase 11.5.1: Live migration uses iterative dirty page transfer
 //! - Phase 11.10: Fault tolerance uses continuous dirty page streaming
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 
 /// Page size constants.
@@ -125,9 +125,9 @@ pub struct EptManager {
     /// All mappings, keyed by GPA (page-aligned).
     mappings: BTreeMap<u64, EptMapping>,
     /// Write-protected GPAs (quick lookup set).
-    write_protected_pages: HashMap<u64, ()>,
+    write_protected_pages: HashSet<u64>,
     /// Dirty page tracking: pages written since last bitmap clear.
-    dirty_pages: HashMap<u64, ()>,
+    dirty_pages: HashSet<u64>,
     /// Whether dirty tracking is enabled.
     dirty_tracking_enabled: bool,
     /// Statistics.
@@ -154,8 +154,8 @@ impl EptManager {
         Self {
             guest_id: guest_id.to_string(),
             mappings: BTreeMap::new(),
-            write_protected_pages: HashMap::new(),
-            dirty_pages: HashMap::new(),
+            write_protected_pages: HashSet::new(),
+            dirty_pages: HashSet::new(),
             dirty_tracking_enabled: false,
             stats: EptStats::default(),
         }
@@ -174,6 +174,10 @@ impl EptManager {
     /// Map a guest physical address range to a host physical address.
     ///
     /// Both `gpa` and `hpa` must be aligned to `page_size`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operation fails.
     pub fn map(
         &mut self,
         gpa: u64,
@@ -219,6 +223,10 @@ impl EptManager {
     ///
     /// Maps `size` bytes from `gpa_base` to `hpa_base`, preferring 2MB pages
     /// when alignment allows, falling back to 4KB pages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operation fails.
     pub fn map_range(
         &mut self,
         gpa_base: u64,
@@ -254,6 +262,10 @@ impl EptManager {
     }
 
     /// Unmap a guest physical address.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operation fails.
     pub fn unmap(&mut self, gpa: u64) -> Result<EptMapping, EptError> {
         let mapping = self.mappings.remove(&gpa)
             .ok_or(EptError::NotMapped { gpa })?;
@@ -286,13 +298,17 @@ impl EptManager {
     /// The page retains its read/execute permissions but writes will cause
     /// an EPT violation (VM exit), allowing the hypervisor to implement
     /// copy-on-write semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operation fails.
     pub fn ept_set_write_protect(&mut self, gpa: u64) -> Result<(), EptError> {
         let mapping = self.mappings.get_mut(&gpa)
             .ok_or(EptError::NotMapped { gpa })?;
 
         if !mapping.write_protected {
             mapping.write_protected = true;
-            self.write_protected_pages.insert(gpa, ());
+            self.write_protected_pages.insert(gpa);
             self.stats.write_protected_count += 1;
             self.stats.protect_operations += 1;
         }
@@ -301,6 +317,10 @@ impl EptManager {
     }
 
     /// Clear write-protection on a guest page.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operation fails.
     pub fn ept_clear_write_protect(&mut self, gpa: u64) -> Result<(), EptError> {
         let mapping = self.mappings.get_mut(&gpa)
             .ok_or(EptError::NotMapped { gpa })?;
@@ -325,7 +345,7 @@ impl EptManager {
             if let Some(mapping) = self.mappings.get_mut(&gpa) {
                 if !mapping.write_protected {
                     mapping.write_protected = true;
-                    self.write_protected_pages.insert(gpa, ());
+                    self.write_protected_pages.insert(gpa);
                     self.stats.write_protected_count += 1;
                     count += 1;
                 }
@@ -338,7 +358,7 @@ impl EptManager {
     /// Clear write-protection on all pages.
     pub fn clear_all_write_protect(&mut self) -> u64 {
         let count = self.write_protected_pages.len() as u64;
-        let gpas: Vec<u64> = self.write_protected_pages.keys().copied().collect();
+        let gpas: Vec<u64> = self.write_protected_pages.iter().copied().collect();
         for gpa in gpas {
             if let Some(mapping) = self.mappings.get_mut(&gpa) {
                 mapping.write_protected = false;
@@ -353,7 +373,7 @@ impl EptManager {
     /// Check if a page is write-protected.
     #[must_use]
     pub fn is_write_protected(&self, gpa: u64) -> bool {
-        self.write_protected_pages.contains_key(&gpa)
+        self.write_protected_pages.contains(&gpa)
     }
 
     // -----------------------------------------------------------------------
@@ -379,13 +399,17 @@ impl EptManager {
     ///
     /// In the real implementation, this is called from the VM exit handler
     /// when a write to a write-protected page occurs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operation fails.
     pub fn mark_dirty(&mut self, gpa: u64) -> Result<(), EptError> {
         let mapping = self.mappings.get_mut(&gpa)
             .ok_or(EptError::NotMapped { gpa })?;
 
         if self.dirty_tracking_enabled && !mapping.dirty {
             mapping.dirty = true;
-            self.dirty_pages.insert(gpa, ());
+            self.dirty_pages.insert(gpa);
             self.stats.dirty_page_count += 1;
         }
 
@@ -397,7 +421,7 @@ impl EptManager {
     /// Returns a vector of GPAs that have been written to since the last call.
     /// This is the core primitive for iterative dirty page transfer in live migration.
     pub fn ept_get_and_clear_dirty_bitmap(&mut self) -> Vec<u64> {
-        let dirty: Vec<u64> = self.dirty_pages.keys().copied().collect();
+        let dirty: Vec<u64> = self.dirty_pages.iter().copied().collect();
 
         // Clear dirty state
         for &gpa in &dirty {
@@ -441,13 +465,17 @@ impl EptManager {
 
     /// Iterate over all write-protected GPAs.
     pub fn write_protected_pages(&self) -> impl Iterator<Item = u64> + '_ {
-        self.write_protected_pages.keys().copied()
+        self.write_protected_pages.iter().copied()
     }
 
     /// Handle an EPT violation (write to write-protected page).
     ///
     /// Returns the mapping info so the caller can implement copy-on-write.
     /// Marks the page dirty and optionally clears write-protection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operation fails.
     pub fn handle_ept_violation(
         &mut self,
         gpa: u64,

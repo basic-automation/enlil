@@ -1,11 +1,11 @@
-//! CPUID filtering for guest transparency.
+//! `CPUID` filtering for guest transparency.
 //!
-//! The hypervisor must intercept CPUID instructions and return
+//! The hypervisor must intercept `CPUID` instructions and return
 //! crafted responses that hide its presence and report correct
 //! topology for the guest's allocated cores.
 
-/// A single CPUID leaf entry.
-#[derive(Debug, Clone)]
+/// A single `CPUID` leaf entry.
+#[derive(Debug, Clone, Copy)]
 pub struct CpuidEntry {
     pub function: u32,
     pub index: u32,
@@ -15,22 +15,22 @@ pub struct CpuidEntry {
     pub edx: u32,
 }
 
-/// Guest CPU topology description for CPUID crafting.
-#[derive(Debug, Clone)]
+/// Guest CPU topology description for `CPUID` crafting.
+#[derive(Debug, Clone, Copy)]
 pub struct GuestTopology {
     /// Number of logical CPUs the guest sees.
     pub logical_cpus: u32,
     /// Cores per package (physical cores visible to guest).
     pub cores_per_package: u32,
-    /// Threads per core (typically 1 unless exposing HT).
+    /// Threads per core (typically 1 unless exposing `HT`).
     pub threads_per_core: u32,
     /// Package (socket) count visible to guest.
     pub packages: u32,
-    /// L1 cache sharing (cores sharing L1, typically 1).
+    /// `L1` cache sharing (cores sharing `L1`, typically 1).
     pub l1_sharing: u32,
-    /// L2 cache sharing (cores sharing L2, typically 1-2).
+    /// `L2` cache sharing (cores sharing `L2`, typically 1-2).
     pub l2_sharing: u32,
-    /// L3 cache sharing (cores sharing L3, typically all).
+    /// `L3` cache sharing (cores sharing `L3`, typically all).
     pub l3_sharing: u32,
 }
 
@@ -50,17 +50,18 @@ impl GuestTopology {
     }
 }
 
-/// CPUID filter that modifies host CPUID data for guest consumption.
+/// `CPUID` filter that modifies host `CPUID` data for guest consumption.
 pub struct CpuidFilter {
     /// Guest topology description.
     topology: GuestTopology,
     /// Whether to hide the hypervisor present bit.
     hide_hypervisor: bool,
-    /// Custom vendor string (12 bytes). None = pass through host vendor.
+    /// Custom vendor string (12 bytes). `None` = pass through host vendor.
     custom_vendor: Option<[u8; 12]>,
 }
 
 impl CpuidFilter {
+    /// Create a filter for a guest with the given CPU count.
     #[must_use]
     pub const fn new(guest_cpu_count: u32) -> Self {
         Self {
@@ -90,16 +91,24 @@ impl CpuidFilter {
         self.custom_vendor = Some(vendor);
     }
 
+    /// Get the guest topology configuration.
     #[must_use]
     pub const fn topology(&self) -> &GuestTopology {
         &self.topology
     }
 
-    /// Filter a CPUID entry for guest consumption.
-    /// Returns None if the leaf should be hidden entirely.
+    /// Filter a `CPUID` entry for guest consumption.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Some(entry)` with modified values, or `None` if the leaf should be hidden entirely.
+    ///
+    /// # Must Use
+    ///
+    /// The returned filtered entry must be used; ignoring it defeats the purpose of filtering.
     #[must_use]
     pub fn filter(&self, entry: &CpuidEntry) -> Option<CpuidEntry> {
-        let mut out = entry.clone();
+        let mut out = *entry;
 
         match entry.function {
             // Leaf 0x0: Vendor ID and max standard leaf
@@ -113,13 +122,13 @@ impl CpuidFilter {
             // Leaf 0x1: Feature information
             0x1 => {
                 if self.hide_hypervisor {
-                    // Clear hypervisor present bit (ECX bit 31)
+                    // Clear hypervisor present bit (`ECX` bit 31)
                     out.ecx &= !(1 << 31);
                 }
-                // Report correct logical processor count in EBX[23:16]
-                out.ebx = (out.ebx & 0xFF00FFFF)
+                // Report correct logical processor count in `EBX`[23:16]
+                out.ebx = (out.ebx & 0xFF00_FFFF)
                     | ((self.topology.logical_cpus & 0xFF) << 16);
-                // Set initial APIC ID in EBX[31:24] (will be per-vCPU)
+                // Set initial `APIC` ID in `EBX`[31:24] (will be per-vCPU)
                 // Leave as-is for now — set per-vCPU at runtime
             }
             // Leaf 0x4: Deterministic cache parameters
@@ -130,43 +139,42 @@ impl CpuidFilter {
                 }
 
                 let sharing = match entry.index {
-                    0 => self.topology.l1_sharing, // L1 data
-                    1 => self.topology.l1_sharing, // L1 instruction
+                    0 | 1 => self.topology.l1_sharing, // L1 data and instruction
                     2 => self.topology.l2_sharing, // L2 unified
                     3 => self.topology.l3_sharing, // L3 unified
                     _ => 1,
                 };
 
-                // EAX[25:14] = max threads sharing this cache - 1
+                // `EAX`[25:14] = max threads sharing this cache - 1
                 let max_sharing = sharing.saturating_sub(1) & 0xFFF;
-                out.eax = (out.eax & 0xFC003FFF) | (max_sharing << 14);
+                out.eax = (out.eax & 0xFC00_3FFF) | (max_sharing << 14);
 
-                // EAX[31:26] = max cores per package - 1
+                // `EAX`[31:26] = max cores per package - 1
                 let max_cores = self.topology.cores_per_package.saturating_sub(1) & 0x3F;
-                out.eax = (out.eax & 0x03FFFFFF) | (max_cores << 26);
+                out.eax = (out.eax & 0x03FF_FFFF) | (max_cores << 26);
             }
-            // Leaf 0xB: Extended topology enumeration (x2APIC)
+            // Leaf 0xB: Extended topology enumeration (x2`APIC`)
             0xB => {
                 match entry.index {
                     0 => {
-                        // SMT level: threads per core
+                        // `SMT` level: threads per core
                         let shift = u32::from(self.topology.threads_per_core > 1);
-                        out.eax = (out.eax & 0xFFFFFFE0) | (shift & 0x1F);
-                        out.ebx = (out.ebx & 0xFFFF0000)
+                        out.eax = (out.eax & 0xFFFF_FFE0) | (shift & 0x1F);
+                        out.ebx = (out.ebx & 0xFFFF_0000)
                             | (self.topology.threads_per_core & 0xFFFF);
-                        // ECX[15:8] = level type (1 = SMT)
-                        out.ecx = (out.ecx & 0xFFFF00FF) | (1 << 8);
+                        // `ECX`[15:8] = level type (1 = `SMT`)
+                        out.ecx = (out.ecx & 0xFFFF_00FF) | (1 << 8);
                     }
                     1 => {
                         // Core level: logical processors per package
                         let shift = 32u32.saturating_sub(
                             self.topology.logical_cpus.leading_zeros()
                         );
-                        out.eax = (out.eax & 0xFFFFFFE0) | (shift & 0x1F);
-                        out.ebx = (out.ebx & 0xFFFF0000)
+                        out.eax = (out.eax & 0xFFFF_FFE0) | (shift & 0x1F);
+                        out.ebx = (out.ebx & 0xFFFF_0000)
                             | (self.topology.logical_cpus & 0xFFFF);
-                        // ECX[15:8] = level type (2 = Core)
-                        out.ecx = (out.ecx & 0xFFFF00FF) | (2 << 8);
+                        // `ECX`[15:8] = level type (2 = Core)
+                        out.ecx = (out.ecx & 0xFFFF_00FF) | (2 << 8);
                     }
                     _ => {
                         // Invalid level
@@ -176,8 +184,8 @@ impl CpuidFilter {
                     }
                 }
             }
-            // Leaf 0x40000000-0x400000FF: Hypervisor leaves
-            0x40000000..=0x400000FF
+            // Leaf 0x4000_0000-0x4000_00FF: Hypervisor leaves
+            0x4000_0000..=0x4000_00FF
                 if self.hide_hypervisor => {
                     return None; // hide all hypervisor-specific leaves
                 }
@@ -187,33 +195,40 @@ impl CpuidFilter {
         Some(out)
     }
 
-    /// Generate a complete set of topology-related CPUID entries for a vCPU.
-    /// `apic_id` is the initial APIC ID for this specific vCPU.
+    /// Generate a complete set of topology-related `CPUID` entries for a vCPU.
+    ///
+    /// # Arguments
+    ///
+    /// * `apic_id` - The initial `APIC` ID for this specific vCPU.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `CPUID` entries with per-vCPU topology information.
     #[must_use]
     pub fn generate_topology_entries(&self, apic_id: u32) -> Vec<CpuidEntry> {
         let mut entries = Vec::new();
 
-        // Leaf 0x1 with per-vCPU APIC ID
+        // Leaf 0x1 with per-vCPU `APIC` ID
         entries.push(CpuidEntry {
             function: 0x1,
             index: 0,
             eax: 0, // will be filled from host
             ebx: ((apic_id & 0xFF) << 24)
                 | ((self.topology.logical_cpus & 0xFF) << 16)
-                | (0x08 << 8), // CLFLUSH line size = 8 * 8 = 64 bytes
+                | (0x08 << 8), // `CLFLUSH` line size = 8 * 8 = 64 bytes
             ecx: 0,
             edx: 0,
         });
 
         // Leaf 0xB sub-leaves
-        // SMT level
+        // `SMT` level
         let smt_shift = u32::from(self.topology.threads_per_core > 1);
         entries.push(CpuidEntry {
             function: 0xB,
             index: 0,
             eax: smt_shift,
             ebx: self.topology.threads_per_core,
-            ecx: (1 << 8), // level type = SMT, level number = 0
+            ecx: (1 << 8), // level type = `SMT`, level number = 0
             edx: apic_id,
         });
 
@@ -255,7 +270,7 @@ mod tests {
     fn hides_hypervisor_leaves() {
         let filter = CpuidFilter::new(4);
         let entry = CpuidEntry {
-            function: 0x40000000,
+            function: 0x4000_0000,
             index: 0,
             eax: 0,
             ebx: 0,
@@ -272,7 +287,7 @@ mod tests {
             function: 0x1,
             index: 0,
             eax: 0,
-            ebx: 0x00FF0000, // host says 255 logical CPUs
+            ebx: 0x00FF_0000, // host says 255 logical CPUs
             ecx: 0,
             edx: 0,
         };
@@ -307,15 +322,15 @@ mod tests {
         let entry = CpuidEntry {
             function: 0x4,
             index: 3,
-            eax: 0x00000063, // some cache type bits
+            eax: 0x0000_0063, // some cache type bits
             ebx: 0,
             ecx: 0,
             edx: 0,
         };
         let filtered = filter.filter(&entry).unwrap();
-        // EAX[31:26] = max cores per package - 1 = 3
+        // `EAX`[31:26] = max cores per package - 1 = 3
         assert_eq!((filtered.eax >> 26) & 0x3F, 3);
-        // EAX[25:14] = max threads sharing L3 - 1 = 3
+        // `EAX`[25:14] = max threads sharing `L3` - 1 = 3
         assert_eq!((filtered.eax >> 14) & 0xFFF, 3);
     }
 
@@ -323,7 +338,7 @@ mod tests {
     fn leaf_0xb_topology() {
         let filter = CpuidFilter::new(4);
 
-        // SMT level (index 0)
+        // `SMT` level (index 0)
         let entry = CpuidEntry {
             function: 0xB,
             index: 0,
@@ -336,7 +351,7 @@ mod tests {
         // threads_per_core = 1, so shift = 0
         assert_eq!(filtered.eax & 0x1F, 0);
         assert_eq!(filtered.ebx & 0xFFFF, 1); // 1 thread per core
-        assert_eq!((filtered.ecx >> 8) & 0xFF, 1); // level type = SMT
+        assert_eq!((filtered.ecx >> 8) & 0xFF, 1); // level type = `SMT`
 
         // Core level (index 1)
         let entry = CpuidEntry {
@@ -359,11 +374,11 @@ mod tests {
 
         assert_eq!(entries.len(), 3); // leaf 1 + leaf 0xB sub0 + leaf 0xB sub1
 
-        // Check APIC ID in leaf 0x1
+        // Check `APIC` ID in leaf 0x1
         let leaf1 = &entries[0];
         assert_eq!((leaf1.ebx >> 24) & 0xFF, 2);
 
-        // Check APIC ID in leaf 0xB
+        // Check `APIC` ID in leaf 0xB
         let leaf_b0 = &entries[1];
         assert_eq!(leaf_b0.edx, 2);
         let leaf_b1 = &entries[2];
@@ -412,7 +427,7 @@ mod tests {
 
         // Hypervisor leaves should also be visible
         let hv_entry = CpuidEntry {
-            function: 0x40000000,
+            function: 0x4000_0000,
             index: 0,
             eax: 0,
             ebx: 0,

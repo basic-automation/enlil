@@ -152,7 +152,7 @@ pub fn online_cpu_count() -> usize {
 /// Get a list of all online CPU IDs (0-based).
 #[must_use]
 pub fn online_cpus() -> Vec<u32> {
-    (0..online_cpu_count() as u32).collect()
+    (0..u32::try_from(online_cpu_count()).unwrap_or(u32::MAX)).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -250,7 +250,12 @@ pub struct VcpuThread {
 ///
 /// The `run_fn` closure is the vCPU's main loop (`KVM_RUN` loop on Linux,
 /// VMLAUNCH loop on bare-metal). It receives the `guest_id` and `vcpu_id`.
-pub fn launch_vcpu_thread<F>(config: VcpuThreadConfig, run_fn: F) -> VcpuThread
+///
+/// # Panics
+///
+/// Panics if the vCPU thread fails to spawn.
+#[must_use]
+pub fn launch_vcpu_thread<F>(config: &VcpuThreadConfig, run_fn: F) -> VcpuThread
 where
     F: FnOnce(&str, u32) + Send + 'static,
 {
@@ -360,12 +365,14 @@ mod tests {
         let ran = Arc::new(AtomicBool::new(false));
         let ran2 = ran.clone();
 
+        let config = VcpuThreadConfig {
+            guest_id: "test".into(),
+            vcpu_id: 0,
+            physical_core: 0,
+        };
+
         let mut thread = launch_vcpu_thread(
-            VcpuThreadConfig {
-                guest_id: "test".into(),
-                vcpu_id: 0,
-                physical_core: 0,
-            },
+            &config,
             move |guest_id, vcpu_id| {
                 assert_eq!(guest_id, "test");
                 assert_eq!(vcpu_id, 0);

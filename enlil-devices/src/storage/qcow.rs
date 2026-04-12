@@ -10,7 +10,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::Mutex;
 
 /// Qcow2 magic number: "QFI\xfb"
-const QCOW2_MAGIC: u32 = 0x514649FB;
+const QCOW2_MAGIC: u32 = 0x5146_49FB;
 
 /// Qcow2 header (v2/v3).
 #[derive(Debug, Clone)]
@@ -32,17 +32,21 @@ pub struct QcowHeader {
 
 impl QcowHeader {
     /// Parse a qcow2 header from raw bytes (must be at least 72 bytes).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the header is too short or has an invalid magic number.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < 72 {
             bail!("qcow2 header too short: {} bytes", bytes.len());
         }
         let magic = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         if magic != QCOW2_MAGIC {
-            bail!("not a qcow2 file: magic 0x{:08x}", magic);
+            bail!("not a qcow2 file: magic 0x{magic:08x}");
         }
         let version = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
         if version != 2 && version != 3 {
-            bail!("unsupported qcow2 version: {}", version);
+            bail!("unsupported qcow2 version: {version}");
         }
         Ok(Self {
             magic,
@@ -61,12 +65,15 @@ impl QcowHeader {
         })
     }
 
-    pub fn cluster_size(&self) -> u64 {
+    /// Cluster size in bytes.
+    #[must_use]
+    pub const fn cluster_size(&self) -> u64 {
         1u64 << self.cluster_bits
     }
 
     /// Number of L2 entries per L2 table.
-    pub fn l2_entries(&self) -> u64 {
+    #[must_use]
+    pub const fn l2_entries(&self) -> u64 {
         self.cluster_size() / 8
     }
 }
@@ -83,6 +90,10 @@ pub struct QcowBackend {
 
 impl QcowBackend {
     /// Open a qcow2 image file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be opened or contains invalid qcow2 data.
     pub fn open(path: &std::path::Path) -> Result<Self> {
         let mut file = File::open(path)
             .with_context(|| format!("failed to open qcow2: {}", path.display()))?;
@@ -112,9 +123,9 @@ impl QcowBackend {
     }
 
     /// Resolve a guest byte offset to a host file offset.
-    /// Returns None if the cluster is unallocated (read as zeroes).
+    /// Returns `None` if the cluster is unallocated (read as zeroes).
+    #[allow(clippy::cast_possible_truncation)]
     fn resolve_offset(&self, guest_offset: u64, file: &mut File) -> Result<Option<u64>> {
-        let _cluster_bits = self.header.cluster_bits;
         let cluster_size = self.header.cluster_size();
         let l2_entries = self.header.l2_entries();
 
@@ -126,7 +137,7 @@ impl QcowBackend {
 
         let l1_entry = self.l1_table[l1_index as usize];
         // Bits 9..55 contain the offset of the L2 table
-        let l2_table_offset = l1_entry & 0x00FFFFFFFFFFFE00;
+        let l2_table_offset = l1_entry & 0x00FF_FFFF_FFFF_FE00;
         if l2_table_offset == 0 {
             return Ok(None); // L2 table not allocated
         }
@@ -141,7 +152,7 @@ impl QcowBackend {
         let l2_entry = u64::from_be_bytes(buf);
 
         // Bits 9..55 contain the host cluster offset
-        let host_cluster_offset = l2_entry & 0x00FFFFFFFFFFFE00;
+        let host_cluster_offset = l2_entry & 0x00FF_FFFF_FFFF_FE00;
         if host_cluster_offset == 0 {
             return Ok(None); // Cluster not allocated
         }
@@ -153,11 +164,12 @@ impl QcowBackend {
 }
 
 impl StorageBackend for QcowBackend {
+    #[allow(clippy::cast_possible_truncation)]
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
         if offset >= self.header.size {
             return Ok(0);
         }
-        let mut file = self.file.lock().map_err(|e| anyhow::anyhow!("lock: {}", e))?;
+        let mut file = self.file.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let cluster_size = self.header.cluster_size();
         let mut total_read = 0usize;
         let mut remaining = buf.len().min((self.header.size - offset) as usize);
@@ -184,6 +196,7 @@ impl StorageBackend for QcowBackend {
             remaining -= chunk;
         }
 
+        drop(file);
         Ok(total_read)
     }
 
@@ -254,6 +267,7 @@ mod tests {
 
         // Data cluster: fill with a pattern
         let data_start = 3 * cluster_size;
+        #[allow(clippy::cast_possible_truncation)]
         for i in 0..cluster_size {
             img[data_start + i] = (i & 0xFF) as u8;
         }
@@ -286,8 +300,9 @@ mod tests {
         let mut buf = vec![0u8; 256];
         let n = backend.read_at(0, &mut buf).unwrap();
         assert_eq!(n, 256);
+        #[allow(clippy::cast_possible_truncation)]
         for (i, &b) in buf.iter().enumerate() {
-            assert_eq!(b, (i & 0xFF) as u8, "mismatch at offset {}", i);
+            assert_eq!(b, (i & 0xFF) as u8, "mismatch at offset {i}");
         }
     }
 

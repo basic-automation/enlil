@@ -30,13 +30,16 @@ pub mod controller;
 pub mod device;
 pub mod monitor;
 pub mod routing;
+pub mod types;
 pub mod xhci;
 
 pub use controller::VirtualXhciController;
 pub use device::{UsbClass, UsbDevice, UsbDeviceId, UsbDeviceState, UsbSpeed};
-pub use monitor::{HotplugEvent, UsbInventory, UsbMonitor};
-pub use routing::{RoutingEngine, RoutingPolicy, RoutingRule};
+pub use monitor::{UsbHotplugEvent, UsbMonitor};
+pub use routing::{RoutingRule, RoutingState, RoutingTable};
 pub use xhci::{
-    Trb, TrbCompletionCode, TrbRing, TrbType, XhciCapability, XhciDoorbell, XhciOperational,
-    XhciPortState, XhciRegisters,
+    DoorbellArray, DoorbellTarget, EventRing, InterrupterRegisterSet,
+    CapabilityRegisters, OperationalRegisters, PortRegisterSet, PortState, RuntimeRegisters,
+    CommandRing, TransferRing, TrbRing,
+    CommandTrb, EventTrb, NormalTrb, Trb, TrbCompletionCode, TrbType,
 };

@@ -13,7 +13,7 @@ mod msi;
 mod controller;
 
 /// Interrupt delivery mode (shared across LAPIC, IOAPIC, MSI).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryMode {
     Fixed = 0,
     LowestPriority = 1,
@@ -25,9 +25,10 @@ pub enum DeliveryMode {
 }
 
 impl DeliveryMode {
-    pub fn from_bits(bits: u8) -> Self {
+    /// Convert bits to delivery mode.
+    #[must_use]
+    pub const fn from_bits(bits: u8) -> Self {
         match bits & 0x7 {
-            0 => Self::Fixed,
             1 => Self::LowestPriority,
             2 => Self::Smi,
             4 => Self::Nmi,
@@ -40,7 +41,7 @@ impl DeliveryMode {
 }
 
 /// Trigger mode for interrupts.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TriggerMode {
     Edge,
     Level,

@@ -1,58 +1,37 @@
-//! Network device configuration.
-//!
-//! Maps to the TOML config:
-//! ```toml
-//! [guest.linux1.net]
-//! eth0 = { mode = "bridge", bridge = "br0", mac = "52:54:00:01:00:01" }
-//! ```
+//! Network device configuration types.
 
-use std::fmt;
-
-/// MAC address as 6 bytes.
+/// A 6-byte MAC address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MacAddress(pub [u8; 6]);
 
 impl MacAddress {
-    pub const BROADCAST: Self = Self([0xff; 6]);
-    pub const ZERO: Self = Self([0x00; 6]);
-
-    /// Parse a MAC address from "aa:bb:cc:dd:ee:ff" format.
-    pub fn parse(s: &str) -> Result<Self, MacParseError> {
-        let parts: Vec<&str> = s.split(':').collect();
-        if parts.len() != 6 {
-            return Err(MacParseError::InvalidFormat(s.to_string()));
-        }
-        let mut bytes = [0u8; 6];
-        for (i, part) in parts.iter().enumerate() {
-            bytes[i] =
-                u8::from_str_radix(part, 16).map_err(|_| MacParseError::InvalidByte(i, part.to_string()))?;
-        }
-        Ok(Self(bytes))
-    }
-
-    /// Returns true if this is a multicast address (bit 0 of first octet set).
-    pub fn is_multicast(&self) -> bool {
+    /// Check if this is a multicast address (bit 0 of first octet set).
+    #[must_use]
+    pub const fn is_multicast(self) -> bool {
         self.0[0] & 0x01 != 0
     }
 
-    /// Returns true if this is the broadcast address (ff:ff:ff:ff:ff:ff).
-    pub fn is_broadcast(&self) -> bool {
-        *self == Self::BROADCAST
+    /// Check if this is a broadcast address (all `0xFF`).
+    #[must_use]
+    pub fn is_broadcast(self) -> bool {
+        self.0 == [0xFF; 6]
     }
 
-    /// Returns true if this is a unicast address.
-    pub fn is_unicast(&self) -> bool {
+    /// Check if this is a unicast address.
+    #[must_use]
+    pub const fn is_unicast(self) -> bool {
         !self.is_multicast()
     }
 
-    /// Returns the raw bytes.
-    pub fn as_bytes(&self) -> &[u8; 6] {
+    /// Get the raw bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 6] {
         &self.0
     }
 }
 
-impl fmt::Display for MacAddress {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Display for MacAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
             "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -61,81 +40,106 @@ impl fmt::Display for MacAddress {
     }
 }
 
-impl From<[u8; 6]> for MacAddress {
-    fn from(bytes: [u8; 6]) -> Self {
-        Self(bytes)
-    }
-}
-
-/// Errors from parsing a MAC address string.
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum MacParseError {
-    #[error("invalid MAC format: {0}")]
-    InvalidFormat(String),
-    #[error("invalid byte at position {0}: {1}")]
-    InvalidByte(usize, String),
-}
-
-/// Network backend mode.
-#[derive(Debug, Clone, PartialEq)]
-pub enum NetBackendMode {
-    /// Bridge mode — connect to a host bridge via TAP.
-    Bridge { bridge: String },
-    /// NAT mode — host-side NAT (future).
-    Nat,
-    /// Null mode — packets are dropped, for testing.
-    Null,
-}
-
-/// Configuration for a virtual NIC.
-#[derive(Debug, Clone)]
+/// Configuration for a virtual network device.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetDeviceConfig {
-    /// Interface name inside the guest config (e.g. "eth0").
+    /// Device name (e.g. "vnet0").
     pub name: String,
-    /// MAC address (6 bytes).
+    /// MAC address for this device.
     pub mac: MacAddress,
-    /// Backend mode.
-    pub mode: NetBackendMode,
-    /// Name of the TAP interface on the host (Linux only).
-    pub tap_name: Option<String>,
-    /// MTU size.
+    /// Optional bridge to connect to.
+    pub bridge: Option<String>,
+    /// MTU in bytes.
     pub mtu: u16,
-}
-
-impl NetDeviceConfig {
-    /// Create a new config with the given name and MAC.
-    pub fn new(name: &str, mac: MacAddress) -> Self {
-        Self {
-            name: name.to_string(),
-            mac,
-            mode: NetBackendMode::Null,
-            tap_name: None,
-            mtu: 1500,
-        }
-    }
-
-    /// Create a bridge-mode config.
-    pub fn bridge(name: &str, mac: MacAddress, bridge: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            mac,
-            mode: NetBackendMode::Bridge {
-                bridge: bridge.to_string(),
-            },
-            tap_name: None,
-            mtu: 1500,
-        }
-    }
+    /// Whether to enable checksum offload.
+    pub checksum_offload: bool,
+    /// Whether to enable TSO.
+    pub tso: bool,
+    /// Number of TX queues.
+    pub tx_queues: u8,
+    /// Number of RX queues.
+    pub rx_queues: u8,
 }
 
 impl Default for NetDeviceConfig {
     fn default() -> Self {
         Self {
-            name: "eth0".to_string(),
-            mac: MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]),
-            mode: NetBackendMode::Null,
-            tap_name: None,
+            name: String::new(),
+            mac: MacAddress([0; 6]),
+            bridge: None,
             mtu: 1500,
+            checksum_offload: true,
+            tso: false,
+            tx_queues: 1,
+            rx_queues: 1,
         }
+    }
+}
+
+impl NetDeviceConfig {
+    /// Create a new network device configuration.
+    #[must_use]
+    pub fn new(name: &str, mac: MacAddress) -> Self {
+        Self {
+            name: name.to_string(),
+            mac,
+            ..Self::default()
+        }
+    }
+
+    /// Create a bridged network device configuration.
+    #[must_use]
+    pub fn bridge(name: &str, mac: MacAddress, bridge: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            mac,
+            bridge: Some(bridge.to_string()),
+            ..Self::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mac_address() {
+        let mac = MacAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        assert!(mac.is_unicast());
+        assert!(!mac.is_multicast());
+        assert!(!mac.is_broadcast());
+
+        let broadcast = MacAddress([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        assert!(broadcast.is_broadcast());
+        assert!(broadcast.is_multicast());
+
+        let multicast = MacAddress([0x01, 0x00, 0x5E, 0x00, 0x00, 0x01]);
+        assert!(multicast.is_multicast());
+        assert!(!multicast.is_broadcast());
+    }
+
+    #[test]
+    fn test_mac_display() {
+        let mac = MacAddress([0x02, 0xAB, 0xCD, 0xEF, 0x01, 0x23]);
+        assert_eq!(format!("{mac}"), "02:ab:cd:ef:01:23");
+    }
+
+    #[test]
+    fn test_config_default() {
+        let config = NetDeviceConfig::new("vnet0", MacAddress([0x02, 0, 0, 0, 0, 1]));
+        assert_eq!(config.name, "vnet0");
+        assert_eq!(config.mtu, 1500);
+        assert!(config.bridge.is_none());
+    }
+
+    #[test]
+    fn test_config_bridge() {
+        let config = NetDeviceConfig::bridge(
+            "vnet0",
+            MacAddress([0x02, 0, 0, 0, 0, 1]),
+            "br0",
+        );
+        assert_eq!(config.bridge.as_deref(), Some("br0"));
     }
 }

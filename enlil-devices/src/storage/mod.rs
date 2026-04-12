@@ -19,18 +19,37 @@ use anyhow::Result;
 /// object-safe and avoids async-trait overhead in the hot path.
 pub trait StorageBackend: Send + Sync {
     /// Read bytes from the backend at the given byte offset.
+    ///
     /// Returns the number of bytes actually read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operation fails.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize>;
 
     /// Write bytes to the backend at the given byte offset.
+    ///
     /// Returns the number of bytes actually written.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operation fails.
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize>;
 
     /// Flush any buffered writes to stable storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operation fails.
     fn flush(&self) -> Result<()>;
 
     /// Inform the backend that the given range is no longer needed (trim/discard).
-    /// Backends that don't support trim can return Ok(()).
+    ///
+    /// Backends that don't support trim can return `Ok(())`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operation fails.
     fn trim(&self, offset: u64, len: u64) -> Result<()> {
         let _ = (offset, len);
         Ok(())
@@ -51,6 +70,7 @@ pub struct MemoryBackend {
 
 impl MemoryBackend {
     /// Create a new memory backend with the given size, initialized to zero.
+    #[must_use]
     pub fn new(size: usize) -> Self {
         Self {
             data: std::sync::RwLock::new(vec![0u8; size]),
@@ -59,7 +79,8 @@ impl MemoryBackend {
     }
 
     /// Create a memory backend from existing data.
-    pub fn from_data(data: Vec<u8>) -> Self {
+    #[must_use]
+    pub const fn from_data(data: Vec<u8>) -> Self {
         Self {
             data: std::sync::RwLock::new(data),
             readonly: false,
@@ -67,7 +88,8 @@ impl MemoryBackend {
     }
 
     /// Create a read-only memory backend.
-    pub fn new_readonly(data: Vec<u8>) -> Self {
+    #[must_use]
+    pub const fn new_readonly(data: Vec<u8>) -> Self {
         Self {
             data: std::sync::RwLock::new(data),
             readonly: true,
@@ -76,8 +98,9 @@ impl MemoryBackend {
 }
 
 impl StorageBackend for MemoryBackend {
+    #[allow(clippy::cast_possible_truncation)]
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        let data = self.data.read().map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+        let data = self.data.read().map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         let offset = offset as usize;
         if offset >= data.len() {
             return Ok(0);
@@ -85,14 +108,16 @@ impl StorageBackend for MemoryBackend {
         let available = data.len() - offset;
         let to_read = buf.len().min(available);
         buf[..to_read].copy_from_slice(&data[offset..offset + to_read]);
+        drop(data);
         Ok(to_read)
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize> {
         if self.readonly {
             anyhow::bail!("backend is read-only");
         }
-        let mut data = self.data.write().map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+        let mut data = self.data.write().map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         let offset = offset as usize;
         if offset >= data.len() {
             return Ok(0);
@@ -100,6 +125,7 @@ impl StorageBackend for MemoryBackend {
         let available = data.len() - offset;
         let to_write = buf.len().min(available);
         data[offset..offset + to_write].copy_from_slice(&buf[..to_write]);
+        drop(data);
         Ok(to_write)
     }
 
@@ -107,21 +133,21 @@ impl StorageBackend for MemoryBackend {
         Ok(())
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn trim(&self, offset: u64, len: u64) -> Result<()> {
         if self.readonly {
             anyhow::bail!("backend is read-only");
         }
-        let mut data = self.data.write().map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+        let mut data = self.data.write().map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         let start = (offset as usize).min(data.len());
         let end = ((offset + len) as usize).min(data.len());
-        for byte in &mut data[start..end] {
-            *byte = 0;
-        }
+        data[start..end].fill(0);
+        drop(data);
         Ok(())
     }
 
     fn capacity(&self) -> u64 {
-        self.data.read().map(|d| d.len() as u64).unwrap_or(0)
+        self.data.read().map_or(0, |d| d.len() as u64)
     }
 
     fn is_readonly(&self) -> bool {

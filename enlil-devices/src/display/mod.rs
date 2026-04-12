@@ -22,10 +22,11 @@ pub enum PixelFormat {
 
 impl PixelFormat {
     /// Bytes per pixel
-    pub fn bytes_per_pixel(&self) -> usize {
+    #[must_use]
+    pub const fn bytes_per_pixel(&self) -> usize {
         match self {
-            PixelFormat::RGBA8888 | PixelFormat::BGRA8888 | PixelFormat::XRGB8888 => 4,
-            PixelFormat::RGB565 => 2,
+            Self::RGBA8888 | Self::BGRA8888 | Self::XRGB8888 => 4,
+            Self::RGB565 => 2,
         }
     }
 }
@@ -42,6 +43,7 @@ pub struct FrameRef {
 }
 
 impl FrameRef {
+    #[allow(clippy::cast_possible_truncation)]
     pub fn new(width: u32, height: u32, pixel_format: PixelFormat) -> Self {
         Self {
             id: { static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1); COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) },
@@ -49,8 +51,7 @@ impl FrameRef {
                 use std::time::{SystemTime, UNIX_EPOCH};
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0)
+                    .map_or(0, |d| d.as_nanos() as u64)
             },
             pixel_format,
             width,
@@ -84,6 +85,7 @@ pub struct IvshmemSource {
 }
 
 impl IvshmemSource {
+    #[must_use]
     pub fn new(size: usize, format: PixelFormat) -> Self {
         Self {
             shared_memory: Arc::new(vec![0u8; size]),
@@ -92,6 +94,8 @@ impl IvshmemSource {
         }
     }
 
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
     pub fn update_frame(&self, width: u32, height: u32) {
         let frame = FrameRef::new(width, height, self.format);
         *self.current_frame.lock().unwrap() = Some(frame);
@@ -127,6 +131,7 @@ pub struct VirtioGpuSource {
 }
 
 impl VirtioGpuSource {
+    #[must_use]
     pub fn new(format: PixelFormat, max_frames: usize) -> Self {
         Self {
             frames: Arc::new(RwLock::new(VecDeque::with_capacity(max_frames))),
@@ -136,6 +141,8 @@ impl VirtioGpuSource {
         }
     }
 
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
     pub fn submit_frame(&self, width: u32, height: u32, data: Vec<u8>) {
         let frame = FrameRef::new(width, height, self.format);
         let frame_id = frame.id;
@@ -145,7 +152,7 @@ impl VirtioGpuSource {
         if frames.len() > self.max_frames {
             frames.pop_front();
         }
-
+        drop(frames);
         *self.current_frame.lock().unwrap() = Some(frame);
     }
 }
@@ -185,6 +192,8 @@ pub struct CompositorOwnedSource {
 }
 
 impl CompositorOwnedSource {
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn new(width: u32, height: u32, format: PixelFormat) -> Self {
         let size = (width * height) as usize * format.bytes_per_pixel();
         Self {
@@ -196,17 +205,22 @@ impl CompositorOwnedSource {
         }
     }
 
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
     pub fn update_pixels(&self, pixels: Vec<u8>) {
         *self.buffer.lock().unwrap() = pixels;
         let frame = FrameRef::new(self.width, self.height, self.format);
         *self.current_frame.lock().unwrap() = Some(frame);
     }
 
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
     pub fn clear(&self, color: u32) {
         let mut buf = self.buffer.lock().unwrap();
         for chunk in buf.chunks_exact_mut(self.format.bytes_per_pixel()) {
             chunk.copy_from_slice(&color.to_le_bytes()[..chunk.len()]);
         }
+        drop(buf);
         let frame = FrameRef::new(self.width, self.height, self.format);
         *self.current_frame.lock().unwrap() = Some(frame);
     }
@@ -242,7 +256,8 @@ pub struct Zone {
 }
 
 impl Zone {
-    pub fn new(id: u32, x: u32, y: u32, width: u32, height: u32, name: String) -> Self {
+    #[must_use]
+    pub const fn new(id: u32, x: u32, y: u32, width: u32, height: u32, name: String) -> Self {
         Self {
             id,
             x,
@@ -255,7 +270,8 @@ impl Zone {
         }
     }
 
-    pub fn contains_point(&self, px: u32, py: u32) -> bool {
+    #[must_use]
+    pub const fn contains_point(&self, px: u32, py: u32) -> bool {
         px >= self.x && px < self.x + self.width && py >= self.y && py < self.y + self.height
     }
 }
@@ -269,7 +285,8 @@ pub struct ZoneLayout {
 }
 
 impl ZoneLayout {
-    pub fn new(screen_width: u32, screen_height: u32) -> Self {
+    #[must_use]
+    pub const fn new(screen_width: u32, screen_height: u32) -> Self {
         Self {
             zones: Vec::new(),
             screen_width,
@@ -282,6 +299,7 @@ impl ZoneLayout {
         self.zones.sort_by_key(|z| z.z_index);
     }
 
+    #[must_use]
     pub fn find_zone_at(&self, x: u32, y: u32) -> Option<&Zone> {
         self.zones
             .iter()
@@ -289,6 +307,7 @@ impl ZoneLayout {
             .find(|z| z.visible && z.contains_point(x, y))
     }
 
+    #[must_use]
     pub fn find_zone_by_id(&self, id: u32) -> Option<&Zone> {
         self.zones.iter().find(|z| z.id == id)
     }
@@ -306,6 +325,7 @@ pub struct ZoneLayoutEngine {
 }
 
 impl ZoneLayoutEngine {
+    #[must_use]
     pub fn new(screen_width: u32, screen_height: u32) -> Self {
         Self {
             layout: Arc::new(RwLock::new(ZoneLayout::new(screen_width, screen_height))),
@@ -313,27 +333,38 @@ impl ZoneLayoutEngine {
         }
     }
 
+    #[must_use]
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
     pub fn create_zone(&self, x: u32, y: u32, width: u32, height: u32, name: String) -> u32 {
         let mut id_gen = self.next_zone_id.lock().unwrap();
         let zone_id = *id_gen;
         *id_gen += 1;
+        drop(id_gen);
 
         let zone = Zone::new(zone_id, x, y, width, height, name);
         self.layout.write().unwrap().add_zone(zone);
         zone_id
     }
 
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
     pub fn delete_zone(&self, zone_id: u32) {
         let mut layout = self.layout.write().unwrap();
         layout.zones.retain(|z| z.id != zone_id);
     }
 
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
     pub fn set_zone_visibility(&self, zone_id: u32, visible: bool) {
         if let Some(zone) = self.layout.write().unwrap().find_zone_mut(zone_id) {
             zone.visible = visible;
         }
     }
 
+    #[must_use]
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
     pub fn get_layout(&self) -> ZoneLayout {
         self.layout.read().unwrap().clone()
     }
@@ -384,6 +415,8 @@ impl InputRouter {
         }
     }
 
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
     pub fn route_event(&self, event: InputEvent) {
         let layout = self.zone_layout.read().unwrap();
 
@@ -408,14 +441,22 @@ impl InputRouter {
         }
     }
 
+    #[must_use]
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
     pub fn next_event(&self) -> Option<(u32, InputEvent)> {
         self.event_queue.lock().unwrap().pop_front()
     }
 
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
     pub fn set_focus(&self, zone_id: Option<u32>) {
         *self.focused_zone.lock().unwrap() = zone_id;
     }
 
+    #[must_use]
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
     pub fn get_focus(&self) -> Option<u32> {
         *self.focused_zone.lock().unwrap()
     }
@@ -530,6 +571,7 @@ pub struct DisplayCompositor {
 }
 
 impl DisplayCompositor {
+    #[must_use]
     pub fn new(config: DisplayConfig) -> Self {
         let layout = Arc::new(RwLock::new(ZoneLayout::new(config.width, config.height)));
         let layout_engine = Arc::new(ZoneLayoutEngine::new(config.width, config.height));
@@ -545,6 +587,8 @@ impl DisplayCompositor {
         }
     }
 
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
     pub fn register_source(&self, zone_id: u32, source: Arc<dyn FramebufferSource>) {
         self.framebuffer_sources
             .write()
@@ -552,6 +596,8 @@ impl DisplayCompositor {
             .insert(zone_id, source);
     }
 
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
     pub fn unregister_source(&self, zone_id: u32) {
         self.framebuffer_sources.write().unwrap().remove(&zone_id);
     }
@@ -560,34 +606,53 @@ impl DisplayCompositor {
         self.input_router.route_event(event);
     }
 
+    #[must_use]
     pub fn get_next_input_event(&self) -> Option<(u32, InputEvent)> {
         self.input_router.next_event()
     }
 
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
     pub fn set_display_mode(&self, mode: DisplayMode) {
         *self.display_mode.lock().unwrap() = mode;
     }
 
+    #[must_use]
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
     pub fn get_display_mode(&self) -> DisplayMode {
         *self.display_mode.lock().unwrap()
     }
 
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
     pub fn enable_pip(&self, zone_id: u32) {
         let mut config = self.config.lock().unwrap();
         config.pip.source_zone_id = Some(zone_id);
+        drop(config);
         *self.pip_enabled.lock().unwrap() = true;
     }
 
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
     pub fn disable_pip(&self) {
         let mut config = self.config.lock().unwrap();
         config.pip.source_zone_id = None;
+        drop(config);
         *self.pip_enabled.lock().unwrap() = false;
     }
 
+    #[must_use]
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
     pub fn is_pip_enabled(&self) -> bool {
         *self.pip_enabled.lock().unwrap()
     }
 
+    #[must_use]
+    #[allow(clippy::significant_drop_tightening)]
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
     pub fn composite_frame(&self) -> Option<Vec<u8>> {
         let config = self.config.lock().unwrap();
         let sources = self.framebuffer_sources.read().unwrap();
@@ -621,16 +686,23 @@ impl DisplayCompositor {
         Some(composite_buffer)
     }
 
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
     pub fn resize(&self, width: u32, height: u32) {
         let mut config = self.config.lock().unwrap();
         config.width = width;
         config.height = height;
     }
 
+    #[must_use]
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
     pub fn get_config(&self) -> DisplayConfig {
         self.config.lock().unwrap().clone()
     }
 
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
     pub fn set_config(&self, config: DisplayConfig) {
         *self.config.lock().unwrap() = config;
     }
@@ -682,7 +754,7 @@ mod tests {
         let source = CompositorOwnedSource::new(640, 480, PixelFormat::RGBA8888);
         assert_eq!(source.source_type(), "compositor");
 
-        source.clear(0xFF000000);
+        source.clear(0xFF00_0000);
         assert!(source.current_frame().is_some());
     }
 

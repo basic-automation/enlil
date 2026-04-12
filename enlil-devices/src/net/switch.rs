@@ -59,29 +59,31 @@ pub struct VirtualSwitch {
 #[derive(Debug, Clone, Default)]
 pub struct SwitchStats {
     /// Total frames received by the switch.
-    pub frames_in: u64,
+    pub received: u64,
     /// Total frames forwarded (unicast hit).
-    pub frames_forwarded: u64,
+    pub forwarded: u64,
     /// Total frames flooded (broadcast/unknown unicast).
-    pub frames_flooded: u64,
+    pub flooded: u64,
     /// Total frames dropped (e.g., to the source port).
-    pub frames_dropped: u64,
+    pub dropped: u64,
 }
 
 impl VirtualSwitch {
     /// Create a new virtual switch.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             fdb: HashMap::new(),
             port_queues: HashMap::new(),
             ports: Vec::new(),
-            aging_time: Duration::from_secs(300),
+            aging_time: Duration::from_mins(5),
             max_fdb_entries: 4096,
             stats: SwitchStats::default(),
         }
     }
 
     /// Create a switch with a custom aging time.
+    #[must_use]
     pub fn with_aging_time(aging_time: Duration) -> Self {
         Self {
             aging_time,
@@ -91,6 +93,7 @@ impl VirtualSwitch {
 
     /// Register a new port on the switch. Returns the port ID.
     pub fn add_port(&mut self) -> PortId {
+        #[allow(clippy::cast_possible_truncation)]
         let id = PortId(self.ports.len() as u32);
         self.ports.push(id);
         self.port_queues.insert(id, VecDeque::new());
@@ -106,17 +109,20 @@ impl VirtualSwitch {
     }
 
     /// Number of registered ports.
-    pub fn port_count(&self) -> usize {
+    #[must_use]
+    pub const fn port_count(&self) -> usize {
         self.ports.len()
     }
 
     /// Number of entries in the forwarding database.
+    #[must_use]
     pub fn fdb_size(&self) -> usize {
         self.fdb.len()
     }
 
     /// Get a reference to the switch statistics.
-    pub fn stats(&self) -> &SwitchStats {
+    #[must_use]
+    pub const fn stats(&self) -> &SwitchStats {
         &self.stats
     }
 
@@ -128,11 +134,11 @@ impl VirtualSwitch {
     pub fn process_frame(&mut self, src_port: PortId, frame: &[u8]) {
         // Minimum Ethernet frame: 14-byte header.
         if frame.len() < 14 {
-            self.stats.frames_dropped += 1;
+            self.stats.dropped += 1;
             return;
         }
 
-        self.stats.frames_in += 1;
+        self.stats.received += 1;
 
         let dst_mac = MacAddress([
             frame[0], frame[1], frame[2], frame[3], frame[4], frame[5],
@@ -145,20 +151,20 @@ impl VirtualSwitch {
         self.learn(src_mac, src_port);
 
         // Age out old entries periodically (cheap check).
-        if self.stats.frames_in.is_multiple_of(1000) {
+        if self.stats.received.is_multiple_of(1000) {
             self.age_entries();
         }
 
         // Forward or flood.
         if dst_mac.is_broadcast() || dst_mac.is_multicast() {
             self.flood(src_port, frame);
-        } else if let Some(dst_port) = self.lookup(&dst_mac) {
+        } else if let Some(dst_port) = self.lookup(dst_mac) {
             if dst_port == src_port {
                 // Don't send back to source.
-                self.stats.frames_dropped += 1;
+                self.stats.dropped += 1;
             } else {
                 self.enqueue(dst_port, frame);
-                self.stats.frames_forwarded += 1;
+                self.stats.forwarded += 1;
             }
         } else {
             // Unknown unicast — flood.
@@ -172,23 +178,23 @@ impl VirtualSwitch {
     pub fn dequeue(&mut self, port: PortId) -> Option<Vec<u8>> {
         self.port_queues
             .get_mut(&port)
-            .and_then(|q| q.pop_front())
+            .and_then(VecDeque::pop_front)
     }
 
     /// Check if a port has pending frames.
+    #[must_use]
     pub fn has_pending(&self, port: PortId) -> bool {
         self.port_queues
             .get(&port)
-            .map(|q| !q.is_empty())
-            .unwrap_or(false)
+            .is_some_and(|q| !q.is_empty())
     }
 
     /// Number of pending frames for a port.
+    #[must_use]
     pub fn pending_count(&self, port: PortId) -> usize {
         self.port_queues
             .get(&port)
-            .map(|q| q.len())
-            .unwrap_or(0)
+            .map_or(0, std::collections::VecDeque::len)
     }
 
     /// Manually flush all FDB entries.
@@ -220,8 +226,8 @@ impl VirtualSwitch {
         );
     }
 
-    fn lookup(&self, mac: &MacAddress) -> Option<PortId> {
-        self.fdb.get(mac).map(|entry| entry.port)
+    fn lookup(&self, mac: MacAddress) -> Option<PortId> {
+        self.fdb.get(&mac).map(|entry| entry.port)
     }
 
     fn flood(&mut self, src_port: PortId, frame: &[u8]) {
@@ -235,7 +241,7 @@ impl VirtualSwitch {
         for port in targets {
             self.enqueue(port, frame);
         }
-        self.stats.frames_flooded += 1;
+        self.stats.flooded += 1;
     }
 
     fn enqueue(&mut self, port: PortId, frame: &[u8]) {
@@ -335,8 +341,8 @@ mod tests {
         let _p1 = sw.add_port();
 
         sw.process_frame(p0, &[0u8; 5]);
-        assert_eq!(sw.stats().frames_dropped, 1);
-        assert_eq!(sw.stats().frames_in, 0);
+        assert_eq!(sw.stats().dropped, 1);
+        assert_eq!(sw.stats().received, 0);
     }
 
     #[test]

@@ -1,10 +1,10 @@
-//! VirtIO network device feature flags.
+//! `VirtIO` network device feature flags.
 //!
-//! Defined per the VirtIO 1.2 specification, Section 5.1.3.
+//! Defined per the `VirtIO` 1.2 specification, Section 5.1.3.
 
 use std::fmt;
 
-/// VirtIO network feature bits.
+/// `VirtIO` network feature bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NetFeatures(u64);
 
@@ -21,17 +21,17 @@ impl NetFeatures {
     pub const MTU: u64 = 1 << 3;
     /// Device has given MAC address.
     pub const MAC: u64 = 1 << 5;
-    /// Driver can receive TSOv4.
+    /// Driver can receive `TSOv4`.
     pub const GUEST_TSO4: u64 = 1 << 7;
-    /// Driver can receive TSOv6.
+    /// Driver can receive `TSOv6`.
     pub const GUEST_TSO6: u64 = 1 << 8;
     /// Driver can receive TSO with ECN.
     pub const GUEST_ECN: u64 = 1 << 9;
     /// Driver can receive UFO.
     pub const GUEST_UFO: u64 = 1 << 10;
-    /// Device can receive TSOv4.
+    /// Device can receive `TSOv4`.
     pub const HOST_TSO4: u64 = 1 << 11;
-    /// Device can receive TSOv6.
+    /// Device can receive `TSOv6`.
     pub const HOST_TSO6: u64 = 1 << 12;
     /// Device can receive TSO with ECN.
     pub const HOST_ECN: u64 = 1 << 13;
@@ -54,7 +54,7 @@ impl NetFeatures {
 
     // ── VirtIO generic feature bits (bits 24–37) ──
 
-    /// Indicates compliance with VirtIO 1.0+.
+    /// Indicates compliance with `VirtIO` 1.0+.
     pub const VERSION_1: u64 = 1 << 32;
 
     /// Default features offered by our device.
@@ -62,36 +62,43 @@ impl NetFeatures {
         Self::MAC | Self::STATUS | Self::MRG_RXBUF | Self::CSUM | Self::GUEST_CSUM;
 
     /// Create from raw bits.
+    #[must_use]
     pub const fn from_bits(bits: u64) -> Self {
         Self(bits)
     }
 
     /// Get raw bits.
+    #[must_use]
     pub const fn bits(self) -> u64 {
         self.0
     }
 
     /// Check if a feature is set.
+    #[must_use]
     pub const fn contains(self, feature: u64) -> bool {
         (self.0 & feature) == feature
     }
 
     /// Set a feature bit.
+    #[must_use]
     pub const fn with(self, feature: u64) -> Self {
         Self(self.0 | feature)
     }
 
     /// Clear a feature bit.
+    #[must_use]
     pub const fn without(self, feature: u64) -> Self {
         Self(self.0 & !feature)
     }
 
     /// Negotiate features: returns the intersection of offered and requested.
+    #[must_use]
     pub const fn negotiate(offered: Self, requested: Self) -> Self {
         Self(offered.0 & requested.0)
     }
 
     /// Empty feature set.
+    #[must_use]
     pub const fn empty() -> Self {
         Self(0)
     }
@@ -167,7 +174,7 @@ mod tests {
     #[test]
     fn display() {
         let f = NetFeatures::from_bits(NetFeatures::MAC | NetFeatures::CSUM);
-        let s = format!("{}", f);
+        let s = format!("{f}");
         assert!(s.contains("MAC"));
         assert!(s.contains("CSUM"));
     }

@@ -63,6 +63,10 @@ impl Hypervisor {
     }
 
     /// Add a VM from config. Allocates memory and registers serial output.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if memory allocation fails or the VM configuration is invalid.
     pub fn add_vm(&mut self, config: VmConfig) -> Result<usize, Error> {
         let guest_id = config.name.clone();
 
@@ -117,6 +121,10 @@ pub struct Vm {
 
 impl Vm {
     /// Create a new VM from configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration has no CPUs or zero memory.
     pub fn new(config: VmConfig) -> Result<Self, Error> {
         if config.cpus.is_empty() {
             return Err(Error::Vm("guest must have at least one CPU".into()));
@@ -126,7 +134,7 @@ impl Vm {
         }
 
         let vcpu_manager =
-            VcpuManager::new(&config.name, &config.cpus, config.scheduling.clone());
+            VcpuManager::new(&config.name, &config.cpus, config.scheduling);
 
         Ok(Self {
             config,
@@ -232,6 +240,8 @@ mod tests {
 
     #[test]
     fn hypervisor_serial_routing() {
+        use crate::serial::DATA_REG;
+
         let mut hv = Hypervisor::new(8 * 1024 * 1024 * 1024, 256 * 1024 * 1024);
 
         hv.add_vm(VmConfig {
@@ -241,7 +251,6 @@ mod tests {
         .unwrap();
 
         // Write to serial via UART TX register and verify routing
-        use crate::serial::DATA_REG;
         for &byte in b"hello" {
             hv.serial_mux().handle_write("vm1", DATA_REG, byte);
         }

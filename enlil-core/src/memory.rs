@@ -159,6 +159,10 @@ impl MemoryManager {
     /// Returns the host base address (HPA) of the allocated region.
     ///
     /// A [`MemoryMap`] is automatically created that maps GPA 0 → HPA base.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if insufficient memory or duplicate guest ID.
     pub fn allocate(&mut self, guest_id: &str, size_mb: u64) -> Result<u64, Error> {
         // Reject duplicate guest ids.
         if self.regions.values().any(|r| r.guest_id == guest_id) {
@@ -216,6 +220,14 @@ impl MemoryManager {
     ///
     /// The region is moved to an internal free-list and may be reused by
     /// future allocations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the guest ID is not found.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal region map is inconsistent.
     pub fn deallocate(&mut self, guest_id: &str) -> Result<(), Error> {
         let base = self
             .regions

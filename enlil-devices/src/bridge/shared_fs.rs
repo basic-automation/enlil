@@ -10,7 +10,7 @@ pub struct SharedFsConfig {
     pub auto_clean: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SharedFsLayout {
     Clipboard,
     Dragdrop,
@@ -19,12 +19,12 @@ pub enum SharedFsLayout {
 }
 
 impl SharedFsLayout {
-    fn subdir(&self) -> &str {
+    const fn subdir(&self) -> &str {
         match self {
-            SharedFsLayout::Clipboard => "clipboard",
-            SharedFsLayout::Dragdrop => "dragdrop",
-            SharedFsLayout::Transfer => "transfer",
-            SharedFsLayout::User => "user",
+            Self::Clipboard => "clipboard",
+            Self::Dragdrop => "dragdrop",
+            Self::Transfer => "transfer",
+            Self::User => "user",
         }
     }
 }
@@ -37,7 +37,7 @@ pub struct FileTransfer {
     pub status: TransferStatus,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferStatus {
     Pending,
     InProgress,
@@ -58,7 +58,7 @@ impl SharedFsManager {
     /// Returns an error if the backing directory layout cannot be initialized.
     pub fn new(config: SharedFsConfig) -> std::io::Result<Self> {
         Self::init_layout(&config.backing_path)?;
-        Ok(SharedFsManager {
+        Ok(Self {
             config,
             transfers: HashMap::new(),
         })
@@ -116,6 +116,7 @@ impl SharedFsManager {
         );
     }
 
+    #[must_use]
     pub fn get_transfer(&self, id: &str) -> Option<&FileTransfer> {
         self.transfers.get(id)
     }

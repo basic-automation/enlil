@@ -1,0 +1,77 @@
+//! Guest physical memory management.
+//!
+//! Tracks memory allocations across guests, ensures no overlap,
+//! and provides the foundation for EPT/NPT mapping.
+//!
+//! All allocations are 2 MB-aligned to support large-page mappings
+//! in Extended Page Tables (Intel EPT) and Nested Page Tables (AMD NPT).
+
+use crate::error::Error;
+use std::collections::BTreeMap;
+
+/// 2 MB in bytes — the alignment boundary for all guest memory regions.
+/// This enables EPT/NPT large-page (2 MB) mappings without splitting.
+const LARGE_PAGE_SIZE: u64 = 2 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+/// Configuration for a guest's memory region.
+#[derive(Debug, Clone)]
+pub struct GuestMemoryConfig {
+    /// Size in megabytes.
+    pub size_mb: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Memory region
+// ---------------------------------------------------------------------------
+
+/// A reserved region of host physical memory assigned to a guest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryRegion {
+    /// Host physical base address (HPA) of this region.
+    pub host_base: u64,
+    /// Size in bytes (always a multiple of [`LARGE_PAGE_SIZE`]).
+    pub size: u64,
+    /// Owning guest identifier.
+    pub guest_id: String,
+}
+
+// ---------------------------------------------------------------------------
+// GPA → HPA mapping
+// ---------------------------------------------------------------------------
+
+/// A single entry in a guest's memory map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryMapEntry {
+    /// Guest Physical Address (start of range).
+    pub gpa: u64,
+    /// Host Physical Address that `gpa` maps to.
+    pub hpa: u64,
+    /// Length of the mapped range in bytes.
+    pub size: u64,
+}
+
+/// Represents the guest-visible physical address space.
+///
+/// Every guest sees memory starting at GPA 0. The `MemoryMap` records
+/// how that guest-physical space maps onto host-physical addresses so
+/// that EPT/NPT tables can be constructed later.
+#[derive(Debug, Clone)]
+pub struct MemoryMap {
+    guest_id: String,
+    entries: Vec<MemoryMapEntry>,
+}
+
+impl MemoryMap {
+    /// Create a new, empty memory map for `guest_id`.
+    fn new(guest_id: &str) -> Self {
+        Self {
+            guest_id: guest_id.to_string(),
+            entries: Vec::new(),
+        }
+    }
+
+    /// Add a flat mapping: GPA `gpa` → HPA `hpa` for `size` bytes.

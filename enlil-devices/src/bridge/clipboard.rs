@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 /// Clipboard content types
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClipboardContent {
     Text(String),
     Image(Vec<u8>),
@@ -12,6 +12,7 @@ pub enum ClipboardContent {
 }
 
 impl ClipboardContent {
+    #[must_use]
     pub const fn size(&self) -> usize {
         match self {
             Self::Text(s) | Self::Html(s) => s.len(),
@@ -20,6 +21,7 @@ impl ClipboardContent {
         }
     }
 
+    #[must_use]
     pub const fn content_type(&self) -> &'static str {
         match self {
             Self::Text(_) => "text",
@@ -52,6 +54,7 @@ impl Default for ClipboardPolicy {
 }
 
 impl ClipboardPolicy {
+    #[must_use]
     pub fn new(allowed_types: &[&str], max_size: usize) -> Self {
         Self {
             allowed_types: allowed_types.iter().copied().map(String::from).collect(),
@@ -61,6 +64,7 @@ impl ClipboardPolicy {
         }
     }
 
+    #[must_use]
     pub fn allows(&self, content: &ClipboardContent) -> bool {
         content.size() <= self.max_size
             && self.allowed_types.contains(&content.content_type().to_string())
@@ -79,12 +83,12 @@ struct ClipboardEntry {
 #[allow(dead_code)]
 impl ClipboardEntry {
     /// Returns the sequence number of this entry.
-    fn sequence(&self) -> u64 {
+    const fn sequence(&self) -> u64 {
         self.sequence
     }
 
     /// Returns the source guest ID that created this entry.
-    fn source_guest(&self) -> u32 {
+    const fn source_guest(&self) -> u32 {
         self.source_guest
     }
 }
@@ -98,6 +102,7 @@ pub struct ClipboardHub {
 }
 
 impl ClipboardHub {
+    #[must_use]
     pub fn new(max_history: usize) -> Self {
         Self {
             history: Arc::new(Mutex::new(VecDeque::new())),
@@ -230,10 +235,10 @@ mod tests {
     fn test_hub_write_and_read() {
         let hub = ClipboardHub::new(10);
         let content = ClipboardContent::Text("test".to_string());
-        
+
         let seq = hub.write(1, content.clone()).expect("write failed");
         assert_eq!(seq, 0);
-        
+
         let read_content = hub.read(1).expect("read failed").expect("no content");
         assert_eq!(read_content, content);
     }
@@ -252,12 +257,12 @@ mod tests {
     #[test]
     fn test_hub_history_ring_buffer() {
         let hub = ClipboardHub::new(3);
-        
+
         hub.write(1, ClipboardContent::Text("a".into())).unwrap();
         hub.write(1, ClipboardContent::Text("b".into())).unwrap();
         hub.write(1, ClipboardContent::Text("c".into())).unwrap();
         assert_eq!(hub.history_len().unwrap(), 3);
-        
+
         hub.write(1, ClipboardContent::Text("d".into())).unwrap();
         assert_eq!(hub.history_len().unwrap(), 3);
     }

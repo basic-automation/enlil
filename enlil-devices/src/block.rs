@@ -1,7 +1,7 @@
-//! VirtIO Block Device emulation.
+//! `VirtIO` Block Device emulation.
 //!
-//! Implements the VirtIO block device specification (virtio-blk).
-//! Uses the `StorageBackend` trait for pluggable storage backends.
+//! Implements the `VirtIO` block device specification (virtio-blk).
+//! Uses the [`StorageBackend`] trait for pluggable storage backends.
 
 use crate::storage::StorageBackend;
 use std::sync::Arc;
@@ -38,25 +38,25 @@ bitflags::bitflags! {
     }
 }
 
-/// VirtIO block device configuration space.
+/// `VirtIO` block device configuration space.
 #[derive(Debug, Clone)]
 #[repr(C)]
 pub struct BlockConfig {
     /// Capacity in 512-byte sectors.
     pub capacity: u64,
-    /// Maximum size of any single segment (if SIZE_MAX).
+    /// Maximum size of any single segment (if `SIZE_MAX`).
     pub size_max: u32,
-    /// Maximum number of segments in a request (if SEG_MAX).
+    /// Maximum number of segments in a request (if `SEG_MAX`).
     pub seg_max: u32,
-    /// Geometry (if GEOMETRY).
+    /// Geometry (if `GEOMETRY`).
     pub cylinders: u16,
     pub heads: u8,
     pub sectors: u8,
-    /// Block size (if BLK_SIZE).
+    /// Block size (if `BLK_SIZE`).
     pub blk_size: u32,
 }
 
-/// A VirtIO block request header (from guest memory).
+/// A `VirtIO` block request header (from guest memory).
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct BlockRequestHeader {
@@ -66,6 +66,12 @@ pub struct BlockRequestHeader {
 }
 
 impl BlockRequestHeader {
+    /// Parse a block request header from bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `None` if the input is less than 16 bytes.
+    #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < 16 {
             return None;
@@ -81,7 +87,7 @@ impl BlockRequestHeader {
     }
 }
 
-/// VirtIO block device.
+/// `VirtIO` block device.
 pub struct VirtioBlockDevice {
     /// The storage backend.
     backend: Arc<dyn StorageBackend>,
@@ -96,7 +102,7 @@ pub struct VirtioBlockDevice {
 }
 
 /// Block device I/O statistics.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct BlockStats {
     pub reads: u64,
     pub writes: u64,
@@ -108,7 +114,7 @@ pub struct BlockStats {
 }
 
 impl VirtioBlockDevice {
-    /// Create a new VirtIO block device with the given storage backend.
+    /// Create a new `VirtIO` block device with the given storage backend.
     pub fn new(backend: Arc<dyn StorageBackend>, device_id: &str) -> Self {
         let capacity = backend.capacity();
         let readonly = backend.is_readonly();
@@ -127,7 +133,7 @@ impl VirtioBlockDevice {
 
         let config = BlockConfig {
             capacity: capacity / 512,
-            size_max: 1024 * 1024, // 1MB max segment
+            size_max: 1_048_576, // 1MB max segment
             seg_max: 128,
             cylinders: 0,
             heads: 0,
@@ -150,45 +156,59 @@ impl VirtioBlockDevice {
     }
 
     /// Get the device's offered features.
-    pub fn features(&self) -> BlockFeatures {
+    #[must_use]
+    pub const fn features(&self) -> BlockFeatures {
         self.features
     }
 
     /// Get the device configuration.
-    pub fn config(&self) -> &BlockConfig {
+    #[must_use]
+    pub const fn config(&self) -> &BlockConfig {
         &self.config
     }
 
     /// Get I/O statistics.
-    pub fn stats(&self) -> &BlockStats {
+    #[must_use]
+    pub const fn stats(&self) -> &BlockStats {
         &self.stats
     }
 
     /// Read the config space at the given offset.
+    ///
+    /// # Arguments
+    ///
+    /// * `offset` - Byte offset within the config space
+    /// * `size` - Number of bytes to read (1, 2, 4, or 8)
+    ///
+    /// # Returns
+    ///
+    /// The requested value as a `u64`, or 0 if out of bounds.
+    #[must_use]
     pub fn read_config(&self, offset: u64, size: u8) -> u64 {
         let config_bytes = self.config_as_bytes();
+        #[allow(clippy::cast_possible_truncation)]
         let offset = offset as usize;
         if offset >= config_bytes.len() {
             return 0;
         }
         match size {
-            1 => config_bytes.get(offset).copied().unwrap_or(0) as u64,
+            1 => u64::from(config_bytes.get(offset).copied().unwrap_or(0)),
             2 => {
-                let b0 = config_bytes.get(offset).copied().unwrap_or(0) as u64;
-                let b1 = config_bytes.get(offset + 1).copied().unwrap_or(0) as u64;
+                let b0 = u64::from(config_bytes.get(offset).copied().unwrap_or(0));
+                let b1 = u64::from(config_bytes.get(offset + 1).copied().unwrap_or(0));
                 b0 | (b1 << 8)
             }
             4 => {
                 let mut val = 0u64;
                 for i in 0..4 {
-                    val |= (config_bytes.get(offset + i).copied().unwrap_or(0) as u64) << (i * 8);
+                    val |= u64::from(config_bytes.get(offset + i).copied().unwrap_or(0)) << (i * 8);
                 }
                 val
             }
             8 => {
                 let mut val = 0u64;
                 for i in 0..8 {
-                    val |= (config_bytes.get(offset + i).copied().unwrap_or(0) as u64) << (i * 8);
+                    val |= u64::from(config_bytes.get(offset + i).copied().unwrap_or(0)) << (i * 8);
                 }
                 val
             }
@@ -196,6 +216,7 @@ impl VirtioBlockDevice {
         }
     }
 
+    #[must_use]
     fn config_as_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(28);
         bytes.extend_from_slice(&self.config.capacity.to_le_bytes());
@@ -210,18 +231,21 @@ impl VirtioBlockDevice {
 
     /// Process a block request.
     ///
-    /// `header_bytes`: the 16-byte request header
-    /// `data_buf`: the data buffer (for reads: output, for writes: input)
+    /// # Arguments
     ///
-    /// Returns (status_byte, bytes_transferred).
+    /// * `header_bytes` - the 16-byte request header
+    /// * `data_buf` - the data buffer (for reads: output, for writes: input)
+    ///
+    /// # Returns
+    ///
+    /// A tuple of (`status_byte`, `bytes_transferred`).
     pub fn process_request(
         &mut self,
         header_bytes: &[u8],
         data_buf: &mut [u8],
     ) -> (u8, usize) {
-        let header = match BlockRequestHeader::from_bytes(header_bytes) {
-            Some(h) => h,
-            None => return (VIRTIO_BLK_S_IOERR, 0),
+        let Some(header) = BlockRequestHeader::from_bytes(header_bytes) else {
+            return (VIRTIO_BLK_S_IOERR, 0);
         };
 
         match header.request_type {
@@ -229,7 +253,9 @@ impl VirtioBlockDevice {
             VIRTIO_BLK_T_OUT => self.handle_write(header.sector, data_buf),
             VIRTIO_BLK_T_FLUSH => self.handle_flush(),
             VIRTIO_BLK_T_GET_ID => self.handle_get_id(data_buf),
-            VIRTIO_BLK_T_DISCARD => self.handle_discard(header.sector, data_buf.len() as u64),
+            VIRTIO_BLK_T_DISCARD => {
+                self.handle_discard(header.sector, u64::from(u32::try_from(data_buf.len()).unwrap_or(u32::MAX)))
+            }
             _ => {
                 self.stats.errors += 1;
                 (VIRTIO_BLK_S_UNSUPP, 0)
@@ -239,48 +265,39 @@ impl VirtioBlockDevice {
 
     fn handle_read(&mut self, sector: u64, buf: &mut [u8]) -> (u8, usize) {
         let offset = sector * 512;
-        match self.backend.read_at(offset, buf) {
-            Ok(n) => {
-                self.stats.reads += 1;
-                self.stats.read_bytes += n as u64;
-                (VIRTIO_BLK_S_OK, n)
-            }
-            Err(_) => {
-                self.stats.errors += 1;
-                (VIRTIO_BLK_S_IOERR, 0)
-            }
+        if let Ok(n) = self.backend.read_at(offset, buf) {
+            self.stats.reads += 1;
+            self.stats.read_bytes += u64::from(u32::try_from(n).unwrap_or(u32::MAX));
+            (VIRTIO_BLK_S_OK, n)
+        } else {
+            self.stats.errors += 1;
+            (VIRTIO_BLK_S_IOERR, 0)
         }
     }
 
-    fn handle_write(&mut self, sector: u64, buf: &mut [u8]) -> (u8, usize) {
+    fn handle_write(&mut self, sector: u64, buf: &[u8]) -> (u8, usize) {
         if self.backend.is_readonly() {
             self.stats.errors += 1;
             return (VIRTIO_BLK_S_IOERR, 0);
         }
         let offset = sector * 512;
-        match self.backend.write_at(offset, buf) {
-            Ok(n) => {
-                self.stats.writes += 1;
-                self.stats.write_bytes += n as u64;
-                (VIRTIO_BLK_S_OK, n)
-            }
-            Err(_) => {
-                self.stats.errors += 1;
-                (VIRTIO_BLK_S_IOERR, 0)
-            }
+        if let Ok(n) = self.backend.write_at(offset, buf) {
+            self.stats.writes += 1;
+            self.stats.write_bytes += u64::from(u32::try_from(n).unwrap_or(u32::MAX));
+            (VIRTIO_BLK_S_OK, n)
+        } else {
+            self.stats.errors += 1;
+            (VIRTIO_BLK_S_IOERR, 0)
         }
     }
 
     fn handle_flush(&mut self) -> (u8, usize) {
-        match self.backend.flush() {
-            Ok(()) => {
-                self.stats.flushes += 1;
-                (VIRTIO_BLK_S_OK, 0)
-            }
-            Err(_) => {
-                self.stats.errors += 1;
-                (VIRTIO_BLK_S_IOERR, 0)
-            }
+        if matches!(self.backend.flush(), Ok(())) {
+            self.stats.flushes += 1;
+            (VIRTIO_BLK_S_OK, 0)
+        } else {
+            self.stats.errors += 1;
+            (VIRTIO_BLK_S_IOERR, 0)
         }
     }
 
@@ -292,15 +309,12 @@ impl VirtioBlockDevice {
 
     fn handle_discard(&mut self, sector: u64, len_bytes: u64) -> (u8, usize) {
         let offset = sector * 512;
-        match self.backend.trim(offset, len_bytes) {
-            Ok(()) => {
-                self.stats.discards += 1;
-                (VIRTIO_BLK_S_OK, 0)
-            }
-            Err(_) => {
-                self.stats.errors += 1;
-                (VIRTIO_BLK_S_IOERR, 0)
-            }
+        if matches!(self.backend.trim(offset, len_bytes), Ok(())) {
+            self.stats.discards += 1;
+            (VIRTIO_BLK_S_OK, 0)
+        } else {
+            self.stats.errors += 1;
+            (VIRTIO_BLK_S_IOERR, 0)
         }
     }
 }
@@ -311,7 +325,7 @@ mod tests {
     use crate::storage::MemoryBackend;
 
     fn make_device() -> VirtioBlockDevice {
-        let backend = Arc::new(MemoryBackend::new(1024 * 1024)); // 1MB
+        let backend = Arc::new(MemoryBackend::new(1_048_576)); // 1MB
         VirtioBlockDevice::new(backend, "test-disk")
     }
 
@@ -371,7 +385,7 @@ mod tests {
         // Write data first
         let header = make_header(VIRTIO_BLK_T_OUT, 0);
         let mut data = vec![0xFF; 512];
-        dev.process_request(&header, &mut data);
+        let _ = dev.process_request(&header, &mut data);
 
         // Discard sector 0
         let header = make_header(VIRTIO_BLK_T_DISCARD, 0);
@@ -392,7 +406,7 @@ mod tests {
 
     #[test]
     fn test_readonly_device() {
-        let backend = Arc::new(MemoryBackend::new_readonly(vec![0u8; 1024 * 1024]));
+        let backend = Arc::new(MemoryBackend::new_readonly(vec![0u8; 1_048_576]));
         let mut dev = VirtioBlockDevice::new(backend, "ro-disk");
         assert!(dev.features().contains(BlockFeatures::RO));
 
@@ -418,12 +432,12 @@ mod tests {
         let mut dev = make_device();
         let header = make_header(VIRTIO_BLK_T_OUT, 0);
         let mut data = vec![0xFF; 512];
-        dev.process_request(&header, &mut data);
-        dev.process_request(&header, &mut data);
+        let _ = dev.process_request(&header, &mut data);
+        let _ = dev.process_request(&header, &mut data);
 
         let header = make_header(VIRTIO_BLK_T_IN, 0);
         let mut buf = vec![0u8; 512];
-        dev.process_request(&header, &mut buf);
+        let _ = dev.process_request(&header, &mut buf);
 
         assert_eq!(dev.stats().writes, 2);
         assert_eq!(dev.stats().reads, 1);

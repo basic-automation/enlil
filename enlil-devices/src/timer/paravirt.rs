@@ -20,11 +20,11 @@ pub struct KvmClockPage {
     /// Version counter — odd means update in progress.
     pub version: AtomicU32,
     _pad0: u32,
-    /// TSC value at the time system_time was captured.
+    /// TSC value at the time `system_time` was captured.
     pub tsc_timestamp: AtomicU64,
-    /// System time in nanoseconds at tsc_timestamp.
+    /// System time in nanoseconds at `tsc_timestamp`.
     pub system_time: AtomicU64,
-    /// Multiplier: ns = (tsc_delta * tsc_to_system_mul) >> tsc_shift.
+    /// Multiplier: ns = (`tsc_delta` * `tsc_to_system_mul`) >> `tsc_shift`.
     pub tsc_to_system_mul: AtomicU32,
     /// Shift for the TSC-to-ns conversion.
     pub tsc_shift: i8,
@@ -46,9 +46,12 @@ pub struct KvmClock {
 impl KvmClock {
     /// Create a new KVM clock manager.
     ///
-    /// `page_gpa`: guest physical address where the clock page is mapped.
-    /// `tsc_freq_hz`: the TSC frequency for this vCPU.
-    pub fn new(page_gpa: u64, tsc_freq_hz: u64) -> Self {
+    /// # Arguments
+    ///
+    /// * `page_gpa` - guest physical address where the clock page is mapped.
+    /// * `tsc_freq_hz` - the TSC frequency for this vCPU.
+    #[must_use]
+    pub const fn new(page_gpa: u64, tsc_freq_hz: u64) -> Self {
         Self {
             page_gpa,
             version: 0,
@@ -57,14 +60,16 @@ impl KvmClock {
     }
 
     /// Get the guest physical address of the clock page.
-    pub fn page_gpa(&self) -> u64 {
+    #[must_use]
+    pub const fn page_gpa(&self) -> u64 {
         self.page_gpa
     }
 
     /// Compute the TSC-to-nanoseconds multiplier and shift.
     ///
-    /// Returns (multiplier, shift) such that:
-    ///   ns = (tsc_delta * multiplier) >> shift
+    /// Returns `(multiplier, shift)` such that:
+    ///   ns = (`tsc_delta` * multiplier) >> shift
+    #[must_use]
     pub fn compute_mul_shift(&self) -> (u32, i8) {
         if self.tsc_freq_hz == 0 {
             return (0, 0);
@@ -72,16 +77,24 @@ impl KvmClock {
         // We want: mul / 2^shift = 10^9 / tsc_freq
         // Choose shift = 32 for good precision
         let shift: i8 = 32;
-        let mul = ((1_000_000_000u128) << shift as u128) / self.tsc_freq_hz as u128;
-        (mul as u32, shift)
+        let mul = ((1_000_000_000u128) << u32::from(shift.unsigned_abs())) / u128::from(self.tsc_freq_hz);
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            (mul as u32, shift)
+        }
     }
 
     /// Update the clock page data. Call this on each VM entry or periodically.
     ///
-    /// `current_tsc`: the current TSC value.
-    /// `system_time_ns`: the current system time in nanoseconds.
+    /// # Arguments
     ///
-    /// Returns the serialized clock page bytes (64 bytes).
+    /// * `current_tsc` - the current TSC value.
+    /// * `system_time_ns` - the current system time in nanoseconds.
+    ///
+    /// # Returns
+    ///
+    /// The serialized clock page bytes (64 bytes).
+    #[must_use]
     pub fn update(&mut self, current_tsc: u64, system_time_ns: u64) -> Vec<u8> {
         self.version += 2; // Always even after update
         let (mul, shift) = self.compute_mul_shift();
@@ -96,14 +109,18 @@ impl KvmClock {
         // tsc_to_system_mul (offset 24, 4 bytes)
         page[24..28].copy_from_slice(&mul.to_le_bytes());
         // tsc_shift (offset 28, 1 byte)
-        page[28] = shift as u8;
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            page[28] = shift.unsigned_abs();
+        }
         // flags (offset 29, 1 byte) — TSC is stable
         page[29] = 0x01;
         page
     }
 
     /// Get the current version counter.
-    pub fn version(&self) -> u32 {
+    #[must_use]
+    pub const fn version(&self) -> u32 {
         self.version
     }
 }
@@ -115,14 +132,14 @@ impl KvmClock {
 /// Hyper-V Reference TSC page layout.
 ///
 /// Windows guests use this for high-resolution timekeeping.
-/// The guest reads the page and computes: time = (rdtsc() * scale) >> 64 + offset.
+/// The guest reads the page and computes: time = (`rdtsc()` * `scale`) >> 64 + `offset`.
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct HyperVReferenceTscPage {
     /// Sequence counter — 0 means invalid/use fallback.
     pub sequence: u32,
     _reserved0: u32,
-    /// Scale factor: reference_time = (tsc * scale) >> 64.
+    /// Scale factor: `reference_time` = (`tsc` * `scale`) >> 64.
     pub scale: u64,
     /// Offset added after scaling.
     pub offset: i64,
@@ -142,7 +159,13 @@ pub struct HyperVReferenceTsc {
 
 impl HyperVReferenceTsc {
     /// Create a new Hyper-V reference TSC manager.
-    pub fn new(page_gpa: u64, tsc_freq_hz: u64) -> Self {
+    ///
+    /// # Arguments
+    ///
+    /// * `page_gpa` - guest physical address of the TSC page.
+    /// * `tsc_freq_hz` - the TSC frequency in Hz.
+    #[must_use]
+    pub const fn new(page_gpa: u64, tsc_freq_hz: u64) -> Self {
         Self {
             page_gpa,
             sequence: 0,
@@ -152,25 +175,36 @@ impl HyperVReferenceTsc {
     }
 
     /// Get the guest physical address.
-    pub fn page_gpa(&self) -> u64 {
+    #[must_use]
+    pub const fn page_gpa(&self) -> u64 {
         self.page_gpa
     }
 
     /// Compute the scale factor.
     ///
-    /// scale = (ref_freq * 2^64) / tsc_freq
-    pub fn compute_scale(&self) -> u64 {
+    /// scale = (`ref_freq` * 2^64) / `tsc_freq`
+    #[must_use]
+    #[allow(clippy::cast_lossless)]
+    pub const fn compute_scale(&self) -> u64 {
         if self.tsc_freq_hz == 0 {
             return 0;
         }
-        (((self.ref_freq_hz as u128) << 64) / self.tsc_freq_hz as u128) as u64
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            (((self.ref_freq_hz as u128) << 64) / (self.tsc_freq_hz as u128)) as u64
+        }
     }
 
     /// Update the reference TSC page.
     ///
-    /// `tsc_offset`: the TSC offset for this vCPU.
+    /// # Arguments
     ///
-    /// Returns the serialized page bytes (32 bytes).
+    /// * `tsc_offset` - the TSC offset for this vCPU.
+    ///
+    /// # Returns
+    ///
+    /// The serialized page bytes (32 bytes).
+    #[must_use]
     pub fn update(&mut self, tsc_offset: i64) -> Vec<u8> {
         self.sequence += 1;
         let scale = self.compute_scale();
@@ -187,6 +221,7 @@ impl HyperVReferenceTsc {
     }
 
     /// Invalidate the page (guest falls back to MSR-based time).
+    #[must_use]
     pub fn invalidate(&mut self) -> Vec<u8> {
         let mut page = vec![0u8; 32];
         // sequence = 0 means invalid
@@ -195,7 +230,8 @@ impl HyperVReferenceTsc {
     }
 
     /// Get the current sequence number.
-    pub fn sequence(&self) -> u32 {
+    #[must_use]
+    pub const fn sequence(&self) -> u32 {
         self.sequence
     }
 }
@@ -213,9 +249,12 @@ mod tests {
         assert_eq!(shift, 32);
 
         // Verify: 3 billion ticks * mul >> 32 should ≈ 1 second (10^9 ns)
-        let ns = ((3_000_000_000u128 * mul as u128) >> 32) as u64;
-        // Allow 1% error
-        assert!((ns as i64 - 1_000_000_000i64).unsigned_abs() < 10_000_000);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        {
+            let ns = ((3_000_000_000u128 * u128::from(mul)) >> 32) as u64;
+            // Allow 1% error
+            assert!((ns as i64 - 1_000_000_000i64).unsigned_abs() < 10_000_000);
+        }
     }
 
     #[test]
@@ -239,9 +278,9 @@ mod tests {
     #[test]
     fn kvm_clock_version_increments() {
         let mut clock = KvmClock::new(0x1000, 3_000_000_000);
-        clock.update(0, 0);
+        let _ = clock.update(0, 0);
         assert_eq!(clock.version(), 2);
-        clock.update(0, 0);
+        let _ = clock.update(0, 0);
         assert_eq!(clock.version(), 4);
     }
 
@@ -263,7 +302,7 @@ mod tests {
     #[test]
     fn hyperv_tsc_invalidate() {
         let mut tsc = HyperVReferenceTsc::new(0x2000, 3_000_000_000);
-        tsc.update(0); // seq = 1
+        let _ = tsc.update(0); // seq = 1
         let page = tsc.invalidate();
         let seq = u32::from_le_bytes([page[0], page[1], page[2], page[3]]);
         assert_eq!(seq, 0); // invalid

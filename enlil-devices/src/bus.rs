@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 /// Direction of an I/O operation.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoDirection {
     Read,
     Write,
@@ -51,7 +51,8 @@ pub struct PioBus {
 }
 
 impl PioBus {
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             devices: BTreeMap::new(),
         }
@@ -63,6 +64,7 @@ impl PioBus {
     }
 
     /// Find which device owns a given port.
+    #[must_use]
     pub fn lookup(&self, port: u16) -> Option<usize> {
         // Find the device whose base is <= port
         self.devices
@@ -85,16 +87,20 @@ pub struct MmioBus {
 }
 
 impl MmioBus {
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             devices: BTreeMap::new(),
         }
     }
 
+    /// Register a device's MMIO base address.
     pub fn register(&mut self, base: u64, device_index: usize) {
         self.devices.insert(base, device_index);
     }
 
+    /// Look up which device owns a given MMIO address.
+    #[must_use]
     pub fn lookup(&self, address: u64) -> Option<usize> {
         self.devices
             .range(..=address)

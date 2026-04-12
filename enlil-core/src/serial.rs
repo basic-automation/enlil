@@ -289,6 +289,7 @@ impl UartState {
         let dlab = self.lcr & 0x80 != 0;
 
         match offset {
+            #[allow(clippy::cast_possible_truncation)]
             DATA_REG if dlab => self.divisor as u8,
             DATA_REG => self.read_data(),
             IER_REG if dlab => (self.divisor >> 8) as u8,
@@ -318,11 +319,8 @@ impl UartState {
                 self.divisor = (self.divisor & 0x00FF) | (u16::from(value) << 8);
             }
             IER_REG => self.ier = value & 0x0F,
-            IIR_REG => { /* FCR write — acknowledge but ignore for now */ }
             LCR_REG => self.lcr = value,
             MCR_REG => self.mcr = value & 0x1F,
-            LSR_REG => { /* read-only, ignore writes */ }
-            MSR_REG => { /* read-only, ignore writes */ }
             SCR_REG => self.scr = value,
             _ => {}
         }
@@ -443,12 +441,10 @@ impl SerialMultiplexer {
     ///
     /// `offset` is 0–7 relative to the guest's COM base port.
     pub fn handle_read(&mut self, guest_id: &str, offset: u16) -> u8 {
-        if let Some(uart) = self.guests.get_mut(guest_id) {
-            uart.read_register(offset)
-        } else {
+        self.guests.get_mut(guest_id).map_or_else(|| {
             log::warn!("serial: read from unknown guest '{guest_id}'");
             0xFF
-        }
+        }, |uart| uart.read_register(offset))
     }
 
     /// Inject input bytes into a guest's RX FIFO.
@@ -793,6 +789,7 @@ mod tests {
         {
             let mux = shared.lock().unwrap();
             assert_eq!(mux.guest_count(), 1);
+            drop(mux);
         }
     }
 }

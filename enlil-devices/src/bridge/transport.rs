@@ -12,11 +12,13 @@ pub struct GuestId(u16);
 
 impl GuestId {
     /// Create a new `GuestId`.
+    #[must_use]
     pub const fn new(id: u16) -> Self {
         Self(id)
     }
 
     /// Get the numeric ID.
+    #[must_use]
     pub const fn id(&self) -> u16 {
         self.0
     }
@@ -45,20 +47,22 @@ pub enum BridgeChannel {
 
 impl BridgeChannel {
     /// Get all channel variants.
-    pub const fn all() -> &'static [BridgeChannel] {
+    #[must_use]
+    pub const fn all() -> &'static [Self] {
         &[
-            BridgeChannel::Clipboard,
-            BridgeChannel::DragDrop,
-            BridgeChannel::Notify,
-            BridgeChannel::SharedFs,
-            BridgeChannel::FastNet,
-            BridgeChannel::UrlRoute,
-            BridgeChannel::ControlTx,
-            BridgeChannel::ControlRx,
+            Self::Clipboard,
+            Self::DragDrop,
+            Self::Notify,
+            Self::SharedFs,
+            Self::FastNet,
+            Self::UrlRoute,
+            Self::ControlTx,
+            Self::ControlRx,
         ]
     }
 
     /// Get the queue index for this channel.
+    #[must_use]
     pub const fn queue_index(&self) -> usize {
         *self as usize
     }
@@ -83,6 +87,7 @@ pub struct MessageHeader {
 
 impl MessageHeader {
     /// Create a new message header.
+    #[must_use]
     pub const fn new(
         src: GuestId,
         dst: GuestId,
@@ -101,6 +106,7 @@ impl MessageHeader {
     }
 
     /// Serialize header to bytes (fixed 32 bytes).
+    #[must_use]
     pub fn to_bytes(&self) -> [u8; 32] {
         let mut buf = [0u8; 32];
         buf[0..2].copy_from_slice(&self.src.0.to_le_bytes());
@@ -166,7 +172,7 @@ impl BridgeMessage {
     ///
     /// # Errors
     ///
-    /// Returns an error if the payload length does not match the header payload_len field.
+    /// Returns an error if the payload length does not match the header `payload_len` field.
     pub fn new(header: MessageHeader, payload: Vec<u8>) -> Result<Self, String> {
         if header.payload_len as usize != payload.len() {
             return Err(format!(
@@ -179,11 +185,13 @@ impl BridgeMessage {
     }
 
     /// Get total frame size (header + payload).
+    #[must_use]
     pub const fn frame_size(&self) -> usize {
         32 + self.payload.len()
     }
 
     /// Serialize to bytes.
+    #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.frame_size());
         buf.extend_from_slice(&self.header.to_bytes());
@@ -262,6 +270,7 @@ pub struct LocalVirtioTransport {
 
 impl LocalVirtioTransport {
     /// Create a new `LocalVirtioTransport` with specified max queue depth.
+    #[must_use]
     pub fn new(max_queue_depth: usize) -> Self {
         Self {
             queues: [
@@ -279,7 +288,7 @@ impl LocalVirtioTransport {
     }
 
     /// Get queue for a channel.
-    fn get_queue(&self, channel: BridgeChannel) -> &Arc<Mutex<VecDeque<BridgeMessage>>> {
+    const fn get_queue(&self, channel: BridgeChannel) -> &Arc<Mutex<VecDeque<BridgeMessage>>> {
         &self.queues[channel.queue_index()]
     }
 }
@@ -355,11 +364,13 @@ impl VirtioBridgeDevice {
     }
 
     /// Receive a message from the device.
+    #[must_use]
     pub fn recv(&self) -> Option<BridgeMessage> {
         self.transport.recv()
     }
 
     /// Get transport reference.
+    #[must_use]
     pub fn transport(&self) -> &Arc<dyn BridgeTransport> {
         &self.transport
     }

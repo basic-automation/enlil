@@ -1,0 +1,9 @@
+//! Anti-detection stealth modules
+//!
+//! Provides CPUID interception, timing stealth (TSC/APERF/MPERF),
+//! LBR save/restore, and PMC virtualization to defeat anti-VM detection.
+
+pub mod cpuid;
+pub mod timing;
+pub mod lbr;
+pub mod pmc;

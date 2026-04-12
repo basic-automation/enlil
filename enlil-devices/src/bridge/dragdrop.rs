@@ -9,6 +9,7 @@ pub struct DragPayload {
 }
 
 impl DragPayload {
+    #[must_use]
     pub const fn new(file_uris: Vec<String>, mime_types: Vec<String>) -> Self {
         Self {
             file_uris,
@@ -17,6 +18,7 @@ impl DragPayload {
         }
     }
 
+    #[must_use]
     pub fn with_thumbnail(mut self, thumbnail: Vec<u8>) -> Self {
         self.preview_thumbnail = Some(thumbnail);
         self
@@ -40,18 +42,22 @@ pub enum DragState {
 }
 
 impl DragState {
+    #[must_use]
     pub const fn is_idle(&self) -> bool {
         matches!(self, Self::Idle)
     }
 
+    #[must_use]
     pub const fn is_dragging(&self) -> bool {
         matches!(self, Self::Dragging { .. })
     }
 
+    #[must_use]
     pub const fn is_hovering(&self) -> bool {
         matches!(self, Self::Hovering { .. })
     }
 
+    #[must_use]
     pub const fn is_dropped(&self) -> bool {
         matches!(self, Self::Dropped)
     }
@@ -64,6 +70,7 @@ pub struct DragDropManager {
 }
 
 impl DragDropManager {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             state: DragState::Idle,
@@ -171,6 +178,7 @@ impl DragDropManager {
         Ok(())
     }
 
+    #[must_use]
     pub const fn state(&self) -> &DragState {
         &self.state
     }

@@ -1,7 +1,7 @@
 //! Enlil Bridge — Inter-guest communication subsystem
 //!
 //! Provides clipboard sharing, drag-and-drop, shared filesystem,
-//! and notification routing between guest VMs via VirtIO queues.
+//! and notification routing between guest VMs via `VirtIO` queues.
 
 pub mod clipboard;
 pub mod dragdrop;
