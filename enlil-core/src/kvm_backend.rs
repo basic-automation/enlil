@@ -68,10 +68,9 @@ impl GuestExit {
     #[must_use]
     pub const fn outcome(&self) -> RunOutcome {
         match self {
-            Self::Halted
-            | Self::Shutdown
-            | Self::InternalError
-            | Self::FailedEntry(_) => RunOutcome::Stopped,
+            Self::Halted | Self::Shutdown | Self::InternalError | Self::FailedEntry(_) => {
+                RunOutcome::Stopped
+            }
             Self::IoIn { .. }
             | Self::IoOut { .. }
             | Self::MmioRead { .. }
@@ -186,8 +185,8 @@ mod linux {
         /// Returns [`Error::HypervisorError`] if KVM is unavailable, the API
         /// version is unexpected, or any setup ioctl fails.
         pub fn new() -> Result<Self> {
-            let kvm = Kvm::new()
-                .map_err(|e| Error::HypervisorError(format!("open /dev/kvm: {e}")))?;
+            let kvm =
+                Kvm::new().map_err(|e| Error::HypervisorError(format!("open /dev/kvm: {e}")))?;
 
             let api = kvm.get_api_version();
             if api != 12 {
@@ -249,9 +248,9 @@ mod linux {
             };
             // SAFETY: forwarded from this function's safety contract.
             unsafe {
-                self.vm
-                    .set_user_memory_region(region)
-                    .map_err(|e| Error::HypervisorError(format!("KVM_SET_USER_MEMORY_REGION: {e}")))?;
+                self.vm.set_user_memory_region(region).map_err(|e| {
+                    Error::HypervisorError(format!("KVM_SET_USER_MEMORY_REGION: {e}"))
+                })?;
             }
             self.next_slot += 1;
             let entry = MemSlot {
@@ -376,11 +375,19 @@ mod tests {
     #[test]
     fn resumable_exits_continue_the_loop() {
         assert_eq!(
-            GuestExit::IoIn { port: 0x3f8, size: 1 }.outcome(),
+            GuestExit::IoIn {
+                port: 0x3f8,
+                size: 1
+            }
+            .outcome(),
             RunOutcome::Continue
         );
         assert_eq!(
-            GuestExit::MmioWrite { addr: 0xfee0_0000, size: 4 }.outcome(),
+            GuestExit::MmioWrite {
+                addr: 0xfee0_0000,
+                size: 4
+            }
+            .outcome(),
             RunOutcome::Continue
         );
         assert_eq!(GuestExit::Interrupted.outcome(), RunOutcome::Continue);
