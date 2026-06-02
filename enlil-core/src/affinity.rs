@@ -130,7 +130,7 @@ pub fn pin_current_thread_to_mask(mask: &AffinityMask) -> PinResult {
 
 /// Get the affinity mask of the current thread.
 #[must_use]
-pub const fn get_current_affinity() -> PinResult {
+pub fn get_current_affinity() -> PinResult {
     #[cfg(target_os = "linux")]
     {
         get_affinity_linux()
@@ -161,8 +161,6 @@ pub fn online_cpus() -> Vec<u32> {
 
 #[cfg(target_os = "linux")]
 fn pin_linux(mask: &AffinityMask) -> PinResult {
-    use std::mem;
-
     // cpu_set_t is 1024 bits = 128 bytes on Linux
     const CPU_SET_SIZE: usize = 128;
     let mut cpu_set = [0u8; CPU_SET_SIZE];
