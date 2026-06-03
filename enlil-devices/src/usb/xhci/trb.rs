@@ -92,7 +92,7 @@ impl Trb {
 
     /// Decode a TRB from a 16-byte array (little-endian).
     #[must_use]
-    pub fn from_bytes(buf: &[u8; 16]) -> Self {
+    pub const fn from_bytes(buf: &[u8; 16]) -> Self {
         Self {
             parameter: u64::from_le_bytes([
                 buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],

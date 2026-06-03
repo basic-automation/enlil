@@ -99,11 +99,7 @@ impl fmt::Display for UsbDevice {
             self.id.product_id,
             self.product_name(),
             self.speed,
-            if let Some(ref g) = self.assigned_guest {
-                g.as_str()
-            } else {
-                "unassigned"
-            }
+            self.assigned_guest.as_ref().map_or("unassigned", |g| g.as_str())
         )
     }
 }

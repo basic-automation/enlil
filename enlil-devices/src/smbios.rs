@@ -148,19 +148,19 @@ impl SmbiosBuilder {
         // Type 2: Baseboard Information
         data.extend_from_slice(&self.build_type2());
         // Type 3: System Enclosure
-        data.extend_from_slice(&self.build_type3());
+        data.extend_from_slice(&Self::build_type3());
         // Type 4: Processor Information
         data.extend_from_slice(&self.build_type4());
         // Type 16: Physical Memory Array
         data.extend_from_slice(&self.build_type16());
         // Type 17: Memory Device (one per module)
         for (i, module) in self.config.ram_modules.iter().enumerate() {
-            data.extend_from_slice(&self.build_type17(i, module));
+            data.extend_from_slice(&Self::build_type17(i, module));
         }
         // Type 32: System Boot Information
-        data.extend_from_slice(&self.build_type32());
+        data.extend_from_slice(&Self::build_type32());
         // Type 127: End-of-Table
-        data.extend_from_slice(&self.build_type127());
+        data.extend_from_slice(&Self::build_type127());
 
         data
     }
@@ -325,7 +325,7 @@ impl SmbiosBuilder {
         header
     }
 
-    fn build_type3(&self) -> Vec<u8> {
+    fn build_type3() -> Vec<u8> {
         let mut header = vec![
             3,  // Type 3
             22, // Length
@@ -471,7 +471,7 @@ impl SmbiosBuilder {
         header
     }
 
-    fn build_type17(&self, index: usize, module: &RamModule) -> Vec<u8> {
+    fn build_type17(index: usize, module: &RamModule) -> Vec<u8> {
         let handle = u16_of(17 + index);
         let mut header = vec![
             17, // Type 17
@@ -571,7 +571,7 @@ impl SmbiosBuilder {
         header
     }
 
-    fn build_type32(&self) -> Vec<u8> {
+    fn build_type32() -> Vec<u8> {
         let mut header = vec![
             32, // Type 32
             20, // Length
@@ -589,7 +589,7 @@ impl SmbiosBuilder {
         header
     }
 
-    fn build_type127(&self) -> Vec<u8> {
+    fn build_type127() -> Vec<u8> {
         vec![
             127, // Type 127
             4,   // Length

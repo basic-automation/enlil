@@ -194,10 +194,9 @@ impl RoutingTable {
             }
         }
 
-        match &self.default_guest {
-            Some(guest) => RoutingDecision::RouteToGuest(guest.clone()),
-            None => RoutingDecision::Unassigned,
-        }
+        self.default_guest.as_ref().map_or(RoutingDecision::Unassigned, |guest| {
+            RoutingDecision::RouteToGuest(guest.clone())
+        })
     }
 
     /// Return the number of active (enabled) rules.
@@ -284,12 +283,11 @@ impl RoutingState {
         bus_addr: u8,
         new_guest: GuestId,
     ) -> Result<GuestId, RoutingError> {
-        let mut inner = self.inner.lock().expect("routing state poisoned");
-        let old = inner
-            .assignments
-            .insert(bus_addr, new_guest)
-            .ok_or(RoutingError::DeviceNotAssigned(bus_addr))?;
-        Ok(old)
+        let old = {
+            let mut inner = self.inner.lock().expect("routing state poisoned");
+            inner.assignments.insert(bus_addr, new_guest)
+        };
+        old.ok_or(RoutingError::DeviceNotAssigned(bus_addr))
     }
 
     /// Remove a device assignment (e.g., on disconnect).

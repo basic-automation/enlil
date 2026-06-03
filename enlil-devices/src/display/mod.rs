@@ -655,10 +655,13 @@ impl DisplayCompositor {
     /// # Panics
     /// Panics if an internal lock is poisoned.
     pub fn composite_frame(&self) -> Option<Vec<u8>> {
-        let config = self.config.lock().unwrap();
+        let (cfg_width, cfg_height) = {
+            let config = self.config.lock().unwrap();
+            (config.width, config.height)
+        };
         let sources = self.framebuffer_sources.read().unwrap();
 
-        let frame_size = (config.width * config.height) as usize * 4;
+        let frame_size = (cfg_width * cfg_height) as usize * 4;
         let mut composite_buffer = vec![0u8; frame_size];
 
         let layout = self.layout_engine.get_layout();
@@ -674,11 +677,11 @@ impl DisplayCompositor {
             {
                 // Simple copy composition
                 let bytes_per_pixel = 4;
-                for y in 0..zone.height.min(config.height.saturating_sub(zone.y)) {
-                    for x in 0..zone.width.min(config.width.saturating_sub(zone.x)) {
+                for y in 0..zone.height.min(cfg_height.saturating_sub(zone.y)) {
+                    for x in 0..zone.width.min(cfg_width.saturating_sub(zone.x)) {
                         let src_idx = ((y * zone.width + x) as usize) * bytes_per_pixel;
                         let dst_idx =
-                            (((zone.y + y) * config.width + zone.x + x) as usize) * bytes_per_pixel;
+                            (((zone.y + y) * cfg_width + zone.x + x) as usize) * bytes_per_pixel;
                         if src_idx + bytes_per_pixel <= data.len()
                             && dst_idx + bytes_per_pixel <= composite_buffer.len()
                         {

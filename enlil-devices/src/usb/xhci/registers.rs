@@ -61,7 +61,7 @@ impl CapabilityRegisters {
         let hcsparams3 = 0x0A | (0x7FF << 16);
 
         // HCCPARAMS1: AC64=1 (64-bit addressing), CSZ=1 (64-byte context)
-        let hccparams1 = 0x1 | (1 << 2);
+        let caps1 = 0x1 | (1 << 2);
 
         Self {
             caplength: 0x20,
@@ -69,7 +69,7 @@ impl CapabilityRegisters {
             hcsparams1,
             hcsparams2,
             hcsparams3,
-            hccparams1,
+            hccparams1: caps1,
             dboff: 0x2000,
             rtsoff: 0x1000,
             hccparams2: 0,
@@ -420,17 +420,13 @@ impl OperationalRegisters {
                 let port_offset = offset - 0x400;
                 let port_idx = (port_offset / 16) as usize;
                 let reg_offset = port_offset % 16;
-                if let Some(port) = self.ports.get(port_idx) {
-                    match reg_offset {
-                        0 => port.portsc,
-                        4 => port.portpmsc,
-                        8 => port.portli,
-                        12 => port.porthlpmc,
-                        _ => 0,
-                    }
-                } else {
-                    0
-                }
+                self.ports.get(port_idx).map_or(0, |port| match reg_offset {
+                    0 => port.portsc,
+                    4 => port.portpmsc,
+                    8 => port.portli,
+                    12 => port.porthlpmc,
+                    _ => 0,
+                })
             }
             _ => 0,
         }

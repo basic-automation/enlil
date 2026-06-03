@@ -367,14 +367,9 @@ mod tests {
     fn vendor_string_correct() {
         let table = CpuidStealthTable::build(&test_config());
         let result = table.lookup(0, 0);
-        let ebx_bytes = result.ebx.to_le_bytes();
-        let edx_bytes = result.edx.to_le_bytes();
-        let ecx_bytes = result.ecx.to_le_bytes();
-        let vendor: Vec<u8> = ebx_bytes
+        let vendor: Vec<u8> = [result.ebx, result.edx, result.ecx]
             .iter()
-            .chain(edx_bytes.iter())
-            .chain(ecx_bytes.iter())
-            .copied()
+            .flat_map(|r| r.to_le_bytes())
             .collect();
         assert_eq!(&vendor, b"AuthenticAMD");
     }

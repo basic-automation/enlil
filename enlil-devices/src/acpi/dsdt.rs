@@ -69,7 +69,7 @@ impl DsdtBuilder {
         let mut aml = AmlBuilder::new();
         self.build_system_bus(&mut aml);
         self.build_processors(&mut aml);
-        self.build_sleep_states(&mut aml);
+        Self::build_sleep_states(&mut aml);
         aml.into_bytes()
     }
 
@@ -118,22 +118,22 @@ impl DsdtBuilder {
 
         // RTC
         if self.config.has_rtc {
-            self.build_rtc(aml);
+            Self::build_rtc(aml);
         }
 
         // PS/2 Keyboard Controller
         if self.config.has_ps2 {
-            self.build_ps2(aml);
+            Self::build_ps2(aml);
         }
 
         // COM1 serial port
-        self.build_com1(aml);
+        Self::build_com1(aml);
 
         aml.device_end(&isa);
     }
 
     /// Build RTC device
-    fn build_rtc(&self, aml: &mut AmlBuilder) {
+    fn build_rtc(aml: &mut AmlBuilder) {
         let rtc = aml.device_start(b"RTC_");
         aml.name_string(b"_HID", "PNP0B00");
         let sta = aml.method_start(b"_STA", 0, false);
@@ -143,7 +143,7 @@ impl DsdtBuilder {
     }
 
     /// Build PS/2 keyboard and mouse
-    fn build_ps2(&self, aml: &mut AmlBuilder) {
+    fn build_ps2(aml: &mut AmlBuilder) {
         // Keyboard
         let kbd = aml.device_start(b"KBD_");
         aml.name_string(b"_HID", "PNP0303");
@@ -162,7 +162,7 @@ impl DsdtBuilder {
     }
 
     /// Build COM1 serial port
-    fn build_com1(&self, aml: &mut AmlBuilder) {
+    fn build_com1(aml: &mut AmlBuilder) {
         let com1 = aml.device_start(b"COM1");
         aml.name_string(b"_HID", "PNP0501");
         aml.name_integer(b"_UID", 1);
@@ -189,7 +189,7 @@ impl DsdtBuilder {
     }
 
     /// Build sleep state objects (\S5 for shutdown)
-    fn build_sleep_states(&self, aml: &mut AmlBuilder) {
+    fn build_sleep_states(aml: &mut AmlBuilder) {
         // \_S5 (soft off) — required for ACPI shutdown
         aml.name_integer(b"_S5_", 0);
     }

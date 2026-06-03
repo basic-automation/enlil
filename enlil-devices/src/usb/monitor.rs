@@ -128,6 +128,7 @@ impl UsbMonitor {
         }
         let addr = UsbAddress::new(*next);
         *next += 1;
+        drop(next);
         Ok(addr)
     }
 
@@ -135,6 +136,10 @@ impl UsbMonitor {
     ///
     /// In production, the xHCI driver calls this when a port status change
     /// event fires.
+    /// # Errors
+    ///
+    /// Returns [`UsbError::AddressExhausted`] if no device address is free.
+    ///
     /// # Panics
     ///
     /// Panics if the internal device lock is poisoned.
@@ -166,6 +171,11 @@ impl UsbMonitor {
     }
 
     /// Simulate a device disconnect event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UsbError::DeviceNotFound`] if no device is mapped at `port_path`.
+    ///
     /// # Panics
     ///
     /// Panics if the internal device lock is poisoned.

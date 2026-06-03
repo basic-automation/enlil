@@ -155,10 +155,8 @@ impl VirtualTpm {
             }
             crb_regs::CTRL_STS => u64::from(self.ctrl_sts),
             crb_regs::CTRL_START => u64::from(self.ctrl_start),
-            crb_regs::CMD_SIZE => 4096,
-            crb_regs::RSP_SIZE => 4096,
-            crb_regs::CMD_ADDR => TPM_MMIO_BASE + crb_regs::DATA_BUFFER,
-            crb_regs::RSP_ADDR => TPM_MMIO_BASE + crb_regs::DATA_BUFFER,
+            crb_regs::CMD_SIZE | crb_regs::RSP_SIZE => 4096,
+            crb_regs::CMD_ADDR | crb_regs::RSP_ADDR => TPM_MMIO_BASE + crb_regs::DATA_BUFFER,
             o if o >= crb_regs::DATA_BUFFER => {
                 // Read from response buffer
                 let buf_offset = usize_of(o - crb_regs::DATA_BUFFER);

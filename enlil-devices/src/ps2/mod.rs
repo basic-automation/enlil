@@ -177,17 +177,13 @@ impl I8042Controller {
                 // Write configuration byte
                 self.config = data;
             }
-            0xD1 => {
-                // Write output port
-                // Bit 0 = system reset (0 = reset)
-                // We ignore reset requests in emulation
-            }
             0xD4 => {
                 // Forward data to mouse
                 if let Some(response) = self.mouse.receive_command(data) {
                     self.queue_mouse_output(response);
                 }
             }
+            // 0xD1 (write output port): bit 0 is system reset, which we ignore.
             _ => {}
         }
     }

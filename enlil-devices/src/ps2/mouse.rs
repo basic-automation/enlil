@@ -54,7 +54,7 @@ impl Ps2Mouse {
     /// Receive a command byte from the host. Returns response byte if any.
     pub fn receive_command(&mut self, data: u8) -> Option<u8> {
         if let Some(cmd) = self.expecting_data.take() {
-            return self.handle_data_byte(cmd, data);
+            return Some(self.handle_data_byte(cmd, data));
         }
 
         match data {
@@ -159,7 +159,7 @@ impl Ps2Mouse {
     }
 
     /// Handle data byte for multi-byte commands
-    const fn handle_data_byte(&mut self, cmd: MouseCommand, data: u8) -> Option<u8> {
+    const fn handle_data_byte(&mut self, cmd: MouseCommand, data: u8) -> u8 {
         match cmd {
             MouseCommand::SetSampleRate => {
                 self.sample_rate = data;
@@ -173,13 +173,12 @@ impl Ps2Mouse {
                     }
                     _ => self.intellimouse_seq = 0,
                 }
-                Some(0xFA)
             }
             MouseCommand::SetResolution => {
                 self.resolution = data;
-                Some(0xFA)
             }
         }
+        0xFA
     }
 
     /// Inject mouse movement from host input
@@ -195,25 +194,25 @@ impl Ps2Mouse {
 
     /// Build a PS/2 mouse packet
     fn build_packet(&self, buttons: u8, dx: i16, dy: i16) -> Vec<u8> {
-        let dx_clamped = dx.clamp(-256, 255);
-        let dy_clamped = dy.clamp(-256, 255);
+        let horiz = dx.clamp(-256, 255);
+        let vert = dy.clamp(-256, 255);
 
         let mut byte0: u8 = 0x08; // Always-set bit 3
         byte0 |= buttons & 0x07; // Button bits
-        if dx_clamped < 0 {
+        if horiz < 0 {
             byte0 |= 0x10; // X sign
         }
-        if dy_clamped < 0 {
+        if vert < 0 {
             byte0 |= 0x20; // Y sign
         }
-        if dx_clamped.unsigned_abs() > 255 {
+        if horiz.unsigned_abs() > 255 {
             byte0 |= 0x40; // X overflow
         }
-        if dy_clamped.unsigned_abs() > 255 {
+        if vert.unsigned_abs() > 255 {
             byte0 |= 0x80; // Y overflow
         }
 
-        let mut packet = vec![byte0, dx_clamped.to_le_bytes()[0], dy_clamped.to_le_bytes()[0]];
+        let mut packet = vec![byte0, horiz.to_le_bytes()[0], vert.to_le_bytes()[0]];
 
         // Intellimouse: 4th byte for scroll wheel
         if self.mouse_id == 3 {
