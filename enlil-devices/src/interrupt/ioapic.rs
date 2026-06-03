@@ -6,7 +6,6 @@
 use super::DeliveryMode;
 
 /// I/O APIC base address.
-#[allow(dead_code)]
 pub const IOAPIC_BASE: u64 = 0xFEC0_0000;
 
 /// I/O APIC register select (`IOREGSEL`) offset.
@@ -26,20 +25,26 @@ pub const NUM_IOAPIC_PINS: usize = 24;
 /// I/O APIC version (simulating 82093AA).
 const IOAPIC_VERSION: u32 = 0x11;
 
-/// Redirection Table Entry.
-#[derive(Debug, Clone, Copy)]
-#[allow(clippy::struct_excessive_bools)]
-pub struct RedirectionEntry {
-    /// Interrupt vector (0-255).
-    pub vector: u8,
-    /// Delivery mode.
-    pub delivery_mode: DeliveryMode,
+/// Destination-mode, delivery-status, and polarity bits of a redirection entry.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RteFlags {
     /// Destination mode: `false` = physical, `true` = logical.
     pub dest_logical: bool,
     /// Delivery status (read-only): `false` = idle, `true` = send pending.
     pub delivery_pending: bool,
     /// Polarity: `false` = active high, `true` = active low.
     pub active_low: bool,
+}
+
+/// Redirection Table Entry.
+#[derive(Debug, Clone, Copy)]
+pub struct RedirectionEntry {
+    /// Interrupt vector (0-255).
+    pub vector: u8,
+    /// Delivery mode.
+    pub delivery_mode: DeliveryMode,
+    /// Destination-mode / status / polarity flags.
+    pub flags: RteFlags,
     /// Remote IRR (for level-triggered, read-only).
     pub remote_irr: bool,
     /// Trigger mode: `false` = edge, `true` = level.
@@ -55,9 +60,11 @@ impl Default for RedirectionEntry {
         Self {
             vector: 0,
             delivery_mode: DeliveryMode::Fixed,
-            dest_logical: false,
-            delivery_pending: false,
-            active_low: false,
+            flags: RteFlags {
+                dest_logical: false,
+                delivery_pending: false,
+                active_low: false,
+            },
             remote_irr: false,
             level_triggered: false,
             masked: true, // All entries start masked
@@ -72,13 +79,13 @@ impl RedirectionEntry {
     pub const fn low(&self) -> u32 {
         let mut val = self.vector as u32;
         val |= (self.delivery_mode as u32 & 0x7) << 8;
-        if self.dest_logical {
+        if self.flags.dest_logical {
             val |= 1 << 11;
         }
-        if self.delivery_pending {
+        if self.flags.delivery_pending {
             val |= 1 << 12;
         }
-        if self.active_low {
+        if self.flags.active_low {
             val |= 1 << 13;
         }
         if self.remote_irr {
@@ -100,20 +107,18 @@ impl RedirectionEntry {
     }
 
     /// Decode low 32 bits into the RTE fields.
-    #[allow(clippy::cast_possible_truncation)]
     pub const fn set_low(&mut self, val: u32) {
         self.vector = (val & 0xFF) as u8;
         self.delivery_mode = DeliveryMode::from_bits(((val >> 8) & 0x7) as u8);
-        self.dest_logical = (val >> 11) & 1 != 0;
+        self.flags.dest_logical = (val >> 11) & 1 != 0;
         // delivery_pending is read-only
-        self.active_low = (val >> 13) & 1 != 0;
+        self.flags.active_low = (val >> 13) & 1 != 0;
         // remote_irr is read-only
         self.level_triggered = (val >> 15) & 1 != 0;
         self.masked = (val >> 16) & 1 != 0;
     }
 
     /// Decode high 32 bits.
-    #[allow(clippy::cast_possible_truncation)]
     pub const fn set_high(&mut self, val: u32) {
         self.destination = ((val >> 24) & 0xFF) as u8;
     }
@@ -147,7 +152,7 @@ impl RedirectionEntry {
     /// Whether destination mode is logical.
     #[must_use]
     pub const fn destination_mode_logical(&self) -> bool {
-        self.dest_logical
+        self.flags.dest_logical
     }
 
     /// Set the interrupt vector.
@@ -167,7 +172,7 @@ impl RedirectionEntry {
 
     /// Set the destination mode to logical.
     pub const fn set_destination_mode_logical(&mut self, logical: bool) {
-        self.dest_logical = logical;
+        self.flags.dest_logical = logical;
     }
 
     /// Set the mask bit.
@@ -198,9 +203,11 @@ impl IoApic {
             entries: [RedirectionEntry {
                 vector: 0,
                 delivery_mode: DeliveryMode::Fixed,
-                dest_logical: false,
-                delivery_pending: false,
-                active_low: false,
+                flags: RteFlags {
+                    dest_logical: false,
+                    delivery_pending: false,
+                    active_low: false,
+                },
                 remote_irr: false,
                 level_triggered: false,
                 masked: true,
@@ -294,7 +301,7 @@ impl IoApic {
         Some(InterruptRoute {
             vector: entry.vector,
             delivery_mode: entry.delivery_mode,
-            dest_logical: entry.dest_logical,
+            dest_logical: entry.flags.dest_logical,
             destination: entry.destination,
             level_triggered: entry.level_triggered,
         })
@@ -315,7 +322,7 @@ impl IoApic {
                 entry.remote_irr = false;
                 // If the IRQ line is still asserted, re-trigger
                 if self.irq_level[i] {
-                    entry.delivery_pending = true;
+                    entry.flags.delivery_pending = true;
                 }
             }
         }
@@ -367,6 +374,7 @@ pub struct InterruptRoute {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::truncate::u32_of;
 
     #[test]
     fn ioapic_default_entries_masked() {
@@ -382,9 +390,8 @@ mod tests {
         ioapic.mmio_write(IOREGSEL, u32::from(IOAPIC_REG_VER));
         let ver = ioapic.mmio_read(IOWIN);
         assert_eq!(ver & 0xFF, IOAPIC_VERSION);
-        #[allow(clippy::cast_possible_truncation)]
         {
-            assert_eq!((ver >> 16) & 0xFF, (NUM_IOAPIC_PINS - 1) as u32);
+            assert_eq!((ver >> 16) & 0xFF, u32_of(NUM_IOAPIC_PINS - 1));
         }
     }
 

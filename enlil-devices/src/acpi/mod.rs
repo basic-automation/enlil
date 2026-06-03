@@ -81,9 +81,55 @@ pub struct AcpiTableSet {
     pub table_offsets: Vec<(String, usize)>,
 }
 
+/// The ACPI tables that have no inter-table address dependencies.
+struct SecondaryTables {
+    madt: Vec<u8>,
+    mcfg: Vec<u8>,
+    hpet: Vec<u8>,
+    ssdt: Vec<u8>,
+    srat: Vec<u8>,
+    slit: Vec<u8>,
+    waet: Vec<u8>,
+    bgrt: Vec<u8>,
+    tpm2: Vec<u8>,
+}
+
+fn build_secondary_tables(config: &AcpiTableSetConfig) -> SecondaryTables {
+    SecondaryTables {
+        madt: madt::MadtBuilder::standard(config.vcpu_count)
+            .oem_info(config.oem.clone())
+            .build(),
+        mcfg: mcfg::McfgBuilder::standard(config.pcie_ecam_base)
+            .oem_info(config.oem.clone())
+            .build(),
+        hpet: hpet::HpetBuilder::new()
+            .oem_info(config.oem.clone())
+            .base_address(config.hpet_base)
+            .build(),
+        ssdt: ssdt::SsdtBuilder::new(config.vcpu_count)
+            .oem_info(config.oem.clone())
+            .build(),
+        srat: srat::SratBuilder::single_node(config.vcpu_count, config.memory_size_bytes)
+            .oem_info(config.oem.clone())
+            .build(),
+        slit: slit::SlitBuilder::single_node()
+            .oem_info(config.oem.clone())
+            .build(),
+        waet: waet::WaetBuilder::new()
+            .oem_info(config.oem.clone())
+            .build(),
+        bgrt: bgrt::BgrtBuilder::new()
+            .oem_info(config.oem.clone())
+            .image_address(config.boot_logo_address)
+            .build(),
+        tpm2: tpm2::Tpm2Builder::new()
+            .oem_info(config.oem.clone())
+            .build(),
+    }
+}
+
 /// Build a complete ACPI table set for a guest VM
 #[must_use]
-#[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
 pub fn build_acpi_tables(config: &AcpiTableSetConfig) -> AcpiTableSet {
     let base = config.table_base_address;
     let mut tables = Vec::new();
@@ -97,36 +143,18 @@ pub fn build_acpi_tables(config: &AcpiTableSetConfig) -> AcpiTableSet {
     .oem_info(config.oem.clone())
     .build();
 
-    // Build all other tables to compute sizes
-    let madt_bytes = madt::MadtBuilder::standard(config.vcpu_count)
-        .oem_info(config.oem.clone())
-        .build();
-    let mcfg_bytes = mcfg::McfgBuilder::standard(config.pcie_ecam_base)
-        .oem_info(config.oem.clone())
-        .build();
-    let hpet_bytes = hpet::HpetBuilder::new()
-        .oem_info(config.oem.clone())
-        .base_address(config.hpet_base)
-        .build();
-    let ssdt_bytes = ssdt::SsdtBuilder::new(config.vcpu_count)
-        .oem_info(config.oem.clone())
-        .build();
-    let srat_bytes = srat::SratBuilder::single_node(config.vcpu_count, config.memory_size_bytes)
-        .oem_info(config.oem.clone())
-        .build();
-    let slit_bytes = slit::SlitBuilder::single_node()
-        .oem_info(config.oem.clone())
-        .build();
-    let waet_bytes = waet::WaetBuilder::new()
-        .oem_info(config.oem.clone())
-        .build();
-    let bgrt_bytes = bgrt::BgrtBuilder::new()
-        .oem_info(config.oem.clone())
-        .image_address(config.boot_logo_address)
-        .build();
-    let tpm2_bytes = tpm2::Tpm2Builder::new()
-        .oem_info(config.oem.clone())
-        .build();
+    // Build all other tables to compute sizes.
+    let SecondaryTables {
+        madt: madt_bytes,
+        mcfg: mcfg_bytes,
+        hpet: hpet_bytes,
+        ssdt: ssdt_bytes,
+        srat: srat_bytes,
+        slit: slit_bytes,
+        waet: waet_bytes,
+        bgrt: bgrt_bytes,
+        tpm2: tpm2_bytes,
+    } = build_secondary_tables(config);
 
     // Layout: XSDT | FADT | MADT | MCFG | HPET | SSDT | SRAT | SLIT | WAET | BGRT | TPM2 | DSDT
     let xsdt_offset = 0usize;
@@ -174,43 +202,26 @@ pub fn build_acpi_tables(config: &AcpiTableSetConfig) -> AcpiTableSet {
         .add_table(tpm2_gpa)
         .build();
 
-    // Assemble all tables into contiguous buffer
+    // Assemble all tables into a contiguous buffer (XSDT at 0, FADT at fadt_offset).
     tables.resize(fadt_offset, 0);
     tables[xsdt_offset..xsdt_offset + xsdt_bytes.len()].copy_from_slice(&xsdt_bytes);
     offsets.push(("XSDT".to_string(), xsdt_offset));
-
-    tables.extend_from_slice(&fadt_bytes);
-    offsets.push(("FADT".to_string(), fadt_offset));
-
-    tables.extend_from_slice(&madt_bytes);
-    offsets.push(("MADT".to_string(), madt_start));
-
-    tables.extend_from_slice(&mcfg_bytes);
-    offsets.push(("MCFG".to_string(), mcfg_start));
-
-    tables.extend_from_slice(&hpet_bytes);
-    offsets.push(("HPET".to_string(), hpet_start));
-
-    tables.extend_from_slice(&ssdt_bytes);
-    offsets.push(("SSDT".to_string(), ssdt_start));
-
-    tables.extend_from_slice(&srat_bytes);
-    offsets.push(("SRAT".to_string(), srat_start));
-
-    tables.extend_from_slice(&slit_bytes);
-    offsets.push(("SLIT".to_string(), slit_start));
-
-    tables.extend_from_slice(&waet_bytes);
-    offsets.push(("WAET".to_string(), waet_start));
-
-    tables.extend_from_slice(&bgrt_bytes);
-    offsets.push(("BGRT".to_string(), bgrt_start));
-
-    tables.extend_from_slice(&tpm2_bytes);
-    offsets.push(("TPM2".to_string(), tpm2_start));
-
-    tables.extend_from_slice(&dsdt_bytes);
-    offsets.push(("DSDT".to_string(), dsdt_start));
+    for (name, bytes) in [
+        ("FADT", &fadt_bytes),
+        ("MADT", &madt_bytes),
+        ("MCFG", &mcfg_bytes),
+        ("HPET", &hpet_bytes),
+        ("SSDT", &ssdt_bytes),
+        ("SRAT", &srat_bytes),
+        ("SLIT", &slit_bytes),
+        ("WAET", &waet_bytes),
+        ("BGRT", &bgrt_bytes),
+        ("TPM2", &tpm2_bytes),
+        ("DSDT", &dsdt_bytes),
+    ] {
+        offsets.push((name.to_string(), tables.len()));
+        tables.extend_from_slice(bytes);
+    }
 
     // Build RSDP pointing to XSDT
     let xsdt_gpa = base + xsdt_offset as u64;
@@ -238,7 +249,10 @@ mod tests {
         assert_eq!(table_set.rsdp.len(), 36);
 
         // Tables should contain all expected tables
-        assert!(table_set.tables.len() > 276, "Tables must be larger than just FADT");
+        assert!(
+            table_set.tables.len() > 276,
+            "Tables must be larger than just FADT"
+        );
 
         // Should have 12 table entries (XSDT + FADT + MADT + MCFG + HPET + SSDT + SRAT + SLIT + WAET + BGRT + TPM2 + DSDT)
         assert_eq!(table_set.table_offsets.len(), 12);
@@ -301,7 +315,10 @@ mod tests {
         let xsdt_len = u32::from_le_bytes(xsdt[4..8].try_into().unwrap()) as usize;
         // XSDT: 36-byte header + 8 bytes per entry
         let entry_count = (xsdt_len - 36) / 8;
-        assert_eq!(entry_count, 10, "XSDT must point to 10 tables (FADT+MADT+MCFG+HPET+SSDT+SRAT+SLIT+WAET+BGRT+TPM2)");
+        assert_eq!(
+            entry_count, 10,
+            "XSDT must point to 10 tables (FADT+MADT+MCFG+HPET+SSDT+SRAT+SLIT+WAET+BGRT+TPM2)"
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@
 //! forwarding table, then uses the destination MAC to decide where to
 //! send the frame.
 
+use crate::truncate::u32_of;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -93,8 +94,7 @@ impl VirtualSwitch {
 
     /// Register a new port on the switch. Returns the port ID.
     pub fn add_port(&mut self) -> PortId {
-        #[allow(clippy::cast_possible_truncation)]
-        let id = PortId(self.ports.len() as u32);
+        let id = PortId(u32_of(self.ports.len()));
         self.ports.push(id);
         self.port_queues.insert(id, VecDeque::new());
         id
@@ -140,12 +140,8 @@ impl VirtualSwitch {
 
         self.stats.received += 1;
 
-        let dst_mac = MacAddress([
-            frame[0], frame[1], frame[2], frame[3], frame[4], frame[5],
-        ]);
-        let src_mac = MacAddress([
-            frame[6], frame[7], frame[8], frame[9], frame[10], frame[11],
-        ]);
+        let dst_mac = MacAddress([frame[0], frame[1], frame[2], frame[3], frame[4], frame[5]]);
+        let src_mac = MacAddress([frame[6], frame[7], frame[8], frame[9], frame[10], frame[11]]);
 
         // Learn the source MAC.
         self.learn(src_mac, src_port);
@@ -184,9 +180,7 @@ impl VirtualSwitch {
     /// Check if a port has pending frames.
     #[must_use]
     pub fn has_pending(&self, port: PortId) -> bool {
-        self.port_queues
-            .get(&port)
-            .is_some_and(|q| !q.is_empty())
+        self.port_queues.get(&port).is_some_and(|q| !q.is_empty())
     }
 
     /// Number of pending frames for a port.

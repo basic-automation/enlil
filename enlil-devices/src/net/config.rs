@@ -135,11 +135,7 @@ mod tests {
 
     #[test]
     fn test_config_bridge() {
-        let config = NetDeviceConfig::bridge(
-            "vnet0",
-            MacAddress([0x02, 0, 0, 0, 0, 1]),
-            "br0",
-        );
+        let config = NetDeviceConfig::bridge("vnet0", MacAddress([0x02, 0, 0, 0, 0, 1]), "br0");
         assert_eq!(config.bridge.as_deref(), Some("br0"));
     }
 }

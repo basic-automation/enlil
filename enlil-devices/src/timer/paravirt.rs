@@ -3,6 +3,7 @@
 //! Provides KVM clock (for Linux guests) and Hyper-V reference TSC (for Windows guests).
 //! These allow guests to read time without VM exits.
 
+use crate::truncate::{Widen, u32_of};
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
 // ---------------------------------------------------------------------------
@@ -77,11 +78,9 @@ impl KvmClock {
         // We want: mul / 2^shift = 10^9 / tsc_freq
         // Choose shift = 32 for good precision
         let shift: i8 = 32;
-        let mul = ((1_000_000_000u128) << u32::from(shift.unsigned_abs())) / u128::from(self.tsc_freq_hz);
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            (mul as u32, shift)
-        }
+        let mul =
+            ((1_000_000_000u128) << u32::from(shift.unsigned_abs())) / u128::from(self.tsc_freq_hz);
+        (u32_of(mul), shift)
     }
 
     /// Update the clock page data. Call this on each VM entry or periodically.
@@ -109,7 +108,6 @@ impl KvmClock {
         // tsc_to_system_mul (offset 24, 4 bytes)
         page[24..28].copy_from_slice(&mul.to_le_bytes());
         // tsc_shift (offset 28, 1 byte)
-        #[allow(clippy::cast_possible_truncation)]
         {
             page[28] = shift.unsigned_abs();
         }
@@ -184,15 +182,11 @@ impl HyperVReferenceTsc {
     ///
     /// scale = (`ref_freq` * 2^64) / `tsc_freq`
     #[must_use]
-    #[allow(clippy::cast_lossless)]
-    pub const fn compute_scale(&self) -> u64 {
+    pub fn compute_scale(&self) -> u64 {
         if self.tsc_freq_hz == 0 {
             return 0;
         }
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            (((self.ref_freq_hz as u128) << 64) / (self.tsc_freq_hz as u128)) as u64
-        }
+        ((u128::from(self.ref_freq_hz) << 64) / u128::from(self.tsc_freq_hz)).to_u64()
     }
 
     /// Update the reference TSC page.
@@ -249,11 +243,10 @@ mod tests {
         assert_eq!(shift, 32);
 
         // Verify: 3 billion ticks * mul >> 32 should ≈ 1 second (10^9 ns)
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         {
-            let ns = ((3_000_000_000u128 * u128::from(mul)) >> 32) as u64;
+            let ns = ((3_000_000_000u128 * u128::from(mul)) >> 32).to_u64();
             // Allow 1% error
-            assert!((ns as i64 - 1_000_000_000i64).unsigned_abs() < 10_000_000);
+            assert!((ns.cast_signed() - 1_000_000_000i64).unsigned_abs() < 10_000_000);
         }
     }
 

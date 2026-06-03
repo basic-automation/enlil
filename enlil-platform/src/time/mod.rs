@@ -104,11 +104,18 @@ impl std::ops::Sub for Instant {
 impl PartialEq for Instant {
     fn eq(&self, other: &Self) -> bool {
         #[cfg(feature = "platform-linux")]
-        { self.inner == other.inner }
+        {
+            self.inner == other.inner
+        }
         #[cfg(feature = "platform-baremetal")]
-        { self.tsc_value == other.tsc_value }
+        {
+            self.tsc_value == other.tsc_value
+        }
         #[cfg(not(any(feature = "platform-linux", feature = "platform-baremetal")))]
-        { let _ = other; true }
+        {
+            let _ = other;
+            true
+        }
     }
 }
 
@@ -123,11 +130,18 @@ impl PartialOrd for Instant {
 impl Ord for Instant {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         #[cfg(feature = "platform-linux")]
-        { self.inner.cmp(&other.inner) }
+        {
+            self.inner.cmp(&other.inner)
+        }
         #[cfg(feature = "platform-baremetal")]
-        { self.tsc_value.cmp(&other.tsc_value) }
+        {
+            self.tsc_value.cmp(&other.tsc_value)
+        }
         #[cfg(not(any(feature = "platform-linux", feature = "platform-baremetal")))]
-        { let _ = other; std::cmp::Ordering::Equal }
+        {
+            let _ = other;
+            std::cmp::Ordering::Equal
+        }
     }
 }
 
@@ -173,16 +187,16 @@ pub fn calibrate_tsc_from_cpuid() -> Option<u64> {
     if max_leaf < 0x15 {
         return None;
     }
-    
+
     let cpuid = core::arch::x86_64::__cpuid(0x15);
     let denominator = u64::from(cpuid.eax);
     let numerator = u64::from(cpuid.ebx);
     let crystal_hz = u64::from(cpuid.ecx);
-    
+
     if denominator == 0 || numerator == 0 {
         return None;
     }
-    
+
     if crystal_hz != 0 {
         // Direct calculation
         Some(crystal_hz * numerator / denominator)
@@ -196,13 +210,15 @@ pub fn calibrate_tsc_from_cpuid() -> Option<u64> {
 
 /// Attempt to calibrate TSC and store the result.
 /// Tries CPUID 0x15 first, falls back to a default estimate.
-#[cfg(target_arch = "x86_64")]  
+#[cfg(target_arch = "x86_64")]
 pub fn calibrate_tsc() {
     if let Some(freq) = calibrate_tsc_from_cpuid() {
         set_tsc_frequency(freq);
         let ghz_int = freq / 1_000_000_000;
         let ghz_frac = (freq % 1_000_000_000) / 10_000_000;
-        log::info!("TSC frequency calibrated via CPUID 0x15: {freq} Hz ({ghz_int}.{ghz_frac:02} GHz)");
+        log::info!(
+            "TSC frequency calibrated via CPUID 0x15: {freq} Hz ({ghz_int}.{ghz_frac:02} GHz)"
+        );
     } else {
         log::warn!("CPUID 0x15 TSC calibration not available; TSC frequency must be set manually");
     }
@@ -216,7 +232,9 @@ fn read_tsc() -> u64 {
         core::arch::x86_64::_rdtsc()
     }
     #[cfg(not(target_arch = "x86_64"))]
-    { 0 }
+    {
+        0
+    }
 }
 
 /// Convert TSC ticks to Duration.
@@ -370,7 +388,10 @@ mod tests {
             assert!(freq > 0, "TSC frequency should be positive");
             // Sanity: should be between 100 MHz and 10 GHz
             assert!(freq > 100_000_000, "TSC frequency suspiciously low: {freq}");
-            assert!(freq < 10_000_000_000, "TSC frequency suspiciously high: {freq}");
+            assert!(
+                freq < 10_000_000_000,
+                "TSC frequency suspiciously high: {freq}"
+            );
         }
     }
 }

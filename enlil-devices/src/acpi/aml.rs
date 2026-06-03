@@ -56,12 +56,12 @@ impl AmlBuilder {
 
     /// Current length
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.data.len()
     }
 
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
 
@@ -71,55 +71,53 @@ impl AmlBuilder {
         self
     }
 
-    /// Encode a PkgLength field (ACPI spec §20.2.4)
-    #[allow(clippy::cast_possible_truncation)]
+    /// Encode a `PkgLength` field (ACPI spec §20.2.4)
     fn encode_pkg_length(length: usize) -> Vec<u8> {
         if length < 0x3F {
-            vec![length as u8]
+            vec![length.to_le_bytes()[0]]
         } else if length < 0xFFF {
             vec![
-                ((length & 0x0F) as u8) | (1 << 6),
-                ((length >> 4) & 0xFF) as u8,
+                (length.to_le_bytes()[0] & 0x0F) | (1 << 6),
+                (length >> 4).to_le_bytes()[0],
             ]
         } else if length < 0xF_FFFF {
             vec![
-                ((length & 0x0F) as u8) | (2 << 6),
-                ((length >> 4) & 0xFF) as u8,
-                ((length >> 12) & 0xFF) as u8,
+                (length.to_le_bytes()[0] & 0x0F) | (2 << 6),
+                (length >> 4).to_le_bytes()[0],
+                (length >> 12).to_le_bytes()[0],
             ]
         } else {
             vec![
-                ((length & 0x0F) as u8) | (3 << 6),
-                ((length >> 4) & 0xFF) as u8,
-                ((length >> 12) & 0xFF) as u8,
-                ((length >> 20) & 0xFF) as u8,
+                (length.to_le_bytes()[0] & 0x0F) | (3 << 6),
+                (length >> 4).to_le_bytes()[0],
+                (length >> 12).to_le_bytes()[0],
+                (length >> 20).to_le_bytes()[0],
             ]
         }
     }
 
     /// Encode a 4-character ACPI name
-    fn encode_name(name: &[u8; 4]) -> [u8; 4] {
-        *name
+    const fn encode_name(name: [u8; 4]) -> [u8; 4] {
+        name
     }
 
     /// Name(name, value) — defines a named integer
-    #[allow(clippy::cast_possible_truncation)]
     pub fn name_integer(&mut self, name: &[u8; 4], value: u64) -> &mut Self {
         self.data.push(opcode::NAME_OP);
-        self.data.extend_from_slice(&Self::encode_name(name));
+        self.data.extend_from_slice(&Self::encode_name(*name));
         if value == 0 {
             self.data.push(opcode::ZERO);
         } else if value == 1 {
             self.data.push(opcode::ONE);
         } else if value <= 0xFF {
             self.data.push(opcode::BYTE_PREFIX);
-            self.data.push(value as u8);
+            self.data.push(value.to_le_bytes()[0]);
         } else if value <= 0xFFFF {
             self.data.push(opcode::WORD_PREFIX);
-            self.data.extend_from_slice(&(value as u16).to_le_bytes());
+            self.data.extend_from_slice(&value.to_le_bytes()[..2]);
         } else if value <= 0xFFFF_FFFF {
             self.data.push(opcode::DWORD_PREFIX);
-            self.data.extend_from_slice(&(value as u32).to_le_bytes());
+            self.data.extend_from_slice(&value.to_le_bytes()[..4]);
         } else {
             self.data.push(opcode::QWORD_PREFIX);
             self.data.extend_from_slice(&value.to_le_bytes());
@@ -130,7 +128,7 @@ impl AmlBuilder {
     /// Name(name, "string")
     pub fn name_string(&mut self, name: &[u8; 4], value: &str) -> &mut Self {
         self.data.push(opcode::NAME_OP);
-        self.data.extend_from_slice(&Self::encode_name(name));
+        self.data.extend_from_slice(&Self::encode_name(*name));
         self.data.push(opcode::STRING_PREFIX);
         self.data.extend_from_slice(value.as_bytes());
         self.data.push(0); // null terminator
@@ -143,16 +141,15 @@ impl AmlBuilder {
         let length_pos = self.data.len();
         // Reserve 4 bytes for PkgLength (worst case)
         self.data.extend_from_slice(&[0, 0, 0, 0]);
-        self.data.extend_from_slice(&Self::encode_name(name));
+        self.data.extend_from_slice(&Self::encode_name(*name));
         ScopeHandle {
-            opcode_pos: length_pos - 1,
             length_pos,
             content_start: self.data.len(),
         }
     }
 
-    /// Close a Scope block, patches the PkgLength
-    pub fn scope_end(&mut self, handle: ScopeHandle) {
+    /// Close a Scope block, patches the `PkgLength`
+    pub fn scope_end(&mut self, handle: &ScopeHandle) {
         self.patch_pkg_length(handle.length_pos, handle.content_start);
     }
 
@@ -162,16 +159,15 @@ impl AmlBuilder {
         self.data.push(opcode::DEVICE_OP);
         let length_pos = self.data.len();
         self.data.extend_from_slice(&[0, 0, 0, 0]);
-        self.data.extend_from_slice(&Self::encode_name(name));
+        self.data.extend_from_slice(&Self::encode_name(*name));
         ScopeHandle {
-            opcode_pos: length_pos - 2,
             length_pos,
             content_start: self.data.len(),
         }
     }
 
     /// Close a Device block
-    pub fn device_end(&mut self, handle: ScopeHandle) {
+    pub fn device_end(&mut self, handle: &ScopeHandle) {
         self.patch_pkg_length(handle.length_pos, handle.content_start);
     }
 
@@ -180,22 +176,20 @@ impl AmlBuilder {
         self.data.push(opcode::METHOD_OP);
         let length_pos = self.data.len();
         self.data.extend_from_slice(&[0, 0, 0, 0]);
-        self.data.extend_from_slice(&Self::encode_name(name));
+        self.data.extend_from_slice(&Self::encode_name(*name));
         let flags = argc | (u8::from(serialized) << 3);
         self.data.push(flags);
         ScopeHandle {
-            opcode_pos: length_pos - 1,
             length_pos,
             content_start: self.data.len(),
         }
     }
 
-    pub fn method_end(&mut self, handle: ScopeHandle) {
+    pub fn method_end(&mut self, handle: &ScopeHandle) {
         self.patch_pkg_length(handle.length_pos, handle.content_start);
     }
 
     /// Return(integer)
-    #[allow(clippy::cast_possible_truncation)]
     pub fn return_integer(&mut self, value: u64) -> &mut Self {
         self.data.push(opcode::RETURN_OP);
         if value == 0 {
@@ -204,20 +198,19 @@ impl AmlBuilder {
             self.data.push(opcode::ONE);
         } else if value <= 0xFF {
             self.data.push(opcode::BYTE_PREFIX);
-            self.data.push(value as u8);
+            self.data.push(value.to_le_bytes()[0]);
         } else if value <= 0xFFFF {
             self.data.push(opcode::WORD_PREFIX);
-            self.data.extend_from_slice(&(value as u16).to_le_bytes());
+            self.data.extend_from_slice(&value.to_le_bytes()[..2]);
         } else {
             self.data.push(opcode::DWORD_PREFIX);
-            self.data.extend_from_slice(&(value as u32).to_le_bytes());
+            self.data.extend_from_slice(&value.to_le_bytes()[..4]);
         }
         self
     }
 
-    /// Patch a PkgLength at the given position
-    #[allow(clippy::cast_possible_truncation)]
-    fn patch_pkg_length(&mut self, length_pos: usize, content_start: usize) {
+    /// Patch a `PkgLength` at the given position
+    fn patch_pkg_length(&mut self, length_pos: usize, _content_start: usize) {
         let total_len = self.data.len() - length_pos;
         let encoded = Self::encode_pkg_length(total_len);
 
@@ -234,7 +227,8 @@ impl AmlBuilder {
             if shift > 0 {
                 let src_start = length_pos + reserved;
                 let remaining = self.data.len() - src_start;
-                self.data.copy_within(src_start..src_start + remaining, length_pos + actual);
+                self.data
+                    .copy_within(src_start..src_start + remaining, length_pos + actual);
                 self.data.truncate(self.data.len() - shift);
             }
         }
@@ -249,10 +243,7 @@ impl Default for AmlBuilder {
 
 /// Handle for patching scope/device/method lengths
 pub struct ScopeHandle {
-    #[allow(dead_code)]
-    opcode_pos: usize,
     length_pos: usize,
-    #[allow(dead_code)]
     content_start: usize,
 }
 
@@ -296,7 +287,7 @@ mod tests {
         let mut aml = AmlBuilder::new();
         let scope = aml.scope_start(b"_SB_");
         aml.name_integer(b"TEST", 1);
-        aml.scope_end(scope);
+        aml.scope_end(&scope);
         let bytes = aml.into_bytes();
         assert_eq!(bytes[0], opcode::SCOPE_OP);
         // Should have valid PkgLength
@@ -311,8 +302,8 @@ mod tests {
         aml.name_string(b"_HID", "PNP0A08"); // PCI Express root
         aml.name_string(b"_CID", "PNP0A03"); // PCI compatible
         aml.name_integer(b"_UID", 0);
-        aml.device_end(dev);
-        aml.scope_end(sb);
+        aml.device_end(&dev);
+        aml.scope_end(&sb);
         let bytes = aml.into_bytes();
         assert!(!bytes.is_empty());
     }
@@ -322,7 +313,7 @@ mod tests {
         let mut aml = AmlBuilder::new();
         let method = aml.method_start(b"_STA", 0, false);
         aml.return_integer(0x0F); // Present + Enabled + Functional
-        aml.method_end(method);
+        aml.method_end(&method);
         let bytes = aml.into_bytes();
         assert_eq!(bytes[0], opcode::METHOD_OP);
     }

@@ -180,3 +180,34 @@
 - Hypervisor 101 in Rust: https://github.com/tandasat/Hypervisor-101-in-Rust
 - SoftCompute (SPIR-V CPU JIT): https://github.com/lighttransport/softcompute
 - Mediated Passthrough Benchmarking (FGCS, Jun 2025): Future Generation Computer Systems
+
+---
+
+## 2026-06-02 — KVM Backend vCPU Run-Loop & Memory-Region API (Phase 0.2 / 5)
+
+Context: reconstructed `enlil-core::kvm_backend` (the prior commit's file had been
+clobbered with a tool placeholder and never contained real code). Researched the
+current rust-vmm patterns to make sure the run-loop/exit model matches the ecosystem.
+
+- **rust-vmm `vm-device` IoManager dispatch** —
+  https://github.com/rust-vmm/vm-device — the canonical interface splits guest
+  access handling into `pio_read/pio_write/mmio_read/mmio_write`. *How it changes
+  the build:* validates our new `VmExitHandler` trait (io_in/io_out/mmio_read/
+  mmio_write). When we wire `enlil-devices::bus::Bus` to the backend, implement
+  `VmExitHandler` for the bus and forward to the existing device dispatch rather
+  than inventing a parallel path — keep one bus, one address-decode.
+- **`kvm-ioctls` `VcpuExit` semantics** —
+  https://docs.rs/kvm-ioctls/latest/kvm_ioctls/enum.VcpuExit.html — for `IoIn`/
+  `MmioRead` the handler must fill the provided slice *before* the next `KVM_RUN`;
+  KVM returns those bytes to the guest. *Confirms* our dispatch fills the buffer
+  in place inside `run_vcpu` before returning the owned `GuestExit` summary.
+- **`KVM_SET_USER_MEMORY_REGION2` + `guest_memfd`** (QEMU/LKML 2025:
+  https://lwn.net/Articles/938597/ , https://lkml.org/lkml/2025/8/22/472) — the
+  newer memslot ioctl backs regions with private `guest_memfd` for confidential
+  VMs (TDX/SEV-SNP) and supports per-page shared/private attributes + dirty-ring.
+  *How it changes the build:* our `map_memory` deliberately uses the classic
+  `set_user_memory_region` (hva-backed) — correct for Phase 5 transparency where
+  the host must read/synthesise guest memory (ACPI/SMBIOS injection). Flag for
+  Phase 8/CVM work: a second `map_private_memory` path on
+  `set_user_memory_region2` will be needed if we ever target confidential guests,
+  and it is incompatible with host-side memory introspection.

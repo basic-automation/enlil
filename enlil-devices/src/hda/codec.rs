@@ -3,6 +3,7 @@
 //! Emulates a Realtek ALC892-compatible codec with output and input widgets.
 //! Windows loads the inbox HD Audio class driver for this.
 
+use crate::truncate::u32_of;
 /// Codec address on the HDA link
 pub const CODEC_ADDRESS: u8 = 0;
 
@@ -61,79 +62,74 @@ impl HdaCodec {
     /// Create a Realtek ALC892-like codec
     #[must_use]
     pub fn new_realtek() -> Self {
-        let mut widgets = Vec::new();
-
-        // NID 0x02: Audio Output (DAC)
-        widgets.push(HdaWidget {
-            nid: 0x02,
-            widget_type: WidgetType::AudioOutput,
-            capabilities: 0x0001_0041, // Stereo, Digital
-            pin_config: 0,
-            connections: Vec::new(),
-            amp_gain: 0x7F,
-            stream_channel: 0,
-            format: 0x0011, // 48kHz 16-bit stereo
-        });
-
-        // NID 0x03: Audio Output (DAC) - secondary
-        widgets.push(HdaWidget {
-            nid: 0x03,
-            widget_type: WidgetType::AudioOutput,
-            capabilities: 0x0001_0041,
-            pin_config: 0,
-            connections: Vec::new(),
-            amp_gain: 0x7F,
-            stream_channel: 0,
-            format: 0x0011,
-        });
-
-        // NID 0x08: Audio Input (ADC)
-        widgets.push(HdaWidget {
-            nid: 0x08,
-            widget_type: WidgetType::AudioInput,
-            capabilities: 0x0010_0341, // Stereo, In Amp
-            pin_config: 0,
-            connections: vec![0x18, 0x19],
-            amp_gain: 0x7F,
-            stream_channel: 0,
-            format: 0x0011,
-        });
-
-        // NID 0x14: Pin Complex (Line Out)
-        widgets.push(HdaWidget {
-            nid: 0x14,
-            widget_type: WidgetType::PinComplex,
-            capabilities: 0x0040_0000, // Output capable
-            pin_config: 0x0121_4010,   // Line out, front, jack
-            connections: vec![0x02],
-            amp_gain: 0,
-            stream_channel: 0,
-            format: 0,
-        });
-
-        // NID 0x18: Pin Complex (Mic In)
-        widgets.push(HdaWidget {
-            nid: 0x18,
-            widget_type: WidgetType::PinComplex,
-            capabilities: 0x0020_0000, // Input capable
-            pin_config: 0x01A1_9030,   // Mic in, front, jack
-            connections: Vec::new(),
-            amp_gain: 0,
-            stream_channel: 0,
-            format: 0,
-        });
-
-        // NID 0x19: Pin Complex (Front Mic)
-        widgets.push(HdaWidget {
-            nid: 0x19,
-            widget_type: WidgetType::PinComplex,
-            capabilities: 0x0020_0000,
-            pin_config: 0x02A1_9040, // Mic in, front, jack
-            connections: Vec::new(),
-            amp_gain: 0,
-            stream_channel: 0,
-            format: 0,
-        });
+        let widgets = vec![
+            // NID 0x02: Audio Output (DAC)
+            HdaWidget {
+                nid: 0x02,
+                widget_type: WidgetType::AudioOutput,
+                capabilities: 0x0001_0041, // Stereo, Digital
+                pin_config: 0,
+                connections: Vec::new(),
+                amp_gain: 0x7F,
+                stream_channel: 0,
+                format: 0x0011, // 48kHz 16-bit stereo
+            },
+            // NID 0x03: Audio Output (DAC) - secondary
+            HdaWidget {
+                nid: 0x03,
+                widget_type: WidgetType::AudioOutput,
+                capabilities: 0x0001_0041,
+                pin_config: 0,
+                connections: Vec::new(),
+                amp_gain: 0x7F,
+                stream_channel: 0,
+                format: 0x0011,
+            },
+            // NID 0x08: Audio Input (ADC)
+            HdaWidget {
+                nid: 0x08,
+                widget_type: WidgetType::AudioInput,
+                capabilities: 0x0010_0341, // Stereo, In Amp
+                pin_config: 0,
+                connections: vec![0x18, 0x19],
+                amp_gain: 0x7F,
+                stream_channel: 0,
+                format: 0x0011,
+            },
+            // NID 0x14: Pin Complex (Line Out)
+            HdaWidget {
+                nid: 0x14,
+                widget_type: WidgetType::PinComplex,
+                capabilities: 0x0040_0000, // Output capable
+                pin_config: 0x0121_4010,   // Line out, front, jack
+                connections: vec![0x02],
+                amp_gain: 0,
+                stream_channel: 0,
+                format: 0,
+            },
+            // NID 0x18: Pin Complex (Mic In)
+            HdaWidget {
+                nid: 0x18,
+                widget_type: WidgetType::PinComplex,
+                capabilities: 0x0020_0000, // Input capable
+                pin_config: 0x01A1_9030,   // Mic in, front, jack
+                connections: Vec::new(),
+                amp_gain: 0,
+                stream_channel: 0,
+                format: 0,
+            },
+            // NID 0x19: Pin Complex (Front Mic)
+            HdaWidget {
+                nid: 0x19,
+                widget_type: WidgetType::PinComplex,
+                capabilities: 0x0020_0000,
+                pin_config: 0x02A1_9040, // Mic in, front, jack
+                connections: Vec::new(),
+                amp_gain: 0,
+                stream_channel: 0,
+                format: 0,
+            },
+        ];
 
         Self {
             vendor_id: 0x10EC_0892, // Realtek ALC892
@@ -146,9 +142,8 @@ impl HdaCodec {
 
     /// Process a codec verb and return the response
     #[must_use]
-    #[allow(clippy::cast_lossless)]
     pub fn process_verb(&mut self, verb: u32) -> u32 {
-        let _codec_addr = (verb >> 28) & 0xF;
+        // bits 28-31 are the codec address (single codec here, so ignored)
         let nid = ((verb >> 20) & 0x7F) as u8;
         let payload = verb & 0xFFFFF;
 
@@ -156,7 +151,7 @@ impl HdaCodec {
         // - 12-bit verb [19:8] + 8-bit param [7:0] for get/set verbs (0x200-0xFFF)
         // - 4-bit verb [19:16] + 16-bit param [15:0] for set verbs (0x1-0x7)
         let verb_high = (payload >> 16) & 0xF;
-        let verb_id = if verb_high >= 1 && verb_high <= 7 {
+        let verb_id = if (1..=7).contains(&verb_high) {
             // 4-bit verb + 16-bit payload
             verb_high
         } else {
@@ -169,9 +164,9 @@ impl HdaCodec {
             (0x00, 0xF00) => {
                 let param = payload & 0xFF;
                 match param {
-                    0x00 => self.vendor_id,           // Vendor ID
-                    0x02 => self.revision_id,         // Revision ID
-                    0x04 => 0x0001_0001,              // Subordinate node count
+                    0x00 => self.vendor_id,   // Vendor ID
+                    0x02 => self.revision_id, // Revision ID
+                    0x04 => 0x0001_0001,      // Subordinate node count
                     _ => 0,
                 }
             }
@@ -181,12 +176,12 @@ impl HdaCodec {
                 match param {
                     0x04 => {
                         // Node count: start NID and count
-                        let count = self.widgets.len() as u32;
+                        let count = u32_of(self.widgets.len());
                         (0x02 << 16) | count
                     }
-                    0x05 => 0x01,   // Function Group Type: Audio
-                    0x08 => 0x0001, // Supported PCM sizes/rates
-                    0x09 => 0x0001, // Supported stream formats
+                    // Function group type (Audio), supported PCM sizes/rates, and
+                    // supported stream formats all report 1 here.
+                    0x05 | 0x08 | 0x09 => 0x01,
                     0x0A => 0x0001_0041, // Audio widget capabilities (for the group)
                     _ => 0,
                 }
@@ -194,40 +189,32 @@ impl HdaCodec {
             // Widget parameter query
             (nid, 0xF00) => {
                 let param = payload & 0xFF;
-                if let Some(w) = self.widgets.iter().find(|w| w.nid == nid) {
-                    match param {
-                        0x09 => w.capabilities,
-                        0x0C => w.pin_config,
-                        0x0E => {
-                            // Connection list length
-                            w.connections.len() as u32
-                        }
-                        _ => 0,
-                    }
-                } else {
-                    0
-                }
-            }
-            // Get connection list entry
-            (nid, 0xF02) => {
-                if let Some(w) = self.widgets.iter().find(|w| w.nid == nid) {
-                    let idx = (payload & 0xFF) as usize;
-                    if idx < w.connections.len() {
-                        w.connections[idx] as u32
-                    } else {
-                        0
-                    }
-                } else {
-                    0
-                }
-            }
-            // Get/Set converter stream/channel
-            (nid, 0xF06) => {
                 self.widgets
                     .iter()
                     .find(|w| w.nid == nid)
-                    .map_or(0, |w| w.stream_channel as u32)
+                    .map_or(0, |w| match param {
+                        0x09 => w.capabilities,
+                        0x0C => w.pin_config,
+                        // Connection list length
+                        0x0E => u32_of(w.connections.len()),
+                        _ => 0,
+                    })
             }
+            // Get connection list entry
+            (nid, 0xF02) => self.widgets.iter().find(|w| w.nid == nid).map_or(0, |w| {
+                let idx = (payload & 0xFF) as usize;
+                if idx < w.connections.len() {
+                    u32::from(w.connections[idx])
+                } else {
+                    0
+                }
+            }),
+            // Get/Set converter stream/channel
+            (nid, 0xF06) => self
+                .widgets
+                .iter()
+                .find(|w| w.nid == nid)
+                .map_or(0, |w| u32::from(w.stream_channel)),
             (nid, 0x706) => {
                 if let Some(w) = self.widgets.iter_mut().find(|w| w.nid == nid) {
                     w.stream_channel = (payload & 0xFF) as u8;
@@ -239,12 +226,11 @@ impl HdaCodec {
             // Get/Set amplifier gain/mute
             (_, 0xB | 0x3) => 0x7F, // Max gain, unmuted
             // Config default
-            (nid, 0xF1C) => {
-                self.widgets
-                    .iter()
-                    .find(|w| w.nid == nid)
-                    .map_or(0, |w| w.pin_config)
-            }
+            (nid, 0xF1C) => self
+                .widgets
+                .iter()
+                .find(|w| w.nid == nid)
+                .map_or(0, |w| w.pin_config),
             _ => 0,
         }
     }
@@ -280,7 +266,7 @@ mod tests {
     fn pin_config_query() {
         let mut codec = HdaCodec::new_realtek();
         // Query NID 0x14 pin config default
-        let verb = (0x14u32 << 20) | 0xF1C_00;
+        let verb = (0x14u32 << 20) | 0x000F_1C00;
         let response = codec.process_verb(verb);
         assert_ne!(response, 0, "Pin config should be non-zero for line out");
     }

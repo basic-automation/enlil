@@ -62,7 +62,6 @@ impl MsiMessage {
 }
 
 /// MSI capability structure for a PCI device.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct MsiCapability {
     /// Whether MSI is enabled.
@@ -81,7 +80,6 @@ pub struct MsiCapability {
     pub pending_bits: u32,
 }
 
-#[allow(dead_code)]
 impl MsiCapability {
     /// Create a new MSI capability with default values.
     ///
@@ -127,7 +125,6 @@ impl MsiCapability {
     ///
     /// * `vector_idx` - Vector index
     #[must_use]
-    #[allow(clippy::cast_lossless)]
     pub const fn message_for_vector(&self, vector_idx: u8) -> MsiMessage {
         let mut msg = self.message;
         msg.data = (msg.data & !0xFF) | ((msg.data & 0xFF).wrapping_add(vector_idx as u32) & 0xFF);
@@ -287,18 +284,18 @@ mod tests {
     #[test]
     fn test_msi_capability_vector_masking() {
         let mut cap = MsiCapability::new(false, true);
-        
+
         // With per_vector_masking enabled, check initial state
         assert!(!cap.is_vector_masked(0));
         assert!(!cap.is_vector_masked(3));
-        
+
         // Set mask for vectors 0, 2, 3
         cap.mask_bits = 0x0D; // bits 0, 2, 3
         assert!(cap.is_vector_masked(0));
         assert!(!cap.is_vector_masked(1));
         assert!(cap.is_vector_masked(2));
         assert!(cap.is_vector_masked(3));
-        
+
         // With per_vector_masking disabled, always returns false
         cap.per_vector_masking = false;
         assert!(!cap.is_vector_masked(0));
@@ -308,20 +305,20 @@ mod tests {
     #[test]
     fn test_msi_capability_message_for_vector() {
         let cap = MsiCapability::new(true, true);
-        
+
         let base_vector = cap.message.vector();
-        
+
         // Test getting messages for different vectors
         for i in 0..8 {
             let msg = cap.message_for_vector(i);
             assert_eq!(msg.vector(), base_vector.wrapping_add(i));
             assert_eq!(msg.address, cap.message.address);
         }
-        
+
         // Test vector wrapping (8-bit)
         let msg = cap.message_for_vector(255);
         assert_eq!(msg.vector(), 255);
-        
+
         // Vector 0 is a valid edge case.
         let msg = cap.message_for_vector(0);
         assert_eq!(msg.vector(), base_vector.wrapping_add(0));
@@ -360,10 +357,10 @@ mod tests {
     fn test_msix_table_entry_vector_control() {
         let mut entry = MsixTableEntry::default();
         assert_eq!(entry.vector_control(), 1); // masked by default
-        
+
         entry.masked = false;
         assert_eq!(entry.vector_control(), 0);
-        
+
         entry.set_vector_control(1);
         assert!(entry.masked);
     }

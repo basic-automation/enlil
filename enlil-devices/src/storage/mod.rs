@@ -4,6 +4,7 @@
 //! - `RawFileBackend` — raw disk image files
 //! - `QcowBackend` — qcow2 disk images (read-only)
 
+use crate::truncate::usize_of;
 pub mod qcow;
 pub mod raw;
 
@@ -98,10 +99,12 @@ impl MemoryBackend {
 }
 
 impl StorageBackend for MemoryBackend {
-    #[allow(clippy::cast_possible_truncation)]
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        let data = self.data.read().map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
-        let offset = offset as usize;
+        let data = self
+            .data
+            .read()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let offset = usize_of(offset);
         if offset >= data.len() {
             return Ok(0);
         }
@@ -112,13 +115,15 @@ impl StorageBackend for MemoryBackend {
         Ok(to_read)
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize> {
         if self.readonly {
             anyhow::bail!("backend is read-only");
         }
-        let mut data = self.data.write().map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
-        let offset = offset as usize;
+        let mut data = self
+            .data
+            .write()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let offset = usize_of(offset);
         if offset >= data.len() {
             return Ok(0);
         }
@@ -133,14 +138,16 @@ impl StorageBackend for MemoryBackend {
         Ok(())
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     fn trim(&self, offset: u64, len: u64) -> Result<()> {
         if self.readonly {
             anyhow::bail!("backend is read-only");
         }
-        let mut data = self.data.write().map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
-        let start = (offset as usize).min(data.len());
-        let end = ((offset + len) as usize).min(data.len());
+        let mut data = self
+            .data
+            .write()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let start = usize_of(offset).min(data.len());
+        let end = usize_of(offset + len).min(data.len());
         data[start..end].fill(0);
         drop(data);
         Ok(())

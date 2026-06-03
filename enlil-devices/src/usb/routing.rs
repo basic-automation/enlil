@@ -50,11 +50,13 @@ pub enum DeviceMatcher {
 
 impl DeviceMatcher {
     /// Test whether a device matches this criteria.
+    #[must_use]
     pub fn matches(&self, device: &UsbDeviceId) -> bool {
         match self {
-            Self::VidPid { vendor_id, product_id } => {
-                device.vendor_id == *vendor_id && device.product_id == *product_id
-            }
+            Self::VidPid {
+                vendor_id,
+                product_id,
+            } => device.vendor_id == *vendor_id && device.product_id == *product_id,
             Self::VendorOnly { vendor_id } => device.vendor_id == *vendor_id,
             Self::PortPath(path) => device.port_path.as_deref() == Some(path.as_str()),
             Self::Serial(serial) => device.serial.as_deref() == Some(serial.as_str()),
@@ -67,7 +69,10 @@ impl DeviceMatcher {
 impl fmt::Display for DeviceMatcher {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::VidPid { vendor_id, product_id } => {
+            Self::VidPid {
+                vendor_id,
+                product_id,
+            } => {
                 write!(f, "{vendor_id:04x}:{product_id:04x}")
             }
             Self::VendorOnly { vendor_id } => write!(f, "{vendor_id:04x}:*"),
@@ -111,7 +116,8 @@ pub struct RoutingTable {
 
 impl RoutingTable {
     /// Create a new empty routing table.
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             rules: Vec::new(),
             default_guest: None,
@@ -125,7 +131,8 @@ impl RoutingTable {
     }
 
     /// Get the current default guest.
-    pub fn default_guest(&self) -> Option<&GuestId> {
+    #[must_use]
+    pub const fn default_guest(&self) -> Option<&GuestId> {
         self.default_guest.as_ref()
     }
 
@@ -173,11 +180,13 @@ impl RoutingTable {
     }
 
     /// Get all rules (read-only).
+    #[must_use]
     pub fn rules(&self) -> &[RoutingRule] {
         &self.rules
     }
 
     /// Determine which guest a device should be routed to.
+    #[must_use]
     pub fn route(&self, device: &UsbDeviceId) -> RoutingDecision {
         for rule in &self.rules {
             if rule.enabled && rule.matcher.matches(device) {
@@ -185,19 +194,22 @@ impl RoutingTable {
             }
         }
 
-        match &self.default_guest {
-            Some(guest) => RoutingDecision::RouteToGuest(guest.clone()),
-            None => RoutingDecision::Unassigned,
-        }
+        self.default_guest
+            .as_ref()
+            .map_or(RoutingDecision::Unassigned, |guest| {
+                RoutingDecision::RouteToGuest(guest.clone())
+            })
     }
 
     /// Return the number of active (enabled) rules.
+    #[must_use]
     pub fn active_rule_count(&self) -> usize {
         self.rules.iter().filter(|r| r.enabled).count()
     }
 
     /// Return the total number of rules.
-    pub fn total_rule_count(&self) -> usize {
+    #[must_use]
+    pub const fn total_rule_count(&self) -> usize {
         self.rules.len()
     }
 }
@@ -227,6 +239,7 @@ struct RoutingStateInner {
 
 impl RoutingState {
     /// Create new routing state with the given table.
+    #[must_use]
     pub fn new(table: RoutingTable) -> Self {
         Self {
             inner: Arc::new(Mutex::new(RoutingStateInner {
@@ -237,6 +250,7 @@ impl RoutingState {
     }
 
     /// Get a clone handle for thread-safe sharing.
+    #[must_use]
     pub fn clone_handle(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -245,6 +259,10 @@ impl RoutingState {
 
     /// Assign a device to a guest based on current routing rules.
     /// Returns the routing decision.
+    /// # Panics
+    ///
+    /// Panics if the internal routing-state lock is poisoned.
+    #[must_use]
     pub fn assign_device(&self, bus_addr: u8, device: &UsbDeviceId) -> RoutingDecision {
         let mut inner = self.inner.lock().expect("routing state poisoned");
         let decision = inner.table.route(device);
@@ -259,38 +277,55 @@ impl RoutingState {
     /// # Errors
     ///
     /// Returns an error if the device is not currently assigned.
+    /// # Panics
+    ///
+    /// Panics if the internal routing-state lock is poisoned.
     pub fn reassign_device(
         &self,
         bus_addr: u8,
         new_guest: GuestId,
     ) -> Result<GuestId, RoutingError> {
-        let mut inner = self.inner.lock().expect("routing state poisoned");
-        let old = inner
-            .assignments
-            .insert(bus_addr, new_guest)
-            .ok_or(RoutingError::DeviceNotAssigned(bus_addr))?;
-        Ok(old)
+        let old = {
+            let mut inner = self.inner.lock().expect("routing state poisoned");
+            inner.assignments.insert(bus_addr, new_guest)
+        };
+        old.ok_or(RoutingError::DeviceNotAssigned(bus_addr))
     }
 
     /// Remove a device assignment (e.g., on disconnect).
+    /// # Panics
+    ///
+    /// Panics if the internal routing-state lock is poisoned.
+    #[must_use]
     pub fn unassign_device(&self, bus_addr: u8) -> Option<GuestId> {
         let mut inner = self.inner.lock().expect("routing state poisoned");
         inner.assignments.remove(&bus_addr)
     }
 
     /// Get the current guest assignment for a device.
+    /// # Panics
+    ///
+    /// Panics if the internal routing-state lock is poisoned.
+    #[must_use]
     pub fn get_assignment(&self, bus_addr: u8) -> Option<GuestId> {
         let inner = self.inner.lock().expect("routing state poisoned");
         inner.assignments.get(&bus_addr).cloned()
     }
 
     /// Get all current assignments.
+    /// # Panics
+    ///
+    /// Panics if the internal routing-state lock is poisoned.
+    #[must_use]
     pub fn all_assignments(&self) -> HashMap<u8, GuestId> {
         let inner = self.inner.lock().expect("routing state poisoned");
         inner.assignments.clone()
     }
 
     /// Access the routing table for rule management.
+    /// # Panics
+    ///
+    /// Panics if the internal routing-state lock is poisoned.
     pub fn with_table<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut RoutingTable) -> R,
@@ -325,6 +360,7 @@ pub enum RoutingError {
 /// # Errors
 ///
 /// Returns `None` if the string is not a valid VID:PID pair.
+#[must_use]
 pub fn parse_vid_pid(s: &str) -> Option<(u16, u16)> {
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() != 2 {
@@ -439,15 +475,28 @@ mod tests {
     fn routing_table_priority_ordering() {
         let mut table = RoutingTable::new();
         table.add_rule(10, DeviceMatcher::Any, "linux2".into());
-        table.add_rule(1, DeviceMatcher::VidPid { vendor_id: 0x046d, product_id: 0xc077 }, "linux1".into());
+        table.add_rule(
+            1,
+            DeviceMatcher::VidPid {
+                vendor_id: 0x046d,
+                product_id: 0xc077,
+            },
+            "linux1".into(),
+        );
 
         // The VID:PID rule has higher priority (lower number).
         let mouse = make_device(0x046d, 0xc077);
-        assert_eq!(table.route(&mouse), RoutingDecision::RouteToGuest("linux1".into()));
+        assert_eq!(
+            table.route(&mouse),
+            RoutingDecision::RouteToGuest("linux1".into())
+        );
 
         // Other devices fall through to the Any rule.
         let other = make_device(0x1234, 0x5678);
-        assert_eq!(table.route(&other), RoutingDecision::RouteToGuest("linux2".into()));
+        assert_eq!(
+            table.route(&other),
+            RoutingDecision::RouteToGuest("linux2".into())
+        );
     }
 
     #[test]
@@ -456,7 +505,10 @@ mod tests {
         table.set_default_guest(Some("linux1".into()));
 
         let dev = make_device(0x1234, 0x5678);
-        assert_eq!(table.route(&dev), RoutingDecision::RouteToGuest("linux1".into()));
+        assert_eq!(
+            table.route(&dev),
+            RoutingDecision::RouteToGuest("linux1".into())
+        );
     }
 
     #[test]
@@ -511,7 +563,7 @@ mod tests {
         let state = RoutingState::new(table);
 
         let dev = make_device(0x046d, 0xc077);
-        state.assign_device(1, &dev);
+        let _ = state.assign_device(1, &dev);
         let removed = state.unassign_device(1);
         assert_eq!(removed, Some("linux1".into()));
         assert_eq!(state.get_assignment(1), None);
@@ -532,7 +584,7 @@ mod tests {
         let handle = state.clone_handle();
 
         let dev = make_device(0x046d, 0xc077);
-        state.assign_device(1, &dev);
+        let _ = state.assign_device(1, &dev);
         assert_eq!(handle.get_assignment(1), Some("linux1".into()));
     }
 
@@ -554,11 +606,21 @@ mod tests {
     #[test]
     fn matcher_display() {
         assert_eq!(
-            DeviceMatcher::VidPid { vendor_id: 0x046d, product_id: 0xc077 }.to_string(),
+            DeviceMatcher::VidPid {
+                vendor_id: 0x046d,
+                product_id: 0xc077
+            }
+            .to_string(),
             "046d:c077"
         );
-        assert_eq!(DeviceMatcher::VendorOnly { vendor_id: 0x046d }.to_string(), "046d:*");
-        assert_eq!(DeviceMatcher::PortPath("1-1".into()).to_string(), "port:1-1");
+        assert_eq!(
+            DeviceMatcher::VendorOnly { vendor_id: 0x046d }.to_string(),
+            "046d:*"
+        );
+        assert_eq!(
+            DeviceMatcher::PortPath("1-1".into()).to_string(),
+            "port:1-1"
+        );
         assert_eq!(DeviceMatcher::Any.to_string(), "*");
     }
 

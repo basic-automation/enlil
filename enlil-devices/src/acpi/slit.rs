@@ -5,13 +5,14 @@
 //! distance (self-to-self) is always 10 per the ACPI spec.
 
 use super::tables::{AcpiSdtHeader, OemInfo};
+use crate::truncate::{u32_of, usize_of};
 
 /// SLIT table builder
 pub struct SlitBuilder {
     oem: OemInfo,
     /// Number of NUMA proximity domains
     locality_count: u64,
-    /// Distance matrix (row-major, locality_count × locality_count)
+    /// Distance matrix (row-major, `locality_count` × `locality_count`)
     distances: Vec<u8>,
 }
 
@@ -30,11 +31,14 @@ impl SlitBuilder {
     ///
     /// `distances` must be `count * count` entries, row-major order.
     /// Diagonal entries should be 10 (self-distance).
+    /// # Panics
+    ///
+    /// Panics if `distances.len()` is not `count * count`.
     #[must_use]
     pub fn multi_node(count: u64, distances: Vec<u8>) -> Self {
         assert_eq!(
             distances.len(),
-            (count * count) as usize,
+            usize_of(count * count),
             "distance matrix must be count×count"
         );
         Self {
@@ -45,20 +49,19 @@ impl SlitBuilder {
     }
 
     #[must_use]
-    pub fn oem_info(mut self, oem: OemInfo) -> Self {
+    pub const fn oem_info(mut self, oem: OemInfo) -> Self {
         self.oem = oem;
         self
     }
 
     /// Build the SLIT table as bytes
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn build(&self) -> Vec<u8> {
         // Header (36) + locality count (8) + distance matrix
         let total_length = 36 + 8 + self.distances.len();
         let mut buf = Vec::with_capacity(total_length);
 
-        let header = AcpiSdtHeader::new(*b"SLIT", total_length as u32, 1, &self.oem);
+        let header = AcpiSdtHeader::new(*b"SLIT", u32_of(total_length), 1, &self.oem);
         buf.extend_from_slice(&header.to_bytes());
 
         // Number of System Localities (8 bytes, u64 LE)

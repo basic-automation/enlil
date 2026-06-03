@@ -12,7 +12,6 @@ use super::virtqueue::Virtqueue;
 use std::collections::VecDeque;
 
 /// Device status bits (`VirtIO` 1.2, Section 2.1).
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceStatus {
     Reset = 0,
@@ -54,7 +53,6 @@ pub struct VirtioNetDevice {
     /// RX virtqueue (host → guest).
     rx_queue: Virtqueue,
     /// Queue size.
-    #[allow(dead_code)]
     queue_size: u16,
     /// Network backend.
     backend: Box<dyn NetBackend>,
@@ -65,6 +63,12 @@ pub struct VirtioNetDevice {
 }
 
 impl VirtioNetDevice {
+    /// Configured virtqueue size.
+    #[must_use]
+    pub const fn queue_size(&self) -> u16 {
+        self.queue_size
+    }
+
     /// Create a new `VirtIO` network device.
     #[must_use]
     pub fn new(config: &NetDeviceConfig, backend: Box<dyn NetBackend>) -> Self {
@@ -143,7 +147,9 @@ impl VirtioNetDevice {
         }
 
         while self.tx_queue.has_available() {
-            let Ok(desc) = self.tx_queue.pop_available() else { break };
+            let Ok(desc) = self.tx_queue.pop_available() else {
+                break;
+            };
 
             // The descriptor data contains: [VirtioNetHeader][Ethernet frame]
             let hdr_size = VirtioNetHeader::wire_size(self.merge_rxbuf);
@@ -201,7 +207,9 @@ impl VirtioNetDevice {
             if !self.rx_queue.has_available() {
                 break;
             }
-            let Ok(mut desc) = self.rx_queue.pop_available() else { break };
+            let Ok(mut desc) = self.rx_queue.pop_available() else {
+                break;
+            };
 
             if desc.data.len() < frame.len() {
                 self.stats.rx_drops += 1;
@@ -256,11 +264,12 @@ impl VirtioNetDevice {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::backend::NullBackend;
+    use super::*;
 
     fn make_device() -> VirtioNetDevice {
-        let config = NetDeviceConfig::new("test0", MacAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]));
+        let config =
+            NetDeviceConfig::new("test0", MacAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]));
         let backend = Box::new(NullBackend::new());
         VirtioNetDevice::new(&config, backend)
     }
@@ -275,7 +284,9 @@ mod tests {
     #[test]
     fn test_activate_and_reset() {
         let mut dev = make_device();
-        dev.activate(NetFeatures::from_bits(NetFeatures::MAC | NetFeatures::STATUS));
+        dev.activate(NetFeatures::from_bits(
+            NetFeatures::MAC | NetFeatures::STATUS,
+        ));
         assert_eq!(dev.status(), DeviceStatus::DriverOk as u8);
 
         dev.reset();
@@ -285,7 +296,9 @@ mod tests {
     #[test]
     fn test_tx_processing() {
         let mut dev = make_device();
-        dev.activate(NetFeatures::from_bits(NetFeatures::MAC | NetFeatures::STATUS));
+        dev.activate(NetFeatures::from_bits(
+            NetFeatures::MAC | NetFeatures::STATUS,
+        ));
 
         // Build a TX descriptor: [header][frame]
         let hdr = VirtioNetHeader::EMPTY;
@@ -301,7 +314,9 @@ mod tests {
     #[test]
     fn test_inject_rx() {
         let mut dev = make_device();
-        dev.activate(NetFeatures::from_bits(NetFeatures::MAC | NetFeatures::STATUS));
+        dev.activate(NetFeatures::from_bits(
+            NetFeatures::MAC | NetFeatures::STATUS,
+        ));
 
         dev.inject_rx(&[0x01, 0x02, 0x03, 0x04]);
         assert_eq!(dev.pending_rx_count(), 1);
@@ -318,7 +333,9 @@ mod tests {
     #[test]
     fn test_tx_too_short() {
         let mut dev = make_device();
-        dev.activate(NetFeatures::from_bits(NetFeatures::MAC | NetFeatures::STATUS));
+        dev.activate(NetFeatures::from_bits(
+            NetFeatures::MAC | NetFeatures::STATUS,
+        ));
 
         // Push a descriptor that's too short (no header)
         dev.tx_queue.push_available(vec![0x01], false).unwrap();

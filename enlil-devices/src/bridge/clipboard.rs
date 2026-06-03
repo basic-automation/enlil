@@ -67,28 +67,30 @@ impl ClipboardPolicy {
     #[must_use]
     pub fn allows(&self, content: &ClipboardContent) -> bool {
         content.size() <= self.max_size
-            && self.allowed_types.contains(&content.content_type().to_string())
+            && self
+                .allowed_types
+                .contains(&content.content_type().to_string())
     }
 }
 
 /// Clipboard entry with sequence number
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
-struct ClipboardEntry {
+pub struct ClipboardEntry {
     content: ClipboardContent,
     sequence: u64,
     source_guest: u32,
 }
 
-#[allow(dead_code)]
 impl ClipboardEntry {
     /// Returns the sequence number of this entry.
-    const fn sequence(&self) -> u64 {
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
         self.sequence
     }
 
     /// Returns the source guest ID that created this entry.
-    const fn source_guest(&self) -> u32 {
+    #[must_use]
+    pub const fn source_guest(&self) -> u32 {
         self.source_guest
     }
 }
@@ -183,7 +185,10 @@ impl ClipboardHub {
     ///
     /// Returns an error if the lock is poisoned.
     pub fn history_len(&self) -> Result<usize, &'static str> {
-        self.history.lock().map(|h| h.len()).map_err(|_| "Lock poisoned")
+        self.history
+            .lock()
+            .map(|h| h.len())
+            .map_err(|_| "Lock poisoned")
     }
 
     /// Returns the current clipboard sequence number.
@@ -192,7 +197,10 @@ impl ClipboardHub {
     ///
     /// Returns an error if the lock is poisoned.
     pub fn get_sequence(&self) -> Result<u64, &'static str> {
-        self.sequence.lock().map(|s| *s).map_err(|_| "Lock poisoned")
+        self.sequence
+            .lock()
+            .map(|s| *s)
+            .map_err(|_| "Lock poisoned")
     }
 }
 

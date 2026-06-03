@@ -8,24 +8,24 @@ use std::collections::HashMap;
 /// TPM 2.0 Command/Response protocol
 #[repr(C, packed)]
 pub struct TpmCommandHeader {
-    pub tag: u16,                  // 0x8001 = TPM2_ST_NO_SESSIONS
-    pub size: u32,                 // Total command size
-    pub code: u32,                 // TPM2_CC_* command code
+    pub tag: u16,  // 0x8001 = TPM2_ST_NO_SESSIONS
+    pub size: u32, // Total command size
+    pub code: u32, // TPM2_CC_* command code
 }
 
 #[repr(C, packed)]
 pub struct TpmResponseHeader {
     pub tag: u16,
     pub size: u32,
-    pub code: u32,                 // 0 = success, non-zero = error
+    pub code: u32, // 0 = success, non-zero = error
 }
 
 /// TPM 2.0 PCR (Platform Configuration Register)
 /// Stores measurements of firmware, bootloader, kernel, etc.
 #[derive(Clone)]
 pub struct TpmPcr {
-    pub value: Vec<u8>,            // SHA-256 hash (32 bytes)
-    pub alg: u16,                  // TPM_ALG_SHA256 = 0x000B
+    pub value: Vec<u8>, // SHA-256 hash (32 bytes)
+    pub alg: u16,       // TPM_ALG_SHA256 = 0x000B
 }
 
 impl TpmPcr {
@@ -51,6 +51,8 @@ impl TpmPcr {
 }
 
 /// Virtual TPM 2.0 Emulation
+// EK/AIK/SRK key material is generated and stored now; the attestation/quote
+// paths that consume it land later in Phase 5 (vTPM 2.0).
 pub struct VirtualTpm {
     /// PCRs 0-23 (24 total)
     pcrs: Vec<TpmPcr>,
@@ -64,6 +66,12 @@ pub struct VirtualTpm {
     nv_storage: HashMap<u32, Vec<u8>>,
     /// TPM is initialized
     initialized: bool,
+}
+
+impl Default for VirtualTpm {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl VirtualTpm {
@@ -81,6 +89,24 @@ impl VirtualTpm {
             nv_storage: HashMap::new(),
             initialized: false,
         }
+    }
+
+    /// Endorsement Key (EK) bytes — long-term TPM identity key.
+    #[must_use]
+    pub fn endorsement_key(&self) -> &[u8] {
+        &self.endorsement_key
+    }
+
+    /// Attestation Identity Key (AIK) bytes — used for remote attestation.
+    #[must_use]
+    pub fn attestation_key(&self) -> &[u8] {
+        &self.attestation_key
+    }
+
+    /// Storage Root Key (SRK) bytes — protects sealed objects.
+    #[must_use]
+    pub fn storage_root_key(&self) -> &[u8] {
+        &self.storage_root_key
     }
 
     /// TPM2_Startup — initialize TPM
@@ -152,6 +178,12 @@ pub struct TpmDispatcher {
     tpm: VirtualTpm,
 }
 
+impl Default for TpmDispatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TpmDispatcher {
     pub fn new() -> Self {
         Self {
@@ -171,7 +203,7 @@ impl TpmDispatcher {
         let cc = u32::from_be_bytes([command[6], command[7], command[8], command[9]]);
 
         let response_code = match cc {
-            0x00000144 => self.tpm.startup(0), // TPM2_CC_Startup
+            0x00000144 => self.tpm.startup(0),  // TPM2_CC_Startup
             0x00000145 => self.tpm.shutdown(0), // TPM2_CC_Shutdown
             0x0000017E => {
                 // TPM2_CC_PCR_Extend

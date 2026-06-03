@@ -7,6 +7,7 @@
 
 use super::aml::opcode;
 use super::tables::{AcpiSdtHeader, OemInfo};
+use crate::truncate::{u8_of, u16_of, u32_of};
 
 /// P-state definition (performance state)
 #[derive(Debug, Clone, Copy)]
@@ -36,7 +37,7 @@ pub struct CState {
     pub register_address: u64,
     /// Register bit width
     pub register_bit_width: u8,
-    /// Address space ID (0x7F = FFixedHW for Intel, 0x01 = IO)
+    /// Address space ID (0x7F = `FFixedHW` for Intel, 0x01 = IO)
     pub address_space: u8,
 }
 
@@ -49,6 +50,12 @@ pub struct SsdtBuilder {
 }
 
 impl SsdtBuilder {
+    /// Number of vCPUs this builder emits power-management objects for.
+    #[must_use]
+    pub const fn vcpu_count(&self) -> u8 {
+        self.vcpu_count
+    }
+
     #[must_use]
     pub fn new(vcpu_count: u8) -> Self {
         Self {
@@ -60,7 +67,7 @@ impl SsdtBuilder {
     }
 
     #[must_use]
-    pub fn oem_info(mut self, oem: OemInfo) -> Self {
+    pub const fn oem_info(mut self, oem: OemInfo) -> Self {
         self.oem = oem;
         self
     }
@@ -142,7 +149,6 @@ impl SsdtBuilder {
     }
 
     /// Encode an AML integer data object (without Name opcode)
-    #[allow(clippy::cast_possible_truncation)]
     fn encode_integer(value: u64) -> Vec<u8> {
         let mut buf = Vec::new();
         if value == 0 {
@@ -151,13 +157,13 @@ impl SsdtBuilder {
             buf.push(opcode::ONE);
         } else if value <= 0xFF {
             buf.push(opcode::BYTE_PREFIX);
-            buf.push(value as u8);
+            buf.push(u8_of(value));
         } else if value <= 0xFFFF {
             buf.push(opcode::WORD_PREFIX);
-            buf.extend_from_slice(&(value as u16).to_le_bytes());
+            buf.extend_from_slice(&(u16_of(value)).to_le_bytes());
         } else if value <= 0xFFFF_FFFF {
             buf.push(opcode::DWORD_PREFIX);
-            buf.extend_from_slice(&(value as u32).to_le_bytes());
+            buf.extend_from_slice(&(u32_of(value)).to_le_bytes());
         } else {
             buf.push(opcode::QWORD_PREFIX);
             buf.extend_from_slice(&value.to_le_bytes());
@@ -165,28 +171,27 @@ impl SsdtBuilder {
         buf
     }
 
-    /// Encode a PkgLength
-    #[allow(clippy::cast_possible_truncation)]
+    /// Encode a `PkgLength`
     fn encode_pkg_length(length: usize) -> Vec<u8> {
         if length < 0x3F {
-            vec![length as u8]
+            vec![u8_of(length)]
         } else if length < 0xFFF {
             vec![
-                ((length & 0x0F) as u8) | (1 << 6),
-                ((length >> 4) & 0xFF) as u8,
+                (u8_of(length & 0x0F)) | (1 << 6),
+                (length >> 4).to_le_bytes()[0],
             ]
         } else if length < 0xF_FFFF {
             vec![
-                ((length & 0x0F) as u8) | (2 << 6),
-                ((length >> 4) & 0xFF) as u8,
-                ((length >> 12) & 0xFF) as u8,
+                (u8_of(length & 0x0F)) | (2 << 6),
+                (length >> 4).to_le_bytes()[0],
+                (length >> 12).to_le_bytes()[0],
             ]
         } else {
             vec![
-                ((length & 0x0F) as u8) | (3 << 6),
-                ((length >> 4) & 0xFF) as u8,
-                ((length >> 12) & 0xFF) as u8,
-                ((length >> 20) & 0xFF) as u8,
+                (u8_of(length & 0x0F)) | (3 << 6),
+                (length >> 4).to_le_bytes()[0],
+                (length >> 12).to_le_bytes()[0],
+                (length >> 20).to_le_bytes()[0],
             ]
         }
     }
@@ -205,7 +210,8 @@ impl SsdtBuilder {
         pkg.push(opcode::PACKAGE_OP);
         // PkgLength covers: pkg_length_bytes + num_elements + inner
         let pkg_body_len = 1 + inner.len(); // 1 for NumElements
-        let pkg_len_bytes = Self::encode_pkg_length(pkg_body_len + Self::encode_pkg_length(pkg_body_len).len());
+        let pkg_len_bytes =
+            Self::encode_pkg_length(pkg_body_len + Self::encode_pkg_length(pkg_body_len).len());
         pkg.extend_from_slice(&pkg_len_bytes);
         pkg.push(6); // NumElements
         pkg.extend_from_slice(&inner);
@@ -222,10 +228,10 @@ impl SsdtBuilder {
         let mut pkg = Vec::new();
         pkg.push(opcode::PACKAGE_OP);
         let pkg_body_len = 1 + entries_bytes.len(); // 1 for NumElements
-        let pkg_len_bytes = Self::encode_pkg_length(pkg_body_len + Self::encode_pkg_length(pkg_body_len).len());
+        let pkg_len_bytes =
+            Self::encode_pkg_length(pkg_body_len + Self::encode_pkg_length(pkg_body_len).len());
         pkg.extend_from_slice(&pkg_len_bytes);
-        #[allow(clippy::cast_possible_truncation)]
-        pkg.push(self.pstates.len() as u8);
+        pkg.push(u8_of(self.pstates.len()));
         pkg.extend_from_slice(&entries_bytes);
 
         let mut buf = Vec::new();
@@ -241,12 +247,12 @@ impl SsdtBuilder {
         buf.push(cstate.address_space);
         buf.push(cstate.register_bit_width);
         buf.push(0); // bit offset
-        buf.push(if cstate.register_bit_width == 0 { 0 } else { 1 }); // access size: byte
+        buf.push(u8::from(cstate.register_bit_width != 0)); // access size: byte
         buf.extend_from_slice(&cstate.register_address.to_le_bytes());
         buf
     }
 
-    /// Build a _CST C-state sub-package: Package(4) { ResourceTemplate{Register(...)}, CType, Latency, Power }
+    /// Build a _CST C-state sub-package: Package(4) { ResourceTemplate{Register(...)}, `CType`, Latency, Power }
     fn build_cst_entry(cstate: &CState) -> Vec<u8> {
         // Build the ResourceTemplate buffer containing the GAS
         let gas_bytes = Self::build_gas(cstate);
@@ -261,7 +267,8 @@ impl SsdtBuilder {
         let mut pkg = Vec::new();
         pkg.push(opcode::PACKAGE_OP);
         let pkg_body_len = 1 + inner.len();
-        let pkg_len_bytes = Self::encode_pkg_length(pkg_body_len + Self::encode_pkg_length(pkg_body_len).len());
+        let pkg_len_bytes =
+            Self::encode_pkg_length(pkg_body_len + Self::encode_pkg_length(pkg_body_len).len());
         pkg.extend_from_slice(&pkg_len_bytes);
         pkg.push(4); // NumElements
         pkg.extend_from_slice(&inner);
@@ -283,7 +290,9 @@ impl SsdtBuilder {
         let mut buf = Vec::new();
         buf.push(opcode::BUFFER_OP);
         let buffer_inner_len = Self::encode_integer(resource.len() as u64).len() + resource.len();
-        let buf_len_bytes = Self::encode_pkg_length(buffer_inner_len + Self::encode_pkg_length(buffer_inner_len).len());
+        let buf_len_bytes = Self::encode_pkg_length(
+            buffer_inner_len + Self::encode_pkg_length(buffer_inner_len).len(),
+        );
         buf.extend_from_slice(&buf_len_bytes);
         buf.extend_from_slice(&Self::encode_integer(resource.len() as u64));
         buf.extend_from_slice(&resource);
@@ -301,10 +310,10 @@ impl SsdtBuilder {
 
         let mut pkg = Vec::new();
         pkg.push(opcode::PACKAGE_OP);
-        #[allow(clippy::cast_possible_truncation)]
-        let num_elements = (self.cstates.len() + 1) as u8; // count integer + entries
+        let num_elements = u8_of(self.cstates.len() + 1); // count integer + entries
         let pkg_body_len = 1 + entries_bytes.len(); // 1 for NumElements byte
-        let pkg_len_bytes = Self::encode_pkg_length(pkg_body_len + Self::encode_pkg_length(pkg_body_len).len());
+        let pkg_len_bytes =
+            Self::encode_pkg_length(pkg_body_len + Self::encode_pkg_length(pkg_body_len).len());
         pkg.extend_from_slice(&pkg_len_bytes);
         pkg.push(num_elements);
         pkg.extend_from_slice(&entries_bytes);
@@ -317,8 +326,7 @@ impl SsdtBuilder {
     }
 
     /// Generate processor name: C00_, C01_, ... C0F_, C10_, etc.
-    #[allow(clippy::cast_possible_truncation)]
-    fn processor_name(index: u8) -> [u8; 4] {
+    const fn processor_name(index: u8) -> [u8; 4] {
         let hex = b"0123456789ABCDEF";
         [
             b'C',
@@ -352,7 +360,9 @@ impl SsdtBuilder {
             let mut cpu0_scope = Vec::new();
             cpu0_scope.push(opcode::SCOPE_OP);
             let scope_inner_len = 4 + cpu0_body.len(); // 4 for name
-            let scope_pkg_len = Self::encode_pkg_length(scope_inner_len + Self::encode_pkg_length(scope_inner_len).len());
+            let scope_pkg_len = Self::encode_pkg_length(
+                scope_inner_len + Self::encode_pkg_length(scope_inner_len).len(),
+            );
             cpu0_scope.extend_from_slice(&scope_pkg_len);
             cpu0_scope.extend_from_slice(&cpu0_name);
             cpu0_scope.extend_from_slice(&cpu0_body);
@@ -366,7 +376,8 @@ impl SsdtBuilder {
         // Wrap in Scope(\_PR_)
         aml.push(opcode::SCOPE_OP);
         let pr_inner_len = 4 + pr_body.len(); // 4 for name "_PR_"
-        let pr_pkg_len = Self::encode_pkg_length(pr_inner_len + Self::encode_pkg_length(pr_inner_len).len());
+        let pr_pkg_len =
+            Self::encode_pkg_length(pr_inner_len + Self::encode_pkg_length(pr_inner_len).len());
         aml.extend_from_slice(&pr_pkg_len);
         aml.extend_from_slice(b"_PR_");
         aml.extend_from_slice(&pr_body);
@@ -376,10 +387,9 @@ impl SsdtBuilder {
 
     /// Build the complete SSDT table as a byte vector
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn build(&self) -> Vec<u8> {
         let aml_bytes = self.generate_aml();
-        let total_length = (AcpiSdtHeader::SIZE + aml_bytes.len()) as u32;
+        let total_length = u32_of(AcpiSdtHeader::SIZE + aml_bytes.len());
 
         let header = AcpiSdtHeader::new(*b"SSDT", total_length, 2, &self.oem);
         let mut buf = Vec::with_capacity(total_length as usize);
@@ -453,7 +463,7 @@ mod tests {
             .pstates(vec![
                 PState {
                     frequency_mhz: 4000,
-                    power_mw: 105000,
+                    power_mw: 105_000,
                     latency_us: 10,
                     control: 0x28,
                     status: 0x28,

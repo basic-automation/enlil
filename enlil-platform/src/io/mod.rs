@@ -266,7 +266,6 @@ impl FramebufferConsole {
     pub const fn dimensions(&self) -> (usize, usize) {
         (self.width, self.height)
     }
-
 }
 
 impl PlatformIo for FramebufferConsole {
@@ -516,10 +515,7 @@ mod tests {
         let mut buf = [0u8; 16];
         let result = fb.read(&mut buf);
         assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().kind(),
-            io::ErrorKind::Unsupported
-        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Unsupported);
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! and APIC ID assignment.
 
 use super::tables::{AcpiSdtHeader, OemInfo};
+use crate::truncate::u32_of;
 
 /// MADT entry types
 #[repr(u8)]
@@ -179,13 +180,13 @@ impl MadtBuilder {
     }
 
     #[must_use]
-    pub fn oem_info(mut self, oem: OemInfo) -> Self {
+    pub const fn oem_info(mut self, oem: OemInfo) -> Self {
         self.oem = oem;
         self
     }
 
     #[must_use]
-    pub fn local_apic_address(mut self, addr: u32) -> Self {
+    pub const fn local_apic_address(mut self, addr: u32) -> Self {
         self.local_apic_address = addr;
         self
     }
@@ -236,20 +237,35 @@ impl MadtBuilder {
 
     /// Build the MADT as a byte vector
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn build(&self) -> Vec<u8> {
         // Calculate total size
-        let entries_size: usize = self.local_apics.iter().map(|e| e.to_bytes().len()).sum::<usize>()
-            + self.io_apics.iter().map(|e| e.to_bytes().len()).sum::<usize>()
-            + self.overrides.iter().map(|e| e.to_bytes().len()).sum::<usize>()
-            + self.local_nmi.iter().map(|e| e.to_bytes().len()).sum::<usize>();
+        let entries_size: usize = self
+            .local_apics
+            .iter()
+            .map(|e| e.to_bytes().len())
+            .sum::<usize>()
+            + self
+                .io_apics
+                .iter()
+                .map(|e| e.to_bytes().len())
+                .sum::<usize>()
+            + self
+                .overrides
+                .iter()
+                .map(|e| e.to_bytes().len())
+                .sum::<usize>()
+            + self
+                .local_nmi
+                .iter()
+                .map(|e| e.to_bytes().len())
+                .sum::<usize>();
 
         let total_length = 36 + 8 + entries_size; // header + fixed fields + entries
 
         let mut buf = Vec::with_capacity(total_length);
 
         // SDT Header
-        let header = AcpiSdtHeader::new(*b"APIC", total_length as u32, 3, &self.oem);
+        let header = AcpiSdtHeader::new(*b"APIC", u32_of(total_length), 3, &self.oem);
         buf.extend_from_slice(&header.to_bytes());
 
         // Fixed fields

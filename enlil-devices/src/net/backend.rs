@@ -103,13 +103,12 @@ impl NetBackend for NullBackend {
 
 /// A loopback backend that echoes transmitted frames back as received frames.
 /// Useful for testing the full TX→RX path.
-#[allow(dead_code)]
 pub struct LoopbackBackend {
     queue: VecDeque<Vec<u8>>,
 }
 
-#[allow(dead_code)]
 impl LoopbackBackend {
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             queue: VecDeque::new(),
@@ -152,7 +151,6 @@ impl NetBackend for LoopbackBackend {
 
 /// One end of a shared-memory pipe for connecting two net devices in tests.
 /// Frames sent on one end appear as received on the other.
-#[allow(dead_code)]
 pub struct PipeBackend {
     /// Frames we send go into the peer's rx queue.
     peer_rx: Arc<Mutex<VecDeque<Vec<u8>>>>,
@@ -160,9 +158,9 @@ pub struct PipeBackend {
     our_rx: Arc<Mutex<VecDeque<Vec<u8>>>>,
 }
 
-#[allow(dead_code)]
 impl PipeBackend {
     /// Create a connected pair of pipe backends.
+    #[must_use]
     pub fn pair() -> (Self, Self) {
         let q1 = Arc::new(Mutex::new(VecDeque::new()));
         let q2 = Arc::new(Mutex::new(VecDeque::new()));
@@ -180,10 +178,7 @@ impl PipeBackend {
 
 impl NetBackend for PipeBackend {
     fn send(&mut self, frame: &[u8]) -> std::io::Result<usize> {
-        self.peer_rx
-            .lock()
-            .unwrap()
-            .push_back(frame.to_vec());
+        self.peer_rx.lock().unwrap().push_back(frame.to_vec());
         Ok(frame.len())
     }
 

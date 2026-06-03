@@ -1,10 +1,10 @@
 //! Integration tests for enlil-std — proves Phase 1.11 milestone.
 
-use enlil_std::thread;
-use enlil_std::sync::{Mutex, Arc, channel};
-use enlil_std::collections::{Vec, HashMap};
-use enlil_std::time::Instant;
+use enlil_std::collections::{HashMap, Vec};
 use enlil_std::future::block_on;
+use enlil_std::sync::{Arc, Mutex, channel};
+use enlil_std::thread;
+use enlil_std::time::Instant;
 
 #[test]
 fn thread_spawn_and_join() {

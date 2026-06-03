@@ -18,9 +18,9 @@ pub enum DeviceSpeed {
     Full,
     /// High speed (480 Mbps) — USB 2.0.
     High,
-    /// SuperSpeed (5 Gbps) — USB 3.0.
+    /// `SuperSpeed` (5 Gbps) — USB 3.0.
     Super,
-    /// SuperSpeed+ (10 Gbps) — USB 3.1 Gen 2.
+    /// `SuperSpeed`+ (10 Gbps) — USB 3.1 Gen 2.
     SuperPlus,
 }
 
@@ -73,7 +73,7 @@ pub enum UsbDeviceClass {
 impl UsbDeviceClass {
     /// Create from a USB class code byte.
     #[must_use]
-    pub fn from_code(code: u8) -> Self {
+    pub const fn from_code(code: u8) -> Self {
         match code {
             0x00 => Self::PerInterface,
             0x01 => Self::Audio,
@@ -91,7 +91,7 @@ impl UsbDeviceClass {
 
     /// Return the numeric USB class code.
     #[must_use]
-    pub fn code(&self) -> u8 {
+    pub const fn code(&self) -> u8 {
         match self {
             Self::PerInterface => 0x00,
             Self::Audio => 0x01,
@@ -229,7 +229,7 @@ pub struct UsbPortPath {
 impl UsbPortPath {
     /// Create a new port path.
     #[must_use]
-    pub fn new(bus: u8, ports: Vec<u8>) -> Self {
+    pub const fn new(bus: u8, ports: Vec<u8>) -> Self {
         Self { bus, ports }
     }
 }
@@ -259,13 +259,13 @@ pub struct UsbAddress(u8);
 impl UsbAddress {
     /// Create a new USB address.
     #[must_use]
-    pub fn new(addr: u8) -> Self {
+    pub const fn new(addr: u8) -> Self {
         Self(addr)
     }
 
     /// Get the raw address value.
     #[must_use]
-    pub fn value(self) -> u8 {
+    pub const fn value(self) -> u8 {
         self.0
     }
 }

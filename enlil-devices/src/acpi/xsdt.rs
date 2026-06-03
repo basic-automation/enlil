@@ -4,6 +4,7 @@
 //! RSDP → XSDT → [FADT, MADT, MCFG, HPET, ...]
 
 use super::tables::{AcpiSdtHeader, OemInfo};
+use crate::truncate::u32_of;
 
 /// XSDT builder — collects table addresses and generates the binary table
 pub struct XsdtBuilder {
@@ -21,7 +22,7 @@ impl XsdtBuilder {
     }
 
     #[must_use]
-    pub fn oem_info(mut self, oem: OemInfo) -> Self {
+    pub const fn oem_info(mut self, oem: OemInfo) -> Self {
         self.oem = oem;
         self
     }
@@ -40,12 +41,11 @@ impl XsdtBuilder {
 
     /// Build the XSDT as a byte vector
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn build(&self) -> Vec<u8> {
         let total_length = 36 + self.table_addresses.len() * 8;
         let mut buf = Vec::with_capacity(total_length);
 
-        let header = AcpiSdtHeader::new(*b"XSDT", total_length as u32, 1, &self.oem);
+        let header = AcpiSdtHeader::new(*b"XSDT", u32_of(total_length), 1, &self.oem);
         buf.extend_from_slice(&header.to_bytes());
 
         for &addr in &self.table_addresses {

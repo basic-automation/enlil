@@ -57,7 +57,6 @@ impl RawFileBackend {
 }
 
 impl StorageBackend for RawFileBackend {
-    #[allow(clippy::cast_possible_truncation)]
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
         let mut file = self.file.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         file.seek(SeekFrom::Start(offset))?;
@@ -66,7 +65,6 @@ impl StorageBackend for RawFileBackend {
         Ok(n)
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize> {
         if self.readonly {
             anyhow::bail!("backend is read-only");
@@ -78,7 +76,6 @@ impl StorageBackend for RawFileBackend {
         Ok(n)
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     fn flush(&self) -> Result<()> {
         let file = self.file.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         file.sync_all()?;

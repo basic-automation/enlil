@@ -7,10 +7,10 @@
 //!  MSI/MSI-X (addr+data) -------------+--> LAPIC 1 --> vCPU 1
 //! ```
 
-mod lapic;
-mod ioapic;
-mod msi;
 mod controller;
+mod ioapic;
+mod lapic;
+mod msi;
 
 /// Interrupt delivery mode (shared across LAPIC, IOAPIC, MSI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +56,8 @@ pub struct InterruptEntry {
     pub level: bool,
 }
 
-pub use lapic::LocalApic;
-pub use ioapic::{IoApic, RedirectionEntry};
-pub use msi::{MsiMessage, MsixCapability, MsixTableEntry};
 pub use controller::InterruptController;
+pub use ioapic::IOAPIC_BASE;
+pub use ioapic::{IoApic, RedirectionEntry};
+pub use lapic::LocalApic;
+pub use msi::{MsiCapability, MsiMessage, MsixCapability, MsixTableEntry};

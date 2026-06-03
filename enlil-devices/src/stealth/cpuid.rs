@@ -84,13 +84,12 @@ impl CpuVendor {
 }
 
 impl CpuidStealthTable {
-    /// Build the stealth CPUID table from physical CPU info
-    #[must_use]
-    pub fn build(config: &CpuidStealthConfig) -> Self {
-        let mut entries = Vec::with_capacity(128);
-        let max_standard_leaf = 0x16; // Processor Frequency
-        let max_extended_leaf = 0x8000_0008; // Virtual/Physical address sizes
-
+    /// Push the standard (0x0–0xD) CPUID leaves.
+    fn push_standard_leaves(
+        config: &CpuidStealthConfig,
+        max_standard_leaf: u32,
+        entries: &mut Vec<CpuidCacheEntry>,
+    ) {
         // Leaf 0x0: Vendor ID
         let (ebx, edx, ecx) = config.vendor.vendor_regs();
         entries.push(CpuidCacheEntry {
@@ -129,7 +128,7 @@ impl CpuidStealthTable {
         });
 
         // Leaf 0xB: Extended Topology
-        Self::build_topology_leaves(config, &mut entries);
+        Self::build_topology_leaves(config, entries);
 
         // Leaf 0xD: XSAVE features
         entries.push(CpuidCacheEntry {
@@ -153,7 +152,14 @@ impl CpuidStealthTable {
                 });
             }
         }
+    }
 
+    /// Push the extended (0x80000000+) CPUID leaves.
+    fn push_extended_leaves(
+        config: &CpuidStealthConfig,
+        max_extended_leaf: u32,
+        entries: &mut Vec<CpuidCacheEntry>,
+    ) {
         // Extended leaves
         // 0x80000000: Max extended leaf
         entries.push(CpuidCacheEntry {
@@ -184,10 +190,26 @@ impl CpuidStealthTable {
                 leaf: 0x8000_0002 + i,
                 subleaf: 0,
                 result: CpuidResult {
-                    eax: u32::from_le_bytes(config.brand_string[offset..offset + 4].try_into().unwrap_or([0; 4])),
-                    ebx: u32::from_le_bytes(config.brand_string[offset + 4..offset + 8].try_into().unwrap_or([0; 4])),
-                    ecx: u32::from_le_bytes(config.brand_string[offset + 8..offset + 12].try_into().unwrap_or([0; 4])),
-                    edx: u32::from_le_bytes(config.brand_string[offset + 12..offset + 16].try_into().unwrap_or([0; 4])),
+                    eax: u32::from_le_bytes(
+                        config.brand_string[offset..offset + 4]
+                            .try_into()
+                            .unwrap_or([0; 4]),
+                    ),
+                    ebx: u32::from_le_bytes(
+                        config.brand_string[offset + 4..offset + 8]
+                            .try_into()
+                            .unwrap_or([0; 4]),
+                    ),
+                    ecx: u32::from_le_bytes(
+                        config.brand_string[offset + 8..offset + 12]
+                            .try_into()
+                            .unwrap_or([0; 4]),
+                    ),
+                    edx: u32::from_le_bytes(
+                        config.brand_string[offset + 12..offset + 16]
+                            .try_into()
+                            .unwrap_or([0; 4]),
+                    ),
                 },
             });
         }
@@ -201,6 +223,17 @@ impl CpuidStealthTable {
                 ..CpuidResult::default()
             },
         });
+    }
+
+    /// Build the stealth CPUID table from physical CPU info.
+    #[must_use]
+    pub fn build(config: &CpuidStealthConfig) -> Self {
+        let mut entries = Vec::with_capacity(128);
+        let max_standard_leaf = 0x16; // Processor Frequency
+        let max_extended_leaf = 0x8000_0008; // Virtual/Physical address sizes
+
+        Self::push_standard_leaves(config, max_standard_leaf, &mut entries);
+        Self::push_extended_leaves(config, max_extended_leaf, &mut entries);
 
         Self {
             entries,
@@ -218,7 +251,8 @@ impl CpuidStealthTable {
         }
 
         // Bounds check
-        if leaf <= self.max_standard_leaf || (0x8000_0000..=self.max_extended_leaf).contains(&leaf) {
+        if leaf <= self.max_standard_leaf || (0x8000_0000..=self.max_extended_leaf).contains(&leaf)
+        {
             for entry in &self.entries {
                 if entry.leaf == leaf && entry.subleaf == subleaf {
                     return entry.result;
@@ -231,7 +265,7 @@ impl CpuidStealthTable {
         CpuidResult::default()
     }
 
-    fn build_leaf_1(config: &CpuidStealthConfig) -> CpuidResult {
+    const fn build_leaf_1(config: &CpuidStealthConfig) -> CpuidResult {
         let mut ecx = config.features_ecx;
         if config.hide_hypervisor {
             // Clear bit 31: hypervisor present
@@ -246,29 +280,28 @@ impl CpuidStealthTable {
         }
     }
 
-    fn build_leaf_7(config: &CpuidStealthConfig) -> CpuidResult {
+    const fn build_leaf_7(_config: &CpuidStealthConfig) -> CpuidResult {
         // Pass through common structured features, masking dangerous ones
         CpuidResult {
-            eax: 0, // max subleaf
+            eax: 0,           // max subleaf
             ebx: 0x0000_0281, // FSGSBASE, BMI1, AVX2 (conservative)
             ecx: 0,
             edx: 0,
         }
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     fn build_topology_leaves(config: &CpuidStealthConfig, entries: &mut Vec<CpuidCacheEntry>) {
         // Subleaf 0: SMT level
         let threads_per_core = config.threads_per_core;
-        let smt_shift = if threads_per_core > 1 { 1 } else { 0 };
+        let smt_shift = u32::from(threads_per_core > 1);
         entries.push(CpuidCacheEntry {
             leaf: 0xB,
             subleaf: 0,
             result: CpuidResult {
                 eax: smt_shift,
                 ebx: threads_per_core,
-                ecx: (1 << 8) | 0, // SMT level type = 1, level number = 0
-                edx: 0, // x2APIC ID (set per-vCPU at runtime)
+                ecx: (1 << 8), // SMT level type = 1, level number = 0
+                edx: 0,        // x2APIC ID (set per-vCPU at runtime)
             },
         });
 
@@ -351,10 +384,10 @@ mod tests {
     fn vendor_string_correct() {
         let table = CpuidStealthTable::build(&test_config());
         let result = table.lookup(0, 0);
-        let ebx_bytes = result.ebx.to_le_bytes();
-        let edx_bytes = result.edx.to_le_bytes();
-        let ecx_bytes = result.ecx.to_le_bytes();
-        let vendor: Vec<u8> = ebx_bytes.iter().chain(edx_bytes.iter()).chain(ecx_bytes.iter()).copied().collect();
+        let vendor: Vec<u8> = [result.ebx, result.edx, result.ecx]
+            .iter()
+            .flat_map(|r| r.to_le_bytes())
+            .collect();
         assert_eq!(&vendor, b"AuthenticAMD");
     }
 

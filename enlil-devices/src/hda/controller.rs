@@ -4,61 +4,62 @@
 //! Windows loads hdaudio.sys when it detects this device.
 
 use super::codec::HdaCodec;
+use crate::truncate::{u8_of, u16_of, u32_of};
 
 /// HDA controller MMIO register offsets (Intel HD Audio spec section 3)
 pub mod regs {
-    pub const GCAP: u32 = 0x00;      // Global Capabilities
-    pub const VMIN: u32 = 0x02;      // Minor Version
-    pub const VMAJ: u32 = 0x03;      // Major Version
-    pub const OUTPAY: u32 = 0x04;    // Output Payload Capability
-    pub const INPAY: u32 = 0x06;     // Input Payload Capability
-    pub const GCTL: u32 = 0x08;      // Global Control
-    pub const WAKEEN: u32 = 0x0C;    // Wake Enable
-    pub const STATESTS: u32 = 0x0E;  // State Change Status
-    pub const GSTS: u32 = 0x10;      // Global Status
-    pub const INTCTL: u32 = 0x20;    // Interrupt Control
-    pub const INTSTS: u32 = 0x24;    // Interrupt Status
-    pub const WALCLK: u32 = 0x30;    // Wall Clock Counter
-    pub const SSYNC: u32 = 0x38;     // Stream Synchronization
+    pub const GCAP: u32 = 0x00; // Global Capabilities
+    pub const VMIN: u32 = 0x02; // Minor Version
+    pub const VMAJ: u32 = 0x03; // Major Version
+    pub const OUTPAY: u32 = 0x04; // Output Payload Capability
+    pub const INPAY: u32 = 0x06; // Input Payload Capability
+    pub const GCTL: u32 = 0x08; // Global Control
+    pub const WAKEEN: u32 = 0x0C; // Wake Enable
+    pub const STATESTS: u32 = 0x0E; // State Change Status
+    pub const GSTS: u32 = 0x10; // Global Status
+    pub const INTCTL: u32 = 0x20; // Interrupt Control
+    pub const INTSTS: u32 = 0x24; // Interrupt Status
+    pub const WALCLK: u32 = 0x30; // Wall Clock Counter
+    pub const SSYNC: u32 = 0x38; // Stream Synchronization
 
     // CORB (Command Output Ring Buffer)
     pub const CORBLBASE: u32 = 0x40;
     pub const CORBUBASE: u32 = 0x44;
-    pub const CORBWP: u32 = 0x48;    // Write Pointer
-    pub const CORBRP: u32 = 0x4A;    // Read Pointer
-    pub const CORBCTL: u32 = 0x4C;   // Control
-    pub const CORBSTS: u32 = 0x4D;   // Status
-    pub const CORBSIZE: u32 = 0x4E;  // Size
+    pub const CORBWP: u32 = 0x48; // Write Pointer
+    pub const CORBRP: u32 = 0x4A; // Read Pointer
+    pub const CORBCTL: u32 = 0x4C; // Control
+    pub const CORBSTS: u32 = 0x4D; // Status
+    pub const CORBSIZE: u32 = 0x4E; // Size
 
     // RIRB (Response Input Ring Buffer)
     pub const RIRBLBASE: u32 = 0x50;
     pub const RIRBUBASE: u32 = 0x54;
-    pub const RIRBWP: u32 = 0x58;    // Write Pointer
-    pub const RINTCNT: u32 = 0x5A;   // Response Interrupt Count
-    pub const RIRBCTL: u32 = 0x5C;   // Control
-    pub const RIRBSTS: u32 = 0x5D;   // Status
-    pub const RIRBSIZE: u32 = 0x5E;  // Size
+    pub const RIRBWP: u32 = 0x58; // Write Pointer
+    pub const RINTCNT: u32 = 0x5A; // Response Interrupt Count
+    pub const RIRBCTL: u32 = 0x5C; // Control
+    pub const RIRBSTS: u32 = 0x5D; // Status
+    pub const RIRBSIZE: u32 = 0x5E; // Size
 
     // Immediate Command
-    pub const IC: u32 = 0x60;        // Immediate Command
-    pub const IR: u32 = 0x64;        // Immediate Response
-    pub const ICS: u32 = 0x68;       // Immediate Command Status
+    pub const IC: u32 = 0x60; // Immediate Command
+    pub const IR: u32 = 0x64; // Immediate Response
+    pub const ICS: u32 = 0x68; // Immediate Command Status
 
     // Stream Descriptor base (first output stream)
     pub const SD0_BASE: u32 = 0x80;
-    pub const SD_SIZE: u32 = 0x20;   // Each stream descriptor is 0x20 bytes
+    pub const SD_SIZE: u32 = 0x20; // Each stream descriptor is 0x20 bytes
 }
 
 /// Stream descriptor register offsets (relative to stream base)
 pub mod sd_regs {
-    pub const CTL: u32 = 0x00;   // Stream Descriptor Control (3 bytes)
-    pub const STS: u32 = 0x03;   // Status
-    pub const LPIB: u32 = 0x04;  // Link Position in Buffer
-    pub const CBL: u32 = 0x08;   // Cyclic Buffer Length
-    pub const LVI: u32 = 0x0C;   // Last Valid Index
-    pub const FMT: u32 = 0x12;   // Format
-    pub const BDPL: u32 = 0x18;  // BDL Pointer Lower
-    pub const BDPU: u32 = 0x1C;  // BDL Pointer Upper
+    pub const CTL: u32 = 0x00; // Stream Descriptor Control (3 bytes)
+    pub const STS: u32 = 0x03; // Status
+    pub const LPIB: u32 = 0x04; // Link Position in Buffer
+    pub const CBL: u32 = 0x08; // Cyclic Buffer Length
+    pub const LVI: u32 = 0x0C; // Last Valid Index
+    pub const FMT: u32 = 0x12; // Format
+    pub const BDPL: u32 = 0x18; // BDL Pointer Lower
+    pub const BDPU: u32 = 0x1C; // BDL Pointer Upper
 }
 
 /// Number of output streams
@@ -133,8 +134,8 @@ impl HdaController {
     #[must_use]
     pub fn new() -> Self {
         // GCAP: 4 output streams, 4 input streams, 64-bit addressing, serial bus number 0
-        let gcap: u16 = ((NUM_OUTPUT_STREAMS as u16) << 12)
-            | ((NUM_INPUT_STREAMS as u16) << 8)
+        let gcap: u16 = ((u16_of(NUM_OUTPUT_STREAMS as u64)) << 12)
+            | ((u16_of(NUM_INPUT_STREAMS as u64)) << 8)
             | 0x01; // 64-bit
 
         Self {
@@ -180,8 +181,7 @@ impl HdaController {
 
     /// Handle MMIO read at offset from BAR0
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
-    pub fn read(&self, offset: u32, size: u8) -> u64 {
+    pub fn read(&self, offset: u32, _size: u8) -> u64 {
         match offset {
             regs::GCAP => u64::from(self.gcap),
             regs::VMIN => u64::from(self.vmin),
@@ -197,16 +197,16 @@ impl HdaController {
             regs::WALCLK => u64::from(self.walclk),
             regs::SSYNC => u64::from(self.ssync),
 
-            regs::CORBLBASE => (self.corb_base & 0xFFFF_FFFF) as u64,
-            regs::CORBUBASE => (self.corb_base >> 32) as u64,
+            regs::CORBLBASE => self.corb_base & 0xFFFF_FFFF,
+            regs::CORBUBASE => self.corb_base >> 32,
             regs::CORBWP => u64::from(self.corb_wp),
             regs::CORBRP => u64::from(self.corb_rp),
             regs::CORBCTL => u64::from(self.corb_ctl),
             regs::CORBSTS => u64::from(self.corb_sts),
             regs::CORBSIZE => u64::from(self.corb_size),
 
-            regs::RIRBLBASE => (self.rirb_base & 0xFFFF_FFFF) as u64,
-            regs::RIRBUBASE => (self.rirb_base >> 32) as u64,
+            regs::RIRBLBASE => self.rirb_base & 0xFFFF_FFFF,
+            regs::RIRBUBASE => self.rirb_base >> 32,
             regs::RIRBWP => u64::from(self.rirb_wp),
             regs::RINTCNT => u64::from(self.rintcnt),
             regs::RIRBCTL => u64::from(self.rirb_ctl),
@@ -218,20 +218,17 @@ impl HdaController {
             regs::ICS => u64::from(self.ics),
 
             // Stream descriptors
-            o if o >= regs::SD0_BASE => {
-                self.read_stream_descriptor(o)
-            }
+            o if o >= regs::SD0_BASE => self.read_stream_descriptor(o),
 
             _ => 0,
         }
     }
 
     /// Handle MMIO write at offset from BAR0
-    #[allow(clippy::cast_possible_truncation)]
-    pub fn write(&mut self, offset: u32, value: u64, size: u8) {
+    pub fn write(&mut self, offset: u32, value: u64, _size: u8) {
         match offset {
             regs::GCTL => {
-                let val = value as u32;
+                let val = u32_of(value);
                 // Bit 0: Controller Reset (CRST)
                 if val & 1 != 0 && self.gctl & 1 == 0 {
                     // Coming out of reset
@@ -239,45 +236,47 @@ impl HdaController {
                 }
                 self.gctl = val;
             }
-            regs::WAKEEN => self.wakeen = value as u16,
+            regs::WAKEEN => self.wakeen = u16_of(value),
             regs::STATESTS => {
                 // Write-1-to-clear
-                self.statests &= !(value as u16);
+                self.statests &= !(u16_of(value));
             }
             regs::GSTS => {
-                self.gsts &= !(value as u16);
+                self.gsts &= !(u16_of(value));
             }
-            regs::INTCTL => self.intctl = value as u32,
+            regs::INTCTL => self.intctl = u32_of(value),
             regs::INTSTS => {
                 // Write-1-to-clear
-                self.intsts &= !(value as u32);
+                self.intsts &= !(u32_of(value));
             }
-            regs::SSYNC => self.ssync = value as u32,
+            regs::SSYNC => self.ssync = u32_of(value),
 
             regs::CORBLBASE => {
                 self.corb_base = (self.corb_base & 0xFFFF_FFFF_0000_0000) | (value & 0xFFFF_FFFF);
             }
             regs::CORBUBASE => {
-                self.corb_base = (self.corb_base & 0x0000_0000_FFFF_FFFF) | ((value & 0xFFFF_FFFF) << 32);
+                self.corb_base =
+                    (self.corb_base & 0x0000_0000_FFFF_FFFF) | ((value & 0xFFFF_FFFF) << 32);
             }
-            regs::CORBWP => self.corb_wp = value as u16,
+            regs::CORBWP => self.corb_wp = u16_of(value),
             regs::CORBRP => {
                 // Bit 15: reset read pointer
                 if value & 0x8000 != 0 {
                     self.corb_rp = 0;
                 }
             }
-            regs::CORBCTL => self.corb_ctl = value as u8,
+            regs::CORBCTL => self.corb_ctl = u8_of(value),
             regs::CORBSTS => {
-                self.corb_sts &= !(value as u8);
+                self.corb_sts &= !(u8_of(value));
             }
-            regs::CORBSIZE => self.corb_size = value as u8 & 0x03,
+            regs::CORBSIZE => self.corb_size = u8_of(value) & 0x03,
 
             regs::RIRBLBASE => {
                 self.rirb_base = (self.rirb_base & 0xFFFF_FFFF_0000_0000) | (value & 0xFFFF_FFFF);
             }
             regs::RIRBUBASE => {
-                self.rirb_base = (self.rirb_base & 0x0000_0000_FFFF_FFFF) | ((value & 0xFFFF_FFFF) << 32);
+                self.rirb_base =
+                    (self.rirb_base & 0x0000_0000_FFFF_FFFF) | ((value & 0xFFFF_FFFF) << 32);
             }
             regs::RIRBWP => {
                 // Bit 15: reset write pointer
@@ -285,19 +284,19 @@ impl HdaController {
                     self.rirb_wp = 0;
                 }
             }
-            regs::RINTCNT => self.rintcnt = value as u16,
-            regs::RIRBCTL => self.rirb_ctl = value as u8,
+            regs::RINTCNT => self.rintcnt = u16_of(value),
+            regs::RIRBCTL => self.rirb_ctl = u8_of(value),
             regs::RIRBSTS => {
-                self.rirb_sts &= !(value as u8);
+                self.rirb_sts &= !(u8_of(value));
             }
-            regs::RIRBSIZE => self.rirb_size = value as u8 & 0x03,
+            regs::RIRBSIZE => self.rirb_size = u8_of(value) & 0x03,
 
             // Immediate command interface
             regs::IC => {
-                self.ic = value as u32;
+                self.ic = u32_of(value);
             }
             regs::ICS => {
-                let val = value as u16;
+                let val = u16_of(value);
                 // Bit 0: Immediate Command Busy (ICB) — set to 1 to execute
                 if val & 0x01 != 0 {
                     self.execute_immediate_command();
@@ -349,7 +348,6 @@ impl HdaController {
     }
 
     /// Write a stream descriptor register
-    #[allow(clippy::cast_possible_truncation)]
     fn write_stream_descriptor(&mut self, offset: u32, value: u64) {
         let rel = offset - regs::SD0_BASE;
         let stream_idx = (rel / regs::SD_SIZE) as usize;
@@ -365,7 +363,7 @@ impl HdaController {
 
         match reg_offset {
             sd_regs::CTL => {
-                let val = value as u32 & 0x00FF_FFFF;
+                let val = u32_of(value) & 0x00FF_FFFF;
                 // Bit 1: Stream Reset
                 if val & 0x02 != 0 {
                     sd.lpib = 0;
@@ -375,13 +373,13 @@ impl HdaController {
             }
             sd_regs::STS => {
                 // Write-1-to-clear
-                sd.sts &= !(value as u8);
+                sd.sts &= !(u8_of(value));
             }
-            sd_regs::CBL => sd.cbl = value as u32,
-            sd_regs::LVI => sd.lvi = value as u16,
-            sd_regs::FMT => sd.fmt = value as u16,
-            sd_regs::BDPL => sd.bdl_lower = value as u32,
-            sd_regs::BDPU => sd.bdl_upper = value as u32,
+            sd_regs::CBL => sd.cbl = u32_of(value),
+            sd_regs::LVI => sd.lvi = u16_of(value),
+            sd_regs::FMT => sd.fmt = u16_of(value),
+            sd_regs::BDPL => sd.bdl_lower = u32_of(value),
+            sd_regs::BDPU => sd.bdl_upper = u32_of(value),
             _ => {}
         }
     }
@@ -476,7 +474,7 @@ mod tests {
 
     #[test]
     fn pci_ids() {
-        let (vendor, device) = HdaController::pci_ids();
+        let (vendor, _device) = HdaController::pci_ids();
         assert_eq!(vendor, 0x8086);
     }
 }

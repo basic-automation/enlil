@@ -38,6 +38,4 @@ pub use registers::{
     CapabilityRegisters, OperationalRegisters, PortRegisterSet, PortState, RuntimeRegisters,
 };
 pub use ring::{CommandRing, TransferRing, TrbRing};
-pub use trb::{
-    CommandTrb, EventTrb, NormalTrb, Trb, TrbCompletionCode, TrbType,
-};
+pub use trb::{CommandTrb, EventTrb, NormalTrb, Trb, TrbCompletionCode, TrbType};

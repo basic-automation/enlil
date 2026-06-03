@@ -116,18 +116,10 @@ fn main() -> anyhow::Result<()> {
             }
 
             println!(
-                "\nHypervisor ready: {} VMs, {:.0} MB allocated, {:.0} MB available",
+                "\nHypervisor ready: {} VMs, {} MB allocated, {} MB available",
                 hypervisor.vm_count(),
-                {
-                    #[allow(clippy::cast_precision_loss)]
-                    let v = hypervisor.memory_manager().allocated_bytes() as f64;
-                    v
-                } / (1024.0 * 1024.0),
-                {
-                    #[allow(clippy::cast_precision_loss)]
-                    let v = hypervisor.memory_manager().available_bytes() as f64;
-                    v
-                } / (1024.0 * 1024.0),
+                hypervisor.memory_manager().allocated_bytes() / (1024 * 1024),
+                hypervisor.memory_manager().available_bytes() / (1024 * 1024),
             );
         }
         Commands::Status => {

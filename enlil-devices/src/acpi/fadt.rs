@@ -5,6 +5,7 @@
 //! motherboard firmware output.
 
 use super::tables::{AcpiSdtHeader, OemInfo};
+use crate::truncate::u32_of;
 
 /// FADT revision 6 (ACPI 6.4) — 276 bytes total
 const FADT_REVISION: u8 = 6;
@@ -160,50 +161,49 @@ impl FadtBuilder {
     }
 
     #[must_use]
-    pub fn oem_info(mut self, oem: OemInfo) -> Self {
+    pub const fn oem_info(mut self, oem: OemInfo) -> Self {
         self.oem = oem;
         self
     }
 
     #[must_use]
-    pub fn sci_interrupt(mut self, irq: u16) -> Self {
+    pub const fn sci_interrupt(mut self, irq: u16) -> Self {
         self.sci_interrupt = irq;
         self
     }
 
     #[must_use]
-    pub fn flags(mut self, flags: u32) -> Self {
+    pub const fn flags(mut self, flags: u32) -> Self {
         self.flags = flags;
         self
     }
 
     #[must_use]
-    pub fn boot_arch_flags(mut self, flags: u16) -> Self {
+    pub const fn boot_arch_flags(mut self, flags: u16) -> Self {
         self.boot_arch_flags = flags;
         self
     }
 
     #[must_use]
-    pub fn pm1a_event_block(mut self, port: u32) -> Self {
+    pub const fn pm1a_event_block(mut self, port: u32) -> Self {
         self.pm1a_event_block = port;
         self
     }
 
     #[must_use]
-    pub fn pm1a_control_block(mut self, port: u32) -> Self {
+    pub const fn pm1a_control_block(mut self, port: u32) -> Self {
         self.pm1a_control_block = port;
         self
     }
 
     #[must_use]
-    pub fn pm_timer_block(mut self, port: u32) -> Self {
+    pub const fn pm_timer_block(mut self, port: u32) -> Self {
         self.pm_timer_block = port;
         self
     }
 
     /// Build the FADT as a byte vector
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn build(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(FADT_LENGTH as usize);
 
@@ -214,7 +214,7 @@ impl FadtBuilder {
         // Offset 36: FIRMWARE_CTRL (4 bytes) — 32-bit physical address of FACS
         buf.extend_from_slice(&0u32.to_le_bytes());
         // Offset 40: DSDT (4 bytes) — 32-bit physical address of DSDT
-        buf.extend_from_slice(&(self.dsdt_address as u32).to_le_bytes());
+        buf.extend_from_slice(&(u32_of(self.dsdt_address)).to_le_bytes());
         // Offset 44: Reserved (was INT_MODEL in ACPI 1.0)
         buf.push(0);
         // Offset 45: Preferred PM Profile (2 = Mobile, 1 = Desktop)
@@ -312,7 +312,7 @@ impl FadtBuilder {
         // Offset 208: X_PM_TMR_BLK
         GenericAddress::io(u64::from(self.pm_timer_block), 32).write_to(&mut buf);
         // Offset 220: X_GPE0_BLK
-        GenericAddress::io(u64::from(self.gpe0_block), u8::from(self.gpe0_length) * 8).write_to(&mut buf);
+        GenericAddress::io(u64::from(self.gpe0_block), self.gpe0_length * 8).write_to(&mut buf);
         // Offset 232: X_GPE1_BLK
         GenericAddress::zero().write_to(&mut buf);
         // Offset 244: SLEEP_CONTROL_REG

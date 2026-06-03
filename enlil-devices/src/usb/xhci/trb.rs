@@ -35,10 +35,9 @@ impl Trb {
         }
     }
 
-
     /// Create a TRB with the given type and all other fields zeroed.
     #[must_use]
-    pub fn new(trb_type: TrbType) -> Self {
+    pub const fn new(trb_type: TrbType) -> Self {
         let mut trb = Self::zeroed();
         trb.set_trb_type(trb_type);
         trb
@@ -57,7 +56,7 @@ impl Trb {
     }
 
     /// Set the cycle bit.
-    pub fn set_cycle_bit(&mut self, cycle: bool) {
+    pub const fn set_cycle_bit(&mut self, cycle: bool) {
         if cycle {
             self.control |= 1;
         } else {
@@ -66,18 +65,18 @@ impl Trb {
     }
 
     /// Alias for [`set_cycle_bit`](Self::set_cycle_bit) — used by ring implementations.
-    pub fn set_cycle(&mut self, cycle: bool) {
+    pub const fn set_cycle(&mut self, cycle: bool) {
         self.set_cycle_bit(cycle);
     }
 
     /// Set the TRB type in bits [15:10].
-    pub fn set_trb_type(&mut self, trb_type: TrbType) {
+    pub const fn set_trb_type(&mut self, trb_type: TrbType) {
         self.control = (self.control & !(0x3F << 10)) | ((trb_type as u32) << 10);
     }
 
     /// Decode the TRB type field into a known variant.
     #[must_use]
-    pub fn decoded_type(&self) -> TrbType {
+    pub const fn decoded_type(&self) -> TrbType {
         TrbType::from_raw(self.trb_type())
     }
 
@@ -93,11 +92,13 @@ impl Trb {
 
     /// Decode a TRB from a 16-byte array (little-endian).
     #[must_use]
-    pub fn from_bytes(buf: &[u8; 16]) -> Self {
+    pub const fn from_bytes(buf: &[u8; 16]) -> Self {
         Self {
-            parameter: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
-            status: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
-            control: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+            parameter: u64::from_le_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]),
+            status: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+            control: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
         }
     }
 }
@@ -329,7 +330,7 @@ pub struct NormalTrb {
 impl NormalTrb {
     /// Encode into a raw TRB.
     #[must_use]
-    pub fn to_trb(&self, cycle: bool) -> Trb {
+    pub const fn to_trb(&self, cycle: bool) -> Trb {
         let mut control: u32 = (TrbType::Normal as u32) << 10;
         if cycle {
             control |= 1;
@@ -384,22 +385,34 @@ impl CommandTrb {
                 trb.set_trb_type(TrbType::DisableSlotCommand);
                 trb.control |= u32::from(*slot_id) << 24;
             }
-            Self::AddressDevice { slot_id, input_context_ptr } => {
+            Self::AddressDevice {
+                slot_id,
+                input_context_ptr,
+            } => {
                 trb.set_trb_type(TrbType::AddressDeviceCommand);
                 trb.parameter = *input_context_ptr;
                 trb.control |= u32::from(*slot_id) << 24;
             }
-            Self::ConfigureEndpoint { slot_id, input_context_ptr } => {
+            Self::ConfigureEndpoint {
+                slot_id,
+                input_context_ptr,
+            } => {
                 trb.set_trb_type(TrbType::ConfigureEndpointCommand);
                 trb.parameter = *input_context_ptr;
                 trb.control |= u32::from(*slot_id) << 24;
             }
-            Self::ResetEndpoint { slot_id, endpoint_id } => {
+            Self::ResetEndpoint {
+                slot_id,
+                endpoint_id,
+            } => {
                 trb.set_trb_type(TrbType::ResetEndpointCommand);
                 trb.control |= u32::from(*slot_id) << 24;
                 trb.control |= u32::from(*endpoint_id) << 16;
             }
-            Self::StopEndpoint { slot_id, endpoint_id } => {
+            Self::StopEndpoint {
+                slot_id,
+                endpoint_id,
+            } => {
                 trb.set_trb_type(TrbType::StopEndpointCommand);
                 trb.control |= u32::from(*slot_id) << 24;
                 trb.control |= u32::from(*endpoint_id) << 16;
@@ -451,8 +464,7 @@ impl EventTrb {
             } => {
                 trb.set_trb_type(TrbType::TransferEvent);
                 trb.parameter = *trb_pointer;
-                trb.status = (*transfer_length & 0x00FF_FFFF)
-                    | ((*completion_code as u32) << 24);
+                trb.status = (*transfer_length & 0x00FF_FFFF) | ((*completion_code as u32) << 24);
                 trb.control |= u32::from(*slot_id) << 24;
                 trb.control |= u32::from(*endpoint_id) << 16;
             }
@@ -480,7 +492,7 @@ impl EventTrb {
 
     /// Attempt to decode an event TRB from a raw TRB.
     #[must_use]
-    pub fn from_trb(trb: &Trb) -> Option<Self> {
+    pub const fn from_trb(trb: &Trb) -> Option<Self> {
         match trb.decoded_type() {
             TrbType::TransferEvent => Some(Self::TransferEvent {
                 trb_pointer: trb.parameter,
@@ -598,7 +610,11 @@ mod tests {
         let trb = event.to_trb(true);
         let decoded = EventTrb::from_trb(&trb).unwrap();
         match decoded {
-            EventTrb::CommandCompletion { command_trb_pointer, completion_code, slot_id } => {
+            EventTrb::CommandCompletion {
+                command_trb_pointer,
+                completion_code,
+                slot_id,
+            } => {
                 assert_eq!(command_trb_pointer, 0x2000);
                 assert_eq!(completion_code, TrbCompletionCode::Success);
                 assert_eq!(slot_id, 3);

@@ -40,26 +40,26 @@ impl BgrtBuilder {
     }
 
     #[must_use]
-    pub fn oem_info(mut self, oem: OemInfo) -> Self {
+    pub const fn oem_info(mut self, oem: OemInfo) -> Self {
         self.oem = oem;
         self
     }
 
     #[must_use]
-    pub fn image_address(mut self, addr: u64) -> Self {
+    pub const fn image_address(mut self, addr: u64) -> Self {
         self.image_address = addr;
         self
     }
 
     #[must_use]
-    pub fn image_offset(mut self, x: u32, y: u32) -> Self {
+    pub const fn image_offset(mut self, x: u32, y: u32) -> Self {
         self.image_offset_x = x;
         self.image_offset_y = y;
         self
     }
 
     #[must_use]
-    pub fn status(mut self, status: u8) -> Self {
+    pub const fn status(mut self, status: u8) -> Self {
         self.status = status;
         self
     }
@@ -145,18 +145,14 @@ mod tests {
 
     #[test]
     fn bgrt_image_address() {
-        let bgrt = BgrtBuilder::new()
-            .image_address(0xDEAD_BEEF_0000)
-            .build();
+        let bgrt = BgrtBuilder::new().image_address(0xDEAD_BEEF_0000).build();
         let addr = u64::from_le_bytes(bgrt[40..48].try_into().unwrap());
         assert_eq!(addr, 0xDEAD_BEEF_0000);
     }
 
     #[test]
     fn bgrt_custom_offset() {
-        let bgrt = BgrtBuilder::new()
-            .image_offset(100, 200)
-            .build();
+        let bgrt = BgrtBuilder::new().image_offset(100, 200).build();
         let x = u32::from_le_bytes(bgrt[48..52].try_into().unwrap());
         let y = u32::from_le_bytes(bgrt[52..56].try_into().unwrap());
         assert_eq!(x, 100);

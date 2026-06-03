@@ -28,13 +28,13 @@ impl WaetBuilder {
     }
 
     #[must_use]
-    pub fn oem_info(mut self, oem: OemInfo) -> Self {
+    pub const fn oem_info(mut self, oem: OemInfo) -> Self {
         self.oem = oem;
         self
     }
 
     #[must_use]
-    pub fn flags(mut self, flags: u32) -> Self {
+    pub const fn flags(mut self, flags: u32) -> Self {
         self.emulated_device_flags = flags;
         self
     }

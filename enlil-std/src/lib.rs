@@ -17,12 +17,12 @@
 //! surface needed by the hypervisor: threads, sync primitives, collections,
 //! async/await, time, and formatted I/O.
 
-pub mod thread;
-pub mod sync;
-pub mod time;
-pub mod io;
 pub mod collections;
 pub mod future;
+pub mod io;
+pub mod sync;
+pub mod thread;
+pub mod time;
 
 /// Re-export the platform layer for direct access when needed.
 pub use enlil_platform as platform;

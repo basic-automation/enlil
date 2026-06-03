@@ -17,12 +17,12 @@
 //!
 //! This means all code above the platform layer is identical in both modes.
 
-pub mod memory;
-pub mod threading;
-pub mod sync;
 pub mod async_rt;
-pub mod time;
 pub mod io;
+pub mod memory;
+pub mod sync;
+pub mod threading;
+pub mod time;
 
 /// Platform initialization — must be called before any other platform services.
 ///
@@ -42,11 +42,17 @@ pub fn init() {
 #[must_use]
 pub const fn backend_name() -> &'static str {
     #[cfg(feature = "platform-linux")]
-    { "linux" }
+    {
+        "linux"
+    }
     #[cfg(feature = "platform-baremetal")]
-    { "baremetal" }
+    {
+        "baremetal"
+    }
     #[cfg(not(any(feature = "platform-linux", feature = "platform-baremetal")))]
-    { "none" }
+    {
+        "none"
+    }
 }
 
 #[cfg(feature = "platform-linux")]

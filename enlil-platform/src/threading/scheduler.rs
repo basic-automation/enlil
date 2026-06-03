@@ -6,8 +6,8 @@
 //! - Priority levels: Critical (vCPU) > High (device I/O) > Normal (compute) > Low (management)
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Task priority levels, ordered from highest to lowest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -185,7 +185,12 @@ impl Scheduler {
     }
 
     /// Submit a task to a specific CPU's run queue.
-    pub fn submit_to(&self, cpu: usize, priority: Priority, work: impl FnOnce() + Send + 'static) -> usize {
+    pub fn submit_to(
+        &self,
+        cpu: usize,
+        priority: Priority,
+        work: impl FnOnce() + Send + 'static,
+    ) -> usize {
         let id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
         let task = SchedulerTask::new(id, priority, work);
         self.run_queues[cpu % self.run_queues.len()].push(task);

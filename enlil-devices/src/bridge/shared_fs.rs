@@ -1,6 +1,6 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
 pub struct SharedFsConfig {
@@ -82,7 +82,9 @@ impl SharedFsManager {
     ///
     /// Returns an error if the file cannot be copied to the clipboard directory.
     pub fn stage_clipboard(&self, src: &Path) -> std::io::Result<PathBuf> {
-        let dest = self.config.backing_path
+        let dest = self
+            .config
+            .backing_path
             .join(SharedFsLayout::Clipboard.subdir())
             .join(src.file_name().unwrap_or_default());
         fs::copy(src, &dest)?;
@@ -95,14 +97,22 @@ impl SharedFsManager {
     ///
     /// Returns an error if the file cannot be copied to the drag-drop directory.
     pub fn stage_dragdrop(&self, src: &Path) -> std::io::Result<PathBuf> {
-        let dest = self.config.backing_path
+        let dest = self
+            .config
+            .backing_path
             .join(SharedFsLayout::Dragdrop.subdir())
             .join(src.file_name().unwrap_or_default());
         fs::copy(src, &dest)?;
         Ok(dest)
     }
 
-    pub fn add_transfer(&mut self, id: String, src_guest: String, dst_guest: String, files: Vec<PathBuf>) {
+    pub fn add_transfer(
+        &mut self,
+        id: String,
+        src_guest: String,
+        dst_guest: String,
+        files: Vec<PathBuf>,
+    ) {
         let transfer_id = id.clone();
         self.transfers.insert(
             transfer_id,
@@ -215,9 +225,17 @@ mod tests {
     fn test_add_and_get_transfer() {
         let (root, cfg) = setup_test("add_and_get_transfer");
         let mut mgr = SharedFsManager::new(cfg).unwrap();
-        mgr.add_transfer("t1".to_string(), "guest1".to_string(), "guest2".to_string(), vec![]);
+        mgr.add_transfer(
+            "t1".to_string(),
+            "guest1".to_string(),
+            "guest2".to_string(),
+            vec![],
+        );
         assert!(mgr.get_transfer("t1").is_some());
-        assert_eq!(mgr.get_transfer("t1").unwrap().status, TransferStatus::Pending);
+        assert_eq!(
+            mgr.get_transfer("t1").unwrap().status,
+            TransferStatus::Pending
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

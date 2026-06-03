@@ -4,6 +4,7 @@
 //! We virtualize PMC access to return consistent values that don't
 //! reveal VMEXIT overhead.
 
+use crate::truncate::u32_of;
 /// Maximum number of general-purpose PMCs to virtualize
 pub const MAX_GP_PMCS: usize = 8;
 /// Maximum number of fixed-function PMCs
@@ -41,7 +42,7 @@ pub mod msr {
 
 impl PmcState {
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             gp_counters: [0; MAX_GP_PMCS],
             fixed_counters: [0; MAX_FIXED_PMCS],
@@ -56,7 +57,7 @@ impl PmcState {
     /// Handle RDPMC instruction. Returns the shadow counter value.
     /// `ecx` is the PMC index: 0-N for GP, 0x40000000+ for fixed.
     #[must_use]
-    pub fn read_pmc(&self, ecx: u32) -> u64 {
+    pub const fn read_pmc(&self, ecx: u32) -> u64 {
         if ecx >= 0x4000_0000 {
             // Fixed-function PMC
             let idx = (ecx - 0x4000_0000) as usize;
@@ -79,15 +80,15 @@ impl PmcState {
     /// Handle WRMSR for a PMC MSR
     pub fn write_msr(&mut self, msr: u32, value: u64) {
         match msr {
-            m if m >= msr::IA32_PMC0 && m < msr::IA32_PMC0 + MAX_GP_PMCS as u32 => {
+            m if m >= msr::IA32_PMC0 && m < msr::IA32_PMC0 + u32_of(MAX_GP_PMCS) => {
                 let idx = (m - msr::IA32_PMC0) as usize;
                 self.gp_counters[idx] = value;
             }
-            m if m >= msr::IA32_PERFEVTSEL0 && m < msr::IA32_PERFEVTSEL0 + MAX_GP_PMCS as u32 => {
+            m if m >= msr::IA32_PERFEVTSEL0 && m < msr::IA32_PERFEVTSEL0 + u32_of(MAX_GP_PMCS) => {
                 let idx = (m - msr::IA32_PERFEVTSEL0) as usize;
                 self.event_select[idx] = value;
             }
-            m if m >= msr::IA32_FIXED_CTR0 && m < msr::IA32_FIXED_CTR0 + MAX_FIXED_PMCS as u32 => {
+            m if m >= msr::IA32_FIXED_CTR0 && m < msr::IA32_FIXED_CTR0 + u32_of(MAX_FIXED_PMCS) => {
                 let idx = (m - msr::IA32_FIXED_CTR0) as usize;
                 self.fixed_counters[idx] = value;
             }
@@ -104,15 +105,15 @@ impl PmcState {
     #[must_use]
     pub fn read_msr(&self, msr: u32) -> Option<u64> {
         match msr {
-            m if m >= msr::IA32_PMC0 && m < msr::IA32_PMC0 + MAX_GP_PMCS as u32 => {
+            m if m >= msr::IA32_PMC0 && m < msr::IA32_PMC0 + u32_of(MAX_GP_PMCS) => {
                 let idx = (m - msr::IA32_PMC0) as usize;
                 Some(self.gp_counters[idx])
             }
-            m if m >= msr::IA32_PERFEVTSEL0 && m < msr::IA32_PERFEVTSEL0 + MAX_GP_PMCS as u32 => {
+            m if m >= msr::IA32_PERFEVTSEL0 && m < msr::IA32_PERFEVTSEL0 + u32_of(MAX_GP_PMCS) => {
                 let idx = (m - msr::IA32_PERFEVTSEL0) as usize;
                 Some(self.event_select[idx])
             }
-            m if m >= msr::IA32_FIXED_CTR0 && m < msr::IA32_FIXED_CTR0 + MAX_FIXED_PMCS as u32 => {
+            m if m >= msr::IA32_FIXED_CTR0 && m < msr::IA32_FIXED_CTR0 + u32_of(MAX_FIXED_PMCS) => {
                 let idx = (m - msr::IA32_FIXED_CTR0) as usize;
                 Some(self.fixed_counters[idx])
             }
@@ -163,7 +164,7 @@ mod tests {
     fn initial_counters_zero() {
         let pmc = PmcState::new();
         for i in 0..MAX_GP_PMCS {
-            assert_eq!(pmc.read_pmc(i as u32), 0);
+            assert_eq!(pmc.read_pmc(u32_of(i)), 0);
         }
     }
 

@@ -24,7 +24,11 @@ impl<T> JoinHandle<T> {
     /// without producing a result (should not happen in normal operation).
     pub fn join(self) -> Result<T, Box<dyn std::any::Any + Send>> {
         self.inner.join()?;
-        let val = self.result.lock().unwrap().take()
+        let val = self
+            .result
+            .lock()
+            .unwrap()
+            .take()
             .expect("thread completed but produced no result");
         Ok(val)
     }
@@ -70,7 +74,9 @@ pub fn sleep(dur: std::time::Duration) {
 /// Get the current thread's ID (delegates to std on linux backend).
 #[must_use]
 pub fn current_thread_name() -> Option<String> {
-    std::thread::current().name().map(std::string::ToString::to_string)
+    std::thread::current()
+        .name()
+        .map(std::string::ToString::to_string)
 }
 
 #[cfg(test)]

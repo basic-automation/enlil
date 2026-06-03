@@ -4,13 +4,14 @@
 //! Uses the [`StorageBackend`] trait for pluggable storage backends.
 
 use crate::storage::StorageBackend;
+use crate::truncate::usize_of;
 use std::sync::Arc;
 
 // VirtIO block request types
-pub const VIRTIO_BLK_T_IN: u32 = 0;       // Read
-pub const VIRTIO_BLK_T_OUT: u32 = 1;      // Write
-pub const VIRTIO_BLK_T_FLUSH: u32 = 4;    // Flush
-pub const VIRTIO_BLK_T_GET_ID: u32 = 8;   // Get device ID
+pub const VIRTIO_BLK_T_IN: u32 = 0; // Read
+pub const VIRTIO_BLK_T_OUT: u32 = 1; // Write
+pub const VIRTIO_BLK_T_FLUSH: u32 = 4; // Flush
+pub const VIRTIO_BLK_T_GET_ID: u32 = 8; // Get device ID
 pub const VIRTIO_BLK_T_DISCARD: u32 = 11; // Discard/trim
 
 // VirtIO block status codes
@@ -80,8 +81,8 @@ impl BlockRequestHeader {
             request_type: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
             reserved: u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
             sector: u64::from_le_bytes([
-                bytes[8], bytes[9], bytes[10], bytes[11],
-                bytes[12], bytes[13], bytes[14], bytes[15],
+                bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
+                bytes[15],
             ]),
         })
     }
@@ -186,8 +187,7 @@ impl VirtioBlockDevice {
     #[must_use]
     pub fn read_config(&self, offset: u64, size: u8) -> u64 {
         let config_bytes = self.config_as_bytes();
-        #[allow(clippy::cast_possible_truncation)]
-        let offset = offset as usize;
+        let offset = usize_of(offset);
         if offset >= config_bytes.len() {
             return 0;
         }
@@ -239,11 +239,7 @@ impl VirtioBlockDevice {
     /// # Returns
     ///
     /// A tuple of (`status_byte`, `bytes_transferred`).
-    pub fn process_request(
-        &mut self,
-        header_bytes: &[u8],
-        data_buf: &mut [u8],
-    ) -> (u8, usize) {
+    pub fn process_request(&mut self, header_bytes: &[u8], data_buf: &mut [u8]) -> (u8, usize) {
         let Some(header) = BlockRequestHeader::from_bytes(header_bytes) else {
             return (VIRTIO_BLK_S_IOERR, 0);
         };
@@ -253,9 +249,10 @@ impl VirtioBlockDevice {
             VIRTIO_BLK_T_OUT => self.handle_write(header.sector, data_buf),
             VIRTIO_BLK_T_FLUSH => self.handle_flush(),
             VIRTIO_BLK_T_GET_ID => self.handle_get_id(data_buf),
-            VIRTIO_BLK_T_DISCARD => {
-                self.handle_discard(header.sector, u64::from(u32::try_from(data_buf.len()).unwrap_or(u32::MAX)))
-            }
+            VIRTIO_BLK_T_DISCARD => self.handle_discard(
+                header.sector,
+                u64::from(u32::try_from(data_buf.len()).unwrap_or(u32::MAX)),
+            ),
             _ => {
                 self.stats.errors += 1;
                 (VIRTIO_BLK_S_UNSUPP, 0)
