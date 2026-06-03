@@ -7,7 +7,7 @@
 //! - Picture-in-Picture support
 //! - Configuration via serde
 
-use crate::truncate::{u32_of, Widen};
+use crate::truncate::{Widen, u32_of};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
@@ -54,7 +54,7 @@ impl FrameRef {
                 use std::time::{SystemTime, UNIX_EPOCH};
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .map_or(0, |d| d.as_nanos().widen())
+                    .map_or(0, |d| d.as_nanos().to_u64())
             },
             pixel_format,
             width,

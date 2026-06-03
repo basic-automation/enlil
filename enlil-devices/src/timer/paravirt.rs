@@ -3,7 +3,7 @@
 //! Provides KVM clock (for Linux guests) and Hyper-V reference TSC (for Windows guests).
 //! These allow guests to read time without VM exits.
 
-use crate::truncate::{u32_of, Widen};
+use crate::truncate::{Widen, u32_of};
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
 // ---------------------------------------------------------------------------
@@ -80,9 +80,7 @@ impl KvmClock {
         let shift: i8 = 32;
         let mul =
             ((1_000_000_000u128) << u32::from(shift.unsigned_abs())) / u128::from(self.tsc_freq_hz);
-        {
-            (u32_of(mul), shift)
-        }
+        (u32_of(mul), shift)
     }
 
     /// Update the clock page data. Call this on each VM entry or periodically.
@@ -188,9 +186,7 @@ impl HyperVReferenceTsc {
         if self.tsc_freq_hz == 0 {
             return 0;
         }
-        {
-            ((u128::from(self.ref_freq_hz) << 64) / u128::from(self.tsc_freq_hz)).widen()
-        }
+        ((u128::from(self.ref_freq_hz) << 64) / u128::from(self.tsc_freq_hz)).to_u64()
     }
 
     /// Update the reference TSC page.
@@ -248,7 +244,7 @@ mod tests {
 
         // Verify: 3 billion ticks * mul >> 32 should ≈ 1 second (10^9 ns)
         {
-            let ns = ((3_000_000_000u128 * u128::from(mul)) >> 32).widen();
+            let ns = ((3_000_000_000u128 * u128::from(mul)) >> 32).to_u64();
             // Allow 1% error
             assert!((ns.cast_signed() - 1_000_000_000i64).unsigned_abs() < 10_000_000);
         }

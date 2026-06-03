@@ -4,8 +4,8 @@
 //! and the DSDT pointer. We generate a realistic FADT that matches common
 //! motherboard firmware output.
 
-use crate::truncate::u32_of;
 use super::tables::{AcpiSdtHeader, OemInfo};
+use crate::truncate::u32_of;
 
 /// FADT revision 6 (ACPI 6.4) — 276 bytes total
 const FADT_REVISION: u8 = 6;

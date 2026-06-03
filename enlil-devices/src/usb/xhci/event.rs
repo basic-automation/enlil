@@ -8,8 +8,8 @@
 //! Each interrupter has its own Event Ring Segment Table (ERST) that
 //! maps the ring segments in guest physical memory.
 
-use crate::truncate::u16_of;
 use super::trb::{Trb, TrbCompletionCode, TrbType};
+use crate::truncate::u16_of;
 use std::fmt;
 
 // ---------------------------------------------------------------------------

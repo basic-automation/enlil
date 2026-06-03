@@ -5,8 +5,8 @@
 //! vCPU to a proximity domain, and memory affinity entries describing
 //! which memory ranges belong to which domain.
 
-use crate::truncate::u32_of;
 use super::tables::{AcpiSdtHeader, OemInfo};
+use crate::truncate::u32_of;
 
 /// Processor Local APIC Affinity structure (type 0, 16 bytes)
 #[derive(Debug, Clone)]

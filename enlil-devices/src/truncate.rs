@@ -9,36 +9,36 @@
 /// Widening to `u64` for any unsigned integer width (lossless).
 pub trait Widen {
     /// Zero-extend `self` to a `u64`.
-    fn widen(self) -> u64;
+    fn to_u64(self) -> u64;
 }
 
 impl Widen for u8 {
-    fn widen(self) -> u64 {
+    fn to_u64(self) -> u64 {
         u64::from(self)
     }
 }
 impl Widen for u16 {
-    fn widen(self) -> u64 {
+    fn to_u64(self) -> u64 {
         u64::from(self)
     }
 }
 impl Widen for u32 {
-    fn widen(self) -> u64 {
+    fn to_u64(self) -> u64 {
         u64::from(self)
     }
 }
 impl Widen for u64 {
-    fn widen(self) -> u64 {
+    fn to_u64(self) -> u64 {
         self
     }
 }
 impl Widen for usize {
-    fn widen(self) -> u64 {
+    fn to_u64(self) -> u64 {
         self as u64
     }
 }
 impl Widen for u128 {
-    fn widen(self) -> u64 {
+    fn to_u64(self) -> u64 {
         let b = self.to_le_bytes();
         u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
     }
@@ -46,29 +46,29 @@ impl Widen for u128 {
 
 /// `usize` value of `x`, saturating (lossless on 64-bit targets).
 pub fn usize_of(x: impl Widen) -> usize {
-    usize::try_from(x.widen()).unwrap_or(usize::MAX)
+    usize::try_from(x.to_u64()).unwrap_or(usize::MAX)
 }
 
 /// Low 8 bits of `x`.
 pub fn u8_of(x: impl Widen) -> u8 {
-    x.widen().to_le_bytes()[0]
+    x.to_u64().to_le_bytes()[0]
 }
 
 /// Low 16 bits of `x` (little-endian).
 pub fn u16_of(x: impl Widen) -> u16 {
-    let b = x.widen().to_le_bytes();
+    let b = x.to_u64().to_le_bytes();
     u16::from_le_bytes([b[0], b[1]])
 }
 
 /// Low 32 bits of `x` (little-endian).
 pub fn u32_of(x: impl Widen) -> u32 {
-    let b = x.widen().to_le_bytes();
+    let b = x.to_u64().to_le_bytes();
     u32::from_le_bytes([b[0], b[1], b[2], b[3]])
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{u16_of, u32_of, u8_of, usize_of};
+    use super::{u8_of, u16_of, u32_of, usize_of};
 
     #[test]
     fn narrows_low_bits() {

@@ -4,7 +4,7 @@
 //! a PCI Express bus with ECAM (Enhanced Configuration Access Mechanism)
 //! for device enumeration.
 
-use crate::truncate::{u16_of, u8_of};
+use crate::truncate::{u8_of, u16_of};
 /// PCI configuration space size per function
 pub const PCI_CONFIG_SPACE_SIZE: usize = 256;
 /// `PCIe` extended configuration space size per function
@@ -313,12 +313,13 @@ impl PcieRootComplex {
         };
         let reg_offset = (offset & 0xFFF) as u16;
 
-        self.find_device(&bdf).map_or(0xFFFF_FFFF, |dev| match size {
-            1 => u32::from(dev.read_u8(reg_offset)),
-            2 => u32::from(dev.read_u16(reg_offset)),
-            4 => dev.read_u32(reg_offset),
-            _ => 0xFFFF_FFFF,
-        })
+        self.find_device(&bdf)
+            .map_or(0xFFFF_FFFF, |dev| match size {
+                1 => u32::from(dev.read_u8(reg_offset)),
+                2 => u32::from(dev.read_u16(reg_offset)),
+                4 => dev.read_u32(reg_offset),
+                _ => 0xFFFF_FFFF,
+            })
     }
 
     /// Handle ECAM MMIO write

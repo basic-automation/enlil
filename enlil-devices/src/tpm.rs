@@ -4,7 +4,7 @@
 //! at the standard address 0xFED40000. Each guest gets its own independent
 //! virtual TPM with separate PCR banks, endorsement keys, etc.
 
-use crate::truncate::{u16_of, u32_of, u8_of, usize_of};
+use crate::truncate::{u8_of, u16_of, u32_of, usize_of};
 /// Standard TPM MMIO base address
 pub const TPM_MMIO_BASE: u64 = 0xFED4_0000;
 /// TPM MMIO region size (4KB for CRB interface)

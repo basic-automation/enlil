@@ -6,6 +6,36 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-02 (later still) — Zero `#[allow]`, strict clippy, all lints fixed for real
+
+Per request: removed **every** `#[allow]` attribute (120 of them), kept the strict
+`#![deny(clippy::all, clippy::pedantic, clippy::nursery)]`, and fixed every lint —
+and every cascade lint the fixes produced — instead of suppressing.
+
+- **Register/byte casts (~134):** added a small `enlil-devices::truncate` module
+  (`Widen` trait + `u8_of`/`u16_of`/`u32_of`/`usize_of`, little-endian byte
+  reconstruction — no lossy `as`, no panic) and rewrote intentional truncations to
+  use it; signed TSC math uses `i64::cast_signed`/`u64::cast_unsigned`. (Renamed the
+  trait method off `widen` to `to_u64` to dodge a future-std name collision.)
+- **dead_code (~25):** re-exported genuinely-public-but-unreferenced API
+  (`LoopbackBackend`, `PipeBackend`, `MsiCapability`, `IOAPIC_BASE`, `DeviceStatus`,
+  `ClipboardEntry`), added accessors for stored-but-unread config fields, removed
+  truly-unused private constants.
+- **docs:** added accurate `# Panics`/`# Errors` sections (lock poisoning, asserts)
+  and removed infallible `unwrap`s (`Trb::from_bytes` via explicit byte arrays).
+- **structure:** `unused_self` → associated fns; `option_if_let_else` → `map_or`;
+  `match_same_arms` combined; `unnecessary_wraps` (PS/2 `handle_data_byte` → `u8`);
+  `significant_drop_tightening` (scoped lock guards); `vec_init_then_push` → `vec![]`;
+  split two `too_many_lines` fns (`build_acpi_tables`, `CpuidStealthTable::build`);
+  refactored two `struct_excessive_bools` (`PitChannel`→`ByteLatch`, `RedirectionEntry`
+  →`RteFlags` sub-structs).
+
+**Verified (exact CI commands):** `cargo fmt --all -- --check` OK · `cargo clippy
+--all-targets --workspace -- -D warnings` OK · `cargo test --workspace` **630 passed,
+0 failed**. `#[allow]` count in `*/src`: **0**. Strict deny groups still in place.
+
+---
+
 ## 2026-06-02 (later) — Lint/format cleanup: CI "Check & Lint" is now green
 
 Followed up on the build-fix PR by paying down the fmt + clippy debt that had

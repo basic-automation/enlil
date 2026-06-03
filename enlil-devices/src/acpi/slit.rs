@@ -4,8 +4,8 @@
 //! this — Windows uses it for memory allocation optimization. The diagonal
 //! distance (self-to-self) is always 10 per the ACPI spec.
 
-use crate::truncate::{u32_of, usize_of};
 use super::tables::{AcpiSdtHeader, OemInfo};
+use crate::truncate::{u32_of, usize_of};
 
 /// SLIT table builder
 pub struct SlitBuilder {

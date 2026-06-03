@@ -194,9 +194,11 @@ impl RoutingTable {
             }
         }
 
-        self.default_guest.as_ref().map_or(RoutingDecision::Unassigned, |guest| {
-            RoutingDecision::RouteToGuest(guest.clone())
-        })
+        self.default_guest
+            .as_ref()
+            .map_or(RoutingDecision::Unassigned, |guest| {
+                RoutingDecision::RouteToGuest(guest.clone())
+            })
     }
 
     /// Return the number of active (enabled) rules.

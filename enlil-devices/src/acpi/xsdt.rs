@@ -3,8 +3,8 @@
 //! The XSDT contains 64-bit pointers to all other ACPI tables.
 //! RSDP → XSDT → [FADT, MADT, MCFG, HPET, ...]
 
-use crate::truncate::u32_of;
 use super::tables::{AcpiSdtHeader, OemInfo};
+use crate::truncate::u32_of;
 
 /// XSDT builder — collects table addresses and generates the binary table
 pub struct XsdtBuilder {

@@ -3,8 +3,8 @@
 //! Implements the Intel HDA controller register set exposed via PCI BAR0.
 //! Windows loads hdaudio.sys when it detects this device.
 
-use crate::truncate::{u16_of, u32_of, u8_of};
 use super::codec::HdaCodec;
+use crate::truncate::{u8_of, u16_of, u32_of};
 
 /// HDA controller MMIO register offsets (Intel HD Audio spec section 3)
 pub mod regs {
@@ -134,8 +134,9 @@ impl HdaController {
     #[must_use]
     pub fn new() -> Self {
         // GCAP: 4 output streams, 4 input streams, 64-bit addressing, serial bus number 0
-        let gcap: u16 =
-            ((u16_of(NUM_OUTPUT_STREAMS as u64)) << 12) | ((u16_of(NUM_INPUT_STREAMS as u64)) << 8) | 0x01; // 64-bit
+        let gcap: u16 = ((u16_of(NUM_OUTPUT_STREAMS as u64)) << 12)
+            | ((u16_of(NUM_INPUT_STREAMS as u64)) << 8)
+            | 0x01; // 64-bit
 
         Self {
             gcap,

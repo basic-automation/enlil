@@ -99,7 +99,9 @@ impl fmt::Display for UsbDevice {
             self.id.product_id,
             self.product_name(),
             self.speed,
-            self.assigned_guest.as_ref().map_or("unassigned", |g| g.as_str())
+            self.assigned_guest
+                .as_ref()
+                .map_or("unassigned", |g| g.as_str())
         )
     }
 }

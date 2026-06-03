@@ -65,74 +65,69 @@ impl HdaCodec {
         let widgets = vec![
             // NID 0x02: Audio Output (DAC)
             HdaWidget {
-            nid: 0x02,
-            widget_type: WidgetType::AudioOutput,
-            capabilities: 0x0001_0041, // Stereo, Digital
-            pin_config: 0,
-            connections: Vec::new(),
-            amp_gain: 0x7F,
-            stream_channel: 0,
-            format: 0x0011, // 48kHz 16-bit stereo
+                nid: 0x02,
+                widget_type: WidgetType::AudioOutput,
+                capabilities: 0x0001_0041, // Stereo, Digital
+                pin_config: 0,
+                connections: Vec::new(),
+                amp_gain: 0x7F,
+                stream_channel: 0,
+                format: 0x0011, // 48kHz 16-bit stereo
             },
-
-        // NID 0x03: Audio Output (DAC) - secondary
+            // NID 0x03: Audio Output (DAC) - secondary
             HdaWidget {
-            nid: 0x03,
-            widget_type: WidgetType::AudioOutput,
-            capabilities: 0x0001_0041,
-            pin_config: 0,
-            connections: Vec::new(),
-            amp_gain: 0x7F,
-            stream_channel: 0,
-            format: 0x0011,
+                nid: 0x03,
+                widget_type: WidgetType::AudioOutput,
+                capabilities: 0x0001_0041,
+                pin_config: 0,
+                connections: Vec::new(),
+                amp_gain: 0x7F,
+                stream_channel: 0,
+                format: 0x0011,
             },
-
-        // NID 0x08: Audio Input (ADC)
+            // NID 0x08: Audio Input (ADC)
             HdaWidget {
-            nid: 0x08,
-            widget_type: WidgetType::AudioInput,
-            capabilities: 0x0010_0341, // Stereo, In Amp
-            pin_config: 0,
-            connections: vec![0x18, 0x19],
-            amp_gain: 0x7F,
-            stream_channel: 0,
-            format: 0x0011,
+                nid: 0x08,
+                widget_type: WidgetType::AudioInput,
+                capabilities: 0x0010_0341, // Stereo, In Amp
+                pin_config: 0,
+                connections: vec![0x18, 0x19],
+                amp_gain: 0x7F,
+                stream_channel: 0,
+                format: 0x0011,
             },
-
-        // NID 0x14: Pin Complex (Line Out)
+            // NID 0x14: Pin Complex (Line Out)
             HdaWidget {
-            nid: 0x14,
-            widget_type: WidgetType::PinComplex,
-            capabilities: 0x0040_0000, // Output capable
-            pin_config: 0x0121_4010,   // Line out, front, jack
-            connections: vec![0x02],
-            amp_gain: 0,
-            stream_channel: 0,
-            format: 0,
+                nid: 0x14,
+                widget_type: WidgetType::PinComplex,
+                capabilities: 0x0040_0000, // Output capable
+                pin_config: 0x0121_4010,   // Line out, front, jack
+                connections: vec![0x02],
+                amp_gain: 0,
+                stream_channel: 0,
+                format: 0,
             },
-
-        // NID 0x18: Pin Complex (Mic In)
+            // NID 0x18: Pin Complex (Mic In)
             HdaWidget {
-            nid: 0x18,
-            widget_type: WidgetType::PinComplex,
-            capabilities: 0x0020_0000, // Input capable
-            pin_config: 0x01A1_9030,   // Mic in, front, jack
-            connections: Vec::new(),
-            amp_gain: 0,
-            stream_channel: 0,
-            format: 0,
+                nid: 0x18,
+                widget_type: WidgetType::PinComplex,
+                capabilities: 0x0020_0000, // Input capable
+                pin_config: 0x01A1_9030,   // Mic in, front, jack
+                connections: Vec::new(),
+                amp_gain: 0,
+                stream_channel: 0,
+                format: 0,
             },
-
-        // NID 0x19: Pin Complex (Front Mic)
+            // NID 0x19: Pin Complex (Front Mic)
             HdaWidget {
-            nid: 0x19,
-            widget_type: WidgetType::PinComplex,
-            capabilities: 0x0020_0000,
-            pin_config: 0x02A1_9040, // Mic in, front, jack
-            connections: Vec::new(),
-            amp_gain: 0,
-            stream_channel: 0,
-            format: 0,
+                nid: 0x19,
+                widget_type: WidgetType::PinComplex,
+                capabilities: 0x0020_0000,
+                pin_config: 0x02A1_9040, // Mic in, front, jack
+                connections: Vec::new(),
+                amp_gain: 0,
+                stream_channel: 0,
+                format: 0,
             },
         ];
 
@@ -194,25 +189,26 @@ impl HdaCodec {
             // Widget parameter query
             (nid, 0xF00) => {
                 let param = payload & 0xFF;
-                self.widgets.iter().find(|w| w.nid == nid).map_or(0, |w| match param {
-                    0x09 => w.capabilities,
-                    0x0C => w.pin_config,
-                    // Connection list length
-                    0x0E => u32_of(w.connections.len()),
-                    _ => 0,
-                })
+                self.widgets
+                    .iter()
+                    .find(|w| w.nid == nid)
+                    .map_or(0, |w| match param {
+                        0x09 => w.capabilities,
+                        0x0C => w.pin_config,
+                        // Connection list length
+                        0x0E => u32_of(w.connections.len()),
+                        _ => 0,
+                    })
             }
             // Get connection list entry
-            (nid, 0xF02) => {
-                self.widgets.iter().find(|w| w.nid == nid).map_or(0, |w| {
-                    let idx = (payload & 0xFF) as usize;
-                    if idx < w.connections.len() {
-                        u32::from(w.connections[idx])
-                    } else {
-                        0
-                    }
-                })
-            }
+            (nid, 0xF02) => self.widgets.iter().find(|w| w.nid == nid).map_or(0, |w| {
+                let idx = (payload & 0xFF) as usize;
+                if idx < w.connections.len() {
+                    u32::from(w.connections[idx])
+                } else {
+                    0
+                }
+            }),
             // Get/Set converter stream/channel
             (nid, 0xF06) => self
                 .widgets

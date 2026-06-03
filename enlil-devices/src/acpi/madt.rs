@@ -4,8 +4,8 @@
 //! discover processors and interrupt controllers. Must match the vCPU count
 //! and APIC ID assignment.
 
-use crate::truncate::u32_of;
 use super::tables::{AcpiSdtHeader, OemInfo};
+use crate::truncate::u32_of;
 
 /// MADT entry types
 #[repr(u8)]

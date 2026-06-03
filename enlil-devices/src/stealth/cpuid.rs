@@ -84,13 +84,12 @@ impl CpuVendor {
 }
 
 impl CpuidStealthTable {
-    /// Build the stealth CPUID table from physical CPU info
-    #[must_use]
-    pub fn build(config: &CpuidStealthConfig) -> Self {
-        let mut entries = Vec::with_capacity(128);
-        let max_standard_leaf = 0x16; // Processor Frequency
-        let max_extended_leaf = 0x8000_0008; // Virtual/Physical address sizes
-
+    /// Push the standard (0x0–0xD) CPUID leaves.
+    fn push_standard_leaves(
+        config: &CpuidStealthConfig,
+        max_standard_leaf: u32,
+        entries: &mut Vec<CpuidCacheEntry>,
+    ) {
         // Leaf 0x0: Vendor ID
         let (ebx, edx, ecx) = config.vendor.vendor_regs();
         entries.push(CpuidCacheEntry {
@@ -129,7 +128,7 @@ impl CpuidStealthTable {
         });
 
         // Leaf 0xB: Extended Topology
-        Self::build_topology_leaves(config, &mut entries);
+        Self::build_topology_leaves(config, entries);
 
         // Leaf 0xD: XSAVE features
         entries.push(CpuidCacheEntry {
@@ -153,7 +152,14 @@ impl CpuidStealthTable {
                 });
             }
         }
+    }
 
+    /// Push the extended (0x80000000+) CPUID leaves.
+    fn push_extended_leaves(
+        config: &CpuidStealthConfig,
+        max_extended_leaf: u32,
+        entries: &mut Vec<CpuidCacheEntry>,
+    ) {
         // Extended leaves
         // 0x80000000: Max extended leaf
         entries.push(CpuidCacheEntry {
@@ -217,6 +223,17 @@ impl CpuidStealthTable {
                 ..CpuidResult::default()
             },
         });
+    }
+
+    /// Build the stealth CPUID table from physical CPU info.
+    #[must_use]
+    pub fn build(config: &CpuidStealthConfig) -> Self {
+        let mut entries = Vec::with_capacity(128);
+        let max_standard_leaf = 0x16; // Processor Frequency
+        let max_extended_leaf = 0x8000_0008; // Virtual/Physical address sizes
+
+        Self::push_standard_leaves(config, max_standard_leaf, &mut entries);
+        Self::push_extended_leaves(config, max_extended_leaf, &mut entries);
 
         Self {
             entries,

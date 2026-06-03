@@ -115,11 +115,9 @@ impl TscManager {
 
         if state.scaling_enabled {
             let scaled = ((u128::from(host_tsc)) * (u128::from(state.scaling_ratio))) >> 16;
-            return (scaled.widen().cast_signed() + state.offset).cast_unsigned();
+            return (scaled.to_u64().cast_signed() + state.offset).cast_unsigned();
         }
-        {
-            (host_tsc.cast_signed() + state.offset).cast_unsigned()
-        }
+        (host_tsc.cast_signed() + state.offset).cast_unsigned()
     }
 
     /// Synchronize a vCPU's TSC to a specific value (used after migration).
@@ -129,7 +127,7 @@ impl TscManager {
             if state.scaling_enabled {
                 let scaled = ((u128::from(host_tsc)) * (u128::from(state.scaling_ratio))) >> 16;
                 {
-                    state.offset = guest_tsc.cast_signed() - scaled.widen().cast_signed();
+                    state.offset = guest_tsc.cast_signed() - scaled.to_u64().cast_signed();
                 }
             } else {
                 {
@@ -178,9 +176,7 @@ impl TscManager {
             .unwrap_or_default()
             .as_nanos();
         // Simulate ~3GHz TSC
-        {
-            (nanos * 3 / 1_000_000_000) as u64
-        }
+        { (nanos * 3 / 1_000_000_000) as u64 }
     }
 }
 
@@ -211,7 +207,7 @@ mod tests {
         let state = mgr.vcpu_state(0).unwrap();
         assert!(state.scaling_enabled);
         // Ratio should be ~0.667 in 48.16 = ~43690
-        let expected_ratio: u64 = (((2_000_000_000u128) << 16) / 3_000_000_000u128).widen();
+        let expected_ratio: u64 = (((2_000_000_000u128) << 16) / 3_000_000_000u128).to_u64();
         assert_eq!(state.scaling_ratio, expected_ratio);
     }
 

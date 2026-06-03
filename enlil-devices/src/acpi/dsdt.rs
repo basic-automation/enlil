@@ -8,9 +8,9 @@
 //! - Processor objects
 //! - Power management (_S5 sleep state for shutdown)
 
-use crate::truncate::u32_of;
 use super::aml::AmlBuilder;
 use super::tables::{AcpiSdtHeader, OemInfo};
+use crate::truncate::u32_of;
 
 /// DSDT builder configuration
 pub struct DsdtConfig {

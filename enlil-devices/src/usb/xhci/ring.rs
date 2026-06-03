@@ -19,7 +19,6 @@ use super::trb::Trb;
 /// Default number of TRB entries per ring segment.
 const DEFAULT_RING_SIZE: usize = 256;
 
-
 // ---------------------------------------------------------------------------
 // TRB Ring (generic base)
 // ---------------------------------------------------------------------------

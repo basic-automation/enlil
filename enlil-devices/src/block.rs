@@ -3,8 +3,8 @@
 //! Implements the `VirtIO` block device specification (virtio-blk).
 //! Uses the [`StorageBackend`] trait for pluggable storage backends.
 
-use crate::truncate::usize_of;
 use crate::storage::StorageBackend;
+use crate::truncate::usize_of;
 use std::sync::Arc;
 
 // VirtIO block request types

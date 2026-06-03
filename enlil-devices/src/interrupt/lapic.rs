@@ -7,8 +7,8 @@
 //! - IPI delivery
 //! - EOI processing
 
-use crate::truncate::{u32_of, u8_of};
 use super::{DeliveryMode, InterruptEntry, TriggerMode};
+use crate::truncate::{u8_of, u32_of};
 
 // LAPIC register offsets (byte offsets from base 0xFEE00000)
 pub const LAPIC_ID: u32 = 0x020;

@@ -3,8 +3,8 @@
 //! Parses the qcow2 header and L1/L2 tables to resolve guest cluster
 //! offsets to host file offsets. Write support is deferred to a later phase.
 
-use crate::truncate::usize_of;
 use super::StorageBackend;
+use crate::truncate::usize_of;
 use anyhow::{Context, Result, bail};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};

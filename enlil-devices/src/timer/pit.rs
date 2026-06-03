@@ -63,6 +63,15 @@ impl AccessMode {
 }
 
 /// A single PIT channel.
+/// Lo/hi byte access-latch position for a PIT channel.
+#[derive(Debug, Clone, Default)]
+pub struct ByteLatch {
+    /// Next read targets the high byte (lobyte/hibyte access mode).
+    pub read_hi: bool,
+    /// Next write targets the high byte.
+    pub write_hi: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct PitChannel {
     pub count: u16,
@@ -70,8 +79,7 @@ pub struct PitChannel {
     pub mode: ChannelMode,
     pub access: AccessMode,
     pub latched_count: Option<u16>,
-    pub read_hi: bool,
-    pub write_hi: bool,
+    pub byte_latch: ByteLatch,
     pub gate: bool,
     pub output: bool,
     pub enabled: bool,
@@ -87,8 +95,10 @@ impl PitChannel {
             mode: ChannelMode::InterruptOnTerminalCount,
             access: AccessMode::LoHiByte,
             latched_count: None,
-            read_hi: false,
-            write_hi: false,
+            byte_latch: ByteLatch {
+                read_hi: false,
+                write_hi: false,
+            },
             gate: true,
             output: false,
             enabled: false,
@@ -101,12 +111,12 @@ impl PitChannel {
             AccessMode::LoByte | AccessMode::Latch => (value & 0xFF) as u8,
             AccessMode::HiByte => ((value >> 8) & 0xFF) as u8,
             AccessMode::LoHiByte => {
-                if self.read_hi {
-                    self.read_hi = false;
+                if self.byte_latch.read_hi {
+                    self.byte_latch.read_hi = false;
                     self.latched_count = None;
                     ((value >> 8) & 0xFF) as u8
                 } else {
-                    self.read_hi = true;
+                    self.byte_latch.read_hi = true;
                     (value & 0xFF) as u8
                 }
             }
@@ -124,13 +134,13 @@ impl PitChannel {
                 self.load_count();
             }
             AccessMode::LoHiByte => {
-                if self.write_hi {
+                if self.byte_latch.write_hi {
                     self.reload = (self.reload & 0x00FF) | (u16::from(val) << 8);
-                    self.write_hi = false;
+                    self.byte_latch.write_hi = false;
                     self.load_count();
                 } else {
                     self.reload = (self.reload & 0xFF00) | u16::from(val);
-                    self.write_hi = true;
+                    self.byte_latch.write_hi = true;
                 }
             }
             AccessMode::Latch => {}
@@ -258,8 +268,8 @@ impl Pit {
         let ch = &mut self.channels[channel_idx];
         ch.access = access;
         ch.mode = mode;
-        ch.read_hi = false;
-        ch.write_hi = false;
+        ch.byte_latch.read_hi = false;
+        ch.byte_latch.write_hi = false;
         ch.output = false;
         ch.enabled = false;
     }

@@ -5,9 +5,9 @@
 //! - `_PSS` — Performance Supported States (frequency/voltage pairs)
 //! - `_CST` — C-States (idle power states: C1, C2, C3)
 
-use crate::truncate::{u16_of, u32_of, u8_of};
 use super::aml::opcode;
 use super::tables::{AcpiSdtHeader, OemInfo};
+use crate::truncate::{u8_of, u16_of, u32_of};
 
 /// P-state definition (performance state)
 #[derive(Debug, Clone, Copy)]

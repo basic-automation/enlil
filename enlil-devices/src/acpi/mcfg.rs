@@ -3,8 +3,8 @@
 //! Required for PCI Express configuration space access. Windows uses this
 //! to discover the ECAM (Enhanced Configuration Access Mechanism) base address.
 
-use crate::truncate::u32_of;
 use super::tables::{AcpiSdtHeader, OemInfo};
+use crate::truncate::u32_of;
 
 /// A single MCFG allocation entry
 #[derive(Debug, Clone)]
