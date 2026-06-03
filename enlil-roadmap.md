@@ -11,7 +11,7 @@ A Rust-based Type-1 hypervisor that turns a single x86 desktop into multiple tra
 - **Language:** 100% Rust (no_std for core, std for tooling)
 - **Foundation:** RustVMM crate ecosystem
 - **Target Hardware:** x86_64 desktops with Intel VT-x/VT-d or AMD-V/AMD-Vi
-- **Guest OS Support:** Linux and Windows (transparent — guests must not detect the hypervisor)
+- **Guest OS Support:** OS-agnostic goal — any guest, transparently, by emulating the platform it expects. Near-term (x86): Linux, Windows, *BSD, x86 Android. Via Phase 10 (ARM): ARM Android, Apple-Silicon guests. Stretch: macOS (Apple hardware only — license + SMC/board-id). Research-only: iOS (Apple hardware root of trust — not transparently virtualizable on non-Apple HW). See **Core Model** below.
 - **License:** TBD (recommend MIT or Apache 2.0 for max ecosystem compatibility)
 
 ---
@@ -72,6 +72,84 @@ Power On → UEFI Firmware (motherboard, unchanged)
 ```
 
 Each guest has its own virtual UEFI (OVMF) and its own bootloader inside the VM. Enlil doesn't replace GRUB — it sits below everything. Unplug the USB and reboot to return to your normal bare-metal setup instantly.
+
+---
+
+## Core Model — Logical Machines over a Physical Pool
+
+Enlil mediates **both directions** of every hardware interaction and routes them across a
+pool of physical machines, so the mapping between guests and hardware is arbitrary and may
+cross machine and network boundaries.
+
+- **OS → HW:** guest VM-exits / MMIO-PIO traps / hypercalls / VirtIO kicks are intercepted
+  and routed to a device *back-end* that may live on another node.
+- **HW → OS:** physical IRQs, DMA completions, and device/input events are captured on the
+  node that owns the device, serialized, routed to the node running the target guest, and
+  injected as virtual interrupts / virtqueue completions.
+
+This makes physical machines **stateless hardware nodes** (resource providers) and each
+guest a **logical machine** defined only by a resource manifest + a routing table. Classic
+virtualization is *N guests on 1 host*; Enlil is *N guests on M hosts, fully composable* —
+hardware disaggregation **underneath unmodified OSs** (the ambitious version of CXL / RDMA
+device pools / LegoOS, none of which work transparently beneath stock Windows/Linux).
+
+### The governing law: interconnect latency sets the granularity of sharing
+
+| Interconnect | Added latency | What can be pooled transparently |
+|---|---|---|
+| On-board PCIe / **CXL** | sub-µs (~200–400 ns) | almost anything, incl. memory (CXL.mem as a NUMA tier) and live devices |
+| **RDMA**, same datacenter | ~1–5 µs | storage, NIC, GPU-compute, cold-page memory — *not* a hot vCPU's RAM |
+| **WAN**, 1000s of miles | ~20–40 ms RTT | coarse/async only: remote storage, streamed I/O, whole-guest migration, replication/failover |
+
+Local DRAM is ~80 ns, so WAN is ~100,000× slower: a vCPU cannot run against RAM that is
+1000s of miles away. **A single kernel's tightly-coupled hot CPU+RAM working set stays on
+one node** (or a CXL-NUMA domain); across distance you *move or replicate* the guest, you
+do not share its hot state. Everything else — devices, storage, GPU-offload, capacity — is
+poolable, with **latency-aware placement**.
+
+**Placement policy (heart of Phase 9):** classify each workload — coupled-and-hot → local;
+decomposable / replicable → fabric. Enlil presents the aggregate as ordinary virtual
+hardware to the guest; behind that front-end the fabric fulfills it with whichever pattern
+fits the device's latency class.
+
+**Design rule (applies from Phase 3 onward):** build *every* device as a front-end/back-end
+pair behind a pluggable transport (`local | CXL | RDMA | network`), even while only `local`
+is implemented — so remoting is a transport swap, not a rewrite. VirtIO / vhost-user / vDPA
+is already exactly this shape.
+
+### Distributed-compute planes (Phase 9 Fabric / Phase 11 Mesh)
+
+Patterns for routing latency-tolerant work across heterogeneous, possibly untrusted nodes —
+they succeed precisely because they don't share hot state:
+
+- **Work-unit engine (à la Folding@home):** split a job into independent units, scatter to
+  the pool, gather async, assign redundantly to beat stragglers/failures, checkpoint. This
+  is how a latency-tolerant virtual device (a virtual compute queue or vGPU-offload surface)
+  is fulfilled.
+- **Resource market + reputation (à la Bittensor):** permissionless heterogeneous nodes
+  advertise capability, get scored and compensated — the discovery, incentive, and
+  trust-ranking plane that grows the pool beyond your own machines.
+- **Verifiable execution + consensus (à la Ethereum):** validity/fraud proofs and BFT
+  consensus let untrusted remote nodes run work you can trust without redoing it, and keep
+  replicated guests consistent. See `enlil-zk-performance-research.md`.
+
+### Transparency is per-guest-family
+
+The hypervisor must present the machine model each OS expects (PC/UEFI, ARM SoC, Apple
+platform) and defeat that family's VM-detection vectors (CPUID hypervisor bit, RDTSC/TSC
+timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" generalizes to a
+**transparent virtual *machine*, platform-shaped per guest**.
+
+### Guest OS feasibility tiers
+
+| Guest | Feasibility | Notes |
+|---|---|---|
+| Linux, *BSD | ✅ near-term (x86) | BSD ≈ Linux on x86 — cheap win |
+| Windows | ✅ in scope (Phase 5) | + VM-detection hardening |
+| Android (x86) | ✅ near-term | Android-x86 / Bliss on the PC model |
+| Android (ARM) | ⏳ needs Phase 10a (ARM) | Play Integrity is hardware-attested |
+| macOS | ⚠️ Apple hardware only | license + SMC/board-id; major transparency lift |
+| iOS | ❌ research-only | Apple-signed boot chain + Secure Enclave; not transparently virtualizable on non-Apple HW |
 
 ---
 

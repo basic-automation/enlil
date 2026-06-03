@@ -12,11 +12,16 @@ Type-1 hypervisor. Custom target `x86_64-unknown-enlil.json`; toolchain pinned i
 virtualization is available, also run guest-boot / integration tests; otherwise mark them
 "not run (no nested virt)" — never claim or fake a boot or benchmark you didn't run.
 
-**NORTH STAR:** Enlil is a Rust Type-1 hypervisor that turns x86 hardware into multiple
-transparent virtual PCs with granular peripheral routing and GPU sharing. Guests must
-believe they're on bare metal. Hardware is virtualized and poolable, so machines can be
-combined or split — including across a network (Phase 11, Enlil Mesh). Every run should
-move some phase toward that end state.
+**NORTH STAR:** Enlil is a Rust Type-1 hypervisor that mediates *both directions* of every
+hardware interaction (OS→HW and HW→OS) and routes them across a pool of physical nodes —
+turning M machines into N transparent, composable *logical machines*. Guests must believe
+they're on bare metal and must not detect the hypervisor. The goal is **OS-agnostic**:
+Linux, Windows, *BSD, x86 Android near-term; ARM Android and Apple-Silicon via Phase 10;
+macOS (Apple HW) and iOS as constrained/research targets. Interconnect latency sets what
+can be pooled at what distance (PCIe/CXL → RDMA → WAN); a kernel's hot CPU+RAM working set
+stays on one node, everything else is poolable with latency-aware placement. See
+`enlil-roadmap.md` → **Core Model** for the authoritative architecture. Every run should
+move some roadmap phase toward that end state.
 
 ---
 
@@ -58,10 +63,11 @@ Do these in order, in one focused session:
   (no nested virt)" when unavailable). Never claim a boot or benchmark you didn't run.
 
 ### 6. Land it and hand off
-- **Commit directly to `master`** (you opted for no PR), then `git push origin master`.
-  Message format: `routine(phase-N): <what you did>`. Because there's no review gate,
-  **only commit work that builds and passes the tests you could run** — if it's not
-  green, commit nothing and record the blocker in `PROGRESS.md` instead.
+- **Land the work for review.** The remote environment automatically puts each run's
+  commits on a branch and opens a PR — it does *not* push to `master` directly. Use commit
+  message format `routine(phase-N): <what you did>`. **Only commit work that builds and
+  passes the tests you could run** — if it's not green, commit nothing and record the
+  blocker in `PROGRESS.md` instead.
 - Append to `PROGRESS.md`: date, the step taken, research that informed it, exact test
   results, and the recommended next step for tomorrow. This file + `git log` are how the
   next run (which has no memory of today) resumes without redoing or re-researching work.
