@@ -13,12 +13,8 @@ pub const STATUS_CMD_PORT: u16 = 0x64;
 
 /// i8042 controller status register bits
 const STATUS_OUTPUT_FULL: u8 = 0x01;
-const STATUS_INPUT_FULL: u8 = 0x02;
 const STATUS_SYSTEM_FLAG: u8 = 0x04;
-const STATUS_COMMAND: u8 = 0x08;
 const STATUS_MOUSE_OUTPUT: u8 = 0x20;
-const STATUS_TIMEOUT_ERROR: u8 = 0x40;
-const STATUS_PARITY_ERROR: u8 = 0x80;
 
 /// i8042 controller commands (written to port 0x64)
 #[repr(u8)]

@@ -50,6 +50,12 @@ pub struct SsdtBuilder {
 }
 
 impl SsdtBuilder {
+    /// Number of vCPUs this builder emits power-management objects for.
+    #[must_use]
+    pub const fn vcpu_count(&self) -> u8 {
+        self.vcpu_count
+    }
+
     #[must_use]
     pub fn new(vcpu_count: u8) -> Self {
         Self {

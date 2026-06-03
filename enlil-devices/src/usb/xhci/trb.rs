@@ -94,9 +94,11 @@ impl Trb {
     #[must_use]
     pub fn from_bytes(buf: &[u8; 16]) -> Self {
         Self {
-            parameter: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
-            status: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
-            control: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+            parameter: u64::from_le_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]),
+            status: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+            control: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
         }
     }
 }

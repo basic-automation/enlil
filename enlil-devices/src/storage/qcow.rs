@@ -3,7 +3,7 @@
 //! Parses the qcow2 header and L1/L2 tables to resolve guest cluster
 //! offsets to host file offsets. Write support is deferred to a later phase.
 
-use crate::truncate::{u8_of, usize_of};
+use crate::truncate::usize_of;
 use super::StorageBackend;
 use anyhow::{Context, Result, bail};
 use std::fs::File;
@@ -219,6 +219,7 @@ impl StorageBackend for QcowBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::truncate::u8_of;
 
     fn make_minimal_qcow2() -> Vec<u8> {
         // Build a minimal valid qcow2 v2 image:

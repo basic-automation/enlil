@@ -65,18 +65,27 @@ impl UsbMonitor {
     }
 
     /// Return a snapshot of all currently connected devices.
+    /// # Panics
+    ///
+    /// Panics if the internal device lock is poisoned.
     #[must_use]
     pub fn devices(&self) -> HashMap<UsbPortPath, UsbDeviceInfo> {
         self.devices.lock().expect("device lock poisoned").clone()
     }
 
     /// Return the number of connected devices.
+    /// # Panics
+    ///
+    /// Panics if the internal device lock is poisoned.
     #[must_use]
     pub fn device_count(&self) -> usize {
         self.devices.lock().expect("device lock poisoned").len()
     }
 
     /// Look up a device by its port path.
+    /// # Panics
+    ///
+    /// Panics if the internal device lock is poisoned.
     #[must_use]
     pub fn device_by_port(&self, port: &UsbPortPath) -> Option<UsbDeviceInfo> {
         self.devices
@@ -87,6 +96,9 @@ impl UsbMonitor {
     }
 
     /// Look up a device by VID:PID (returns the first match).
+    /// # Panics
+    ///
+    /// Panics if the internal device lock is poisoned.
     #[must_use]
     pub fn device_by_vid_pid(&self, vendor_id: u16, product_id: u16) -> Option<UsbDeviceInfo> {
         self.devices
@@ -98,6 +110,9 @@ impl UsbMonitor {
     }
 
     /// Register a hot-plug callback.
+    /// # Panics
+    ///
+    /// Panics if the internal device lock is poisoned.
     pub fn on_hotplug(&self, callback: HotplugCallback) {
         self.listeners
             .lock()
@@ -120,6 +135,9 @@ impl UsbMonitor {
     ///
     /// In production, the xHCI driver calls this when a port status change
     /// event fires.
+    /// # Panics
+    ///
+    /// Panics if the internal device lock is poisoned.
     pub fn report_connect(
         &self,
         port_path: UsbPortPath,
@@ -148,6 +166,9 @@ impl UsbMonitor {
     }
 
     /// Simulate a device disconnect event.
+    /// # Panics
+    ///
+    /// Panics if the internal device lock is poisoned.
     pub fn report_disconnect(&self, port_path: &UsbPortPath) -> UsbResult<()> {
         let removed = self
             .devices
@@ -171,6 +192,9 @@ impl UsbMonitor {
     }
 
     /// Check if enough time has elapsed for another poll cycle.
+    /// # Panics
+    ///
+    /// Panics if the internal device lock is poisoned.
     #[must_use]
     pub fn should_poll(&self) -> bool {
         let last = *self.last_poll.lock().expect("poll lock poisoned");
@@ -178,6 +202,9 @@ impl UsbMonitor {
     }
 
     /// Record that a poll cycle just completed.
+    /// # Panics
+    ///
+    /// Panics if the internal device lock is poisoned.
     pub fn mark_polled(&self) {
         *self.last_poll.lock().expect("poll lock poisoned") = Instant::now();
     }

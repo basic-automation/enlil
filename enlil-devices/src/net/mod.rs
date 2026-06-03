@@ -34,9 +34,9 @@ mod virtqueue;
 #[cfg(target_os = "linux")]
 mod tap;
 
-pub use backend::{NetBackend, NullBackend};
+pub use backend::{LoopbackBackend, NetBackend, NullBackend, PipeBackend};
 pub use config::NetDeviceConfig;
-pub use device::VirtioNetDevice;
+pub use device::{DeviceStatus, VirtioNetDevice};
 pub use features::NetFeatures;
 pub use header::VirtioNetHeader;
 pub use switch::{PortId, VirtualSwitch};

@@ -258,6 +258,9 @@ impl RoutingState {
 
     /// Assign a device to a guest based on current routing rules.
     /// Returns the routing decision.
+    /// # Panics
+    ///
+    /// Panics if the internal routing-state lock is poisoned.
     #[must_use]
     pub fn assign_device(&self, bus_addr: u8, device: &UsbDeviceId) -> RoutingDecision {
         let mut inner = self.inner.lock().expect("routing state poisoned");
@@ -273,6 +276,9 @@ impl RoutingState {
     /// # Errors
     ///
     /// Returns an error if the device is not currently assigned.
+    /// # Panics
+    ///
+    /// Panics if the internal routing-state lock is poisoned.
     pub fn reassign_device(
         &self,
         bus_addr: u8,
@@ -287,6 +293,9 @@ impl RoutingState {
     }
 
     /// Remove a device assignment (e.g., on disconnect).
+    /// # Panics
+    ///
+    /// Panics if the internal routing-state lock is poisoned.
     #[must_use]
     pub fn unassign_device(&self, bus_addr: u8) -> Option<GuestId> {
         let mut inner = self.inner.lock().expect("routing state poisoned");
@@ -294,6 +303,9 @@ impl RoutingState {
     }
 
     /// Get the current guest assignment for a device.
+    /// # Panics
+    ///
+    /// Panics if the internal routing-state lock is poisoned.
     #[must_use]
     pub fn get_assignment(&self, bus_addr: u8) -> Option<GuestId> {
         let inner = self.inner.lock().expect("routing state poisoned");
@@ -301,6 +313,9 @@ impl RoutingState {
     }
 
     /// Get all current assignments.
+    /// # Panics
+    ///
+    /// Panics if the internal routing-state lock is poisoned.
     #[must_use]
     pub fn all_assignments(&self) -> HashMap<u8, GuestId> {
         let inner = self.inner.lock().expect("routing state poisoned");
@@ -308,6 +323,9 @@ impl RoutingState {
     }
 
     /// Access the routing table for rule management.
+    /// # Panics
+    ///
+    /// Panics if the internal routing-state lock is poisoned.
     pub fn with_table<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut RoutingTable) -> R,

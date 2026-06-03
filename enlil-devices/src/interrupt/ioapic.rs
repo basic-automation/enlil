@@ -3,7 +3,6 @@
 //! Implements the Intel 82093AA I/O APIC with 24 redirection table entries.
 //! Accessible via MMIO at `0xFEC00000`.
 
-use crate::truncate::u32_of;
 use super::DeliveryMode;
 
 /// I/O APIC base address.
@@ -364,6 +363,7 @@ pub struct InterruptRoute {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::truncate::u32_of;
 
     #[test]
     fn ioapic_default_entries_masked() {

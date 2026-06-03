@@ -59,4 +59,5 @@ pub struct InterruptEntry {
 pub use controller::InterruptController;
 pub use ioapic::{IoApic, RedirectionEntry};
 pub use lapic::LocalApic;
-pub use msi::{MsiMessage, MsixCapability, MsixTableEntry};
+pub use ioapic::IOAPIC_BASE;
+pub use msi::{MsiCapability, MsiMessage, MsixCapability, MsixTableEntry};

@@ -31,6 +31,9 @@ impl SlitBuilder {
     ///
     /// `distances` must be `count * count` entries, row-major order.
     /// Diagonal entries should be 10 (self-distance).
+    /// # Panics
+    ///
+    /// Panics if `distances.len()` is not `count * count`.
     #[must_use]
     pub fn multi_node(count: u64, distances: Vec<u8>) -> Self {
         assert_eq!(

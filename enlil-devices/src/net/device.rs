@@ -63,6 +63,12 @@ pub struct VirtioNetDevice {
 }
 
 impl VirtioNetDevice {
+    /// Configured virtqueue size.
+    #[must_use]
+    pub const fn queue_size(&self) -> u16 {
+        self.queue_size
+    }
+
     /// Create a new `VirtIO` network device.
     #[must_use]
     pub fn new(config: &NetDeviceConfig, backend: Box<dyn NetBackend>) -> Self {

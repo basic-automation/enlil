@@ -19,8 +19,6 @@ use super::trb::Trb;
 /// Default number of TRB entries per ring segment.
 const DEFAULT_RING_SIZE: usize = 256;
 
-/// Maximum number of segments in a segmented ring (event ring).
-const MAX_SEGMENTS: usize = 16;
 
 // ---------------------------------------------------------------------------
 // TRB Ring (generic base)

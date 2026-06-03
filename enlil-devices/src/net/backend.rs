@@ -108,6 +108,7 @@ pub struct LoopbackBackend {
 }
 
 impl LoopbackBackend {
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             queue: VecDeque::new(),
@@ -159,6 +160,7 @@ pub struct PipeBackend {
 
 impl PipeBackend {
     /// Create a connected pair of pipe backends.
+    #[must_use]
     pub fn pair() -> (Self, Self) {
         let q1 = Arc::new(Mutex::new(VecDeque::new()));
         let q2 = Arc::new(Mutex::new(VecDeque::new()));

@@ -75,7 +75,7 @@ impl ClipboardPolicy {
 
 /// Clipboard entry with sequence number
 #[derive(Debug, Clone)]
-struct ClipboardEntry {
+pub struct ClipboardEntry {
     content: ClipboardContent,
     sequence: u64,
     source_guest: u32,
@@ -83,12 +83,14 @@ struct ClipboardEntry {
 
 impl ClipboardEntry {
     /// Returns the sequence number of this entry.
-    const fn sequence(&self) -> u64 {
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
         self.sequence
     }
 
     /// Returns the source guest ID that created this entry.
-    const fn source_guest(&self) -> u32 {
+    #[must_use]
+    pub const fn source_guest(&self) -> u32 {
         self.source_guest
     }
 }
