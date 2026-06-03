@@ -202,7 +202,9 @@ impl PioBus {
     /// Service a guest port write. Writes to unmapped ports are dropped.
     pub fn write(&mut self, port: u16, data: &[u8]) {
         if let Some(entry) = self.lookup_mut(port) {
-            entry.device.pio_write(port, u8_of(data.len()), le_to_u32(data));
+            entry
+                .device
+                .pio_write(port, u8_of(data.len()), le_to_u32(data));
         }
     }
 }
