@@ -6,70 +6,74 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
-## 2026-06-03 — Real device bus + wire `VmExitHandler` to it (Phase 0.2 / 5)
+## 2026-06-03 — Real device bus + KVM `VmExitHandler` bridge (Phase 2 / 0.2)
 
-Picked up the recommended next step from 2026-06-02: stop the KVM run loop's exits
-from dead-ending in stubs and route them through a real address-decoding device bus.
+The previous run's recommended next step: give guest exits somewhere to go. Done —
+the device bus is now a real dispatcher and the KVM backend is wired to it.
 
 ### Situation found
-- `enlil-devices::bus` was unwired scaffolding: `PioBus`/`MmioBus` mapped a base
-  address → a device *index* with no device storage, and `lookup` only checked
-  `base <= port` (the **upper** bound was never tested, so an access just past a
-  device's last register would mis-route to it). Nothing implemented `PioDevice`/
-  `MmioDevice` or used the buses.
-- `enlil-core::exit_handler` was three no-op stubs (`handle_exit`, `handle_io_exit`,
-  `handle_mmio_exit`) — unreferenced anywhere.
+`enlil-devices::bus` was an **unused stub**: `PioBus`/`MmioBus` mapped a base address
+to a device *index* (`BTreeMap<addr, usize>`) with **no owned devices, no dispatch, and
+no upper range bound** — so `lookup(port)` returned the nearest-lower base even for a
+port far past that device. `PioDevice`/`MmioDevice` traits existed but had zero
+implementors or callers. `enlil-core`'s `kvm_backend::VmExitHandler` had nothing behind
+it (`exit_handler.rs` is dead stubs). `enlil-core` did not depend on `enlil-devices`,
+though `ARCHITECTURE.md` specifies `enlil-core ──► enlil-devices` and Phase 2 = "PIO/MMIO
+exit handling in enlil-core".
 
-### What I did (one increment)
-- **Rebuilt `enlil-devices::bus`** into a real dispatcher:
-  - `PioDevice`/`MmioDevice` traits are now byte-slice + offset based
-    (`pio_read(offset, &mut [u8])` / `pio_write(offset, &[u8])`, MMIO analog) —
-    the access width is `data.len()`, matching `VmExitHandler` and rust-vmm
-    `vm-device`'s `MutDevicePio`/`MutDeviceMmio`.
-  - `PioBus`/`MmioBus` **own** their devices (`Box<dyn …>`) keyed by base in a
-    `BTreeMap`, register over a `[base, base+len)` window with **overlap and
-    zero-length rejection** (`BusError`), and decode against the **full** range.
-    `read`/`write` return `handled: bool`. PIO uses `u32` and MMIO `u128` interior
-    math so `base+len` can't wrap at the top of the address space.
-  - Added a combined `Bus { pio, mmio }`.
-- **Wired it in `enlil-core::exit_handler`**: replaced the stubs with
-  `impl VmExitHandler for enlil_devices::bus::Bus` (orphan rule OK — trait is local).
-  `io_in`/`mmio_read` fill from the device or `0xFF` (floating bus) when unmapped;
-  `io_out`/`mmio_write` route to the device or `log::trace!` a dropped write. Added
-  `enlil-devices` as an `enlil-core` dependency (acyclic: devices has no enlil deps).
-- **Repo hygiene**: removed 3 tracked clutter files (`enlil-core/src/memory_dump_*.txt`,
-  ~16 KB of stray source dumps; not referenced by any `include_*!` or build script).
+### What I did (one increment: the PIO/MMIO dispatch path)
+- **`enlil-devices/src/bus.rs` rewritten** into a real dispatching bus:
+  - `PioBus`/`MmioBus` now **own** `Box<dyn PioDevice/MmioDevice>` keyed by base in a
+    `BTreeMap`, registered over an explicit half-open range `[base, end)`. `register`
+    **rejects empty ranges and overlaps** (checks the predecessor's `end` and the
+    successor's `base`) → `Result<(), BusError>`.
+  - Lookup finds the greatest base `<= addr` **and confirms `addr < end`** (fixes the
+    stub's missing upper bound).
+  - Byte-slice front door (`read(addr, &mut [u8])` / `write(addr, &[u8])`) matching the
+    KVM exit / `VmExitHandler` shape, with little-endian width conversion to the typed
+    `pio_read(port,size)->u32` / `mmio_read(offset,size)->u64` device methods. PIO passes
+    the absolute port; MMIO passes `addr - base` as the offset.
+  - **x86 open-bus semantics** for unmapped addresses: reads fill `0xFF`, writes dropped.
+- **`enlil-core` ⇒ depends on `enlil-devices`** (architecturally-sanctioned edge) and a
+  new **`enlil-core/src/device_bus.rs`**: `DeviceBus { pio, mmio }` with `add_pio`/
+  `add_mmio` helpers and **`impl VmExitHandler for DeviceBus`** forwarding `io_in/io_out/
+  mmio_read/mmio_write` straight to the bus — one bus, one decode path (rust-vmm
+  `IoManager` model; see research note 2026-06-03).
+- **Repo hygiene:** removed three stray `enlil-core/src/memory_dump_{1,2,3}.txt` dumps of
+  `memory.rs` (junk from the `1f00b52` commit; not Rust, not referenced).
 
 ### Research (informed the design) — logged in `enlil-research-review.md` (2026-06-03)
-- rust-vmm `vm-device` `IoManager`: separate PIO/MMIO buses, devices registered over
-  an address *range*, full-range decode before dispatch, `&mut self` device traits →
-  validated the bus shape and exposed the upper-bound decode bug we fixed.
-- `vm-superio::Serial` (16550A): TX = write THR byte straight to an `io::Write`; RX =
-  bounded FIFO + `interrupt_evt`. → COM1 is a `PioDevice` over `0x3F8..0x400`; reuse
-  `vm-superio` rather than re-emulating the UART (this is the next step).
+rust-vmm `vm-device` `IoManager`/`PioManager`+`MmioManager` and Dragonball `dbs-device`
+both register devices over an **address range** and route by the range that *contains* the
+access — confirming the range-keyed, overlap-rejecting bus and the byte-slice/open-bus
+front door over typed device accessors.
 
-### Test results (exact CI commands)
+### Test results (exact)
 - `cargo fmt --all -- --check` → **OK**
-- `cargo clippy --all-targets --workspace -- -D warnings` → **OK** (whole workspace;
-  fixed the `collapsible_if` the new code introduced by using edition-2024 let-chains).
-- `cargo test --workspace` → **all green**: enlil-core **108 passed**
-  (incl. 4 new `exit_handler::tests`), enlil-devices **426 passed** (incl. 4 new
-  `bus::tests` — range routing, offset translation, overlap/zero-length rejection,
-  top-of-address-space no-overflow), every other crate unchanged. 0 failed.
-- KVM/guest-boot path: **not run (no nested virt)** — `/dev/kvm` is absent on this
-  runner; `kvm_create_vm_and_map_memory` self-skips as before.
-- No_std custom-target build: **N/A** — no crate is `#![no_std]` yet.
+- `cargo clippy --all-targets --workspace -- -D warnings` → **OK** (clean; bus.rs is in
+  the strict-deny `enlil-devices` crate — used edition-2024 let-chains to satisfy
+  `collapsible_if`).
+- `cargo test --workspace` → **639 passed, 0 failed** (was 630; +6 `bus` tests, +3
+  `device_bus` bridge tests). New tests cover: PIO/MMIO read LE width, write reaching the
+  owning device at the right port/offset/width (verified via `Rc<RefCell>` shared logs),
+  open-bus on unmapped, overlap + empty-range rejection, and the `VmExitHandler` bridge
+  end-to-end (a fake COM1 capturing guest bytes; MMIO offset routing).
+- KVM `/dev/kvm` path: **not run (no nested virt on this runner)** — unchanged; this
+  increment is pure userspace dispatch and needs no KVM.
+- no_std custom-target build: **N/A** — no crate is `#![no_std]` yet (`bus.rs` uses
+  `std::collections::BTreeMap`).
 
 ### Recommended next step (tomorrow)
-1. **Best next increment:** add a COM1 serial `PioDevice` (`0x3F8`, len 8) that wraps
-   `vm-superio::Serial` with TX → host stdout, register it on a `Bus`, and have
-   `KvmBackend::run_vcpu` take `&mut Bus` as its `VmExitHandler`. Add a `/dev/kvm`-gated
-   integration test that maps a tiny real-mode/long-mode blob doing `OUT 0x3F8, 'X'`
-   then `HLT`, runs the vCPU, and asserts the byte reached the serial sink. This is the
-   last hop to the Phase 0.2 "Linux to a serial shell" milestone.
-2. The bus stores `Box<dyn PioDevice>` (no `Send`); if/when vCPUs run on their own
-   threads, revisit to `Arc<Mutex<…>>` per rust-vmm — fine for the single-vCPU loop now.
-3. Still worth requesting a KVM-enabled runner so the guest-boot path actually executes.
+1. **Register a real device on the bus.** Wrap the 16550 UART in `enlil-core::serial`
+   (or a thin `enlil-devices` adapter) as a `PioDevice` at COM1 `0x3F8..0x400` and add it
+   to `DeviceBus` so guest serial writes reach the console. Then a `/dev/kvm`-gated
+   integration test that loads a tiny real-mode code blob which writes a byte to `0x3F8`
+   and `hlt`s, runs it via `KvmBackend::run_vcpu` with the `DeviceBus` handler, and asserts
+   the byte arrived — this finally exercises the full exit→device path and advances the
+   Phase 0.2 "Linux to serial shell" milestone. (Needs a KVM-capable runner to actually
+   run; otherwise it self-skips like the existing `kvm_create_vm_and_map_memory`.)
+2. After serial: PIT (`0x40-0x43`) and the PCI config-space ports (`0xCF8/0xCFC`) are the
+   next PIO devices a guest touches early in boot.
 
 ---
 
