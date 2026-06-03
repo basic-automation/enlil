@@ -211,3 +211,27 @@ current rust-vmm patterns to make sure the run-loop/exit model matches the ecosy
   Phase 8/CVM work: a second `map_private_memory` path on
   `set_user_memory_region2` will be needed if we ever target confidential guests,
   and it is incompatible with host-side memory introspection.
+
+## 2026-06-03 — Device-Bus Address Decode & PIO/MMIO Dispatch (Phase 2 / 0.2)
+
+Context: the next step from PROGRESS — give guest exits somewhere to go by turning
+`enlil-devices::bus` from an unused address→index *routing table* (no owned devices,
+no upper-range bound, no dispatch) into a real dispatching bus, then bridge it to the
+backend's `VmExitHandler` in `enlil-core` (ARCHITECTURE Phase 2: "PIO/MMIO exit
+handling in enlil-core").
+
+- **rust-vmm `vm-device` `IoManager` / `PioManager`+`MmioManager`** —
+  https://github.com/rust-vmm/vm-device/blob/main/README.md ,
+  https://docs.rs/vm-device/latest/vm_device/ — devices are registered on a bus over
+  an explicit **address *range*** (`PioRange`/`MmioRange`); on an access the manager
+  finds the device whose range *contains* the address and routes to it. *How it
+  changes the build:* our new `PioBus`/`MmioBus` register `Box<dyn PioDevice/MmioDevice>`
+  keyed by base in a `BTreeMap` and validate `addr < end` on lookup (the old stub only
+  stored the base, so any port above a device's range wrongly matched it) and reject
+  overlapping registrations. Keep ONE bus / one decode path — `enlil-core`'s
+  `VmExitHandler` impl forwards straight to it (no parallel decode), per the prior note.
+- **dbs-device `device_manager`** — https://docs.rs/dbs-device/0.1.0/dbs_device/device_manager/
+  — Dragonball uses the same split-bus model. Confirms the byte-slice front door
+  (`read(addr, &mut [u8])` / `write(addr, &[u8])`) matching the KVM exit shape, with
+  internal little-endian width conversion to the device's typed accessors, and x86
+  *open-bus* semantics for unmapped addresses (reads → all-ones `0xFF`, writes dropped).

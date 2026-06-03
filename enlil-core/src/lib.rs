@@ -1,6 +1,7 @@
 pub mod acpi;
 pub mod affinity;
 pub mod cpuid;
+pub mod device_bus;
 pub mod ept;
 pub mod error;
 pub mod exit_handler;
