@@ -1,6 +1,8 @@
-//! VM Exit Handler
+//! Legacy VM-exit helpers.
 //!
-//! Processes KVM VM exits (IO, MMIO, HLT, CPUID, etc.) and dispatches to appropriate handlers.
+//! This module is currently a placeholder. The active exit-dispatch path is
+//! `device_bus::DeviceBus`, which implements
+//! [`crate::kvm_backend::VmExitHandler`].
 
 pub fn handle_exit(_exit_reason: u32, _rip: u64) -> bool {
     // Handle various exit reasons
