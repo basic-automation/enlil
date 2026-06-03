@@ -131,7 +131,7 @@ they succeed precisely because they don't share hot state:
   trust-ranking plane that grows the pool beyond your own machines.
 - **Verifiable execution + consensus (à la Ethereum):** validity/fraud proofs and BFT
   consensus let untrusted remote nodes run work you can trust without redoing it, and keep
-  replicated guests consistent. See `enlil-zk-performance-research.md`.
+  replicated guests consistent. See [`RESEARCH.md`](RESEARCH.md) → Part II.
 
 ### Transparency is per-guest-family
 
@@ -274,8 +274,8 @@ Enlil must be testable without modifying the user's existing system. This is the
 - **Goal:** A user with a USB drive and two ISOs goes from zero to two running desktops in under 30 minutes
 
 ### 0.4 Documentation
-- Write ARCHITECTURE.md documenting the crate structure and design decisions
-- Document the KVM-to-bare-metal migration plan
+- Write [`README.md`](README.md) documenting the crate structure, layer stack, and design decisions
+- Document the KVM-to-bare-metal migration plan (the phase progression in this roadmap)
 - Set up mdbook or similar for developer docs
 
 ---
