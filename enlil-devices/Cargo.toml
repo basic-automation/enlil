@@ -5,6 +5,7 @@ edition = "2024"
 description = "Virtual device backends — USB router, GPU arbiter, storage, network"
 
 [dependencies]
+enlil-core = { path = "../enlil-core" }
 log = "0.4"
 anyhow = "1"
 thiserror = "2"

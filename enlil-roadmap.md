@@ -221,13 +221,25 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > `KvmBackend::{new, map_memory, create_vcpu, run_vcpu}` over `kvm-ioctls`, with a
 > hypervisor-agnostic `GuestExit` model and a `VmExitHandler` trait
 > (`io_in/io_out/mmio_read/mmio_write`). Integration tests that touch `/dev/kvm`
-> self-skip when nested virt is unavailable. **Next:** when wiring exits to devices,
-> implement `VmExitHandler` *for* `enlil-devices::bus::Bus` and forward to its existing
-> dispatch — do not build a parallel address-decode path (matches rust-vmm `vm-device`
-> `IoManager`). `map_memory` intentionally uses the classic `set_user_memory_region`
+> self-skip when nested virt is unavailable. `map_memory` intentionally uses the classic `set_user_memory_region`
 > (hva-backed) so the host can synthesise/introspect guest memory for ACPI/SMBIOS
 > injection; a `set_user_memory_region2` / `guest_memfd` path is only needed for
 > confidential guests (Phase 8) and is incompatible with that introspection.
+>
+> **Status (2026-06-03):** `enlil-devices::bus::Bus` is now an *owning* device bus
+> (boxed `PioDevice`/`MmioDevice` trait objects keyed by range in a `BTreeMap`,
+> with overlap/empty-range registration checks) and **implements `VmExitHandler`**,
+> so KVM I/O and MMIO exits route straight to the owning device with one
+> address-decode path (the rust-vmm `vm-device` `IoManager` shape). Dispatch is
+> byte-oriented little-endian to match KVM's buffers; unmapped accesses float to
+> all-ones on read and drop writes. **Next:** give the existing emulated devices
+> (serial UART in `enlil-core::serial`, PIT/PIC/IOAPIC, PS/2) `PioDevice`/
+> `MmioDevice` impls and register them on a `Bus`, then drive a `KvmBackend`
+> `run_vcpu` loop with that `Bus` as the handler — boot a tiny code blob to `HLT`
+> as a `/dev/kvm`-gated integration test. Note: `serial` lives in `enlil-core` but
+> the `Bus` is in `enlil-devices` (which now depends on `enlil-core`); the serial
+> `PioDevice` impl therefore belongs on the `enlil-devices` side (a thin adapter
+> over `UartState`) to respect crate layering.
 
 ### 0.3 USB Live Boot & Non-Destructive Testing (CRITICAL FOR ADOPTION)
 

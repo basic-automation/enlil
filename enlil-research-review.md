@@ -211,3 +211,38 @@ current rust-vmm patterns to make sure the run-loop/exit model matches the ecosy
   Phase 8/CVM work: a second `map_private_memory` path on
   `set_user_memory_region2` will be needed if we ever target confidential guests,
   and it is incompatible with host-side memory introspection.
+
+---
+
+## 2026-06-03 — Device Bus dispatch shape (wiring `VmExitHandler` → devices, Phase 0.2 / 5)
+
+Context: implementing the run-loop→device wiring flagged yesterday — an owning
+`enlil-devices::bus::Bus` that implements `enlil_core::kvm_backend::VmExitHandler`.
+Re-checked the canonical rust-vmm dispatch contract before building; nothing here
+is new theory, it confirms the concrete API shape.
+
+- **rust-vmm `vm-device` `IoManager` / `Mut{Device}Pio|Mmio`** —
+  https://github.com/rust-vmm/vm-device/blob/main/README.md — the manager owns
+  two address-keyed buses (PIO + MMIO), registers each device over a *range*, and
+  the VMM dispatches VM-exits via `pio_read/pio_write/mmio_read/mmio_write`; the
+  manager looks up the device whose registered range contains the address and
+  forwards. *How it changed the build:* our `Bus` mirrors this exactly — devices
+  keyed by range base in a `BTreeMap`, `O(log n)` "greatest base ≤ target" lookup
+  plus an upper-bound check, and four byte-oriented dispatch methods feeding the
+  `VmExitHandler` impl. We intentionally kept a single owning bus (not a separate
+  index map) so there is one address-decode path, per yesterday's note.
+- **`VcpuExit::IoIn` buffer = `count * size`** —
+  https://docs.rs/kvm-ioctls/latest/kvm_ioctls/enum.VcpuExit.html — string I/O
+  (`rep ins/outs`) surfaces as a buffer longer than one element; the slice is the
+  whole `count*size` transfer with no separate width field. *How it changed the
+  build:* `Bus::{read,write}_pio` treat `len <= 4` as a single width-`len` access
+  but fall back to byte-wide accesses to the *same* port for longer buffers
+  (`rep outsb`/`insb`, the realistic console DMA path), and MMIO splits long
+  buffers across ascending addresses. Documented as a known simplification: a
+  non-byte string width (`rep outsw`) would need the explicit size from `kvm_run`,
+  which the slice form doesn't carry — revisit if a guest actually uses it.
+- **Unmapped-access semantics** — Intel SDM Vol.1 §18 / real-hw behaviour: an
+  unclaimed x86 bus read floats to all-ones and writes are dropped. *How it
+  changed the build:* `Bus` fills `0xFF` on reads with no registered device and
+  silently drops writes, rather than the `VmExitHandler` default (leave buffer
+  untouched). This is the more faithful guest-visible behaviour for probing.
