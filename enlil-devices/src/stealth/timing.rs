@@ -69,8 +69,8 @@ impl TimingStealth {
             // Update calibration
             self.exit_count += 1;
             self.exit_cost_sum += exit_duration;
-            if self.exit_count > 0 {
-                self.avg_cpuid_exit_cost = self.exit_cost_sum / self.exit_count;
+            if let Some(avg) = self.exit_cost_sum.checked_div(self.exit_count) {
+                self.avg_cpuid_exit_cost = avg;
             }
         }
 

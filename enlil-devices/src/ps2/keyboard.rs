@@ -142,7 +142,7 @@ impl Ps2Keyboard {
                     self.output_queue.push_back(self.scancode_set);
                     Some(ACK)
                 } else {
-                    self.scancode_set = data.min(3).max(1);
+                    self.scancode_set = data.clamp(1, 3);
                     Some(ACK)
                 }
             }

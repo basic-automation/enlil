@@ -37,7 +37,7 @@ impl Trb {
 
     /// Create a TRB with the given type and all other fields zeroed.
     #[must_use]
-    pub fn new(trb_type: TrbType) -> Self {
+    pub const fn new(trb_type: TrbType) -> Self {
         let mut trb = Self::zeroed();
         trb.set_trb_type(trb_type);
         trb
@@ -65,7 +65,7 @@ impl Trb {
     }
 
     /// Alias for [`set_cycle_bit`](Self::set_cycle_bit) — used by ring implementations.
-    pub fn set_cycle(&mut self, cycle: bool) {
+    pub const fn set_cycle(&mut self, cycle: bool) {
         self.set_cycle_bit(cycle);
     }
 
@@ -490,7 +490,7 @@ impl EventTrb {
 
     /// Attempt to decode an event TRB from a raw TRB.
     #[must_use]
-    pub fn from_trb(trb: &Trb) -> Option<Self> {
+    pub const fn from_trb(trb: &Trb) -> Option<Self> {
         match trb.decoded_type() {
             TrbType::TransferEvent => Some(Self::TransferEvent {
                 trb_pointer: trb.parameter,

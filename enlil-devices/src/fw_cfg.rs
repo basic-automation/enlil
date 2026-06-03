@@ -153,8 +153,10 @@ impl FwCfgDevice {
     }
 
     /// Handle PIO write
-    pub fn pio_write(&mut self, port: u16, value: u16) {
-        if port == FW_CFG_PORT_SEL { self.write_selector(value) }
+    pub const fn pio_write(&mut self, port: u16, value: u16) {
+        if port == FW_CFG_PORT_SEL {
+            self.write_selector(value);
+        }
     }
 
     /// Get the number of registered files

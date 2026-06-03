@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::types::{
-    DeviceSpeed, UsbAddress, UsbDeviceDescriptor, UsbDeviceInfo, UsbDeviceState,
-    UsbError, UsbPortPath, UsbResult,
+    DeviceSpeed, UsbAddress, UsbDeviceDescriptor, UsbDeviceInfo, UsbDeviceState, UsbError,
+    UsbPortPath, UsbResult,
 };
 
 // ---------------------------------------------------------------------------
@@ -198,6 +198,7 @@ impl UsbMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::usb::types::UsbDeviceClass;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn test_descriptor(vid: u16, pid: u16) -> UsbDeviceDescriptor {

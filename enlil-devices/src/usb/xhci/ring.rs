@@ -20,6 +20,7 @@ use super::trb::Trb;
 const DEFAULT_RING_SIZE: usize = 256;
 
 /// Maximum number of segments in a segmented ring (event ring).
+#[allow(dead_code)] // defined for spec completeness; not all bits/fields are consumed yet
 const MAX_SEGMENTS: usize = 16;
 
 // ---------------------------------------------------------------------------
@@ -343,13 +344,13 @@ impl TransferRing {
     }
 
     /// Halt this endpoint (e.g., on a STALL or error).
-    pub fn halt(&mut self) {
+    pub const fn halt(&mut self) {
         self.halted = true;
         self.ring.stop();
     }
 
     /// Clear the halt condition (after Reset Endpoint command).
-    pub fn clear_halt(&mut self) {
+    pub const fn clear_halt(&mut self) {
         self.halted = false;
         self.ring.start();
     }
@@ -385,6 +386,7 @@ impl TransferRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::usb::xhci::trb::TrbType;
 
     #[test]
     fn trb_ring_enqueue_dequeue() {

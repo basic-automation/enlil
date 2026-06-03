@@ -285,7 +285,7 @@ impl CpuidStealthTable {
                 eax: smt_shift,
                 ebx: threads_per_core,
                 ecx: (1 << 8), // SMT level type = 1, level number = 0
-                edx: 0,            // x2APIC ID (set per-vCPU at runtime)
+                edx: 0,        // x2APIC ID (set per-vCPU at runtime)
             },
         });
 

@@ -196,16 +196,16 @@ impl HdaController {
             regs::WALCLK => u64::from(self.walclk),
             regs::SSYNC => u64::from(self.ssync),
 
-            regs::CORBLBASE => (self.corb_base & 0xFFFF_FFFF),
-            regs::CORBUBASE => (self.corb_base >> 32),
+            regs::CORBLBASE => self.corb_base & 0xFFFF_FFFF,
+            regs::CORBUBASE => self.corb_base >> 32,
             regs::CORBWP => u64::from(self.corb_wp),
             regs::CORBRP => u64::from(self.corb_rp),
             regs::CORBCTL => u64::from(self.corb_ctl),
             regs::CORBSTS => u64::from(self.corb_sts),
             regs::CORBSIZE => u64::from(self.corb_size),
 
-            regs::RIRBLBASE => (self.rirb_base & 0xFFFF_FFFF),
-            regs::RIRBUBASE => (self.rirb_base >> 32),
+            regs::RIRBLBASE => self.rirb_base & 0xFFFF_FFFF,
+            regs::RIRBUBASE => self.rirb_base >> 32,
             regs::RIRBWP => u64::from(self.rirb_wp),
             regs::RINTCNT => u64::from(self.rintcnt),
             regs::RIRBCTL => u64::from(self.rirb_ctl),
@@ -475,7 +475,7 @@ mod tests {
 
     #[test]
     fn pci_ids() {
-        let (vendor, device) = HdaController::pci_ids();
+        let (vendor, _device) = HdaController::pci_ids();
         assert_eq!(vendor, 0x8086);
     }
 }

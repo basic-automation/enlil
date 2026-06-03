@@ -87,6 +87,9 @@ impl TapBackend {
     /// Returns an error if the control socket cannot be opened or the
     /// `SIOCBRADDIF` ioctl fails.
     pub fn attach_to_bridge(&self, bridge_name: &str) -> io::Result<()> {
+        // SIOCBRADDIF: add an interface to a bridge.
+        const SIOCBRADDIF: libc::c_ulong = 0x89a2;
+
         let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
         if sock < 0 {
             return Err(io::Error::last_os_error());
@@ -105,8 +108,6 @@ impl TapBackend {
         // little-endian byte layout, so no lossy cast is needed.
         ifr[16..20].copy_from_slice(&ifindex.to_le_bytes());
 
-        // SIOCBRADDIF = 0x89a2
-        const SIOCBRADDIF: libc::c_ulong = 0x89a2;
         let ret = unsafe { libc::ioctl(sock, SIOCBRADDIF as _, ifr.as_mut_ptr()) };
         unsafe {
             libc::close(sock);
@@ -130,6 +131,9 @@ impl TapBackend {
         // declare them as u16 to avoid a lossy cast from c_int.
         const IFF_UP: u16 = 0x1;
         const IFF_RUNNING: u16 = 0x40;
+        // Get/set interface flags ioctls.
+        const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
+        const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
 
         let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
         if sock < 0 {
@@ -140,10 +144,6 @@ impl TapBackend {
         let name_bytes = self.name.as_bytes();
         let copy_len = name_bytes.len().min(15);
         ifr[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
-
-        // SIOCGIFFLAGS
-        const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
-        const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
 
         let ret = unsafe { libc::ioctl(sock, SIOCGIFFLAGS as _, ifr.as_mut_ptr()) };
         if ret < 0 {
@@ -172,13 +172,14 @@ impl TapBackend {
     }
 
     fn get_ifindex(&self, sock: RawFd) -> io::Result<i32> {
+        // SIOCGIFINDEX: resolve interface name to index.
+        const SIOCGIFINDEX: libc::c_ulong = 0x8933;
+
         let mut ifr = [0u8; 40];
         let name_bytes = self.name.as_bytes();
         let copy_len = name_bytes.len().min(15);
         ifr[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
 
-        // SIOCGIFINDEX
-        const SIOCGIFINDEX: libc::c_ulong = 0x8933;
         let ret = unsafe { libc::ioctl(sock, SIOCGIFINDEX as _, ifr.as_mut_ptr()) };
         if ret < 0 {
             return Err(io::Error::last_os_error());

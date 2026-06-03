@@ -240,7 +240,7 @@ impl VirtualTpm {
     /// Process a TPM command from the command buffer
     fn process_command(&mut self) {
         if self.cmd_buffer.len() < 10 {
-            self.write_error_response(0x000001_01); // TPM_RC_FAILURE
+            self.write_error_response(0x0000_0101); // TPM_RC_FAILURE
             return;
         }
 
@@ -401,6 +401,6 @@ mod tests {
         let val = tpm.read_register(crb_regs::DATA_BUFFER, 1);
         // Data buffer read returns from rsp_buffer, write goes to cmd_buffer
         // so they won't match, but both operations should not panic
-        assert!(val == 0 || val == 0x42 || true); // Just verify no panic
+        let _ = val; // only checking that the read/write path does not panic
     }
 }

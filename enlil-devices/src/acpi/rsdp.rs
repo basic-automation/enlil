@@ -1,7 +1,7 @@
-/// ACPI 2.0+ RSDP (Root System Description Pointer) builder.
-///
-/// The RSDP is the entry point to the ACPI table hierarchy.
-/// Located at a well-known physical address, it points to the XSDT.
+//! ACPI 2.0+ RSDP (Root System Description Pointer) builder.
+//!
+//! The RSDP is the entry point to the ACPI table hierarchy.
+//! Located at a well-known physical address, it points to the XSDT.
 
 const RSDP_SIGNATURE: &[u8; 8] = b"RSD PTR ";
 const RSDP_REVISION_2: u8 = 2;

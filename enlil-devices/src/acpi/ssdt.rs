@@ -43,6 +43,7 @@ pub struct CState {
 /// SSDT builder for CPU power management objects
 pub struct SsdtBuilder {
     oem: OemInfo,
+    #[allow(dead_code)] // defined for spec completeness; not all bits/fields are consumed yet
     vcpu_count: u8,
     pstates: Vec<PState>,
     cstates: Vec<CState>,
@@ -462,7 +463,7 @@ mod tests {
             .pstates(vec![
                 PState {
                     frequency_mhz: 4000,
-                    power_mw: 105000,
+                    power_mw: 105_000,
                     latency_us: 10,
                     control: 0x28,
                     status: 0x28,

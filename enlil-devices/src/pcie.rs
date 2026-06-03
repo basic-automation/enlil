@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn config_space_read_write() {
-        let mut cs = PciConfigSpace::new(PciBdf::new(0, 0, 0), 0x8086, 0x1234);
+        let cs = PciConfigSpace::new(PciBdf::new(0, 0, 0), 0x8086, 0x1234);
         assert_eq!(cs.vendor_id(), 0x8086);
         assert_eq!(cs.device_id(), 0x1234);
         assert!(cs.is_present());

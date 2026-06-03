@@ -545,7 +545,7 @@ mod tests {
         let state = RoutingState::new(table);
 
         let dev = make_device(0x046d, 0xc077);
-        state.assign_device(1, &dev);
+        let _ = state.assign_device(1, &dev);
         let removed = state.unassign_device(1);
         assert_eq!(removed, Some("linux1".into()));
         assert_eq!(state.get_assignment(1), None);
@@ -566,7 +566,7 @@ mod tests {
         let handle = state.clone_handle();
 
         let dev = make_device(0x046d, 0xc077);
-        state.assign_device(1, &dev);
+        let _ = state.assign_device(1, &dev);
         assert_eq!(handle.get_assignment(1), Some("linux1".into()));
     }
 

@@ -148,7 +148,7 @@ impl HdaCodec {
     #[must_use]
     #[allow(clippy::cast_lossless)]
     pub fn process_verb(&mut self, verb: u32) -> u32 {
-        let _codec_addr = (verb >> 28) & 0xF;
+        // bits 28-31 are the codec address (single codec here, so ignored)
         let nid = ((verb >> 20) & 0x7F) as u8;
         let payload = verb & 0xFFFFF;
 
@@ -278,7 +278,7 @@ mod tests {
     fn pin_config_query() {
         let mut codec = HdaCodec::new_realtek();
         // Query NID 0x14 pin config default
-        let verb = (0x14u32 << 20) | 0xF1C_00;
+        let verb = (0x14u32 << 20) | 0x000F_1C00;
         let response = codec.process_verb(verb);
         assert_ne!(response, 0, "Pin config should be non-zero for line out");
     }

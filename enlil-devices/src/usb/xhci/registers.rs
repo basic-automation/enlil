@@ -57,7 +57,7 @@ impl CapabilityRegisters {
         let hcsparams2 = 0x1 | (4 << 4);
 
         // HCSPARAMS3: U1 device exit latency = 10µs, U2 = 2047µs
-        let hcsparams3 = 10 | (2047 << 16);
+        let hcsparams3 = 0x0A | (0x7FF << 16);
 
         // HCCPARAMS1: AC64=1 (64-bit addressing), CSZ=1 (64-byte context)
         let hccparams1 = 0x1 | (1 << 2);
