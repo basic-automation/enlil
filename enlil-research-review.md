@@ -211,3 +211,28 @@ current rust-vmm patterns to make sure the run-loop/exit model matches the ecosy
   Phase 8/CVM work: a second `map_private_memory` path on
   `set_user_memory_region2` will be needed if we ever target confidential guests,
   and it is incompatible with host-side memory introspection.
+
+## 2026-06-03 — Device-bus address decode (PIO/MMIO dispatch) for the run loop (Phase 0.2 / 5)
+
+Context: building the real `enlil-devices::bus` dispatcher that `VmExitHandler`
+will forward to (the prior `PioBus`/`MmioBus` were base→index stubs with no device
+storage and no upper-bound check). Confirmed the design against rust-vmm.
+
+- **rust-vmm `vm-device` IoManager / Mut{Pio,Mmio}Device** —
+  https://github.com/rust-vmm/vm-device/blob/main/README.md ,
+  https://docs.rs/vm-device/latest/vm_device/ — canonical model: *separate* PIO and
+  MMIO buses; devices are registered over an **address range**; on each access the
+  manager checks a device is registered **for the requested address** and only then
+  dispatches; `MutDevicePio`/`MutDeviceMmio` take `&mut self` (matches our
+  `VmExitHandler`'s `&mut self`). *How it changes the build:* our `lookup` only tested
+  `base <= port` (greatest lower bound) and never the **upper** bound — an access just
+  past a device's last register would mis-route to that device. Fix: store
+  `(base, len)` ranges and require `port < base + len`; return a `handled: bool` so
+  the run loop can log/zero-or-0xFF unmapped accesses instead of silently mis-routing.
+- **vm-superio `Serial` (16550A)** — https://github.com/rust-vmm/vm-superio ,
+  https://docs.rs/vm-superio/ — TX is trivial (write THR byte straight to an
+  `io::Write`); RX uses a bounded FIFO + an `interrupt_evt` to signal the driver;
+  emulates DLL/IER/DLH/IIR/LCR/LSR/MCR/MSR/SR. *How it changes the build:* the COM1
+  serial device (the 0.2 milestone "shell over serial") is a `PioDevice` over the
+  8-port range `0x3F8..0x400`; our new range-checked bus must register exactly that
+  span. Reuse `vm-superio::Serial` rather than re-emulating the UART when we add COM1.

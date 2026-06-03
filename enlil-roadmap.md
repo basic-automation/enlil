@@ -221,10 +221,19 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > `KvmBackend::{new, map_memory, create_vcpu, run_vcpu}` over `kvm-ioctls`, with a
 > hypervisor-agnostic `GuestExit` model and a `VmExitHandler` trait
 > (`io_in/io_out/mmio_read/mmio_write`). Integration tests that touch `/dev/kvm`
-> self-skip when nested virt is unavailable. **Next:** when wiring exits to devices,
-> implement `VmExitHandler` *for* `enlil-devices::bus::Bus` and forward to its existing
-> dispatch — do not build a parallel address-decode path (matches rust-vmm `vm-device`
-> `IoManager`). `map_memory` intentionally uses the classic `set_user_memory_region`
+> self-skip when nested virt is unavailable.
+>
+> **Status (2026-06-03):** the device bus is now real and wired. `enlil-devices::bus`
+> owns `PioBus`/`MmioBus` that register devices over a `[base, base+len)` range (with
+> overlap + zero-length rejection) and decode on the **full** range, plus a combined
+> `Bus { pio, mmio }`. `enlil-core::exit_handler` implements `VmExitHandler` *for*
+> `enlil_devices::bus::Bus` (single bus, single decode — matches rust-vmm `vm-device`
+> `IoManager`): `io_in`/`mmio_read` fill the buffer from the device or return `0xFF`
+> for unmapped reads (floating bus); `io_out`/`mmio_write` route to the device or log
+> a dropped write. **Next:** add a real COM1 `PioDevice` over `0x3F8..0x400` (wrap
+> `vm-superio::Serial`, TX → host stdout) and have `run_vcpu` drive a `Bus`, then a
+> `/dev/kvm`-gated test that boots a tiny `OUT 0x3F8; HLT` blob and observes the byte.
+> `map_memory` intentionally uses the classic `set_user_memory_region`
 > (hva-backed) so the host can synthesise/introspect guest memory for ACPI/SMBIOS
 > injection; a `set_user_memory_region2` / `guest_memfd` path is only needed for
 > confidential guests (Phase 8) and is incompatible with that introspection.
