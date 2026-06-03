@@ -156,7 +156,7 @@ impl HdaCodec {
         // - 12-bit verb [19:8] + 8-bit param [7:0] for get/set verbs (0x200-0xFFF)
         // - 4-bit verb [19:16] + 16-bit param [15:0] for set verbs (0x1-0x7)
         let verb_high = (payload >> 16) & 0xF;
-        let verb_id = if verb_high >= 1 && verb_high <= 7 {
+        let verb_id = if (1..=7).contains(&verb_high) {
             // 4-bit verb + 16-bit payload
             verb_high
         } else {

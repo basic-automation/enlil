@@ -11,7 +11,7 @@ pub struct SlitBuilder {
     oem: OemInfo,
     /// Number of NUMA proximity domains
     locality_count: u64,
-    /// Distance matrix (row-major, locality_count × locality_count)
+    /// Distance matrix (row-major, `locality_count` × `locality_count`)
     distances: Vec<u8>,
 }
 
@@ -45,7 +45,7 @@ impl SlitBuilder {
     }
 
     #[must_use]
-    pub fn oem_info(mut self, oem: OemInfo) -> Self {
+    pub const fn oem_info(mut self, oem: OemInfo) -> Self {
         self.oem = oem;
         self
     }

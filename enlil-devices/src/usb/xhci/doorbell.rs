@@ -38,7 +38,7 @@ impl DoorbellTarget {
     ///   - Bits [7:0]: DB Target (endpoint ID or 0 for command ring)
     ///   - Bits [31:16]: DB Stream ID
     #[must_use]
-    pub fn decode(doorbell_index: u8, value: u32) -> Self {
+    pub const fn decode(doorbell_index: u8, value: u32) -> Self {
         let target = (value & 0xFF) as u8;
         let stream_id = ((value >> 16) & 0xFFFF) as u16;
 
@@ -97,7 +97,7 @@ impl fmt::Display for DoorbellTarget {
 /// these writes and process the TRBs from guest memory.
 #[derive(Debug)]
 pub struct DoorbellArray {
-    /// Doorbell register values. Index 0 = HC, 1..=max_slots = device slots.
+    /// Doorbell register values. Index 0 = HC, `1..=max_slots` = device slots.
     registers: Vec<u32>,
     /// Pending doorbell rings (slot indices that have been written since last check).
     pending: Vec<bool>,
@@ -108,7 +108,7 @@ pub struct DoorbellArray {
 impl DoorbellArray {
     /// Create a new doorbell array for the given number of device slots.
     ///
-    /// Total doorbells = max_slots + 1 (doorbell 0 is for the HC).
+    /// Total doorbells = `max_slots` + 1 (doorbell 0 is for the HC).
     #[must_use]
     pub fn new(max_slots: u8) -> Self {
         let count = usize::from(max_slots) + 1;
@@ -170,7 +170,7 @@ impl DoorbellArray {
 
     /// Number of doorbells in the array.
     #[must_use]
-    pub fn count(&self) -> usize {
+    pub const fn count(&self) -> usize {
         self.registers.len()
     }
 

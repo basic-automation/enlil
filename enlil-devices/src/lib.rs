@@ -19,7 +19,7 @@
 //! - PS/2 keyboard/mouse
 //! - Intel HDA audio controller
 //! - PCI Express root complex
-//! - QEMU fw_cfg firmware configuration
+//! - QEMU `fw_cfg` firmware configuration
 
 pub mod acpi;
 pub mod block;

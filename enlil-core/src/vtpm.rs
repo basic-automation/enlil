@@ -51,6 +51,9 @@ impl TpmPcr {
 }
 
 /// Virtual TPM 2.0 Emulation
+// EK/AIK/SRK key material is generated and stored now; the attestation/quote
+// paths that consume it land later in Phase 5 (vTPM 2.0).
+#[allow(dead_code)]
 pub struct VirtualTpm {
     /// PCRs 0-23 (24 total)
     pcrs: Vec<TpmPcr>,
@@ -64,6 +67,12 @@ pub struct VirtualTpm {
     nv_storage: HashMap<u32, Vec<u8>>,
     /// TPM is initialized
     initialized: bool,
+}
+
+impl Default for VirtualTpm {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl VirtualTpm {
@@ -150,6 +159,12 @@ impl VirtualTpm {
 /// TPM Command Dispatcher
 pub struct TpmDispatcher {
     tpm: VirtualTpm,
+}
+
+impl Default for TpmDispatcher {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TpmDispatcher {

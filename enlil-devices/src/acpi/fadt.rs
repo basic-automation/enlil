@@ -160,43 +160,43 @@ impl FadtBuilder {
     }
 
     #[must_use]
-    pub fn oem_info(mut self, oem: OemInfo) -> Self {
+    pub const fn oem_info(mut self, oem: OemInfo) -> Self {
         self.oem = oem;
         self
     }
 
     #[must_use]
-    pub fn sci_interrupt(mut self, irq: u16) -> Self {
+    pub const fn sci_interrupt(mut self, irq: u16) -> Self {
         self.sci_interrupt = irq;
         self
     }
 
     #[must_use]
-    pub fn flags(mut self, flags: u32) -> Self {
+    pub const fn flags(mut self, flags: u32) -> Self {
         self.flags = flags;
         self
     }
 
     #[must_use]
-    pub fn boot_arch_flags(mut self, flags: u16) -> Self {
+    pub const fn boot_arch_flags(mut self, flags: u16) -> Self {
         self.boot_arch_flags = flags;
         self
     }
 
     #[must_use]
-    pub fn pm1a_event_block(mut self, port: u32) -> Self {
+    pub const fn pm1a_event_block(mut self, port: u32) -> Self {
         self.pm1a_event_block = port;
         self
     }
 
     #[must_use]
-    pub fn pm1a_control_block(mut self, port: u32) -> Self {
+    pub const fn pm1a_control_block(mut self, port: u32) -> Self {
         self.pm1a_control_block = port;
         self
     }
 
     #[must_use]
-    pub fn pm_timer_block(mut self, port: u32) -> Self {
+    pub const fn pm_timer_block(mut self, port: u32) -> Self {
         self.pm_timer_block = port;
         self
     }
@@ -312,7 +312,7 @@ impl FadtBuilder {
         // Offset 208: X_PM_TMR_BLK
         GenericAddress::io(u64::from(self.pm_timer_block), 32).write_to(&mut buf);
         // Offset 220: X_GPE0_BLK
-        GenericAddress::io(u64::from(self.gpe0_block), u8::from(self.gpe0_length) * 8)
+        GenericAddress::io(u64::from(self.gpe0_block), self.gpe0_length * 8)
             .write_to(&mut buf);
         // Offset 232: X_GPE1_BLK
         GenericAddress::zero().write_to(&mut buf);

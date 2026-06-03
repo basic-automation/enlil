@@ -113,6 +113,12 @@ pub struct LbrSanitizer {
     pub expected_guest_branch_target: u64,
 }
 
+impl Default for LbrSanitizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LbrSanitizer {
     pub fn new() -> Self {
         Self {
@@ -122,7 +128,7 @@ impl LbrSanitizer {
 
     /// Sanitize LBR stack after a detected VMEXIT (e.g., via CPUID trap)
     /// Removes or falsifies the branch record that shows branch-to-hypervisor
-    pub fn sanitize_lbr(&self, lbr_stack: &mut Vec<(u64, u64)>, guest_rip: u64) {
+    pub fn sanitize_lbr(&self, lbr_stack: &mut [(u64, u64)], guest_rip: u64) {
         if let Some((from, _to)) = lbr_stack.last_mut() {
             // The most recent LBR entry shows: from=guest_instruction, to=hypervisor_entry
             // Replace the "to" with the next expected guest instruction (to hide the VMEXIT)
@@ -145,6 +151,12 @@ pub struct CpuidResponse {
     pub ebx: u32,
     pub ecx: u32,
     pub edx: u32,
+}
+
+impl Default for CpuidCachingHelper {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CpuidCachingHelper {

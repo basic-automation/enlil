@@ -56,7 +56,7 @@ impl Trb {
     }
 
     /// Set the cycle bit.
-    pub fn set_cycle_bit(&mut self, cycle: bool) {
+    pub const fn set_cycle_bit(&mut self, cycle: bool) {
         if cycle {
             self.control |= 1;
         } else {
@@ -70,13 +70,13 @@ impl Trb {
     }
 
     /// Set the TRB type in bits [15:10].
-    pub fn set_trb_type(&mut self, trb_type: TrbType) {
+    pub const fn set_trb_type(&mut self, trb_type: TrbType) {
         self.control = (self.control & !(0x3F << 10)) | ((trb_type as u32) << 10);
     }
 
     /// Decode the TRB type field into a known variant.
     #[must_use]
-    pub fn decoded_type(&self) -> TrbType {
+    pub const fn decoded_type(&self) -> TrbType {
         TrbType::from_raw(self.trb_type())
     }
 
@@ -328,7 +328,7 @@ pub struct NormalTrb {
 impl NormalTrb {
     /// Encode into a raw TRB.
     #[must_use]
-    pub fn to_trb(&self, cycle: bool) -> Trb {
+    pub const fn to_trb(&self, cycle: bool) -> Trb {
         let mut control: u32 = (TrbType::Normal as u32) << 10;
         if cycle {
             control |= 1;

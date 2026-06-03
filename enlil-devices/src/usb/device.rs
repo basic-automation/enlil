@@ -60,7 +60,7 @@ impl UsbDevice {
 
     /// Check if this device is currently assigned to a guest.
     #[must_use]
-    pub fn is_assigned(&self) -> bool {
+    pub const fn is_assigned(&self) -> bool {
         self.assigned_guest.is_some()
     }
 
@@ -70,7 +70,7 @@ impl UsbDevice {
     }
 
     /// Unassign this device from its current guest.
-    pub fn unassign(&mut self) -> Option<String> {
+    pub const fn unassign(&mut self) -> Option<String> {
         self.assigned_guest.take()
     }
 

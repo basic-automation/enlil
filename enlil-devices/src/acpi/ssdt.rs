@@ -36,7 +36,7 @@ pub struct CState {
     pub register_address: u64,
     /// Register bit width
     pub register_bit_width: u8,
-    /// Address space ID (0x7F = FFixedHW for Intel, 0x01 = IO)
+    /// Address space ID (0x7F = `FFixedHW` for Intel, 0x01 = IO)
     pub address_space: u8,
 }
 
@@ -60,7 +60,7 @@ impl SsdtBuilder {
     }
 
     #[must_use]
-    pub fn oem_info(mut self, oem: OemInfo) -> Self {
+    pub const fn oem_info(mut self, oem: OemInfo) -> Self {
         self.oem = oem;
         self
     }
@@ -165,7 +165,7 @@ impl SsdtBuilder {
         buf
     }
 
-    /// Encode a PkgLength
+    /// Encode a `PkgLength`
     #[allow(clippy::cast_possible_truncation)]
     fn encode_pkg_length(length: usize) -> Vec<u8> {
         if length < 0x3F {
@@ -243,12 +243,12 @@ impl SsdtBuilder {
         buf.push(cstate.address_space);
         buf.push(cstate.register_bit_width);
         buf.push(0); // bit offset
-        buf.push(if cstate.register_bit_width == 0 { 0 } else { 1 }); // access size: byte
+        buf.push(u8::from(cstate.register_bit_width != 0)); // access size: byte
         buf.extend_from_slice(&cstate.register_address.to_le_bytes());
         buf
     }
 
-    /// Build a _CST C-state sub-package: Package(4) { ResourceTemplate{Register(...)}, CType, Latency, Power }
+    /// Build a _CST C-state sub-package: Package(4) { ResourceTemplate{Register(...)}, `CType`, Latency, Power }
     fn build_cst_entry(cstate: &CState) -> Vec<u8> {
         // Build the ResourceTemplate buffer containing the GAS
         let gas_bytes = Self::build_gas(cstate);
@@ -324,7 +324,7 @@ impl SsdtBuilder {
 
     /// Generate processor name: C00_, C01_, ... C0F_, C10_, etc.
     #[allow(clippy::cast_possible_truncation)]
-    fn processor_name(index: u8) -> [u8; 4] {
+    const fn processor_name(index: u8) -> [u8; 4] {
         let hex = b"0123456789ABCDEF";
         [
             b'C',

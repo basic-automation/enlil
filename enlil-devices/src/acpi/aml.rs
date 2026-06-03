@@ -56,12 +56,12 @@ impl AmlBuilder {
 
     /// Current length
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.data.len()
     }
 
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
 
@@ -71,7 +71,7 @@ impl AmlBuilder {
         self
     }
 
-    /// Encode a PkgLength field (ACPI spec §20.2.4)
+    /// Encode a `PkgLength` field (ACPI spec §20.2.4)
     #[allow(clippy::cast_possible_truncation)]
     fn encode_pkg_length(length: usize) -> Vec<u8> {
         if length < 0x3F {
@@ -98,7 +98,7 @@ impl AmlBuilder {
     }
 
     /// Encode a 4-character ACPI name
-    fn encode_name(name: &[u8; 4]) -> [u8; 4] {
+    const fn encode_name(name: &[u8; 4]) -> [u8; 4] {
         *name
     }
 
@@ -151,7 +151,7 @@ impl AmlBuilder {
         }
     }
 
-    /// Close a Scope block, patches the PkgLength
+    /// Close a Scope block, patches the `PkgLength`
     pub fn scope_end(&mut self, handle: ScopeHandle) {
         self.patch_pkg_length(handle.length_pos, handle.content_start);
     }
@@ -215,9 +215,9 @@ impl AmlBuilder {
         self
     }
 
-    /// Patch a PkgLength at the given position
+    /// Patch a `PkgLength` at the given position
     #[allow(clippy::cast_possible_truncation)]
-    fn patch_pkg_length(&mut self, length_pos: usize, content_start: usize) {
+    fn patch_pkg_length(&mut self, length_pos: usize, _content_start: usize) {
         let total_len = self.data.len() - length_pos;
         let encoded = Self::encode_pkg_length(total_len);
 

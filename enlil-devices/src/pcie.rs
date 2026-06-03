@@ -1,12 +1,12 @@
 //! PCI Express root complex and configuration space emulation
 //!
-//! Provides a virtual PCIe root complex for guest VMs. Windows expects
+//! Provides a virtual `PCIe` root complex for guest VMs. Windows expects
 //! a PCI Express bus with ECAM (Enhanced Configuration Access Mechanism)
 //! for device enumeration.
 
 /// PCI configuration space size per function
 pub const PCI_CONFIG_SPACE_SIZE: usize = 256;
-/// PCIe extended configuration space size per function
+/// `PCIe` extended configuration space size per function
 pub const PCIE_CONFIG_SPACE_SIZE: usize = 4096;
 /// ECAM size per bus (256 devices * 8 functions * 4096 bytes)
 pub const ECAM_BUS_SIZE: usize = 256 * 8 * 4096;
@@ -125,7 +125,7 @@ impl PciConfigSpace {
     /// Create a config space for a real device
     #[must_use]
     pub fn new(bdf: PciBdf, vendor_id: u16, device_id: u16) -> Self {
-        let mut data = vec![0u8; PCIE_CONFIG_SPACE_SIZE];
+        let data = vec![0u8; PCIE_CONFIG_SPACE_SIZE];
         let mut cs = Self {
             data,
             bar_masks: [0; 6],
@@ -234,7 +234,7 @@ impl PciConfigSpace {
     /// Handle a guest config space write (respecting BAR masks)
     pub fn guest_write_u32(&mut self, offset: u16, value: u32) {
         // BAR writes need special handling for size detection
-        if offset >= cfg::BAR0 && offset <= cfg::BAR5 {
+        if (cfg::BAR0..=cfg::BAR5).contains(&offset) {
             let bar_idx = ((offset - cfg::BAR0) / 4) as usize;
             if bar_idx < 6 {
                 let mask = self.bar_masks[bar_idx];
@@ -279,7 +279,7 @@ pub struct PcieRootComplex {
 impl PcieRootComplex {
     /// Create a new root complex with the given ECAM base address
     #[must_use]
-    pub fn new(ecam_base: u64) -> Self {
+    pub const fn new(ecam_base: u64) -> Self {
         Self {
             devices: Vec::new(),
             ecam_base,

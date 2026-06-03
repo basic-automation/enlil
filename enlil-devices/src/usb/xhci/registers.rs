@@ -196,7 +196,7 @@ pub struct PortRegisterSet {
 impl PortRegisterSet {
     /// Create a new port register set in the disconnected state.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             portsc: 0,
             portpmsc: 0,
@@ -257,7 +257,7 @@ impl PortRegisterSet {
     }
 
     /// Simulate a device disconnection.
-    pub fn disconnect_device(&mut self) {
+    pub const fn disconnect_device(&mut self) {
         self.speed = 0;
         // CCS=0, PP=1, CSC=1
         self.portsc = (1 << 9) | (1 << 17);
@@ -326,7 +326,7 @@ pub struct OperationalRegisters {
     pub crcr: u64,
     /// Device Context Base Address Array Pointer (64-bit).
     pub dcbaap: u64,
-    /// Configure register (MaxSlotsEn).
+    /// Configure register (`MaxSlotsEn`).
     pub config: u32,
     /// Port register sets.
     pub ports: Vec<PortRegisterSet>,
@@ -394,7 +394,7 @@ impl OperationalRegisters {
     }
 
     /// Write to USBSTS — write-1-to-clear semantics for event bits.
-    pub fn write_usbsts(&mut self, value: u32) {
+    pub const fn write_usbsts(&mut self, value: u32) {
         // HSE(2), EINT(3), PCD(4) are write-1-to-clear
         let w1c_mask: u32 = 0x1C;
         let w1c_bits = value & w1c_mask;
@@ -468,7 +468,7 @@ impl RuntimeRegisters {
     }
 
     /// Advance the microframe index (called periodically at 125µs intervals).
-    pub fn tick(&mut self) {
+    pub const fn tick(&mut self) {
         self.mfindex = (self.mfindex + 1) & 0x3FFF;
     }
 }

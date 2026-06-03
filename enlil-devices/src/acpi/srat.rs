@@ -64,7 +64,7 @@ pub struct MemoryAffinityEntry {
 impl MemoryAffinityEntry {
     /// Create entry for a memory range in the given proximity domain
     #[must_use]
-    pub fn new(
+    pub const fn new(
         proximity_domain: u32,
         base_address: u64,
         length: u64,
@@ -125,7 +125,7 @@ impl SratBuilder {
     }
 
     #[must_use]
-    pub fn oem_info(mut self, oem: OemInfo) -> Self {
+    pub const fn oem_info(mut self, oem: OemInfo) -> Self {
         self.oem = oem;
         self
     }

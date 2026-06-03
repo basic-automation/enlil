@@ -20,7 +20,7 @@ pub mod intel_msr {
     pub const LBR_INFO_BASE: u32 = 0xDC0;
     /// LBR TOS (Top of Stack pointer)
     pub const LBR_TOS: u32 = 0x1C9;
-    /// DebugCtl MSR (enables LBR recording)
+    /// `DebugCtl` MSR (enables LBR recording)
     pub const IA32_DEBUGCTL: u32 = 0x1D9;
 }
 
@@ -44,7 +44,7 @@ pub struct LbrState {
     pub info: [u64; LBR_STACK_SIZE],
     /// Top of stack pointer (index into the circular buffer)
     pub tos: u32,
-    /// IA32_DEBUGCTL shadow value
+    /// `IA32_DEBUGCTL` shadow value
     pub debug_ctl: u64,
     /// Whether LBR recording is enabled by guest
     pub lbr_enabled: bool,
@@ -63,7 +63,7 @@ pub enum LbrPlatform {
 
 impl LbrState {
     #[must_use]
-    pub fn new(platform: LbrPlatform) -> Self {
+    pub const fn new(platform: LbrPlatform) -> Self {
         Self {
             from_addresses: [0; LBR_STACK_SIZE],
             to_addresses: [0; LBR_STACK_SIZE],
@@ -80,7 +80,7 @@ impl LbrState {
     /// The most recent LBR entry will contain the branch from guest code
     /// into the hypervisor's VMEXIT handler. This must be removed or the
     /// guest can detect the hypervisor by inspecting its own LBR stack.
-    pub fn sanitize_after_exit(&mut self, guest_rip: u64) {
+    pub const fn sanitize_after_exit(&mut self, guest_rip: u64) {
         if !self.lbr_enabled {
             return;
         }
@@ -102,14 +102,14 @@ impl LbrState {
         self.info[tos_idx] = 0;
     }
 
-    /// Handle RDMSR for IA32_DEBUGCTL
+    /// Handle RDMSR for `IA32_DEBUGCTL`
     #[must_use]
     pub const fn read_debug_ctl(&self) -> u64 {
         self.debug_ctl
     }
 
-    /// Handle WRMSR for IA32_DEBUGCTL
-    pub fn write_debug_ctl(&mut self, value: u64) {
+    /// Handle WRMSR for `IA32_DEBUGCTL`
+    pub const fn write_debug_ctl(&mut self, value: u64) {
         self.debug_ctl = value;
         // LBR is enabled when bit 0 is set
         self.lbr_enabled = (value & 1) != 0;
@@ -123,7 +123,7 @@ impl LbrState {
 
     /// Handle RDMSR for LBR FROM[index]
     #[must_use]
-    pub fn read_from(&self, index: usize) -> u64 {
+    pub const fn read_from(&self, index: usize) -> u64 {
         if index < LBR_STACK_SIZE {
             self.from_addresses[index]
         } else {
@@ -133,7 +133,7 @@ impl LbrState {
 
     /// Handle RDMSR for LBR TO[index]
     #[must_use]
-    pub fn read_to(&self, index: usize) -> u64 {
+    pub const fn read_to(&self, index: usize) -> u64 {
         if index < LBR_STACK_SIZE {
             self.to_addresses[index]
         } else {
@@ -143,7 +143,7 @@ impl LbrState {
 
     /// Handle RDMSR for LBR INFO[index]
     #[must_use]
-    pub fn read_info(&self, index: usize) -> u64 {
+    pub const fn read_info(&self, index: usize) -> u64 {
         if index < LBR_STACK_SIZE {
             self.info[index]
         } else {

@@ -159,7 +159,7 @@ impl Ps2Mouse {
     }
 
     /// Handle data byte for multi-byte commands
-    fn handle_data_byte(&mut self, cmd: MouseCommand, data: u8) -> Option<u8> {
+    const fn handle_data_byte(&mut self, cmd: MouseCommand, data: u8) -> Option<u8> {
         match cmd {
             MouseCommand::SetSampleRate => {
                 self.sample_rate = data;

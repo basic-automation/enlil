@@ -1,4 +1,4 @@
-//! QEMU fw_cfg device emulation
+//! QEMU `fw_cfg` device emulation
 //!
 //! Provides firmware configuration data to OVMF. Used to pass ACPI tables,
 //! SMBIOS tables, kernel images, and other boot-time data to the guest
@@ -6,12 +6,12 @@
 //!
 //! Protocol: port I/O at 0x510 (selector) and 0x511 (data), or MMIO via DMA.
 
-/// fw_cfg I/O port addresses
+/// `fw_cfg` I/O port addresses
 pub const FW_CFG_PORT_SEL: u16 = 0x0510;
 pub const FW_CFG_PORT_DATA: u16 = 0x0511;
 pub const FW_CFG_PORT_DMA: u16 = 0x0514;
 
-/// fw_cfg item selectors
+/// `fw_cfg` item selectors
 pub mod selector {
     pub const SIGNATURE: u16 = 0x0000;
     pub const ID: u16 = 0x0001;
@@ -21,7 +21,7 @@ pub mod selector {
     pub const SMBIOS_TABLES: u16 = 0x8002;
 }
 
-/// A named fw_cfg file entry
+/// A named `fw_cfg` file entry
 #[derive(Debug, Clone)]
 pub struct FwCfgFile {
     /// File name (up to 55 bytes, null-terminated)
@@ -32,7 +32,7 @@ pub struct FwCfgFile {
     pub selector: u16,
 }
 
-/// fw_cfg device state
+/// `fw_cfg` device state
 #[derive(Debug, Clone)]
 pub struct FwCfgDevice {
     /// Registered files
@@ -47,7 +47,7 @@ pub struct FwCfgDevice {
 
 impl FwCfgDevice {
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             files: Vec::new(),
             current_selector: 0,
@@ -56,7 +56,7 @@ impl FwCfgDevice {
         }
     }
 
-    /// Add a named file to the fw_cfg device
+    /// Add a named file to the `fw_cfg` device
     pub fn add_file(&mut self, name: &str, data: Vec<u8>) -> u16 {
         let sel = self.next_selector;
         self.files.push(FwCfgFile {
@@ -81,7 +81,7 @@ impl FwCfgDevice {
     }
 
     /// Handle port I/O write to selector port (0x510)
-    pub fn write_selector(&mut self, value: u16) {
+    pub const fn write_selector(&mut self, value: u16) {
         self.current_selector = value;
         self.read_offset = 0;
     }
@@ -154,15 +154,12 @@ impl FwCfgDevice {
 
     /// Handle PIO write
     pub fn pio_write(&mut self, port: u16, value: u16) {
-        match port {
-            FW_CFG_PORT_SEL => self.write_selector(value),
-            _ => {}
-        }
+        if port == FW_CFG_PORT_SEL { self.write_selector(value) }
     }
 
     /// Get the number of registered files
     #[must_use]
-    pub fn file_count(&self) -> usize {
+    pub const fn file_count(&self) -> usize {
         self.files.len()
     }
 }

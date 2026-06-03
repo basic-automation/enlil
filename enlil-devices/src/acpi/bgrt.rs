@@ -40,26 +40,26 @@ impl BgrtBuilder {
     }
 
     #[must_use]
-    pub fn oem_info(mut self, oem: OemInfo) -> Self {
+    pub const fn oem_info(mut self, oem: OemInfo) -> Self {
         self.oem = oem;
         self
     }
 
     #[must_use]
-    pub fn image_address(mut self, addr: u64) -> Self {
+    pub const fn image_address(mut self, addr: u64) -> Self {
         self.image_address = addr;
         self
     }
 
     #[must_use]
-    pub fn image_offset(mut self, x: u32, y: u32) -> Self {
+    pub const fn image_offset(mut self, x: u32, y: u32) -> Self {
         self.image_offset_x = x;
         self.image_offset_y = y;
         self
     }
 
     #[must_use]
-    pub fn status(mut self, status: u8) -> Self {
+    pub const fn status(mut self, status: u8) -> Self {
         self.status = status;
         self
     }

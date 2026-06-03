@@ -2,7 +2,7 @@
 //!
 //! Critical for defeating IET (Instruction Execution Time) divergence tests.
 //! Anti-cheat IET tests compare CPUID execution time against a slow reference
-//! instruction using IA32_APERF instead of TSC.
+//! instruction using `IA32_APERF` instead of TSC.
 
 /// Per-vCPU timing stealth state
 #[derive(Debug, Clone)]
@@ -30,7 +30,7 @@ pub struct TimingStealth {
 impl TimingStealth {
     /// Create a new timing stealth state
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             tsc_offset: 0,
             cumulative_exit_tsc: 0,
@@ -47,7 +47,7 @@ impl TimingStealth {
     /// Called at VMEXIT: record the TSC and update shadow counters.
     /// `host_tsc` is the TSC read immediately after VMEXIT.
     /// `host_aperf` and `host_mperf` are the physical counter values.
-    pub fn on_vmexit(&mut self, host_tsc: u64) {
+    pub const fn on_vmexit(&mut self, host_tsc: u64) {
         self.last_exit_tsc = host_tsc;
 
         // Calculate guest execution time since last entry
@@ -61,7 +61,7 @@ impl TimingStealth {
 
     /// Called at VMENTRY: record the TSC and update the offset.
     /// `host_tsc` is the TSC read just before VMENTRY/VMRESUME.
-    pub fn on_vmentry(&mut self, host_tsc: u64) {
+    pub const fn on_vmentry(&mut self, host_tsc: u64) {
         if self.last_exit_tsc > 0 {
             let exit_duration = host_tsc.saturating_sub(self.last_exit_tsc);
             self.cumulative_exit_tsc += exit_duration;
@@ -91,25 +91,25 @@ impl TimingStealth {
         self.tsc_offset
     }
 
-    /// Handle RDMSR for IA32_APERF (0xE8) — return shadow value
+    /// Handle RDMSR for `IA32_APERF` (0xE8) — return shadow value
     #[must_use]
     pub const fn read_aperf(&self) -> u64 {
         self.shadow_aperf
     }
 
-    /// Handle RDMSR for IA32_MPERF (0xE7) — return shadow value
+    /// Handle RDMSR for `IA32_MPERF` (0xE7) — return shadow value
     #[must_use]
     pub const fn read_mperf(&self) -> u64 {
         self.shadow_mperf
     }
 
-    /// Handle WRMSR for IA32_APERF — update shadow
-    pub fn write_aperf(&mut self, value: u64) {
+    /// Handle WRMSR for `IA32_APERF` — update shadow
+    pub const fn write_aperf(&mut self, value: u64) {
         self.shadow_aperf = value;
     }
 
-    /// Handle WRMSR for IA32_MPERF — update shadow
-    pub fn write_mperf(&mut self, value: u64) {
+    /// Handle WRMSR for `IA32_MPERF` — update shadow
+    pub const fn write_mperf(&mut self, value: u64) {
         self.shadow_mperf = value;
     }
 

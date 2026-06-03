@@ -50,6 +50,7 @@ pub enum DeviceMatcher {
 
 impl DeviceMatcher {
     /// Test whether a device matches this criteria.
+    #[must_use]
     pub fn matches(&self, device: &UsbDeviceId) -> bool {
         match self {
             Self::VidPid {
@@ -115,7 +116,8 @@ pub struct RoutingTable {
 
 impl RoutingTable {
     /// Create a new empty routing table.
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             rules: Vec::new(),
             default_guest: None,
@@ -129,7 +131,8 @@ impl RoutingTable {
     }
 
     /// Get the current default guest.
-    pub fn default_guest(&self) -> Option<&GuestId> {
+    #[must_use]
+    pub const fn default_guest(&self) -> Option<&GuestId> {
         self.default_guest.as_ref()
     }
 
@@ -177,11 +180,13 @@ impl RoutingTable {
     }
 
     /// Get all rules (read-only).
+    #[must_use]
     pub fn rules(&self) -> &[RoutingRule] {
         &self.rules
     }
 
     /// Determine which guest a device should be routed to.
+    #[must_use]
     pub fn route(&self, device: &UsbDeviceId) -> RoutingDecision {
         for rule in &self.rules {
             if rule.enabled && rule.matcher.matches(device) {
@@ -196,12 +201,14 @@ impl RoutingTable {
     }
 
     /// Return the number of active (enabled) rules.
+    #[must_use]
     pub fn active_rule_count(&self) -> usize {
         self.rules.iter().filter(|r| r.enabled).count()
     }
 
     /// Return the total number of rules.
-    pub fn total_rule_count(&self) -> usize {
+    #[must_use]
+    pub const fn total_rule_count(&self) -> usize {
         self.rules.len()
     }
 }
@@ -231,6 +238,7 @@ struct RoutingStateInner {
 
 impl RoutingState {
     /// Create new routing state with the given table.
+    #[must_use]
     pub fn new(table: RoutingTable) -> Self {
         Self {
             inner: Arc::new(Mutex::new(RoutingStateInner {
@@ -241,6 +249,7 @@ impl RoutingState {
     }
 
     /// Get a clone handle for thread-safe sharing.
+    #[must_use]
     pub fn clone_handle(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -249,6 +258,7 @@ impl RoutingState {
 
     /// Assign a device to a guest based on current routing rules.
     /// Returns the routing decision.
+    #[must_use]
     pub fn assign_device(&self, bus_addr: u8, device: &UsbDeviceId) -> RoutingDecision {
         let mut inner = self.inner.lock().expect("routing state poisoned");
         let decision = inner.table.route(device);
@@ -277,18 +287,21 @@ impl RoutingState {
     }
 
     /// Remove a device assignment (e.g., on disconnect).
+    #[must_use]
     pub fn unassign_device(&self, bus_addr: u8) -> Option<GuestId> {
         let mut inner = self.inner.lock().expect("routing state poisoned");
         inner.assignments.remove(&bus_addr)
     }
 
     /// Get the current guest assignment for a device.
+    #[must_use]
     pub fn get_assignment(&self, bus_addr: u8) -> Option<GuestId> {
         let inner = self.inner.lock().expect("routing state poisoned");
         inner.assignments.get(&bus_addr).cloned()
     }
 
     /// Get all current assignments.
+    #[must_use]
     pub fn all_assignments(&self) -> HashMap<u8, GuestId> {
         let inner = self.inner.lock().expect("routing state poisoned");
         inner.assignments.clone()
@@ -329,6 +342,7 @@ pub enum RoutingError {
 /// # Errors
 ///
 /// Returns `None` if the string is not a valid VID:PID pair.
+#[must_use]
 pub fn parse_vid_pid(s: &str) -> Option<(u16, u16)> {
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() != 2 {

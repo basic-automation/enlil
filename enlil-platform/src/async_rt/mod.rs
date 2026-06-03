@@ -351,11 +351,7 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
 
 /// Create a no-op waker (for `block_on`).
 fn noop_waker() -> Waker {
-    struct NoopWake;
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-    Waker::from(Arc::new(NoopWake))
+    Waker::noop().clone()
 }
 
 // ---------------------------------------------------------------------------

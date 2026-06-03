@@ -128,6 +128,9 @@ pub struct SmbiosMemoryDevice {
 }
 
 /// SMBIOS table generator
+// Fields hold SMBIOS string/identity values captured at construction; the
+// table emitters that read them are part of the in-progress Phase 5 synthesis.
+#[allow(dead_code)]
 pub struct SmbiosGenerator {
     manufacturer: String,
     product_name: String,
@@ -149,7 +152,7 @@ impl SmbiosGenerator {
         Self {
             manufacturer,
             product_name,
-            serial_number: serial_number,
+            serial_number,
             bios_vendor,
             cpu_model_name,
             total_memory_mb,

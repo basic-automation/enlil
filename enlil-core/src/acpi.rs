@@ -115,6 +115,9 @@ pub struct MadtIoApic {
 }
 
 /// ACPI table generator
+// Fields hold table parameters captured at construction; the per-table
+// emitters that read them are part of the in-progress Phase 5 synthesis.
+#[allow(dead_code)]
 pub struct AcpiTableGenerator {
     oem_id: [u8; 6],
     oem_table_id: [u8; 8],

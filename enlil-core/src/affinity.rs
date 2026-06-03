@@ -203,9 +203,9 @@ fn get_affinity_linux() -> PinResult {
 
     if ret == 0 {
         let mut mask = AffinityMask::empty();
-        for byte_idx in 0..CPU_SET_SIZE {
+        for (byte_idx, &byte) in cpu_set.iter().enumerate() {
             for bit_idx in 0..8 {
-                if cpu_set[byte_idx] & (1 << bit_idx) != 0 {
+                if byte & (1 << bit_idx) != 0 {
                     mask.add((byte_idx * 8 + bit_idx) as u32);
                 }
             }

@@ -65,7 +65,7 @@ pub struct SmbiosConfig {
     pub cpu_max_speed: u16,
     /// Total RAM in MB
     pub total_ram_mb: u32,
-    /// RAM modules (size_mb, speed_mhz, manufacturer, part_number)
+    /// RAM modules (`size_mb`, `speed_mhz`, manufacturer, `part_number`)
     pub ram_modules: Vec<RamModule>,
 }
 
@@ -130,7 +130,7 @@ pub struct SmbiosBuilder {
 
 impl SmbiosBuilder {
     #[must_use]
-    pub fn new(config: SmbiosConfig) -> Self {
+    pub const fn new(config: SmbiosConfig) -> Self {
         Self { config }
     }
 
@@ -557,8 +557,8 @@ impl SmbiosBuilder {
             header.push(0);
         }
 
-        let dimm_label = format!("DIMM_{}", index);
-        let bank_label = format!("BANK {}", index);
+        let dimm_label = format!("DIMM_{index}");
+        let bank_label = format!("BANK {index}");
         append_strings(
             &mut header,
             &[

@@ -179,13 +179,13 @@ impl MadtBuilder {
     }
 
     #[must_use]
-    pub fn oem_info(mut self, oem: OemInfo) -> Self {
+    pub const fn oem_info(mut self, oem: OemInfo) -> Self {
         self.oem = oem;
         self
     }
 
     #[must_use]
-    pub fn local_apic_address(mut self, addr: u32) -> Self {
+    pub const fn local_apic_address(mut self, addr: u32) -> Self {
         self.local_apic_address = addr;
         self
     }

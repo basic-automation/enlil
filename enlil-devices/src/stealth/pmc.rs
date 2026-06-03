@@ -41,7 +41,7 @@ pub mod msr {
 
 impl PmcState {
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             gp_counters: [0; MAX_GP_PMCS],
             fixed_counters: [0; MAX_FIXED_PMCS],
@@ -56,7 +56,7 @@ impl PmcState {
     /// Handle RDPMC instruction. Returns the shadow counter value.
     /// `ecx` is the PMC index: 0-N for GP, 0x40000000+ for fixed.
     #[must_use]
-    pub fn read_pmc(&self, ecx: u32) -> u64 {
+    pub const fn read_pmc(&self, ecx: u32) -> u64 {
         if ecx >= 0x4000_0000 {
             // Fixed-function PMC
             let idx = (ecx - 0x4000_0000) as usize;
@@ -77,7 +77,7 @@ impl PmcState {
     }
 
     /// Handle WRMSR for a PMC MSR
-    pub fn write_msr(&mut self, msr: u32, value: u64) {
+    pub const fn write_msr(&mut self, msr: u32, value: u64) {
         match msr {
             m if m >= msr::IA32_PMC0 && m < msr::IA32_PMC0 + MAX_GP_PMCS as u32 => {
                 let idx = (m - msr::IA32_PMC0) as usize;
@@ -102,7 +102,7 @@ impl PmcState {
 
     /// Handle RDMSR for a PMC MSR
     #[must_use]
-    pub fn read_msr(&self, msr: u32) -> Option<u64> {
+    pub const fn read_msr(&self, msr: u32) -> Option<u64> {
         match msr {
             m if m >= msr::IA32_PMC0 && m < msr::IA32_PMC0 + MAX_GP_PMCS as u32 => {
                 let idx = (m - msr::IA32_PMC0) as usize;

@@ -180,7 +180,7 @@ impl HdaController {
     /// Handle MMIO read at offset from BAR0
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn read(&self, offset: u32, size: u8) -> u64 {
+    pub fn read(&self, offset: u32, _size: u8) -> u64 {
         match offset {
             regs::GCAP => u64::from(self.gcap),
             regs::VMIN => u64::from(self.vmin),
@@ -196,16 +196,16 @@ impl HdaController {
             regs::WALCLK => u64::from(self.walclk),
             regs::SSYNC => u64::from(self.ssync),
 
-            regs::CORBLBASE => (self.corb_base & 0xFFFF_FFFF) as u64,
-            regs::CORBUBASE => (self.corb_base >> 32) as u64,
+            regs::CORBLBASE => (self.corb_base & 0xFFFF_FFFF),
+            regs::CORBUBASE => (self.corb_base >> 32),
             regs::CORBWP => u64::from(self.corb_wp),
             regs::CORBRP => u64::from(self.corb_rp),
             regs::CORBCTL => u64::from(self.corb_ctl),
             regs::CORBSTS => u64::from(self.corb_sts),
             regs::CORBSIZE => u64::from(self.corb_size),
 
-            regs::RIRBLBASE => (self.rirb_base & 0xFFFF_FFFF) as u64,
-            regs::RIRBUBASE => (self.rirb_base >> 32) as u64,
+            regs::RIRBLBASE => (self.rirb_base & 0xFFFF_FFFF),
+            regs::RIRBUBASE => (self.rirb_base >> 32),
             regs::RIRBWP => u64::from(self.rirb_wp),
             regs::RINTCNT => u64::from(self.rintcnt),
             regs::RIRBCTL => u64::from(self.rirb_ctl),
@@ -225,7 +225,7 @@ impl HdaController {
 
     /// Handle MMIO write at offset from BAR0
     #[allow(clippy::cast_possible_truncation)]
-    pub fn write(&mut self, offset: u32, value: u64, size: u8) {
+    pub fn write(&mut self, offset: u32, value: u64, _size: u8) {
         match offset {
             regs::GCTL => {
                 let val = value as u32;
@@ -349,7 +349,7 @@ impl HdaController {
 
     /// Write a stream descriptor register
     #[allow(clippy::cast_possible_truncation)]
-    fn write_stream_descriptor(&mut self, offset: u32, value: u64) {
+    const fn write_stream_descriptor(&mut self, offset: u32, value: u64) {
         let rel = offset - regs::SD0_BASE;
         let stream_idx = (rel / regs::SD_SIZE) as usize;
         let reg_offset = rel % regs::SD_SIZE;

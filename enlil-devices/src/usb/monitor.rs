@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::types::{
-    DeviceSpeed, UsbAddress, UsbDeviceClass, UsbDeviceDescriptor, UsbDeviceInfo, UsbDeviceState,
+    DeviceSpeed, UsbAddress, UsbDeviceDescriptor, UsbDeviceInfo, UsbDeviceState,
     UsbError, UsbPortPath, UsbResult,
 };
 
@@ -53,6 +53,7 @@ pub struct UsbMonitor {
 
 impl UsbMonitor {
     /// Create a new USB monitor with the given poll interval.
+    #[must_use]
     pub fn new(poll_interval: Duration) -> Self {
         Self {
             devices: Arc::new(Mutex::new(HashMap::new())),
@@ -64,16 +65,19 @@ impl UsbMonitor {
     }
 
     /// Return a snapshot of all currently connected devices.
+    #[must_use]
     pub fn devices(&self) -> HashMap<UsbPortPath, UsbDeviceInfo> {
         self.devices.lock().expect("device lock poisoned").clone()
     }
 
     /// Return the number of connected devices.
+    #[must_use]
     pub fn device_count(&self) -> usize {
         self.devices.lock().expect("device lock poisoned").len()
     }
 
     /// Look up a device by its port path.
+    #[must_use]
     pub fn device_by_port(&self, port: &UsbPortPath) -> Option<UsbDeviceInfo> {
         self.devices
             .lock()
@@ -83,6 +87,7 @@ impl UsbMonitor {
     }
 
     /// Look up a device by VID:PID (returns the first match).
+    #[must_use]
     pub fn device_by_vid_pid(&self, vendor_id: u16, product_id: u16) -> Option<UsbDeviceInfo> {
         self.devices
             .lock()
@@ -160,11 +165,13 @@ impl UsbMonitor {
     }
 
     /// Get the configured poll interval.
-    pub fn poll_interval(&self) -> Duration {
+    #[must_use]
+    pub const fn poll_interval(&self) -> Duration {
         self.poll_interval
     }
 
     /// Check if enough time has elapsed for another poll cycle.
+    #[must_use]
     pub fn should_poll(&self) -> bool {
         let last = *self.last_poll.lock().expect("poll lock poisoned");
         last.elapsed() >= self.poll_interval

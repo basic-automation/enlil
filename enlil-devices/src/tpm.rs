@@ -117,7 +117,7 @@ pub struct VirtualTpm {
     pub cmd_buffer: Vec<u8>,
     /// Response buffer
     pub rsp_buffer: Vec<u8>,
-    /// Persistent state file path (for BitLocker, Windows Hello, etc.)
+    /// Persistent state file path (for `BitLocker`, Windows Hello, etc.)
     pub state_path: Option<String>,
 }
 
@@ -141,7 +141,7 @@ impl VirtualTpm {
         }
     }
 
-    /// Handle MMIO read at given offset from TPM_MMIO_BASE
+    /// Handle MMIO read at given offset from `TPM_MMIO_BASE`
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub fn read_register(&self, offset: u64, size: u8) -> u64 {
@@ -187,7 +187,7 @@ impl VirtualTpm {
         }
     }
 
-    /// Handle MMIO write at given offset from TPM_MMIO_BASE
+    /// Handle MMIO write at given offset from `TPM_MMIO_BASE`
     #[allow(clippy::cast_possible_truncation)]
     pub fn write_register(&mut self, offset: u64, value: u64, size: u8) {
         match offset {
@@ -293,14 +293,14 @@ impl VirtualTpm {
         self.rsp_buffer[..10].copy_from_slice(&response);
     }
 
-    /// Handle TPM2_GetCapability — returns basic TPM properties
+    /// Handle `TPM2_GetCapability` — returns basic TPM properties
     fn handle_get_capability(&mut self) {
         // Simplified: return a minimal capability response
         // Real implementation would parse the capability type from cmd_buffer
         self.write_success_response();
     }
 
-    /// Handle TPM2_GetRandom — returns pseudo-random bytes
+    /// Handle `TPM2_GetRandom` — returns pseudo-random bytes
     fn handle_get_random(&mut self) {
         // Parse requested byte count from command
         let bytes_requested = if self.cmd_buffer.len() >= 12 {

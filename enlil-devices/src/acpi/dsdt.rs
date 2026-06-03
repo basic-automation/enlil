@@ -58,7 +58,7 @@ impl DsdtBuilder {
     }
 
     #[must_use]
-    pub fn oem_info(mut self, oem: OemInfo) -> Self {
+    pub const fn oem_info(mut self, oem: OemInfo) -> Self {
         self.oem = oem;
         self
     }
@@ -216,7 +216,7 @@ impl DsdtBuilder {
 
 /// Generate processor name like C000, C001, ..., C00F, C010, etc.
 #[allow(clippy::cast_possible_truncation)]
-fn processor_name(index: u8) -> [u8; 4] {
+const fn processor_name(index: u8) -> [u8; 4] {
     let hex_chars = b"0123456789ABCDEF";
     [
         b'C',

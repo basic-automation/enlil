@@ -228,7 +228,7 @@ impl NetBackend for TapBackend {
         ret > 0 && (pfd.revents & libc::POLLIN) != 0
     }
 
-    fn backend_name(&self) -> &str {
+    fn backend_name(&self) -> &'static str {
         "tap"
     }
 }

@@ -65,7 +65,7 @@ pub struct I8042Controller {
     pub kbd_irq_pending: bool,
     /// Mouse IRQ pending
     pub mouse_irq_pending: bool,
-    /// Whether output is from mouse (for STATUS_MOUSE_OUTPUT bit)
+    /// Whether output is from mouse (for `STATUS_MOUSE_OUTPUT` bit)
     output_is_mouse: bool,
 }
 
@@ -87,7 +87,7 @@ impl I8042Controller {
 
     /// Read from port 0x60 (data port)
     #[must_use]
-    pub fn read_data(&mut self) -> u8 {
+    pub const fn read_data(&mut self) -> u8 {
         self.status &= !STATUS_OUTPUT_FULL;
         self.status &= !STATUS_MOUSE_OUTPUT;
         self.kbd_irq_pending = false;
@@ -97,7 +97,7 @@ impl I8042Controller {
 
     /// Read from port 0x64 (status register)
     #[must_use]
-    pub fn read_status(&self) -> u8 {
+    pub const fn read_status(&self) -> u8 {
         self.status
     }
 
@@ -197,7 +197,7 @@ impl I8042Controller {
     }
 
     /// Queue data from keyboard into output buffer
-    fn queue_keyboard_output(&mut self, data: u8) {
+    const fn queue_keyboard_output(&mut self, data: u8) {
         self.output_buffer = data;
         self.status |= STATUS_OUTPUT_FULL;
         self.status &= !STATUS_MOUSE_OUTPUT;
@@ -208,7 +208,7 @@ impl I8042Controller {
     }
 
     /// Queue data from mouse into output buffer
-    fn queue_mouse_output(&mut self, data: u8) {
+    const fn queue_mouse_output(&mut self, data: u8) {
         self.output_buffer = data;
         self.status |= STATUS_OUTPUT_FULL;
         self.status |= STATUS_MOUSE_OUTPUT;

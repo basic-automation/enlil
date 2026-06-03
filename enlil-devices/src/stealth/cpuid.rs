@@ -248,7 +248,7 @@ impl CpuidStealthTable {
         CpuidResult::default()
     }
 
-    fn build_leaf_1(config: &CpuidStealthConfig) -> CpuidResult {
+    const fn build_leaf_1(config: &CpuidStealthConfig) -> CpuidResult {
         let mut ecx = config.features_ecx;
         if config.hide_hypervisor {
             // Clear bit 31: hypervisor present
@@ -263,7 +263,7 @@ impl CpuidStealthTable {
         }
     }
 
-    fn build_leaf_7(config: &CpuidStealthConfig) -> CpuidResult {
+    const fn build_leaf_7(_config: &CpuidStealthConfig) -> CpuidResult {
         // Pass through common structured features, masking dangerous ones
         CpuidResult {
             eax: 0,           // max subleaf
@@ -277,14 +277,14 @@ impl CpuidStealthTable {
     fn build_topology_leaves(config: &CpuidStealthConfig, entries: &mut Vec<CpuidCacheEntry>) {
         // Subleaf 0: SMT level
         let threads_per_core = config.threads_per_core;
-        let smt_shift = if threads_per_core > 1 { 1 } else { 0 };
+        let smt_shift = u32::from(threads_per_core > 1);
         entries.push(CpuidCacheEntry {
             leaf: 0xB,
             subleaf: 0,
             result: CpuidResult {
                 eax: smt_shift,
                 ebx: threads_per_core,
-                ecx: (1 << 8) | 0, // SMT level type = 1, level number = 0
+                ecx: (1 << 8), // SMT level type = 1, level number = 0
                 edx: 0,            // x2APIC ID (set per-vCPU at runtime)
             },
         });

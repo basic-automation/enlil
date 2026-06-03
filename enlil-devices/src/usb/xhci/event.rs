@@ -147,7 +147,7 @@ impl EventRing {
     }
 
     /// Advance the enqueue pointer, wrapping and toggling cycle state as needed.
-    fn advance_enqueue(&mut self) {
+    const fn advance_enqueue(&mut self) {
         self.enqueue_idx += 1;
         if self.enqueue_idx >= self.capacity {
             self.enqueue_idx = 0;
@@ -157,7 +157,7 @@ impl EventRing {
 
     /// Check if the ring is full (enqueue would overwrite unread events).
     #[must_use]
-    pub fn is_full(&self) -> bool {
+    pub const fn is_full(&self) -> bool {
         let next = if self.enqueue_idx + 1 >= self.capacity {
             0
         } else {
@@ -168,13 +168,13 @@ impl EventRing {
 
     /// Check if the ring is empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.enqueue_idx == self.dequeue_idx
     }
 
     /// Number of pending (unread) events.
     #[must_use]
-    pub fn pending_count(&self) -> usize {
+    pub const fn pending_count(&self) -> usize {
         if self.enqueue_idx >= self.dequeue_idx {
             self.enqueue_idx - self.dequeue_idx
         } else {
@@ -183,7 +183,7 @@ impl EventRing {
     }
 
     /// Update the dequeue pointer (called when guest advances ERDP).
-    pub fn set_dequeue_index(&mut self, idx: usize) {
+    pub const fn set_dequeue_index(&mut self, idx: usize) {
         if idx < self.capacity {
             self.dequeue_idx = idx;
         }
@@ -287,7 +287,7 @@ impl InterrupterRegisterSet {
     }
 
     /// Set the interrupt pending bit.
-    pub fn set_pending(&mut self, pending: bool) {
+    pub const fn set_pending(&mut self, pending: bool) {
         if pending {
             self.iman |= 1;
         } else {
@@ -296,7 +296,7 @@ impl InterrupterRegisterSet {
     }
 
     /// Write to the IMAN register (write-1-to-clear for IP bit).
-    pub fn write_iman(&mut self, value: u32) {
+    pub const fn write_iman(&mut self, value: u32) {
         // Bit 0 (IP): write-1-to-clear
         if value & 1 != 0 {
             self.iman &= !1;
@@ -308,7 +308,7 @@ impl InterrupterRegisterSet {
     /// Write to the ERDP register.
     ///
     /// Bits [3:0] contain flags (EHB in bit 3), bits [63:4] are the address.
-    pub fn write_erdp(&mut self, value: u64) {
+    pub const fn write_erdp(&mut self, value: u64) {
         // Clear Event Handler Busy (EHB) if bit 3 is set (write-1-to-clear).
         let ehb_clear = (value & 0x8) != 0;
         self.erdp = value & !0xF; // Store address portion only

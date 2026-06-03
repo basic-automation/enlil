@@ -33,25 +33,25 @@ impl Tpm2Builder {
     }
 
     #[must_use]
-    pub fn oem_info(mut self, oem: OemInfo) -> Self {
+    pub const fn oem_info(mut self, oem: OemInfo) -> Self {
         self.oem = oem;
         self
     }
 
     #[must_use]
-    pub fn platform_class(mut self, class: u16) -> Self {
+    pub const fn platform_class(mut self, class: u16) -> Self {
         self.platform_class = class;
         self
     }
 
     #[must_use]
-    pub fn control_area_address(mut self, addr: u64) -> Self {
+    pub const fn control_area_address(mut self, addr: u64) -> Self {
         self.control_area_address = addr;
         self
     }
 
     #[must_use]
-    pub fn start_method(mut self, method: u32) -> Self {
+    pub const fn start_method(mut self, method: u32) -> Self {
         self.start_method = method;
         self
     }
