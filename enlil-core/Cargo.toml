@@ -6,6 +6,7 @@ description = "Enlil hypervisor core — VMM entry, vCPU management, memory part
 
 [dependencies]
 enlil-config = { path = "../enlil-config" }
+enlil-devices = { path = "../enlil-devices" }
 log = "0.4"
 thiserror = "2"
 anyhow = "1"

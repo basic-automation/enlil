@@ -226,20 +226,15 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > injection; a `set_user_memory_region2` / `guest_memfd` path is only needed for
 > confidential guests (Phase 8) and is incompatible with that introspection.
 >
-> **Status (2026-06-03):** `enlil-devices::bus::Bus` is now an *owning* device bus
-> (boxed `PioDevice`/`MmioDevice` trait objects keyed by range in a `BTreeMap`,
-> with overlap/empty-range registration checks) and **implements `VmExitHandler`**,
-> so KVM I/O and MMIO exits route straight to the owning device with one
-> address-decode path (the rust-vmm `vm-device` `IoManager` shape). Dispatch is
-> byte-oriented little-endian to match KVM's buffers; unmapped accesses float to
-> all-ones on read and drop writes. **Next:** give the existing emulated devices
-> (serial UART in `enlil-core::serial`, PIT/PIC/IOAPIC, PS/2) `PioDevice`/
-> `MmioDevice` impls and register them on a `Bus`, then drive a `KvmBackend`
-> `run_vcpu` loop with that `Bus` as the handler — boot a tiny code blob to `HLT`
-> as a `/dev/kvm`-gated integration test. Note: `serial` lives in `enlil-core` but
-> the `Bus` is in `enlil-devices` (which now depends on `enlil-core`); the serial
-> `PioDevice` impl therefore belongs on the `enlil-devices` side (a thin adapter
-> over `UartState`) to respect crate layering.
+> **Status (2026-06-03):** the device bus is now real. `enlil-devices::bus`
+> (`PioBus`/`MmioBus`) owns `Box<dyn PioDevice/MmioDevice>` registered over explicit
+> address *ranges* (overlap-rejecting, upper-bound-checked) and dispatches byte-slice
+> accesses with little-endian width conversion and x86 open-bus semantics for unmapped
+> addresses. `enlil-core::device_bus::DeviceBus` bundles one of each and implements
+> `VmExitHandler`, forwarding straight to the bus — the single decode path. **Next:**
+> register the 16550 serial UART (`enlil-core::serial`) as a `PioDevice` at `0x3F8` so
+> a guest's serial writes reach the console, then a `/dev/kvm`-gated test that boots a
+> tiny code blob which writes to COM1 and `hlt`s, asserting the bytes arrived.
 
 ### 0.3 USB Live Boot & Non-Destructive Testing (CRITICAL FOR ADOPTION)
 

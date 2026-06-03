@@ -1,35 +1,83 @@
 //! Device bus abstractions.
 //!
 //! Dispatches PIO (port I/O) and MMIO (memory-mapped I/O) accesses from guest
-//! VM exits to the appropriate virtual device handler.
+//! VM exits to the virtual device that owns the target address range.
 //!
-//! The [`Bus`] owns its devices (boxed [`PioDevice`] / [`MmioDevice`] trait
-//! objects), keyed by the address range each device claims, and routes every
-//! access to the device whose range contains the target port/address. Accesses
-//! that fall outside every registered range read back all-ones (the value a
-//! real x86 bus floats to when nothing drives it) and drop writes, exactly as
-//! unmapped hardware would.
+//! A guest access is a *byte access* of 1, 2 or 4 bytes (PIO) or up to 8 bytes
+//! (MMIO). The bus front door ([`PioBus::read`]/[`PioBus::write`],
+//! [`MmioBus::read`]/[`MmioBus::write`]) is therefore byte-slice oriented,
+//! matching the shape KVM hands us on an exit (and
+//! `enlil-core::kvm_backend::VmExitHandler`), so wiring a vCPU run loop to the
+//! bus is a direct forward with no second address-decode path. Internally the
+//! bus converts to/from the width-oriented [`PioDevice`]/[`MmioDevice`] trait
+//! methods (little-endian, matching x86).
 //!
-//! [`Bus`] also implements [`enlil_core::kvm_backend::VmExitHandler`], so the
-//! KVM run loop can hand guest I/O and MMIO exits straight to the device model
-//! with no separate decode path. The handler interface is byte-oriented
-//! (little-endian, as KVM delivers it); this module converts between those
-//! byte buffers and the width-and-value form the device traits use.
+//! Devices register over an explicit address *range* `[base, end)`. Lookup finds
+//! the device whose base is the greatest `<= addr` and confirms `addr < end`, so
+//! an access past a device's range is *not* misrouted to it (the previous routing
+//! table stored only the base and had no upper bound). Overlapping registrations
+//! are rejected.
+//!
+//! Unmapped accesses follow the x86 *open-bus* convention: reads return all-ones
+//! (`0xFF` per byte) and writes are silently dropped.
 
+use crate::truncate::u8_of;
 use std::collections::BTreeMap;
 
-use enlil_core::kvm_backend::VmExitHandler;
+/// Direction of an I/O operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoDirection {
+    Read,
+    Write,
+}
 
-use crate::truncate::{Widen, u8_of};
+/// A port I/O (PIO) access from a guest.
+#[derive(Debug, Clone)]
+pub struct PioAccess {
+    pub port: u16,
+    pub direction: IoDirection,
+    pub size: u8,
+    pub data: u32,
+}
+
+/// A memory-mapped I/O (MMIO) access from a guest.
+#[derive(Debug, Clone)]
+pub struct MmioAccess {
+    pub address: u64,
+    pub direction: IoDirection,
+    pub size: u8,
+    pub data: u64,
+}
+
+/// Error returned when registering a device on a bus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusError {
+    /// The device's declared range was empty (`end <= base`).
+    EmptyRange,
+    /// The device's range overlaps an already-registered device. Carries the
+    /// `[base, end)` of the conflicting resident.
+    Overlap { base: u64, end: u64 },
+}
+
+impl core::fmt::Display for BusError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Self::EmptyRange => f.write_str("device declared an empty address range"),
+            Self::Overlap { base, end } => {
+                write!(f, "address range overlaps device at [{base:#x}, {end:#x})")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BusError {}
 
 /// Trait for devices that handle port I/O.
 ///
-/// `port` is the absolute I/O port; `size` is the access width in bytes
-/// (1, 2, or 4). Reads return the value in the low `size` bytes of the `u32`.
+/// `port` is the absolute guest port; `size` is the access width in bytes
+/// (1/2/4). Reads return the value in the low `size` bytes of the `u32`.
 pub trait PioDevice {
-    /// Handle a guest `in` from `port` of `size` bytes.
     fn pio_read(&mut self, port: u16, size: u8) -> u32;
-    /// Handle a guest `out` to `port` of `size` bytes carrying `data`.
     fn pio_write(&mut self, port: u16, size: u8, data: u32);
     /// The half-open port range `[base, end)` this device claims.
     fn port_range(&self) -> (u16, u16);
@@ -37,556 +85,378 @@ pub trait PioDevice {
 
 /// Trait for devices that handle memory-mapped I/O.
 ///
-/// `offset` is relative to the device's MMIO base; `size` is the access width
-/// in bytes (1–8). Reads return the value in the low `size` bytes of the `u64`.
+/// `offset` is relative to the device's base address; `size` is the access
+/// width in bytes (1/2/4/8). Reads return the value in the low `size` bytes of
+/// the `u64`.
 pub trait MmioDevice {
-    /// Handle a guest read of `size` bytes at `offset` within this device.
     fn mmio_read(&mut self, offset: u64, size: u8) -> u64;
-    /// Handle a guest write of `size` bytes carrying `data` at `offset`.
     fn mmio_write(&mut self, offset: u64, size: u8, data: u64);
     /// The half-open address range `[base, end)` this device claims.
     fn mmio_range(&self) -> (u64, u64);
 }
 
-/// Error returned when a device cannot be registered on a [`Bus`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RegisterError {
-    /// The device's declared range overlaps an already-registered device.
-    Overlap {
-        /// Start of the offending range.
-        base: u64,
-        /// End (exclusive) of the offending range.
-        end: u64,
-    },
-    /// The device declared an empty or inverted range (`end <= base`).
-    EmptyRange {
-        /// Start of the offending range.
-        base: u64,
-        /// End (exclusive) of the offending range.
-        end: u64,
-    },
+/// Build a `u32` from the low (up to 4) little-endian bytes of `data`.
+fn le_to_u32(data: &[u8]) -> u32 {
+    let mut bytes = [0u8; 4];
+    let n = data.len().min(4);
+    bytes[..n].copy_from_slice(&data[..n]);
+    u32::from_le_bytes(bytes)
 }
 
-impl std::fmt::Display for RegisterError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Overlap { base, end } => {
-                write!(
-                    f,
-                    "device range [{base:#x}, {end:#x}) overlaps an existing device"
-                )
-            }
-            Self::EmptyRange { base, end } => {
-                write!(f, "device range [{base:#x}, {end:#x}) is empty or inverted")
-            }
-        }
+/// Build a `u64` from the low (up to 8) little-endian bytes of `data`.
+fn le_to_u64(data: &[u8]) -> u64 {
+    let mut bytes = [0u8; 8];
+    let n = data.len().min(8);
+    bytes[..n].copy_from_slice(&data[..n]);
+    u64::from_le_bytes(bytes)
+}
+
+/// Copy the little-endian bytes of a read result into the guest's buffer,
+/// stopping at whichever of the two is shorter (the access width).
+fn fill_le(data: &mut [u8], le_bytes: &[u8]) {
+    for (dst, &src) in data.iter_mut().zip(le_bytes.iter()) {
+        *dst = src;
     }
 }
 
-impl std::error::Error for RegisterError {}
-
-/// A registered PIO device and the end of its claimed range.
+/// A registered PIO device plus the exclusive upper bound of its range.
 struct PioEntry {
-    /// End (exclusive) of the device's port range.
+    /// Exclusive end of the claimed range.
     end: u16,
-    /// The device itself.
-    device: Box<dyn PioDevice + Send>,
+    device: Box<dyn PioDevice>,
 }
 
-/// A registered MMIO device and the end of its claimed range.
-struct MmioEntry {
-    /// End (exclusive) of the device's address range.
-    end: u64,
-    /// The device itself.
-    device: Box<dyn MmioDevice + Send>,
-}
-
-/// Routes guest PIO and MMIO accesses to the devices that own them.
-///
-/// Devices are keyed by the base of their claimed range in a [`BTreeMap`], so
-/// a lookup is a single `O(log n)` "greatest base ≤ target" query followed by
-/// an upper-bound check against that device's range end.
+/// PIO bus — owns devices and routes port I/O to the one covering each port.
 #[derive(Default)]
-pub struct Bus {
-    /// PIO devices keyed by range base.
-    pio: BTreeMap<u16, PioEntry>,
-    /// MMIO devices keyed by range base.
-    mmio: BTreeMap<u64, MmioEntry>,
+pub struct PioBus {
+    /// Maps each device's base port to its entry.
+    devices: BTreeMap<u16, PioEntry>,
 }
 
-impl Bus {
-    /// Create an empty bus with no devices registered.
+impl PioBus {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            pio: BTreeMap::new(),
-            mmio: BTreeMap::new(),
+            devices: BTreeMap::new(),
         }
     }
 
-    /// Number of PIO devices registered.
-    #[must_use]
-    pub fn pio_count(&self) -> usize {
-        self.pio.len()
-    }
-
-    /// Number of MMIO devices registered.
-    #[must_use]
-    pub fn mmio_count(&self) -> usize {
-        self.mmio.len()
-    }
-
-    // -- Registration --
-
-    /// Register a PIO device, claiming the port range it reports via
+    /// Register `device` over the half-open range it declares via
     /// [`PioDevice::port_range`].
     ///
     /// # Errors
-    /// Returns [`RegisterError::EmptyRange`] if the device reports `end <= base`,
-    /// or [`RegisterError::Overlap`] if its range intersects an already-
-    /// registered device.
-    pub fn register_pio(&mut self, device: Box<dyn PioDevice + Send>) -> Result<(), RegisterError> {
+    /// Returns [`BusError::EmptyRange`] if the declared range is empty, or
+    /// [`BusError::Overlap`] if it intersects an already-registered device.
+    pub fn register(&mut self, device: Box<dyn PioDevice>) -> Result<(), BusError> {
         let (base, end) = device.port_range();
         if end <= base {
-            return Err(RegisterError::EmptyRange {
-                base: base.to_u64(),
-                end: end.to_u64(),
+            return Err(BusError::EmptyRange);
+        }
+        // The device immediately at or below `base` must end at or before it.
+        if let Some((_, prev)) = self.devices.range(..=base).next_back()
+            && prev.end > base
+        {
+            return Err(BusError::Overlap {
+                base: u64::from(base),
+                end: u64::from(prev.end),
             });
         }
-        let overlaps = self
-            .pio
-            .iter()
-            .any(|(&existing_base, entry)| base < entry.end && existing_base < end);
-        if overlaps {
-            return Err(RegisterError::Overlap {
-                base: base.to_u64(),
-                end: end.to_u64(),
+        // The next device above `base` must start at or after our `end`.
+        if let Some((&next_base, next)) = self.devices.range(base..).next()
+            && next_base < end
+        {
+            return Err(BusError::Overlap {
+                base: u64::from(next_base),
+                end: u64::from(next.end),
             });
         }
-        self.pio.insert(base, PioEntry { end, device });
+        self.devices.insert(base, PioEntry { end, device });
         Ok(())
     }
 
-    /// Register an MMIO device, claiming the address range it reports via
+    /// Whether some registered device covers `port`.
+    #[must_use]
+    pub fn is_mapped(&self, port: u16) -> bool {
+        self.devices
+            .range(..=port)
+            .next_back()
+            .is_some_and(|(_, e)| port < e.end)
+    }
+
+    fn lookup_mut(&mut self, port: u16) -> Option<&mut PioEntry> {
+        let (_, entry) = self.devices.range_mut(..=port).next_back()?;
+        (port < entry.end).then_some(entry)
+    }
+
+    /// Service a guest port read of `data.len()` bytes, filling `data` in place.
+    /// Unmapped ports read as all-ones (open bus).
+    pub fn read(&mut self, port: u16, data: &mut [u8]) {
+        if let Some(entry) = self.lookup_mut(port) {
+            let value = entry.device.pio_read(port, u8_of(data.len()));
+            fill_le(data, &value.to_le_bytes());
+        } else {
+            data.fill(0xFF);
+        }
+    }
+
+    /// Service a guest port write. Writes to unmapped ports are dropped.
+    pub fn write(&mut self, port: u16, data: &[u8]) {
+        if let Some(entry) = self.lookup_mut(port) {
+            entry
+                .device
+                .pio_write(port, u8_of(data.len()), le_to_u32(data));
+        }
+    }
+}
+
+/// A registered MMIO device plus the exclusive upper bound of its range.
+struct MmioEntry {
+    /// Exclusive end of the claimed range.
+    end: u64,
+    device: Box<dyn MmioDevice>,
+}
+
+/// MMIO bus — owns devices and routes memory-mapped I/O to the one covering
+/// each address.
+#[derive(Default)]
+pub struct MmioBus {
+    /// Maps each device's base address to its entry.
+    devices: BTreeMap<u64, MmioEntry>,
+}
+
+impl MmioBus {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            devices: BTreeMap::new(),
+        }
+    }
+
+    /// Register `device` over the half-open range it declares via
     /// [`MmioDevice::mmio_range`].
     ///
     /// # Errors
-    /// Returns [`RegisterError::EmptyRange`] if the device reports `end <= base`,
-    /// or [`RegisterError::Overlap`] if its range intersects an already-
-    /// registered device.
-    pub fn register_mmio(
-        &mut self,
-        device: Box<dyn MmioDevice + Send>,
-    ) -> Result<(), RegisterError> {
+    /// Returns [`BusError::EmptyRange`] if the declared range is empty, or
+    /// [`BusError::Overlap`] if it intersects an already-registered device.
+    pub fn register(&mut self, device: Box<dyn MmioDevice>) -> Result<(), BusError> {
         let (base, end) = device.mmio_range();
         if end <= base {
-            return Err(RegisterError::EmptyRange { base, end });
+            return Err(BusError::EmptyRange);
         }
-        let overlaps = self
-            .mmio
-            .iter()
-            .any(|(&existing_base, entry)| base < entry.end && existing_base < end);
-        if overlaps {
-            return Err(RegisterError::Overlap { base, end });
+        if let Some((_, prev)) = self.devices.range(..=base).next_back()
+            && prev.end > base
+        {
+            return Err(BusError::Overlap {
+                base,
+                end: prev.end,
+            });
         }
-        self.mmio.insert(base, MmioEntry { end, device });
+        if let Some((&next_base, next)) = self.devices.range(base..).next()
+            && next_base < end
+        {
+            return Err(BusError::Overlap {
+                base: next_base,
+                end: next.end,
+            });
+        }
+        self.devices.insert(base, MmioEntry { end, device });
         Ok(())
     }
 
-    // -- Device lookup --
-
-    /// The PIO device whose claimed range contains `port`, if any.
-    fn pio_device(&mut self, port: u16) -> Option<&mut (dyn PioDevice + Send + 'static)> {
-        self.pio
-            .range_mut(..=port)
+    /// Whether some registered device covers `address`.
+    #[must_use]
+    pub fn is_mapped(&self, address: u64) -> bool {
+        self.devices
+            .range(..=address)
             .next_back()
-            .filter(|(_, entry)| port < entry.end)
-            .map(|(_, entry)| entry.device.as_mut())
+            .is_some_and(|(_, e)| address < e.end)
     }
 
-    /// The MMIO device whose claimed range contains `addr`, plus its base
-    /// address (so the caller can form the device-relative offset).
-    fn mmio_device(&mut self, addr: u64) -> Option<(u64, &mut (dyn MmioDevice + Send + 'static))> {
-        self.mmio
-            .range_mut(..=addr)
-            .next_back()
-            .filter(|(_, entry)| addr < entry.end)
-            .map(|(&base, entry)| (base, entry.device.as_mut()))
+    fn lookup_mut(&mut self, address: u64) -> Option<(u64, &mut MmioEntry)> {
+        let (&base, entry) = self.devices.range_mut(..=address).next_back()?;
+        (address < entry.end).then_some((base, entry))
     }
 
-    // -- Byte-oriented dispatch (matches `VmExitHandler`'s interface) --
-
-    /// Service a guest port read, filling `data` (1–4 bytes, little-endian).
-    /// Buffers longer than four bytes are treated as repeated byte-wide string
-    /// input (`rep insb`) from the same port. Unmapped ports read all-ones.
-    pub fn read_pio(&mut self, port: u16, data: &mut [u8]) {
-        if data.len() <= 4 {
-            self.read_pio_one(port, data);
+    /// Service a guest MMIO read of `data.len()` bytes, filling `data` in place.
+    /// Unmapped addresses read as all-ones (open bus).
+    pub fn read(&mut self, address: u64, data: &mut [u8]) {
+        if let Some((base, entry)) = self.lookup_mut(address) {
+            let value = entry.device.mmio_read(address - base, u8_of(data.len()));
+            fill_le(data, &value.to_le_bytes());
         } else {
-            for byte in data.iter_mut() {
-                self.read_pio_one(port, std::slice::from_mut(byte));
-            }
+            data.fill(0xFF);
         }
     }
 
-    /// Service a guest port write of `data` (1–4 bytes, little-endian).
-    /// Buffers longer than four bytes are treated as repeated byte-wide string
-    /// output (`rep outsb`) to the same port. Unmapped ports drop the write.
-    pub fn write_pio(&mut self, port: u16, data: &[u8]) {
-        if data.len() <= 4 {
-            self.write_pio_one(port, data);
-        } else {
-            for byte in data {
-                self.write_pio_one(port, std::slice::from_ref(byte));
-            }
-        }
-    }
-
-    /// Service a guest MMIO read, filling `data` (1–8 bytes, little-endian).
-    /// Buffers longer than eight bytes are split into byte-wide accesses with
-    /// ascending addresses. Unmapped addresses read all-ones.
-    pub fn read_mmio(&mut self, addr: u64, data: &mut [u8]) {
-        if data.len() <= 8 {
-            self.read_mmio_one(addr, data);
-        } else {
-            for (offset, byte) in data.iter_mut().enumerate() {
-                self.read_mmio_one(
-                    addr.wrapping_add(offset.to_u64()),
-                    std::slice::from_mut(byte),
-                );
-            }
-        }
-    }
-
-    /// Service a guest MMIO write of `data` (1–8 bytes, little-endian).
-    /// Buffers longer than eight bytes are split into byte-wide accesses with
-    /// ascending addresses. Unmapped addresses drop the write.
-    pub fn write_mmio(&mut self, addr: u64, data: &[u8]) {
-        if data.len() <= 8 {
-            self.write_mmio_one(addr, data);
-        } else {
-            for (offset, byte) in data.iter().enumerate() {
-                self.write_mmio_one(
-                    addr.wrapping_add(offset.to_u64()),
-                    std::slice::from_ref(byte),
-                );
-            }
-        }
-    }
-
-    // -- Single-access helpers (width <= the register size) --
-
-    fn read_pio_one(&mut self, port: u16, data: &mut [u8]) {
-        let size = u8_of(data.len());
-        let value = self
-            .pio_device(port)
-            .map_or(u32::MAX, |device| device.pio_read(port, size));
-        let bytes = value.to_le_bytes();
-        for (dst, src) in data.iter_mut().zip(bytes) {
-            *dst = src;
-        }
-    }
-
-    fn write_pio_one(&mut self, port: u16, data: &[u8]) {
-        let size = u8_of(data.len());
-        let mut bytes = [0u8; 4];
-        for (dst, src) in bytes.iter_mut().zip(data) {
-            *dst = *src;
-        }
-        let value = u32::from_le_bytes(bytes);
-        if let Some(device) = self.pio_device(port) {
-            device.pio_write(port, size, value);
-        }
-    }
-
-    fn read_mmio_one(&mut self, addr: u64, data: &mut [u8]) {
-        let size = u8_of(data.len());
-        let value = self.mmio_device(addr).map_or(u64::MAX, |(base, device)| {
-            device.mmio_read(addr - base, size)
-        });
-        let bytes = value.to_le_bytes();
-        for (dst, src) in data.iter_mut().zip(bytes) {
-            *dst = src;
-        }
-    }
-
-    fn write_mmio_one(&mut self, addr: u64, data: &[u8]) {
-        let size = u8_of(data.len());
-        let mut bytes = [0u8; 8];
-        for (dst, src) in bytes.iter_mut().zip(data) {
-            *dst = *src;
-        }
-        let value = u64::from_le_bytes(bytes);
-        if let Some((base, device)) = self.mmio_device(addr) {
-            device.mmio_write(addr - base, size, value);
+    /// Service a guest MMIO write. Writes to unmapped addresses are dropped.
+    pub fn write(&mut self, address: u64, data: &[u8]) {
+        if let Some((base, entry)) = self.lookup_mut(address) {
+            entry
+                .device
+                .mmio_write(address - base, u8_of(data.len()), le_to_u64(data));
         }
     }
 }
-
-/// Bridges KVM vCPU exits to the device model: every guest I/O / MMIO access
-/// surfaced by the run loop is routed to the owning device (or floats to
-/// all-ones / is dropped when unmapped).
-impl VmExitHandler for Bus {
-    fn io_in(&mut self, port: u16, data: &mut [u8]) {
-        self.read_pio(port, data);
-    }
-    fn io_out(&mut self, port: u16, data: &[u8]) {
-        self.write_pio(port, data);
-    }
-    fn mmio_read(&mut self, addr: u64, data: &mut [u8]) {
-        self.read_mmio(addr, data);
-    }
-    fn mmio_write(&mut self, addr: u64, data: &[u8]) {
-        self.write_mmio(addr, data);
-    }
-}
-
-// ===========================================================================
-// Tests
-// ===========================================================================
 
 #[cfg(test)]
 mod tests {
-    use super::{Bus, MmioDevice, PioDevice, RegisterError, VmExitHandler};
-    use std::sync::{Arc, Mutex};
+    use super::{BusError, MmioBus, MmioDevice, PioBus, PioDevice};
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
-    /// Shared log of `(port_or_offset, size, data)` writes, so a test can
-    /// inspect what a boxed device recorded after dispatch.
-    type WriteLog<T> = Arc<Mutex<Vec<(T, u8, u64)>>>;
+    /// One recorded access: `(addr_or_offset, size, data)` (`data` is 0 for reads).
+    type Access = (u64, u8, u64);
 
-    /// A minimal PIO device over a fixed range. Reads return `read_value`;
-    /// writes are appended to the shared `writes` log.
-    struct FakePio {
-        base: u16,
-        len: u16,
-        read_value: u32,
-        writes: WriteLog<u16>,
+    /// A test device that logs every access into a shared `Vec` (so the log is
+    /// still inspectable after the device is moved into a bus) and returns a
+    /// fixed pattern on read.
+    struct Recorder {
+        base: u64,
+        len: u64,
+        read_value: u64,
+        reads: Rc<RefCell<Vec<Access>>>,
+        writes: Rc<RefCell<Vec<Access>>>,
     }
 
-    impl FakePio {
-        fn new(base: u16, len: u16, read_value: u32) -> (Self, WriteLog<u16>) {
-            let writes: WriteLog<u16> = Arc::new(Mutex::new(Vec::new()));
-            let dev = Self {
+    impl Recorder {
+        fn new(base: u64, len: u64, read_value: u64) -> Self {
+            Self {
                 base,
                 len,
                 read_value,
-                writes: Arc::clone(&writes),
-            };
-            (dev, writes)
+                reads: Rc::new(RefCell::new(Vec::new())),
+                writes: Rc::new(RefCell::new(Vec::new())),
+            }
+        }
+
+        /// A clone of the write log that stays live after the device is boxed
+        /// and handed to a bus.
+        fn write_log(&self) -> Rc<RefCell<Vec<Access>>> {
+            Rc::clone(&self.writes)
         }
     }
 
-    impl PioDevice for FakePio {
-        fn pio_read(&mut self, _port: u16, _size: u8) -> u32 {
-            self.read_value
+    impl PioDevice for Recorder {
+        fn pio_read(&mut self, port: u16, size: u8) -> u32 {
+            self.reads.borrow_mut().push((u64::from(port), size, 0));
+            u32::from_le_bytes(self.read_value.to_le_bytes()[..4].try_into().unwrap())
         }
         fn pio_write(&mut self, port: u16, size: u8, data: u32) {
             self.writes
-                .lock()
-                .unwrap()
-                .push((port, size, u64::from(data)));
+                .borrow_mut()
+                .push((u64::from(port), size, u64::from(data)));
         }
         fn port_range(&self) -> (u16, u16) {
-            (self.base, self.base + self.len)
+            (
+                u16::try_from(self.base).unwrap(),
+                u16::try_from(self.base + self.len).unwrap(),
+            )
         }
     }
 
-    /// A minimal MMIO device that stores a single 64-bit cell and logs writes.
-    struct FakeMmio {
-        base: u64,
-        len: u64,
-        cell: u64,
-        writes: WriteLog<u64>,
-    }
-
-    impl FakeMmio {
-        fn new(base: u64, len: u64, cell: u64) -> (Self, WriteLog<u64>) {
-            let writes: WriteLog<u64> = Arc::new(Mutex::new(Vec::new()));
-            let dev = Self {
-                base,
-                len,
-                cell,
-                writes: Arc::clone(&writes),
-            };
-            (dev, writes)
-        }
-    }
-
-    impl MmioDevice for FakeMmio {
-        fn mmio_read(&mut self, _offset: u64, _size: u8) -> u64 {
-            self.cell
+    impl MmioDevice for Recorder {
+        fn mmio_read(&mut self, offset: u64, size: u8) -> u64 {
+            self.reads.borrow_mut().push((offset, size, 0));
+            self.read_value
         }
         fn mmio_write(&mut self, offset: u64, size: u8, data: u64) {
-            self.writes.lock().unwrap().push((offset, size, data));
-            self.cell = data;
+            self.writes.borrow_mut().push((offset, size, data));
         }
         fn mmio_range(&self) -> (u64, u64) {
             (self.base, self.base + self.len)
         }
     }
 
-    /// Register a PIO fake and discard its write log (for read-only tests).
-    fn pio(bus: &mut Bus, base: u16, len: u16, read_value: u32) {
-        let (dev, _log) = FakePio::new(base, len, read_value);
-        bus.register_pio(Box::new(dev)).expect("register pio");
-    }
-
     #[test]
-    fn register_rejects_empty_and_overlapping_ranges() {
-        let mut bus = Bus::new();
-        // Empty range.
-        let (empty_dev, _) = FakePio::new(0x100, 0, 0);
-        let empty = bus.register_pio(Box::new(empty_dev));
-        assert_eq!(
-            empty,
-            Err(RegisterError::EmptyRange {
-                base: 0x100,
-                end: 0x100
-            })
-        );
+    fn pio_write_reaches_owning_device_with_le_data() {
+        let mut bus = PioBus::new();
+        let dev = Recorder::new(0x3F8, 8, 0);
+        let writes = dev.write_log();
+        bus.register(Box::new(dev)).unwrap();
 
-        // First real device: 0x3f8..0x400.
-        pio(&mut bus, 0x3f8, 8, 0);
-        assert_eq!(bus.pio_count(), 1);
-
-        // Overlapping device: 0x3ff..0x401 intersects the above.
-        let (overlap_dev, _) = FakePio::new(0x3ff, 2, 0);
-        let overlap = bus.register_pio(Box::new(overlap_dev));
-        assert_eq!(
-            overlap,
-            Err(RegisterError::Overlap {
-                base: 0x3ff,
-                end: 0x401
-            })
-        );
-        assert_eq!(bus.pio_count(), 1);
-
-        // Adjacent, non-overlapping device registers fine.
-        pio(&mut bus, 0x400, 8, 0);
-        assert_eq!(bus.pio_count(), 2);
+        bus.write(0x3F8, b"OK"); // 0x4B4F little-endian
+        assert_eq!(&*writes.borrow(), &[(0x3F8, 2, 0x4B4F)]);
     }
 
     #[test]
     fn pio_read_returns_device_value_little_endian() {
-        let mut bus = Bus::new();
-        pio(&mut bus, 0x3f8, 8, 0x1234_5678);
+        let mut bus = PioBus::new();
+        bus.register(Box::new(Recorder::new(0x60, 4, 0x1234_5678)))
+            .unwrap();
 
-        let mut one = [0u8; 1];
-        bus.read_pio(0x3f8, &mut one);
-        assert_eq!(one, [0x78]);
-
-        let mut two = [0u8; 2];
-        bus.read_pio(0x3f9, &mut two);
-        assert_eq!(two, [0x78, 0x56]);
-
-        let mut four = [0u8; 4];
-        bus.read_pio(0x3fa, &mut four);
-        assert_eq!(four, [0x78, 0x56, 0x34, 0x12]);
-    }
-
-    #[test]
-    fn pio_write_reassembles_little_endian_value_and_size() {
-        let mut bus = Bus::new();
-        let (dev, log) = FakePio::new(0x3f8, 8, 0);
-        bus.register_pio(Box::new(dev)).unwrap();
-
-        bus.write_pio(0x3f8, &[0xef, 0xbe, 0xad, 0xde]);
-
-        let writes = log.lock().unwrap().clone();
-        assert_eq!(writes.len(), 1);
-        assert_eq!(writes[0], (0x3f8, 4, 0xdead_beef));
-    }
-
-    #[test]
-    fn unmapped_pio_reads_float_high_and_drops_writes() {
-        let mut bus = Bus::new();
         let mut buf = [0u8; 4];
-        bus.read_pio(0x80, &mut buf);
-        assert_eq!(buf, [0xff, 0xff, 0xff, 0xff]);
-        // Writing to nothing must not panic.
-        bus.write_pio(0x80, &[1, 2, 3, 4]);
+        bus.read(0x60, &mut buf);
+        assert_eq!(buf, [0x78, 0x56, 0x34, 0x12]);
+
+        // A 1-byte read takes only the low byte.
+        let mut one = [0u8; 1];
+        bus.read(0x60, &mut one);
+        assert_eq!(one, [0x78]);
     }
 
     #[test]
-    fn mmio_read_write_roundtrips_through_offset() {
-        let mut bus = Bus::new();
-        let (dev, log) = FakeMmio::new(0xfed4_0000, 0x1000, 0);
-        bus.register_mmio(Box::new(dev)).unwrap();
+    fn unmapped_pio_is_open_bus() {
+        let mut bus = PioBus::new();
+        bus.register(Box::new(Recorder::new(0x3F8, 8, 0))).unwrap();
 
-        // Write a 4-byte value at base+0x10.
-        bus.write_mmio(0xfed4_0010, &[0x11, 0x22, 0x33, 0x44]);
-        // The device sees the device-relative offset (0x10), the access width,
-        // and the little-endian value.
-        let writes = log.lock().unwrap().clone();
-        assert_eq!(writes.len(), 1);
-        assert_eq!(writes[0], (0x10, 4, 0x4433_2211));
-
-        // The fake echoes its stored cell back on any read.
-        let mut out = [0u8; 4];
-        bus.read_mmio(0xfed4_0010, &mut out);
-        assert_eq!(out, [0x11, 0x22, 0x33, 0x44]);
+        // Below, above, and just past the device's range all read as 0xFF.
+        let mut buf = [0u8; 2];
+        bus.read(0x70, &mut buf);
+        assert_eq!(buf, [0xFF, 0xFF]);
+        bus.read(0x400, &mut buf);
+        assert_eq!(buf, [0xFF, 0xFF]);
+        // 0x3F8 + 8 == 0x400 is the exclusive end -> not owned.
+        assert!(!bus.is_mapped(0x400));
+        assert!(bus.is_mapped(0x3FF));
+        // Writes to unmapped ports must not panic.
+        bus.write(0x70, &[1]);
     }
 
     #[test]
-    fn unmapped_mmio_reads_float_high() {
-        let mut bus = Bus::new();
+    fn pio_overlap_is_rejected() {
+        let mut bus = PioBus::new();
+        bus.register(Box::new(Recorder::new(0x3F8, 8, 0))).unwrap();
+        // Starts inside the first device's range.
+        let err = bus
+            .register(Box::new(Recorder::new(0x3FF, 8, 0)))
+            .unwrap_err();
+        assert!(matches!(err, BusError::Overlap { .. }));
+        // Straddles from below into the first device.
+        let err = bus
+            .register(Box::new(Recorder::new(0x3F0, 16, 0)))
+            .unwrap_err();
+        assert!(matches!(err, BusError::Overlap { .. }));
+        // Adjacent (ends exactly at 0x3F8) is fine.
+        bus.register(Box::new(Recorder::new(0x3F0, 8, 0))).unwrap();
+    }
+
+    #[test]
+    fn mmio_dispatch_uses_offset_and_width() {
+        let mut bus = MmioBus::new();
+        let dev = Recorder::new(0xFEE0_0000, 0x1000, 0xDEAD_BEEF_CAFE_BABE);
+        let writes = dev.write_log();
+        bus.register(Box::new(dev)).unwrap();
+
+        // 8-byte read returns the full value, little-endian.
         let mut buf = [0u8; 8];
-        bus.read_mmio(0xdead_0000, &mut buf);
-        assert_eq!(buf, [0xff; 8]);
-        bus.write_mmio(0xdead_0000, &[1]); // must not panic
+        bus.read(0xFEE0_0000, &mut buf);
+        assert_eq!(buf, 0xDEAD_BEEF_CAFE_BABE_u64.to_le_bytes());
+
+        // A write at base + 0x20 must reach the device as offset 0x20, width 4.
+        bus.write(0xFEE0_0020, &0x1122_3344_u32.to_le_bytes());
+        assert_eq!(&*writes.borrow(), &[(0x20, 4, 0x1122_3344)]);
+
+        // The last byte of the range is owned; the exclusive end is not.
+        assert!(bus.is_mapped(0xFEE0_0FFF));
+        assert!(!bus.is_mapped(0xFEE0_1000));
     }
 
     #[test]
-    fn vm_exit_handler_routes_to_the_right_device() {
-        // Two PIO devices on disjoint ranges; verify the handler path (the KVM
-        // entry point) lands each access on the correct device.
-        let mut bus = Bus::new();
-        pio(&mut bus, 0x60, 1, 0xaa); // PS/2-ish
-        let (com1, com1_log) = FakePio::new(0x3f8, 8, 0x55); // COM1-ish
-        bus.register_pio(Box::new(com1)).unwrap();
-
-        let mut a = [0u8; 1];
-        VmExitHandler::io_in(&mut bus, 0x60, &mut a);
-        assert_eq!(a, [0xaa]);
-
-        let mut b = [0u8; 1];
-        VmExitHandler::io_in(&mut bus, 0x3f8, &mut b);
-        assert_eq!(b, [0x55]);
-
-        // A write through the handler reaches the mapped device; an unmapped
-        // write is dropped cleanly (no panic, nothing recorded).
-        VmExitHandler::io_out(&mut bus, 0x3f8, &[0x41]);
-        VmExitHandler::io_out(&mut bus, 0x999, &[0x41]);
-        let writes = com1_log.lock().unwrap().clone();
-        assert_eq!(writes.as_slice(), &[(0x3f8, 1, 0x41)]);
-    }
-
-    #[test]
-    fn rep_string_pio_writes_each_byte_to_same_port() {
-        // A >4-byte PIO buffer is byte-wide string output (`rep outsb`) to one
-        // port: every element must reach the device as a separate 1-byte write.
-        let mut bus = Bus::new();
-        let (dev, log) = FakePio::new(0x3f8, 8, 0);
-        bus.register_pio(Box::new(dev)).unwrap();
-
-        bus.write_pio(0x3f8, b"Hi!"); // <= 4 bytes is a single access...
-        bus.write_pio(0x3f8, b"hello world!"); // ...but 12 bytes is 12 writes
-
-        let writes = log.lock().unwrap().clone();
-        // First call: one combined access of 3 bytes; then 12 single-byte ones.
-        assert_eq!(writes.len(), 1 + 12);
-        assert_eq!(writes[0].1, 3); // size of the combined access
-        assert!(
-            writes[1..]
-                .iter()
-                .all(|&(port, size, _)| port == 0x3f8 && size == 1),
-            "string output must be byte-wide writes to the same port"
-        );
-        // The string bytes arrive in order.
-        let bytes: Vec<u8> = writes[1..]
-            .iter()
-            .map(|&(_, _, d)| u8::try_from(d).unwrap())
-            .collect();
-        assert_eq!(bytes, b"hello world!");
+    fn mmio_empty_range_is_rejected() {
+        let mut bus = MmioBus::new();
+        let err = bus
+            .register(Box::new(Recorder::new(0x1000, 0, 0)))
+            .unwrap_err();
+        assert_eq!(err, BusError::EmptyRange);
     }
 }
