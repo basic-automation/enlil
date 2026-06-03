@@ -79,9 +79,8 @@ impl TimingStealth {
         // Update TSC offset to hide cumulative VMEXIT time
         // Guest TSC = Host TSC + offset
         // We want: Guest TSC ≈ Host TSC - cumulative_exit_time
-        #[allow(clippy::cast_possible_wrap)]
         {
-            self.tsc_offset = -(self.cumulative_exit_tsc as i64);
+            self.tsc_offset = -(self.cumulative_exit_tsc.cast_signed());
         }
     }
 

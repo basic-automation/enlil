@@ -3,6 +3,7 @@
 //! Emulates a Realtek ALC892-compatible codec with output and input widgets.
 //! Windows loads the inbox HD Audio class driver for this.
 
+use crate::truncate::u32_of;
 /// Codec address on the HDA link
 pub const CODEC_ADDRESS: u8 = 0;
 
@@ -146,7 +147,6 @@ impl HdaCodec {
 
     /// Process a codec verb and return the response
     #[must_use]
-    #[allow(clippy::cast_lossless)]
     pub fn process_verb(&mut self, verb: u32) -> u32 {
         // bits 28-31 are the codec address (single codec here, so ignored)
         let nid = ((verb >> 20) & 0x7F) as u8;
@@ -181,7 +181,7 @@ impl HdaCodec {
                 match param {
                     0x04 => {
                         // Node count: start NID and count
-                        let count = self.widgets.len() as u32;
+                        let count = u32_of(self.widgets.len());
                         (0x02 << 16) | count
                     }
                     0x05 => 0x01,        // Function Group Type: Audio
@@ -200,7 +200,7 @@ impl HdaCodec {
                         0x0C => w.pin_config,
                         0x0E => {
                             // Connection list length
-                            w.connections.len() as u32
+                            u32_of(w.connections.len())
                         }
                         _ => 0,
                     }
@@ -213,7 +213,7 @@ impl HdaCodec {
                 if let Some(w) = self.widgets.iter().find(|w| w.nid == nid) {
                     let idx = (payload & 0xFF) as usize;
                     if idx < w.connections.len() {
-                        w.connections[idx] as u32
+                        u32::from(w.connections[idx])
                     } else {
                         0
                     }
@@ -226,7 +226,7 @@ impl HdaCodec {
                 .widgets
                 .iter()
                 .find(|w| w.nid == nid)
-                .map_or(0, |w| w.stream_channel as u32),
+                .map_or(0, |w| u32::from(w.stream_channel)),
             (nid, 0x706) => {
                 if let Some(w) = self.widgets.iter_mut().find(|w| w.nid == nid) {
                     w.stream_channel = (payload & 0xFF) as u8;

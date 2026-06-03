@@ -7,6 +7,7 @@
 //! - IPI delivery
 //! - EOI processing
 
+use crate::truncate::{u32_of, u8_of};
 use super::{DeliveryMode, InterruptEntry, TriggerMode};
 
 // LAPIC register offsets (byte offsets from base 0xFEE00000)
@@ -202,8 +203,7 @@ impl LocalApic {
                 if idx < 8 { self.irr[idx] } else { 0 }
             }
             LAPIC_ESR => self.esr,
-            #[allow(clippy::cast_possible_truncation)]
-            LAPIC_ICR_LOW => self.icr as u32,
+            LAPIC_ICR_LOW => u32_of(self.icr),
             LAPIC_ICR_HIGH => (self.icr >> 32) as u32,
             LAPIC_LVT_TIMER => self.lvt_timer,
             LAPIC_LVT_THERMAL => self.lvt_thermal,
@@ -328,8 +328,7 @@ impl LocalApic {
 
         let pending_vec = Self::highest_bit_in_register(&self.irr)?;
         let servicing_vec = Self::highest_bit_in_register(&self.isr).unwrap_or(0);
-        #[allow(clippy::cast_possible_truncation)]
-        let ppr = self.compute_ppr() as u8;
+        let ppr = u8_of(self.compute_ppr());
 
         // Interrupt priority class = vector >> 4
         // Can deliver if IRR priority > PPR priority
@@ -400,8 +399,7 @@ impl LocalApic {
         for i in (0..8).rev() {
             if regs[i] != 0 {
                 let bit = regs[i].ilog2();
-                #[allow(clippy::cast_possible_truncation)]
-                return Some((i as u8) * 32 + bit as u8);
+                return Some((u8_of(i)) * 32 + u8_of(bit));
             }
         }
         None

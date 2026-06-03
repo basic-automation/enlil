@@ -3,6 +3,7 @@
 //! Implements the `VirtIO` block device specification (virtio-blk).
 //! Uses the [`StorageBackend`] trait for pluggable storage backends.
 
+use crate::truncate::usize_of;
 use crate::storage::StorageBackend;
 use std::sync::Arc;
 
@@ -186,8 +187,7 @@ impl VirtioBlockDevice {
     #[must_use]
     pub fn read_config(&self, offset: u64, size: u8) -> u64 {
         let config_bytes = self.config_as_bytes();
-        #[allow(clippy::cast_possible_truncation)]
-        let offset = offset as usize;
+        let offset = usize_of(offset);
         if offset >= config_bytes.len() {
             return 0;
         }

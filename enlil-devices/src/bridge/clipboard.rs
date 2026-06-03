@@ -74,7 +74,6 @@ impl ClipboardPolicy {
 }
 
 /// Clipboard entry with sequence number
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct ClipboardEntry {
     content: ClipboardContent,
@@ -82,7 +81,6 @@ struct ClipboardEntry {
     source_guest: u32,
 }
 
-#[allow(dead_code)]
 impl ClipboardEntry {
     /// Returns the sequence number of this entry.
     const fn sequence(&self) -> u64 {

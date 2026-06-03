@@ -11,6 +11,7 @@
 //! forwarding table, then uses the destination MAC to decide where to
 //! send the frame.
 
+use crate::truncate::u32_of;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -93,8 +94,7 @@ impl VirtualSwitch {
 
     /// Register a new port on the switch. Returns the port ID.
     pub fn add_port(&mut self) -> PortId {
-        #[allow(clippy::cast_possible_truncation)]
-        let id = PortId(self.ports.len() as u32);
+        let id = PortId(u32_of(self.ports.len()));
         self.ports.push(id);
         self.port_queues.insert(id, VecDeque::new());
         id

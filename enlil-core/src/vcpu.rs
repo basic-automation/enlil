@@ -182,7 +182,6 @@ impl VcpuManager {
             .iter()
             .enumerate()
             .map(|(i, &core)| {
-                #[allow(clippy::cast_possible_truncation)]
                 let id = i as u32;
                 VcpuConfig {
                     id,

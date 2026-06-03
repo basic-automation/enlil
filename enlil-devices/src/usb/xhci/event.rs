@@ -8,6 +8,7 @@
 //! Each interrupter has its own Event Ring Segment Table (ERST) that
 //! maps the ring segments in guest physical memory.
 
+use crate::truncate::u16_of;
 use super::trb::{Trb, TrbCompletionCode, TrbType};
 use std::fmt;
 
@@ -63,7 +64,7 @@ impl EventRing {
     /// Create a new event ring with a single segment of the given size.
     #[must_use]
     pub fn new(segment_size: usize) -> Self {
-        let segment = EventRingSegment::new(0, segment_size as u16);
+        let segment = EventRingSegment::new(0, u16_of(segment_size));
         Self {
             segments: vec![segment],
             entries: vec![Trb::zeroed(); segment_size],

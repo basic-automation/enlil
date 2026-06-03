@@ -83,7 +83,6 @@ pub struct AcpiTableSet {
 
 /// Build a complete ACPI table set for a guest VM
 #[must_use]
-#[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
 pub fn build_acpi_tables(config: &AcpiTableSetConfig) -> AcpiTableSet {
     let base = config.table_base_address;
     let mut tables = Vec::new();

@@ -103,12 +103,10 @@ impl NetBackend for NullBackend {
 
 /// A loopback backend that echoes transmitted frames back as received frames.
 /// Useful for testing the full TX→RX path.
-#[allow(dead_code)]
 pub struct LoopbackBackend {
     queue: VecDeque<Vec<u8>>,
 }
 
-#[allow(dead_code)]
 impl LoopbackBackend {
     pub const fn new() -> Self {
         Self {
@@ -152,7 +150,6 @@ impl NetBackend for LoopbackBackend {
 
 /// One end of a shared-memory pipe for connecting two net devices in tests.
 /// Frames sent on one end appear as received on the other.
-#[allow(dead_code)]
 pub struct PipeBackend {
     /// Frames we send go into the peer's rx queue.
     peer_rx: Arc<Mutex<VecDeque<Vec<u8>>>>,
@@ -160,7 +157,6 @@ pub struct PipeBackend {
     our_rx: Arc<Mutex<VecDeque<Vec<u8>>>>,
 }
 
-#[allow(dead_code)]
 impl PipeBackend {
     /// Create a connected pair of pipe backends.
     pub fn pair() -> (Self, Self) {

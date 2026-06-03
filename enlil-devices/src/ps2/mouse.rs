@@ -183,7 +183,6 @@ impl Ps2Mouse {
     }
 
     /// Inject mouse movement from host input
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     pub fn inject_movement(&mut self, buttons: u8, dx: i16, dy: i16) {
         self.buttons = buttons;
         if self.reporting_enabled {
@@ -195,7 +194,6 @@ impl Ps2Mouse {
     }
 
     /// Build a PS/2 mouse packet
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     fn build_packet(&self, buttons: u8, dx: i16, dy: i16) -> Vec<u8> {
         let dx_clamped = dx.clamp(-256, 255);
         let dy_clamped = dy.clamp(-256, 255);
@@ -215,7 +213,7 @@ impl Ps2Mouse {
             byte0 |= 0x80; // Y overflow
         }
 
-        let mut packet = vec![byte0, dx_clamped as u8, dy_clamped as u8];
+        let mut packet = vec![byte0, dx_clamped.to_le_bytes()[0], dy_clamped.to_le_bytes()[0]];
 
         // Intellimouse: 4th byte for scroll wheel
         if self.mouse_id == 3 {

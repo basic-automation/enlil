@@ -5,6 +5,7 @@
 //! - `_PSS` — Performance Supported States (frequency/voltage pairs)
 //! - `_CST` — C-States (idle power states: C1, C2, C3)
 
+use crate::truncate::{u16_of, u32_of, u8_of};
 use super::aml::opcode;
 use super::tables::{AcpiSdtHeader, OemInfo};
 
@@ -43,7 +44,6 @@ pub struct CState {
 /// SSDT builder for CPU power management objects
 pub struct SsdtBuilder {
     oem: OemInfo,
-    #[allow(dead_code)] // defined for spec completeness; not all bits/fields are consumed yet
     vcpu_count: u8,
     pstates: Vec<PState>,
     cstates: Vec<CState>,
@@ -143,7 +143,6 @@ impl SsdtBuilder {
     }
 
     /// Encode an AML integer data object (without Name opcode)
-    #[allow(clippy::cast_possible_truncation)]
     fn encode_integer(value: u64) -> Vec<u8> {
         let mut buf = Vec::new();
         if value == 0 {
@@ -152,13 +151,13 @@ impl SsdtBuilder {
             buf.push(opcode::ONE);
         } else if value <= 0xFF {
             buf.push(opcode::BYTE_PREFIX);
-            buf.push(value as u8);
+            buf.push(u8_of(value));
         } else if value <= 0xFFFF {
             buf.push(opcode::WORD_PREFIX);
-            buf.extend_from_slice(&(value as u16).to_le_bytes());
+            buf.extend_from_slice(&(u16_of(value)).to_le_bytes());
         } else if value <= 0xFFFF_FFFF {
             buf.push(opcode::DWORD_PREFIX);
-            buf.extend_from_slice(&(value as u32).to_le_bytes());
+            buf.extend_from_slice(&(u32_of(value)).to_le_bytes());
         } else {
             buf.push(opcode::QWORD_PREFIX);
             buf.extend_from_slice(&value.to_le_bytes());
@@ -167,27 +166,26 @@ impl SsdtBuilder {
     }
 
     /// Encode a `PkgLength`
-    #[allow(clippy::cast_possible_truncation)]
     fn encode_pkg_length(length: usize) -> Vec<u8> {
         if length < 0x3F {
-            vec![length as u8]
+            vec![u8_of(length)]
         } else if length < 0xFFF {
             vec![
-                ((length & 0x0F) as u8) | (1 << 6),
-                ((length >> 4) & 0xFF) as u8,
+                (u8_of(length & 0x0F)) | (1 << 6),
+                (length >> 4).to_le_bytes()[0],
             ]
         } else if length < 0xF_FFFF {
             vec![
-                ((length & 0x0F) as u8) | (2 << 6),
-                ((length >> 4) & 0xFF) as u8,
-                ((length >> 12) & 0xFF) as u8,
+                (u8_of(length & 0x0F)) | (2 << 6),
+                (length >> 4).to_le_bytes()[0],
+                (length >> 12).to_le_bytes()[0],
             ]
         } else {
             vec![
-                ((length & 0x0F) as u8) | (3 << 6),
-                ((length >> 4) & 0xFF) as u8,
-                ((length >> 12) & 0xFF) as u8,
-                ((length >> 20) & 0xFF) as u8,
+                (u8_of(length & 0x0F)) | (3 << 6),
+                (length >> 4).to_le_bytes()[0],
+                (length >> 12).to_le_bytes()[0],
+                (length >> 20).to_le_bytes()[0],
             ]
         }
     }
@@ -227,8 +225,7 @@ impl SsdtBuilder {
         let pkg_len_bytes =
             Self::encode_pkg_length(pkg_body_len + Self::encode_pkg_length(pkg_body_len).len());
         pkg.extend_from_slice(&pkg_len_bytes);
-        #[allow(clippy::cast_possible_truncation)]
-        pkg.push(self.pstates.len() as u8);
+        pkg.push(u8_of(self.pstates.len()));
         pkg.extend_from_slice(&entries_bytes);
 
         let mut buf = Vec::new();
@@ -307,8 +304,7 @@ impl SsdtBuilder {
 
         let mut pkg = Vec::new();
         pkg.push(opcode::PACKAGE_OP);
-        #[allow(clippy::cast_possible_truncation)]
-        let num_elements = (self.cstates.len() + 1) as u8; // count integer + entries
+        let num_elements = u8_of(self.cstates.len() + 1); // count integer + entries
         let pkg_body_len = 1 + entries_bytes.len(); // 1 for NumElements byte
         let pkg_len_bytes =
             Self::encode_pkg_length(pkg_body_len + Self::encode_pkg_length(pkg_body_len).len());
@@ -324,7 +320,6 @@ impl SsdtBuilder {
     }
 
     /// Generate processor name: C00_, C01_, ... C0F_, C10_, etc.
-    #[allow(clippy::cast_possible_truncation)]
     const fn processor_name(index: u8) -> [u8; 4] {
         let hex = b"0123456789ABCDEF";
         [
@@ -386,10 +381,9 @@ impl SsdtBuilder {
 
     /// Build the complete SSDT table as a byte vector
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn build(&self) -> Vec<u8> {
         let aml_bytes = self.generate_aml();
-        let total_length = (AcpiSdtHeader::SIZE + aml_bytes.len()) as u32;
+        let total_length = u32_of(AcpiSdtHeader::SIZE + aml_bytes.len());
 
         let header = AcpiSdtHeader::new(*b"SSDT", total_length, 2, &self.oem);
         let mut buf = Vec::with_capacity(total_length as usize);

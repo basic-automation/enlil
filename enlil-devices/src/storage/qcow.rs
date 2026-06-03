@@ -3,6 +3,7 @@
 //! Parses the qcow2 header and L1/L2 tables to resolve guest cluster
 //! offsets to host file offsets. Write support is deferred to a later phase.
 
+use crate::truncate::{u8_of, usize_of};
 use super::StorageBackend;
 use anyhow::{Context, Result, bail};
 use std::fs::File;
@@ -124,7 +125,6 @@ impl QcowBackend {
 
     /// Resolve a guest byte offset to a host file offset.
     /// Returns `None` if the cluster is unallocated (read as zeroes).
-    #[allow(clippy::cast_possible_truncation)]
     fn resolve_offset(&self, guest_offset: u64, file: &mut File) -> Result<Option<u64>> {
         let cluster_size = self.header.cluster_size();
         let l2_entries = self.header.l2_entries();
@@ -135,7 +135,7 @@ impl QcowBackend {
             return Ok(None);
         }
 
-        let l1_entry = self.l1_table[l1_index as usize];
+        let l1_entry = self.l1_table[usize_of(l1_index)];
         // Bits 9..55 contain the offset of the L2 table
         let l2_table_offset = l1_entry & 0x00FF_FFFF_FFFF_FE00;
         if l2_table_offset == 0 {
@@ -164,7 +164,6 @@ impl QcowBackend {
 }
 
 impl StorageBackend for QcowBackend {
-    #[allow(clippy::cast_possible_truncation)]
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
         if offset >= self.header.size {
             return Ok(0);
@@ -172,13 +171,13 @@ impl StorageBackend for QcowBackend {
         let mut file = self.file.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let cluster_size = self.header.cluster_size();
         let mut total_read = 0usize;
-        let mut remaining = buf.len().min((self.header.size - offset) as usize);
+        let mut remaining = buf.len().min(usize_of(self.header.size - offset));
         let mut current_offset = offset;
 
         while remaining > 0 {
             // How many bytes until the end of this cluster?
-            let in_cluster = (current_offset % cluster_size) as usize;
-            let chunk = remaining.min((cluster_size as usize) - in_cluster);
+            let in_cluster = usize_of(current_offset % cluster_size);
+            let chunk = remaining.min(usize_of(cluster_size) - in_cluster);
 
             match self.resolve_offset(current_offset, &mut file)? {
                 Some(host_offset) => {
@@ -267,9 +266,8 @@ mod tests {
 
         // Data cluster: fill with a pattern
         let data_start = 3 * cluster_size;
-        #[allow(clippy::cast_possible_truncation)]
         for i in 0..cluster_size {
-            img[data_start + i] = (i & 0xFF) as u8;
+            img[data_start + i] = u8_of(i & 0xFF);
         }
 
         img
@@ -300,9 +298,8 @@ mod tests {
         let mut buf = vec![0u8; 256];
         let n = backend.read_at(0, &mut buf).unwrap();
         assert_eq!(n, 256);
-        #[allow(clippy::cast_possible_truncation)]
         for (i, &b) in buf.iter().enumerate() {
-            assert_eq!(b, (i & 0xFF) as u8, "mismatch at offset {i}");
+            assert_eq!(b, u8_of(i & 0xFF), "mismatch at offset {i}");
         }
     }
 

@@ -4,6 +4,7 @@
 //! and the DSDT pointer. We generate a realistic FADT that matches common
 //! motherboard firmware output.
 
+use crate::truncate::u32_of;
 use super::tables::{AcpiSdtHeader, OemInfo};
 
 /// FADT revision 6 (ACPI 6.4) — 276 bytes total
@@ -203,7 +204,6 @@ impl FadtBuilder {
 
     /// Build the FADT as a byte vector
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn build(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(FADT_LENGTH as usize);
 
@@ -214,7 +214,7 @@ impl FadtBuilder {
         // Offset 36: FIRMWARE_CTRL (4 bytes) — 32-bit physical address of FACS
         buf.extend_from_slice(&0u32.to_le_bytes());
         // Offset 40: DSDT (4 bytes) — 32-bit physical address of DSDT
-        buf.extend_from_slice(&(self.dsdt_address as u32).to_le_bytes());
+        buf.extend_from_slice(&(u32_of(self.dsdt_address)).to_le_bytes());
         // Offset 44: Reserved (was INT_MODEL in ACPI 1.0)
         buf.push(0);
         // Offset 45: Preferred PM Profile (2 = Mobile, 1 = Desktop)

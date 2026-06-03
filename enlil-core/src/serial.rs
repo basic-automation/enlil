@@ -285,7 +285,6 @@ impl UartState {
         let dlab = self.lcr & 0x80 != 0;
 
         match offset {
-            #[allow(clippy::cast_possible_truncation)]
             DATA_REG if dlab => self.divisor as u8,
             DATA_REG => self.read_data(),
             IER_REG if dlab => (self.divisor >> 8) as u8,

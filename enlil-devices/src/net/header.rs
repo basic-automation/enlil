@@ -36,7 +36,6 @@ pub mod flags {
     /// The device has validated the received data checksum.
     pub const DATA_VALID: u8 = 2;
     /// Reports number of coalesced RSC segments.
-    #[allow(dead_code)]
     pub const RSC_INFO: u8 = 4;
 }
 

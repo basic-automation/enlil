@@ -8,6 +8,7 @@
 //! - Processor objects
 //! - Power management (_S5 sleep state for shutdown)
 
+use crate::truncate::u32_of;
 use super::aml::AmlBuilder;
 use super::tables::{AcpiSdtHeader, OemInfo};
 
@@ -79,7 +80,7 @@ impl DsdtBuilder {
         // PCI0 — PCI Express Root Complex
         self.build_pci_root(aml);
 
-        aml.scope_end(sb);
+        aml.scope_end(&sb);
     }
 
     /// Build PCI Express Root Complex (PCI0)
@@ -100,12 +101,12 @@ impl DsdtBuilder {
         // _STA: present and functional
         let sta = aml.method_start(b"_STA", 0, false);
         aml.return_integer(0x0F);
-        aml.method_end(sta);
+        aml.method_end(&sta);
 
         // ISA/LPC bridge
         self.build_isa_bridge(aml);
 
-        aml.device_end(pci0);
+        aml.device_end(&pci0);
     }
 
     /// Build ISA/LPC bridge under PCI0
@@ -128,7 +129,7 @@ impl DsdtBuilder {
         // COM1 serial port
         self.build_com1(aml);
 
-        aml.device_end(isa);
+        aml.device_end(&isa);
     }
 
     /// Build RTC device
@@ -137,8 +138,8 @@ impl DsdtBuilder {
         aml.name_string(b"_HID", "PNP0B00");
         let sta = aml.method_start(b"_STA", 0, false);
         aml.return_integer(0x0F);
-        aml.method_end(sta);
-        aml.device_end(rtc);
+        aml.method_end(&sta);
+        aml.device_end(&rtc);
     }
 
     /// Build PS/2 keyboard and mouse
@@ -148,16 +149,16 @@ impl DsdtBuilder {
         aml.name_string(b"_HID", "PNP0303");
         let sta = aml.method_start(b"_STA", 0, false);
         aml.return_integer(0x0F);
-        aml.method_end(sta);
-        aml.device_end(kbd);
+        aml.method_end(&sta);
+        aml.device_end(&kbd);
 
         // Mouse
         let mou = aml.device_start(b"MOU_");
         aml.name_string(b"_HID", "PNP0F13");
         let sta = aml.method_start(b"_STA", 0, false);
         aml.return_integer(0x0F);
-        aml.method_end(sta);
-        aml.device_end(mou);
+        aml.method_end(&sta);
+        aml.device_end(&mou);
     }
 
     /// Build COM1 serial port
@@ -167,8 +168,8 @@ impl DsdtBuilder {
         aml.name_integer(b"_UID", 1);
         let sta = aml.method_start(b"_STA", 0, false);
         aml.return_integer(0x0F);
-        aml.method_end(sta);
-        aml.device_end(com1);
+        aml.method_end(&sta);
+        aml.device_end(&com1);
     }
 
     /// Build processor objects (_PR scope)
@@ -181,10 +182,10 @@ impl DsdtBuilder {
             aml.name_integer(b"_UID", u64::from(i));
             let sta = aml.method_start(b"_STA", 0, false);
             aml.return_integer(0x0F);
-            aml.method_end(sta);
-            aml.device_end(proc_dev);
+            aml.method_end(&sta);
+            aml.device_end(&proc_dev);
         }
-        aml.scope_end(pr);
+        aml.scope_end(&pr);
     }
 
     /// Build sleep state objects (\S5 for shutdown)
@@ -195,14 +196,13 @@ impl DsdtBuilder {
 
     /// Build the DSDT as a byte vector
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn build(&self) -> Vec<u8> {
         let aml_bytes = self.generate_aml();
         let total_length = 36 + aml_bytes.len();
 
         let mut buf = Vec::with_capacity(total_length);
 
-        let header = AcpiSdtHeader::new(*b"DSDT", total_length as u32, 2, &self.oem);
+        let header = AcpiSdtHeader::new(*b"DSDT", u32_of(total_length), 2, &self.oem);
         buf.extend_from_slice(&header.to_bytes());
         buf.extend_from_slice(&aml_bytes);
 
@@ -215,7 +215,6 @@ impl DsdtBuilder {
 }
 
 /// Generate processor name like C000, C001, ..., C00F, C010, etc.
-#[allow(clippy::cast_possible_truncation)]
 const fn processor_name(index: u8) -> [u8; 4] {
     let hex_chars = b"0123456789ABCDEF";
     [

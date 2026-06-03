@@ -4,6 +4,7 @@
 //! a PCI Express bus with ECAM (Enhanced Configuration Access Mechanism)
 //! for device enumeration.
 
+use crate::truncate::{u16_of, u8_of};
 /// PCI configuration space size per function
 pub const PCI_CONFIG_SPACE_SIZE: usize = 256;
 /// `PCIe` extended configuration space size per function
@@ -208,7 +209,7 @@ impl PciConfigSpace {
     /// Set a BAR value and its writable mask (for size detection)
     pub fn set_bar(&mut self, bar_index: usize, value: u32, mask: u32) {
         if bar_index < 6 {
-            let offset = cfg::BAR0 + (bar_index as u16) * 4;
+            let offset = cfg::BAR0 + (u16_of(bar_index)) * 4;
             self.write_u32(offset, value);
             self.bar_masks[bar_index] = mask;
         }
@@ -336,8 +337,8 @@ impl PcieRootComplex {
 
         if let Some(dev) = self.find_device_mut(&bdf) {
             match size {
-                1 => dev.write_u8(reg_offset, value as u8),
-                2 => dev.write_u16(reg_offset, value as u16),
+                1 => dev.write_u8(reg_offset, u8_of(value)),
+                2 => dev.write_u16(reg_offset, u16_of(value)),
                 4 => dev.guest_write_u32(reg_offset, value),
                 _ => {}
             }

@@ -4,6 +4,7 @@
 //! this — Windows uses it for memory allocation optimization. The diagonal
 //! distance (self-to-self) is always 10 per the ACPI spec.
 
+use crate::truncate::{u32_of, usize_of};
 use super::tables::{AcpiSdtHeader, OemInfo};
 
 /// SLIT table builder
@@ -34,7 +35,7 @@ impl SlitBuilder {
     pub fn multi_node(count: u64, distances: Vec<u8>) -> Self {
         assert_eq!(
             distances.len(),
-            (count * count) as usize,
+            usize_of(count * count),
             "distance matrix must be count×count"
         );
         Self {
@@ -52,13 +53,12 @@ impl SlitBuilder {
 
     /// Build the SLIT table as bytes
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn build(&self) -> Vec<u8> {
         // Header (36) + locality count (8) + distance matrix
         let total_length = 36 + 8 + self.distances.len();
         let mut buf = Vec::with_capacity(total_length);
 
-        let header = AcpiSdtHeader::new(*b"SLIT", total_length as u32, 1, &self.oem);
+        let header = AcpiSdtHeader::new(*b"SLIT", u32_of(total_length), 1, &self.oem);
         buf.extend_from_slice(&header.to_bytes());
 
         // Number of System Localities (8 bytes, u64 LE)

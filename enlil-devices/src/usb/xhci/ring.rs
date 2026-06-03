@@ -20,7 +20,6 @@ use super::trb::Trb;
 const DEFAULT_RING_SIZE: usize = 256;
 
 /// Maximum number of segments in a segmented ring (event ring).
-#[allow(dead_code)] // defined for spec completeness; not all bits/fields are consumed yet
 const MAX_SEGMENTS: usize = 16;
 
 // ---------------------------------------------------------------------------

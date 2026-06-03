@@ -4,6 +4,7 @@
 //! discover processors and interrupt controllers. Must match the vCPU count
 //! and APIC ID assignment.
 
+use crate::truncate::u32_of;
 use super::tables::{AcpiSdtHeader, OemInfo};
 
 /// MADT entry types
@@ -236,7 +237,6 @@ impl MadtBuilder {
 
     /// Build the MADT as a byte vector
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn build(&self) -> Vec<u8> {
         // Calculate total size
         let entries_size: usize = self
@@ -265,7 +265,7 @@ impl MadtBuilder {
         let mut buf = Vec::with_capacity(total_length);
 
         // SDT Header
-        let header = AcpiSdtHeader::new(*b"APIC", total_length as u32, 3, &self.oem);
+        let header = AcpiSdtHeader::new(*b"APIC", u32_of(total_length), 3, &self.oem);
         buf.extend_from_slice(&header.to_bytes());
 
         // Fixed fields

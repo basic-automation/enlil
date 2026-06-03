@@ -3,32 +3,17 @@
 // pedantic/nursery lints are either inherent to hardware/register code or are
 // low-value churn here; correctness lints (clippy::all) stay denied. Kept
 // explicit (rather than dropping the deny groups) so new code is still linted.
-#![allow(clippy::module_name_repetitions)]
 // Register/byte arithmetic intentionally narrows widths (e.g. u32 field -> u8).
-#![allow(clippy::cast_possible_truncation)]
 // `from`/`to`, `lo`/`hi` etc. are the natural names in device/register code.
-#![allow(clippy::similar_names)]
 // Device methods keep `&self` for API/trait consistency and future state even
 // when the current body does not read it.
-#![allow(clippy::unused_self)]
-#![allow(clippy::trivially_copy_pass_by_ref)]
-#![allow(clippy::needless_pass_by_value)]
 // Most `unwrap()`s here are on infallible fixed-size conversions; documenting a
 // `# Panics` section on each would be noise. (Tracked as a doc-polish follow-up.)
-#![allow(clippy::missing_panics_doc)]
-#![allow(clippy::missing_errors_doc)]
 // `if let … else` is frequently clearer than `map_or` for register dispatch.
-#![allow(clippy::option_if_let_else)]
-#![allow(clippy::significant_drop_tightening)]
 // Register/command decode tables deliberately keep one match arm per case even
 // when bodies coincide, and keep stable `Result`/`Option` signatures.
-#![allow(clippy::match_same_arms)]
-#![allow(clippy::unnecessary_wraps)]
-#![allow(clippy::branches_sharing_code)]
-#![allow(clippy::too_many_lines)]
 // Building long fixed device tables (e.g. HDA widget lists) reads more clearly
 // as `Vec::new()` + pushes than a giant `vec![]` literal.
-#![allow(clippy::vec_init_then_push)]
 
 //! enlil-devices: Virtual device backends
 //!
@@ -66,5 +51,6 @@ pub mod stealth;
 pub mod storage;
 pub mod timer;
 pub mod tpm;
+mod truncate;
 pub mod usb;
 pub mod virtio;

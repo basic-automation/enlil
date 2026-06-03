@@ -53,7 +53,6 @@ impl TpmPcr {
 /// Virtual TPM 2.0 Emulation
 // EK/AIK/SRK key material is generated and stored now; the attestation/quote
 // paths that consume it land later in Phase 5 (vTPM 2.0).
-#[allow(dead_code)]
 pub struct VirtualTpm {
     /// PCRs 0-23 (24 total)
     pcrs: Vec<TpmPcr>,
@@ -90,6 +89,24 @@ impl VirtualTpm {
             nv_storage: HashMap::new(),
             initialized: false,
         }
+    }
+
+    /// Endorsement Key (EK) bytes — long-term TPM identity key.
+    #[must_use]
+    pub fn endorsement_key(&self) -> &[u8] {
+        &self.endorsement_key
+    }
+
+    /// Attestation Identity Key (AIK) bytes — used for remote attestation.
+    #[must_use]
+    pub fn attestation_key(&self) -> &[u8] {
+        &self.attestation_key
+    }
+
+    /// Storage Root Key (SRK) bytes — protects sealed objects.
+    #[must_use]
+    pub fn storage_root_key(&self) -> &[u8] {
+        &self.storage_root_key
     }
 
     /// TPM2_Startup — initialize TPM

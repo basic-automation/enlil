@@ -13,15 +13,11 @@ pub const STATUS_CMD_PORT: u16 = 0x64;
 
 /// i8042 controller status register bits
 const STATUS_OUTPUT_FULL: u8 = 0x01;
-#[allow(dead_code)] // defined for spec completeness; not all bits/fields are consumed yet
 const STATUS_INPUT_FULL: u8 = 0x02;
 const STATUS_SYSTEM_FLAG: u8 = 0x04;
-#[allow(dead_code)] // defined for spec completeness; not all bits/fields are consumed yet
 const STATUS_COMMAND: u8 = 0x08;
 const STATUS_MOUSE_OUTPUT: u8 = 0x20;
-#[allow(dead_code)] // defined for spec completeness; not all bits/fields are consumed yet
 const STATUS_TIMEOUT_ERROR: u8 = 0x40;
-#[allow(dead_code)] // defined for spec completeness; not all bits/fields are consumed yet
 const STATUS_PARITY_ERROR: u8 = 0x80;
 
 /// i8042 controller commands (written to port 0x64)

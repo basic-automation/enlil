@@ -12,7 +12,6 @@ use super::virtqueue::Virtqueue;
 use std::collections::VecDeque;
 
 /// Device status bits (`VirtIO` 1.2, Section 2.1).
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceStatus {
     Reset = 0,
@@ -54,7 +53,6 @@ pub struct VirtioNetDevice {
     /// RX virtqueue (host → guest).
     rx_queue: Virtqueue,
     /// Queue size.
-    #[allow(dead_code)]
     queue_size: u16,
     /// Network backend.
     backend: Box<dyn NetBackend>,

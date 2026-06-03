@@ -130,7 +130,6 @@ impl MmioTransport {
                     self.driver_features =
                         (self.driver_features & !0xFFFF_FFFF) | (u64::from(val32));
                 } else {
-                    #[allow(clippy::cast_possible_wrap)]
                     {
                         self.driver_features =
                             (self.driver_features & 0xFFFF_FFFF) | ((u64::from(val32)) << 32);
@@ -141,7 +140,6 @@ impl MmioTransport {
             regs::QUEUE_SEL => self.queue_sel = val32,
             regs::QUEUE_NUM => {
                 if let Some(q) = self.current_queue_mut() {
-                    #[allow(clippy::cast_possible_truncation)]
                     {
                         q.size = u16::try_from(value).unwrap_or(0);
                     }
@@ -168,7 +166,6 @@ impl MmioTransport {
             }
             regs::QUEUE_DESC_HIGH => {
                 if let Some(q) = self.current_queue_mut() {
-                    #[allow(clippy::cast_possible_wrap)]
                     {
                         q.desc_addr = (q.desc_addr & 0xFFFF_FFFF) | ((u64::from(val32)) << 32);
                     }
@@ -181,7 +178,6 @@ impl MmioTransport {
             }
             regs::QUEUE_AVAIL_HIGH => {
                 if let Some(q) = self.current_queue_mut() {
-                    #[allow(clippy::cast_possible_wrap)]
                     {
                         q.avail_addr = (q.avail_addr & 0xFFFF_FFFF) | ((u64::from(val32)) << 32);
                     }
@@ -194,7 +190,6 @@ impl MmioTransport {
             }
             regs::QUEUE_USED_HIGH => {
                 if let Some(q) = self.current_queue_mut() {
-                    #[allow(clippy::cast_possible_wrap)]
                     {
                         q.used_addr = (q.used_addr & 0xFFFF_FFFF) | ((u64::from(val32)) << 32);
                     }

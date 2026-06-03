@@ -3,6 +3,7 @@
 //! The RSDP is the entry point to the ACPI table hierarchy.
 //! Located at a well-known physical address, it points to the XSDT.
 
+use crate::truncate::u32_of;
 const RSDP_SIGNATURE: &[u8; 8] = b"RSD PTR ";
 const RSDP_REVISION_2: u8 = 2;
 const RSDP_V1_LEN: usize = 20;
@@ -45,7 +46,6 @@ impl RsdpBuilder {
 
     /// Build the raw RSDP bytes (36 bytes for ACPI 2.0+).
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn build(&self) -> Vec<u8> {
         let mut buf = vec![0u8; RSDP_V2_LEN];
 
@@ -63,7 +63,7 @@ impl RsdpBuilder {
         buf[16..20].copy_from_slice(&0u32.to_le_bytes());
 
         // Length (offset 20, 4 bytes)
-        buf[20..24].copy_from_slice(&(RSDP_V2_LEN as u32).to_le_bytes());
+        buf[20..24].copy_from_slice(&(u32_of(RSDP_V2_LEN)).to_le_bytes());
 
         // XsdtAddress (offset 24, 8 bytes)
         buf[24..32].copy_from_slice(&self.xsdt_address.to_le_bytes());

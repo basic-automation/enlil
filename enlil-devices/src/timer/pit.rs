@@ -7,6 +7,7 @@
 //!
 //! I/O ports: 0x40-0x43 (channels 0-2 data, 0x43 command)
 
+use crate::truncate::u16_of;
 /// PIT oscillator frequency in Hz.
 pub const PIT_FREQUENCY: u32 = 1_193_182;
 
@@ -62,7 +63,6 @@ impl AccessMode {
 }
 
 /// A single PIT channel.
-#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct PitChannel {
     pub count: u16,
@@ -137,14 +137,13 @@ impl PitChannel {
         }
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     fn load_count(&mut self) {
         let effective = if self.reload == 0 {
             0x0001_0000_u32
         } else {
             u32::from(self.reload)
         };
-        self.count = effective as u16;
+        self.count = u16_of(effective);
         self.enabled = true;
         self.output = false;
     }

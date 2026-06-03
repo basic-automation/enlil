@@ -62,7 +62,6 @@ impl MsiMessage {
 }
 
 /// MSI capability structure for a PCI device.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct MsiCapability {
     /// Whether MSI is enabled.
@@ -81,7 +80,6 @@ pub struct MsiCapability {
     pub pending_bits: u32,
 }
 
-#[allow(dead_code)]
 impl MsiCapability {
     /// Create a new MSI capability with default values.
     ///
@@ -127,7 +125,6 @@ impl MsiCapability {
     ///
     /// * `vector_idx` - Vector index
     #[must_use]
-    #[allow(clippy::cast_lossless)]
     pub const fn message_for_vector(&self, vector_idx: u8) -> MsiMessage {
         let mut msg = self.message;
         msg.data = (msg.data & !0xFF) | ((msg.data & 0xFF).wrapping_add(vector_idx as u32) & 0xFF);

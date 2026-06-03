@@ -4,6 +4,7 @@
 //! Windows reads these extensively during setup and activation. The tables
 //! must look like they came from a real motherboard vendor.
 
+use crate::truncate::{u16_of, u32_of};
 /// SMBIOS entry point versions
 const SMBIOS_MAJOR: u8 = 3;
 const SMBIOS_MINOR: u8 = 4;
@@ -166,10 +167,9 @@ impl SmbiosBuilder {
 
     /// Build the SMBIOS 3.0 64-bit Entry Point structure
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn build_entry_point(&self, structure_table_address: u64) -> Vec<u8> {
         let structures = self.build_structures();
-        let structure_table_length = structures.len() as u32;
+        let structure_table_length = u32_of(structures.len());
 
         let mut buf = Vec::with_capacity(24);
         // Anchor string
@@ -373,7 +373,6 @@ impl SmbiosBuilder {
         header
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     fn build_type4(&self) -> Vec<u8> {
         let mut header = vec![
             4,  // Type 4
@@ -459,8 +458,7 @@ impl SmbiosBuilder {
         // Error Info Handle: Not Provided
         header.extend_from_slice(&0xFFFEu16.to_le_bytes());
         // Number of Memory Devices
-        #[allow(clippy::cast_possible_truncation)]
-        let num_devices = self.config.ram_modules.len() as u16;
+        let num_devices = u16_of(self.config.ram_modules.len());
         header.extend_from_slice(&num_devices.to_le_bytes());
         // Extended Maximum Capacity (bytes)
         header
@@ -473,9 +471,8 @@ impl SmbiosBuilder {
         header
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     fn build_type17(&self, index: usize, module: &RamModule) -> Vec<u8> {
-        let handle = (17 + index) as u16;
+        let handle = u16_of(17 + index);
         let mut header = vec![
             17, // Type 17
             92, // Length (SMBIOS 3.3)
@@ -493,7 +490,7 @@ impl SmbiosBuilder {
         if module.size_mb > 0x7FFF {
             header.extend_from_slice(&0x7FFFu16.to_le_bytes());
         } else {
-            header.extend_from_slice(&(module.size_mb as u16).to_le_bytes());
+            header.extend_from_slice(&(u16_of(module.size_mb)).to_le_bytes());
         }
         // Form Factor: DIMM
         header.push(9);

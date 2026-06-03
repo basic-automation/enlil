@@ -7,6 +7,7 @@
 //! Doorbell 0 is for the Host Controller (command ring).
 //! Doorbells 1–MaxSlots are for device endpoints.
 
+use crate::truncate::u8_of;
 use std::fmt;
 
 // ---------------------------------------------------------------------------
@@ -162,7 +163,7 @@ impl DoorbellArray {
             if self.pending[i] {
                 self.pending[i] = false;
                 let value = self.registers[i];
-                targets.push(DoorbellTarget::decode(i as u8, value));
+                targets.push(DoorbellTarget::decode(u8_of(i), value));
             }
         }
         targets

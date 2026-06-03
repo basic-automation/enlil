@@ -3,6 +3,7 @@
 //! Implements the Intel HDA controller register set exposed via PCI BAR0.
 //! Windows loads hdaudio.sys when it detects this device.
 
+use crate::truncate::{u16_of, u32_of, u8_of};
 use super::codec::HdaCodec;
 
 /// HDA controller MMIO register offsets (Intel HD Audio spec section 3)
@@ -134,7 +135,7 @@ impl HdaController {
     pub fn new() -> Self {
         // GCAP: 4 output streams, 4 input streams, 64-bit addressing, serial bus number 0
         let gcap: u16 =
-            ((NUM_OUTPUT_STREAMS as u16) << 12) | ((NUM_INPUT_STREAMS as u16) << 8) | 0x01; // 64-bit
+            ((u16_of(NUM_OUTPUT_STREAMS as u64)) << 12) | ((u16_of(NUM_INPUT_STREAMS as u64)) << 8) | 0x01; // 64-bit
 
         Self {
             gcap,
@@ -179,7 +180,6 @@ impl HdaController {
 
     /// Handle MMIO read at offset from BAR0
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn read(&self, offset: u32, _size: u8) -> u64 {
         match offset {
             regs::GCAP => u64::from(self.gcap),
@@ -224,11 +224,10 @@ impl HdaController {
     }
 
     /// Handle MMIO write at offset from BAR0
-    #[allow(clippy::cast_possible_truncation)]
     pub fn write(&mut self, offset: u32, value: u64, _size: u8) {
         match offset {
             regs::GCTL => {
-                let val = value as u32;
+                let val = u32_of(value);
                 // Bit 0: Controller Reset (CRST)
                 if val & 1 != 0 && self.gctl & 1 == 0 {
                     // Coming out of reset
@@ -236,20 +235,20 @@ impl HdaController {
                 }
                 self.gctl = val;
             }
-            regs::WAKEEN => self.wakeen = value as u16,
+            regs::WAKEEN => self.wakeen = u16_of(value),
             regs::STATESTS => {
                 // Write-1-to-clear
-                self.statests &= !(value as u16);
+                self.statests &= !(u16_of(value));
             }
             regs::GSTS => {
-                self.gsts &= !(value as u16);
+                self.gsts &= !(u16_of(value));
             }
-            regs::INTCTL => self.intctl = value as u32,
+            regs::INTCTL => self.intctl = u32_of(value),
             regs::INTSTS => {
                 // Write-1-to-clear
-                self.intsts &= !(value as u32);
+                self.intsts &= !(u32_of(value));
             }
-            regs::SSYNC => self.ssync = value as u32,
+            regs::SSYNC => self.ssync = u32_of(value),
 
             regs::CORBLBASE => {
                 self.corb_base = (self.corb_base & 0xFFFF_FFFF_0000_0000) | (value & 0xFFFF_FFFF);
@@ -258,18 +257,18 @@ impl HdaController {
                 self.corb_base =
                     (self.corb_base & 0x0000_0000_FFFF_FFFF) | ((value & 0xFFFF_FFFF) << 32);
             }
-            regs::CORBWP => self.corb_wp = value as u16,
+            regs::CORBWP => self.corb_wp = u16_of(value),
             regs::CORBRP => {
                 // Bit 15: reset read pointer
                 if value & 0x8000 != 0 {
                     self.corb_rp = 0;
                 }
             }
-            regs::CORBCTL => self.corb_ctl = value as u8,
+            regs::CORBCTL => self.corb_ctl = u8_of(value),
             regs::CORBSTS => {
-                self.corb_sts &= !(value as u8);
+                self.corb_sts &= !(u8_of(value));
             }
-            regs::CORBSIZE => self.corb_size = value as u8 & 0x03,
+            regs::CORBSIZE => self.corb_size = u8_of(value) & 0x03,
 
             regs::RIRBLBASE => {
                 self.rirb_base = (self.rirb_base & 0xFFFF_FFFF_0000_0000) | (value & 0xFFFF_FFFF);
@@ -284,19 +283,19 @@ impl HdaController {
                     self.rirb_wp = 0;
                 }
             }
-            regs::RINTCNT => self.rintcnt = value as u16,
-            regs::RIRBCTL => self.rirb_ctl = value as u8,
+            regs::RINTCNT => self.rintcnt = u16_of(value),
+            regs::RIRBCTL => self.rirb_ctl = u8_of(value),
             regs::RIRBSTS => {
-                self.rirb_sts &= !(value as u8);
+                self.rirb_sts &= !(u8_of(value));
             }
-            regs::RIRBSIZE => self.rirb_size = value as u8 & 0x03,
+            regs::RIRBSIZE => self.rirb_size = u8_of(value) & 0x03,
 
             // Immediate command interface
             regs::IC => {
-                self.ic = value as u32;
+                self.ic = u32_of(value);
             }
             regs::ICS => {
-                let val = value as u16;
+                let val = u16_of(value);
                 // Bit 0: Immediate Command Busy (ICB) — set to 1 to execute
                 if val & 0x01 != 0 {
                     self.execute_immediate_command();
@@ -348,8 +347,7 @@ impl HdaController {
     }
 
     /// Write a stream descriptor register
-    #[allow(clippy::cast_possible_truncation)]
-    const fn write_stream_descriptor(&mut self, offset: u32, value: u64) {
+    fn write_stream_descriptor(&mut self, offset: u32, value: u64) {
         let rel = offset - regs::SD0_BASE;
         let stream_idx = (rel / regs::SD_SIZE) as usize;
         let reg_offset = rel % regs::SD_SIZE;
@@ -364,7 +362,7 @@ impl HdaController {
 
         match reg_offset {
             sd_regs::CTL => {
-                let val = value as u32 & 0x00FF_FFFF;
+                let val = u32_of(value) & 0x00FF_FFFF;
                 // Bit 1: Stream Reset
                 if val & 0x02 != 0 {
                     sd.lpib = 0;
@@ -374,13 +372,13 @@ impl HdaController {
             }
             sd_regs::STS => {
                 // Write-1-to-clear
-                sd.sts &= !(value as u8);
+                sd.sts &= !(u8_of(value));
             }
-            sd_regs::CBL => sd.cbl = value as u32,
-            sd_regs::LVI => sd.lvi = value as u16,
-            sd_regs::FMT => sd.fmt = value as u16,
-            sd_regs::BDPL => sd.bdl_lower = value as u32,
-            sd_regs::BDPU => sd.bdl_upper = value as u32,
+            sd_regs::CBL => sd.cbl = u32_of(value),
+            sd_regs::LVI => sd.lvi = u16_of(value),
+            sd_regs::FMT => sd.fmt = u16_of(value),
+            sd_regs::BDPL => sd.bdl_lower = u32_of(value),
+            sd_regs::BDPU => sd.bdl_upper = u32_of(value),
             _ => {}
         }
     }

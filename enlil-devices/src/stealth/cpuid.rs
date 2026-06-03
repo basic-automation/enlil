@@ -273,7 +273,6 @@ impl CpuidStealthTable {
         }
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     fn build_topology_leaves(config: &CpuidStealthConfig, entries: &mut Vec<CpuidCacheEntry>) {
         // Subleaf 0: SMT level
         let threads_per_core = config.threads_per_core;

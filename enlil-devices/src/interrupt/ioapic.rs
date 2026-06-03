@@ -3,10 +3,10 @@
 //! Implements the Intel 82093AA I/O APIC with 24 redirection table entries.
 //! Accessible via MMIO at `0xFEC00000`.
 
+use crate::truncate::u32_of;
 use super::DeliveryMode;
 
 /// I/O APIC base address.
-#[allow(dead_code)]
 pub const IOAPIC_BASE: u64 = 0xFEC0_0000;
 
 /// I/O APIC register select (`IOREGSEL`) offset.
@@ -28,7 +28,6 @@ const IOAPIC_VERSION: u32 = 0x11;
 
 /// Redirection Table Entry.
 #[derive(Debug, Clone, Copy)]
-#[allow(clippy::struct_excessive_bools)]
 pub struct RedirectionEntry {
     /// Interrupt vector (0-255).
     pub vector: u8,
@@ -100,7 +99,6 @@ impl RedirectionEntry {
     }
 
     /// Decode low 32 bits into the RTE fields.
-    #[allow(clippy::cast_possible_truncation)]
     pub const fn set_low(&mut self, val: u32) {
         self.vector = (val & 0xFF) as u8;
         self.delivery_mode = DeliveryMode::from_bits(((val >> 8) & 0x7) as u8);
@@ -113,7 +111,6 @@ impl RedirectionEntry {
     }
 
     /// Decode high 32 bits.
-    #[allow(clippy::cast_possible_truncation)]
     pub const fn set_high(&mut self, val: u32) {
         self.destination = ((val >> 24) & 0xFF) as u8;
     }
@@ -382,9 +379,8 @@ mod tests {
         ioapic.mmio_write(IOREGSEL, u32::from(IOAPIC_REG_VER));
         let ver = ioapic.mmio_read(IOWIN);
         assert_eq!(ver & 0xFF, IOAPIC_VERSION);
-        #[allow(clippy::cast_possible_truncation)]
         {
-            assert_eq!((ver >> 16) & 0xFF, (NUM_IOAPIC_PINS - 1) as u32);
+            assert_eq!((ver >> 16) & 0xFF, u32_of(NUM_IOAPIC_PINS - 1));
         }
     }
 

@@ -4,6 +4,7 @@
 //! at the standard address 0xFED40000. Each guest gets its own independent
 //! virtual TPM with separate PCR banks, endorsement keys, etc.
 
+use crate::truncate::{u16_of, u32_of, u8_of, usize_of};
 /// Standard TPM MMIO base address
 pub const TPM_MMIO_BASE: u64 = 0xFED4_0000;
 /// TPM MMIO region size (4KB for CRB interface)
@@ -143,7 +144,6 @@ impl VirtualTpm {
 
     /// Handle MMIO read at given offset from `TPM_MMIO_BASE`
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn read_register(&self, offset: u64, size: u8) -> u64 {
         match offset {
             crb_regs::LOC_STATE => u64::from(self.loc_state),
@@ -161,7 +161,7 @@ impl VirtualTpm {
             crb_regs::RSP_ADDR => TPM_MMIO_BASE + crb_regs::DATA_BUFFER,
             o if o >= crb_regs::DATA_BUFFER => {
                 // Read from response buffer
-                let buf_offset = (o - crb_regs::DATA_BUFFER) as usize;
+                let buf_offset = usize_of(o - crb_regs::DATA_BUFFER);
                 if buf_offset < self.rsp_buffer.len() {
                     match size {
                         1 => u64::from(self.rsp_buffer[buf_offset]),
@@ -188,11 +188,10 @@ impl VirtualTpm {
     }
 
     /// Handle MMIO write at given offset from `TPM_MMIO_BASE`
-    #[allow(clippy::cast_possible_truncation)]
     pub fn write_register(&mut self, offset: u64, value: u64, size: u8) {
         match offset {
             crb_regs::LOC_CTRL => {
-                self.loc_ctrl = value as u32;
+                self.loc_ctrl = u32_of(value);
                 // Request use: bit 1
                 if value & 2 != 0 {
                     self.loc_sts = 0x01; // Granted
@@ -217,16 +216,16 @@ impl VirtualTpm {
             }
             o if o >= crb_regs::DATA_BUFFER => {
                 // Write to command buffer
-                let buf_offset = (o - crb_regs::DATA_BUFFER) as usize;
+                let buf_offset = usize_of(o - crb_regs::DATA_BUFFER);
                 if buf_offset < self.cmd_buffer.len() {
                     match size {
-                        1 => self.cmd_buffer[buf_offset] = value as u8,
+                        1 => self.cmd_buffer[buf_offset] = u8_of(value),
                         2 => {
-                            let bytes = (value as u16).to_le_bytes();
+                            let bytes = (u16_of(value)).to_le_bytes();
                             self.cmd_buffer[buf_offset..buf_offset + 2].copy_from_slice(&bytes);
                         }
                         4 => {
-                            let bytes = (value as u32).to_le_bytes();
+                            let bytes = (u32_of(value)).to_le_bytes();
                             self.cmd_buffer[buf_offset..buf_offset + 4].copy_from_slice(&bytes);
                         }
                         _ => {}
@@ -314,14 +313,14 @@ impl VirtualTpm {
         // Response: header (10) + digested (2) + size (2) + data
         let response_size = 10 + 2 + 2 + bytes_requested;
         self.rsp_buffer[0..2].copy_from_slice(&[0x00, 0xC4]); // tag
-        self.rsp_buffer[2..6].copy_from_slice(&(response_size as u32).to_be_bytes());
+        self.rsp_buffer[2..6].copy_from_slice(&(u32_of(response_size)).to_be_bytes());
         self.rsp_buffer[6..10].copy_from_slice(&0u32.to_be_bytes()); // success
-        self.rsp_buffer[10..12].copy_from_slice(&(bytes_requested as u16).to_be_bytes());
-        self.rsp_buffer[12..14].copy_from_slice(&(bytes_requested as u16).to_be_bytes());
+        self.rsp_buffer[10..12].copy_from_slice(&(u16_of(bytes_requested)).to_be_bytes());
+        self.rsp_buffer[12..14].copy_from_slice(&(u16_of(bytes_requested)).to_be_bytes());
 
         // Fill with deterministic "random" bytes (real impl would use entropy)
         for i in 0..bytes_requested {
-            self.rsp_buffer[14 + i] = ((i * 7 + 13) & 0xFF) as u8;
+            self.rsp_buffer[14 + i] = u8_of((i * 7 + 13) & 0xFF);
         }
     }
 }

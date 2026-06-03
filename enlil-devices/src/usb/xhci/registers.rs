@@ -6,6 +6,7 @@
 //!
 //! Reference: xHCI specification 1.2, sections 5.1–5.5.
 
+use crate::truncate::u32_of;
 use std::fmt;
 
 // ---------------------------------------------------------------------------
@@ -409,9 +410,9 @@ impl OperationalRegisters {
             0x04 => self.usbsts,
             0x08 => self.pagesize,
             0x14 => self.dnctrl,
-            0x18 => self.crcr as u32,
+            0x18 => u32_of(self.crcr),
             0x1C => (self.crcr >> 32) as u32,
-            0x30 => self.dcbaap as u32,
+            0x30 => u32_of(self.dcbaap),
             0x34 => (self.dcbaap >> 32) as u32,
             0x38 => self.config,
             offset if offset >= 0x400 => {

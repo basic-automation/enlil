@@ -6,6 +6,7 @@
 //!
 //! Protocol: port I/O at 0x510 (selector) and 0x511 (data), or MMIO via DMA.
 
+use crate::truncate::u32_of;
 /// `fw_cfg` I/O port addresses
 pub const FW_CFG_PORT_SEL: u16 = 0x0510;
 pub const FW_CFG_PORT_DATA: u16 = 0x0511;
@@ -122,12 +123,12 @@ impl FwCfgDevice {
 
     /// Build the file directory structure
     fn build_file_directory(&self) -> Vec<u8> {
-        let count = self.files.len() as u32;
+        let count = u32_of(self.files.len());
         let mut dir = count.to_be_bytes().to_vec();
 
         for file in &self.files {
             // Size (4 bytes, big-endian)
-            dir.extend_from_slice(&(file.data.len() as u32).to_be_bytes());
+            dir.extend_from_slice(&(u32_of(file.data.len())).to_be_bytes());
             // Selector (2 bytes, big-endian)
             dir.extend_from_slice(&file.selector.to_be_bytes());
             // Reserved (2 bytes)

@@ -7,6 +7,7 @@
 //! - Picture-in-Picture support
 //! - Configuration via serde
 
+use crate::truncate::{u32_of, Widen};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
@@ -43,7 +44,6 @@ pub struct FrameRef {
 }
 
 impl FrameRef {
-    #[allow(clippy::cast_possible_truncation)]
     pub fn new(width: u32, height: u32, pixel_format: PixelFormat) -> Self {
         Self {
             id: {
@@ -54,12 +54,12 @@ impl FrameRef {
                 use std::time::{SystemTime, UNIX_EPOCH};
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .map_or(0, |d| d.as_nanos() as u64)
+                    .map_or(0, |d| d.as_nanos().widen())
             },
             pixel_format,
             width,
             height,
-            stride: width * pixel_format.bytes_per_pixel() as u32,
+            stride: width * u32_of(pixel_format.bytes_per_pixel()),
         }
     }
 }
@@ -196,7 +196,6 @@ pub struct CompositorOwnedSource {
 
 impl CompositorOwnedSource {
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn new(width: u32, height: u32, format: PixelFormat) -> Self {
         let size = (width * height) as usize * format.bytes_per_pixel();
         Self {
@@ -653,7 +652,6 @@ impl DisplayCompositor {
     }
 
     #[must_use]
-    #[allow(clippy::significant_drop_tightening)]
     /// # Panics
     /// Panics if an internal lock is poisoned.
     pub fn composite_frame(&self) -> Option<Vec<u8>> {

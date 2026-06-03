@@ -117,7 +117,6 @@ pub struct MadtIoApic {
 /// ACPI table generator
 // Fields hold table parameters captured at construction; the per-table
 // emitters that read them are part of the in-progress Phase 5 synthesis.
-#[allow(dead_code)]
 pub struct AcpiTableGenerator {
     oem_id: [u8; 6],
     oem_table_id: [u8; 8],
@@ -140,6 +139,24 @@ impl AcpiTableGenerator {
             local_apic_addr: 0xFEE00000, // Standard x86 local APIC address
             vcpu_count,
         }
+    }
+
+    /// The vCPU count this generator emits topology for.
+    #[must_use]
+    pub const fn vcpu_count(&self) -> u32 {
+        self.vcpu_count
+    }
+
+    /// The local APIC base address reported in the MADT.
+    #[must_use]
+    pub const fn local_apic_addr(&self) -> u32 {
+        self.local_apic_addr
+    }
+
+    /// The OEM table identifier stamped into emitted tables.
+    #[must_use]
+    pub const fn oem_table_id(&self) -> [u8; 8] {
+        self.oem_table_id
     }
 
     /// Generate RSDP at a fixed location (0xE0000 on x86)

@@ -130,7 +130,6 @@ pub struct SmbiosMemoryDevice {
 /// SMBIOS table generator
 // Fields hold SMBIOS string/identity values captured at construction; the
 // table emitters that read them are part of the in-progress Phase 5 synthesis.
-#[allow(dead_code)]
 pub struct SmbiosGenerator {
     manufacturer: String,
     product_name: String,
@@ -157,6 +156,42 @@ impl SmbiosGenerator {
             cpu_model_name,
             total_memory_mb,
         }
+    }
+
+    /// System manufacturer string (SMBIOS type 1).
+    #[must_use]
+    pub fn manufacturer(&self) -> &str {
+        &self.manufacturer
+    }
+
+    /// Product name string (SMBIOS type 1).
+    #[must_use]
+    pub fn product_name(&self) -> &str {
+        &self.product_name
+    }
+
+    /// System serial number string (SMBIOS type 1).
+    #[must_use]
+    pub fn serial_number(&self) -> &str {
+        &self.serial_number
+    }
+
+    /// BIOS vendor string (SMBIOS type 0).
+    #[must_use]
+    pub fn bios_vendor(&self) -> &str {
+        &self.bios_vendor
+    }
+
+    /// CPU model/brand string (SMBIOS type 4).
+    #[must_use]
+    pub fn cpu_model_name(&self) -> &str {
+        &self.cpu_model_name
+    }
+
+    /// Total installed memory in MiB (SMBIOS type 16/17).
+    #[must_use]
+    pub const fn total_memory_mb(&self) -> u64 {
+        self.total_memory_mb
     }
 
     /// Create default SMBIOS matching realistic hardware
