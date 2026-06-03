@@ -169,9 +169,9 @@ impl HdaCodec {
             (0x00, 0xF00) => {
                 let param = payload & 0xFF;
                 match param {
-                    0x00 => self.vendor_id,           // Vendor ID
-                    0x02 => self.revision_id,         // Revision ID
-                    0x04 => 0x0001_0001,              // Subordinate node count
+                    0x00 => self.vendor_id,   // Vendor ID
+                    0x02 => self.revision_id, // Revision ID
+                    0x04 => 0x0001_0001,      // Subordinate node count
                     _ => 0,
                 }
             }
@@ -184,9 +184,9 @@ impl HdaCodec {
                         let count = self.widgets.len() as u32;
                         (0x02 << 16) | count
                     }
-                    0x05 => 0x01,   // Function Group Type: Audio
-                    0x08 => 0x0001, // Supported PCM sizes/rates
-                    0x09 => 0x0001, // Supported stream formats
+                    0x05 => 0x01,        // Function Group Type: Audio
+                    0x08 => 0x0001,      // Supported PCM sizes/rates
+                    0x09 => 0x0001,      // Supported stream formats
                     0x0A => 0x0001_0041, // Audio widget capabilities (for the group)
                     _ => 0,
                 }
@@ -222,12 +222,11 @@ impl HdaCodec {
                 }
             }
             // Get/Set converter stream/channel
-            (nid, 0xF06) => {
-                self.widgets
-                    .iter()
-                    .find(|w| w.nid == nid)
-                    .map_or(0, |w| w.stream_channel as u32)
-            }
+            (nid, 0xF06) => self
+                .widgets
+                .iter()
+                .find(|w| w.nid == nid)
+                .map_or(0, |w| w.stream_channel as u32),
             (nid, 0x706) => {
                 if let Some(w) = self.widgets.iter_mut().find(|w| w.nid == nid) {
                     w.stream_channel = (payload & 0xFF) as u8;
@@ -239,12 +238,11 @@ impl HdaCodec {
             // Get/Set amplifier gain/mute
             (_, 0xB | 0x3) => 0x7F, // Max gain, unmuted
             // Config default
-            (nid, 0xF1C) => {
-                self.widgets
-                    .iter()
-                    .find(|w| w.nid == nid)
-                    .map_or(0, |w| w.pin_config)
-            }
+            (nid, 0xF1C) => self
+                .widgets
+                .iter()
+                .find(|w| w.nid == nid)
+                .map_or(0, |w| w.pin_config),
             _ => 0,
         }
     }

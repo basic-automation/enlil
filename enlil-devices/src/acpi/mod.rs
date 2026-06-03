@@ -238,7 +238,10 @@ mod tests {
         assert_eq!(table_set.rsdp.len(), 36);
 
         // Tables should contain all expected tables
-        assert!(table_set.tables.len() > 276, "Tables must be larger than just FADT");
+        assert!(
+            table_set.tables.len() > 276,
+            "Tables must be larger than just FADT"
+        );
 
         // Should have 12 table entries (XSDT + FADT + MADT + MCFG + HPET + SSDT + SRAT + SLIT + WAET + BGRT + TPM2 + DSDT)
         assert_eq!(table_set.table_offsets.len(), 12);
@@ -301,7 +304,10 @@ mod tests {
         let xsdt_len = u32::from_le_bytes(xsdt[4..8].try_into().unwrap()) as usize;
         // XSDT: 36-byte header + 8 bytes per entry
         let entry_count = (xsdt_len - 36) / 8;
-        assert_eq!(entry_count, 10, "XSDT must point to 10 tables (FADT+MADT+MCFG+HPET+SSDT+SRAT+SLIT+WAET+BGRT+TPM2)");
+        assert_eq!(
+            entry_count, 10,
+            "XSDT must point to 10 tables (FADT+MADT+MCFG+HPET+SSDT+SRAT+SLIT+WAET+BGRT+TPM2)"
+        );
     }
 
     #[test]

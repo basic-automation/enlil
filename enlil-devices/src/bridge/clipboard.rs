@@ -67,7 +67,9 @@ impl ClipboardPolicy {
     #[must_use]
     pub fn allows(&self, content: &ClipboardContent) -> bool {
         content.size() <= self.max_size
-            && self.allowed_types.contains(&content.content_type().to_string())
+            && self
+                .allowed_types
+                .contains(&content.content_type().to_string())
     }
 }
 
@@ -183,7 +185,10 @@ impl ClipboardHub {
     ///
     /// Returns an error if the lock is poisoned.
     pub fn history_len(&self) -> Result<usize, &'static str> {
-        self.history.lock().map(|h| h.len()).map_err(|_| "Lock poisoned")
+        self.history
+            .lock()
+            .map(|h| h.len())
+            .map_err(|_| "Lock poisoned")
     }
 
     /// Returns the current clipboard sequence number.
@@ -192,7 +197,10 @@ impl ClipboardHub {
     ///
     /// Returns an error if the lock is poisoned.
     pub fn get_sequence(&self) -> Result<u64, &'static str> {
-        self.sequence.lock().map(|s| *s).map_err(|_| "Lock poisoned")
+        self.sequence
+            .lock()
+            .map(|s| *s)
+            .map_err(|_| "Lock poisoned")
     }
 }
 

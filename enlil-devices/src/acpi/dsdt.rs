@@ -255,9 +255,7 @@ mod tests {
         let dsdt = DsdtBuilder::new(DsdtConfig::default()).build();
         // Should contain PNP0A08 string somewhere in the AML
         let aml = &dsdt[36..];
-        let found = aml
-            .windows(7)
-            .any(|w| w == b"PNP0A08");
+        let found = aml.windows(7).any(|w| w == b"PNP0A08");
         assert!(found, "DSDT must contain PCI Express root HID");
     }
 

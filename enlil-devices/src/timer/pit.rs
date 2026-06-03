@@ -139,7 +139,11 @@ impl PitChannel {
 
     #[allow(clippy::cast_possible_truncation)]
     fn load_count(&mut self) {
-        let effective = if self.reload == 0 { 0x0001_0000_u32 } else { u32::from(self.reload) };
+        let effective = if self.reload == 0 {
+            0x0001_0000_u32
+        } else {
+            u32::from(self.reload)
+        };
         self.count = effective as u16;
         self.enabled = true;
         self.output = false;

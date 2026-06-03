@@ -110,7 +110,7 @@ impl LocalApic {
             irr: [0; 8],
             esr: 0,
             icr: 0,
-            lvt_timer: 0x0001_0000,    // Masked
+            lvt_timer: 0x0001_0000, // Masked
             lvt_thermal: 0x0001_0000,
             lvt_perf: 0x0001_0000,
             lvt_lint0: 0x0001_0000,
@@ -250,16 +250,14 @@ impl LocalApic {
                 };
             }
             LAPIC_LVT_THERMAL | LAPIC_LVT_PERF | LAPIC_LVT_LINT0 | LAPIC_LVT_LINT1
-            | LAPIC_LVT_ERROR => {
-                match offset {
-                    LAPIC_LVT_THERMAL => self.lvt_thermal = value,
-                    LAPIC_LVT_PERF => self.lvt_perf = value,
-                    LAPIC_LVT_LINT0 => self.lvt_lint0 = value,
-                    LAPIC_LVT_LINT1 => self.lvt_lint1 = value,
-                    LAPIC_LVT_ERROR => self.lvt_error = value,
-                    _ => unreachable!(),
-                }
-            }
+            | LAPIC_LVT_ERROR => match offset {
+                LAPIC_LVT_THERMAL => self.lvt_thermal = value,
+                LAPIC_LVT_PERF => self.lvt_perf = value,
+                LAPIC_LVT_LINT0 => self.lvt_lint0 = value,
+                LAPIC_LVT_LINT1 => self.lvt_lint1 = value,
+                LAPIC_LVT_ERROR => self.lvt_error = value,
+                _ => unreachable!(),
+            },
             LAPIC_TIMER_INIT => {
                 self.timer_initial = value;
                 self.timer_current = value;
@@ -375,8 +373,7 @@ impl LocalApic {
     #[must_use]
     fn compute_apr(&self) -> u32 {
         // APR = max(TPR, highest ISR priority)
-        let isr_prio = Self::highest_bit_in_register(&self.isr)
-            .map_or(0, |v| u32::from(v >> 4));
+        let isr_prio = Self::highest_bit_in_register(&self.isr).map_or(0, |v| u32::from(v >> 4));
         let tpr_prio = self.tpr >> 4;
         if tpr_prio >= isr_prio {
             self.tpr

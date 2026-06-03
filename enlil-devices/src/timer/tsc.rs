@@ -52,7 +52,11 @@ impl TscManager {
     /// * `vcpu_count` - Number of vCPUs.
     #[must_use]
     pub fn new(host_freq: u64, guest_freq: u64, vcpu_count: usize) -> Self {
-        let guest_freq = if guest_freq == 0 { host_freq } else { guest_freq };
+        let guest_freq = if guest_freq == 0 {
+            host_freq
+        } else {
+            guest_freq
+        };
         let needs_scaling = guest_freq != host_freq;
 
         // Calculate scaling ratio in 48.16 fixed point
@@ -98,9 +102,7 @@ impl TscManager {
     /// Compute the VMCS `TSC_OFFSET` value for a vCPU.
     #[must_use]
     pub fn vmcs_tsc_offset(&self, vcpu_id: usize) -> i64 {
-        self.vcpu_states
-            .get(vcpu_id)
-            .map_or(0, |s| s.offset)
+        self.vcpu_states.get(vcpu_id).map_or(0, |s| s.offset)
     }
 
     /// Compute what TSC value the guest would see right now.
@@ -178,9 +180,7 @@ impl TscManager {
     /// Read the host TSC.
     #[cfg(target_arch = "x86_64")]
     fn read_host_tsc() -> u64 {
-        unsafe {
-            core::arch::x86_64::_rdtsc()
-        }
+        unsafe { core::arch::x86_64::_rdtsc() }
     }
 
     #[cfg(not(target_arch = "x86_64"))]

@@ -312,7 +312,8 @@ impl FadtBuilder {
         // Offset 208: X_PM_TMR_BLK
         GenericAddress::io(u64::from(self.pm_timer_block), 32).write_to(&mut buf);
         // Offset 220: X_GPE0_BLK
-        GenericAddress::io(u64::from(self.gpe0_block), u8::from(self.gpe0_length) * 8).write_to(&mut buf);
+        GenericAddress::io(u64::from(self.gpe0_block), u8::from(self.gpe0_length) * 8)
+            .write_to(&mut buf);
         // Offset 232: X_GPE1_BLK
         GenericAddress::zero().write_to(&mut buf);
         // Offset 244: SLEEP_CONTROL_REG

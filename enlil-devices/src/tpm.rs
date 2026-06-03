@@ -132,8 +132,8 @@ impl VirtualTpm {
             locality: 0,
             loc_state: 0x81, // TPM established, locality 0 active
             loc_ctrl: 0,
-            loc_sts: 0x01,   // Granted
-            ctrl_sts: 0,     // Idle
+            loc_sts: 0x01, // Granted
+            ctrl_sts: 0,   // Idle
             ctrl_start: 0,
             cmd_buffer: vec![0u8; 4096],
             rsp_buffer: vec![0u8; 4096],
@@ -245,11 +245,7 @@ impl VirtualTpm {
         }
 
         // TPM command header: tag (2) + size (4) + command_code (4)
-        let command_code = u32::from_be_bytes(
-            self.cmd_buffer[6..10]
-                .try_into()
-                .unwrap_or([0; 4]),
-        );
+        let command_code = u32::from_be_bytes(self.cmd_buffer[6..10].try_into().unwrap_or([0; 4]));
 
         match TpmCommand::from(command_code) {
             TpmCommand::Startup => {
@@ -308,9 +304,7 @@ impl VirtualTpm {
     fn handle_get_random(&mut self) {
         // Parse requested byte count from command
         let bytes_requested = if self.cmd_buffer.len() >= 12 {
-            u16::from_be_bytes(
-                self.cmd_buffer[10..12].try_into().unwrap_or([0; 2]),
-            ) as usize
+            u16::from_be_bytes(self.cmd_buffer[10..12].try_into().unwrap_or([0; 2])) as usize
         } else {
             0
         };
@@ -389,9 +383,7 @@ mod tests {
         tpm.started = true;
 
         let cmd = [
-            0x80, 0x01,
-            0x00, 0x00, 0x00, 0x0C,
-            0x00, 0x00, 0x01, 0x7B, // TPM_CC_GetRandom
+            0x80, 0x01, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x01, 0x7B, // TPM_CC_GetRandom
             0x00, 0x10, // 16 bytes
         ];
         tpm.cmd_buffer[..cmd.len()].copy_from_slice(&cmd);

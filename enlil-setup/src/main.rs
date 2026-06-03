@@ -36,11 +36,7 @@ impl std::fmt::Display for HardwareInfo {
             "  USB controllers : {}",
             format_list(&self.usb_controllers)
         )?;
-        write!(
-            f,
-            "  IOMMU groups    : {}",
-            format_list(&self.iommu_groups)
-        )
+        write!(f, "  IOMMU groups    : {}", format_list(&self.iommu_groups))
     }
 }
 

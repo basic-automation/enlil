@@ -112,7 +112,9 @@ impl TimeSliceScheduler {
 
     /// Remove a vCPU from the scheduler.
     pub fn remove_vcpu(&mut self, guest_id: &str, vcpu_id: u32) -> bool {
-        let pos = self.run_queue.iter()
+        let pos = self
+            .run_queue
+            .iter()
             .position(|(g, v)| g == guest_id && *v == vcpu_id);
         if let Some(p) = pos {
             self.run_queue.remove(p);
@@ -230,7 +232,9 @@ impl VcpuManager {
     ///
     /// Returns an error string if the vCPU is not found or is in a stopped state.
     pub fn start_vcpu(&mut self, vcpu_id: u32) -> Result<(), String> {
-        let state = self.states.get_mut(vcpu_id as usize)
+        let state = self
+            .states
+            .get_mut(vcpu_id as usize)
             .ok_or_else(|| format!("vCPU {vcpu_id} not found"))?;
         match *state {
             VcpuState::Created | VcpuState::Paused => {
@@ -248,7 +252,9 @@ impl VcpuManager {
     ///
     /// Returns an error string if the vCPU is not found or not in a pauseable state.
     pub fn pause_vcpu(&mut self, vcpu_id: u32) -> Result<(), String> {
-        let state = self.states.get_mut(vcpu_id as usize)
+        let state = self
+            .states
+            .get_mut(vcpu_id as usize)
             .ok_or_else(|| format!("vCPU {vcpu_id} not found"))?;
         match *state {
             VcpuState::Running => {
@@ -266,7 +272,9 @@ impl VcpuManager {
     ///
     /// Returns an error string if the vCPU is not found.
     pub fn stop_vcpu(&mut self, vcpu_id: u32) -> Result<(), String> {
-        let state = self.states.get_mut(vcpu_id as usize)
+        let state = self
+            .states
+            .get_mut(vcpu_id as usize)
             .ok_or_else(|| format!("vCPU {vcpu_id} not found"))?;
         *state = VcpuState::Stopped;
         Ok(())
@@ -301,11 +309,12 @@ impl VcpuManager {
         let plan = match &self.policy {
             SchedulingPolicy::Dedicated => {
                 // 1:1 pin each vCPU to its assigned core
-                let bindings = requested.iter().map(|cfg| {
-                    AffinityBinding::Pinned {
+                let bindings = requested
+                    .iter()
+                    .map(|cfg| AffinityBinding::Pinned {
                         physical_core: cfg.pinned_core.unwrap_or(0),
-                    }
-                }).collect();
+                    })
+                    .collect();
                 SchedulingPlan {
                     bindings,
                     effective_policy: SchedulingPolicy::Dedicated,
@@ -314,10 +323,17 @@ impl VcpuManager {
             SchedulingPolicy::TimeSlice { quantum_ms } => {
                 // All vCPUs time-share across available cores
                 let q = *quantum_ms;
-                let bindings = requested.iter().enumerate().map(|(i, _cfg)| {
-                    let core = available_cores[i % available_cores.len()];
-                    AffinityBinding::Shared { physical_core: core, quantum_ms: q }
-                }).collect();
+                let bindings = requested
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _cfg)| {
+                        let core = available_cores[i % available_cores.len()];
+                        AffinityBinding::Shared {
+                            physical_core: core,
+                            quantum_ms: q,
+                        }
+                    })
+                    .collect();
                 SchedulingPlan {
                     bindings,
                     effective_policy: SchedulingPolicy::TimeSlice { quantum_ms: q },
@@ -326,32 +342,38 @@ impl VcpuManager {
             SchedulingPolicy::Auto => {
                 // Check if we have enough dedicated cores
                 let can_dedicate = requested.iter().all(|cfg| {
-                    cfg.pinned_core.is_some_and(|c| available_cores.contains(&c))
+                    cfg.pinned_core
+                        .is_some_and(|c| available_cores.contains(&c))
                 });
 
                 if can_dedicate {
-                    let bindings = requested.iter().map(|cfg| {
-                        AffinityBinding::Pinned {
+                    let bindings = requested
+                        .iter()
+                        .map(|cfg| AffinityBinding::Pinned {
                             physical_core: cfg.pinned_core.unwrap_or(0),
-                        }
-                    }).collect();
+                        })
+                        .collect();
                     SchedulingPlan {
                         bindings,
                         effective_policy: SchedulingPolicy::Dedicated,
                     }
                 } else {
                     // Fall back to time-slicing
-                    let bindings = requested.iter().enumerate().map(|(i, _cfg)| {
-                        let core = if available_cores.is_empty() {
-                            0
-                        } else {
-                            available_cores[i % available_cores.len()]
-                        };
-                        AffinityBinding::Shared {
-                            physical_core: core,
-                            quantum_ms: DEFAULT_QUANTUM_MS,
-                        }
-                    }).collect();
+                    let bindings = requested
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _cfg)| {
+                            let core = if available_cores.is_empty() {
+                                0
+                            } else {
+                                available_cores[i % available_cores.len()]
+                            };
+                            AffinityBinding::Shared {
+                                physical_core: core,
+                                quantum_ms: DEFAULT_QUANTUM_MS,
+                            }
+                        })
+                        .collect();
                     SchedulingPlan {
                         bindings,
                         effective_policy: SchedulingPolicy::TimeSlice {

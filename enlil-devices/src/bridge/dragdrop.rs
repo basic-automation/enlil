@@ -156,11 +156,7 @@ impl DragDropManager {
                 target_guest,
                 payload,
             } => {
-                let result = (
-                    source_guest.clone(),
-                    target_guest.clone(),
-                    payload.clone(),
-                );
+                let result = (source_guest.clone(), target_guest.clone(), payload.clone());
                 self.state = DragState::Dropped;
                 Ok(result)
             }
@@ -208,8 +204,7 @@ mod tests {
     #[test]
     fn test_payload_with_thumbnail() {
         let thumbnail = vec![1, 2, 3, 4];
-        let payload = DragPayload::new(vec![], vec![])
-            .with_thumbnail(thumbnail.clone());
+        let payload = DragPayload::new(vec![], vec![]).with_thumbnail(thumbnail.clone());
         assert_eq!(payload.preview_thumbnail, Some(thumbnail));
     }
 

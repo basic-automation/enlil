@@ -187,7 +187,7 @@ mod tests {
 
         // Second round
         ts.on_vmentry(2500); // 500 cycles in host
-        ts.on_vmexit(4000);  // 1500 more guest cycles
+        ts.on_vmexit(4000); // 1500 more guest cycles
 
         assert_eq!(ts.read_aperf(), 2500); // 1000 + 1500
     }

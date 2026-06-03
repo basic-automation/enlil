@@ -234,7 +234,8 @@ impl AmlBuilder {
             if shift > 0 {
                 let src_start = length_pos + reserved;
                 let remaining = self.data.len() - src_start;
-                self.data.copy_within(src_start..src_start + remaining, length_pos + actual);
+                self.data
+                    .copy_within(src_start..src_start + remaining, length_pos + actual);
                 self.data.truncate(self.data.len() - shift);
             }
         }

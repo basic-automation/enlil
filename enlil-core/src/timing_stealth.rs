@@ -55,7 +55,8 @@ impl VcpuTimingState {
         let current_mperf = self.mperf.load(Ordering::Relaxed);
         if current_mperf > 0 {
             let ratio = (current_aperf as f64) / (current_mperf as f64);
-            self.mperf.store((current_aperf as f64 / ratio) as u64, Ordering::Release);
+            self.mperf
+                .store((current_aperf as f64 / ratio) as u64, Ordering::Release);
         }
 
         self.last_guest_rip.store(guest_rip, Ordering::Release);
@@ -148,9 +149,7 @@ pub struct CpuidResponse {
 
 impl CpuidCachingHelper {
     pub fn new() -> Self {
-        Self {
-            cache: Vec::new(),
-        }
+        Self { cache: Vec::new() }
     }
 
     /// Build CPUID cache for all relevant leaves
@@ -173,7 +172,7 @@ impl CpuidCachingHelper {
         self.cache_cpuid(CpuidResponse {
             leaf: 0x00,
             subleaf: 0,
-            eax: 0x16,  // Max leaf
+            eax: 0x16,       // Max leaf
             ebx: 0x756e6547, // "Genu"
             ecx: 0x6c65746e, // "ntel"
             edx: 0x49656e69, // "ineI"

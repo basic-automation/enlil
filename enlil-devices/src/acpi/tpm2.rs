@@ -140,9 +140,7 @@ mod tests {
 
     #[test]
     fn tpm2_custom_control_area() {
-        let tpm2 = Tpm2Builder::new()
-            .control_area_address(0xFED4_0000)
-            .build();
+        let tpm2 = Tpm2Builder::new().control_area_address(0xFED4_0000).build();
         let addr = u64::from_le_bytes(tpm2[40..48].try_into().unwrap());
         assert_eq!(addr, 0xFED4_0000);
         let sum: u8 = tpm2.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));

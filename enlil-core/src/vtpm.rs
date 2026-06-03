@@ -8,24 +8,24 @@ use std::collections::HashMap;
 /// TPM 2.0 Command/Response protocol
 #[repr(C, packed)]
 pub struct TpmCommandHeader {
-    pub tag: u16,                  // 0x8001 = TPM2_ST_NO_SESSIONS
-    pub size: u32,                 // Total command size
-    pub code: u32,                 // TPM2_CC_* command code
+    pub tag: u16,  // 0x8001 = TPM2_ST_NO_SESSIONS
+    pub size: u32, // Total command size
+    pub code: u32, // TPM2_CC_* command code
 }
 
 #[repr(C, packed)]
 pub struct TpmResponseHeader {
     pub tag: u16,
     pub size: u32,
-    pub code: u32,                 // 0 = success, non-zero = error
+    pub code: u32, // 0 = success, non-zero = error
 }
 
 /// TPM 2.0 PCR (Platform Configuration Register)
 /// Stores measurements of firmware, bootloader, kernel, etc.
 #[derive(Clone)]
 pub struct TpmPcr {
-    pub value: Vec<u8>,            // SHA-256 hash (32 bytes)
-    pub alg: u16,                  // TPM_ALG_SHA256 = 0x000B
+    pub value: Vec<u8>, // SHA-256 hash (32 bytes)
+    pub alg: u16,       // TPM_ALG_SHA256 = 0x000B
 }
 
 impl TpmPcr {
@@ -171,7 +171,7 @@ impl TpmDispatcher {
         let cc = u32::from_be_bytes([command[6], command[7], command[8], command[9]]);
 
         let response_code = match cc {
-            0x00000144 => self.tpm.startup(0), // TPM2_CC_Startup
+            0x00000144 => self.tpm.startup(0),  // TPM2_CC_Startup
             0x00000145 => self.tpm.shutdown(0), // TPM2_CC_Shutdown
             0x0000017E => {
                 // TPM2_CC_PCR_Extend

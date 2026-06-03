@@ -90,8 +90,8 @@ impl Default for SmbiosConfig {
             system_version: "System Version".to_string(),
             system_serial: "System Serial Number".to_string(),
             system_uuid: [
-                0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0,
-                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+                0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+                0x77, 0x88,
             ],
             system_sku: "SKU".to_string(),
             system_family: "To be filled by O.E.M.".to_string(),
@@ -204,8 +204,8 @@ impl SmbiosBuilder {
 
     fn build_type0(&self) -> Vec<u8> {
         let mut header = vec![
-            0,    // Type 0
-            26,   // Length (formatted area)
+            0,  // Type 0
+            26, // Length (formatted area)
             0, 0, // Handle
         ];
         // Vendor string ref
@@ -235,19 +235,22 @@ impl SmbiosBuilder {
         header.extend_from_slice(&32u16.to_le_bytes()); // 32 MB
 
         // Strings section
-        append_strings(&mut header, &[
-            &self.config.bios_vendor,
-            &self.config.bios_version,
-            &self.config.bios_date,
-        ]);
+        append_strings(
+            &mut header,
+            &[
+                &self.config.bios_vendor,
+                &self.config.bios_version,
+                &self.config.bios_date,
+            ],
+        );
 
         header
     }
 
     fn build_type1(&self) -> Vec<u8> {
         let mut header = vec![
-            1,    // Type 1
-            27,   // Length
+            1,  // Type 1
+            27, // Length
             1, 0, // Handle
         ];
         // Manufacturer string ref
@@ -267,22 +270,25 @@ impl SmbiosBuilder {
         // Family string ref
         header.push(6);
 
-        append_strings(&mut header, &[
-            &self.config.system_manufacturer,
-            &self.config.system_product,
-            &self.config.system_version,
-            &self.config.system_serial,
-            &self.config.system_sku,
-            &self.config.system_family,
-        ]);
+        append_strings(
+            &mut header,
+            &[
+                &self.config.system_manufacturer,
+                &self.config.system_product,
+                &self.config.system_version,
+                &self.config.system_serial,
+                &self.config.system_sku,
+                &self.config.system_family,
+            ],
+        );
 
         header
     }
 
     fn build_type2(&self) -> Vec<u8> {
         let mut header = vec![
-            2,    // Type 2
-            15,   // Length
+            2,  // Type 2
+            15, // Length
             2, 0, // Handle
         ];
         // Manufacturer
@@ -304,22 +310,25 @@ impl SmbiosBuilder {
         // Board Type: Motherboard
         header.push(0x0A);
 
-        append_strings(&mut header, &[
-            &self.config.baseboard_manufacturer,
-            &self.config.baseboard_product,
-            "Rev X.0x",
-            &self.config.baseboard_serial,
-            "Default string",
-            "Default string",
-        ]);
+        append_strings(
+            &mut header,
+            &[
+                &self.config.baseboard_manufacturer,
+                &self.config.baseboard_product,
+                "Rev X.0x",
+                &self.config.baseboard_serial,
+                "Default string",
+                "Default string",
+            ],
+        );
 
         header
     }
 
     fn build_type3(&self) -> Vec<u8> {
         let mut header = vec![
-            3,    // Type 3
-            22,   // Length
+            3,  // Type 3
+            22, // Length
             3, 0, // Handle
         ];
         // Manufacturer
@@ -351,12 +360,15 @@ impl SmbiosBuilder {
         // Contained Element Record Length: 0
         header.push(0);
 
-        append_strings(&mut header, &[
-            "Default string",
-            "Default string",
-            "Default string",
-            "Default string",
-        ]);
+        append_strings(
+            &mut header,
+            &[
+                "Default string",
+                "Default string",
+                "Default string",
+                "Default string",
+            ],
+        );
 
         header
     }
@@ -364,8 +376,8 @@ impl SmbiosBuilder {
     #[allow(clippy::cast_possible_truncation)]
     fn build_type4(&self) -> Vec<u8> {
         let mut header = vec![
-            4,    // Type 4
-            48,   // Length (SMBIOS 3.0)
+            4,  // Type 4
+            48, // Length (SMBIOS 3.0)
             4, 0, // Handle
         ];
         // Socket Designation
@@ -415,22 +427,25 @@ impl SmbiosBuilder {
         // Processor Family 2
         header.extend_from_slice(&0x0108u16.to_le_bytes()); // Zen 4
 
-        append_strings(&mut header, &[
-            "AM5",
-            "Advanced Micro Devices, Inc.",
-            &self.config.cpu_brand,
-            "Unknown",
-            "Unknown",
-            "Unknown",
-        ]);
+        append_strings(
+            &mut header,
+            &[
+                "AM5",
+                "Advanced Micro Devices, Inc.",
+                &self.config.cpu_brand,
+                "Unknown",
+                "Unknown",
+                "Unknown",
+            ],
+        );
 
         header
     }
 
     fn build_type16(&self) -> Vec<u8> {
         let mut header = vec![
-            16,   // Type 16
-            23,   // Length
+            16, // Type 16
+            23, // Length
             16, 0, // Handle
         ];
         // Location: System Board
@@ -448,7 +463,8 @@ impl SmbiosBuilder {
         let num_devices = self.config.ram_modules.len() as u16;
         header.extend_from_slice(&num_devices.to_le_bytes());
         // Extended Maximum Capacity (bytes)
-        header.extend_from_slice(&(u64::from(self.config.total_ram_mb) * 1024 * 1024).to_le_bytes());
+        header
+            .extend_from_slice(&(u64::from(self.config.total_ram_mb) * 1024 * 1024).to_le_bytes());
 
         // No strings
         header.push(0);
@@ -543,22 +559,25 @@ impl SmbiosBuilder {
 
         let dimm_label = format!("DIMM_{}", index);
         let bank_label = format!("BANK {}", index);
-        append_strings(&mut header, &[
-            &dimm_label,
-            &bank_label,
-            &module.manufacturer,
-            &module.serial,
-            "Not Specified",
-            &module.part_number,
-        ]);
+        append_strings(
+            &mut header,
+            &[
+                &dimm_label,
+                &bank_label,
+                &module.manufacturer,
+                &module.serial,
+                "Not Specified",
+                &module.part_number,
+            ],
+        );
 
         header
     }
 
     fn build_type32(&self) -> Vec<u8> {
         let mut header = vec![
-            32,   // Type 32
-            20,   // Length
+            32, // Type 32
+            20, // Length
             32, 0, // Handle
         ];
         // Reserved (6 bytes)
@@ -575,8 +594,8 @@ impl SmbiosBuilder {
 
     fn build_type127(&self) -> Vec<u8> {
         vec![
-            127,  // Type 127
-            4,    // Length
+            127, // Type 127
+            4,   // Length
             127, 0, // Handle
             0, 0, // End of strings
         ]

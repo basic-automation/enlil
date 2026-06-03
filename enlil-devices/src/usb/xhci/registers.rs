@@ -50,9 +50,8 @@ impl CapabilityRegisters {
         let max_intrs: u16 = 1;
 
         // HCSPARAMS1: MaxSlots[7:0], MaxIntrs[18:8], MaxPorts[31:24]
-        let hcsparams1 = u32::from(max_slots)
-            | (u32::from(max_intrs) << 8)
-            | (u32::from(num_ports) << 24);
+        let hcsparams1 =
+            u32::from(max_slots) | (u32::from(max_intrs) << 8) | (u32::from(num_ports) << 24);
 
         // HCSPARAMS2: IST=1, ERST_Max=4 (16 entries), SPB_Max=0
         let hcsparams2 = 0x1 | (4 << 4);
@@ -340,7 +339,7 @@ impl OperationalRegisters {
         Self {
             usbcmd: 0,
             usbsts: 0x0001, // HCHalted = 1 on reset
-            pagesize: 1, // 4096 bytes
+            pagesize: 1,    // 4096 bytes
             dnctrl: 0,
             crcr: 0,
             dcbaap: 0,

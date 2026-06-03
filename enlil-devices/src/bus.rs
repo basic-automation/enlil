@@ -67,10 +67,7 @@ impl PioBus {
     #[must_use]
     pub fn lookup(&self, port: u16) -> Option<usize> {
         // Find the device whose base is <= port
-        self.devices
-            .range(..=port)
-            .next_back()
-            .map(|(_, &idx)| idx)
+        self.devices.range(..=port).next_back().map(|(_, &idx)| idx)
     }
 }
 

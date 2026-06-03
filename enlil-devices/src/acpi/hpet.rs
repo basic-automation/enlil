@@ -79,10 +79,10 @@ impl HpetBuilder {
         buf.extend_from_slice(&event_timer_block_id.to_le_bytes());
 
         // Offset 40: Base Address (12-byte GAS)
-        buf.push(0);    // address space: memory
-        buf.push(64);   // bit width
-        buf.push(0);    // bit offset
-        buf.push(0);    // access size (undefined)
+        buf.push(0); // address space: memory
+        buf.push(64); // bit width
+        buf.push(0); // bit offset
+        buf.push(0); // access size (undefined)
         buf.extend_from_slice(&self.base_address.to_le_bytes());
 
         // Offset 52: HPET Number

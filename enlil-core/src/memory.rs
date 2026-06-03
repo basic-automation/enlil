@@ -234,9 +234,7 @@ impl MemoryManager {
             .values()
             .find(|r| r.guest_id == guest_id)
             .map(|r| r.host_base)
-            .ok_or_else(|| {
-                Error::Memory(format!("no region found for guest '{guest_id}'"))
-            })?;
+            .ok_or_else(|| Error::Memory(format!("no region found for guest '{guest_id}'")))?;
 
         let region = self.regions.remove(&base).unwrap();
         self.memory_maps.remove(guest_id);

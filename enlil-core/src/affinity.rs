@@ -121,9 +121,7 @@ pub fn pin_current_thread_to_mask(mask: &AffinityMask) -> PinResult {
 
     #[cfg(not(target_os = "linux"))]
     {
-        log::warn!(
-            "CPU pinning not supported on this platform; requested cores: {mask}"
-        );
+        log::warn!("CPU pinning not supported on this platform; requested cores: {mask}");
         PinResult::Unsupported
     }
 }
@@ -145,8 +143,7 @@ pub fn get_current_affinity() -> PinResult {
 /// Query the number of online CPUs.
 #[must_use]
 pub fn online_cpu_count() -> usize {
-    std::thread::available_parallelism()
-        .map_or(1, std::num::NonZero::get)
+    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
 }
 
 /// Get a list of all online CPU IDs (0-based).
@@ -270,9 +267,7 @@ where
             let result = pin_current_thread(core);
             match &result {
                 PinResult::Pinned(mask) => {
-                    log::info!(
-                        "[{guest_id}/vcpu{vcpu_id}] pinned to core(s): {mask}"
-                    );
+                    log::info!("[{guest_id}/vcpu{vcpu_id}] pinned to core(s): {mask}");
                 }
                 PinResult::Unsupported => {
                     log::warn!(
@@ -280,9 +275,7 @@ where
                     );
                 }
                 PinResult::Failed(e) => {
-                    log::error!(
-                        "[{guest_id}/vcpu{vcpu_id}] failed to pin to core {core}: {e}"
-                    );
+                    log::error!("[{guest_id}/vcpu{vcpu_id}] failed to pin to core {core}: {e}");
                 }
             }
             let _ = tx.send(result);
@@ -290,7 +283,9 @@ where
         })
         .expect("failed to spawn vCPU thread");
 
-    let pin_result = rx.recv().unwrap_or(PinResult::Failed("channel closed".into()));
+    let pin_result = rx
+        .recv()
+        .unwrap_or(PinResult::Failed("channel closed".into()));
 
     VcpuThread {
         config: cfg,
@@ -358,7 +353,10 @@ mod tests {
 
     #[test]
     fn launch_vcpu_thread_runs() {
-        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
 
         let ran = Arc::new(AtomicBool::new(false));
         let ran2 = ran.clone();
@@ -369,14 +367,11 @@ mod tests {
             physical_core: 0,
         };
 
-        let mut thread = launch_vcpu_thread(
-            &config,
-            move |guest_id, vcpu_id| {
-                assert_eq!(guest_id, "test");
-                assert_eq!(vcpu_id, 0);
-                ran2.store(true, Ordering::SeqCst);
-            },
-        );
+        let mut thread = launch_vcpu_thread(&config, move |guest_id, vcpu_id| {
+            assert_eq!(guest_id, "test");
+            assert_eq!(vcpu_id, 0);
+            ran2.store(true, Ordering::SeqCst);
+        });
 
         if let Some(h) = thread.handle.take() {
             h.join().unwrap();

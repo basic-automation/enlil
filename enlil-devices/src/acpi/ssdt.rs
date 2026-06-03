@@ -205,7 +205,8 @@ impl SsdtBuilder {
         pkg.push(opcode::PACKAGE_OP);
         // PkgLength covers: pkg_length_bytes + num_elements + inner
         let pkg_body_len = 1 + inner.len(); // 1 for NumElements
-        let pkg_len_bytes = Self::encode_pkg_length(pkg_body_len + Self::encode_pkg_length(pkg_body_len).len());
+        let pkg_len_bytes =
+            Self::encode_pkg_length(pkg_body_len + Self::encode_pkg_length(pkg_body_len).len());
         pkg.extend_from_slice(&pkg_len_bytes);
         pkg.push(6); // NumElements
         pkg.extend_from_slice(&inner);
@@ -222,7 +223,8 @@ impl SsdtBuilder {
         let mut pkg = Vec::new();
         pkg.push(opcode::PACKAGE_OP);
         let pkg_body_len = 1 + entries_bytes.len(); // 1 for NumElements
-        let pkg_len_bytes = Self::encode_pkg_length(pkg_body_len + Self::encode_pkg_length(pkg_body_len).len());
+        let pkg_len_bytes =
+            Self::encode_pkg_length(pkg_body_len + Self::encode_pkg_length(pkg_body_len).len());
         pkg.extend_from_slice(&pkg_len_bytes);
         #[allow(clippy::cast_possible_truncation)]
         pkg.push(self.pstates.len() as u8);
@@ -261,7 +263,8 @@ impl SsdtBuilder {
         let mut pkg = Vec::new();
         pkg.push(opcode::PACKAGE_OP);
         let pkg_body_len = 1 + inner.len();
-        let pkg_len_bytes = Self::encode_pkg_length(pkg_body_len + Self::encode_pkg_length(pkg_body_len).len());
+        let pkg_len_bytes =
+            Self::encode_pkg_length(pkg_body_len + Self::encode_pkg_length(pkg_body_len).len());
         pkg.extend_from_slice(&pkg_len_bytes);
         pkg.push(4); // NumElements
         pkg.extend_from_slice(&inner);
@@ -283,7 +286,9 @@ impl SsdtBuilder {
         let mut buf = Vec::new();
         buf.push(opcode::BUFFER_OP);
         let buffer_inner_len = Self::encode_integer(resource.len() as u64).len() + resource.len();
-        let buf_len_bytes = Self::encode_pkg_length(buffer_inner_len + Self::encode_pkg_length(buffer_inner_len).len());
+        let buf_len_bytes = Self::encode_pkg_length(
+            buffer_inner_len + Self::encode_pkg_length(buffer_inner_len).len(),
+        );
         buf.extend_from_slice(&buf_len_bytes);
         buf.extend_from_slice(&Self::encode_integer(resource.len() as u64));
         buf.extend_from_slice(&resource);
@@ -304,7 +309,8 @@ impl SsdtBuilder {
         #[allow(clippy::cast_possible_truncation)]
         let num_elements = (self.cstates.len() + 1) as u8; // count integer + entries
         let pkg_body_len = 1 + entries_bytes.len(); // 1 for NumElements byte
-        let pkg_len_bytes = Self::encode_pkg_length(pkg_body_len + Self::encode_pkg_length(pkg_body_len).len());
+        let pkg_len_bytes =
+            Self::encode_pkg_length(pkg_body_len + Self::encode_pkg_length(pkg_body_len).len());
         pkg.extend_from_slice(&pkg_len_bytes);
         pkg.push(num_elements);
         pkg.extend_from_slice(&entries_bytes);
@@ -352,7 +358,9 @@ impl SsdtBuilder {
             let mut cpu0_scope = Vec::new();
             cpu0_scope.push(opcode::SCOPE_OP);
             let scope_inner_len = 4 + cpu0_body.len(); // 4 for name
-            let scope_pkg_len = Self::encode_pkg_length(scope_inner_len + Self::encode_pkg_length(scope_inner_len).len());
+            let scope_pkg_len = Self::encode_pkg_length(
+                scope_inner_len + Self::encode_pkg_length(scope_inner_len).len(),
+            );
             cpu0_scope.extend_from_slice(&scope_pkg_len);
             cpu0_scope.extend_from_slice(&cpu0_name);
             cpu0_scope.extend_from_slice(&cpu0_body);
@@ -366,7 +374,8 @@ impl SsdtBuilder {
         // Wrap in Scope(\_PR_)
         aml.push(opcode::SCOPE_OP);
         let pr_inner_len = 4 + pr_body.len(); // 4 for name "_PR_"
-        let pr_pkg_len = Self::encode_pkg_length(pr_inner_len + Self::encode_pkg_length(pr_inner_len).len());
+        let pr_pkg_len =
+            Self::encode_pkg_length(pr_inner_len + Self::encode_pkg_length(pr_inner_len).len());
         aml.extend_from_slice(&pr_pkg_len);
         aml.extend_from_slice(b"_PR_");
         aml.extend_from_slice(&pr_body);

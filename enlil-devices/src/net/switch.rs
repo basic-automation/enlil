@@ -140,12 +140,8 @@ impl VirtualSwitch {
 
         self.stats.received += 1;
 
-        let dst_mac = MacAddress([
-            frame[0], frame[1], frame[2], frame[3], frame[4], frame[5],
-        ]);
-        let src_mac = MacAddress([
-            frame[6], frame[7], frame[8], frame[9], frame[10], frame[11],
-        ]);
+        let dst_mac = MacAddress([frame[0], frame[1], frame[2], frame[3], frame[4], frame[5]]);
+        let src_mac = MacAddress([frame[6], frame[7], frame[8], frame[9], frame[10], frame[11]]);
 
         // Learn the source MAC.
         self.learn(src_mac, src_port);
@@ -184,9 +180,7 @@ impl VirtualSwitch {
     /// Check if a port has pending frames.
     #[must_use]
     pub fn has_pending(&self, port: PortId) -> bool {
-        self.port_queues
-            .get(&port)
-            .is_some_and(|q| !q.is_empty())
+        self.port_queues.get(&port).is_some_and(|q| !q.is_empty())
     }
 
     /// Number of pending frames for a port.

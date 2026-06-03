@@ -7,9 +7,8 @@
 use std::fmt;
 
 pub use super::types::{
-    DeviceSpeed as UsbSpeed,
-    UsbDeviceClass as UsbClass,
-    UsbDeviceDescriptor, UsbDeviceId, UsbDeviceInfo, UsbDeviceState, UsbPortPath,
+    DeviceSpeed as UsbSpeed, UsbDeviceClass as UsbClass, UsbDeviceDescriptor, UsbDeviceId,
+    UsbDeviceInfo, UsbDeviceState, UsbPortPath,
 };
 
 // ---------------------------------------------------------------------------
@@ -87,10 +86,7 @@ impl UsbDevice {
     /// Get a human-readable manufacturer name.
     #[must_use]
     pub fn manufacturer(&self) -> &str {
-        self.descriptor
-            .manufacturer
-            .as_deref()
-            .unwrap_or("Unknown")
+        self.descriptor.manufacturer.as_deref().unwrap_or("Unknown")
     }
 }
 
@@ -118,8 +114,8 @@ impl fmt::Display for UsbDevice {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::types::{UsbAddress, UsbDeviceClass};
+    use super::*;
 
     fn make_info() -> UsbDeviceInfo {
         UsbDeviceInfo {

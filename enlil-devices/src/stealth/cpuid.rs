@@ -184,10 +184,26 @@ impl CpuidStealthTable {
                 leaf: 0x8000_0002 + i,
                 subleaf: 0,
                 result: CpuidResult {
-                    eax: u32::from_le_bytes(config.brand_string[offset..offset + 4].try_into().unwrap_or([0; 4])),
-                    ebx: u32::from_le_bytes(config.brand_string[offset + 4..offset + 8].try_into().unwrap_or([0; 4])),
-                    ecx: u32::from_le_bytes(config.brand_string[offset + 8..offset + 12].try_into().unwrap_or([0; 4])),
-                    edx: u32::from_le_bytes(config.brand_string[offset + 12..offset + 16].try_into().unwrap_or([0; 4])),
+                    eax: u32::from_le_bytes(
+                        config.brand_string[offset..offset + 4]
+                            .try_into()
+                            .unwrap_or([0; 4]),
+                    ),
+                    ebx: u32::from_le_bytes(
+                        config.brand_string[offset + 4..offset + 8]
+                            .try_into()
+                            .unwrap_or([0; 4]),
+                    ),
+                    ecx: u32::from_le_bytes(
+                        config.brand_string[offset + 8..offset + 12]
+                            .try_into()
+                            .unwrap_or([0; 4]),
+                    ),
+                    edx: u32::from_le_bytes(
+                        config.brand_string[offset + 12..offset + 16]
+                            .try_into()
+                            .unwrap_or([0; 4]),
+                    ),
                 },
             });
         }
@@ -218,7 +234,8 @@ impl CpuidStealthTable {
         }
 
         // Bounds check
-        if leaf <= self.max_standard_leaf || (0x8000_0000..=self.max_extended_leaf).contains(&leaf) {
+        if leaf <= self.max_standard_leaf || (0x8000_0000..=self.max_extended_leaf).contains(&leaf)
+        {
             for entry in &self.entries {
                 if entry.leaf == leaf && entry.subleaf == subleaf {
                     return entry.result;
@@ -249,7 +266,7 @@ impl CpuidStealthTable {
     fn build_leaf_7(config: &CpuidStealthConfig) -> CpuidResult {
         // Pass through common structured features, masking dangerous ones
         CpuidResult {
-            eax: 0, // max subleaf
+            eax: 0,           // max subleaf
             ebx: 0x0000_0281, // FSGSBASE, BMI1, AVX2 (conservative)
             ecx: 0,
             edx: 0,
@@ -268,7 +285,7 @@ impl CpuidStealthTable {
                 eax: smt_shift,
                 ebx: threads_per_core,
                 ecx: (1 << 8) | 0, // SMT level type = 1, level number = 0
-                edx: 0, // x2APIC ID (set per-vCPU at runtime)
+                edx: 0,            // x2APIC ID (set per-vCPU at runtime)
             },
         });
 
@@ -354,7 +371,12 @@ mod tests {
         let ebx_bytes = result.ebx.to_le_bytes();
         let edx_bytes = result.edx.to_le_bytes();
         let ecx_bytes = result.ecx.to_le_bytes();
-        let vendor: Vec<u8> = ebx_bytes.iter().chain(edx_bytes.iter()).chain(ecx_bytes.iter()).copied().collect();
+        let vendor: Vec<u8> = ebx_bytes
+            .iter()
+            .chain(edx_bytes.iter())
+            .chain(ecx_bytes.iter())
+            .copied()
+            .collect();
         assert_eq!(&vendor, b"AuthenticAMD");
     }
 

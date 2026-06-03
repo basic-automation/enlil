@@ -145,18 +145,14 @@ mod tests {
 
     #[test]
     fn bgrt_image_address() {
-        let bgrt = BgrtBuilder::new()
-            .image_address(0xDEAD_BEEF_0000)
-            .build();
+        let bgrt = BgrtBuilder::new().image_address(0xDEAD_BEEF_0000).build();
         let addr = u64::from_le_bytes(bgrt[40..48].try_into().unwrap());
         assert_eq!(addr, 0xDEAD_BEEF_0000);
     }
 
     #[test]
     fn bgrt_custom_offset() {
-        let bgrt = BgrtBuilder::new()
-            .image_offset(100, 200)
-            .build();
+        let bgrt = BgrtBuilder::new().image_offset(100, 200).build();
         let x = u32::from_le_bytes(bgrt[48..52].try_into().unwrap());
         let y = u32::from_le_bytes(bgrt[52..56].try_into().unwrap());
         assert_eq!(x, 100);

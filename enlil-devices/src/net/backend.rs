@@ -180,10 +180,7 @@ impl PipeBackend {
 
 impl NetBackend for PipeBackend {
     fn send(&mut self, frame: &[u8]) -> std::io::Result<usize> {
-        self.peer_rx
-            .lock()
-            .unwrap()
-            .push_back(frame.to_vec());
+        self.peer_rx.lock().unwrap().push_back(frame.to_vec());
         Ok(frame.len())
     }
 

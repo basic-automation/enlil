@@ -239,10 +239,26 @@ impl MadtBuilder {
     #[allow(clippy::cast_possible_truncation)]
     pub fn build(&self) -> Vec<u8> {
         // Calculate total size
-        let entries_size: usize = self.local_apics.iter().map(|e| e.to_bytes().len()).sum::<usize>()
-            + self.io_apics.iter().map(|e| e.to_bytes().len()).sum::<usize>()
-            + self.overrides.iter().map(|e| e.to_bytes().len()).sum::<usize>()
-            + self.local_nmi.iter().map(|e| e.to_bytes().len()).sum::<usize>();
+        let entries_size: usize = self
+            .local_apics
+            .iter()
+            .map(|e| e.to_bytes().len())
+            .sum::<usize>()
+            + self
+                .io_apics
+                .iter()
+                .map(|e| e.to_bytes().len())
+                .sum::<usize>()
+            + self
+                .overrides
+                .iter()
+                .map(|e| e.to_bytes().len())
+                .sum::<usize>()
+            + self
+                .local_nmi
+                .iter()
+                .map(|e| e.to_bytes().len())
+                .sum::<usize>();
 
         let total_length = 36 + 8 + entries_size; // header + fixed fields + entries
 

@@ -65,30 +65,16 @@ pub struct VCpuConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmExit {
     /// Guest executed an IN instruction.
-    IoIn {
-        port: u16,
-        size: u8,
-    },
+    IoIn { port: u16, size: u8 },
 
     /// Guest executed an OUT instruction.
-    IoOut {
-        port: u16,
-        size: u8,
-        data: u32,
-    },
+    IoOut { port: u16, size: u8, data: u32 },
 
     /// Guest performed an MMIO read.
-    MmioRead {
-        address: u64,
-        size: u8,
-    },
+    MmioRead { address: u64, size: u8 },
 
     /// Guest performed an MMIO write.
-    MmioWrite {
-        address: u64,
-        size: u8,
-        data: u64,
-    },
+    MmioWrite { address: u64, size: u8, data: u64 },
 
     /// Guest executed a HLT instruction.
     Hlt,
@@ -105,7 +91,10 @@ impl fmt::Display for VmExit {
         match self {
             Self::IoIn { port, size } => write!(f, "IoIn(port=0x{port:04x}, size={size})"),
             Self::IoOut { port, size, data } => {
-                write!(f, "IoOut(port=0x{port:04x}, size={size}, data=0x{data:08x})")
+                write!(
+                    f,
+                    "IoOut(port=0x{port:04x}, size={size}, data=0x{data:08x})"
+                )
             }
             Self::MmioRead { address, size } => {
                 write!(f, "MmioRead(addr=0x{address:016x}, size={size})")
@@ -246,7 +235,10 @@ mod tests {
 
     #[test]
     fn vm_exit_display() {
-        let exit = VmExit::IoIn { port: 0x3F8, size: 1 };
+        let exit = VmExit::IoIn {
+            port: 0x3F8,
+            size: 1,
+        };
         assert!(exit.to_string().contains("0x03f8"));
 
         let exit = VmExit::Hlt;
@@ -262,8 +254,16 @@ mod tests {
         assert_eq!(VmExit::Shutdown, VmExit::Shutdown);
         assert_ne!(VmExit::Hlt, VmExit::Shutdown);
         assert_eq!(
-            VmExit::IoOut { port: 0x60, size: 1, data: 0xAB },
-            VmExit::IoOut { port: 0x60, size: 1, data: 0xAB },
+            VmExit::IoOut {
+                port: 0x60,
+                size: 1,
+                data: 0xAB
+            },
+            VmExit::IoOut {
+                port: 0x60,
+                size: 1,
+                data: 0xAB
+            },
         );
     }
 

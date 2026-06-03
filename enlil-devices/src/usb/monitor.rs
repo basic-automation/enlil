@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::types::{
-    DeviceSpeed, UsbAddress, UsbDeviceClass, UsbDeviceDescriptor, UsbDeviceInfo,
-    UsbDeviceState, UsbError, UsbPortPath, UsbResult,
+    DeviceSpeed, UsbAddress, UsbDeviceClass, UsbDeviceDescriptor, UsbDeviceInfo, UsbDeviceState,
+    UsbError, UsbPortPath, UsbResult,
 };
 
 // ---------------------------------------------------------------------------
@@ -75,7 +75,11 @@ impl UsbMonitor {
 
     /// Look up a device by its port path.
     pub fn device_by_port(&self, port: &UsbPortPath) -> Option<UsbDeviceInfo> {
-        self.devices.lock().expect("device lock poisoned").get(port).cloned()
+        self.devices
+            .lock()
+            .expect("device lock poisoned")
+            .get(port)
+            .cloned()
     }
 
     /// Look up a device by VID:PID (returns the first match).
@@ -84,15 +88,16 @@ impl UsbMonitor {
             .lock()
             .expect("device lock poisoned")
             .values()
-            .find(|d| {
-                d.descriptor.vendor_id == vendor_id && d.descriptor.product_id == product_id
-            })
+            .find(|d| d.descriptor.vendor_id == vendor_id && d.descriptor.product_id == product_id)
             .cloned()
     }
 
     /// Register a hot-plug callback.
     pub fn on_hotplug(&self, callback: HotplugCallback) {
-        self.listeners.lock().expect("listener lock poisoned").push(callback);
+        self.listeners
+            .lock()
+            .expect("listener lock poisoned")
+            .push(callback);
     }
 
     /// Allocate the next device address.
@@ -211,7 +216,9 @@ mod tests {
         let port = UsbPortPath::new(1, vec![1]);
         let desc = test_descriptor(0x046d, 0xc077);
 
-        let info = mon.report_connect(port.clone(), desc, DeviceSpeed::High).unwrap();
+        let info = mon
+            .report_connect(port.clone(), desc, DeviceSpeed::High)
+            .unwrap();
         assert_eq!(info.address.value(), 1);
         assert_eq!(mon.device_count(), 1);
 
@@ -225,7 +232,8 @@ mod tests {
         let port = UsbPortPath::new(1, vec![2]);
         let desc = test_descriptor(0x046d, 0xc534);
 
-        mon.report_connect(port.clone(), desc, DeviceSpeed::Full).unwrap();
+        mon.report_connect(port.clone(), desc, DeviceSpeed::Full)
+            .unwrap();
         assert_eq!(mon.device_count(), 1);
 
         mon.report_disconnect(&port).unwrap();
@@ -268,7 +276,8 @@ mod tests {
         let port = UsbPortPath::new(1, vec![1]);
         let desc = test_descriptor(0x046d, 0xc077);
 
-        mon.report_connect(port.clone(), desc, DeviceSpeed::High).unwrap();
+        mon.report_connect(port.clone(), desc, DeviceSpeed::High)
+            .unwrap();
         assert_eq!(counter.load(Ordering::Relaxed), 1);
 
         mon.report_disconnect(&port).unwrap();
@@ -299,7 +308,9 @@ mod tests {
         let p2 = UsbPortPath::new(1, vec![2]);
         let desc = test_descriptor(0x0001, 0x0001);
 
-        let d1 = mon.report_connect(p1, desc.clone(), DeviceSpeed::Full).unwrap();
+        let d1 = mon
+            .report_connect(p1, desc.clone(), DeviceSpeed::Full)
+            .unwrap();
         let d2 = mon.report_connect(p2, desc, DeviceSpeed::Full).unwrap();
 
         assert_eq!(d1.address.value(), 1);

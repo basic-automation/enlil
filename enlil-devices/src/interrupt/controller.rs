@@ -1,9 +1,9 @@
 //! Unified interrupt controller — coordinates LAPIC, IOAPIC, and MSI delivery.
 
-use super::{DeliveryMode, InterruptEntry, TriggerMode};
-use super::lapic::LocalApic;
 use super::ioapic::IoApic;
+use super::lapic::LocalApic;
 use super::msi::MsiMessage;
+use super::{DeliveryMode, InterruptEntry, TriggerMode};
 
 /// Unified interrupt controller managing all interrupt sources and destinations.
 pub struct InterruptController {
@@ -72,7 +72,9 @@ impl InterruptController {
         match entry.delivery_mode {
             DeliveryMode::LowestPriority => {
                 // Find the LAPIC with the lowest TPR among matching destinations
-                let target = self.lapics.iter()
+                let target = self
+                    .lapics
+                    .iter()
                     .enumerate()
                     .filter(|(_, l)| l.id() == dest && l.is_enabled())
                     .min_by_key(|(_, l)| l.get_tpr());
@@ -92,7 +94,9 @@ impl InterruptController {
     fn deliver_logical(&mut self, _dest: u8, entry: InterruptEntry) {
         match entry.delivery_mode {
             DeliveryMode::LowestPriority => {
-                let target = self.lapics.iter()
+                let target = self
+                    .lapics
+                    .iter()
                     .enumerate()
                     .filter(|(_, l)| l.is_enabled())
                     .min_by_key(|(_, l)| l.get_tpr());
@@ -121,7 +125,8 @@ impl InterruptController {
     /// Check if a vCPU has a pending interrupt.
     #[must_use]
     pub fn has_pending(&self, vcpu_id: u8) -> bool {
-        self.lapics.iter()
+        self.lapics
+            .iter()
             .find(|l| l.id() == vcpu_id)
             .is_some_and(LocalApic::has_pending_interrupt)
     }
@@ -129,7 +134,8 @@ impl InterruptController {
     /// Get the pending interrupt vector for a vCPU.
     #[must_use]
     pub fn pending_vector(&self, vcpu_id: u8) -> Option<u8> {
-        self.lapics.iter()
+        self.lapics
+            .iter()
             .find(|l| l.id() == vcpu_id)
             .and_then(LocalApic::pending_vector)
     }
@@ -148,8 +154,8 @@ impl InterruptController {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::lapic::LAPIC_SVR;
+    use super::*;
 
     fn make_controller(n: u8) -> InterruptController {
         let mut ctrl = InterruptController::new(n);
@@ -170,7 +176,7 @@ mod tests {
         let mut ctrl = make_controller(2);
         let msg = MsiMessage {
             address: 0xFEE0_0000, // dest 0, physical
-            data: 0x30, // vector 0x30, fixed delivery
+            data: 0x30,           // vector 0x30, fixed delivery
             delivery_mode: DeliveryMode::Fixed,
         };
         ctrl.deliver_msi(&msg);

@@ -64,7 +64,6 @@ impl Priority {
     }
 }
 
-
 impl fmt::Display for Priority {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -81,8 +80,7 @@ impl fmt::Display for Priority {
 // ---------------------------------------------------------------------------
 
 /// Specifies which CPU(s) a task may run on.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum CpuAffinity {
     /// The scheduler may place the task on any CPU.
     #[default]
@@ -92,7 +90,6 @@ pub enum CpuAffinity {
     /// Pin to one of the given CPU indices (scheduler picks).
     Set(Vec<usize>),
 }
-
 
 // ---------------------------------------------------------------------------
 // Task
@@ -202,7 +199,12 @@ impl RunQueue {
     /// Push a task into the appropriate priority band.
     pub fn push(&mut self, task: Task) {
         let idx = task.priority as usize;
-        log::trace!("cpu{}: enqueue '{}' @ {}", self.cpu, task.name, task.priority);
+        log::trace!(
+            "cpu{}: enqueue '{}' @ {}",
+            self.cpu,
+            task.name,
+            task.priority
+        );
         self.queues[idx].push_back(task);
     }
 
@@ -233,7 +235,10 @@ impl RunQueue {
     /// Total number of pending tasks across all priority levels.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.queues.iter().map(std::collections::VecDeque::len).sum()
+        self.queues
+            .iter()
+            .map(std::collections::VecDeque::len)
+            .sum()
     }
 
     /// Returns `true` if there are no pending tasks.
@@ -393,7 +398,8 @@ impl BareMetalScheduler {
                         _ => {}
                     }
                 }
-                best.map(|(cpu, _)| cpu).ok_or("no valid CPU in affinity set")?
+                best.map(|(cpu, _)| cpu)
+                    .ok_or("no valid CPU in affinity set")?
             }
             CpuAffinity::Any => {
                 // Least-loaded.
@@ -475,10 +481,7 @@ impl BareMetalScheduler {
     /// Panics if a queue mutex is poisoned.
     #[must_use]
     pub fn total_pending(&self) -> usize {
-        self.queues
-            .iter()
-            .map(|q| q.lock().unwrap().len())
-            .sum()
+        self.queues.iter().map(|q| q.lock().unwrap().len()).sum()
     }
 }
 
@@ -554,7 +557,12 @@ mod tests {
         let mut rq = RunQueue::new(0);
 
         rq.push(Task::new("low", Priority::Low, CpuAffinity::Any, || {}));
-        rq.push(Task::new("crit", Priority::Critical, CpuAffinity::Any, || {}));
+        rq.push(Task::new(
+            "crit",
+            Priority::Critical,
+            CpuAffinity::Any,
+            || {},
+        ));
         rq.push(Task::new("norm", Priority::Normal, CpuAffinity::Any, || {}));
 
         assert_eq!(rq.len(), 3);
@@ -598,7 +606,12 @@ mod tests {
     #[test]
     fn runqueue_steal_prefers_low_priority() {
         let mut rq = RunQueue::new(0);
-        rq.push(Task::new("crit", Priority::Critical, CpuAffinity::Any, || {}));
+        rq.push(Task::new(
+            "crit",
+            Priority::Critical,
+            CpuAffinity::Any,
+            || {},
+        ));
         rq.push(Task::new("low", Priority::Low, CpuAffinity::Any, || {}));
 
         // Steal should take from the lowest priority first (Low before Critical).
@@ -697,7 +710,12 @@ mod tests {
         // Pre-load cpu 1 so cpu 3 should be preferred.
         for _ in 0..3 {
             sched
-                .submit(Task::new("filler", Priority::Low, CpuAffinity::Pinned(1), || {}))
+                .submit(Task::new(
+                    "filler",
+                    Priority::Low,
+                    CpuAffinity::Pinned(1),
+                    || {},
+                ))
                 .unwrap();
         }
 

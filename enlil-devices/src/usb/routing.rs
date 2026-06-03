@@ -52,9 +52,10 @@ impl DeviceMatcher {
     /// Test whether a device matches this criteria.
     pub fn matches(&self, device: &UsbDeviceId) -> bool {
         match self {
-            Self::VidPid { vendor_id, product_id } => {
-                device.vendor_id == *vendor_id && device.product_id == *product_id
-            }
+            Self::VidPid {
+                vendor_id,
+                product_id,
+            } => device.vendor_id == *vendor_id && device.product_id == *product_id,
             Self::VendorOnly { vendor_id } => device.vendor_id == *vendor_id,
             Self::PortPath(path) => device.port_path.as_deref() == Some(path.as_str()),
             Self::Serial(serial) => device.serial.as_deref() == Some(serial.as_str()),
@@ -67,7 +68,10 @@ impl DeviceMatcher {
 impl fmt::Display for DeviceMatcher {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::VidPid { vendor_id, product_id } => {
+            Self::VidPid {
+                vendor_id,
+                product_id,
+            } => {
                 write!(f, "{vendor_id:04x}:{product_id:04x}")
             }
             Self::VendorOnly { vendor_id } => write!(f, "{vendor_id:04x}:*"),
@@ -439,15 +443,28 @@ mod tests {
     fn routing_table_priority_ordering() {
         let mut table = RoutingTable::new();
         table.add_rule(10, DeviceMatcher::Any, "linux2".into());
-        table.add_rule(1, DeviceMatcher::VidPid { vendor_id: 0x046d, product_id: 0xc077 }, "linux1".into());
+        table.add_rule(
+            1,
+            DeviceMatcher::VidPid {
+                vendor_id: 0x046d,
+                product_id: 0xc077,
+            },
+            "linux1".into(),
+        );
 
         // The VID:PID rule has higher priority (lower number).
         let mouse = make_device(0x046d, 0xc077);
-        assert_eq!(table.route(&mouse), RoutingDecision::RouteToGuest("linux1".into()));
+        assert_eq!(
+            table.route(&mouse),
+            RoutingDecision::RouteToGuest("linux1".into())
+        );
 
         // Other devices fall through to the Any rule.
         let other = make_device(0x1234, 0x5678);
-        assert_eq!(table.route(&other), RoutingDecision::RouteToGuest("linux2".into()));
+        assert_eq!(
+            table.route(&other),
+            RoutingDecision::RouteToGuest("linux2".into())
+        );
     }
 
     #[test]
@@ -456,7 +473,10 @@ mod tests {
         table.set_default_guest(Some("linux1".into()));
 
         let dev = make_device(0x1234, 0x5678);
-        assert_eq!(table.route(&dev), RoutingDecision::RouteToGuest("linux1".into()));
+        assert_eq!(
+            table.route(&dev),
+            RoutingDecision::RouteToGuest("linux1".into())
+        );
     }
 
     #[test]
@@ -554,11 +574,21 @@ mod tests {
     #[test]
     fn matcher_display() {
         assert_eq!(
-            DeviceMatcher::VidPid { vendor_id: 0x046d, product_id: 0xc077 }.to_string(),
+            DeviceMatcher::VidPid {
+                vendor_id: 0x046d,
+                product_id: 0xc077
+            }
+            .to_string(),
             "046d:c077"
         );
-        assert_eq!(DeviceMatcher::VendorOnly { vendor_id: 0x046d }.to_string(), "046d:*");
-        assert_eq!(DeviceMatcher::PortPath("1-1".into()).to_string(), "port:1-1");
+        assert_eq!(
+            DeviceMatcher::VendorOnly { vendor_id: 0x046d }.to_string(),
+            "046d:*"
+        );
+        assert_eq!(
+            DeviceMatcher::PortPath("1-1".into()).to_string(),
+            "port:1-1"
+        );
         assert_eq!(DeviceMatcher::Any.to_string(), "*");
     }
 

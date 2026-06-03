@@ -7,58 +7,58 @@ use super::codec::HdaCodec;
 
 /// HDA controller MMIO register offsets (Intel HD Audio spec section 3)
 pub mod regs {
-    pub const GCAP: u32 = 0x00;      // Global Capabilities
-    pub const VMIN: u32 = 0x02;      // Minor Version
-    pub const VMAJ: u32 = 0x03;      // Major Version
-    pub const OUTPAY: u32 = 0x04;    // Output Payload Capability
-    pub const INPAY: u32 = 0x06;     // Input Payload Capability
-    pub const GCTL: u32 = 0x08;      // Global Control
-    pub const WAKEEN: u32 = 0x0C;    // Wake Enable
-    pub const STATESTS: u32 = 0x0E;  // State Change Status
-    pub const GSTS: u32 = 0x10;      // Global Status
-    pub const INTCTL: u32 = 0x20;    // Interrupt Control
-    pub const INTSTS: u32 = 0x24;    // Interrupt Status
-    pub const WALCLK: u32 = 0x30;    // Wall Clock Counter
-    pub const SSYNC: u32 = 0x38;     // Stream Synchronization
+    pub const GCAP: u32 = 0x00; // Global Capabilities
+    pub const VMIN: u32 = 0x02; // Minor Version
+    pub const VMAJ: u32 = 0x03; // Major Version
+    pub const OUTPAY: u32 = 0x04; // Output Payload Capability
+    pub const INPAY: u32 = 0x06; // Input Payload Capability
+    pub const GCTL: u32 = 0x08; // Global Control
+    pub const WAKEEN: u32 = 0x0C; // Wake Enable
+    pub const STATESTS: u32 = 0x0E; // State Change Status
+    pub const GSTS: u32 = 0x10; // Global Status
+    pub const INTCTL: u32 = 0x20; // Interrupt Control
+    pub const INTSTS: u32 = 0x24; // Interrupt Status
+    pub const WALCLK: u32 = 0x30; // Wall Clock Counter
+    pub const SSYNC: u32 = 0x38; // Stream Synchronization
 
     // CORB (Command Output Ring Buffer)
     pub const CORBLBASE: u32 = 0x40;
     pub const CORBUBASE: u32 = 0x44;
-    pub const CORBWP: u32 = 0x48;    // Write Pointer
-    pub const CORBRP: u32 = 0x4A;    // Read Pointer
-    pub const CORBCTL: u32 = 0x4C;   // Control
-    pub const CORBSTS: u32 = 0x4D;   // Status
-    pub const CORBSIZE: u32 = 0x4E;  // Size
+    pub const CORBWP: u32 = 0x48; // Write Pointer
+    pub const CORBRP: u32 = 0x4A; // Read Pointer
+    pub const CORBCTL: u32 = 0x4C; // Control
+    pub const CORBSTS: u32 = 0x4D; // Status
+    pub const CORBSIZE: u32 = 0x4E; // Size
 
     // RIRB (Response Input Ring Buffer)
     pub const RIRBLBASE: u32 = 0x50;
     pub const RIRBUBASE: u32 = 0x54;
-    pub const RIRBWP: u32 = 0x58;    // Write Pointer
-    pub const RINTCNT: u32 = 0x5A;   // Response Interrupt Count
-    pub const RIRBCTL: u32 = 0x5C;   // Control
-    pub const RIRBSTS: u32 = 0x5D;   // Status
-    pub const RIRBSIZE: u32 = 0x5E;  // Size
+    pub const RIRBWP: u32 = 0x58; // Write Pointer
+    pub const RINTCNT: u32 = 0x5A; // Response Interrupt Count
+    pub const RIRBCTL: u32 = 0x5C; // Control
+    pub const RIRBSTS: u32 = 0x5D; // Status
+    pub const RIRBSIZE: u32 = 0x5E; // Size
 
     // Immediate Command
-    pub const IC: u32 = 0x60;        // Immediate Command
-    pub const IR: u32 = 0x64;        // Immediate Response
-    pub const ICS: u32 = 0x68;       // Immediate Command Status
+    pub const IC: u32 = 0x60; // Immediate Command
+    pub const IR: u32 = 0x64; // Immediate Response
+    pub const ICS: u32 = 0x68; // Immediate Command Status
 
     // Stream Descriptor base (first output stream)
     pub const SD0_BASE: u32 = 0x80;
-    pub const SD_SIZE: u32 = 0x20;   // Each stream descriptor is 0x20 bytes
+    pub const SD_SIZE: u32 = 0x20; // Each stream descriptor is 0x20 bytes
 }
 
 /// Stream descriptor register offsets (relative to stream base)
 pub mod sd_regs {
-    pub const CTL: u32 = 0x00;   // Stream Descriptor Control (3 bytes)
-    pub const STS: u32 = 0x03;   // Status
-    pub const LPIB: u32 = 0x04;  // Link Position in Buffer
-    pub const CBL: u32 = 0x08;   // Cyclic Buffer Length
-    pub const LVI: u32 = 0x0C;   // Last Valid Index
-    pub const FMT: u32 = 0x12;   // Format
-    pub const BDPL: u32 = 0x18;  // BDL Pointer Lower
-    pub const BDPU: u32 = 0x1C;  // BDL Pointer Upper
+    pub const CTL: u32 = 0x00; // Stream Descriptor Control (3 bytes)
+    pub const STS: u32 = 0x03; // Status
+    pub const LPIB: u32 = 0x04; // Link Position in Buffer
+    pub const CBL: u32 = 0x08; // Cyclic Buffer Length
+    pub const LVI: u32 = 0x0C; // Last Valid Index
+    pub const FMT: u32 = 0x12; // Format
+    pub const BDPL: u32 = 0x18; // BDL Pointer Lower
+    pub const BDPU: u32 = 0x1C; // BDL Pointer Upper
 }
 
 /// Number of output streams
@@ -133,9 +133,8 @@ impl HdaController {
     #[must_use]
     pub fn new() -> Self {
         // GCAP: 4 output streams, 4 input streams, 64-bit addressing, serial bus number 0
-        let gcap: u16 = ((NUM_OUTPUT_STREAMS as u16) << 12)
-            | ((NUM_INPUT_STREAMS as u16) << 8)
-            | 0x01; // 64-bit
+        let gcap: u16 =
+            ((NUM_OUTPUT_STREAMS as u16) << 12) | ((NUM_INPUT_STREAMS as u16) << 8) | 0x01; // 64-bit
 
         Self {
             gcap,
@@ -218,9 +217,7 @@ impl HdaController {
             regs::ICS => u64::from(self.ics),
 
             // Stream descriptors
-            o if o >= regs::SD0_BASE => {
-                self.read_stream_descriptor(o)
-            }
+            o if o >= regs::SD0_BASE => self.read_stream_descriptor(o),
 
             _ => 0,
         }
@@ -258,7 +255,8 @@ impl HdaController {
                 self.corb_base = (self.corb_base & 0xFFFF_FFFF_0000_0000) | (value & 0xFFFF_FFFF);
             }
             regs::CORBUBASE => {
-                self.corb_base = (self.corb_base & 0x0000_0000_FFFF_FFFF) | ((value & 0xFFFF_FFFF) << 32);
+                self.corb_base =
+                    (self.corb_base & 0x0000_0000_FFFF_FFFF) | ((value & 0xFFFF_FFFF) << 32);
             }
             regs::CORBWP => self.corb_wp = value as u16,
             regs::CORBRP => {
@@ -277,7 +275,8 @@ impl HdaController {
                 self.rirb_base = (self.rirb_base & 0xFFFF_FFFF_0000_0000) | (value & 0xFFFF_FFFF);
             }
             regs::RIRBUBASE => {
-                self.rirb_base = (self.rirb_base & 0x0000_0000_FFFF_FFFF) | ((value & 0xFFFF_FFFF) << 32);
+                self.rirb_base =
+                    (self.rirb_base & 0x0000_0000_FFFF_FFFF) | ((value & 0xFFFF_FFFF) << 32);
             }
             regs::RIRBWP => {
                 // Bit 15: reset write pointer

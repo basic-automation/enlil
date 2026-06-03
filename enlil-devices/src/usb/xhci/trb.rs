@@ -35,7 +35,6 @@ impl Trb {
         }
     }
 
-
     /// Create a TRB with the given type and all other fields zeroed.
     #[must_use]
     pub fn new(trb_type: TrbType) -> Self {
@@ -384,22 +383,34 @@ impl CommandTrb {
                 trb.set_trb_type(TrbType::DisableSlotCommand);
                 trb.control |= u32::from(*slot_id) << 24;
             }
-            Self::AddressDevice { slot_id, input_context_ptr } => {
+            Self::AddressDevice {
+                slot_id,
+                input_context_ptr,
+            } => {
                 trb.set_trb_type(TrbType::AddressDeviceCommand);
                 trb.parameter = *input_context_ptr;
                 trb.control |= u32::from(*slot_id) << 24;
             }
-            Self::ConfigureEndpoint { slot_id, input_context_ptr } => {
+            Self::ConfigureEndpoint {
+                slot_id,
+                input_context_ptr,
+            } => {
                 trb.set_trb_type(TrbType::ConfigureEndpointCommand);
                 trb.parameter = *input_context_ptr;
                 trb.control |= u32::from(*slot_id) << 24;
             }
-            Self::ResetEndpoint { slot_id, endpoint_id } => {
+            Self::ResetEndpoint {
+                slot_id,
+                endpoint_id,
+            } => {
                 trb.set_trb_type(TrbType::ResetEndpointCommand);
                 trb.control |= u32::from(*slot_id) << 24;
                 trb.control |= u32::from(*endpoint_id) << 16;
             }
-            Self::StopEndpoint { slot_id, endpoint_id } => {
+            Self::StopEndpoint {
+                slot_id,
+                endpoint_id,
+            } => {
                 trb.set_trb_type(TrbType::StopEndpointCommand);
                 trb.control |= u32::from(*slot_id) << 24;
                 trb.control |= u32::from(*endpoint_id) << 16;
@@ -451,8 +462,7 @@ impl EventTrb {
             } => {
                 trb.set_trb_type(TrbType::TransferEvent);
                 trb.parameter = *trb_pointer;
-                trb.status = (*transfer_length & 0x00FF_FFFF)
-                    | ((*completion_code as u32) << 24);
+                trb.status = (*transfer_length & 0x00FF_FFFF) | ((*completion_code as u32) << 24);
                 trb.control |= u32::from(*slot_id) << 24;
                 trb.control |= u32::from(*endpoint_id) << 16;
             }
@@ -598,7 +608,11 @@ mod tests {
         let trb = event.to_trb(true);
         let decoded = EventTrb::from_trb(&trb).unwrap();
         match decoded {
-            EventTrb::CommandCompletion { command_trb_pointer, completion_code, slot_id } => {
+            EventTrb::CommandCompletion {
+                command_trb_pointer,
+                completion_code,
+                slot_id,
+            } => {
                 assert_eq!(command_trb_pointer, 0x2000);
                 assert_eq!(completion_code, TrbCompletionCode::Success);
                 assert_eq!(slot_id, 3);

@@ -112,8 +112,7 @@ impl EventRing {
     ) -> bool {
         let mut trb = Trb::zeroed();
         trb.parameter = trb_pointer;
-        trb.status = (transfer_length & 0xFF_FFFF)
-            | ((completion_code as u32) << 24);
+        trb.status = (transfer_length & 0xFF_FFFF) | ((completion_code as u32) << 24);
         trb.control = (u32::from(slot_id) << 24)
             | (u32::from(endpoint_id) << 16)
             | ((TrbType::TransferEvent as u32) << 10);
@@ -130,13 +129,16 @@ impl EventRing {
         let mut trb = Trb::zeroed();
         trb.parameter = trb_pointer;
         trb.status = (completion_code as u32) << 24;
-        trb.control = (u32::from(slot_id) << 24)
-            | ((TrbType::CommandCompletionEvent as u32) << 10);
+        trb.control = (u32::from(slot_id) << 24) | ((TrbType::CommandCompletionEvent as u32) << 10);
         self.post_event(trb)
     }
 
     /// Post a port status change event.
-    pub fn post_port_status_change(&mut self, port_id: u8, completion_code: TrbCompletionCode) -> bool {
+    pub fn post_port_status_change(
+        &mut self,
+        port_id: u8,
+        completion_code: TrbCompletionCode,
+    ) -> bool {
         let mut trb = Trb::zeroed();
         trb.parameter = u64::from(port_id) << 24;
         trb.status = (completion_code as u32) << 24;
@@ -395,13 +397,7 @@ mod tests {
     #[test]
     fn post_transfer_event() {
         let mut ring = EventRing::new(16);
-        assert!(ring.post_transfer_event(
-            0x1000,
-            512,
-            TrbCompletionCode::Success,
-            1,
-            2,
-        ));
+        assert!(ring.post_transfer_event(0x1000, 512, TrbCompletionCode::Success, 1, 2,));
         assert_eq!(ring.pending_count(), 1);
     }
 

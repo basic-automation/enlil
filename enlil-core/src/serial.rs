@@ -163,11 +163,7 @@ impl SerialOutput {
                             let _ = writeln!(f, "{}{}", self.prefix, line);
                         } else {
                             // Lazy-open the file.
-                            match OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(path)
-                            {
+                            match OpenOptions::new().create(true).append(true).open(path) {
                                 Ok(mut f) => {
                                     let line = String::from_utf8_lossy(&self.line_buf);
                                     let _ = writeln!(f, "{}{}", self.prefix, line);
@@ -441,10 +437,13 @@ impl SerialMultiplexer {
     ///
     /// `offset` is 0–7 relative to the guest's COM base port.
     pub fn handle_read(&mut self, guest_id: &str, offset: u16) -> u8 {
-        self.guests.get_mut(guest_id).map_or_else(|| {
-            log::warn!("serial: read from unknown guest '{guest_id}'");
-            0xFF
-        }, |uart| uart.read_register(offset))
+        self.guests.get_mut(guest_id).map_or_else(
+            || {
+                log::warn!("serial: read from unknown guest '{guest_id}'");
+                0xFF
+            },
+            |uart| uart.read_register(offset),
+        )
     }
 
     /// Inject input bytes into a guest's RX FIFO.
@@ -647,7 +646,7 @@ mod tests {
 
         // Set DLAB.
         uart.write_register(LCR_REG, 0x83); // 8N1 + DLAB
-        // Write divisor low and high.
+                                            // Write divisor low and high.
         uart.write_register(DATA_REG, 0x01); // low byte
         uart.write_register(IER_REG, 0x00); // high byte
         assert_eq!(uart.divisor, 0x0001); // 115200 baud

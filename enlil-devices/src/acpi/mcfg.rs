@@ -126,7 +126,7 @@ mod tests {
     #[test]
     fn mcfg_bus_range() {
         let mcfg = McfgBuilder::standard(0xB000_0000).build();
-        assert_eq!(mcfg[54], 0);   // start bus
+        assert_eq!(mcfg[54], 0); // start bus
         assert_eq!(mcfg[55], 255); // end bus
     }
 }

@@ -301,7 +301,7 @@ mod tests {
 
         ctrl.write_command(0x60); // Write config
         ctrl.write_data(0x47);
-        
+
         ctrl.write_command(0x20);
         assert_eq!(ctrl.read_data(), 0x47);
     }
@@ -340,8 +340,11 @@ mod tests {
     fn mouse_write_via_d4() {
         let mut ctrl = I8042Controller::new();
         ctrl.write_command(0xD4); // Write to mouse
-        ctrl.write_data(0xFF);   // Reset command
+        ctrl.write_data(0xFF); // Reset command
         // Mouse should respond with ACK
-        assert_eq!(ctrl.read_status() & STATUS_MOUSE_OUTPUT, STATUS_MOUSE_OUTPUT);
+        assert_eq!(
+            ctrl.read_status() & STATUS_MOUSE_OUTPUT,
+            STATUS_MOUSE_OUTPUT
+        );
     }
 }

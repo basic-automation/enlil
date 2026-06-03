@@ -74,7 +74,11 @@ pub struct PciBdf {
 impl PciBdf {
     #[must_use]
     pub const fn new(bus: u8, device: u8, function: u8) -> Self {
-        Self { bus, device, function }
+        Self {
+            bus,
+            device,
+            function,
+        }
     }
 
     /// Convert BDF to ECAM offset
@@ -156,7 +160,12 @@ impl PciConfigSpace {
     pub fn read_u32(&self, offset: u16) -> u32 {
         let o = offset as usize;
         if o + 3 < self.data.len() {
-            u32::from_le_bytes([self.data[o], self.data[o+1], self.data[o+2], self.data[o+3]])
+            u32::from_le_bytes([
+                self.data[o],
+                self.data[o + 1],
+                self.data[o + 2],
+                self.data[o + 3],
+            ])
         } else {
             0xFFFF_FFFF
         }
@@ -184,7 +193,7 @@ impl PciConfigSpace {
         let bytes = value.to_le_bytes();
         let o = offset as usize;
         if o + 3 < self.data.len() {
-            self.data[o..o+4].copy_from_slice(&bytes);
+            self.data[o..o + 4].copy_from_slice(&bytes);
         }
     }
 

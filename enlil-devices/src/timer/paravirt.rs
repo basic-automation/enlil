@@ -77,7 +77,8 @@ impl KvmClock {
         // We want: mul / 2^shift = 10^9 / tsc_freq
         // Choose shift = 32 for good precision
         let shift: i8 = 32;
-        let mul = ((1_000_000_000u128) << u32::from(shift.unsigned_abs())) / u128::from(self.tsc_freq_hz);
+        let mul =
+            ((1_000_000_000u128) << u32::from(shift.unsigned_abs())) / u128::from(self.tsc_freq_hz);
         #[allow(clippy::cast_possible_truncation)]
         {
             (mul as u32, shift)

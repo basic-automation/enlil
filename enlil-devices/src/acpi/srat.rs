@@ -64,7 +64,13 @@ pub struct MemoryAffinityEntry {
 impl MemoryAffinityEntry {
     /// Create entry for a memory range in the given proximity domain
     #[must_use]
-    pub fn new(proximity_domain: u32, base_address: u64, length: u64, enabled: bool, hot_pluggable: bool) -> Self {
+    pub fn new(
+        proximity_domain: u32,
+        base_address: u64,
+        length: u64,
+        enabled: bool,
+        hot_pluggable: bool,
+    ) -> Self {
         let mut flags = 0u32;
         if enabled {
             flags |= 1;
@@ -141,13 +147,13 @@ impl SratBuilder {
     pub fn single_node(vcpu_count: u8, memory_size: u64) -> Self {
         let mut builder = Self::new();
         for i in 0..vcpu_count {
-            builder.processor_entries.push(
-                ProcessorAffinityEntry::new(i, 0, true),
-            );
+            builder
+                .processor_entries
+                .push(ProcessorAffinityEntry::new(i, 0, true));
         }
-        builder.memory_entries.push(
-            MemoryAffinityEntry::new(0, 0, memory_size, true, false),
-        );
+        builder
+            .memory_entries
+            .push(MemoryAffinityEntry::new(0, 0, memory_size, true, false));
         builder
     }
 

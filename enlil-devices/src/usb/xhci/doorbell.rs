@@ -23,7 +23,11 @@ pub enum DoorbellTarget {
     /// A specific endpoint for a device slot.
     Endpoint { slot_id: u8, endpoint_id: u8 },
     /// Stream transfer ring for a device endpoint.
-    Stream { slot_id: u8, endpoint_id: u8, stream_id: u16 },
+    Stream {
+        slot_id: u8,
+        endpoint_id: u8,
+        stream_id: u16,
+    },
 }
 
 impl DoorbellTarget {
@@ -46,9 +50,16 @@ impl DoorbellTarget {
         if target == 0 {
             Self::ControlEndpoint { slot_id }
         } else if stream_id != 0 {
-            Self::Stream { slot_id, endpoint_id: target, stream_id }
+            Self::Stream {
+                slot_id,
+                endpoint_id: target,
+                stream_id,
+            }
         } else {
-            Self::Endpoint { slot_id, endpoint_id: target }
+            Self::Endpoint {
+                slot_id,
+                endpoint_id: target,
+            }
         }
     }
 }
@@ -58,10 +69,17 @@ impl fmt::Display for DoorbellTarget {
         match self {
             Self::HostCommand => write!(f, "HC Command Ring"),
             Self::ControlEndpoint { slot_id } => write!(f, "Slot {slot_id} EP0"),
-            Self::Endpoint { slot_id, endpoint_id } => {
+            Self::Endpoint {
+                slot_id,
+                endpoint_id,
+            } => {
                 write!(f, "Slot {slot_id} EP{endpoint_id}")
             }
-            Self::Stream { slot_id, endpoint_id, stream_id } => {
+            Self::Stream {
+                slot_id,
+                endpoint_id,
+                stream_id,
+            } => {
                 write!(f, "Slot {slot_id} EP{endpoint_id} Stream {stream_id}")
             }
         }
@@ -124,7 +142,10 @@ impl DoorbellArray {
     /// Check if a specific doorbell has been rung since last clear.
     #[must_use]
     pub fn is_pending(&self, index: u8) -> bool {
-        self.pending.get(usize::from(index)).copied().unwrap_or(false)
+        self.pending
+            .get(usize::from(index))
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Clear the pending state for a doorbell.
@@ -190,7 +211,13 @@ mod tests {
     fn decode_endpoint() {
         // Endpoint ID 3 on slot 2, no stream
         let target = DoorbellTarget::decode(2, 3);
-        assert_eq!(target, DoorbellTarget::Endpoint { slot_id: 2, endpoint_id: 3 });
+        assert_eq!(
+            target,
+            DoorbellTarget::Endpoint {
+                slot_id: 2,
+                endpoint_id: 3
+            }
+        );
     }
 
     #[test]
@@ -200,7 +227,11 @@ mod tests {
         let target = DoorbellTarget::decode(1, value);
         assert_eq!(
             target,
-            DoorbellTarget::Stream { slot_id: 1, endpoint_id: 4, stream_id: 7 }
+            DoorbellTarget::Stream {
+                slot_id: 1,
+                endpoint_id: 4,
+                stream_id: 7
+            }
         );
     }
 
@@ -241,7 +272,13 @@ mod tests {
         let targets = db.drain_pending();
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[0], DoorbellTarget::HostCommand);
-        assert_eq!(targets[1], DoorbellTarget::Endpoint { slot_id: 2, endpoint_id: 3 });
+        assert_eq!(
+            targets[1],
+            DoorbellTarget::Endpoint {
+                slot_id: 2,
+                endpoint_id: 3
+            }
+        );
 
         // All cleared now
         assert!(!db.is_pending(0));
@@ -262,7 +299,11 @@ mod tests {
     fn target_display() {
         assert_eq!(DoorbellTarget::HostCommand.to_string(), "HC Command Ring");
         assert_eq!(
-            DoorbellTarget::Endpoint { slot_id: 1, endpoint_id: 3 }.to_string(),
+            DoorbellTarget::Endpoint {
+                slot_id: 1,
+                endpoint_id: 3
+            }
+            .to_string(),
             "Slot 1 EP3"
         );
     }

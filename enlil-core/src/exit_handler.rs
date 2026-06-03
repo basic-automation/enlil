@@ -5,7 +5,7 @@
 pub fn handle_exit(_exit_reason: u32, _rip: u64) -> bool {
     // Handle various exit reasons
     // This will be expanded as we implement specific exit handlers
-    
+
     match _exit_reason {
         // IO_INSTRUCTION = 30
         30 => {

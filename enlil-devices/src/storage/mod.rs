@@ -100,7 +100,10 @@ impl MemoryBackend {
 impl StorageBackend for MemoryBackend {
     #[allow(clippy::cast_possible_truncation)]
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        let data = self.data.read().map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let data = self
+            .data
+            .read()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         let offset = offset as usize;
         if offset >= data.len() {
             return Ok(0);
@@ -117,7 +120,10 @@ impl StorageBackend for MemoryBackend {
         if self.readonly {
             anyhow::bail!("backend is read-only");
         }
-        let mut data = self.data.write().map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let mut data = self
+            .data
+            .write()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         let offset = offset as usize;
         if offset >= data.len() {
             return Ok(0);
@@ -138,7 +144,10 @@ impl StorageBackend for MemoryBackend {
         if self.readonly {
             anyhow::bail!("backend is read-only");
         }
-        let mut data = self.data.write().map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let mut data = self
+            .data
+            .write()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         let start = (offset as usize).min(data.len());
         let end = ((offset + len) as usize).min(data.len());
         data[start..end].fill(0);

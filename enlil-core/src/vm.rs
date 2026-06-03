@@ -133,8 +133,7 @@ impl Vm {
             return Err(Error::Memory("guest memory must be > 0".into()));
         }
 
-        let vcpu_manager =
-            VcpuManager::new(&config.name, &config.cpus, config.scheduling);
+        let vcpu_manager = VcpuManager::new(&config.name, &config.cpus, config.scheduling);
 
         Ok(Self {
             config,
@@ -222,12 +221,8 @@ mod tests {
         // 16 GB host, 512 MB reserved
         let mut hv = Hypervisor::new(16 * 1024 * 1024 * 1024, 512 * 1024 * 1024);
 
-        let idx0 = hv
-            .add_vm(test_config("vm1", vec![0, 1], 4096))
-            .unwrap();
-        let idx1 = hv
-            .add_vm(test_config("vm2", vec![2, 3], 4096))
-            .unwrap();
+        let idx0 = hv.add_vm(test_config("vm1", vec![0, 1], 4096)).unwrap();
+        let idx1 = hv.add_vm(test_config("vm2", vec![2, 3], 4096)).unwrap();
 
         assert_eq!(hv.vm_count(), 2);
         assert_eq!(hv.vm(idx0).unwrap().name(), "vm1");

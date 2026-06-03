@@ -55,7 +55,9 @@ impl TapBackend {
         let ret = unsafe { libc::ioctl(fd, TUNSETIFF as _, ifr.as_mut_ptr()) };
         if ret < 0 {
             let err = io::Error::last_os_error();
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
             return Err(err);
         }
 
@@ -106,7 +108,9 @@ impl TapBackend {
         // SIOCBRADDIF = 0x89a2
         const SIOCBRADDIF: libc::c_ulong = 0x89a2;
         let ret = unsafe { libc::ioctl(sock, SIOCBRADDIF as _, ifr.as_mut_ptr()) };
-        unsafe { libc::close(sock); }
+        unsafe {
+            libc::close(sock);
+        }
 
         if ret < 0 {
             return Err(io::Error::last_os_error());
@@ -144,7 +148,9 @@ impl TapBackend {
         let ret = unsafe { libc::ioctl(sock, SIOCGIFFLAGS as _, ifr.as_mut_ptr()) };
         if ret < 0 {
             let err = io::Error::last_os_error();
-            unsafe { libc::close(sock); }
+            unsafe {
+                libc::close(sock);
+            }
             return Err(err);
         }
 
@@ -154,7 +160,9 @@ impl TapBackend {
         ifr[16..18].copy_from_slice(&flags.to_le_bytes());
 
         let ret = unsafe { libc::ioctl(sock, SIOCSIFFLAGS as _, ifr.as_mut_ptr()) };
-        unsafe { libc::close(sock); }
+        unsafe {
+            libc::close(sock);
+        }
 
         if ret < 0 {
             return Err(io::Error::last_os_error());
@@ -182,9 +190,8 @@ impl TapBackend {
 
 impl NetBackend for TapBackend {
     fn send(&mut self, frame: &[u8]) -> io::Result<usize> {
-        let ret = unsafe {
-            libc::write(self.fd, frame.as_ptr().cast::<libc::c_void>(), frame.len())
-        };
+        let ret =
+            unsafe { libc::write(self.fd, frame.as_ptr().cast::<libc::c_void>(), frame.len()) };
         if ret < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock {
@@ -197,9 +204,8 @@ impl NetBackend for TapBackend {
     }
 
     fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let ret = unsafe {
-            libc::read(self.fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len())
-        };
+        let ret =
+            unsafe { libc::read(self.fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
         if ret < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock {
@@ -235,7 +241,9 @@ impl AsRawFd for TapBackend {
 
 impl Drop for TapBackend {
     fn drop(&mut self) {
-        unsafe { libc::close(self.fd); }
+        unsafe {
+            libc::close(self.fd);
+        }
         log::debug!("TAP device {} closed", self.name);
     }
 }
