@@ -24,3 +24,4 @@ vm-memory = { version = "0.16", features = ["backend-mmap"] }
 vm-device = "0.1"
 vm-superio = "0.8"
 vmm-sys-util = "0.12"
+libc = "0.2"

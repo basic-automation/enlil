@@ -4,6 +4,7 @@
 //! monotonic clock starting from zero at boot, regardless of when
 //! the vCPU was actually created on the host.
 
+use crate::truncate::Widen;
 /// Per-vCPU TSC configuration.
 #[derive(Debug, Clone)]
 pub struct TscState {
@@ -52,7 +53,11 @@ impl TscManager {
     /// * `vcpu_count` - Number of vCPUs.
     #[must_use]
     pub fn new(host_freq: u64, guest_freq: u64, vcpu_count: usize) -> Self {
-        let guest_freq = if guest_freq == 0 { host_freq } else { guest_freq };
+        let guest_freq = if guest_freq == 0 {
+            host_freq
+        } else {
+            guest_freq
+        };
         let needs_scaling = guest_freq != host_freq;
 
         // Calculate scaling ratio in 48.16 fixed point
@@ -68,8 +73,7 @@ impl TscManager {
         let vcpu_states = (0..vcpu_count)
             .map(|_| TscState {
                 // Offset so guest sees TSC starting near 0
-                #[allow(clippy::cast_possible_wrap)]
-                offset: -(creation_tsc as i64),
+                offset: -(creation_tsc.cast_signed()),
                 frequency_hz: guest_freq,
                 scaling_enabled: needs_scaling,
                 scaling_ratio: u64::try_from(ratio).unwrap_or(u64::MAX),
@@ -98,9 +102,7 @@ impl TscManager {
     /// Compute the VMCS `TSC_OFFSET` value for a vCPU.
     #[must_use]
     pub fn vmcs_tsc_offset(&self, vcpu_id: usize) -> i64 {
-        self.vcpu_states
-            .get(vcpu_id)
-            .map_or(0, |s| s.offset)
+        self.vcpu_states.get(vcpu_id).map_or(0, |s| s.offset)
     }
 
     /// Compute what TSC value the guest would see right now.
@@ -112,23 +114,10 @@ impl TscManager {
         };
 
         if state.scaling_enabled {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             let scaled = ((u128::from(host_tsc)) * (u128::from(state.scaling_ratio))) >> 16;
-            #[allow(
-                clippy::cast_possible_wrap,
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss
-            )]
-            return (scaled as i64 + state.offset) as u64;
+            return (scaled.to_u64().cast_signed() + state.offset).cast_unsigned();
         }
-        #[allow(
-            clippy::cast_possible_wrap,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss
-        )]
-        {
-            (host_tsc as i64 + state.offset) as u64
-        }
+        (host_tsc.cast_signed() + state.offset).cast_unsigned()
     }
 
     /// Synchronize a vCPU's TSC to a specific value (used after migration).
@@ -136,16 +125,13 @@ impl TscManager {
         let host_tsc = Self::read_host_tsc();
         if let Some(state) = self.vcpu_states.get_mut(vcpu_id) {
             if state.scaling_enabled {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                 let scaled = ((u128::from(host_tsc)) * (u128::from(state.scaling_ratio))) >> 16;
-                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                 {
-                    state.offset = guest_tsc as i64 - scaled as i64;
+                    state.offset = guest_tsc.cast_signed() - scaled.to_u64().cast_signed();
                 }
             } else {
-                #[allow(clippy::cast_possible_wrap)]
                 {
-                    state.offset = guest_tsc as i64 - host_tsc as i64;
+                    state.offset = guest_tsc.cast_signed() - host_tsc.cast_signed();
                 }
             }
         }
@@ -178,9 +164,7 @@ impl TscManager {
     /// Read the host TSC.
     #[cfg(target_arch = "x86_64")]
     fn read_host_tsc() -> u64 {
-        unsafe {
-            core::arch::x86_64::_rdtsc()
-        }
+        unsafe { core::arch::x86_64::_rdtsc() }
     }
 
     #[cfg(not(target_arch = "x86_64"))]
@@ -192,10 +176,7 @@ impl TscManager {
             .unwrap_or_default()
             .as_nanos();
         // Simulate ~3GHz TSC
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            (nanos * 3 / 1_000_000_000) as u64
-        }
+        { (nanos * 3 / 1_000_000_000) as u64 }
     }
 }
 
@@ -226,8 +207,7 @@ mod tests {
         let state = mgr.vcpu_state(0).unwrap();
         assert!(state.scaling_enabled);
         // Ratio should be ~0.667 in 48.16 = ~43690
-        #[allow(clippy::cast_possible_truncation)]
-        let expected_ratio: u64 = (((2_000_000_000u128) << 16) / 3_000_000_000u128) as u64;
+        let expected_ratio: u64 = (((2_000_000_000u128) << 16) / 3_000_000_000u128).to_u64();
         assert_eq!(state.scaling_ratio, expected_ratio);
     }
 

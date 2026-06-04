@@ -38,8 +38,7 @@ pub use device::{UsbClass, UsbDevice, UsbDeviceId, UsbDeviceState, UsbSpeed};
 pub use monitor::{UsbHotplugEvent, UsbMonitor};
 pub use routing::{RoutingRule, RoutingState, RoutingTable};
 pub use xhci::{
-    DoorbellArray, DoorbellTarget, EventRing, InterrupterRegisterSet,
-    CapabilityRegisters, OperationalRegisters, PortRegisterSet, PortState, RuntimeRegisters,
-    CommandRing, TransferRing, TrbRing,
-    CommandTrb, EventTrb, NormalTrb, Trb, TrbCompletionCode, TrbType,
+    CapabilityRegisters, CommandRing, CommandTrb, DoorbellArray, DoorbellTarget, EventRing,
+    EventTrb, InterrupterRegisterSet, NormalTrb, OperationalRegisters, PortRegisterSet, PortState,
+    RuntimeRegisters, TransferRing, Trb, TrbCompletionCode, TrbRing, TrbType,
 };

@@ -115,8 +115,7 @@ impl BuddyAllocator {
         }
 
         // Find a free block at the required order or higher.
-        let found_order = (order..=Self::MAX_ORDER)
-            .find(|&o| !self.free_lists[o].is_empty())?;
+        let found_order = (order..=Self::MAX_ORDER).find(|&o| !self.free_lists[o].is_empty())?;
 
         let block = self.free_lists[found_order].pop()?;
 
@@ -126,7 +125,9 @@ impl BuddyAllocator {
             self.free_lists[o].push(buddy);
         }
 
-        STATS.allocated.fetch_add(Self::MIN_BLOCK_SIZE << order, Ordering::Relaxed);
+        STATS
+            .allocated
+            .fetch_add(Self::MIN_BLOCK_SIZE << order, Ordering::Relaxed);
         STATS.alloc_count.fetch_add(1, Ordering::Relaxed);
 
         Some(block as *mut u8)
@@ -157,7 +158,9 @@ impl BuddyAllocator {
         }
 
         self.free_lists[current_order].push(addr);
-        STATS.allocated.fetch_sub(Self::MIN_BLOCK_SIZE << order, Ordering::Relaxed);
+        STATS
+            .allocated
+            .fetch_sub(Self::MIN_BLOCK_SIZE << order, Ordering::Relaxed);
         STATS.dealloc_count.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -240,7 +243,9 @@ impl SlabCache {
         }
         let ptr = self.free_list.pop()?;
         STATS.alloc_count.fetch_add(1, Ordering::Relaxed);
-        STATS.allocated.fetch_add(self.object_size, Ordering::Relaxed);
+        STATS
+            .allocated
+            .fetch_add(self.object_size, Ordering::Relaxed);
         Some(ptr)
     }
 
@@ -248,7 +253,9 @@ impl SlabCache {
     pub fn free(&mut self, ptr: *mut u8) {
         self.free_list.push(ptr);
         STATS.dealloc_count.fetch_add(1, Ordering::Relaxed);
-        STATS.allocated.fetch_sub(self.object_size, Ordering::Relaxed);
+        STATS
+            .allocated
+            .fetch_sub(self.object_size, Ordering::Relaxed);
     }
 
     /// Grow the slab by allocating a new page and carving it into objects.
@@ -634,7 +641,8 @@ impl BitmapFrameAllocator {
     ///
     /// Panics if the frame is outside the managed region.
     pub fn deallocate_frame(&mut self, frame: PhysFrame) {
-        let frame_idx = usize::try_from(frame.number() - self.base_frame).expect("frame index exceeds usize");
+        let frame_idx =
+            usize::try_from(frame.number() - self.base_frame).expect("frame index exceeds usize");
         assert!(
             frame_idx < self.total_frames,
             "frame outside managed region"
@@ -669,7 +677,8 @@ impl BitmapFrameAllocator {
     /// Panics if the frame index cannot be represented as a `usize`.
     #[must_use]
     pub fn is_allocated(&self, frame: PhysFrame) -> bool {
-        let frame_idx = usize::try_from(frame.number() - self.base_frame).expect("frame index exceeds usize");
+        let frame_idx =
+            usize::try_from(frame.number() - self.base_frame).expect("frame index exceeds usize");
         if frame_idx >= self.total_frames {
             return false;
         }
@@ -885,8 +894,7 @@ mod tests {
     #[test]
     fn bitmap_allocator_exhaustion() {
         let num_frames = 4;
-        let mut alloc =
-            BitmapFrameAllocator::new(PhysAddr::new(0x20_0000), num_frames * 4096);
+        let mut alloc = BitmapFrameAllocator::new(PhysAddr::new(0x20_0000), num_frames * 4096);
         assert_eq!(alloc.total_frames(), num_frames);
         assert_eq!(alloc.free_frames(), num_frames);
 

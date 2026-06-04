@@ -1,12 +1,13 @@
 //! PCI Express root complex and configuration space emulation
 //!
-//! Provides a virtual PCIe root complex for guest VMs. Windows expects
+//! Provides a virtual `PCIe` root complex for guest VMs. Windows expects
 //! a PCI Express bus with ECAM (Enhanced Configuration Access Mechanism)
 //! for device enumeration.
 
+use crate::truncate::{u8_of, u16_of};
 /// PCI configuration space size per function
 pub const PCI_CONFIG_SPACE_SIZE: usize = 256;
-/// PCIe extended configuration space size per function
+/// `PCIe` extended configuration space size per function
 pub const PCIE_CONFIG_SPACE_SIZE: usize = 4096;
 /// ECAM size per bus (256 devices * 8 functions * 4096 bytes)
 pub const ECAM_BUS_SIZE: usize = 256 * 8 * 4096;
@@ -74,7 +75,11 @@ pub struct PciBdf {
 impl PciBdf {
     #[must_use]
     pub const fn new(bus: u8, device: u8, function: u8) -> Self {
-        Self { bus, device, function }
+        Self {
+            bus,
+            device,
+            function,
+        }
     }
 
     /// Convert BDF to ECAM offset
@@ -121,7 +126,7 @@ impl PciConfigSpace {
     /// Create a config space for a real device
     #[must_use]
     pub fn new(bdf: PciBdf, vendor_id: u16, device_id: u16) -> Self {
-        let mut data = vec![0u8; PCIE_CONFIG_SPACE_SIZE];
+        let data = vec![0u8; PCIE_CONFIG_SPACE_SIZE];
         let mut cs = Self {
             data,
             bar_masks: [0; 6],
@@ -156,7 +161,12 @@ impl PciConfigSpace {
     pub fn read_u32(&self, offset: u16) -> u32 {
         let o = offset as usize;
         if o + 3 < self.data.len() {
-            u32::from_le_bytes([self.data[o], self.data[o+1], self.data[o+2], self.data[o+3]])
+            u32::from_le_bytes([
+                self.data[o],
+                self.data[o + 1],
+                self.data[o + 2],
+                self.data[o + 3],
+            ])
         } else {
             0xFFFF_FFFF
         }
@@ -184,7 +194,7 @@ impl PciConfigSpace {
         let bytes = value.to_le_bytes();
         let o = offset as usize;
         if o + 3 < self.data.len() {
-            self.data[o..o+4].copy_from_slice(&bytes);
+            self.data[o..o + 4].copy_from_slice(&bytes);
         }
     }
 
@@ -199,7 +209,7 @@ impl PciConfigSpace {
     /// Set a BAR value and its writable mask (for size detection)
     pub fn set_bar(&mut self, bar_index: usize, value: u32, mask: u32) {
         if bar_index < 6 {
-            let offset = cfg::BAR0 + (bar_index as u16) * 4;
+            let offset = cfg::BAR0 + (u16_of(bar_index)) * 4;
             self.write_u32(offset, value);
             self.bar_masks[bar_index] = mask;
         }
@@ -225,7 +235,7 @@ impl PciConfigSpace {
     /// Handle a guest config space write (respecting BAR masks)
     pub fn guest_write_u32(&mut self, offset: u16, value: u32) {
         // BAR writes need special handling for size detection
-        if offset >= cfg::BAR0 && offset <= cfg::BAR5 {
+        if (cfg::BAR0..=cfg::BAR5).contains(&offset) {
             let bar_idx = ((offset - cfg::BAR0) / 4) as usize;
             if bar_idx < 6 {
                 let mask = self.bar_masks[bar_idx];
@@ -270,7 +280,7 @@ pub struct PcieRootComplex {
 impl PcieRootComplex {
     /// Create a new root complex with the given ECAM base address
     #[must_use]
-    pub fn new(ecam_base: u64) -> Self {
+    pub const fn new(ecam_base: u64) -> Self {
         Self {
             devices: Vec::new(),
             ecam_base,
@@ -303,17 +313,13 @@ impl PcieRootComplex {
         };
         let reg_offset = (offset & 0xFFF) as u16;
 
-        if let Some(dev) = self.find_device(&bdf) {
-            match size {
+        self.find_device(&bdf)
+            .map_or(0xFFFF_FFFF, |dev| match size {
                 1 => u32::from(dev.read_u8(reg_offset)),
                 2 => u32::from(dev.read_u16(reg_offset)),
                 4 => dev.read_u32(reg_offset),
                 _ => 0xFFFF_FFFF,
-            }
-        } else {
-            // No device — return all ones
-            0xFFFF_FFFF
-        }
+            })
     }
 
     /// Handle ECAM MMIO write
@@ -327,8 +333,8 @@ impl PcieRootComplex {
 
         if let Some(dev) = self.find_device_mut(&bdf) {
             match size {
-                1 => dev.write_u8(reg_offset, value as u8),
-                2 => dev.write_u16(reg_offset, value as u16),
+                1 => dev.write_u8(reg_offset, u8_of(value)),
+                2 => dev.write_u16(reg_offset, u16_of(value)),
                 4 => dev.guest_write_u32(reg_offset, value),
                 _ => {}
             }
@@ -360,7 +366,7 @@ mod tests {
 
     #[test]
     fn config_space_read_write() {
-        let mut cs = PciConfigSpace::new(PciBdf::new(0, 0, 0), 0x8086, 0x1234);
+        let cs = PciConfigSpace::new(PciBdf::new(0, 0, 0), 0x8086, 0x1234);
         assert_eq!(cs.vendor_id(), 0x8086);
         assert_eq!(cs.device_id(), 0x1234);
         assert!(cs.is_present());

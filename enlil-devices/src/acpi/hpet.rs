@@ -40,19 +40,19 @@ impl HpetBuilder {
     }
 
     #[must_use]
-    pub fn oem_info(mut self, oem: OemInfo) -> Self {
+    pub const fn oem_info(mut self, oem: OemInfo) -> Self {
         self.oem = oem;
         self
     }
 
     #[must_use]
-    pub fn base_address(mut self, addr: u64) -> Self {
+    pub const fn base_address(mut self, addr: u64) -> Self {
         self.base_address = addr;
         self
     }
 
     #[must_use]
-    pub fn pci_vendor_id(mut self, vid: u16) -> Self {
+    pub const fn pci_vendor_id(mut self, vid: u16) -> Self {
         self.pci_vendor_id = vid;
         self
     }
@@ -79,10 +79,10 @@ impl HpetBuilder {
         buf.extend_from_slice(&event_timer_block_id.to_le_bytes());
 
         // Offset 40: Base Address (12-byte GAS)
-        buf.push(0);    // address space: memory
-        buf.push(64);   // bit width
-        buf.push(0);    // bit offset
-        buf.push(0);    // access size (undefined)
+        buf.push(0); // address space: memory
+        buf.push(64); // bit width
+        buf.push(0); // bit offset
+        buf.push(0); // access size (undefined)
         buf.extend_from_slice(&self.base_address.to_le_bytes());
 
         // Offset 52: HPET Number

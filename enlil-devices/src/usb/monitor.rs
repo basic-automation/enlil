@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::types::{
-    DeviceSpeed, UsbAddress, UsbDeviceClass, UsbDeviceDescriptor, UsbDeviceInfo,
-    UsbDeviceState, UsbError, UsbPortPath, UsbResult,
+    DeviceSpeed, UsbAddress, UsbDeviceDescriptor, UsbDeviceInfo, UsbDeviceState, UsbError,
+    UsbPortPath, UsbResult,
 };
 
 // ---------------------------------------------------------------------------
@@ -53,6 +53,7 @@ pub struct UsbMonitor {
 
 impl UsbMonitor {
     /// Create a new USB monitor with the given poll interval.
+    #[must_use]
     pub fn new(poll_interval: Duration) -> Self {
         Self {
             devices: Arc::new(Mutex::new(HashMap::new())),
@@ -64,35 +65,59 @@ impl UsbMonitor {
     }
 
     /// Return a snapshot of all currently connected devices.
+    /// # Panics
+    ///
+    /// Panics if the internal device lock is poisoned.
+    #[must_use]
     pub fn devices(&self) -> HashMap<UsbPortPath, UsbDeviceInfo> {
         self.devices.lock().expect("device lock poisoned").clone()
     }
 
     /// Return the number of connected devices.
+    /// # Panics
+    ///
+    /// Panics if the internal device lock is poisoned.
+    #[must_use]
     pub fn device_count(&self) -> usize {
         self.devices.lock().expect("device lock poisoned").len()
     }
 
     /// Look up a device by its port path.
+    /// # Panics
+    ///
+    /// Panics if the internal device lock is poisoned.
+    #[must_use]
     pub fn device_by_port(&self, port: &UsbPortPath) -> Option<UsbDeviceInfo> {
-        self.devices.lock().expect("device lock poisoned").get(port).cloned()
+        self.devices
+            .lock()
+            .expect("device lock poisoned")
+            .get(port)
+            .cloned()
     }
 
     /// Look up a device by VID:PID (returns the first match).
+    /// # Panics
+    ///
+    /// Panics if the internal device lock is poisoned.
+    #[must_use]
     pub fn device_by_vid_pid(&self, vendor_id: u16, product_id: u16) -> Option<UsbDeviceInfo> {
         self.devices
             .lock()
             .expect("device lock poisoned")
             .values()
-            .find(|d| {
-                d.descriptor.vendor_id == vendor_id && d.descriptor.product_id == product_id
-            })
+            .find(|d| d.descriptor.vendor_id == vendor_id && d.descriptor.product_id == product_id)
             .cloned()
     }
 
     /// Register a hot-plug callback.
+    /// # Panics
+    ///
+    /// Panics if the internal device lock is poisoned.
     pub fn on_hotplug(&self, callback: HotplugCallback) {
-        self.listeners.lock().expect("listener lock poisoned").push(callback);
+        self.listeners
+            .lock()
+            .expect("listener lock poisoned")
+            .push(callback);
     }
 
     /// Allocate the next device address.
@@ -103,6 +128,7 @@ impl UsbMonitor {
         }
         let addr = UsbAddress::new(*next);
         *next += 1;
+        drop(next);
         Ok(addr)
     }
 
@@ -110,6 +136,13 @@ impl UsbMonitor {
     ///
     /// In production, the xHCI driver calls this when a port status change
     /// event fires.
+    /// # Errors
+    ///
+    /// Returns [`UsbError::AddressExhausted`] if no device address is free.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal device lock is poisoned.
     pub fn report_connect(
         &self,
         port_path: UsbPortPath,
@@ -138,6 +171,14 @@ impl UsbMonitor {
     }
 
     /// Simulate a device disconnect event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UsbError::DeviceNotFound`] if no device is mapped at `port_path`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal device lock is poisoned.
     pub fn report_disconnect(&self, port_path: &UsbPortPath) -> UsbResult<()> {
         let removed = self
             .devices
@@ -155,17 +196,25 @@ impl UsbMonitor {
     }
 
     /// Get the configured poll interval.
-    pub fn poll_interval(&self) -> Duration {
+    #[must_use]
+    pub const fn poll_interval(&self) -> Duration {
         self.poll_interval
     }
 
     /// Check if enough time has elapsed for another poll cycle.
+    /// # Panics
+    ///
+    /// Panics if the internal device lock is poisoned.
+    #[must_use]
     pub fn should_poll(&self) -> bool {
         let last = *self.last_poll.lock().expect("poll lock poisoned");
         last.elapsed() >= self.poll_interval
     }
 
     /// Record that a poll cycle just completed.
+    /// # Panics
+    ///
+    /// Panics if the internal device lock is poisoned.
     pub fn mark_polled(&self) {
         *self.last_poll.lock().expect("poll lock poisoned") = Instant::now();
     }
@@ -186,6 +235,7 @@ impl UsbMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::usb::types::UsbDeviceClass;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn test_descriptor(vid: u16, pid: u16) -> UsbDeviceDescriptor {
@@ -211,7 +261,9 @@ mod tests {
         let port = UsbPortPath::new(1, vec![1]);
         let desc = test_descriptor(0x046d, 0xc077);
 
-        let info = mon.report_connect(port.clone(), desc, DeviceSpeed::High).unwrap();
+        let info = mon
+            .report_connect(port.clone(), desc, DeviceSpeed::High)
+            .unwrap();
         assert_eq!(info.address.value(), 1);
         assert_eq!(mon.device_count(), 1);
 
@@ -225,7 +277,8 @@ mod tests {
         let port = UsbPortPath::new(1, vec![2]);
         let desc = test_descriptor(0x046d, 0xc534);
 
-        mon.report_connect(port.clone(), desc, DeviceSpeed::Full).unwrap();
+        mon.report_connect(port.clone(), desc, DeviceSpeed::Full)
+            .unwrap();
         assert_eq!(mon.device_count(), 1);
 
         mon.report_disconnect(&port).unwrap();
@@ -268,7 +321,8 @@ mod tests {
         let port = UsbPortPath::new(1, vec![1]);
         let desc = test_descriptor(0x046d, 0xc077);
 
-        mon.report_connect(port.clone(), desc, DeviceSpeed::High).unwrap();
+        mon.report_connect(port.clone(), desc, DeviceSpeed::High)
+            .unwrap();
         assert_eq!(counter.load(Ordering::Relaxed), 1);
 
         mon.report_disconnect(&port).unwrap();
@@ -299,7 +353,9 @@ mod tests {
         let p2 = UsbPortPath::new(1, vec![2]);
         let desc = test_descriptor(0x0001, 0x0001);
 
-        let d1 = mon.report_connect(p1, desc.clone(), DeviceSpeed::Full).unwrap();
+        let d1 = mon
+            .report_connect(p1, desc.clone(), DeviceSpeed::Full)
+            .unwrap();
         let d2 = mon.report_connect(p2, desc, DeviceSpeed::Full).unwrap();
 
         assert_eq!(d1.address.value(), 1);

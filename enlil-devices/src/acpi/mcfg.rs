@@ -4,6 +4,7 @@
 //! to discover the ECAM (Enhanced Configuration Access Mechanism) base address.
 
 use super::tables::{AcpiSdtHeader, OemInfo};
+use crate::truncate::u32_of;
 
 /// A single MCFG allocation entry
 #[derive(Debug, Clone)]
@@ -53,7 +54,7 @@ impl McfgBuilder {
     }
 
     #[must_use]
-    pub fn oem_info(mut self, oem: OemInfo) -> Self {
+    pub const fn oem_info(mut self, oem: OemInfo) -> Self {
         self.oem = oem;
         self
     }
@@ -72,13 +73,12 @@ impl McfgBuilder {
 
     /// Build the MCFG table as bytes
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn build(&self) -> Vec<u8> {
         // MCFG: 36-byte header + 8-byte reserved + 16 bytes per allocation
         let total_length = 36 + 8 + self.allocations.len() * 16;
         let mut buf = Vec::with_capacity(total_length);
 
-        let header = AcpiSdtHeader::new(*b"MCFG", total_length as u32, 1, &self.oem);
+        let header = AcpiSdtHeader::new(*b"MCFG", u32_of(total_length), 1, &self.oem);
         buf.extend_from_slice(&header.to_bytes());
 
         // 8 bytes reserved
@@ -126,7 +126,7 @@ mod tests {
     #[test]
     fn mcfg_bus_range() {
         let mcfg = McfgBuilder::standard(0xB000_0000).build();
-        assert_eq!(mcfg[54], 0);   // start bus
+        assert_eq!(mcfg[54], 0); // start bus
         assert_eq!(mcfg[55], 255); // end bus
     }
 }

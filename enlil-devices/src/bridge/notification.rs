@@ -175,8 +175,22 @@ mod tests {
     #[test]
     fn test_policy_urgency_threshold() {
         let policy = NotificationPolicy::new(Urgency::Normal, 10);
-        let low = Notification::new(1, "g1".to_string(), "t".to_string(), "b".to_string(), Urgency::Low, "app".to_string());
-        let normal = Notification::new(2, "g1".to_string(), "t".to_string(), "b".to_string(), Urgency::Normal, "app".to_string());
+        let low = Notification::new(
+            1,
+            "g1".to_string(),
+            "t".to_string(),
+            "b".to_string(),
+            Urgency::Low,
+            "app".to_string(),
+        );
+        let normal = Notification::new(
+            2,
+            "g1".to_string(),
+            "t".to_string(),
+            "b".to_string(),
+            Urgency::Normal,
+            "app".to_string(),
+        );
         assert!(!policy.is_allowed(&low));
         assert!(policy.is_allowed(&normal));
     }
@@ -186,11 +200,32 @@ mod tests {
         let mut policy = NotificationPolicy::new(Urgency::Low, 10);
         policy.blocked_apps.insert("blocked".to_string());
         policy.allowed_apps.insert("allowed".to_string());
-        
-        let blocked = Notification::new(1, "g".to_string(), "t".to_string(), "b".to_string(), Urgency::Normal, "blocked".to_string());
-        let allowed = Notification::new(2, "g".to_string(), "t".to_string(), "b".to_string(), Urgency::Normal, "allowed".to_string());
-        let other = Notification::new(3, "g".to_string(), "t".to_string(), "b".to_string(), Urgency::Normal, "other".to_string());
-        
+
+        let blocked = Notification::new(
+            1,
+            "g".to_string(),
+            "t".to_string(),
+            "b".to_string(),
+            Urgency::Normal,
+            "blocked".to_string(),
+        );
+        let allowed = Notification::new(
+            2,
+            "g".to_string(),
+            "t".to_string(),
+            "b".to_string(),
+            Urgency::Normal,
+            "allowed".to_string(),
+        );
+        let other = Notification::new(
+            3,
+            "g".to_string(),
+            "t".to_string(),
+            "b".to_string(),
+            Urgency::Normal,
+            "other".to_string(),
+        );
+
         assert!(!policy.is_allowed(&blocked));
         assert!(policy.is_allowed(&allowed));
         assert!(!policy.is_allowed(&other));
@@ -199,12 +234,25 @@ mod tests {
     #[test]
     fn test_router_routes_by_policy() {
         let mut router = NotificationRouter::new();
-        router.set_policy("guest1".to_string(), NotificationPolicy::new(Urgency::Low, 100));
-        router.set_policy("guest2".to_string(), NotificationPolicy::new(Urgency::Critical, 100));
-        
-        let notif = Notification::new(1, "sender".to_string(), "t".to_string(), "b".to_string(), Urgency::Normal, "app".to_string());
+        router.set_policy(
+            "guest1".to_string(),
+            NotificationPolicy::new(Urgency::Low, 100),
+        );
+        router.set_policy(
+            "guest2".to_string(),
+            NotificationPolicy::new(Urgency::Critical, 100),
+        );
+
+        let notif = Notification::new(
+            1,
+            "sender".to_string(),
+            "t".to_string(),
+            "b".to_string(),
+            Urgency::Normal,
+            "app".to_string(),
+        );
         let recipients = router.route(&notif);
-        
+
         assert_eq!(recipients.len(), 1);
         assert_eq!(recipients[0], "guest1");
     }
@@ -214,13 +262,27 @@ mod tests {
         let mut router = NotificationRouter::new();
         let policy = NotificationPolicy::new(Urgency::Low, 1);
         router.set_policy("guest1".to_string(), policy);
-        
-        let notif1 = Notification::new(1, "sender".to_string(), "t".to_string(), "b".to_string(), Urgency::Normal, "app".to_string());
-        let notif2 = Notification::new(2, "sender".to_string(), "t".to_string(), "b".to_string(), Urgency::Normal, "app".to_string());
-        
+
+        let notif1 = Notification::new(
+            1,
+            "sender".to_string(),
+            "t".to_string(),
+            "b".to_string(),
+            Urgency::Normal,
+            "app".to_string(),
+        );
+        let notif2 = Notification::new(
+            2,
+            "sender".to_string(),
+            "t".to_string(),
+            "b".to_string(),
+            Urgency::Normal,
+            "app".to_string(),
+        );
+
         let r1 = router.route(&notif1);
         assert_eq!(r1.len(), 1);
-        
+
         let r2 = router.route(&notif2);
         assert_eq!(r2.len(), 0);
     }

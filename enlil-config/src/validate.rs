@@ -76,17 +76,20 @@ mod tests {
 
     fn minimal_config() -> EnlilConfig {
         let mut guests = HashMap::new();
-        guests.insert("vm1".into(), GuestConfig {
-            name: "Test VM 1".into(),
-            cpus: vec![0, 1],
-            memory_mb: 2048,
-            kernel: None,
-            initrd: None,
-            cmdline: "console=ttyS0".into(),
-            scheduling: SchedulingMode::Dedicated,
-            disks: vec![],
-            serial: SerialPortConfig::default(),
-        });
+        guests.insert(
+            "vm1".into(),
+            GuestConfig {
+                name: "Test VM 1".into(),
+                cpus: vec![0, 1],
+                memory_mb: 2048,
+                kernel: None,
+                initrd: None,
+                cmdline: "console=ttyS0".into(),
+                scheduling: SchedulingMode::Dedicated,
+                disks: vec![],
+                serial: SerialPortConfig::default(),
+            },
+        );
         EnlilConfig {
             hypervisor: HypervisorConfig::default(),
             guest: guests,
@@ -103,17 +106,20 @@ mod tests {
     #[test]
     fn detects_cpu_overlap() {
         let mut config = minimal_config();
-        config.guest.insert("vm2".into(), GuestConfig {
-            name: "Test VM 2".into(),
-            cpus: vec![1, 2], // CPU 1 overlaps with vm1
-            memory_mb: 2048,
-            kernel: None,
-            initrd: None,
-            cmdline: "console=ttyS0".into(),
-            scheduling: SchedulingMode::Dedicated,
-            disks: vec![],
-            serial: SerialPortConfig::default(),
-        });
+        config.guest.insert(
+            "vm2".into(),
+            GuestConfig {
+                name: "Test VM 2".into(),
+                cpus: vec![1, 2], // CPU 1 overlaps with vm1
+                memory_mb: 2048,
+                kernel: None,
+                initrd: None,
+                cmdline: "console=ttyS0".into(),
+                scheduling: SchedulingMode::Dedicated,
+                disks: vec![],
+                serial: SerialPortConfig::default(),
+            },
+        );
         let errors = validate_config(&config);
         assert!(errors.iter().any(|e| e.contains("CPU 1 already assigned")));
     }

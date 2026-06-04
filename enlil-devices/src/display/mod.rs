@@ -7,9 +7,10 @@
 //! - Picture-in-Picture support
 //! - Configuration via serde
 
+use crate::truncate::{Widen, u32_of};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
-use serde::{Deserialize, Serialize};
 
 /// Pixel format enumeration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -43,20 +44,22 @@ pub struct FrameRef {
 }
 
 impl FrameRef {
-    #[allow(clippy::cast_possible_truncation)]
     pub fn new(width: u32, height: u32, pixel_format: PixelFormat) -> Self {
         Self {
-            id: { static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1); COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) },
+            id: {
+                static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
             timestamp_ns: {
                 use std::time::{SystemTime, UNIX_EPOCH};
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .map_or(0, |d| d.as_nanos() as u64)
+                    .map_or(0, |d| d.as_nanos().to_u64())
             },
             pixel_format,
             width,
             height,
-            stride: width * pixel_format.bytes_per_pixel() as u32,
+            stride: width * u32_of(pixel_format.bytes_per_pixel()),
         }
     }
 }
@@ -193,7 +196,6 @@ pub struct CompositorOwnedSource {
 
 impl CompositorOwnedSource {
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn new(width: u32, height: u32, format: PixelFormat) -> Self {
         let size = (width * height) as usize * format.bytes_per_pixel();
         Self {
@@ -505,8 +507,8 @@ pub struct HotkeyConfig {
 impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
-            toggle_pip: vec![29, 56, 25], // Ctrl+Alt+P
-            cycle_zones: vec![29, 56, 9],  // Ctrl+Alt+Tab
+            toggle_pip: vec![29, 56, 25],   // Ctrl+Alt+P
+            cycle_zones: vec![29, 56, 9],   // Ctrl+Alt+Tab
             reset_layout: vec![29, 56, 19], // Ctrl+Alt+R
         }
     }
@@ -650,14 +652,16 @@ impl DisplayCompositor {
     }
 
     #[must_use]
-    #[allow(clippy::significant_drop_tightening)]
     /// # Panics
     /// Panics if an internal lock is poisoned.
     pub fn composite_frame(&self) -> Option<Vec<u8>> {
-        let config = self.config.lock().unwrap();
+        let (cfg_width, cfg_height) = {
+            let config = self.config.lock().unwrap();
+            (config.width, config.height)
+        };
         let sources = self.framebuffer_sources.read().unwrap();
 
-        let frame_size = (config.width * config.height) as usize * 4;
+        let frame_size = (cfg_width * cfg_height) as usize * 4;
         let mut composite_buffer = vec![0u8; frame_size];
 
         let layout = self.layout_engine.get_layout();
@@ -667,20 +671,26 @@ impl DisplayCompositor {
             }
 
             if let Some(source) = sources.get(&zone.id)
-                && let Some(data) = source.current_frame().and_then(|f| source.get_frame_data(f.id)) {
-                    // Simple copy composition
-                    let bytes_per_pixel = 4;
-                    for y in 0..zone.height.min(config.height.saturating_sub(zone.y)) {
-                        for x in 0..zone.width.min(config.width.saturating_sub(zone.x)) {
-                            let src_idx = ((y * zone.width + x) as usize) * bytes_per_pixel;
-                            let dst_idx = (((zone.y + y) * config.width + zone.x + x) as usize) * bytes_per_pixel;
-                            if src_idx + bytes_per_pixel <= data.len() && dst_idx + bytes_per_pixel <= composite_buffer.len() {
-                                composite_buffer[dst_idx..dst_idx + bytes_per_pixel]
-                                    .copy_from_slice(&data[src_idx..src_idx + bytes_per_pixel]);
-                            }
+                && let Some(data) = source
+                    .current_frame()
+                    .and_then(|f| source.get_frame_data(f.id))
+            {
+                // Simple copy composition
+                let bytes_per_pixel = 4;
+                for y in 0..zone.height.min(cfg_height.saturating_sub(zone.y)) {
+                    for x in 0..zone.width.min(cfg_width.saturating_sub(zone.x)) {
+                        let src_idx = ((y * zone.width + x) as usize) * bytes_per_pixel;
+                        let dst_idx =
+                            (((zone.y + y) * cfg_width + zone.x + x) as usize) * bytes_per_pixel;
+                        if src_idx + bytes_per_pixel <= data.len()
+                            && dst_idx + bytes_per_pixel <= composite_buffer.len()
+                        {
+                            composite_buffer[dst_idx..dst_idx + bytes_per_pixel]
+                                .copy_from_slice(&data[src_idx..src_idx + bytes_per_pixel]);
                         }
                     }
                 }
+            }
         }
 
         Some(composite_buffer)
@@ -861,7 +871,11 @@ mod tests {
     fn test_source_registration() {
         let config = DisplayConfig::default();
         let compositor = DisplayCompositor::new(config);
-        let source = Arc::new(CompositorOwnedSource::new(1920, 1080, PixelFormat::RGBA8888));
+        let source = Arc::new(CompositorOwnedSource::new(
+            1920,
+            1080,
+            PixelFormat::RGBA8888,
+        ));
 
         compositor.register_source(1, source);
         compositor.unregister_source(1);

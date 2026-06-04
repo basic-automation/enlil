@@ -17,8 +17,7 @@ const HPET_CLK_PERIOD_FS: u64 = 100_000_000;
 const TIMER_ROUTE_CAP: u32 = 0x000F_0000; // IRQs 16-19
 
 /// HPET capability register: revision 1, 3 timers, 64-bit counter, legacy capable.
-const HPET_CAP_VALUE: u64 =
-    (HPET_CLK_PERIOD_FS << 32) | ((NUM_TIMERS as u64 - 1) << 8) | 0x01;
+const HPET_CAP_VALUE: u64 = (HPET_CLK_PERIOD_FS << 32) | ((NUM_TIMERS as u64 - 1) << 8) | 0x01;
 
 /// Individual HPET timer state.
 #[derive(Debug, Clone)]
@@ -148,12 +147,14 @@ impl Hpet {
             0x100..=0x1FF => {
                 let timer_idx = ((offset - 0x100) / 0x20) as usize;
                 let reg_offset = (offset - 0x100) % 0x20;
-                self.timers.get(timer_idx).map_or(0, |timer| match reg_offset {
-                    0x00 => timer.config,
-                    0x08 => timer.comparator,
-                    0x10 => timer.fsb_route,
-                    _ => 0,
-                })
+                self.timers
+                    .get(timer_idx)
+                    .map_or(0, |timer| match reg_offset {
+                        0x00 => timer.config,
+                        0x08 => timer.comparator,
+                        0x10 => timer.fsb_route,
+                        _ => 0,
+                    })
             }
             _ => 0,
         }
@@ -176,10 +177,9 @@ impl Hpet {
                 self.interrupt_status &= !value;
             }
             // Main Counter Value (writable only when counter is disabled)
-            0x0F0
-                if !self.is_enabled() => {
-                    self.counter = value;
-                }
+            0x0F0 if !self.is_enabled() => {
+                self.counter = value;
+            }
             // Timer N registers
             0x100..=0x1FF => {
                 let timer_idx = ((offset - 0x100) / 0x20) as usize;
@@ -190,8 +190,8 @@ impl Hpet {
                             // Timer config — preserve read-only bits
                             let read_only_mask: u64 = 0xFFFF_FFFF_0000_0000 | (1 << 4) | (1 << 5);
                             let writable_mask = !read_only_mask;
-                            timer.config = (timer.config & read_only_mask)
-                                | (value & writable_mask);
+                            timer.config =
+                                (timer.config & read_only_mask) | (value & writable_mask);
                         }
                         0x08 => {
                             timer.comparator = value;

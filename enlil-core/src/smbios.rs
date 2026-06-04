@@ -2,13 +2,12 @@
 //!
 //! Generates system identification tables that Windows reads during setup.
 
-
 /// SMBIOS Entry Point Structure
 #[repr(C, packed)]
 pub struct SmbiosEntryPoint {
-    pub anchor_string: [u8; 4],     // "_SM_"
+    pub anchor_string: [u8; 4], // "_SM_"
     pub checksum: u8,
-    pub length: u8,                 // Usually 31 bytes
+    pub length: u8, // Usually 31 bytes
     pub major_version: u8,
     pub minor_version: u8,
     pub max_structure_size: u16,
@@ -25,10 +24,10 @@ pub struct SmbiosEntryPoint {
 /// SMBIOS Type 0 — BIOS Information
 #[repr(C, packed)]
 pub struct SmbiosBiosInfo {
-    pub header_type: u8,            // 0
-    pub length: u8,                 // Typically 20 bytes
+    pub header_type: u8, // 0
+    pub length: u8,      // Typically 20 bytes
     pub handle: u16,
-    pub vendor: u8,                 // String index
+    pub vendor: u8, // String index
     pub version: u8,
     pub starting_address: u16,
     pub release_date: u8,
@@ -44,10 +43,10 @@ pub struct SmbiosBiosInfo {
 /// SMBIOS Type 1 — System Information
 #[repr(C, packed)]
 pub struct SmbiosSystemInfo {
-    pub header_type: u8,            // 1
+    pub header_type: u8, // 1
     pub length: u8,
     pub handle: u16,
-    pub manufacturer: u8,           // String index
+    pub manufacturer: u8, // String index
     pub product_name: u8,
     pub version: u8,
     pub serial_number: u8,
@@ -58,7 +57,7 @@ pub struct SmbiosSystemInfo {
 /// SMBIOS Type 2 — Baseboard Information
 #[repr(C, packed)]
 pub struct SmbiosBaseboard {
-    pub header_type: u8,            // 2
+    pub header_type: u8, // 2
     pub length: u8,
     pub handle: u16,
     pub manufacturer: u8,
@@ -74,7 +73,7 @@ pub struct SmbiosBaseboard {
 /// SMBIOS Type 4 — Processor Information
 #[repr(C, packed)]
 pub struct SmbiosProcessor {
-    pub header_type: u8,            // 4
+    pub header_type: u8, // 4
     pub length: u8,
     pub handle: u16,
     pub socket_designation: u8,
@@ -104,31 +103,33 @@ pub struct SmbiosProcessor {
 /// SMBIOS Type 17 — Memory Device
 #[repr(C, packed)]
 pub struct SmbiosMemoryDevice {
-    pub header_type: u8,            // 17
+    pub header_type: u8, // 17
     pub length: u8,
     pub handle: u16,
     pub array_handle: u16,
     pub error_info_handle: u16,
     pub total_width: u16,
     pub data_width: u16,
-    pub size: u16,                  // In MB (0x7FFF means use extended size)
+    pub size: u16, // In MB (0x7FFF means use extended size)
     pub form_factor: u8,
     pub device_set: u8,
     pub device_locator: u8,
     pub bank_locator: u8,
     pub memory_type: u8,
     pub type_detail: u16,
-    pub speed: u16,                 // MHz
+    pub speed: u16, // MHz
     pub manufacturer: u8,
     pub serial_number: u8,
     pub asset_tag: u8,
     pub part_number: u8,
-    pub attributes: u8,             // Rank
-    pub extended_size: u32,         // In MB, if size == 0x7FFF
-    pub speed_extended: u16,        // MHz, for ACPI 3.2+
+    pub attributes: u8,      // Rank
+    pub extended_size: u32,  // In MB, if size == 0x7FFF
+    pub speed_extended: u16, // MHz, for ACPI 3.2+
 }
 
 /// SMBIOS table generator
+// Fields hold SMBIOS string/identity values captured at construction; the
+// table emitters that read them are part of the in-progress Phase 5 synthesis.
 pub struct SmbiosGenerator {
     manufacturer: String,
     product_name: String,
@@ -150,11 +151,47 @@ impl SmbiosGenerator {
         Self {
             manufacturer,
             product_name,
-            serial_number: serial_number,
+            serial_number,
             bios_vendor,
             cpu_model_name,
             total_memory_mb,
         }
+    }
+
+    /// System manufacturer string (SMBIOS type 1).
+    #[must_use]
+    pub fn manufacturer(&self) -> &str {
+        &self.manufacturer
+    }
+
+    /// Product name string (SMBIOS type 1).
+    #[must_use]
+    pub fn product_name(&self) -> &str {
+        &self.product_name
+    }
+
+    /// System serial number string (SMBIOS type 1).
+    #[must_use]
+    pub fn serial_number(&self) -> &str {
+        &self.serial_number
+    }
+
+    /// BIOS vendor string (SMBIOS type 0).
+    #[must_use]
+    pub fn bios_vendor(&self) -> &str {
+        &self.bios_vendor
+    }
+
+    /// CPU model/brand string (SMBIOS type 4).
+    #[must_use]
+    pub fn cpu_model_name(&self) -> &str {
+        &self.cpu_model_name
+    }
+
+    /// Total installed memory in MiB (SMBIOS type 16/17).
+    #[must_use]
+    pub const fn total_memory_mb(&self) -> u64 {
+        self.total_memory_mb
     }
 
     /// Create default SMBIOS matching realistic hardware

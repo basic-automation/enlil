@@ -190,11 +190,7 @@ impl PriorityExecutor {
     }
 
     /// Spawn a future with the given priority.
-    pub fn spawn(
-        &self,
-        future: impl Future<Output = ()> + Send + 'static,
-        priority: TaskPriority,
-    ) {
+    pub fn spawn(&self, future: impl Future<Output = ()> + Send + 'static, priority: TaskPriority) {
         let queue = self.queue_for(priority);
         let task = Arc::new(Task {
             future: Mutex::new(Box::pin(future)),
@@ -355,11 +351,7 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
 
 /// Create a no-op waker (for `block_on`).
 fn noop_waker() -> Waker {
-    struct NoopWake;
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-    Waker::from(Arc::new(NoopWake))
+    Waker::noop().clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -435,13 +427,28 @@ mod tests {
 
         // Spawn in reverse priority order: Low, Normal, High.
         let o = order.clone();
-        exec.spawn(async move { o.lock().unwrap().push("low"); }, TaskPriority::Low);
+        exec.spawn(
+            async move {
+                o.lock().unwrap().push("low");
+            },
+            TaskPriority::Low,
+        );
 
         let o = order.clone();
-        exec.spawn(async move { o.lock().unwrap().push("normal"); }, TaskPriority::Normal);
+        exec.spawn(
+            async move {
+                o.lock().unwrap().push("normal");
+            },
+            TaskPriority::Normal,
+        );
 
         let o = order.clone();
-        exec.spawn(async move { o.lock().unwrap().push("high"); }, TaskPriority::High);
+        exec.spawn(
+            async move {
+                o.lock().unwrap().push("high");
+            },
+            TaskPriority::High,
+        );
 
         exec.run();
 
@@ -457,22 +464,52 @@ mod tests {
 
         // Interleaved spawn order.
         let o = order.clone();
-        exec.spawn(async move { o.lock().unwrap().push("normal-1"); }, TaskPriority::Normal);
+        exec.spawn(
+            async move {
+                o.lock().unwrap().push("normal-1");
+            },
+            TaskPriority::Normal,
+        );
 
         let o = order.clone();
-        exec.spawn(async move { o.lock().unwrap().push("low-1"); }, TaskPriority::Low);
+        exec.spawn(
+            async move {
+                o.lock().unwrap().push("low-1");
+            },
+            TaskPriority::Low,
+        );
 
         let o = order.clone();
-        exec.spawn(async move { o.lock().unwrap().push("high-1"); }, TaskPriority::High);
+        exec.spawn(
+            async move {
+                o.lock().unwrap().push("high-1");
+            },
+            TaskPriority::High,
+        );
 
         let o = order.clone();
-        exec.spawn(async move { o.lock().unwrap().push("high-2"); }, TaskPriority::High);
+        exec.spawn(
+            async move {
+                o.lock().unwrap().push("high-2");
+            },
+            TaskPriority::High,
+        );
 
         let o = order.clone();
-        exec.spawn(async move { o.lock().unwrap().push("low-2"); }, TaskPriority::Low);
+        exec.spawn(
+            async move {
+                o.lock().unwrap().push("low-2");
+            },
+            TaskPriority::Low,
+        );
 
         let o = order.clone();
-        exec.spawn(async move { o.lock().unwrap().push("normal-2"); }, TaskPriority::Normal);
+        exec.spawn(
+            async move {
+                o.lock().unwrap().push("normal-2");
+            },
+            TaskPriority::Normal,
+        );
 
         exec.run();
 

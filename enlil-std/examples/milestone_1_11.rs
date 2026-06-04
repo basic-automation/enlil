@@ -15,7 +15,10 @@ use enlil_std::time::{Duration, Instant};
 
 fn main() {
     enlil_std::println!("=== Enlil Phase 1.11 Milestone Test ===");
-    enlil_std::println!("Platform: enlil-platform ({})", enlil_platform::backend_name());
+    enlil_std::println!(
+        "Platform: enlil-platform ({})",
+        enlil_platform::backend_name()
+    );
     enlil_std::println!();
 
     // --- 1. Vec and HashMap (collections through platform allocator) ---
@@ -114,9 +117,7 @@ fn main() {
     for i in 0..8 {
         let data = Arc::clone(&data);
         handles.push(thread::spawn(move || {
-            let value = enlil_std::future::block_on(async move {
-                format!("async-thread-{}", i)
-            });
+            let value = enlil_std::future::block_on(async move { format!("async-thread-{}", i) });
             data.lock().push(value);
         }));
     }
@@ -126,7 +127,11 @@ fn main() {
     let elapsed = start.elapsed();
     let final_data = data.lock();
     assert_eq!(final_data.len(), 8);
-    enlil_std::println!("  8 threads × async produced {} results in {:?}", final_data.len(), elapsed);
+    enlil_std::println!(
+        "  8 threads × async produced {} results in {:?}",
+        final_data.len(),
+        elapsed
+    );
     drop(final_data);
     enlil_std::println!("  ✓ Combined test passed");
     enlil_std::println!();

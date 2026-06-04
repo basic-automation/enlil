@@ -206,10 +206,7 @@ impl BridgeMessage {
     /// Returns an error if the buffer is too short for the header or payload.
     pub fn from_bytes(buf: &[u8]) -> Result<Self, String> {
         if buf.len() < 32 {
-            return Err(format!(
-                "Buffer too short for header: {} < 32",
-                buf.len()
-            ));
+            return Err(format!("Buffer too short for header: {} < 32", buf.len()));
         }
 
         let mut header_buf = [0u8; 32];
@@ -296,7 +293,9 @@ impl LocalVirtioTransport {
 impl BridgeTransport for LocalVirtioTransport {
     fn send(&self, msg: BridgeMessage) -> Result<(), String> {
         let queue = self.get_queue(msg.header.channel);
-        let mut q = queue.lock().map_err(|e| format!("Queue lock poisoned: {e}"))?;
+        let mut q = queue
+            .lock()
+            .map_err(|e| format!("Queue lock poisoned: {e}"))?;
 
         if q.len() >= self.max_queue_depth {
             return Err("Queue full".to_string());
@@ -312,9 +311,10 @@ impl BridgeTransport for LocalVirtioTransport {
         for channel in BridgeChannel::all() {
             let queue = self.get_queue(*channel);
             if let Ok(mut q) = queue.lock()
-                && let Some(msg) = q.pop_front() {
-                    return Some(msg);
-                }
+                && let Some(msg) = q.pop_front()
+            {
+                return Some(msg);
+            }
         }
         None
     }
@@ -618,13 +618,7 @@ mod tests {
 
         for channel in BridgeChannel::all() {
             let msg = BridgeMessage::new(
-                MessageHeader::new(
-                    GuestId::new(1),
-                    GuestId::new(2),
-                    *channel,
-                    1,
-                    0,
-                ),
+                MessageHeader::new(GuestId::new(1), GuestId::new(2), *channel, 1, 0),
                 vec![1],
             )
             .unwrap();

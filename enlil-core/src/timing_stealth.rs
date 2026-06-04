@@ -55,7 +55,8 @@ impl VcpuTimingState {
         let current_mperf = self.mperf.load(Ordering::Relaxed);
         if current_mperf > 0 {
             let ratio = (current_aperf as f64) / (current_mperf as f64);
-            self.mperf.store((current_aperf as f64 / ratio) as u64, Ordering::Release);
+            self.mperf
+                .store((current_aperf as f64 / ratio) as u64, Ordering::Release);
         }
 
         self.last_guest_rip.store(guest_rip, Ordering::Release);
@@ -112,6 +113,12 @@ pub struct LbrSanitizer {
     pub expected_guest_branch_target: u64,
 }
 
+impl Default for LbrSanitizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LbrSanitizer {
     pub fn new() -> Self {
         Self {
@@ -121,7 +128,7 @@ impl LbrSanitizer {
 
     /// Sanitize LBR stack after a detected VMEXIT (e.g., via CPUID trap)
     /// Removes or falsifies the branch record that shows branch-to-hypervisor
-    pub fn sanitize_lbr(&self, lbr_stack: &mut Vec<(u64, u64)>, guest_rip: u64) {
+    pub fn sanitize_lbr(&self, lbr_stack: &mut [(u64, u64)], guest_rip: u64) {
         if let Some((from, _to)) = lbr_stack.last_mut() {
             // The most recent LBR entry shows: from=guest_instruction, to=hypervisor_entry
             // Replace the "to" with the next expected guest instruction (to hide the VMEXIT)
@@ -146,11 +153,15 @@ pub struct CpuidResponse {
     pub edx: u32,
 }
 
+impl Default for CpuidCachingHelper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CpuidCachingHelper {
     pub fn new() -> Self {
-        Self {
-            cache: Vec::new(),
-        }
+        Self { cache: Vec::new() }
     }
 
     /// Build CPUID cache for all relevant leaves
@@ -173,7 +184,7 @@ impl CpuidCachingHelper {
         self.cache_cpuid(CpuidResponse {
             leaf: 0x00,
             subleaf: 0,
-            eax: 0x16,  // Max leaf
+            eax: 0x16,       // Max leaf
             ebx: 0x756e6547, // "Genu"
             ecx: 0x6c65746e, // "ntel"
             edx: 0x49656e69, // "ineI"

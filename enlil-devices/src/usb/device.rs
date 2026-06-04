@@ -7,9 +7,8 @@
 use std::fmt;
 
 pub use super::types::{
-    DeviceSpeed as UsbSpeed,
-    UsbDeviceClass as UsbClass,
-    UsbDeviceDescriptor, UsbDeviceId, UsbDeviceInfo, UsbDeviceState, UsbPortPath,
+    DeviceSpeed as UsbSpeed, UsbDeviceClass as UsbClass, UsbDeviceDescriptor, UsbDeviceId,
+    UsbDeviceInfo, UsbDeviceState, UsbPortPath,
 };
 
 // ---------------------------------------------------------------------------
@@ -61,7 +60,7 @@ impl UsbDevice {
 
     /// Check if this device is currently assigned to a guest.
     #[must_use]
-    pub fn is_assigned(&self) -> bool {
+    pub const fn is_assigned(&self) -> bool {
         self.assigned_guest.is_some()
     }
 
@@ -71,7 +70,7 @@ impl UsbDevice {
     }
 
     /// Unassign this device from its current guest.
-    pub fn unassign(&mut self) -> Option<String> {
+    pub const fn unassign(&mut self) -> Option<String> {
         self.assigned_guest.take()
     }
 
@@ -87,10 +86,7 @@ impl UsbDevice {
     /// Get a human-readable manufacturer name.
     #[must_use]
     pub fn manufacturer(&self) -> &str {
-        self.descriptor
-            .manufacturer
-            .as_deref()
-            .unwrap_or("Unknown")
+        self.descriptor.manufacturer.as_deref().unwrap_or("Unknown")
     }
 }
 
@@ -103,11 +99,9 @@ impl fmt::Display for UsbDevice {
             self.id.product_id,
             self.product_name(),
             self.speed,
-            if let Some(ref g) = self.assigned_guest {
-                g.as_str()
-            } else {
-                "unassigned"
-            }
+            self.assigned_guest
+                .as_ref()
+                .map_or("unassigned", |g| g.as_str())
         )
     }
 }
@@ -118,8 +112,8 @@ impl fmt::Display for UsbDevice {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::types::{UsbAddress, UsbDeviceClass};
+    use super::*;
 
     fn make_info() -> UsbDeviceInfo {
         UsbDeviceInfo {

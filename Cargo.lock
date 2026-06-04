@@ -329,6 +329,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "enlil-config",
+ "enlil-devices",
  "event-manager",
  "kvm-bindings",
  "kvm-ioctls",
@@ -350,6 +351,7 @@ dependencies = [
  "async-trait",
  "bitflags 2.11.0",
  "byteorder",
+ "libc",
  "log",
  "serde",
  "serde_json",

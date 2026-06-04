@@ -10,7 +10,7 @@
 //! ownership. When the producer toggles the cycle bit in a TRB, the consumer
 //! knows a new entry is available.
 
-use super::trb::{Trb, TrbType};
+use super::trb::Trb;
 
 // ---------------------------------------------------------------------------
 // Ring configuration
@@ -18,9 +18,6 @@ use super::trb::{Trb, TrbType};
 
 /// Default number of TRB entries per ring segment.
 const DEFAULT_RING_SIZE: usize = 256;
-
-/// Maximum number of segments in a segmented ring (event ring).
-const MAX_SEGMENTS: usize = 16;
 
 // ---------------------------------------------------------------------------
 // TRB Ring (generic base)
@@ -67,7 +64,7 @@ impl TrbRing {
     }
 
     /// Set the guest physical base address of this ring.
-    pub fn set_base_addr(&mut self, addr: u64) {
+    pub const fn set_base_addr(&mut self, addr: u64) {
         self.guest_base_addr = addr;
     }
 
@@ -78,12 +75,12 @@ impl TrbRing {
     }
 
     /// Start the ring (enable processing).
-    pub fn start(&mut self) {
+    pub const fn start(&mut self) {
         self.running = true;
     }
 
     /// Stop the ring (disable processing).
-    pub fn stop(&mut self) {
+    pub const fn stop(&mut self) {
         self.running = false;
     }
 
@@ -114,7 +111,7 @@ impl TrbRing {
         if self.is_empty() {
             return None;
         }
-        let trb = self.entries[self.dequeue_idx].clone();
+        let trb = self.entries[self.dequeue_idx];
         self.advance_dequeue();
         Some(trb)
     }
@@ -136,13 +133,13 @@ impl TrbRing {
 
     /// Check if the ring is full.
     #[must_use]
-    pub fn is_full(&self) -> bool {
+    pub const fn is_full(&self) -> bool {
         (self.enqueue_idx + 1) % self.entries.len() == self.dequeue_idx
     }
 
     /// Number of TRBs currently enqueued.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         if self.enqueue_idx >= self.dequeue_idx {
             self.enqueue_idx - self.dequeue_idx
         } else {
@@ -152,7 +149,7 @@ impl TrbRing {
 
     /// Ring capacity.
     #[must_use]
-    pub fn capacity(&self) -> usize {
+    pub const fn capacity(&self) -> usize {
         self.entries.len()
     }
 
@@ -186,7 +183,7 @@ impl TrbRing {
     }
 
     /// Advance the enqueue pointer, toggling cycle state on wrap.
-    fn advance_enqueue(&mut self) {
+    const fn advance_enqueue(&mut self) {
         self.enqueue_idx += 1;
         if self.enqueue_idx >= self.entries.len() {
             self.enqueue_idx = 0;
@@ -195,7 +192,7 @@ impl TrbRing {
     }
 
     /// Advance the dequeue pointer.
-    fn advance_dequeue(&mut self) {
+    const fn advance_dequeue(&mut self) {
         self.dequeue_idx += 1;
         if self.dequeue_idx >= self.entries.len() {
             self.dequeue_idx = 0;
@@ -249,12 +246,12 @@ impl CommandRing {
     }
 
     /// Set the abort flag (triggered by CRCR write with abort bit).
-    pub fn request_abort(&mut self) {
+    pub const fn request_abort(&mut self) {
         self.abort_pending = true;
     }
 
     /// Check and clear the abort flag.
-    pub fn take_abort(&mut self) -> bool {
+    pub const fn take_abort(&mut self) -> bool {
         let was = self.abort_pending;
         self.abort_pending = false;
         was
@@ -267,7 +264,7 @@ impl CommandRing {
     }
 
     /// Mutable access to the underlying ring.
-    pub fn ring_mut(&mut self) -> &mut TrbRing {
+    pub const fn ring_mut(&mut self) -> &mut TrbRing {
         &mut self.ring
     }
 
@@ -343,13 +340,13 @@ impl TransferRing {
     }
 
     /// Halt this endpoint (e.g., on a STALL or error).
-    pub fn halt(&mut self) {
+    pub const fn halt(&mut self) {
         self.halted = true;
         self.ring.stop();
     }
 
     /// Clear the halt condition (after Reset Endpoint command).
-    pub fn clear_halt(&mut self) {
+    pub const fn clear_halt(&mut self) {
         self.halted = false;
         self.ring.start();
     }
@@ -367,7 +364,7 @@ impl TransferRing {
     }
 
     /// Mutable access.
-    pub fn ring_mut(&mut self) -> &mut TrbRing {
+    pub const fn ring_mut(&mut self) -> &mut TrbRing {
         &mut self.ring
     }
 
@@ -385,6 +382,7 @@ impl TransferRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::usb::xhci::trb::TrbType;
 
     #[test]
     fn trb_ring_enqueue_dequeue() {

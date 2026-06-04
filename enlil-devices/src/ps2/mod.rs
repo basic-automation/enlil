@@ -13,12 +13,8 @@ pub const STATUS_CMD_PORT: u16 = 0x64;
 
 /// i8042 controller status register bits
 const STATUS_OUTPUT_FULL: u8 = 0x01;
-const STATUS_INPUT_FULL: u8 = 0x02;
 const STATUS_SYSTEM_FLAG: u8 = 0x04;
-const STATUS_COMMAND: u8 = 0x08;
 const STATUS_MOUSE_OUTPUT: u8 = 0x20;
-const STATUS_TIMEOUT_ERROR: u8 = 0x40;
-const STATUS_PARITY_ERROR: u8 = 0x80;
 
 /// i8042 controller commands (written to port 0x64)
 #[repr(u8)]
@@ -65,7 +61,7 @@ pub struct I8042Controller {
     pub kbd_irq_pending: bool,
     /// Mouse IRQ pending
     pub mouse_irq_pending: bool,
-    /// Whether output is from mouse (for STATUS_MOUSE_OUTPUT bit)
+    /// Whether output is from mouse (for `STATUS_MOUSE_OUTPUT` bit)
     output_is_mouse: bool,
 }
 
@@ -87,7 +83,7 @@ impl I8042Controller {
 
     /// Read from port 0x60 (data port)
     #[must_use]
-    pub fn read_data(&mut self) -> u8 {
+    pub const fn read_data(&mut self) -> u8 {
         self.status &= !STATUS_OUTPUT_FULL;
         self.status &= !STATUS_MOUSE_OUTPUT;
         self.kbd_irq_pending = false;
@@ -97,7 +93,7 @@ impl I8042Controller {
 
     /// Read from port 0x64 (status register)
     #[must_use]
-    pub fn read_status(&self) -> u8 {
+    pub const fn read_status(&self) -> u8 {
         self.status
     }
 
@@ -114,7 +110,7 @@ impl I8042Controller {
     }
 
     /// Write to port 0x64 (command port)
-    pub fn write_command(&mut self, cmd: u8) {
+    pub const fn write_command(&mut self, cmd: u8) {
         match cmd {
             0x20 => {
                 // Read configuration byte
@@ -181,23 +177,19 @@ impl I8042Controller {
                 // Write configuration byte
                 self.config = data;
             }
-            0xD1 => {
-                // Write output port
-                // Bit 0 = system reset (0 = reset)
-                // We ignore reset requests in emulation
-            }
             0xD4 => {
                 // Forward data to mouse
                 if let Some(response) = self.mouse.receive_command(data) {
                     self.queue_mouse_output(response);
                 }
             }
+            // 0xD1 (write output port): bit 0 is system reset, which we ignore.
             _ => {}
         }
     }
 
     /// Queue data from keyboard into output buffer
-    fn queue_keyboard_output(&mut self, data: u8) {
+    const fn queue_keyboard_output(&mut self, data: u8) {
         self.output_buffer = data;
         self.status |= STATUS_OUTPUT_FULL;
         self.status &= !STATUS_MOUSE_OUTPUT;
@@ -208,7 +200,7 @@ impl I8042Controller {
     }
 
     /// Queue data from mouse into output buffer
-    fn queue_mouse_output(&mut self, data: u8) {
+    const fn queue_mouse_output(&mut self, data: u8) {
         self.output_buffer = data;
         self.status |= STATUS_OUTPUT_FULL;
         self.status |= STATUS_MOUSE_OUTPUT;
@@ -236,7 +228,7 @@ impl I8042Controller {
 
     /// Handle PIO read
     #[must_use]
-    pub fn pio_read(&mut self, port: u16) -> u8 {
+    pub const fn pio_read(&mut self, port: u16) -> u8 {
         match port {
             DATA_PORT => self.read_data(),
             STATUS_CMD_PORT => self.read_status(),
@@ -297,11 +289,11 @@ mod tests {
     fn config_read_write() {
         let mut ctrl = I8042Controller::new();
         ctrl.write_command(0x20); // Read config
-        let old_config = ctrl.read_data();
+        let _old_config = ctrl.read_data();
 
         ctrl.write_command(0x60); // Write config
         ctrl.write_data(0x47);
-        
+
         ctrl.write_command(0x20);
         assert_eq!(ctrl.read_data(), 0x47);
     }
@@ -340,8 +332,11 @@ mod tests {
     fn mouse_write_via_d4() {
         let mut ctrl = I8042Controller::new();
         ctrl.write_command(0xD4); // Write to mouse
-        ctrl.write_data(0xFF);   // Reset command
+        ctrl.write_data(0xFF); // Reset command
         // Mouse should respond with ACK
-        assert_eq!(ctrl.read_status() & STATUS_MOUSE_OUTPUT, STATUS_MOUSE_OUTPUT);
+        assert_eq!(
+            ctrl.read_status() & STATUS_MOUSE_OUTPUT,
+            STATUS_MOUSE_OUTPUT
+        );
     }
 }

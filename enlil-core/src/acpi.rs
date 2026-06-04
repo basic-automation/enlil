@@ -8,8 +8,8 @@ use std::mem::size_of;
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 pub struct AcpiTableHeader {
-    pub signature: [u8; 4],      // "RSDT", "XSDT", "FADT", etc.
-    pub length: u32,             // Total length including header
+    pub signature: [u8; 4], // "RSDT", "XSDT", "FADT", etc.
+    pub length: u32,        // Total length including header
     pub revision: u8,
     pub checksum: u8,
     pub oem_id: [u8; 6],
@@ -23,13 +23,13 @@ pub struct AcpiTableHeader {
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 pub struct Rsdp {
-    pub signature: [u8; 8],      // "RSD PTR "
+    pub signature: [u8; 8], // "RSD PTR "
     pub checksum: u8,
     pub oem_id: [u8; 6],
-    pub revision: u8,            // 2 for ACPI 2.0
-    pub rsdt_address: u32,       // For ACPI 1.0 compat
+    pub revision: u8,      // 2 for ACPI 2.0
+    pub rsdt_address: u32, // For ACPI 1.0 compat
     pub length: u32,
-    pub xsdt_address: u64,       // For ACPI 2.0
+    pub xsdt_address: u64, // For ACPI 2.0
     pub extended_checksum: u8,
     pub reserved: [u8; 3],
 }
@@ -39,11 +39,11 @@ pub struct Rsdp {
 #[derive(Clone, Copy)]
 pub struct Fadt {
     pub header: AcpiTableHeader,
-    pub firmware_ctrl: u32,      // FACS address (32-bit)
-    pub dsdt: u32,               // DSDT address (32-bit)
+    pub firmware_ctrl: u32, // FACS address (32-bit)
+    pub dsdt: u32,          // DSDT address (32-bit)
     pub reserved1: u8,
     pub preferred_pm_profile: u8,
-    pub sci_int: u16,            // SCI interrupt (IRQ 9 typical)
+    pub sci_int: u16, // SCI interrupt (IRQ 9 typical)
     pub smi_cmd: u32,
     pub acpi_enable: u8,
     pub acpi_disable: u8,
@@ -78,7 +78,7 @@ pub struct Fadt {
     pub reserved2: u8,
     pub flags: u32,
     // ACPI 2.0+ 64-bit addresses
-    pub reset_reg: u64,           // GAS (Generic Address Structure)
+    pub reset_reg: u64, // GAS (Generic Address Structure)
     pub reset_value: u8,
     pub arm_boot_arch: u16,
     pub fadt_minor_version: u8,
@@ -97,7 +97,7 @@ pub struct MadtHeader {
 
 #[repr(C, packed)]
 pub struct MadtLocalApic {
-    pub entry_type: u8,           // 0 = local APIC
+    pub entry_type: u8, // 0 = local APIC
     pub length: u8,
     pub processor_uid: u8,
     pub apic_id: u8,
@@ -106,7 +106,7 @@ pub struct MadtLocalApic {
 
 #[repr(C, packed)]
 pub struct MadtIoApic {
-    pub entry_type: u8,           // 1 = IO APIC
+    pub entry_type: u8, // 1 = IO APIC
     pub length: u8,
     pub io_apic_id: u8,
     pub reserved: u8,
@@ -115,6 +115,8 @@ pub struct MadtIoApic {
 }
 
 /// ACPI table generator
+// Fields hold table parameters captured at construction; the per-table
+// emitters that read them are part of the in-progress Phase 5 synthesis.
 pub struct AcpiTableGenerator {
     oem_id: [u8; 6],
     oem_table_id: [u8; 8],
@@ -126,17 +128,35 @@ impl AcpiTableGenerator {
     pub fn new(vcpu_count: u32) -> Self {
         let mut oem_id = [0u8; 6];
         let mut oem_table_id = [0u8; 8];
-        
+
         // "ENLIL" with padding
         oem_id[0..5].copy_from_slice(b"ENLIL");
         oem_table_id[0..7].copy_from_slice(b"ENLILVM");
-        
+
         Self {
             oem_id,
             oem_table_id,
             local_apic_addr: 0xFEE00000, // Standard x86 local APIC address
             vcpu_count,
         }
+    }
+
+    /// The vCPU count this generator emits topology for.
+    #[must_use]
+    pub const fn vcpu_count(&self) -> u32 {
+        self.vcpu_count
+    }
+
+    /// The local APIC base address reported in the MADT.
+    #[must_use]
+    pub const fn local_apic_addr(&self) -> u32 {
+        self.local_apic_addr
+    }
+
+    /// The OEM table identifier stamped into emitted tables.
+    #[must_use]
+    pub const fn oem_table_id(&self) -> [u8; 8] {
+        self.oem_table_id
     }
 
     /// Generate RSDP at a fixed location (0xE0000 on x86)
@@ -155,7 +175,8 @@ impl AcpiTableGenerator {
 
         // Calculate checksums
         rsdp.checksum = Self::calculate_checksum(&rsdp as *const _ as *const u8, 20);
-        rsdp.extended_checksum = Self::calculate_checksum(&rsdp as *const _ as *const u8, size_of::<Rsdp>());
+        rsdp.extended_checksum =
+            Self::calculate_checksum(&rsdp as *const _ as *const u8, size_of::<Rsdp>());
 
         rsdp
     }

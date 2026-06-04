@@ -331,7 +331,11 @@ impl Condvar {
     ///
     /// This is the preferred way to use a condition variable — it handles
     /// spurious wakeups automatically.
-    pub fn wait_while<'a, T, F>(&self, mut guard: MutexGuard<'a, T>, mut predicate: F) -> MutexGuard<'a, T>
+    pub fn wait_while<'a, T, F>(
+        &self,
+        mut guard: MutexGuard<'a, T>,
+        mut predicate: F,
+    ) -> MutexGuard<'a, T>
     where
         F: FnMut(&T) -> bool,
     {

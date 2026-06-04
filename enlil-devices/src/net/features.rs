@@ -162,7 +162,9 @@ mod tests {
 
     #[test]
     fn with_and_without() {
-        let f = NetFeatures::empty().with(NetFeatures::MAC).with(NetFeatures::STATUS);
+        let f = NetFeatures::empty()
+            .with(NetFeatures::MAC)
+            .with(NetFeatures::STATUS);
         assert!(f.contains(NetFeatures::MAC));
         assert!(f.contains(NetFeatures::STATUS));
 

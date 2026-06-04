@@ -6,6 +6,7 @@
 //! which memory ranges belong to which domain.
 
 use super::tables::{AcpiSdtHeader, OemInfo};
+use crate::truncate::u32_of;
 
 /// Processor Local APIC Affinity structure (type 0, 16 bytes)
 #[derive(Debug, Clone)]
@@ -64,7 +65,13 @@ pub struct MemoryAffinityEntry {
 impl MemoryAffinityEntry {
     /// Create entry for a memory range in the given proximity domain
     #[must_use]
-    pub fn new(proximity_domain: u32, base_address: u64, length: u64, enabled: bool, hot_pluggable: bool) -> Self {
+    pub const fn new(
+        proximity_domain: u32,
+        base_address: u64,
+        length: u64,
+        enabled: bool,
+        hot_pluggable: bool,
+    ) -> Self {
         let mut flags = 0u32;
         if enabled {
             flags |= 1;
@@ -87,11 +94,11 @@ impl MemoryAffinityEntry {
         buf[2..6].copy_from_slice(&self.proximity_domain.to_le_bytes());
         // reserved 2 bytes at [6..8]
         // base address low (bits 31:0)
-        buf[8..12].copy_from_slice(&(self.base_address as u32).to_le_bytes());
+        buf[8..12].copy_from_slice(&(u32_of(self.base_address)).to_le_bytes());
         // base address high (bits 63:32)
         buf[12..16].copy_from_slice(&((self.base_address >> 32) as u32).to_le_bytes());
         // length low (bits 31:0)
-        buf[16..20].copy_from_slice(&(self.length as u32).to_le_bytes());
+        buf[16..20].copy_from_slice(&(u32_of(self.length)).to_le_bytes());
         // length high (bits 63:32)
         buf[20..24].copy_from_slice(&((self.length >> 32) as u32).to_le_bytes());
         // reserved 4 bytes at [24..28]
@@ -119,7 +126,7 @@ impl SratBuilder {
     }
 
     #[must_use]
-    pub fn oem_info(mut self, oem: OemInfo) -> Self {
+    pub const fn oem_info(mut self, oem: OemInfo) -> Self {
         self.oem = oem;
         self
     }
@@ -141,19 +148,18 @@ impl SratBuilder {
     pub fn single_node(vcpu_count: u8, memory_size: u64) -> Self {
         let mut builder = Self::new();
         for i in 0..vcpu_count {
-            builder.processor_entries.push(
-                ProcessorAffinityEntry::new(i, 0, true),
-            );
+            builder
+                .processor_entries
+                .push(ProcessorAffinityEntry::new(i, 0, true));
         }
-        builder.memory_entries.push(
-            MemoryAffinityEntry::new(0, 0, memory_size, true, false),
-        );
+        builder
+            .memory_entries
+            .push(MemoryAffinityEntry::new(0, 0, memory_size, true, false));
         builder
     }
 
     /// Build the SRAT as a byte vector
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn build(&self) -> Vec<u8> {
         let proc_size = self.processor_entries.len() * 16;
         let mem_size = self.memory_entries.len() * 40;
@@ -161,7 +167,7 @@ impl SratBuilder {
         let total_length = 36 + 4 + 8 + proc_size + mem_size;
         let mut buf = Vec::with_capacity(total_length);
 
-        let header = AcpiSdtHeader::new(*b"SRAT", total_length as u32, 3, &self.oem);
+        let header = AcpiSdtHeader::new(*b"SRAT", u32_of(total_length), 3, &self.oem);
         buf.extend_from_slice(&header.to_bytes());
 
         // Table Revision (offset 36, 4 bytes) — must be 1

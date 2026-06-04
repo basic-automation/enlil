@@ -33,25 +33,25 @@ impl Tpm2Builder {
     }
 
     #[must_use]
-    pub fn oem_info(mut self, oem: OemInfo) -> Self {
+    pub const fn oem_info(mut self, oem: OemInfo) -> Self {
         self.oem = oem;
         self
     }
 
     #[must_use]
-    pub fn platform_class(mut self, class: u16) -> Self {
+    pub const fn platform_class(mut self, class: u16) -> Self {
         self.platform_class = class;
         self
     }
 
     #[must_use]
-    pub fn control_area_address(mut self, addr: u64) -> Self {
+    pub const fn control_area_address(mut self, addr: u64) -> Self {
         self.control_area_address = addr;
         self
     }
 
     #[must_use]
-    pub fn start_method(mut self, method: u32) -> Self {
+    pub const fn start_method(mut self, method: u32) -> Self {
         self.start_method = method;
         self
     }
@@ -140,9 +140,7 @@ mod tests {
 
     #[test]
     fn tpm2_custom_control_area() {
-        let tpm2 = Tpm2Builder::new()
-            .control_area_address(0xFED4_0000)
-            .build();
+        let tpm2 = Tpm2Builder::new().control_area_address(0xFED4_0000).build();
         let addr = u64::from_le_bytes(tpm2[40..48].try_into().unwrap());
         assert_eq!(addr, 0xFED4_0000);
         let sum: u8 = tpm2.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));

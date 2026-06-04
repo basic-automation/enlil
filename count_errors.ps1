@@ -1,8 +1,0 @@
-$lines = Get-Content "D:\Development\enlil\clippy_output.txt" | Where-Object { $_ -match '^error:' }
-$grouped = @{}
-foreach($l in $lines) {
-    $key = $l -replace ' -->.*$','' -replace 'error: ',''
-    if($grouped.ContainsKey($key)){$grouped[$key]++}else{$grouped[$key]=1}
-}
-$grouped.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 25 | Format-Table -AutoSize
-Write-Host "Total errors: $($lines.Count)"

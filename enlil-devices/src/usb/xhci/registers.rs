@@ -6,6 +6,7 @@
 //!
 //! Reference: xHCI specification 1.2, sections 5.1–5.5.
 
+use crate::truncate::u32_of;
 use std::fmt;
 
 // ---------------------------------------------------------------------------
@@ -50,18 +51,17 @@ impl CapabilityRegisters {
         let max_intrs: u16 = 1;
 
         // HCSPARAMS1: MaxSlots[7:0], MaxIntrs[18:8], MaxPorts[31:24]
-        let hcsparams1 = u32::from(max_slots)
-            | (u32::from(max_intrs) << 8)
-            | (u32::from(num_ports) << 24);
+        let hcsparams1 =
+            u32::from(max_slots) | (u32::from(max_intrs) << 8) | (u32::from(num_ports) << 24);
 
         // HCSPARAMS2: IST=1, ERST_Max=4 (16 entries), SPB_Max=0
         let hcsparams2 = 0x1 | (4 << 4);
 
         // HCSPARAMS3: U1 device exit latency = 10µs, U2 = 2047µs
-        let hcsparams3 = 10 | (2047 << 16);
+        let hcsparams3 = 0x0A | (0x7FF << 16);
 
         // HCCPARAMS1: AC64=1 (64-bit addressing), CSZ=1 (64-byte context)
-        let hccparams1 = 0x1 | (1 << 2);
+        let caps1 = 0x1 | (1 << 2);
 
         Self {
             caplength: 0x20,
@@ -69,7 +69,7 @@ impl CapabilityRegisters {
             hcsparams1,
             hcsparams2,
             hcsparams3,
-            hccparams1,
+            hccparams1: caps1,
             dboff: 0x2000,
             rtsoff: 0x1000,
             hccparams2: 0,
@@ -197,7 +197,7 @@ pub struct PortRegisterSet {
 impl PortRegisterSet {
     /// Create a new port register set in the disconnected state.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             portsc: 0,
             portpmsc: 0,
@@ -258,7 +258,7 @@ impl PortRegisterSet {
     }
 
     /// Simulate a device disconnection.
-    pub fn disconnect_device(&mut self) {
+    pub const fn disconnect_device(&mut self) {
         self.speed = 0;
         // CCS=0, PP=1, CSC=1
         self.portsc = (1 << 9) | (1 << 17);
@@ -327,7 +327,7 @@ pub struct OperationalRegisters {
     pub crcr: u64,
     /// Device Context Base Address Array Pointer (64-bit).
     pub dcbaap: u64,
-    /// Configure register (MaxSlotsEn).
+    /// Configure register (`MaxSlotsEn`).
     pub config: u32,
     /// Port register sets.
     pub ports: Vec<PortRegisterSet>,
@@ -340,7 +340,7 @@ impl OperationalRegisters {
         Self {
             usbcmd: 0,
             usbsts: 0x0001, // HCHalted = 1 on reset
-            pagesize: 1, // 4096 bytes
+            pagesize: 1,    // 4096 bytes
             dnctrl: 0,
             crcr: 0,
             dcbaap: 0,
@@ -395,7 +395,7 @@ impl OperationalRegisters {
     }
 
     /// Write to USBSTS — write-1-to-clear semantics for event bits.
-    pub fn write_usbsts(&mut self, value: u32) {
+    pub const fn write_usbsts(&mut self, value: u32) {
         // HSE(2), EINT(3), PCD(4) are write-1-to-clear
         let w1c_mask: u32 = 0x1C;
         let w1c_bits = value & w1c_mask;
@@ -410,9 +410,9 @@ impl OperationalRegisters {
             0x04 => self.usbsts,
             0x08 => self.pagesize,
             0x14 => self.dnctrl,
-            0x18 => self.crcr as u32,
+            0x18 => u32_of(self.crcr),
             0x1C => (self.crcr >> 32) as u32,
-            0x30 => self.dcbaap as u32,
+            0x30 => u32_of(self.dcbaap),
             0x34 => (self.dcbaap >> 32) as u32,
             0x38 => self.config,
             offset if offset >= 0x400 => {
@@ -420,17 +420,13 @@ impl OperationalRegisters {
                 let port_offset = offset - 0x400;
                 let port_idx = (port_offset / 16) as usize;
                 let reg_offset = port_offset % 16;
-                if let Some(port) = self.ports.get(port_idx) {
-                    match reg_offset {
-                        0 => port.portsc,
-                        4 => port.portpmsc,
-                        8 => port.portli,
-                        12 => port.porthlpmc,
-                        _ => 0,
-                    }
-                } else {
-                    0
-                }
+                self.ports.get(port_idx).map_or(0, |port| match reg_offset {
+                    0 => port.portsc,
+                    4 => port.portpmsc,
+                    8 => port.portli,
+                    12 => port.porthlpmc,
+                    _ => 0,
+                })
             }
             _ => 0,
         }
@@ -469,7 +465,7 @@ impl RuntimeRegisters {
     }
 
     /// Advance the microframe index (called periodically at 125µs intervals).
-    pub fn tick(&mut self) {
+    pub const fn tick(&mut self) {
         self.mfindex = (self.mfindex + 1) & 0x3FFF;
     }
 }

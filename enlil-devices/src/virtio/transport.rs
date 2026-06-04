@@ -3,7 +3,7 @@
 //! Implements the `VirtIO` MMIO transport specification for device discovery
 //! and configuration by guest drivers.
 
-use super::{VirtioDeviceType, VirtioStatus, VIRTIO_MMIO_MAGIC};
+use super::{VIRTIO_MMIO_MAGIC, VirtioDeviceType, VirtioStatus};
 
 /// `VirtIO` MMIO register offsets.
 pub mod regs {
@@ -109,12 +109,10 @@ impl MmioTransport {
                     self.device_features >> 32
                 }
             }
-            regs::QUEUE_NUM_MAX => {
-                self.current_queue().map_or(0, |q| u64::from(q.max_size))
-            }
-            regs::QUEUE_READY => {
-                self.current_queue().map_or(0, |q| u64::from(u8::from(q.ready)))
-            }
+            regs::QUEUE_NUM_MAX => self.current_queue().map_or(0, |q| u64::from(q.max_size)),
+            regs::QUEUE_READY => self
+                .current_queue()
+                .map_or(0, |q| u64::from(u8::from(q.ready))),
             regs::INTERRUPT_STATUS => u64::from(self.interrupt_status),
             regs::STATUS => u64::from(self.status.bits()),
             regs::CONFIG_GENERATION => u64::from(self.config_generation),
@@ -129,11 +127,12 @@ impl MmioTransport {
             regs::DEVICE_FEATURES_SEL => self.device_features_sel = val32,
             regs::DRIVER_FEATURES => {
                 if self.driver_features_sel == 0 {
-                    self.driver_features = (self.driver_features & !0xFFFF_FFFF) | (u64::from(val32));
+                    self.driver_features =
+                        (self.driver_features & !0xFFFF_FFFF) | (u64::from(val32));
                 } else {
-                    #[allow(clippy::cast_possible_wrap)]
                     {
-                        self.driver_features = (self.driver_features & 0xFFFF_FFFF) | ((u64::from(val32)) << 32);
+                        self.driver_features =
+                            (self.driver_features & 0xFFFF_FFFF) | ((u64::from(val32)) << 32);
                     }
                 }
             }
@@ -141,7 +140,6 @@ impl MmioTransport {
             regs::QUEUE_SEL => self.queue_sel = val32,
             regs::QUEUE_NUM => {
                 if let Some(q) = self.current_queue_mut() {
-                    #[allow(clippy::cast_possible_truncation)]
                     {
                         q.size = u16::try_from(value).unwrap_or(0);
                     }
@@ -168,7 +166,6 @@ impl MmioTransport {
             }
             regs::QUEUE_DESC_HIGH => {
                 if let Some(q) = self.current_queue_mut() {
-                    #[allow(clippy::cast_possible_wrap)]
                     {
                         q.desc_addr = (q.desc_addr & 0xFFFF_FFFF) | ((u64::from(val32)) << 32);
                     }
@@ -181,7 +178,6 @@ impl MmioTransport {
             }
             regs::QUEUE_AVAIL_HIGH => {
                 if let Some(q) = self.current_queue_mut() {
-                    #[allow(clippy::cast_possible_wrap)]
                     {
                         q.avail_addr = (q.avail_addr & 0xFFFF_FFFF) | ((u64::from(val32)) << 32);
                     }
@@ -194,7 +190,6 @@ impl MmioTransport {
             }
             regs::QUEUE_USED_HIGH => {
                 if let Some(q) = self.current_queue_mut() {
-                    #[allow(clippy::cast_possible_wrap)]
                     {
                         q.used_addr = (q.used_addr & 0xFFFF_FFFF) | ((u64::from(val32)) << 32);
                     }
@@ -313,7 +308,11 @@ mod tests {
         t.write(regs::STATUS, 4, u64::from(VirtioStatus::ACKNOWLEDGE.bits()));
         assert_eq!(t.status(), VirtioStatus::ACKNOWLEDGE);
 
-        t.write(regs::STATUS, 4, u64::from((VirtioStatus::ACKNOWLEDGE | VirtioStatus::DRIVER).bits()));
+        t.write(
+            regs::STATUS,
+            4,
+            u64::from((VirtioStatus::ACKNOWLEDGE | VirtioStatus::DRIVER).bits()),
+        );
         assert!(t.status().contains(VirtioStatus::DRIVER));
 
         // Reset

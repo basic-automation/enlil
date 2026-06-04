@@ -4,7 +4,8 @@
 //! offsets to host file offsets. Write support is deferred to a later phase.
 
 use super::StorageBackend;
-use anyhow::{bail, Context, Result};
+use crate::truncate::usize_of;
+use anyhow::{Context, Result, bail};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Mutex;
@@ -20,9 +21,9 @@ pub struct QcowHeader {
     pub backing_file_offset: u64,
     pub backing_file_size: u32,
     pub cluster_bits: u32,
-    pub size: u64,           // virtual size in bytes
+    pub size: u64, // virtual size in bytes
     pub crypt_method: u32,
-    pub l1_size: u32,        // number of L1 table entries
+    pub l1_size: u32, // number of L1 table entries
     pub l1_table_offset: u64,
     pub refcount_table_offset: u64,
     pub refcount_table_clusters: u32,
@@ -124,7 +125,6 @@ impl QcowBackend {
 
     /// Resolve a guest byte offset to a host file offset.
     /// Returns `None` if the cluster is unallocated (read as zeroes).
-    #[allow(clippy::cast_possible_truncation)]
     fn resolve_offset(&self, guest_offset: u64, file: &mut File) -> Result<Option<u64>> {
         let cluster_size = self.header.cluster_size();
         let l2_entries = self.header.l2_entries();
@@ -135,7 +135,7 @@ impl QcowBackend {
             return Ok(None);
         }
 
-        let l1_entry = self.l1_table[l1_index as usize];
+        let l1_entry = self.l1_table[usize_of(l1_index)];
         // Bits 9..55 contain the offset of the L2 table
         let l2_table_offset = l1_entry & 0x00FF_FFFF_FFFF_FE00;
         if l2_table_offset == 0 {
@@ -164,7 +164,6 @@ impl QcowBackend {
 }
 
 impl StorageBackend for QcowBackend {
-    #[allow(clippy::cast_possible_truncation)]
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
         if offset >= self.header.size {
             return Ok(0);
@@ -172,13 +171,13 @@ impl StorageBackend for QcowBackend {
         let mut file = self.file.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let cluster_size = self.header.cluster_size();
         let mut total_read = 0usize;
-        let mut remaining = buf.len().min((self.header.size - offset) as usize);
+        let mut remaining = buf.len().min(usize_of(self.header.size - offset));
         let mut current_offset = offset;
 
         while remaining > 0 {
             // How many bytes until the end of this cluster?
-            let in_cluster = (current_offset % cluster_size) as usize;
-            let chunk = remaining.min((cluster_size as usize) - in_cluster);
+            let in_cluster = usize_of(current_offset % cluster_size);
+            let chunk = remaining.min(usize_of(cluster_size) - in_cluster);
 
             match self.resolve_offset(current_offset, &mut file)? {
                 Some(host_offset) => {
@@ -220,6 +219,7 @@ impl StorageBackend for QcowBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::truncate::u8_of;
 
     fn make_minimal_qcow2() -> Vec<u8> {
         // Build a minimal valid qcow2 v2 image:
@@ -244,18 +244,18 @@ mod tests {
 
         // Header
         img[0..4].copy_from_slice(&QCOW2_MAGIC.to_be_bytes());
-        img[4..8].copy_from_slice(&2u32.to_be_bytes());       // version
-        img[8..16].copy_from_slice(&0u64.to_be_bytes());      // backing_file_offset
-        img[16..20].copy_from_slice(&0u32.to_be_bytes());     // backing_file_size
+        img[4..8].copy_from_slice(&2u32.to_be_bytes()); // version
+        img[8..16].copy_from_slice(&0u64.to_be_bytes()); // backing_file_offset
+        img[16..20].copy_from_slice(&0u32.to_be_bytes()); // backing_file_size
         img[20..24].copy_from_slice(&cluster_bits.to_be_bytes());
         img[24..32].copy_from_slice(&virtual_size.to_be_bytes());
-        img[32..36].copy_from_slice(&0u32.to_be_bytes());     // crypt_method
-        img[36..40].copy_from_slice(&1u32.to_be_bytes());     // l1_size = 1
+        img[32..36].copy_from_slice(&0u32.to_be_bytes()); // crypt_method
+        img[36..40].copy_from_slice(&1u32.to_be_bytes()); // l1_size = 1
         img[40..48].copy_from_slice(&l1_offset.to_be_bytes());
-        img[48..56].copy_from_slice(&0u64.to_be_bytes());     // refcount_table_offset
-        img[56..60].copy_from_slice(&0u32.to_be_bytes());     // refcount_table_clusters
-        img[60..64].copy_from_slice(&0u32.to_be_bytes());     // nb_snapshots
-        img[64..72].copy_from_slice(&0u64.to_be_bytes());     // snapshots_offset
+        img[48..56].copy_from_slice(&0u64.to_be_bytes()); // refcount_table_offset
+        img[56..60].copy_from_slice(&0u32.to_be_bytes()); // refcount_table_clusters
+        img[60..64].copy_from_slice(&0u32.to_be_bytes()); // nb_snapshots
+        img[64..72].copy_from_slice(&0u64.to_be_bytes()); // snapshots_offset
 
         // L1 table: entry 0 → L2 table at cluster 2
         let l1_start = cluster_size;
@@ -267,9 +267,8 @@ mod tests {
 
         // Data cluster: fill with a pattern
         let data_start = 3 * cluster_size;
-        #[allow(clippy::cast_possible_truncation)]
         for i in 0..cluster_size {
-            img[data_start + i] = (i & 0xFF) as u8;
+            img[data_start + i] = u8_of(i & 0xFF);
         }
 
         img
@@ -300,9 +299,8 @@ mod tests {
         let mut buf = vec![0u8; 256];
         let n = backend.read_at(0, &mut buf).unwrap();
         assert_eq!(n, 256);
-        #[allow(clippy::cast_possible_truncation)]
         for (i, &b) in buf.iter().enumerate() {
-            assert_eq!(b, (i & 0xFF) as u8, "mismatch at offset {i}");
+            assert_eq!(b, u8_of(i & 0xFF), "mismatch at offset {i}");
         }
     }
 
@@ -318,7 +316,10 @@ mod tests {
         let mut buf = vec![0xFFu8; 256];
         let n = backend.read_at(65536, &mut buf).unwrap();
         assert_eq!(n, 256);
-        assert!(buf.iter().all(|&b| b == 0), "unallocated cluster should be zeroes");
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "unallocated cluster should be zeroes"
+        );
     }
 
     #[test]

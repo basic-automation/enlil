@@ -13,7 +13,7 @@ pub struct OemInfo {
 impl OemInfo {
     /// AMI BIOS-style OEM info (most common on consumer boards)
     #[must_use]
-    pub fn ami() -> Self {
+    pub const fn ami() -> Self {
         Self {
             oem_id: *b"ALASKA",
             oem_table_id: *b"A M I   ",

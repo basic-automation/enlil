@@ -126,8 +126,7 @@ impl CpuidFilter {
                     out.ecx &= !(1 << 31);
                 }
                 // Report correct logical processor count in `EBX`[23:16]
-                out.ebx = (out.ebx & 0xFF00_FFFF)
-                    | ((self.topology.logical_cpus & 0xFF) << 16);
+                out.ebx = (out.ebx & 0xFF00_FFFF) | ((self.topology.logical_cpus & 0xFF) << 16);
                 // Set initial `APIC` ID in `EBX`[31:24] (will be per-vCPU)
                 // Leave as-is for now — set per-vCPU at runtime
             }
@@ -140,8 +139,8 @@ impl CpuidFilter {
 
                 let sharing = match entry.index {
                     0 | 1 => self.topology.l1_sharing, // L1 data and instruction
-                    2 => self.topology.l2_sharing, // L2 unified
-                    3 => self.topology.l3_sharing, // L3 unified
+                    2 => self.topology.l2_sharing,     // L2 unified
+                    3 => self.topology.l3_sharing,     // L3 unified
                     _ => 1,
                 };
 
@@ -160,19 +159,17 @@ impl CpuidFilter {
                         // `SMT` level: threads per core
                         let shift = u32::from(self.topology.threads_per_core > 1);
                         out.eax = (out.eax & 0xFFFF_FFE0) | (shift & 0x1F);
-                        out.ebx = (out.ebx & 0xFFFF_0000)
-                            | (self.topology.threads_per_core & 0xFFFF);
+                        out.ebx =
+                            (out.ebx & 0xFFFF_0000) | (self.topology.threads_per_core & 0xFFFF);
                         // `ECX`[15:8] = level type (1 = `SMT`)
                         out.ecx = (out.ecx & 0xFFFF_00FF) | (1 << 8);
                     }
                     1 => {
                         // Core level: logical processors per package
-                        let shift = 32u32.saturating_sub(
-                            self.topology.logical_cpus.leading_zeros()
-                        );
+                        let shift =
+                            32u32.saturating_sub(self.topology.logical_cpus.leading_zeros());
                         out.eax = (out.eax & 0xFFFF_FFE0) | (shift & 0x1F);
-                        out.ebx = (out.ebx & 0xFFFF_0000)
-                            | (self.topology.logical_cpus & 0xFFFF);
+                        out.ebx = (out.ebx & 0xFFFF_0000) | (self.topology.logical_cpus & 0xFFFF);
                         // `ECX`[15:8] = level type (2 = Core)
                         out.ecx = (out.ecx & 0xFFFF_00FF) | (2 << 8);
                     }
@@ -185,10 +182,9 @@ impl CpuidFilter {
                 }
             }
             // Leaf 0x4000_0000-0x4000_00FF: Hypervisor leaves
-            0x4000_0000..=0x4000_00FF
-                if self.hide_hypervisor => {
-                    return None; // hide all hypervisor-specific leaves
-                }
+            0x4000_0000..=0x4000_00FF if self.hide_hypervisor => {
+                return None; // hide all hypervisor-specific leaves
+            }
             _ => {}
         }
 

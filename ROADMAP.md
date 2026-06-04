@@ -217,6 +217,25 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 - Use `vm-superio` for a serial console (COM1) so the guest can print to your terminal
 - **Milestone:** Boot a minimal Linux kernel (e.g., a buildroot initramfs) to a shell over serial
 
+> **Status (2026-06-02):** `enlil-core::kvm_backend` implements the backend skeleton —
+> `KvmBackend::{new, map_memory, create_vcpu, run_vcpu}` over `kvm-ioctls`, with a
+> hypervisor-agnostic `GuestExit` model and a `VmExitHandler` trait
+> (`io_in/io_out/mmio_read/mmio_write`). Integration tests that touch `/dev/kvm`
+> self-skip when nested virt is unavailable. `map_memory` intentionally uses the classic `set_user_memory_region`
+> (hva-backed) so the host can synthesise/introspect guest memory for ACPI/SMBIOS
+> injection; a `set_user_memory_region2` / `guest_memfd` path is only needed for
+> confidential guests (Phase 8) and is incompatible with that introspection.
+>
+> **Status (2026-06-03):** the device bus is now real. `enlil-devices::bus`
+> (`PioBus`/`MmioBus`) owns `Box<dyn PioDevice/MmioDevice>` registered over explicit
+> address *ranges* (overlap-rejecting, upper-bound-checked) and dispatches byte-slice
+> accesses with little-endian width conversion and x86 open-bus semantics for unmapped
+> addresses. `enlil-core::device_bus::DeviceBus` bundles one of each and implements
+> `VmExitHandler`, forwarding straight to the bus — the single decode path. **Next:**
+> register the 16550 serial UART (`enlil-core::serial`) as a `PioDevice` at `0x3F8` so
+> a guest's serial writes reach the console, then a `/dev/kvm`-gated test that boots a
+> tiny code blob which writes to COM1 and `hlt`s, asserting the bytes arrived.
+
 ### 0.3 USB Live Boot & Non-Destructive Testing (CRITICAL FOR ADOPTION)
 
 Enlil must be testable without modifying the user's existing system. This is the single most important usability feature for early adoption.

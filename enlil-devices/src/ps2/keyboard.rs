@@ -67,7 +67,7 @@ impl Ps2Keyboard {
     pub fn receive_command(&mut self, data: u8) -> Option<u8> {
         // If we're waiting for a data byte from a previous command
         if let Some(cmd) = self.awaiting_data_for.take() {
-            return self.handle_data_byte(cmd, data);
+            return Some(self.handle_data_byte(cmd, data));
         }
 
         match data {
@@ -130,28 +130,23 @@ impl Ps2Keyboard {
     }
 
     /// Handle a data byte following a command
-    fn handle_data_byte(&mut self, cmd: u8, data: u8) -> Option<u8> {
+    fn handle_data_byte(&mut self, cmd: u8, data: u8) -> u8 {
         match cmd {
             0xED => {
                 self.led_state = data & 0x07;
-                Some(ACK)
             }
             0xF0 => {
                 if data == 0 {
                     // Get current scancode set
                     self.output_queue.push_back(self.scancode_set);
-                    Some(ACK)
                 } else {
-                    self.scancode_set = data.min(3).max(1);
-                    Some(ACK)
+                    self.scancode_set = data.clamp(1, 3);
                 }
             }
-            0xF3 => {
-                // Typematic rate — accepted and ignored
-                Some(ACK)
-            }
-            _ => Some(ACK),
+            // 0xF3 (typematic rate) and any other command: just acknowledge.
+            _ => {}
         }
+        ACK
     }
 
     /// Inject a scancode from the host (set 1 make/break code)
@@ -228,7 +223,7 @@ mod tests {
     fn set_leds() {
         let mut kb = Ps2Keyboard::new();
         assert_eq!(kb.receive_command(0xED), Some(ACK));
-        assert_eq!(kb.handle_data_byte(0xED, 0x07), Some(ACK));
+        assert_eq!(kb.handle_data_byte(0xED, 0x07), ACK);
         assert_eq!(kb.led_state, 0x07);
     }
 
