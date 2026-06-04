@@ -135,16 +135,16 @@ behind a `#[cfg(target_arch = "…")]` gate — the core, device, config, and ma
 don't change.
 
 ```rust
-pub trait HypervisorBackend {
-    type VCpu;
-    type PageTable;
-    type InterruptController;
+pub trait HypervisorBackend: Send + Sync {
+    type VCpu: Send;
+    type PageTable: Send;
+    type InterruptController: Send;
 
-    fn create_vcpu(&self, config: VCpuConfig) -> Result<Self::VCpu>;
-    fn run_vcpu(&self, vcpu: &mut Self::VCpu) -> Result<VmExit>;
-    fn handle_exit(&self, vcpu: &mut Self::VCpu, exit: VmExit) -> Result<Action>;
-    fn map_guest_memory(&self, pt: &mut Self::PageTable, gpa: u64, hpa: u64, size: u64, perms: Permissions) -> Result<()>;
-    fn inject_interrupt(&self, vcpu: &mut Self::VCpu, ic: &Self::InterruptController, vector: u8) -> Result<()>;
+    fn create_vcpu(&self, config: &VCpuConfig) -> HalResult<Self::VCpu>;
+    fn run_vcpu(&self, vcpu: &mut Self::VCpu) -> HalResult<VmExit>;
+    fn handle_exit(&self, vcpu: &mut Self::VCpu, exit: &VmExit) -> HalResult<bool>;
+    fn map_guest_memory(&self, page_table: &mut Self::PageTable, guest_addr: u64, host_addr: u64, size: u64, writable: bool) -> HalResult<()>;
+    fn inject_interrupt(&self, vcpu: &mut Self::VCpu, controller: &Self::InterruptController, irq: u32) -> HalResult<()>;
 }
 ```
 
