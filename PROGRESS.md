@@ -6,6 +6,69 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-04 — 16550 UART on the device bus + real-mode KVM serial smoke test (Phase 0.2)
+
+The previous run's recommended next step: register the 16550 UART as a `PioDevice` at
+COM1 and add a `/dev/kvm`-gated test that boots a tiny blob writing to COM1. Done.
+
+### Situation found
+`enlil-core::serial` had a complete `UartState` (16550 register file: IER/IIR/LCR/LSR/
+MCR/MSR/SCR + DLAB divisor, RX FIFO, pluggable `SerialOutput` sink) and a
+`SerialMultiplexer`, but **nothing implemented `enlil_devices::bus::PioDevice`**, so the
+UART could not be mounted on the real `DeviceBus`/`VmExitHandler` path landed on 06-03.
+The `device_bus` tests used a hand-rolled `FakeSerial`, never the real UART.
+
+### What I did (one increment: the UART becomes a real bus device, verified end-to-end)
+- **`enlil-core::serial::SerialPort`** — a new `PioDevice` adapter bundling a `UartState`
+  with its COM base port, claiming `[base, base+8)`. `pio_read/pio_write` map the absolute
+  guest port to the 0–7 register offset (`port - base`) and forward to the UART; serial
+  registers are byte-wide so writes take the low byte. `com1()` convenience ctor.
+- **`DeviceBus::add_serial(SerialPort)`** helper (thin wrapper over `add_pio`).
+- **`SerialOutputMode::Shared(Arc<Mutex<Vec<u8>>>)`** — a new sink mode that appends TX
+  to a *caller-owned* buffer, so guest serial output stays observable after the device is
+  moved into the bus (the host console/logger reads the same `Arc`). This is what made a
+  real end-to-end assertion possible, and is the primitive the console/display path needs.
+- **`KvmBackend::prepare_real_mode_vcpu(index, entry)`** — minimal flat 16-bit real-mode
+  setup (all segment bases 0, `rip=entry`, `rflags=0x2`) so a small real-mode blob can run.
+  Genuinely useful primitive (compiled, not executed here — no `/dev/kvm`).
+- **Tests:** 5 `SerialPort` unit tests (range claim, port→offset mapping, TX to sink, LSR
+  TX-ready, RX injection round-trip), 1 `Shared`-mode test, 1 `real_serial_uart_on_the_bus`
+  (drives the real UART through the real `VmExitHandler` and asserts "OK" reached the
+  shared sink — runs here, no KVM), and 1 `/dev/kvm`-gated **`serial_console_smoke`**:
+  assembles `mov dx,0x3F8; mov al,'O'; out; mov al,'K'; out; hlt`, maps it at gphys 0x1000,
+  runs it via `KvmBackend::run_vcpu` with the `DeviceBus` handler, and asserts the guest
+  reached HLT and "OK" landed in the sink.
+
+### Research (informed the design) — logged in `enlil-research-review.md` (2026-06-04)
+rust-vmm **`vm-superio` `Serial`**: confirms our `UartState` register set is complete
+(same registers; FCR need not be emulated — FIFO is always-on). **Pitfall surfaced:**
+vm-superio raises RX/THR interrupts via a `Trigger`/eventfd; our UART is **polled-only**
+(stores IER, never raises IRQ4). Linux's 8250 driver can run polled so a shell works, but
+interrupt-driven mode needs IRQ4 into the in-kernel IRQ chip — logged as the next step.
+Also noted vm-superio issue #17 (unbounded RX) → cap `inject_input` before wiring host stdin.
+
+### Test results (exact)
+- `cargo fmt --all -- --check` → **OK**
+- `cargo clippy --all-targets --workspace -- -D warnings` → **OK** (clean)
+- `cargo test --workspace` → **647 passed, 0 failed** (was 639; +8). `enlil-core`: 115.
+- `serial_console_smoke` + `kvm_create_vm_and_map_memory`: **self-skipped — `/dev/kvm` not
+  present on this runner (no nested virt).** `prepare_real_mode_vcpu` and the run loop are
+  compiled but NOT executed here; needs a KVM-capable runner to actually exercise.
+- no_std custom-target build: **N/A** — no crate is `#![no_std]` yet.
+
+### Recommended next step (tomorrow)
+1. **Interrupt-driven serial:** give `SerialPort` an IRQ4 sink (an `EventFd` raised via
+   `KVM_IRQ_LINE` through the in-kernel IRQ chip) fired on RX-available / THR-empty,
+   honoring IER and producing the correct IIR identification byte. This is what a default
+   Linux 8250 driver expects and unblocks an actual interactive serial shell. The polled
+   path already works (this run), so this is the next transparency increment.
+2. Then the next early-boot PIO devices: **PIT** (`0x40-0x43`) and **PCI config**
+   (`0xCF8/0xCFC`) as `PioDevice`s on the bus.
+3. Cap `UartState`'s RX `VecDeque` (drop-oldest) before wiring a real host-stdin source
+   (vm-superio issue #17).
+
+---
+
 ## 2026-06-03 — Real device bus + KVM `VmExitHandler` bridge (Phase 2 / 0.2)
 
 The previous run's recommended next step: give guest exits somewhere to go. Done —

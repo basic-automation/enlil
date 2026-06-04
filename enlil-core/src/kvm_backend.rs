@@ -281,6 +281,50 @@ mod linux {
             self.vcpus.len()
         }
 
+        /// Point vCPU `index` at a flat 16-bit real-mode entry: every segment
+        /// gets base 0 (so `rip` is a direct guest-physical offset), `rip` is
+        /// set to `entry`, and `rflags` to the reserved-bit-only `0x2`.
+        ///
+        /// This is the minimal setup needed to execute a small real-mode code
+        /// blob (the shape the Phase 0.2 serial smoke test uses); a full Linux
+        /// boot will instead enter protected/long mode with a GDT.
+        ///
+        /// # Errors
+        /// Returns [`Error::Vcpu`] if `index` is out of range or any of the
+        /// `KVM_{GET,SET}_{SREGS,REGS}` ioctls fail.
+        pub fn prepare_real_mode_vcpu(&self, index: usize, entry: u64) -> Result<()> {
+            let vcpu = self
+                .vcpus
+                .get(index)
+                .ok_or_else(|| Error::Vcpu(format!("no vcpu at index {index}")))?;
+
+            let mut sregs = vcpu
+                .get_sregs()
+                .map_err(|e| Error::Vcpu(format!("KVM_GET_SREGS: {e}")))?;
+            for seg in [
+                &mut sregs.cs,
+                &mut sregs.ds,
+                &mut sregs.es,
+                &mut sregs.fs,
+                &mut sregs.gs,
+                &mut sregs.ss,
+            ] {
+                seg.base = 0;
+                seg.selector = 0;
+            }
+            vcpu.set_sregs(&sregs)
+                .map_err(|e| Error::Vcpu(format!("KVM_SET_SREGS: {e}")))?;
+
+            let mut regs = vcpu
+                .get_regs()
+                .map_err(|e| Error::Vcpu(format!("KVM_GET_REGS: {e}")))?;
+            regs.rip = entry;
+            regs.rflags = 0x2;
+            vcpu.set_regs(&regs)
+                .map_err(|e| Error::Vcpu(format!("KVM_SET_REGS: {e}")))?;
+            Ok(())
+        }
+
         /// Registered guest memory slots.
         #[must_use]
         pub fn mem_slots(&self) -> &[MemSlot] {
