@@ -294,8 +294,7 @@ enlil/
   the owning guest's memory.
 - **Minimal attack surface.** In bare-metal mode Enlil runs no OS — it *is* the OS. No
   syscalls, no kernel modules, no userspace; the only ring-0/EL2 code is Enlil itself.
-- **Rust safety.** `unsafe` is confined to `enlil-platform` (allocator, threading primitives)
-  and `enlil-hal` (VMX/SVM instructions, page-table manipulation). Everything else is safe Rust.
+- **Rust safety.** `unsafe` is minimized and kept to small, audited blocks; it is concentrated in `enlil-platform` and `enlil-hal`, with some `unsafe` in `enlil-core`/`enlil-devices` for FFI and CPU instructions.
 
 The roadmap goes further with confidential-VM support (AMD SEV-SNP / Intel TDX) and optional
 ZK-proof attestation and cross-guest isolation proofs — see [`RESEARCH.md`](RESEARCH.md).
