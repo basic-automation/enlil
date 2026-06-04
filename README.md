@@ -185,19 +185,19 @@ cargo fmt --check
 cargo build --target x86_64-unknown-enlil.json -Z build-std=core,alloc,std
 ```
 
-| Target | Platform backend | HAL backend | Use case |
-|--------|------------------|-------------|----------|
-| `x86_64-unknown-linux-gnu` | `platform-linux` | `KvmBackend` | Development (Phases 0–5) |
-| `x86_64-unknown-enlil` | `platform-baremetal` | `VmxBackend` | Production (Phase 6+) |
+| Target | Platform feature | Hypervisor backend | Use case |
+|--------|------------------|--------------------|----------|
+| `x86_64-unknown-linux-gnu` | `platform-linux` | KVM (via `cfg(target_os = "linux")` deps) | Development (Phases 0–5) |
+| `x86_64-unknown-enlil` | `platform-baremetal` | Native VMX (bare-metal) | Production (Phase 6+) |
 
-Feature flags and `cfg` attributes select the backend at compile time (no runtime dispatch):
+The **platform** is selected by feature flag at compile time. The **hypervisor backend**
+(KVM vs. native VMX) is determined automatically by the target OS — there is no separate
+`backend-*` feature flag:
 
 | Feature flag | Effect |
 |--------------|--------|
-| `platform-linux` | Use the std-delegating platform (default) |
+| `platform-linux` | Use the std-delegating platform (default for hosted builds) |
 | `platform-baremetal` | Use the bare-metal platform implementations |
-| `backend-kvm` | Compile the KVM HAL backend |
-| `backend-vmx` | Compile the native VMX HAL backend |
 
 > The KVM-backed path requires a Linux host with `/dev/kvm`; live guest-boot tests
 > additionally need nested virtualization. Where that isn't available, those tests are
