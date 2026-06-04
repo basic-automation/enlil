@@ -20,7 +20,7 @@ Linux, Windows, *BSD, x86 Android near-term; ARM Android and Apple-Silicon via P
 macOS (Apple HW) and iOS as constrained/research targets. Interconnect latency sets what
 can be pooled at what distance (PCIe/CXL → RDMA → WAN); a kernel's hot CPU+RAM working set
 stays on one node, everything else is poolable with latency-aware placement. See
-`enlil-roadmap.md` → **Core Model** for the authoritative architecture. Every run should
+`ROADMAP.md` → **Core Model** for the authoritative architecture. Every run should
 move some roadmap phase toward that end state.
 
 ---
@@ -28,7 +28,7 @@ move some roadmap phase toward that end state.
 Do these in order, in one focused session:
 
 ### 1. Orient (read before writing)
-- Read `enlil-roadmap.md`, `ARCHITECTURE.md`, the latest `PHASE*-IMPLEMENTATION.md`, and
+- Read `ROADMAP.md`, `README.md`, the latest `PHASE*-IMPLEMENTATION.md`, and
   `PROGRESS.md` (the running log) if it exists.
 - Run `git log --oneline -15` to see what recent runs actually landed.
 - Identify the current phase and the **single next unimplemented item** — the first
@@ -42,12 +42,12 @@ Do these in order, in one focused session:
   mediated passthrough / vGPU, VirtIO, hypervisor transparency / anti-detection, live
   migration, RDMA & disaggregated compute (Phases 9/11). Prefer arXiv and OSDI/SOSP/
   USENIX ATC papers and primary vendor docs (Intel SDM, AMD APM) over blogs.
-- Append findings to `enlil-research-review.md` under a dated heading: source link + 1–2
+- Append findings to `RESEARCH.md` under a dated heading: source link + 1–2
   lines on **how it changes what we build**. Skip anything already logged there.
 - If nothing new applies, write one line saying so and move on.
 
 ### 3. Fold insights into the roadmap
-- Make **surgical** edits to `enlil-roadmap.md` only where research changes the plan
+- Make **surgical** edits to `ROADMAP.md` only where research changes the plan
   (reprioritize, add a sub-task, flag a pitfall). Never rewrite it wholesale.
 
 ### 4. Build the next step
