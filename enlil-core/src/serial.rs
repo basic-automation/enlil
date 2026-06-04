@@ -11,6 +11,11 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
+use enlil_devices::bus::PioDevice;
+
+/// Number of contiguous I/O ports a 16550 UART occupies (`base..base+8`).
+pub const SERIAL_PORT_COUNT: u16 = 8;
+
 // ---------------------------------------------------------------------------
 // COM port base addresses
 // ---------------------------------------------------------------------------
@@ -91,8 +96,14 @@ pub enum SerialOutputMode {
     File(String),
     /// Discard all output silently.
     Null,
-    /// Collect output in an in-memory buffer (useful for testing).
+    /// Collect output in an in-memory buffer owned by this sink (testing).
     Buffer,
+    /// Append every transmitted byte to a caller-owned shared buffer.
+    ///
+    /// Unlike [`Self::Buffer`], the handle is held by the caller, so the guest's
+    /// serial output stays observable even after the owning device has been
+    /// moved into a bus (the host console / logger reads from the same `Arc`).
+    Shared(Arc<Mutex<Vec<u8>>>),
 }
 
 // ---------------------------------------------------------------------------
@@ -141,6 +152,12 @@ impl SerialOutput {
 
             SerialOutputMode::Buffer => {
                 self.mem_buf.push(byte);
+            }
+
+            SerialOutputMode::Shared(buf) => {
+                if let Ok(mut v) = buf.lock() {
+                    v.push(byte);
+                }
             }
 
             SerialOutputMode::Stdout => {
@@ -192,8 +209,8 @@ impl SerialOutput {
             SerialOutputMode::Null => {
                 self.line_buf.clear();
             }
-            SerialOutputMode::Buffer => {
-                // line_buf isn't used for Buffer mode, but just in case:
+            SerialOutputMode::Buffer | SerialOutputMode::Shared(_) => {
+                // line_buf isn't used for Buffer/Shared mode, but just in case:
                 self.line_buf.clear();
             }
             SerialOutputMode::Stdout => {
@@ -379,6 +396,75 @@ impl UartState {
 }
 
 // ---------------------------------------------------------------------------
+// SerialPort — a UART mounted on the device bus as a PIO device
+// ---------------------------------------------------------------------------
+
+/// A single 16550 UART exposed on the port-I/O bus as a [`PioDevice`].
+///
+/// Bundles a [`UartState`] with its COM base port and claims the half-open
+/// range `[base, base + 8)`. Guest `IN`/`OUT` on those ports are dispatched here
+/// by the bus (see `enlil-core::device_bus::DeviceBus`); the absolute port is
+/// translated to the 0–7 register offset the UART expects. Register one on a
+/// [`crate::device_bus::DeviceBus`] to give a guest a working serial console.
+///
+/// The UART is currently **polled-only**: it computes the Line Status Register
+/// (TX-ready, RX-available) on read but does not raise IRQ4. Interrupt-driven
+/// operation is a follow-on (see roadmap Phase 0.2).
+pub struct SerialPort {
+    base: u16,
+    uart: UartState,
+}
+
+impl SerialPort {
+    /// Create a serial port at `base` backed by `uart`.
+    #[must_use]
+    pub const fn new(base: u16, uart: UartState) -> Self {
+        Self { base, uart }
+    }
+
+    /// Convenience: a COM1 (`0x3F8`) serial port routing TX to `output`.
+    #[must_use]
+    pub fn com1(output: SerialOutput) -> Self {
+        Self::new(COM1, UartState::new(output))
+    }
+
+    /// The COM base port this device is mapped at.
+    #[must_use]
+    pub const fn base(&self) -> u16 {
+        self.base
+    }
+
+    /// Borrow the underlying UART (e.g. to inject RX input).
+    #[must_use]
+    pub const fn uart(&self) -> &UartState {
+        &self.uart
+    }
+
+    /// Mutably borrow the underlying UART (e.g. to inject RX input or read TX).
+    pub const fn uart_mut(&mut self) -> &mut UartState {
+        &mut self.uart
+    }
+}
+
+impl PioDevice for SerialPort {
+    fn pio_read(&mut self, port: u16, _size: u8) -> u32 {
+        // The bus only routes ports within our range here, so `port >= base`.
+        let offset = port.wrapping_sub(self.base);
+        u32::from(self.uart.read_register(offset))
+    }
+
+    fn pio_write(&mut self, port: u16, _size: u8, data: u32) {
+        let offset = port.wrapping_sub(self.base);
+        // Serial registers are byte-wide; the guest writes the low byte.
+        self.uart.write_register(offset, data.to_le_bytes()[0]);
+    }
+
+    fn port_range(&self) -> (u16, u16) {
+        (self.base, self.base + SERIAL_PORT_COUNT)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SerialMultiplexer — manages serial ports for all guests
 // ---------------------------------------------------------------------------
 
@@ -513,6 +599,17 @@ mod tests {
             out.write_byte(b);
         }
         assert_eq!(out.buffer_contents(), msg);
+    }
+
+    #[test]
+    fn test_shared_mode_appends_to_caller_buffer() {
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let mut out = SerialOutput::new("guest0", SerialOutputMode::Shared(Arc::clone(&sink)));
+        for &b in b"Hi\n" {
+            out.write_byte(b);
+        }
+        // Shared mode forwards raw bytes (no line buffering) to the caller's Vec.
+        assert_eq!(&*sink.lock().unwrap(), b"Hi\n");
     }
 
     #[test]
@@ -771,6 +868,51 @@ mod tests {
         // 'b' scratch should still be 0.
         assert_eq!(mux.handle_read("b", SCR_REG), 0x00);
         assert_eq!(mux.handle_read("a", SCR_REG), 0x42);
+    }
+
+    // -- SerialPort (bus device) tests --
+
+    #[test]
+    fn test_serial_port_claims_eight_ports_at_base() {
+        let port = SerialPort::com1(SerialOutput::new("g", SerialOutputMode::Null));
+        assert_eq!(port.base(), COM1);
+        assert_eq!(PioDevice::port_range(&port), (0x3F8, 0x400));
+    }
+
+    #[test]
+    fn test_serial_port_write_reaches_output_at_data_reg() {
+        let mut port = SerialPort::com1(SerialOutput::new("g", SerialOutputMode::Buffer));
+        // Guest OUTs to the absolute data-register port (base + DATA_REG).
+        port.pio_write(COM1, 1, u32::from(b'H'));
+        port.pio_write(COM1, 1, u32::from(b'i'));
+        assert_eq!(port.uart().output().buffer_contents(), b"Hi");
+    }
+
+    #[test]
+    fn test_serial_port_maps_absolute_port_to_register_offset() {
+        let mut port = SerialPort::com1(SerialOutput::new("g", SerialOutputMode::Null));
+        // Scratch register lives at base + 7; a write/read there must hit SCR.
+        port.pio_write(COM1 + SCR_REG, 1, 0xAB);
+        assert_eq!(port.pio_read(COM1 + SCR_REG, 1), 0xAB);
+    }
+
+    #[test]
+    fn test_serial_port_lsr_reports_tx_ready() {
+        let mut port = SerialPort::com1(SerialOutput::new("g", SerialOutputMode::Null));
+        let lsr = port.pio_read(COM1 + LSR_REG, 1);
+        assert_ne!(u8::try_from(lsr & 0xFF).unwrap() & LSR_THR_EMPTY, 0);
+    }
+
+    #[test]
+    fn test_serial_port_rx_injection_round_trips() {
+        let mut port = SerialPort::com1(SerialOutput::new("g", SerialOutputMode::Null));
+        port.uart_mut().inject_input(b"Z");
+        // RX byte is available and reads back through the data register.
+        assert_ne!(
+            u8::try_from(port.pio_read(COM1 + LSR_REG, 1) & 0xFF).unwrap() & LSR_DATA_READY,
+            0
+        );
+        assert_eq!(port.pio_read(COM1 + DATA_REG, 1), u32::from(b'Z'));
     }
 
     #[test]

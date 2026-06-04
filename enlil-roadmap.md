@@ -231,10 +231,22 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > address *ranges* (overlap-rejecting, upper-bound-checked) and dispatches byte-slice
 > accesses with little-endian width conversion and x86 open-bus semantics for unmapped
 > addresses. `enlil-core::device_bus::DeviceBus` bundles one of each and implements
-> `VmExitHandler`, forwarding straight to the bus — the single decode path. **Next:**
-> register the 16550 serial UART (`enlil-core::serial`) as a `PioDevice` at `0x3F8` so
-> a guest's serial writes reach the console, then a `/dev/kvm`-gated test that boots a
-> tiny code blob which writes to COM1 and `hlt`s, asserting the bytes arrived.
+> `VmExitHandler`, forwarding straight to the bus — the single decode path.
+>
+> **Status (2026-06-04):** the 16550 UART is now a real bus device.
+> `enlil-core::serial::SerialPort` wraps `UartState` + a COM base port and implements
+> `enlil_devices::bus::PioDevice` over `[base, base+8)`, mapping the absolute guest port
+> to the register offset; `DeviceBus::with_serial`/`add_serial` mount it at COM1 `0x3F8`.
+> A `/dev/kvm`-gated integration test (`serial_console_smoke`) assembles a tiny real-mode
+> blob that `out`s "OK" to `0x3F8` and `hlt`s, runs it through `KvmBackend::run_vcpu` with
+> the `DeviceBus` handler, and asserts the bytes reached the `Buffer`-mode sink (self-skips
+> with no nested virt). **Pitfall flagged for next step:** `UartState` is *polled-only* —
+> it stores IER/MCR but never raises IRQ4. Linux's 8250 driver auto-detects and can run in
+> polled mode, so a serial shell works, but interrupt-driven mode (the default, and what
+> vm-superio models via a `Trigger`/eventfd) needs the UART to signal IRQ4 into the
+> in-kernel IRQ chip on RX-available / THR-empty. **Next:** give `SerialPort` an IRQ sink
+> (raise IRQ4 via `KVM_IRQ_LINE`/an `EventFd`) wired through `DeviceBus`, honoring IER and
+> the IIR identification byte; then PIT (`0x40-0x43`) and PCI config (`0xCF8/0xCFC`).
 
 ### 0.3 USB Live Boot & Non-Destructive Testing (CRITICAL FOR ADOPTION)
 

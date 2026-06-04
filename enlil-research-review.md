@@ -235,3 +235,28 @@ handling in enlil-core").
   (`read(addr, &mut [u8])` / `write(addr, &[u8])`) matching the KVM exit shape, with
   internal little-endian width conversion to the device's typed accessors, and x86
   *open-bus* semantics for unmapped addresses (reads → all-ones `0xFF`, writes dropped).
+
+## 2026-06-04 — 16550 UART Serial Console: register set & interrupt model (Phase 0.2)
+
+Context: the next step from PROGRESS — wrap `enlil-core::serial::UartState` (our 16550
+emulation) as a `PioDevice` and mount it on `DeviceBus` at COM1 `0x3F8`, with a
+KVM-gated smoke test. Checked our register file against the de-facto rust-vmm reference.
+
+- **rust-vmm `vm-superio` `Serial`** — https://github.com/rust-vmm/vm-superio ,
+  https://docs.rs/vm-superio/ — emulates a 16550A with a 64-byte **RX** FIFO and the
+  register set DLL/IER/DLH/IIR/LCR/LSR/MCR/MSR/SR. *How it changes the build:* confirms
+  our `UartState` register set is complete enough (we model the same registers + the
+  DLAB divisor latch); we do **not** need to emulate FCR (vm-superio leaves the FIFO
+  always-on and unconfigurable), so registering the existing `UartState` as-is is sound.
+  Pitfall it surfaces: vm-superio raises the RX-available and THR-empty interrupts by
+  pulsing an `interrupt_evt` **`Trigger`/eventfd**; our `UartState` is **polled-only**
+  (stores IER but never raises IRQ4). Linux's 8250 driver probes and can fall back to
+  polled mode, so a serial *shell* still works for a first boot, but interrupt-driven
+  operation (the default) requires the UART to signal IRQ4 into KVM's in-kernel IRQ chip
+  on RX/THR events — logged as the explicit next step in the roadmap 0.2 status note.
+- **`vm-superio` issue #17 (unbounded RX memory)** —
+  https://github.com/rust-vmm/vm-superio/issues/17 — a host that injects RX faster than
+  the guest drains it can grow the input buffer without bound. *How it changes the build:*
+  our `UartState::inject_input` should eventually cap the RX `VecDeque` (drop-oldest or
+  backpressure) before we wire a real host-stdin source; noted for the input-path work,
+  not this TX-focused increment.
