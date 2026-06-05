@@ -6,6 +6,73 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-05 — Interrupt-driven 16550: IER-honoured IIR + pluggable IRQ4 line (Phase 0.2)
+
+The previous run's recommended next step: give `SerialPort` an IRQ4 sink fired on
+RX-available / THR-empty, honouring IER and producing the correct IIR identification byte.
+Done — the platform-independent half (fully testable here); the KVM `set_irq_line` wiring is
+now the single remaining sub-task (Linux/`/dev/kvm`-only).
+
+### Situation found
+`UartState` was polled-only: it stored `ier`/`mcr` and a constant `iir = IIR_NO_INTERRUPT`
+field that `read_register(IIR_REG)` returned verbatim — it never reflected pending sources and
+never signalled an IRQ. Linux's 8250 driver can run polled (so the 06-04 smoke test works),
+but its **default is interrupt-driven**, so a real serial shell needs IRQ4. No `UartState`
+register field is referenced outside `serial.rs`, so the IIR could be made computed safely.
+
+### What I did (one increment: the UART interrupt model + IRQ-line sink)
+- **Computed IIR honouring IER** (`compute_iir`): highest-priority *enabled and pending*
+  source — RX-available (`0x04`) outranks THR-empty (`0x02`); `0x01` = none. Removed the
+  stored `iir` field.
+- **THR-empty latch** (`thr_empty_pending`): set when ETBEI transitions on (THR is always
+  empty in emulation) and re-armed on every TX (`write_data`); **cleared by an IIR read**
+  when THRE is the reported source (per PC16550D / the linux-serial IIR/LSR-ordering pitfall).
+  RX-available is level-derived from the FIFO + ERBFI (cleared by draining RBR, *not* by an
+  IIR read).
+- **`IrqLine` trait + pluggable sink:** `UartState::set_irq_line` / `SerialPort::attach_irq_line`
+  store a `Box<dyn IrqLine>`; `update_irq` recomputes the level after *every* state-changing
+  access (register read/write, `inject_input`, `read_byte`) and calls `set_level` only on a
+  real edge — matching QEMU's `qemu_set_irq` and vm-superio's eventfd `Trigger`. Blanket
+  `impl IrqLine for Fn(bool) + Send` so the KVM backend can wire it with a closure
+  (`move |level| vm.set_irq_line(4, level)`). `interrupt_pending()` exposes the level for a
+  poll-after-exit driver that doesn't use the callback.
+- **IER/IIR bit constants** added (`IER_RX_AVAILABLE`/`IER_THR_EMPTY`/…, `IIR_THR_EMPTY`/
+  `IIR_RX_AVAILABLE`). IIR FIFO bits 6-7 deliberately left clear (FCR unemulated, like
+  vm-superio) so the guest probes us as a plain 8250 — works polled *or* interrupt-driven.
+
+### Research (informed the design) — logged in `RESEARCH.md` (Part III, 2026-06-05)
+rust-vmm **`vm-superio` `Serial`** + **PC16550D datasheet**: confirmed the IIR priority,
+THRE-acknowledge-on-IIR-read semantics, and the `Trigger`-style level sink. **Pitfall**
+(linux-serial "IIR/LSR out-of-sync"): the THRE latch must be re-evaluated relative to read
+ordering — `update_irq` runs *after* each access mutation so the asserted level always matches
+the computed IIR.
+
+### Test results (exact)
+- `cargo fmt --all -- --check` → **OK**
+- `cargo clippy --all-targets --workspace -- -D warnings` → **OK** (clean)
+- `cargo test --workspace` → **654 passed, 0 failed** (was 647; +7). `enlil-core`: 122 (was 115).
+  New: `test_no_interrupt_when_sources_disabled`, `test_rx_available_interrupt`,
+  `test_thr_empty_interrupt_set_and_acked_by_iir_read`, `test_rx_outranks_thr_empty_in_iir`,
+  `test_irq_line_edges_on_rx`, `test_irq_line_accepts_a_closure`,
+  `test_serial_port_drives_irq_line`.
+- `serial_console_smoke` + `kvm_create_vm_and_map_memory`: **self-skipped — `/dev/kvm` not
+  present (no nested virt).** The interrupt logic added this run is pure userspace and is
+  fully exercised; the KVM IRQ delivery path is not yet written.
+- no_std custom-target build: **N/A** — no crate is `#![no_std]` yet.
+
+### Recommended next step (tomorrow)
+1. **Wire `IrqLine` to KVM.** In `KvmBackend`, after each `run_vcpu` (or via an `irqfd`/
+   `EventFd` registered with `KVM_IRQFD`), assert/deassert IRQ4 through the in-kernel IRQ chip
+   with `vm.set_irq_line(4, level)`. The simplest first cut: a poll-after-exit driver that
+   calls `serial.interrupt_pending()` and `set_irq_line(4, that)`. Add a `/dev/kvm`-gated test
+   that boots a blob enabling ETBEI/ERBFI and verifies an IRQ is taken (needs a KVM runner).
+2. Then the next early-boot PIO devices: **PIT** (`0x40-0x43`) and **PCI config**
+   (`0xCF8/0xCFC`) as `PioDevice`s on the bus.
+3. Cap `UartState`'s RX `VecDeque` (drop-oldest) before wiring a real host-stdin source
+   (vm-superio issue #17) — still outstanding.
+
+---
+
 ## 2026-06-04 — 16550 UART on the device bus + real-mode KVM serial smoke test (Phase 0.2)
 
 The previous run's recommended next step: register the 16550 UART as a `PioDevice` at

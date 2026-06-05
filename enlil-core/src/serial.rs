@@ -52,11 +52,28 @@ pub const LSR_THR_EMPTY: u8 = 0x20;
 pub const LSR_TEMT: u8 = 0x40;
 
 // ---------------------------------------------------------------------------
-// IIR bit patterns
+// IER bit flags (Interrupt Enable Register)
 // ---------------------------------------------------------------------------
 
-/// No interrupt pending.
+/// Enable Received Data Available interrupt (ERBFI).
+pub const IER_RX_AVAILABLE: u8 = 0x01;
+/// Enable Transmitter Holding Register Empty interrupt (ETBEI).
+pub const IER_THR_EMPTY: u8 = 0x02;
+/// Enable Receiver Line Status interrupt (ELSI).
+pub const IER_RX_LINE_STATUS: u8 = 0x04;
+/// Enable Modem Status interrupt (EDSSI).
+pub const IER_MODEM_STATUS: u8 = 0x08;
+
+// ---------------------------------------------------------------------------
+// IIR identification values (Interrupt Identification Register, bits 0-3)
+// ---------------------------------------------------------------------------
+
+/// No interrupt pending (bit 0 set).
 pub const IIR_NO_INTERRUPT: u8 = 0x01;
+/// Transmitter Holding Register Empty interrupt pending.
+pub const IIR_THR_EMPTY: u8 = 0x02;
+/// Received Data Available interrupt pending (higher priority than THRE).
+pub const IIR_RX_AVAILABLE: u8 = 0x04;
 
 // ---------------------------------------------------------------------------
 // SerialConfig
@@ -247,6 +264,35 @@ impl Drop for SerialOutput {
 }
 
 // ---------------------------------------------------------------------------
+// IrqLine — the host-side interrupt sink a UART drives
+// ---------------------------------------------------------------------------
+
+/// A host-side interrupt line the UART drives to assert/deassert its IRQ.
+///
+/// The 16550 raises IRQ4 (COM1) whenever an *enabled* interrupt source is
+/// pending and lowers it when none remain (see [`UartState::interrupt_pending`]).
+/// This trait lets the UART notify the host of that *level change* without
+/// knowing how the interrupt is actually delivered: under KVM the
+/// implementation forwards to `KVM_IRQ_LINE` (`vmm.set_irq_line(4, level)`)
+/// through the in-kernel IRQ chip; in tests a counter observes the edges.
+///
+/// `set_level` is called only when the asserted level actually changes, so an
+/// implementation may treat each call as one edge (matching QEMU's
+/// `qemu_set_irq` model and rust-vmm `vm-superio`'s eventfd `Trigger`).
+pub trait IrqLine: Send {
+    /// Drive the interrupt line: `true` asserts the IRQ, `false` deasserts it.
+    fn set_level(&self, level: bool);
+}
+
+/// Any `Fn(bool)` doubles as an [`IrqLine`], so the KVM backend can wire one
+/// with a closure (e.g. `move |level| vm.set_irq_line(4, level)`).
+impl<F: Fn(bool) + Send> IrqLine for F {
+    fn set_level(&self, level: bool) {
+        self(level);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // UartState — per-guest UART register emulation
 // ---------------------------------------------------------------------------
 
@@ -257,8 +303,6 @@ impl Drop for SerialOutput {
 pub struct UartState {
     /// Interrupt Enable Register.
     pub ier: u8,
-    /// Interrupt Identification Register (read-only to guest).
-    pub iir: u8,
     /// Line Control Register.
     pub lcr: u8,
     /// Modem Control Register.
@@ -273,6 +317,14 @@ pub struct UartState {
     pub divisor: u16,
     /// Receive buffer — bytes injected by the host for the guest to read.
     rx_fifo: VecDeque<u8>,
+    /// THR-empty interrupt latch: set when the transmitter holding register
+    /// becomes empty (after a TX, or when ETBEI is freshly enabled), cleared
+    /// when the guest reads IIR and THRE was the reported source.
+    thr_empty_pending: bool,
+    /// Optional host interrupt sink (IRQ4). Driven on every level change.
+    irq_line: Option<Box<dyn IrqLine>>,
+    /// Last level we asserted on `irq_line`, so we only notify on a real edge.
+    irq_level: bool,
     /// The output sink for transmitted bytes.
     output: SerialOutput,
 }
@@ -283,7 +335,6 @@ impl UartState {
     pub fn new(output: SerialOutput) -> Self {
         Self {
             ier: 0,
-            iir: IIR_NO_INTERRUPT,
             lcr: 0x03, // 8N1 default
             mcr: 0,
             lsr_overrides: 0,
@@ -291,8 +342,23 @@ impl UartState {
             scr: 0,
             divisor: 0x000C, // 9600 baud default (115200 / 9600 = 12)
             rx_fifo: VecDeque::with_capacity(64),
+            thr_empty_pending: false,
+            irq_line: None,
+            irq_level: false,
             output,
         }
+    }
+
+    /// Attach a host interrupt sink (IRQ4) and synchronise its level to the
+    /// UART's current interrupt state.
+    ///
+    /// The UART subsequently calls [`IrqLine::set_level`] whenever an enabled
+    /// interrupt source asserts or clears (see [`Self::interrupt_pending`]).
+    pub fn set_irq_line(&mut self, line: Box<dyn IrqLine>) {
+        self.irq_line = Some(line);
+        // Reset the cached level so the sync below always emits the current one.
+        self.irq_level = false;
+        self.update_irq();
     }
 
     // -- Register reads (guest IN instruction) --
@@ -301,19 +367,23 @@ impl UartState {
     pub fn read_register(&mut self, offset: u16) -> u8 {
         let dlab = self.lcr & 0x80 != 0;
 
-        match offset {
+        let value = match offset {
             DATA_REG if dlab => self.divisor as u8,
             DATA_REG => self.read_data(),
             IER_REG if dlab => (self.divisor >> 8) as u8,
             IER_REG => self.ier,
-            IIR_REG => self.iir,
+            IIR_REG => self.read_iir(),
             LCR_REG => self.lcr,
             MCR_REG => self.mcr,
             LSR_REG => self.compute_lsr(),
             MSR_REG => self.msr,
             SCR_REG => self.scr,
             _ => 0xFF, // unmapped
-        }
+        };
+        // Draining RBR (RX) or reading IIR (clears the THRE latch) can change
+        // which interrupt is pending; resync the IRQ line.
+        self.update_irq();
+        value
     }
 
     // -- Register writes (guest OUT instruction) --
@@ -330,18 +400,36 @@ impl UartState {
             IER_REG if dlab => {
                 self.divisor = (self.divisor & 0x00FF) | (u16::from(value) << 8);
             }
-            IER_REG => self.ier = value & 0x0F,
+            IER_REG => self.write_ier(value),
             LCR_REG => self.lcr = value,
             MCR_REG => self.mcr = value & 0x1F,
             SCR_REG => self.scr = value,
             _ => {}
         }
+        // An IER change (enable/disable) or a TX (re-arming THRE) can change the
+        // pending interrupt; resync the IRQ line.
+        self.update_irq();
     }
 
     // -- TX path --
 
     fn write_data(&mut self, byte: u8) {
         self.output.write_byte(byte);
+        // TX completes immediately in emulation, so the transmitter holding
+        // register is empty again — re-arm the THRE interrupt.
+        self.thr_empty_pending = true;
+    }
+
+    /// Handle a write to the Interrupt Enable Register.
+    ///
+    /// Only the low four bits are writable. Enabling the THRE interrupt while
+    /// the (always-empty) holding register is empty asserts it once.
+    fn write_ier(&mut self, value: u8) {
+        let prev = self.ier;
+        self.ier = value & 0x0F;
+        if self.ier & IER_THR_EMPTY != 0 && prev & IER_THR_EMPTY == 0 {
+            self.thr_empty_pending = true;
+        }
     }
 
     // -- RX path --
@@ -365,16 +453,64 @@ impl UartState {
         lsr | self.lsr_overrides
     }
 
+    // -- Interrupt model (16550: RX-available outranks THR-empty) --
+
+    /// Compute the IIR identification byte: the highest-priority *enabled and
+    /// pending* interrupt source, or [`IIR_NO_INTERRUPT`] when none.
+    fn compute_iir(&self) -> u8 {
+        if self.ier & IER_RX_AVAILABLE != 0 && !self.rx_fifo.is_empty() {
+            IIR_RX_AVAILABLE
+        } else if self.ier & IER_THR_EMPTY != 0 && self.thr_empty_pending {
+            IIR_THR_EMPTY
+        } else {
+            IIR_NO_INTERRUPT
+        }
+    }
+
+    /// Read the IIR. Per the 16550, reading IIR acknowledges (clears) a pending
+    /// THRE interrupt — but only when THRE is the source actually reported.
+    fn read_iir(&mut self) -> u8 {
+        let iir = self.compute_iir();
+        if iir == IIR_THR_EMPTY {
+            self.thr_empty_pending = false;
+        }
+        iir
+    }
+
+    /// Whether an enabled interrupt source is currently pending — i.e. whether
+    /// the IRQ line (IRQ4 for COM1) should be asserted.
+    #[must_use]
+    pub fn interrupt_pending(&self) -> bool {
+        self.compute_iir() != IIR_NO_INTERRUPT
+    }
+
+    /// Recompute the interrupt level and notify the attached [`IrqLine`] on a
+    /// real edge (no notification when the level is unchanged).
+    fn update_irq(&mut self) {
+        let level = self.interrupt_pending();
+        if level != self.irq_level {
+            self.irq_level = level;
+            if let Some(line) = &self.irq_line {
+                line.set_level(level);
+            }
+        }
+    }
+
     // -- Host-side helpers --
 
     /// Inject bytes into the RX FIFO (as if typed on the guest's console).
     pub fn inject_input(&mut self, data: &[u8]) {
         self.rx_fifo.extend(data);
+        // New RX data may assert the RX-available interrupt.
+        self.update_irq();
     }
 
     /// Read a single byte from the RX FIFO, or `None` if empty.
     pub fn read_byte(&mut self) -> Option<u8> {
-        self.rx_fifo.pop_front()
+        let byte = self.rx_fifo.pop_front();
+        // Draining the FIFO may deassert the RX-available interrupt.
+        self.update_irq();
+        byte
     }
 
     /// Check whether the RX FIFO has data available.
@@ -407,9 +543,11 @@ impl UartState {
 /// translated to the 0–7 register offset the UART expects. Register one on a
 /// [`crate::device_bus::DeviceBus`] to give a guest a working serial console.
 ///
-/// The UART is currently **polled-only**: it computes the Line Status Register
-/// (TX-ready, RX-available) on read but does not raise IRQ4. Interrupt-driven
-/// operation is a follow-on (see roadmap Phase 0.2).
+/// The UART supports both **polled** operation (the guest reads the Line Status
+/// Register for TX-ready / RX-available) and **interrupt-driven** operation:
+/// attach an [`IrqLine`] via [`Self::attach_irq_line`] and the UART asserts /
+/// deasserts IRQ4 as enabled sources (RX-available, THR-empty) become pending,
+/// honouring the IER. The KVM backend wires that line to `KVM_IRQ_LINE`.
 pub struct SerialPort {
     base: u16,
     uart: UartState,
@@ -443,6 +581,21 @@ impl SerialPort {
     /// Mutably borrow the underlying UART (e.g. to inject RX input or read TX).
     pub const fn uart_mut(&mut self) -> &mut UartState {
         &mut self.uart
+    }
+
+    /// Attach a host interrupt sink so the UART drives IRQ4 in interrupt mode.
+    ///
+    /// Forwards to [`UartState::set_irq_line`]; see [`IrqLine`].
+    pub fn attach_irq_line(&mut self, line: Box<dyn IrqLine>) {
+        self.uart.set_irq_line(line);
+    }
+
+    /// Whether the UART currently has an enabled interrupt source pending
+    /// (i.e. whether IRQ4 should be asserted). Useful for a poll-after-exit
+    /// driver that doesn't use an [`IrqLine`] callback.
+    #[must_use]
+    pub fn interrupt_pending(&self) -> bool {
+        self.uart.interrupt_pending()
     }
 }
 
@@ -913,6 +1066,124 @@ mod tests {
             0
         );
         assert_eq!(port.pio_read(COM1 + DATA_REG, 1), u32::from(b'Z'));
+    }
+
+    // -- Interrupt model tests --
+
+    /// Records every IRQ-line edge it is driven through.
+    #[derive(Clone)]
+    struct EdgeLog(Arc<Mutex<Vec<bool>>>);
+
+    impl IrqLine for EdgeLog {
+        fn set_level(&self, level: bool) {
+            self.0.lock().unwrap().push(level);
+        }
+    }
+
+    fn null_uart() -> UartState {
+        UartState::new(SerialOutput::new("g", SerialOutputMode::Null))
+    }
+
+    #[test]
+    fn test_no_interrupt_when_sources_disabled() {
+        let mut uart = null_uart();
+        // Data is waiting but the RX interrupt is not enabled in the IER.
+        uart.inject_input(b"A");
+        assert!(!uart.interrupt_pending());
+        assert_eq!(uart.read_register(IIR_REG), IIR_NO_INTERRUPT);
+    }
+
+    #[test]
+    fn test_rx_available_interrupt() {
+        let mut uart = null_uart();
+        uart.write_register(IER_REG, IER_RX_AVAILABLE);
+        assert!(!uart.interrupt_pending(), "no data yet");
+
+        uart.inject_input(b"A");
+        assert!(uart.interrupt_pending());
+        assert_eq!(uart.read_register(IIR_REG), IIR_RX_AVAILABLE);
+        // Reading IIR does NOT clear an RX interrupt — only draining RBR does.
+        assert!(uart.interrupt_pending());
+
+        assert_eq!(uart.read_register(DATA_REG), b'A');
+        assert!(!uart.interrupt_pending());
+        assert_eq!(uart.read_register(IIR_REG), IIR_NO_INTERRUPT);
+    }
+
+    #[test]
+    fn test_thr_empty_interrupt_set_and_acked_by_iir_read() {
+        let mut uart = null_uart();
+        // Enabling ETBEI while the (always-empty) THR is empty asserts THRE.
+        uart.write_register(IER_REG, IER_THR_EMPTY);
+        assert!(uart.interrupt_pending());
+        assert_eq!(uart.read_register(IIR_REG), IIR_THR_EMPTY);
+        // Reading IIR acknowledged the THRE interrupt.
+        assert!(!uart.interrupt_pending());
+        assert_eq!(uart.read_register(IIR_REG), IIR_NO_INTERRUPT);
+
+        // Transmitting a byte re-arms THRE (TX completes immediately).
+        uart.write_register(DATA_REG, b'X');
+        assert!(uart.interrupt_pending());
+        assert_eq!(uart.read_register(IIR_REG), IIR_THR_EMPTY);
+    }
+
+    #[test]
+    fn test_rx_outranks_thr_empty_in_iir() {
+        let mut uart = null_uart();
+        uart.write_register(IER_REG, IER_RX_AVAILABLE | IER_THR_EMPTY);
+        // ETBEI-enable armed THRE; now RX data arrives too.
+        uart.inject_input(b"Z");
+        // Higher-priority RX source is reported first.
+        assert_eq!(uart.read_register(IIR_REG), IIR_RX_AVAILABLE);
+        // Draining RX exposes the still-pending THRE interrupt.
+        assert_eq!(uart.read_register(DATA_REG), b'Z');
+        assert_eq!(uart.read_register(IIR_REG), IIR_THR_EMPTY);
+    }
+
+    #[test]
+    fn test_irq_line_edges_on_rx() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut uart = null_uart();
+        uart.set_irq_line(Box::new(EdgeLog(Arc::clone(&log))));
+        // Attaching with no pending interrupt emits no edge.
+        assert!(log.lock().unwrap().is_empty());
+
+        uart.write_register(IER_REG, IER_RX_AVAILABLE);
+        assert!(log.lock().unwrap().is_empty(), "no data, no edge");
+
+        uart.inject_input(b"A"); // rising edge
+        uart.read_register(DATA_REG); // falling edge
+        assert_eq!(&*log.lock().unwrap(), &[true, false]);
+    }
+
+    #[test]
+    fn test_irq_line_accepts_a_closure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let asserts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&asserts);
+        let mut uart = null_uart();
+        uart.set_irq_line(Box::new(move |level: bool| {
+            if level {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        // THRE asserts the line once when ETBEI is enabled.
+        uart.write_register(IER_REG, IER_THR_EMPTY);
+        assert_eq!(asserts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_serial_port_drives_irq_line() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut port = SerialPort::com1(SerialOutput::new("g", SerialOutputMode::Null));
+        port.attach_irq_line(Box::new(EdgeLog(Arc::clone(&log))));
+        assert!(!port.interrupt_pending());
+
+        // The guest enables the RX interrupt through the data-bus register write.
+        port.pio_write(COM1 + IER_REG, 1, u32::from(IER_RX_AVAILABLE));
+        port.uart_mut().inject_input(b"!");
+        assert!(port.interrupt_pending());
+        assert_eq!(&*log.lock().unwrap(), &[true]);
     }
 
     #[test]
