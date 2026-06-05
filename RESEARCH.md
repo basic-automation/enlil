@@ -521,3 +521,33 @@ ZK Proving Architecture:
 The zkEVM ecosystem spent three years and hundreds of millions of dollars turning ZK proofs from "minutes" into "seconds." The techniques they developed are general-purpose and directly applicable to Enlil. The hypervisor domain is actually *easier* than the blockchain domain — Enlil's proofs are about static data structures (page tables, IOMMU tables, binary hashes) rather than arbitrary program execution. Enlil doesn't need to prove Turing-complete computation for attestation — just structural correctness of well-defined hardware configuration tables.
 
 By adopting the precompile + continuation + recursion + lookup + Poseidon + GPU pipeline from day one, Enlil's ZK proofs can be fast enough to run at boot (attestation), on-demand (isolation verification), and at meaningful sampling rates (compute verification) — rather than being a theoretical feature that's too slow to use in practice.
+
+---
+
+# Part III — Daily Routine Findings
+
+> Dated notes from the autonomous daily routine. Each entry: source + how it changes what we build.
+
+## 2026-06-05 — 16550 interrupt model (THRE/RDA, IIR priority, Trigger)
+
+- **rust-vmm `vm-superio` `Serial`** (https://github.com/rust-vmm/vm-superio) and the
+  **PC16550D datasheet** (https://www.scs.stanford.edu/10wi-cs140/pintos/specs/pc16550d.pdf):
+  confirm the interrupt model for our move from polled to interrupt-driven serial. IIR reports
+  the *highest-priority enabled+pending* source — RX-data-available (0x04) outranks
+  THR-empty (0x02); bit 0 set (0x01) means "no interrupt". IER bit 0 (ERBFI) gates RX, bit 1
+  (ETBEI) gates THRE. **Reading IIR acknowledges/clears a pending THRE interrupt** (only THRE);
+  reading RBR clears RX when the FIFO drains. vm-superio drives the host IRQ via a `Trigger`
+  (eventfd) — our analogue is a pluggable `IrqLine` sink the UART pulses on level change.
+- **Pitfall (linux-serial "IIR/LSR out-of-sync", https://www.spinics.net/lists/linux-serial/msg03163.html):**
+  the THRE-pending latch must be re-evaluated relative to LSR/IIR read ordering, or the 8250
+  driver can wedge. Our `update_irq` recomputes the line level *after* each register access
+  mutation (and after IIR-read clears the THRE latch), so the asserted level always matches the
+  computed IIR — no stale edge.
+- **FCR not emulated** (vm-superio): FIFO is treated as always-on; we keep IIR FIFO bits 6-7
+  clear so a guest probes us as a plain 8250 (works polled *or* interrupt-driven), matching the
+  existing register file. No change needed there.
+
+**Changes what we build:** implement IER-honored IIR computation + a THRE latch + an `IrqLine`
+sink in `enlil-core::serial::UartState`, asserting/deasserting on every state change. The
+KVM `set_irq_line(4, level)` wiring through the in-kernel irqchip is the follow-on (Linux-only,
+needs `/dev/kvm` to exercise).

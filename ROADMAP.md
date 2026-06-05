@@ -240,13 +240,19 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > A `/dev/kvm`-gated integration test (`serial_console_smoke`) assembles a tiny real-mode
 > blob that `out`s "OK" to `0x3F8` and `hlt`s, runs it through `KvmBackend::run_vcpu` with
 > the `DeviceBus` handler, and asserts the bytes reached the `Buffer`-mode sink (self-skips
-> with no nested virt). **Pitfall flagged for next step:** `UartState` is *polled-only* —
-> it stores IER/MCR but never raises IRQ4. Linux's 8250 driver auto-detects and can run in
-> polled mode, so a serial shell works, but interrupt-driven mode (the default, and what
-> vm-superio models via a `Trigger`/eventfd) needs the UART to signal IRQ4 into the
-> in-kernel IRQ chip on RX-available / THR-empty. **Next:** give `SerialPort` an IRQ sink
-> (raise IRQ4 via `KVM_IRQ_LINE`/an `EventFd`) wired through `DeviceBus`, honoring IER and
-> the IIR identification byte; then PIT (`0x40-0x43`) and PCI config (`0xCF8/0xCFC`).
+> with no nested virt).
+>
+> **Status (2026-06-05):** the UART is now **interrupt-capable**. `UartState` computes the
+> IIR identification byte honouring the IER (RX-available `0x04` outranks THR-empty `0x02`;
+> `0x01` = none), latches THR-empty (re-armed on every TX and on ETBEI-enable, cleared by an
+> IIR read), and exposes `interrupt_pending()` plus a pluggable `IrqLine` sink it pulses on
+> every level change (`SerialPort::attach_irq_line`). A blanket `impl IrqLine for Fn(bool)`
+> lets the backend wire it with a closure. The model matches rust-vmm `vm-superio`'s
+> `Trigger` and the PC16550D datasheet; covered by 7 unit tests (no KVM needed). **Next:**
+> wire that `IrqLine` to KVM — `vmm.set_irq_line(4, level)` through the in-kernel IRQ chip in
+> `KvmBackend` — and drive it after each vCPU exit (or via an `EventFd`/`irqfd`), so a guest
+> running its 8250 in the default interrupt-driven mode gets IRQ4; then PIT (`0x40-0x43`) and
+> PCI config (`0xCF8/0xCFC`).
 
 ### 0.3 USB Live Boot & Non-Destructive Testing (CRITICAL FOR ADOPTION)
 
