@@ -16,7 +16,7 @@
 use crate::kvm_backend::VmExitHandler;
 use crate::serial::{SerialOutput, SerialPort};
 use enlil_devices::bus::{MmioBus, MmioDevice, PioBus, PioDevice};
-use enlil_devices::interrupt::SharedInterruptController;
+use enlil_devices::interrupt::{IoApicMmio, SharedInterruptController};
 use enlil_devices::pcie::{
     vendors, EcamSpace, PciBdf, PciConfigIo, PcieRootComplex, SharedRootComplex,
 };
@@ -210,8 +210,25 @@ impl DeviceBus {
         pit.attach_irq0(Box::new(pic.line(IRQ_PIT)));
         bus.add_pit(pit)?;
 
+        bus.add_ioapic(pic)?;
+
         let pcie = bus.add_pcie(PcieRootComplex::new(DEFAULT_ECAM_BASE))?;
         Ok((bus, pcie))
+    }
+
+    /// Mount the I/O APIC MMIO aperture ([`IoApicMmio`]) at `0xFEC0_0000` over
+    /// `pic`, so a guest OS can program the redirection table — routing device
+    /// IRQ lines (attached via [`SharedInterruptController::line`]) to vCPU
+    /// vectors. Without it the RTEs stay masked and no device IRQ is delivered.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if the aperture overlaps an
+    /// already-registered MMIO device.
+    pub fn add_ioapic(
+        &mut self,
+        pic: &SharedInterruptController,
+    ) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_mmio(Box::new(IoApicMmio::new(pic.clone())))
     }
 }
 
@@ -503,18 +520,13 @@ mod tests {
         use enlil_devices::interrupt::SharedInterruptController;
         use std::sync::{Arc, Mutex};
 
-        // One vCPU; program the I/O APIC RTE for IRQ4 (COM1) to deliver vector
-        // 0x24 to LAPIC 0, and enable LAPIC 0 (SVR bit 8) — what a guest OS does
-        // when it brings up the APIC. (LAPIC_SVR offset 0x0F0 is not re-exported
-        // from enlil-devices, so the literal is used here.)
+        // One vCPU; enable LAPIC 0 (SVR bit 8) as a guest OS would when it brings
+        // up the APIC. (LAPIC_SVR offset 0x0F0 is not re-exported from
+        // enlil-devices, so the literal is used here.) The IRQ4 redirection
+        // entry is programmed below through the I/O APIC's MMIO aperture, the way
+        // a real guest does it.
         let pic = SharedInterruptController::new(1);
-        pic.with(|c| {
-            let rte = c.ioapic.get_rte_mut(4);
-            rte.set_vector(0x24);
-            rte.set_destination(0);
-            rte.set_masked(false);
-            c.lapics[0].write_register(0x0F0, 0x1FF);
-        });
+        pic.with(|c| c.lapics[0].write_register(0x0F0, 0x1FF));
 
         let sink = Arc::new(Mutex::new(Vec::new()));
         let (mut bus, _pcie) = DeviceBus::standard_pc_with_interrupts(
@@ -523,9 +535,18 @@ mod tests {
         )
         .unwrap();
 
-        // Same canonical layout as standard_pc.
+        // Same canonical layout as standard_pc, plus the I/O APIC aperture.
         assert!(bus.pio.is_mapped(COM1));
         assert!(bus.pio.is_mapped(0x40));
+        assert!(bus.mmio.is_mapped(0xFEC0_0000));
+
+        // Program IRQ4's RTE through the I/O APIC MMIO aperture (vector 0x24 to
+        // LAPIC 0, unmasked) the way a guest OS does: IOREGSEL=0x18 (REDTBL base
+        // 0x10 + 2*4) then IOWIN, then high dword at 0x19.
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0000, &0x18u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0010, &0x24u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0000, &0x19u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0010, &0u32.to_le_bytes());
 
         // No interrupt has fired yet.
         assert!(!pic.with(|c| c.has_pending(0)));

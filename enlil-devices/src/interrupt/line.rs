@@ -22,6 +22,12 @@
 use std::sync::{Arc, Mutex};
 
 use super::controller::InterruptController;
+use super::ioapic::IOAPIC_BASE;
+use crate::bus::MmioDevice;
+use crate::truncate::u32_of;
+
+/// Size of the I/O APIC MMIO aperture (one 4 KiB page at [`IOAPIC_BASE`]).
+const IOAPIC_MMIO_SIZE: u64 = 0x1000;
 
 /// A thread-safe, shareable handle to one [`InterruptController`].
 ///
@@ -74,6 +80,46 @@ impl SharedInterruptController {
                 }
             });
         }
+    }
+}
+
+/// The I/O APIC's MMIO aperture as a bus [`MmioDevice`].
+///
+/// Mounted at [`IOAPIC_BASE`] (`0xFEC0_0000`), it forwards the two 32-bit
+/// registers a guest uses to program the redirection table — `IOREGSEL`
+/// (offset `0x00`) and `IOWIN` (offset `0x10`) — into the shared
+/// [`InterruptController`]'s I/O APIC. This is the front-end that lets a guest
+/// OS route device IRQ lines (see [`SharedInterruptController::line`]) to a
+/// vCPU's vector by writing redirection entries; without it the RTEs stay at
+/// their masked reset state and no device interrupt is ever delivered.
+///
+/// Register accesses are 32-bit dwords, so the access size is ignored.
+pub struct IoApicMmio {
+    controller: SharedInterruptController,
+}
+
+impl IoApicMmio {
+    /// Mount the I/O APIC aperture over the shared controller `controller`.
+    #[must_use]
+    pub const fn new(controller: SharedInterruptController) -> Self {
+        Self { controller }
+    }
+}
+
+impl MmioDevice for IoApicMmio {
+    fn mmio_read(&mut self, offset: u64, _size: u8) -> u64 {
+        self.controller
+            .with(|c| u64::from(c.ioapic.mmio_read(offset)))
+    }
+
+    fn mmio_write(&mut self, offset: u64, _size: u8, data: u64) {
+        // IOREGSEL/IOWIN are 32-bit; the I/O APIC takes the low dword.
+        self.controller
+            .with(|c| c.ioapic.mmio_write(offset, u32_of(data)));
+    }
+
+    fn mmio_range(&self) -> (u64, u64) {
+        (IOAPIC_BASE, IOAPIC_BASE + IOAPIC_MMIO_SIZE)
     }
 }
 
@@ -164,6 +210,36 @@ mod tests {
         pic.line(0)(true);
         // Observed through an independent clone -> same underlying controller.
         assert!(other.with(|c| c.has_pending(0)));
+    }
+
+    #[test]
+    fn mmio_front_end_programs_an_rte_and_routes_delivery() {
+        let pic = SharedInterruptController::new(1);
+        pic.with(|c| c.lapics[0].write_register(LAPIC_SVR, 0x1FF));
+        let mut mmio = IoApicMmio::new(pic.clone());
+
+        // Program IRQ4's RTE through MMIO the way a guest OS would: select the
+        // low dword (REDTBL base 0x10 + 2*4 = 0x18), write vector 0x24 unmasked;
+        // then the high dword (0x19), destination APIC 0.
+        mmio.mmio_write(0x00, 4, 0x18); // IOREGSEL = RTE4 low
+        mmio.mmio_write(0x10, 4, 0x24); // IOWIN: vector 0x24, unmasked
+        mmio.mmio_write(0x00, 4, 0x19); // IOREGSEL = RTE4 high
+        mmio.mmio_write(0x10, 4, 0); // IOWIN: destination 0
+
+        // Read the low dword back through MMIO.
+        mmio.mmio_write(0x00, 4, 0x18);
+        assert_eq!(mmio.mmio_read(0x10, 4) & 0xFF, 0x24);
+
+        // A device asserting IRQ4 now routes through the programmed RTE to
+        // LAPIC 0 — the full guest-programmed delivery path.
+        pic.line(4)(true);
+        assert_eq!(pic.with(|c| c.pending_vector(0)), Some(0x24));
+    }
+
+    #[test]
+    fn mmio_aperture_covers_the_ioapic_page() {
+        let mmio = IoApicMmio::new(SharedInterruptController::new(1));
+        assert_eq!(mmio.mmio_range(), (0xFEC0_0000, 0xFEC0_1000));
     }
 
     #[test]

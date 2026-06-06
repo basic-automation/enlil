@@ -61,5 +61,5 @@ pub use controller::InterruptController;
 pub use ioapic::IOAPIC_BASE;
 pub use ioapic::{IoApic, RedirectionEntry};
 pub use lapic::LocalApic;
-pub use line::SharedInterruptController;
+pub use line::{IoApicMmio, SharedInterruptController};
 pub use msi::{MsiCapability, MsiMessage, MsixCapability, MsixTableEntry};
