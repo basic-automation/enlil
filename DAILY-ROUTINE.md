@@ -25,7 +25,21 @@ move some roadmap phase toward that end state.
 
 ---
 
-Do these in order, in one focused session:
+## Session model — work the full 3–4 hours, many increments per run
+
+A run is **not** one task. Budget **3–4 hours** of wall-clock work and land **as many complete,
+tested increments as possible** in that window — typically several, not one. Each increment is
+one trip through steps 1–6 below; when you finish one, **loop straight back to step 1** and pick
+the next item. Keep going until the time budget is spent or you genuinely run out of tractable,
+unblocked work.
+
+The discipline that makes this breadth safe is that **every increment is independently green and
+committed before you start the next** (step 6). A run is therefore a *sequence* of small,
+complete, tested commits — never one sprawling unfinished change. Do a full orient + research
+once at the start; between increments, re-orient only briefly (and research only when the next
+item is in a genuinely new area) so the bulk of the budget goes into building and verifying.
+
+Do these in order, looping for the whole session:
 
 ### 1. Orient (read before writing)
 - Read `ROADMAP.md`, `README.md`, the latest `PHASE*-IMPLEMENTATION.md`, and
@@ -36,7 +50,10 @@ Do these in order, in one focused session:
   roadmap is prose/section-based, not checkboxes. Phases 0–3 are done; Phase 4 USB
   routing / Phase 5 Windows guest + KVM backend were most recently in flight.)
 
-### 2. Research (time-box ~30 min — it serves the build, it is not the deliverable)
+### 2. Research (lean and proportionate — it serves the build, it is not the deliverable)
+> Time-box the *first* increment's research to ~30 min; later increments in the same session
+> get only a quick targeted check (skip entirely if already covered). Research is a tax on build
+> time — across a 3–4 hour run it should stay a small fraction of the total.
 - Search recent (≤ ~18 months) work relevant to **that specific next step**:
   Rust/RustVMM hypervisors, VT-x/VT-d & AMD-V/Vi, IOMMU & SR-IOV passthrough, GPU
   mediated passthrough / vGPU, VirtIO, hypervisor transparency / anti-detection, live
@@ -62,22 +79,31 @@ Do these in order, in one focused session:
 - Record exactly which tests ran and which were skipped (KVM/guest-boot paths → "not run
   (no nested virt)" when unavailable). Never claim a boot or benchmark you didn't run.
 
-### 6. Land it and hand off
-- **Land the work for review.** The remote environment automatically puts each run's
-  commits on a branch and opens a PR — it does *not* push to `master` directly. Use commit
-  message format `routine(phase-N): <what you did>`. **Only commit work that builds and
-  passes the tests you could run** — if it's not green, commit nothing and record the
-  blocker in `PROGRESS.md` instead.
-- Append to `PROGRESS.md`: date, the step taken, research that informed it, exact test
-  results, and the recommended next step for tomorrow. This file + `git log` are how the
-  next run (which has no memory of today) resumes without redoing or re-researching work.
+### 6. Land each increment, then loop (hand off once at the end)
+- **Commit each green increment on its own.** The remote environment automatically puts the
+  run's commits on a branch and opens a PR — it does *not* push to `master` directly. Use commit
+  message format `routine(phase-N): <what you did>`, **one commit per complete increment**.
+  **Only commit work that builds and passes the tests you could run** — if an increment isn't
+  green, commit nothing for it and record the blocker in `PROGRESS.md`.
+- **Then loop.** If time remains in the 3–4 hour budget and there's a tractable, unblocked next
+  item, go back to step 1 and build it as a *new* commit on the same branch. Don't stop after
+  one. Stop only when the budget is spent, every remaining item is blocked, or the only work
+  left is something you can't finish and test cleanly in the time remaining (in which case leave
+  it for tomorrow rather than committing it half-done).
+- **Hand off once, at the end.** Append a single dated `PROGRESS.md` entry covering the whole
+  session: each increment landed (with its commit) and the research that informed it, exact test
+  results, and the recommended next step(s) for tomorrow. This file + `git log` are how the next
+  run (which has no memory of today) resumes without redoing or re-researching work.
 
 ---
 
 ### Guardrails
-- **One increment per run; depth over breadth.** It's an 11-phase road — a clean,
-  documented trail beats a pile of half-finished features.
-- **Never leave `master` unbuildable.** No green, no commit.
+- **Many increments per run, but each one complete.** Fill the 3–4 hour budget with as many
+  tested increments as you can — yet depth *per increment* still wins: a clean, documented trail
+  of small green commits beats a pile of half-finished features. Never stretch a single
+  increment across the "still broken" line just to claim another task.
+- **Never leave `master` unbuildable.** No green, no commit — enforced per increment, so a late
+  failure never poisons the earlier good commits already on the branch.
 - **Keep the repo clean.** Put throwaway scripts/output in a git-ignored `scratch/` dir,
   never the repo root. Don't add to the existing `fix_*.ps1` / `count*.py` / `*_out.txt`
   clutter; clear some out if you have spare cycles.
