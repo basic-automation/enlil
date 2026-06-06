@@ -16,6 +16,7 @@
 use crate::kvm_backend::VmExitHandler;
 use crate::serial::SerialPort;
 use enlil_devices::bus::{MmioBus, MmioDevice, PioBus, PioDevice};
+use enlil_devices::pcie::PciConfigIo;
 use enlil_devices::timer::Pit;
 
 /// The system device bus: a PIO bus and an MMIO bus behind one exit handler.
@@ -84,6 +85,28 @@ impl DeviceBus {
     /// already-registered device.
     pub fn add_pit(&mut self, pit: Pit) -> Result<(), enlil_devices::bus::BusError> {
         self.add_pio(Box::new(pit))
+    }
+
+    /// Mount the legacy PCI **Configuration Mechanism #1** front-end
+    /// ([`PciConfigIo`]) on the PIO bus over the eight ports `0xCF8..=0xCFF`
+    /// (the `CONFIG_ADDRESS`/`CONFIG_DATA` pair).
+    ///
+    /// A guest BIOS / early kernel uses these ports to enumerate the PCI bus
+    /// before it has brought up ECAM MMIO; without them the config ports read
+    /// back as open-bus `0xFF`, so the guest finds no host bridge and no devices.
+    /// ECAM (the MMIO front-end over the same [`PcieRootComplex`]) is mounted
+    /// separately on the MMIO bus.
+    ///
+    /// [`PcieRootComplex`]: enlil_devices::pcie::PcieRootComplex
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if the range overlaps an
+    /// already-registered device.
+    pub fn add_pci_config_io(
+        &mut self,
+        pci: PciConfigIo,
+    ) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_pio(Box::new(pci))
     }
 }
 
@@ -245,6 +268,39 @@ mod tests {
         VmExitHandler::io_out(&mut bus, 0x40, &[0x00]);
         assert!(bus.pio.is_mapped(0x40));
         assert!(bus.pio.is_mapped(COM1));
+    }
+
+    #[test]
+    fn guest_enumerates_pci_through_cf8_cfc_on_the_bus() {
+        use enlil_devices::pcie::{PciBdf, PciConfigIo, PciConfigSpace, PcieRootComplex};
+
+        // A root complex with a single device at BDF 0:2.0.
+        let mut rc = PcieRootComplex::new(0xB000_0000);
+        rc.add_device(PciConfigSpace::new(PciBdf::new(0, 2, 0), 0x8086, 0x5678));
+
+        let mut bus = DeviceBus::new();
+        bus.add_pci_config_io(PciConfigIo::new(rc)).unwrap();
+
+        // The front-end owns exactly the eight legacy CAM ports 0xCF8..=0xCFF.
+        assert!(bus.pio.is_mapped(0xCF8));
+        assert!(bus.pio.is_mapped(0xCFF));
+        assert!(!bus.pio.is_mapped(0xD00));
+
+        // Drive it the way a guest BIOS would: a dword OUT to CONFIG_ADDRESS
+        // (enable | bus 0 | device 2 | func 0 | reg 0), then a dword IN from
+        // CONFIG_DATA, byte-at-a-time as KVM delivers the exit.
+        let addr: u32 = 0x8000_0000 | (2 << 11);
+        VmExitHandler::io_out(&mut bus, 0xCF8, &addr.to_le_bytes());
+        let mut data = [0u8; 4];
+        VmExitHandler::io_in(&mut bus, 0xCFC, &mut data);
+        // device_id:vendor_id = 0x5678_8086.
+        assert_eq!(u32::from_le_bytes(data), 0x5678_8086);
+
+        // An absent function (0:1.0) enumerates as all-ones (no device).
+        let absent: u32 = 0x8000_0000 | (1 << 11);
+        VmExitHandler::io_out(&mut bus, 0xCF8, &absent.to_le_bytes());
+        VmExitHandler::io_in(&mut bus, 0xCFC, &mut data);
+        assert_eq!(u32::from_le_bytes(data), 0xFFFF_FFFF);
     }
 
     #[test]

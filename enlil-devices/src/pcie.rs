@@ -4,6 +4,7 @@
 //! a PCI Express bus with ECAM (Enhanced Configuration Access Mechanism)
 //! for device enumeration.
 
+use crate::bus::PioDevice;
 use crate::truncate::{u8_of, u16_of};
 /// PCI configuration space size per function
 pub const PCI_CONFIG_SPACE_SIZE: usize = 256;
@@ -360,6 +361,142 @@ impl PcieRootComplex {
     }
 }
 
+/// Legacy PCI Configuration Mechanism #1: the `CONFIG_ADDRESS` port (32-bit
+/// register at `0xCF8`).
+pub const CONFIG_ADDRESS_PORT: u16 = 0xCF8;
+/// Legacy PCI Configuration Mechanism #1: the `CONFIG_DATA` window (32-bit, at
+/// `0xCFC`-`0xCFF`).
+pub const CONFIG_DATA_PORT: u16 = 0xCFC;
+/// Bit 31 of `CONFIG_ADDRESS` enables a configuration cycle.
+const CONFIG_ENABLE: u32 = 0x8000_0000;
+
+/// Legacy PCI **Configuration Mechanism #1** front-end (the `0xCF8`/`0xCFC` port
+/// pair) over a [`PcieRootComplex`].
+///
+/// This is the access mechanism a guest BIOS / early kernel uses to enumerate
+/// the PCI bus *before* it has set up ECAM MMIO. Mechanism #1 latches a target
+/// address (bus/device/function/register) into the 32-bit `CONFIG_ADDRESS`
+/// register at port `0xCF8`, then reads or writes the selected configuration
+/// register through the `CONFIG_DATA` window at `0xCFC`-`0xCFF`.
+///
+/// `CONFIG_ADDRESS` layout (per the PCI Local Bus spec):
+/// ```text
+///  31     30..24    23..16   15..11   10..8    7..2    1..0
+/// ┌────┬──────────┬────────┬────────┬───────┬───────┬──────┐
+/// │ EN │ reserved │  bus   │ device │ func  │  reg  │  00  │
+/// └────┴──────────┴────────┴────────┴───────┴───────┴──────┘
+/// ```
+/// The low two bits of the register select are always zero (dword-aligned), so
+/// a byte/word access to `CONFIG_DATA` is steered to the right sub-register by
+/// the *port* offset within the `0xCFC`-`0xCFF` window — `reg | (port - 0xCFC)`.
+/// All decode reuses [`PcieRootComplex::ecam_read`]/[`PcieRootComplex::ecam_write`]
+/// so there is a single config-space decode path shared with the ECAM front-end:
+/// the latched B/D/F is folded back into an ECAM-style offset, whose low 8 bits
+/// cover the 256-byte legacy config space Mechanism #1 can reach.
+pub struct PciConfigIo {
+    /// The root complex whose devices are enumerated through these ports.
+    root: PcieRootComplex,
+    /// The latched `CONFIG_ADDRESS` value (port `0xCF8`).
+    config_address: u32,
+}
+
+/// Low-`size`-byte mask (1/2/4 bytes → `0xFF`/`0xFFFF`/`0xFFFF_FFFF`).
+const fn size_mask(size: u8) -> u32 {
+    match size {
+        1 => 0xFF,
+        2 => 0xFFFF,
+        _ => 0xFFFF_FFFF,
+    }
+}
+
+impl PciConfigIo {
+    /// Wrap a root complex behind the legacy `CONFIG_ADDRESS`/`CONFIG_DATA` ports.
+    #[must_use]
+    pub const fn new(root: PcieRootComplex) -> Self {
+        Self {
+            root,
+            config_address: 0,
+        }
+    }
+
+    /// Borrow the underlying root complex (e.g. to add devices).
+    #[must_use]
+    pub const fn root(&self) -> &PcieRootComplex {
+        &self.root
+    }
+
+    /// Mutably borrow the underlying root complex (e.g. to add devices).
+    pub const fn root_mut(&mut self) -> &mut PcieRootComplex {
+        &mut self.root
+    }
+
+    /// Whether the enable bit (`CONFIG_ADDRESS` bit 31) is set — a config cycle
+    /// is only generated when it is.
+    const fn enabled(&self) -> bool {
+        self.config_address & CONFIG_ENABLE != 0
+    }
+
+    /// ECAM-style offset for a `CONFIG_DATA` access whose byte offset within the
+    /// `0xCFC`-`0xCFF` window is `data_offset` (0..=3). Folds the latched B/D/F
+    /// and the dword-aligned register select back into the same offset encoding
+    /// [`PcieRootComplex::ecam_read`] decodes, so both front-ends share one path.
+    fn target_offset(&self, data_offset: u16) -> u64 {
+        let addr = self.config_address;
+        let bus = ((addr >> 16) & 0xFF) as u8;
+        let device = ((addr >> 11) & 0x1F) as u8;
+        let function = ((addr >> 8) & 0x07) as u8;
+        // Register select (bits 7:2) with the data-window byte offset supplying
+        // the low two bits the latched address forces to zero.
+        let reg = (addr & 0xFC) | u32::from(data_offset & 0x3);
+        PciBdf::new(bus, device, function).ecam_offset() as u64 | u64::from(reg)
+    }
+
+    /// Merge a (possibly sub-dword) guest write into the latched
+    /// `CONFIG_ADDRESS`, leaving the bytes outside the access untouched.
+    fn write_address(&mut self, byte_off: u16, size: u8, data: u32) {
+        let shift = u32::from(byte_off) * 8;
+        if shift >= 32 {
+            return;
+        }
+        let mask = size_mask(size) << shift;
+        let value = (data & size_mask(size)) << shift;
+        self.config_address = (self.config_address & !mask) | value;
+    }
+}
+
+impl PioDevice for PciConfigIo {
+    fn pio_read(&mut self, port: u16, size: u8) -> u32 {
+        if port < CONFIG_DATA_PORT {
+            // CONFIG_ADDRESS window (0xCF8-0xCFB): return the latched value with
+            // the addressed byte shifted down into the low bits.
+            let shift = u32::from(port - CONFIG_ADDRESS_PORT) * 8;
+            (self.config_address >> shift) & size_mask(size)
+        } else {
+            // CONFIG_DATA window (0xCFC-0xCFF): a config cycle only happens with
+            // the enable bit set; otherwise the read is open-bus.
+            if !self.enabled() {
+                return size_mask(size);
+            }
+            let offset = self.target_offset(port - CONFIG_DATA_PORT);
+            self.root.ecam_read(offset, size)
+        }
+    }
+
+    fn pio_write(&mut self, port: u16, size: u8, data: u32) {
+        if port < CONFIG_DATA_PORT {
+            self.write_address(port - CONFIG_ADDRESS_PORT, size, data);
+        } else if self.enabled() {
+            let offset = self.target_offset(port - CONFIG_DATA_PORT);
+            self.root.ecam_write(offset, data, size);
+        }
+    }
+
+    fn port_range(&self) -> (u16, u16) {
+        // Eight ports: CONFIG_ADDRESS (0xCF8-0xCFB) + CONFIG_DATA (0xCFC-0xCFF).
+        (CONFIG_ADDRESS_PORT, CONFIG_DATA_PORT + 4)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,5 +564,117 @@ mod tests {
     fn ecam_offset_calculation() {
         let bdf = PciBdf::new(0, 2, 0);
         assert_eq!(bdf.ecam_offset(), 0x10000);
+    }
+
+    // --- Legacy PCI Configuration Mechanism #1 (0xCF8/0xCFC) ---
+
+    /// Build a `CONFIG_ADDRESS` value for an enabled config cycle.
+    fn config_address(bus: u8, device: u8, function: u8, reg: u8) -> u32 {
+        CONFIG_ENABLE
+            | (u32::from(bus) << 16)
+            | (u32::from(device) << 11)
+            | (u32::from(function) << 8)
+            | u32::from(reg & 0xFC)
+    }
+
+    /// A root complex with one device (Intel `0x8086:0x5678`) at BDF 0:2.0.
+    fn io_with_device() -> PciConfigIo {
+        let mut rc = PcieRootComplex::new(0xB000_0000);
+        rc.add_device(PciConfigSpace::new(PciBdf::new(0, 2, 0), 0x8086, 0x5678));
+        PciConfigIo::new(rc)
+    }
+
+    #[test]
+    fn config_address_latches_and_reads_back() {
+        let mut io = PciConfigIo::new(PcieRootComplex::new(0));
+        io.pio_write(CONFIG_ADDRESS_PORT, 4, 0x8000_1234);
+        assert_eq!(io.pio_read(CONFIG_ADDRESS_PORT, 4), 0x8000_1234);
+        // A byte read of 0xCF9 returns byte 1 of the latched value (0x12).
+        assert_eq!(io.pio_read(CONFIG_ADDRESS_PORT + 1, 1), 0x12);
+    }
+
+    #[test]
+    fn byte_writes_to_config_address_merge_in_place() {
+        let mut io = PciConfigIo::new(PcieRootComplex::new(0));
+        io.pio_write(CONFIG_ADDRESS_PORT, 4, 0x8000_0000);
+        // Byte-poke bus=0x05 into bits 23:16 (0xCFA) without disturbing the rest.
+        io.pio_write(CONFIG_ADDRESS_PORT + 2, 1, 0x05);
+        assert_eq!(io.pio_read(CONFIG_ADDRESS_PORT, 4), 0x8005_0000);
+    }
+
+    #[test]
+    fn mechanism1_reads_vendor_and_device_id() {
+        let mut io = io_with_device();
+        io.pio_write(CONFIG_ADDRESS_PORT, 4, config_address(0, 2, 0, 0x00));
+        // Dword read yields device_id:vendor_id (0x5678_8086).
+        assert_eq!(io.pio_read(CONFIG_DATA_PORT, 4), 0x5678_8086);
+    }
+
+    #[test]
+    fn mechanism1_subword_access_steers_by_data_port_offset() {
+        let mut io = io_with_device();
+        io.pio_write(CONFIG_ADDRESS_PORT, 4, config_address(0, 2, 0, 0x00));
+        // Word at 0xCFC = vendor, word at 0xCFE = device id, byte at 0xCFD = vendor hi.
+        assert_eq!(io.pio_read(CONFIG_DATA_PORT, 2), 0x8086);
+        assert_eq!(io.pio_read(CONFIG_DATA_PORT + 2, 2), 0x5678);
+        assert_eq!(io.pio_read(CONFIG_DATA_PORT + 1, 1), 0x80);
+    }
+
+    #[test]
+    fn disabled_config_cycle_reads_open_bus() {
+        let mut io = io_with_device();
+        // Same B/D/F but enable bit (31) clear -> no config cycle.
+        io.pio_write(
+            CONFIG_ADDRESS_PORT,
+            4,
+            config_address(0, 2, 0, 0) & !CONFIG_ENABLE,
+        );
+        assert_eq!(io.pio_read(CONFIG_DATA_PORT, 4), 0xFFFF_FFFF);
+        assert_eq!(io.pio_read(CONFIG_DATA_PORT, 2), 0xFFFF);
+    }
+
+    #[test]
+    fn mechanism1_absent_device_reads_all_ones() {
+        let mut io = io_with_device();
+        // BDF 0:3.0 has no device.
+        io.pio_write(CONFIG_ADDRESS_PORT, 4, config_address(0, 3, 0, 0x00));
+        assert_eq!(io.pio_read(CONFIG_DATA_PORT, 4), 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn mechanism1_write_reaches_config_space() {
+        let mut io = io_with_device();
+        // Program the interrupt-line register (0x3C) through CONFIG_DATA.
+        // 0x3C == cfg::INTERRUPT_LINE.
+        io.pio_write(CONFIG_ADDRESS_PORT, 4, config_address(0, 2, 0, 0x3C));
+        io.pio_write(CONFIG_DATA_PORT, 1, 0x0B);
+        // Read it straight back through the same window.
+        assert_eq!(io.pio_read(CONFIG_DATA_PORT, 1), 0x0B);
+        // ...and it landed in the backing config space at offset 0x3C.
+        let dev = io.root().find_device(&PciBdf::new(0, 2, 0)).unwrap();
+        assert_eq!(dev.read_u8(cfg::INTERRUPT_LINE), 0x0B);
+    }
+
+    #[test]
+    fn write_disabled_config_cycle_is_dropped() {
+        let mut io = io_with_device();
+        io.pio_write(
+            CONFIG_ADDRESS_PORT,
+            4,
+            config_address(0, 2, 0, 0x3C) & !CONFIG_ENABLE,
+        );
+        io.pio_write(CONFIG_DATA_PORT, 1, 0xEE);
+        let dev = io.root().find_device(&PciBdf::new(0, 2, 0)).unwrap();
+        assert_eq!(
+            dev.read_u8(cfg::INTERRUPT_LINE),
+            0x00,
+            "disabled write must not reach config space"
+        );
+    }
+
+    #[test]
+    fn port_range_claims_the_eight_legacy_cam_ports() {
+        let io = PciConfigIo::new(PcieRootComplex::new(0));
+        assert_eq!(io.port_range(), (0xCF8, 0xD00));
     }
 }

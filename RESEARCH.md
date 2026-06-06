@@ -579,3 +579,30 @@ delivered before count) and a `null_count` status bit in `enlil-devices::timer::
 mount the PIT as a `PioDevice` on `0x40..=0x43`. Channel-0 → IRQ0 delivery (an `IrqLine`-style
 sink mirroring the UART's IRQ4, driven off `Pit::tick`) is the follow-on, and needs the
 KVM/native-VMX interrupt path to actually fire.
+
+## 2026-06-06 — Legacy PCI Configuration Mechanism #1 (0xCF8/0xCFC) front-end
+
+- **PCI Local Bus spec / OSDev "PCI" + Wikipedia "PCI configuration space"**
+  (https://wiki.osdev.org/PCI, https://en.wikipedia.org/wiki/PCI_configuration_space):
+  confirmed Mechanism #1's two 32-bit I/O ports — `CONFIG_ADDRESS` (`0xCF8`) and `CONFIG_DATA`
+  (`0xCFC`). `CONFIG_ADDRESS` layout: bit 31 = enable, bits 23-16 = bus, 15-11 = device,
+  10-8 = function, 7-2 = dword register select, 1-0 forced to `00`. A config cycle is only
+  generated when the enable bit is set; otherwise `CONFIG_DATA` is open-bus. **Pitfall (byte
+  steering):** since the low two register-select bits are always zero, a byte/word read of
+  `CONFIG_DATA` is steered to the right sub-register by the *port offset within the
+  `0xCFC`-`0xCFF` window* (`reg | (port - 0xCFC)`), not by the latched address — the emulator
+  must do the masking/shifting in software. Mechanism #1 reaches only the first 256 bytes of
+  config space (6-bit reg select), vs ECAM's full 4 KiB.
+- **cloud-hypervisor `pci` crate `PciConfigIo` / rust-hypervisor-firmware `src/pci.rs`**
+  (https://github.com/cloud-hypervisor/cloud-hypervisor/blob/main/pci/src/configuration.rs,
+  https://github.com/cloud-hypervisor/rust-hypervisor-firmware/blob/main/src/pci.rs): the
+  canonical Rust reference — a thin `CONFIG_ADDRESS`-latching front-end over a shared
+  config-space store, exactly the shape Enlil needs. Confirms reusing one decode path for both
+  the PIO (CAM) and MMIO (ECAM) front-ends rather than duplicating B/D/F decode.
+
+**Changes what we build:** add `enlil_devices::pcie::PciConfigIo` as a `PioDevice` over
+`0xCF8..=0xCFF` wrapping the existing `PcieRootComplex`, folding the latched B/D/F + register
+back into the ECAM-style offset `PcieRootComplex::ecam_read/ecam_write` already decode (single
+decode path). Without it the guest BIOS finds no host bridge at boot. **Follow-on:** mount ECAM
+on the MMIO bus over the same root complex — which will need shared ownership (`Rc<RefCell>` or
+equivalent) since both front-ends mutate the same device set.

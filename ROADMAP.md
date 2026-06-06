@@ -260,8 +260,20 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > wire interrupts to KVM — the UART's `IrqLine` to `vmm.set_irq_line(4, level)` through the
 > in-kernel IRQ chip in `KvmBackend` (drive it after each vCPU exit or via an `EventFd`/
 > `irqfd`), and a matching channel-0 → IRQ0 sink driven off `Pit::tick`. **Note (hardening,
-> Firecracker #2777):** forbid (re)creating PIT channels after guest boot. Then PCI config
-> (`0xCF8/0xCFC`).
+> Firecracker #2777):** forbid (re)creating PIT channels after guest boot.
+>
+> **Status (2026-06-06):** legacy PCI **Configuration Mechanism #1** (`0xCF8`/`0xCFC`) is now a
+> bus device. `enlil_devices::pcie::PciConfigIo` implements `PioDevice` over `0xCF8..=0xCFF`,
+> wrapping the existing `PcieRootComplex`: a dword OUT to `CONFIG_ADDRESS` latches the target
+> B/D/F + register (enable bit honoured), and reads/writes through the `CONFIG_DATA` window
+> (`0xCFC`-`0xCFF`) are byte-steered by port offset and folded back into the same ECAM-style
+> offset `PcieRootComplex::ecam_read/ecam_write` decode — one shared config-space decode path.
+> `DeviceBus::add_pci_config_io` mounts it, so a guest BIOS can enumerate the host bridge and
+> devices at boot instead of reading open-bus `0xFF`. Covered by 9 `pcie` unit tests + 1
+> `DeviceBus` integration test (no KVM needed). **Next:** mount **ECAM** (the MMIO front-end)
+> on the MMIO bus over the *same* root complex — needs shared ownership (`Rc<RefCell>` or
+> equivalent) so the CAM and ECAM front-ends mutate one device set; then the KVM IRQ wiring
+> (UART IRQ4 + PIT IRQ0) once a `/dev/kvm`-capable runner is available.
 
 ### 0.3 USB Live Boot & Non-Destructive Testing (CRITICAL FOR ADOPTION)
 

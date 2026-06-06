@@ -6,6 +6,72 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-06 (b) — Legacy PCI Configuration Mechanism #1 (0xCF8/0xCFC) on the bus (Phase 0.2)
+
+The previous run's recommended next step #1 (channel-0 → IRQ0 + UART IRQ4 wiring to KVM) is
+**still blocked — no `/dev/kvm` on this runner (no nested virt)**. Took step #2 instead, which
+the roadmap explicitly names next ("Then PCI config (`0xCF8/0xCFC`)"): the legacy PCI
+**Configuration Mechanism #1** port pair. Pure userspace, fully testable here, mirrors the
+06-04 serial / 06-06 PIT bus-mounts.
+
+### Situation found
+`enlil-devices::pcie` had a complete `PcieRootComplex` with device storage and an **ECAM** MMIO
+decode (`ecam_read`/`ecam_write`), plus `PciConfigSpace` (per-function config space with BAR
+size-detection) — but **nothing implemented the legacy CAM PIO front-end**. A guest BIOS that
+enumerates PCI via `0xCF8`/`0xCFC` *before* bringing up ECAM saw open-bus `0xFF` on those ports
+→ no host bridge, no devices found. Neither the ECAM nor the CAM front-end was mounted on any
+bus yet; this run wires the CAM half (the one a legacy/early-boot guest hits first).
+
+### What I did (one increment: PCI Mechanism #1 becomes a real bus device)
+- **`enlil_devices::pcie::PciConfigIo`** — a `PioDevice` over `0xCF8..=0xCFF` (constants
+  `CONFIG_ADDRESS_PORT` / `CONFIG_DATA_PORT`) wrapping a `PcieRootComplex`. A write to the
+  `CONFIG_ADDRESS` window (`0xCF8`-`0xCFB`) latches `config_address` (sub-dword writes merge in
+  place via `write_address`); the enable bit (31) is honoured. Reads/writes of the `CONFIG_DATA`
+  window (`0xCFC`-`0xCFF`) are **byte-steered by port offset** (`reg | (port - 0xCFC)`) and the
+  latched B/D/F + register are folded back into an ECAM-style offset (`target_offset`) so decode
+  **reuses `PcieRootComplex::ecam_read`/`ecam_write`** — a single shared config-space decode
+  path with the future ECAM front-end. A disabled config cycle reads open-bus and drops writes.
+- **`DeviceBus::add_pci_config_io`** in `enlil-core/src/device_bus.rs` (thin wrapper over
+  `add_pio`, mirrors `add_pit`/`add_serial`).
+
+### Research (informed the design) — logged in `RESEARCH.md` (2026-06-06, Mechanism #1 entry)
+PCI Local Bus spec / OSDev "PCI" / Wikipedia "PCI configuration space" (CONFIG_ADDRESS layout,
+enable bit, **byte-steering pitfall** — low two reg bits are always zero so sub-dword CONFIG_DATA
+access is selected by port offset, masked/shifted in software; Mechanism #1 reaches only the
+first 256 bytes). cloud-hypervisor `pci::PciConfigIo` + rust-hypervisor-firmware `src/pci.rs`
+(canonical Rust reference: thin address-latching front-end over a shared config store; reuse one
+decode path for CAM + ECAM).
+
+### Test results (exact)
+- `cargo build` (workspace) → **OK** (0 errors).
+- `cargo fmt --all -- --check` → **OK** (after `cargo fmt --all`).
+- `cargo clippy --all-targets --workspace -- -D warnings` → **OK** (clean; `pcie` is in the
+  strict-deny `enlil-devices` crate — masked truncating casts match the existing `ecam_read`
+  idiom, no new `#[allow]`).
+- `cargo test --workspace` → **672 passed, 0 failed** (was 662; +10). New: 9 `pcie` unit tests
+  (`config_address_latches_and_reads_back`, `byte_writes_to_config_address_merge_in_place`,
+  `mechanism1_reads_vendor_and_device_id`, `mechanism1_subword_access_steers_by_data_port_offset`,
+  `disabled_config_cycle_reads_open_bus`, `mechanism1_absent_device_reads_all_ones`,
+  `mechanism1_write_reaches_config_space`, `write_disabled_config_cycle_is_dropped`,
+  `port_range_claims_the_eight_legacy_cam_ports`) + 1 `DeviceBus` integration test
+  (`guest_enumerates_pci_through_cf8_cfc_on_the_bus`).
+- `/dev/kvm` paths: **not run — no `/dev/kvm` (no nested virt)**; they self-skip.
+- no_std custom-target build: **N/A** — no crate is `#![no_std]` yet.
+
+### Recommended next step (tomorrow)
+1. **Mount ECAM on the MMIO bus** over the *same* `PcieRootComplex` the CAM front-end wraps.
+   This needs shared ownership of the root complex (the CAM `PciConfigIo` currently owns it by
+   value) — wrap it in `Rc<RefCell<PcieRootComplex>>` (or an `Arc<Mutex>` if it must cross
+   threads) and give both `PciConfigIo` and a new `EcamSpace` MMIO device handles, so CAM and
+   ECAM mutate one device set. Add a host bridge (`create_host_bridge`) at BDF 0:0.0 by default
+   so a guest finds *something* at boot. Pure userspace, fully testable here.
+2. **Channel-0 → IRQ0 + UART IRQ4 wiring to KVM** (carried over, still blocked). Give `Pit` an
+   `IrqLine` sink pulsed from `Pit::tick`; wire both it and the UART `IrqLine` to KVM via
+   `set_irq_line(0/4, level)` / `irqfd`. **Needs a `/dev/kvm`-capable runner** — if still
+   unavailable, do the platform-independent half (PIT `IrqLine` + a `tick`-driven edge test).
+3. **Hardening (Firecracker #2777):** once IRQ0 is live, forbid (re)programming PIT channels
+   after guest boot, and stop channel-0 when idle.
+
 ## 2026-06-06 — 8254 PIT on the device bus + read-back command (Phase 0.2)
 
 The previous run's recommended next step was (1) wire the UART `IrqLine` to KVM — **blocked,
