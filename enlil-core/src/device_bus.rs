@@ -16,6 +16,7 @@
 use crate::kvm_backend::VmExitHandler;
 use crate::serial::{SerialOutput, SerialPort};
 use enlil_devices::bus::{MmioBus, MmioDevice, PioBus, PioDevice};
+use enlil_devices::interrupt::SharedInterruptController;
 use enlil_devices::pcie::{
     vendors, EcamSpace, PciBdf, PciConfigIo, PcieRootComplex, SharedRootComplex,
 };
@@ -176,7 +177,48 @@ impl DeviceBus {
         let pcie = bus.add_pcie(PcieRootComplex::new(DEFAULT_ECAM_BASE))?;
         Ok((bus, pcie))
     }
+
+    /// Like [`standard_pc`](Self::standard_pc), but additionally wires the legacy
+    /// devices' interrupt lines into `pic` so they actually reach a vCPU: the
+    /// 8254 PIT's channel-0 line drives [`IRQ_PIT`] and the COM1 16550's line
+    /// drives [`IRQ_COM1`]. Each device pulses its line through `pic`, which
+    /// routes it through the I/O APIC RTE to the destination LAPIC's IRR.
+    ///
+    /// The caller owns `pic` (it clones a handle into each line) so it can mount
+    /// the LAPIC/IOAPIC MMIO, program the redirection table, and read pending
+    /// vectors. The redirection entries start masked, so until the guest OS
+    /// programs the I/O APIC these lines deliver nothing — exactly as on real
+    /// hardware.
+    ///
+    /// Returns the assembled bus and the [`SharedRootComplex`] handle, as
+    /// [`standard_pc`](Self::standard_pc) does.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if any two devices' ranges
+    /// overlap (they do not at these canonical addresses).
+    pub fn standard_pc_with_interrupts(
+        serial_output: SerialOutput,
+        pic: &SharedInterruptController,
+    ) -> Result<(Self, SharedRootComplex), enlil_devices::bus::BusError> {
+        let mut bus = Self::new();
+
+        let mut com1 = SerialPort::com1(serial_output);
+        com1.attach_irq_line(Box::new(pic.line(IRQ_COM1)));
+        bus.add_serial(com1)?;
+
+        let mut pit = Pit::new();
+        pit.attach_irq0(Box::new(pic.line(IRQ_PIT)));
+        bus.add_pit(pit)?;
+
+        let pcie = bus.add_pcie(PcieRootComplex::new(DEFAULT_ECAM_BASE))?;
+        Ok((bus, pcie))
+    }
 }
+
+/// Legacy ISA IRQ line for the 8254 PIT channel-0 (system timer).
+pub const IRQ_PIT: u8 = 0;
+/// Legacy ISA IRQ line for the COM1 16550 UART.
+pub const IRQ_COM1: u8 = 4;
 
 /// Guest-physical base of the `PCIe` ECAM window for the default single-segment
 /// layout. Matches the MCFG table emitted by `enlil_devices::acpi`, so a guest
@@ -453,6 +495,69 @@ mod tests {
             VmExitHandler::io_out(&mut bus, COM1, &[b]);
         }
         assert_eq!(&*sink.lock().unwrap(), b"hi");
+    }
+
+    #[test]
+    fn standard_pc_with_interrupts_routes_uart_irq_to_a_vcpu() {
+        use crate::serial::{SerialOutput, SerialOutputMode, COM1, IER_REG};
+        use enlil_devices::interrupt::SharedInterruptController;
+        use std::sync::{Arc, Mutex};
+
+        // One vCPU; program the I/O APIC RTE for IRQ4 (COM1) to deliver vector
+        // 0x24 to LAPIC 0, and enable LAPIC 0 (SVR bit 8) — what a guest OS does
+        // when it brings up the APIC. (LAPIC_SVR offset 0x0F0 is not re-exported
+        // from enlil-devices, so the literal is used here.)
+        let pic = SharedInterruptController::new(1);
+        pic.with(|c| {
+            let rte = c.ioapic.get_rte_mut(4);
+            rte.set_vector(0x24);
+            rte.set_destination(0);
+            rte.set_masked(false);
+            c.lapics[0].write_register(0x0F0, 0x1FF);
+        });
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let (mut bus, _pcie) = DeviceBus::standard_pc_with_interrupts(
+            SerialOutput::new("guest", SerialOutputMode::Shared(Arc::clone(&sink))),
+            &pic,
+        )
+        .unwrap();
+
+        // Same canonical layout as standard_pc.
+        assert!(bus.pio.is_mapped(COM1));
+        assert!(bus.pio.is_mapped(0x40));
+
+        // No interrupt has fired yet.
+        assert!(!pic.with(|c| c.has_pending(0)));
+
+        // Enabling the THR-empty interrupt in the IER asserts IRQ4 immediately
+        // (the THR is always empty in our model). This is a pure `io_out` exit,
+        // exactly as the guest would issue it.
+        VmExitHandler::io_out(&mut bus, COM1 + IER_REG, &[0x02]);
+
+        // The line drove IRQ4 through the I/O APIC RTE into LAPIC 0's IRR.
+        assert!(pic.with(|c| c.has_pending(0)));
+        assert_eq!(pic.with(|c| c.pending_vector(0)), Some(0x24));
+    }
+
+    #[test]
+    fn standard_pc_with_interrupts_delivers_nothing_through_a_masked_ioapic() {
+        use crate::serial::{SerialOutput, SerialOutputMode, COM1, IER_REG};
+        use enlil_devices::interrupt::SharedInterruptController;
+
+        // LAPIC enabled but the RTEs are left at their reset (masked) state: a
+        // device asserting before the OS programs the I/O APIC reaches no vCPU.
+        let pic = SharedInterruptController::new(1);
+        pic.with(|c| c.lapics[0].write_register(0x0F0, 0x1FF));
+
+        let (mut bus, _pcie) = DeviceBus::standard_pc_with_interrupts(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            &pic,
+        )
+        .unwrap();
+
+        VmExitHandler::io_out(&mut bus, COM1 + IER_REG, &[0x02]);
+        assert!(!pic.with(|c| c.has_pending(0)));
     }
 
     #[test]
