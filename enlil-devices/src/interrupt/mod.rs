@@ -10,6 +10,7 @@
 mod controller;
 mod ioapic;
 mod lapic;
+mod line;
 mod msi;
 
 /// Interrupt delivery mode (shared across LAPIC, IOAPIC, MSI).
@@ -60,4 +61,5 @@ pub use controller::InterruptController;
 pub use ioapic::IOAPIC_BASE;
 pub use ioapic::{IoApic, RedirectionEntry};
 pub use lapic::LocalApic;
+pub use line::{IoApicMmio, SharedInterruptController};
 pub use msi::{MsiCapability, MsiMessage, MsixCapability, MsixTableEntry};

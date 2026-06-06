@@ -631,3 +631,36 @@ equivalent) since both front-ends mutate the same device set.
 root, and a `DeviceBus::add_pcie(root)` helper that mounts CAM + ECAM over one root and seeds a
 default host bridge at 0:0.0 so a guest finds something at boot. Nothing fundamentally new beyond
 the 06-06 Mechanism #1 entry — this is the MMIO twin of the same single-decode-path design.
+
+## 2026-06-07 — Device IRQ delivery: I/O APIC line wiring + MMIO front-end
+
+Targeted check for today's step (wire PIT-IRQ0/UART-IRQ4 to interrupt delivery, then
+let a guest program the routing). Most of the relevant primary material was already
+logged (06-05 16550 IIR/Trigger, 06-06 i8254 in-kernel-vs-userspace, the LAPIC/IOAPIC
+emulation that predates this routine). New, specifically-applied:
+
+- **Intel 82093AA I/O APIC datasheet** (the part `enlil_devices::interrupt::ioapic`
+  already models: version `0x11`, 24 RTEs, `IOREGSEL`@0x00 / `IOWIN`@0x10 at MMIO base
+  `0xFEC0_0000`): a guest programs each redirection entry as **two 32-bit dword writes**
+  (low = vector/delivery/mask/trigger, high = destination), selected via `IOREGSEL`. This
+  is exactly the front-end an `MmioDevice` must expose; nothing decodes B/D/F, it's a thin
+  forward to `IoApic::mmio_read/write(offset)`. RTEs reset **masked**, so a device that
+  asserts before the OS programs the I/O APIC must deliver nothing — the transparent,
+  hardware-accurate behaviour (and a free DoS guard against an un-acked line).
+- **rust-vmm `vm-superio` `Trigger` + KVM `irqfd`/`KVM_IRQ_LINE` model** (already logged
+  06-05): a device drives a *level* sink on real edges; the consumer routes it. Confirms
+  the chosen shape — `SharedInterruptController::line(irq)` returns a `Fn(bool)+Send`
+  level sink (rising edge → `deliver_irq`, falling → `clear_irq`) that satisfies **both**
+  crate-local `IrqLine` traits via their blanket `impl … for F: Fn(bool)+Send`, so the PIT
+  (enlil-devices) and UART (enlil-core) wire identically without a cross-crate dependency.
+- **Why the LAPIC is *not* on the shared MMIO bus** (Intel SDM Vol.3 §10.4, KVM
+  `KVM_CREATE_IRQCHIP`): the local APIC lives at the same physical address (`0xFEE0_0000`)
+  for every CPU and an access implicitly targets the *accessing* vCPU's LAPIC. A shared
+  `MmioBus` has no "current vCPU" notion, so LAPIC MMIO belongs in the per-vCPU exit path
+  (or the in-kernel chip), **not** as a bus `MmioDevice` — only the I/O APIC (genuinely
+  shared) is mounted on the bus.
+
+**Changes what we build:** add `SharedInterruptController` (`Arc<Mutex<InterruptController>>`)
+with a `.line(irq)` level-sink factory and a matching `clear_irq`; add `IoApicMmio` as an
+`MmioDevice` at `0xFEC0_0000`; and a `DeviceBus::standard_pc_with_interrupts` that attaches
+PIT→IRQ0 / UART→IRQ4 and mounts the I/O APIC aperture. Defer LAPIC MMIO to the per-vCPU path.

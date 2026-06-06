@@ -46,6 +46,16 @@ impl InterruptController {
         }
     }
 
+    /// Deassert a device IRQ line (for level-triggered routing).
+    ///
+    /// Edge-triggered ISA lines (the legacy default) latch on assertion and do
+    /// not need a deassert, so this is a no-op for them; for a level-triggered
+    /// RTE it clears the I/O APIC's tracked line state so a later re-assertion
+    /// delivers again.
+    pub const fn clear_irq(&mut self, irq: u8) {
+        self.ioapic.clear_irq(irq as usize);
+    }
+
     /// Deliver an MSI/MSI-X interrupt.
     pub fn deliver_msi(&mut self, msg: &MsiMessage) {
         let vector = msg.vector();

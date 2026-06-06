@@ -274,6 +274,22 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > on the MMIO bus over the *same* root complex — needs shared ownership (`Rc<RefCell>` or
 > equivalent) so the CAM and ECAM front-ends mutate one device set; then the KVM IRQ wiring
 > (UART IRQ4 + PIT IRQ0) once a `/dev/kvm`-capable runner is available.
+>
+> **Status (2026-06-07):** device **IRQ delivery** is now wired in userspace (no KVM needed).
+> `enlil_devices::interrupt::SharedInterruptController` (`Arc<Mutex<InterruptController>>`) has a
+> `.line(irq)` factory returning a `Fn(bool)+Send` level sink — rising edge → `deliver_irq`,
+> falling → the new `clear_irq` — that satisfies *both* the PIT (`enlil-devices`) and UART
+> (`enlil-core`) `IrqLine` traits via their `Fn(bool)+Send` blanket impls, so devices wire to
+> interrupt delivery the same way without a cross-crate dependency. `IoApicMmio` exposes the I/O
+> APIC's `IOREGSEL`/`IOWIN` registers at `0xFEC0_0000` as an `MmioDevice`, so a guest OS programs
+> the redirection table itself (2 dword writes/RTE; RTEs reset masked → no delivery until the OS
+> routes them). `DeviceBus::standard_pc_with_interrupts` attaches PIT→IRQ0, UART→IRQ4, and mounts
+> the aperture: a guest writes an RTE via MMIO, a device asserts its line, and the interrupt
+> routes through the programmed entry into the destination LAPIC's IRR. Covered by 8
+> `interrupt::line` unit tests + 2 `DeviceBus` integration tests (no KVM). The **LAPIC** is
+> deliberately *not* on the shared bus (it's per-vCPU at one address — belongs in the per-vCPU
+> exit path / in-kernel chip). **Next:** the KVM `set_irq_line`/`irqfd` binding once a
+> `/dev/kvm`-capable runner exists; have `KvmBackend` build its bus via `standard_pc_with_interrupts`.
 
 ### 0.3 USB Live Boot & Non-Destructive Testing (CRITICAL FOR ADOPTION)
 
