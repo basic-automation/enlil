@@ -551,3 +551,31 @@ By adopting the precompile + continuation + recursion + lookup + Poseidon + GPU 
 sink in `enlil-core::serial::UartState`, asserting/deasserting on every state change. The
 KVM `set_irq_line(4, level)` wiring through the in-kernel irqchip is the follow-on (Linux-only,
 needs `/dev/kvm` to exercise).
+
+## 2026-06-06 — i8254 PIT on the bus: read-back command + in-kernel-vs-userspace timer
+
+- **Intel 8254 datasheet + OSDev "Programmable Interval Timer"**
+  (https://wiki.osdev.org/Programmable_Interval_Timer): confirmed the **read-back command**
+  (control word, bits 7-6 = `11`): bit 5 low (`/COUNT`) latches the current count of every
+  selected channel, bit 4 low (`/STATUS`) latches a status byte, bits 3-1 select channels
+  2/1/0. The **status byte** is bit7=OUT-pin, bit6=null-count (control word written but count
+  not yet loaded), bits5-4=RW-access, bits3-1=mode, bit0=BCD. When both count and status are
+  requested the status byte is delivered first on the next data-port read. Our `Pit` ignored
+  the read-back command (`channel_idx == 3` → early return) — a transparency gap, since a guest
+  probing timer state via read-back would read garbage.
+- **QEMU `hw/timer/i8254.c` / Linux `arch/x86/kvm/i8254.c` + KVM API
+  (`KVM_CREATE_PIT2`)** (https://www.kernel.org/doc/html/v5.10/virt/kvm/api.html): with KVM the
+  PIT is normally emulated **in-kernel** (`KVM_CREATE_PIT2`) so it is not on our userspace bus
+  at all; userspace only services PIT exits when the in-kernel model is disabled. Enlil's own
+  native-VMX backend (Phase 5+, no in-kernel chip) **must** carry a userspace PIT, so mounting
+  it on `DeviceBus` is correct and necessary even though the KVM path may bypass it.
+- **Pitfall — Firecracker issue #2777**
+  (https://github.com/firecracker-microvm/firecracker/issues/2777): allowing (re)creation of
+  PIT timer channels after the guest kernel has booted is a hardening concern; channel-0 left
+  running also costs steal time. Flagged for when channel-0 IRQ0 delivery is wired.
+
+**Changes what we build:** implement the read-back command (count + status latching, status
+delivered before count) and a `null_count` status bit in `enlil-devices::timer::Pit`, then
+mount the PIT as a `PioDevice` on `0x40..=0x43`. Channel-0 → IRQ0 delivery (an `IrqLine`-style
+sink mirroring the UART's IRQ4, driven off `Pit::tick`) is the follow-on, and needs the
+KVM/native-VMX interrupt path to actually fire.

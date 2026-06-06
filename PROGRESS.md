@@ -6,6 +6,75 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-06 — 8254 PIT on the device bus + read-back command (Phase 0.2)
+
+The previous run's recommended next step was (1) wire the UART `IrqLine` to KVM — **blocked,
+no `/dev/kvm` on this runner (no nested virt)** — or (2) the next early-boot PIO devices,
+**PIT (`0x40-0x43`)** and PCI config (`0xCF8/0xCFC`). Picked (2)'s PIT half: it's pure
+userspace, fully testable here, and mirrors the 06-04 serial bus-mount.
+
+### Situation found
+`enlil-devices::timer::Pit` was a complete-ish i8254 emulation (3 channels, modes 0-3 ticking,
+single-channel latch, `channel0_frequency`) **but it implemented none of the bus traits** —
+nothing called `PioDevice`, so a guest touching `0x40-0x43` got open-bus `0xFF` (a dead
+giveaway / breaks early timer calibration). It also **ignored the read-back command**
+(`write_command` returned early for `channel_idx == 3`), and had no null-count status bit.
+
+### What I did (one increment: the PIT becomes a real, more-transparent bus device)
+- **`impl PioDevice for Pit`** in `enlil-devices/src/timer/pit.rs` over `0x40..=0x43`
+  (`PIT_PORT_BASE`/`PIT_PORT_COUNT` constants): byte-wide reads return the low byte of the
+  `u32`, writes consume the low byte. The bus passes the absolute port, which `read_port`/
+  `write_port` already decode (`port & 0x3`, `0x43` = command).
+- **Read-back command** (`Pit::read_back`): control word bits 7-6 = `11` → `/COUNT` (bit 5
+  low) latches each *selected* channel's current count, `/STATUS` (bit 4 low) latches a status
+  byte; bits 3-1 select channels 2/1/0. A pending latch isn't overwritten by a second
+  read-back (datasheet). `read_data` now delivers a latched **status byte before** any latched
+  count.
+- **Status byte + `null_count`**: added `CounterStatus { output, null_count }` (a sub-struct so
+  `PitChannel` stays ≤ 3 bools — same pattern as the existing `ByteLatch`, avoids the
+  zero-`#[allow]` `struct_excessive_bools` deny). `null_count` is set on a control-word write
+  and cleared on count load; `status_byte()` packs OUT-pin/null-count/RW-access/mode/BCD per
+  the 8254 datasheet. Added `ChannelMode::bits()` / `AccessMode::bits()` for clean enum→field
+  encoding (no `as` casts).
+- **`DeviceBus::add_pit(Pit)`** in `enlil-core/src/device_bus.rs` (thin wrapper over `add_pio`,
+  mirrors `add_serial`).
+
+### Research (informed the design) — logged in `RESEARCH.md` (2026-06-06)
+Intel 8254 datasheet / OSDev PIT (read-back command + status-byte layout), QEMU/Linux
+`i8254.c` + `KVM_CREATE_PIT2` (KVM normally emulates the PIT **in-kernel**, so it bypasses our
+userspace bus — but Enlil's own native-VMX backend will have no in-kernel chip and **must**
+carry a userspace PIT, so this is correct), and Firecracker #2777 (hardening: forbid creating
+PIT channels after boot; channel-0 left running costs steal time).
+
+### Test results (exact)
+- `cargo build` (workspace) → **OK** (0 errors).
+- `cargo fmt --all -- --check` → **OK**.
+- `cargo clippy --all-targets --workspace -- -D warnings` → **OK** (clean; PIT is in the
+  strict-deny `enlil-devices` crate; the `CounterStatus` extraction keeps it under the
+  `struct_excessive_bools` threshold with no `#[allow]`).
+- `cargo test --workspace` → **662 passed, 0 failed** (was 654; +8). New: 6 PIT unit tests
+  (`test_pio_device_claims_four_command_ports`, `test_pio_write_programs_channel_low_byte_only`,
+  `test_pio_read_returns_count_in_low_byte`, `test_read_back_latches_status_before_count`,
+  `test_read_back_null_count_set_before_load`, `test_read_back_only_selected_channels`) + 2
+  `DeviceBus` integration tests (`pit_on_the_bus_programs_and_reads_back_a_channel_count`,
+  `pit_and_serial_coexist_on_the_pio_bus`).
+- `/dev/kvm` paths (`serial_console_smoke`, `kvm_create_vm_and_map_memory`): **not run — no
+  `/dev/kvm` (no nested virt)**; they self-skip. No PIT IRQ delivery was exercised (none was
+  written this run).
+- no_std custom-target build: **N/A** — no crate is `#![no_std]` yet.
+
+### Recommended next step (tomorrow)
+1. **Channel-0 → IRQ0 + UART IRQ4 wiring.** Give `Pit` an `IrqLine`-style sink (mirror the
+   UART's `attach_irq_line`) pulsed from `Pit::tick` when channel 0 reaches terminal count,
+   and wire both it and the existing UART `IrqLine` to KVM via `vm.set_irq_line(0/4, level)`
+   through the in-kernel IRQ chip (or `irqfd`/`EventFd`). Add a `/dev/kvm`-gated test. **Needs
+   a KVM-capable runner** — if still unavailable, do the platform-independent half (the PIT
+   `IrqLine` + a `tick`-driven edge test) and leave the `set_irq_line` call for the KVM runner.
+2. **PCI config space (`0xCF8/0xCFC`)** as a `PioDevice` — the address/data port pair a guest
+   uses to enumerate the PCI bus early in boot. Pure userspace, fully testable here.
+3. **Hardening (Firecracker #2777):** once IRQ0 is live, forbid (re)programming PIT channels
+   after guest boot, and stop channel-0 when idle to avoid steal time.
+
 ## 2026-06-05 — Interrupt-driven 16550: IER-honoured IIR + pluggable IRQ4 line (Phase 0.2)
 
 The previous run's recommended next step: give `SerialPort` an IRQ4 sink fired on

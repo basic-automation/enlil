@@ -248,11 +248,20 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > IIR read), and exposes `interrupt_pending()` plus a pluggable `IrqLine` sink it pulses on
 > every level change (`SerialPort::attach_irq_line`). A blanket `impl IrqLine for Fn(bool)`
 > lets the backend wire it with a closure. The model matches rust-vmm `vm-superio`'s
-> `Trigger` and the PC16550D datasheet; covered by 7 unit tests (no KVM needed). **Next:**
-> wire that `IrqLine` to KVM — `vmm.set_irq_line(4, level)` through the in-kernel IRQ chip in
-> `KvmBackend` — and drive it after each vCPU exit (or via an `EventFd`/`irqfd`), so a guest
-> running its 8250 in the default interrupt-driven mode gets IRQ4; then PIT (`0x40-0x43`) and
-> PCI config (`0xCF8/0xCFC`).
+> `Trigger` and the PC16550D datasheet; covered by 7 unit tests (no KVM needed).
+>
+> **Status (2026-06-06):** the 8254 PIT is now a real bus device.
+> `enlil_devices::timer::Pit` implements `enlil_devices::bus::PioDevice` over `0x40..=0x43`
+> (`DeviceBus::add_pit` mounts it), so the legacy timer ports answer instead of reading back
+> open-bus `0xFF`. Added the **read-back command** (control word bits 7-6 = `11`: `/COUNT`
+> latches each selected channel's count, `/STATUS` latches a status byte delivered before the
+> count) and a `null_count` status bit, so a guest probing timer state sees faithful values.
+> Covered by 6 PIT unit tests + 2 `DeviceBus` integration tests (no KVM needed). **Next:**
+> wire interrupts to KVM — the UART's `IrqLine` to `vmm.set_irq_line(4, level)` through the
+> in-kernel IRQ chip in `KvmBackend` (drive it after each vCPU exit or via an `EventFd`/
+> `irqfd`), and a matching channel-0 → IRQ0 sink driven off `Pit::tick`. **Note (hardening,
+> Firecracker #2777):** forbid (re)creating PIT channels after guest boot. Then PCI config
+> (`0xCF8/0xCFC`).
 
 ### 0.3 USB Live Boot & Non-Destructive Testing (CRITICAL FOR ADOPTION)
 
