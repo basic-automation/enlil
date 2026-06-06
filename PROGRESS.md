@@ -6,7 +6,84 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
-## 2026-06-06 (c) — Session: ECAM MMIO, PIT IRQ0 line, bounded RX FIFO, standard-PC bus (Phase 0.2)
+## 2026-06-07 — Session: device IRQ delivery — line wiring, assembled-bus wiring, I/O APIC MMIO (Phase 0.2)
+
+A multi-increment session. Three complete, independently-green, tested commits on the branch,
+each a full orient→build→verify trip, forming one coherent arc: **make device interrupts actually
+reach a vCPU, and let a guest program the routing.** This took the 06-06(c) recommended next
+step #1, path (a) — "wire the IRQ lines to delivery (native/userspace), no KVM needed". `/dev/kvm`
+is **still absent on this runner (no nested virt)**, so every increment is the pure-userspace half,
+fully exercised by unit/integration tests. Test count: 683 → **693**.
+
+### Increment 1 — `SharedInterruptController` + `clear_irq` (`d1423ad`)
+Both the PIT (`attach_irq0`) and UART (`attach_irq_line`) exposed level sinks (`IrqLine`) but
+nothing consumed them — interrupts went nowhere. Added
+`enlil_devices::interrupt::SharedInterruptController` (`Arc<Mutex<InterruptController>>`, `Send` to
+match the `IrqLine` bound) with:
+- `.line(irq) -> impl Fn(bool) + Send + use<>`: a level sink that calls `deliver_irq(irq)` on a
+  rising edge and the new `InterruptController::clear_irq(irq)` on a falling edge. It satisfies
+  **both** `IrqLine` traits (PIT's in `enlil-devices`, UART's in `enlil-core`) through their
+  `Fn(bool)+Send` blanket impls — one wiring path, no cross-crate dep.
+- `.with(|c| …)` for locked access (program RTEs, read pending vectors), `.new`/`.from_controller`.
+- `InterruptController::clear_irq` forwards to `IoApic::clear_irq` (no-op for edge-triggered ISA
+  lines, correct deassert for a level-triggered RTE).
+- +6 tests (rising-edge delivery, PIT true/false pulse still latches one edge, masked RTE delivers
+  nothing, separate lines hit their own vectors, clones share one controller, level-triggered
+  clear-on-falling-edge).
+
+### Increment 2 — `DeviceBus::standard_pc_with_interrupts` (`fec39ac`)
+`standard_pc` assembled COM1+PIT+PCIe but wired no interrupts. Added a sibling factory taking a
+`&SharedInterruptController` that attaches PIT channel-0 → `IRQ_PIT` (0) and COM1 → `IRQ_COM1` (4)
+**before** boxing them into the bus (you can't reach a device's non-`PioDevice` methods once boxed).
+The caller owns the PIC. New `IRQ_PIT`/`IRQ_COM1` constants. +2 `DeviceBus` tests driving the *real*
+bus: enabling the UART THRE interrupt via an `io_out` exit raises IRQ4 into LAPIC 0's IRR; a masked
+RTE delivers nothing.
+
+### Increment 3 — `IoApicMmio` front-end (`940aaf2`)
+The I/O APIC had `mmio_read/write` methods but wasn't mounted as a bus device, so a guest couldn't
+program the redirection table — RTEs stayed masked and *no* device IRQ could ever be delivered.
+Added `IoApicMmio` (`MmioDevice` at `0xFEC0_0000`, one 4 KiB page) forwarding `IOREGSEL`/`IOWIN` to
+the shared controller's I/O APIC; `DeviceBus::add_ioapic`; and `standard_pc_with_interrupts` now
+mounts it. The increment-2 UART test was upgraded to program IRQ4's RTE **through the MMIO aperture**
+(2 dword writes, as a guest OS does) — closing the loop end-to-end. +2 `interrupt::line` tests.
+
+### Test results (exact)
+- `cargo build` (workspace) → **OK**.
+- `cargo fmt --all -- --check` → **OK** (ran `cargo fmt --all`).
+- `cargo clippy --all-targets --workspace -- -D warnings` → **OK** (clean; `interrupt::line` is in
+  the strict-deny `enlil-devices` crate — used `truncate::u32_of` for the dword write and `const fn`
+  on `IoApicMmio::new`, no new `#[allow]`).
+- `cargo test --workspace` → **693 passed, 0 failed, 1 ignored** (was 683; +10 across the three
+  increments). The 1 ignored is the `/dev/kvm` self-skip.
+- `/dev/kvm` paths (`serial_console_smoke`, `kvm_create_vm_and_map_memory`): **not run — no
+  `/dev/kvm` (no nested virt)**; they self-skip.
+- no_std custom-target build: **N/A** — no crate is `#![no_std]` yet.
+
+### Design note (so tomorrow doesn't re-litigate it)
+The **LAPIC is deliberately NOT a bus `MmioDevice`.** It sits at one physical address
+(`0xFEE0_0000`) for *every* vCPU and an access implicitly targets the accessing vCPU's LAPIC; a
+shared `MmioBus` has no "current vCPU" notion. LAPIC MMIO belongs in the per-vCPU exit path (or the
+in-kernel chip via `KVM_CREATE_IRQCHIP`). Only the genuinely-shared I/O APIC is on the bus. Today's
+tests therefore enable LAPIC 0 via `pic.with(|c| c.lapics[0].write_register(0x0F0, …))` (the
+`LAPIC_SVR` const isn't re-exported from `enlil-devices`).
+
+### Recommended next step (tomorrow)
+1. **KVM binding (blocked on `/dev/kvm`):** when a nested-virt runner is available, bind
+   `SharedInterruptController` delivery to the in-kernel chip via `vm.set_irq_line(irq, level)` /
+   `irqfd`+`EventFd`, and have `KvmBackend` build its bus through `standard_pc_with_interrupts`
+   instead of hand-mounting a lone serial port in `serial_console_smoke`. Add a `/dev/kvm`-gated
+   test that boots a blob, takes a timer/serial interrupt, and observes the vector. **If still no
+   `/dev/kvm`, skip and pick #2/#3.**
+2. **Legacy 8259 PIC (pure userspace, unblocked):** early boot starts in PIC mode before the OS
+   switches to the I/O APIC. We have no dual-8259 emulation (ICW1-4/OCW, IRR/ISR/IMR, cascade,
+   EOI) at `0x20`/`0xA0`. This is a real early-boot gap and pairs with today's interrupt work, but
+   it's a sizeable single increment — scope it carefully.
+3. **CMOS/RTC (`0x70`/`0x71`, unblocked):** another device a guest touches very early (and a
+   common anti-detection probe — must read plausible values). Smaller than the 8259.
+4. **PIT hardening (Firecracker #2777)** was reconsidered and **deferred**: its "forbid re-creating
+   channels after boot" doesn't map cleanly to our model (no separate channel-create op distinct
+   from a control-word write; a running OS legitimately reloads counts). Revisit only with a precise
+   threat model and a "boot complete" signal from the run loop.
 
 A multi-increment session (3–4h budget). Four complete, independently-green, tested commits on
 the branch, each one trip through orient→build→verify. `/dev/kvm` is **still absent on this
