@@ -6,6 +6,77 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-06 (c) — Session: ECAM MMIO, PIT IRQ0 line, bounded RX FIFO, standard-PC bus (Phase 0.2)
+
+A multi-increment session (3–4h budget). Four complete, independently-green, tested commits on
+the branch, each one trip through orient→build→verify. `/dev/kvm` is **still absent on this
+runner (no nested virt)**, so all KVM/guest-boot paths self-skip — every increment below is the
+pure-userspace half and is fully exercised by unit/integration tests. Test count: 672 → **683**.
+
+### Increment 1 — ECAM MMIO front-end over a shared root complex (`d764622`)
+The 06-06(b) recommended next step. `enlil-devices::pcie` had the legacy CAM (`0xCF8`/`0xCFC`)
+front-end but no MMIO ECAM, and CAM owned its `PcieRootComplex` by value so a second front-end
+couldn't share the device set.
+- Refactored `PciConfigIo` to hold `SharedRootComplex` (`Rc<RefCell<PcieRootComplex>>`); kept
+  `new(PcieRootComplex)` (wraps) and added `with_shared` + `shared()`. Removed the `&`-returning
+  `root()`/`root_mut()` (can't borrow through a `RefCell`) — two tests updated to `shared().borrow()`.
+- Added `EcamSpace` (`MmioDevice`): forwards `mmio_read/write` to `ecam_read/ecam_write` over a
+  256-bus / 256 MiB window (`ECAM_SEGMENT_SIZE = 256<<20`) at the root's `ecam_base`. ECAM offset
+  == config offset, so no second B/D/F decode. 8-byte access combines two dwords.
+- `DeviceBus::add_pcie(root) -> SharedRootComplex` mounts CAM (PIO) + ECAM (MMIO) over one root
+  and seeds a default Intel 440FX host bridge at 0:0.0 if absent.
+- **Research** (RESEARCH.md 2026-06-06(c)): OSDev PCIe / Linux acpi-info confirm
+  `phys = ecam_base + ((bus<<20)|(dev<<15)|(fn<<12)|reg)`; cloud-hypervisor `PciConfigMmio` over a
+  shared `PciBus` is the canonical shared-store shape. +6 tests.
+
+### Increment 2 — PIT channel-0 IRQ0 edge sink (`8431951`)
+Carried-over step #1's platform-independent half. Added an `IrqLine` trait (`set_level(bool)`,
+blanket `impl` for `Fn(bool)+Send`) in `enlil-devices::timer::pit` — mirrors the UART's IRQ4 line
+but defined in `enlil-devices` because it's the lower crate (can't depend on `enlil-core`).
+`Pit::attach_irq0` stores a `Box<dyn IrqLine>`; `Pit::tick` pulses `true`/`false` once per
+channel-0 terminal-count edge, so a level-driven `set_irq_line(0, level)` or
+`InterruptController::deliver_irq(0)` sees exactly one edge. +2 tests. (Actual KVM/native delivery
+wiring still needs `/dev/kvm`.)
+
+### Increment 3 — bounded 16550 RX FIFO with hardware-accurate overrun (`525c191`)
+Outstanding since 06-05 (vm-superio issue #17). `UartState::inject_input` was unbounded
+(`rx_fifo.extend`) → a guest that never drains COM1 grows host memory without bound. Capped at
+`RX_FIFO_CAPACITY = 4096`; on overflow the incoming byte is dropped and the LSR **Overrun Error**
+bit (`0x02`, sticky, cleared on LSR read) is set — the real 16550 behaviour, more transparent than
+silently dropping the earliest input, and earliest bytes are preserved. Reused the existing
+`lsr_overrides` field. +2 tests.
+
+### Increment 4 — `DeviceBus::standard_pc` factory (`913689c`)
+No assembled bus existed (the KVM smoke test hand-built one). `standard_pc(serial_output)` mounts
+COM1 UART + 8254 PIT + PCIe (CAM+ECAM+host bridge) at canonical fixed addresses over one shared
+root, returning `(DeviceBus, SharedRootComplex)`. `DEFAULT_ECAM_BASE = 0xB000_0000` matches the
+MCFG table `enlil-devices::acpi` emits. Ties increments 1–3 into something a backend can
+instantiate directly; advances the "Linux to serial shell" milestone. +1 test.
+
+### Test results (exact)
+- `cargo build` (workspace) → **OK**.
+- `cargo fmt --all -- --check` → **OK** (after `cargo fmt --all`).
+- `cargo clippy --all-targets --workspace -- -D warnings` → **OK** (clean; `pcie`/`pit` are in the
+  strict-deny `enlil-devices` crate — used `u32_of` for the ECAM 8-byte split, no new `#[allow]`).
+- `cargo test --workspace` → **683 passed, 0 failed** (was 672; +11 across the four increments).
+- `/dev/kvm` paths (`serial_console_smoke`, `kvm_create_vm_and_map_memory`): **not run — no
+  `/dev/kvm` (no nested virt)**; they self-skip.
+- no_std custom-target build: **N/A** — no crate is `#![no_std]` yet.
+
+### Recommended next step (tomorrow)
+1. **Wire the IRQ lines to delivery.** Both the PIT (`attach_irq0`) and UART (`attach_irq_line`)
+   now expose level sinks but nothing consumes them. Two viable paths: (a) **native/userspace** —
+   wire them to `enlil_devices::interrupt::InterruptController::deliver_irq(0/4)` (no KVM needed,
+   fully testable here: a tick-driven test asserting IRQ0 reaches a LAPIC IRR); (b) **KVM** —
+   `vm.set_irq_line(0/4, level)` / `irqfd`, **needs a `/dev/kvm` runner**. Prefer (a) — it's
+   unblocked and exercises the in-userspace interrupt path the native-VMX backend will use.
+2. **Have the KVM backend build its bus via `DeviceBus::standard_pc`** instead of hand-mounting a
+   lone serial port in `serial_console_smoke`, so the guest-boot path gets PIT + PCI for free
+   (run only on a KVM runner).
+3. **PIT hardening (Firecracker #2777):** once IRQ0 delivery is live, forbid (re)programming PIT
+   channels after guest boot and stop channel-0 when idle. Needs a "boot complete" signal from the
+   run loop, so sequence it after step 1/2.
+
 ## 2026-06-06 (b) — Legacy PCI Configuration Mechanism #1 (0xCF8/0xCFC) on the bus (Phase 0.2)
 
 The previous run's recommended next step #1 (channel-0 → IRQ0 + UART IRQ4 wiring to KVM) is
