@@ -14,9 +14,11 @@
 //! same thing it would on real hardware rather than a hypervisor stall.
 
 use crate::kvm_backend::VmExitHandler;
-use crate::serial::SerialPort;
+use crate::serial::{SerialOutput, SerialPort};
 use enlil_devices::bus::{MmioBus, MmioDevice, PioBus, PioDevice};
-use enlil_devices::pcie::PciConfigIo;
+use enlil_devices::pcie::{
+    vendors, EcamSpace, PciBdf, PciConfigIo, PcieRootComplex, SharedRootComplex,
+};
 use enlil_devices::timer::Pit;
 
 /// The system device bus: a PIO bus and an MMIO bus behind one exit handler.
@@ -108,7 +110,79 @@ impl DeviceBus {
     ) -> Result<(), enlil_devices::bus::BusError> {
         self.add_pio(Box::new(pci))
     }
+
+    /// Mount a complete `PCIe` config-space front-end over `root`: the legacy
+    /// PIO [`PciConfigIo`] (`0xCF8`/`0xCFC`) on the PIO bus **and** the
+    /// [`EcamSpace`] MMIO window (at `root.ecam_base`) on the MMIO bus, both
+    /// sharing one [`PcieRootComplex`] so a register programmed through either
+    /// mechanism is visible through the other.
+    ///
+    /// If `root` does not already contain a device at BDF 0:0.0, a default Intel
+    /// 440FX-style **host bridge** is seeded there so a guest enumerating the bus
+    /// at boot finds at least the root device (matching real hardware, where the
+    /// host bridge always answers).
+    ///
+    /// Returns the [`SharedRootComplex`] handle so the caller can add further
+    /// devices after both front-ends are mounted (the change is seen by both).
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if either the CAM port range
+    /// (`0xCF8..=0xCFF`) or the ECAM MMIO window overlaps an already-registered
+    /// device.
+    pub fn add_pcie(
+        &mut self,
+        root: PcieRootComplex,
+    ) -> Result<SharedRootComplex, enlil_devices::bus::BusError> {
+        let cam = PciConfigIo::new(root);
+        let shared = cam.shared();
+        {
+            let mut rc = shared.borrow_mut();
+            if rc.find_device(&PciBdf::new(0, 0, 0)).is_none() {
+                rc.add_device(PcieRootComplex::create_host_bridge(vendors::INTEL, 0x1237));
+            }
+        }
+        self.add_pci_config_io(cam)?;
+        self.add_mmio(Box::new(EcamSpace::new(shared.clone())))?;
+        Ok(shared)
+    }
+
+    /// Assemble a bus with the legacy devices a PC guest expects to find at the
+    /// canonical fixed addresses, in one call: the **COM1** 16550 UART (`0x3F8`),
+    /// the **8254 PIT** (`0x40`-`0x43`), and the **`PCIe`** config-space pair —
+    /// legacy CAM (`0xCF8`/`0xCFC`) plus the ECAM MMIO window at
+    /// [`DEFAULT_ECAM_BASE`] — over one shared root complex seeded with a default
+    /// host bridge at 0:0.0.
+    ///
+    /// [`DEFAULT_ECAM_BASE`] is the base a standard single-segment MCFG ACPI
+    /// table advertises (`enlil_devices::acpi`), so the window the guest is told
+    /// about matches the one we decode.
+    ///
+    /// Returns the assembled bus and the [`SharedRootComplex`] handle so the
+    /// caller can attach further PCI devices (visible through both front-ends).
+    /// Serial TX is routed to `serial_output`; pass a
+    /// [`SerialOutputMode::Shared`](crate::serial::SerialOutputMode::Shared) sink
+    /// to keep the guest's console output observable.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if any two devices' ranges
+    /// overlap (they do not at these canonical addresses, so this is effectively
+    /// infallible for the default layout).
+    pub fn standard_pc(
+        serial_output: SerialOutput,
+    ) -> Result<(Self, SharedRootComplex), enlil_devices::bus::BusError> {
+        let mut bus = Self::new();
+        bus.add_serial(SerialPort::com1(serial_output))?;
+        bus.add_pit(Pit::new())?;
+        let pcie = bus.add_pcie(PcieRootComplex::new(DEFAULT_ECAM_BASE))?;
+        Ok((bus, pcie))
+    }
 }
+
+/// Guest-physical base of the `PCIe` ECAM window for the default single-segment
+/// layout. Matches the MCFG table emitted by `enlil_devices::acpi`, so a guest
+/// that discovers ECAM from ACPI finds it where [`DeviceBus::standard_pc`]
+/// mounts it.
+pub const DEFAULT_ECAM_BASE: u64 = 0xB000_0000;
 
 impl VmExitHandler for DeviceBus {
     fn io_in(&mut self, port: u16, data: &mut [u8]) {
@@ -301,6 +375,84 @@ mod tests {
         VmExitHandler::io_out(&mut bus, 0xCF8, &absent.to_le_bytes());
         VmExitHandler::io_in(&mut bus, 0xCFC, &mut data);
         assert_eq!(u32::from_le_bytes(data), 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn add_pcie_mounts_cam_and_ecam_sharing_one_device_set() {
+        use enlil_devices::pcie::{PciBdf, PciConfigSpace, PcieRootComplex};
+
+        let mut bus = DeviceBus::new();
+        // Mount both front-ends over a fresh root complex at the standard ECAM
+        // base. add_pcie seeds a default host bridge at 0:0.0.
+        let shared = bus.add_pcie(PcieRootComplex::new(0xB000_0000)).unwrap();
+
+        // CAM owns the eight legacy ports; ECAM owns the 256 MiB window.
+        assert!(bus.pio.is_mapped(0xCF8));
+        assert!(bus.pio.is_mapped(0xCFF));
+        assert!(bus.mmio.is_mapped(0xB000_0000));
+        assert!(bus.mmio.is_mapped(0xBFFF_FFFF));
+        assert!(!bus.mmio.is_mapped(0xC000_0000));
+
+        // The seeded host bridge (0:0.0) answers through the legacy CAM ports:
+        // a dword OUT to CONFIG_ADDRESS (enable | 0:0.0 | reg 0) then IN.
+        let addr: u32 = 0x8000_0000;
+        VmExitHandler::io_out(&mut bus, 0xCF8, &addr.to_le_bytes());
+        let mut data = [0u8; 4];
+        VmExitHandler::io_in(&mut bus, 0xCFC, &mut data);
+        // Intel 440FX host bridge: device_id:vendor_id = 0x1237_8086.
+        assert_eq!(u32::from_le_bytes(data), 0x1237_8086);
+
+        // ...and the same device through the ECAM MMIO window at base + 0.
+        VmExitHandler::mmio_read(&mut bus, 0xB000_0000, &mut data);
+        assert_eq!(u32::from_le_bytes(data), 0x1237_8086);
+
+        // A device added through the shared handle *after* both front-ends are
+        // mounted is visible through ECAM (proving the shared device set).
+        shared
+            .borrow_mut()
+            .add_device(PciConfigSpace::new(PciBdf::new(0, 2, 0), 0x10EC, 0x8168));
+        let dev_addr = 0xB000_0000 + (u64::from(2u32) << 15); // BDF 0:2.0 ecam offset
+        VmExitHandler::mmio_read(&mut bus, dev_addr, &mut data);
+        assert_eq!(u32::from_le_bytes(data), 0x8168_10EC);
+    }
+
+    #[test]
+    fn standard_pc_mounts_all_legacy_devices_at_canonical_addresses() {
+        use crate::device_bus::DEFAULT_ECAM_BASE;
+        use crate::serial::{SerialOutput, SerialOutputMode, COM1};
+        use std::sync::{Arc, Mutex};
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let (mut bus, _pcie) = DeviceBus::standard_pc(SerialOutput::new(
+            "guest",
+            SerialOutputMode::Shared(Arc::clone(&sink)),
+        ))
+        .unwrap();
+
+        // COM1 UART, 8254 PIT, and the legacy PCI CAM ports are all on the PIO bus.
+        assert!(bus.pio.is_mapped(COM1));
+        assert!(bus.pio.is_mapped(0x40));
+        assert!(bus.pio.is_mapped(0x43));
+        assert!(bus.pio.is_mapped(0xCF8));
+        assert!(bus.pio.is_mapped(0xCFF));
+        // The ECAM MMIO window sits at the MCFG-advertised base.
+        assert!(bus.mmio.is_mapped(DEFAULT_ECAM_BASE));
+
+        // The default host bridge answers through both config mechanisms.
+        let addr: u32 = 0x8000_0000; // enable | 0:0.0 | reg 0
+        VmExitHandler::io_out(&mut bus, 0xCF8, &addr.to_le_bytes());
+        let mut data = [0u8; 4];
+        VmExitHandler::io_in(&mut bus, 0xCFC, &mut data);
+        assert_eq!(u32::from_le_bytes(data), 0x1237_8086);
+        VmExitHandler::mmio_read(&mut bus, DEFAULT_ECAM_BASE, &mut data);
+        assert_eq!(u32::from_le_bytes(data), 0x1237_8086);
+
+        // Guest serial output reaches the shared sink (byte-at-a-time, as a
+        // guest drives a byte-wide register).
+        for &b in b"hi" {
+            VmExitHandler::io_out(&mut bus, COM1, &[b]);
+        }
+        assert_eq!(&*sink.lock().unwrap(), b"hi");
     }
 
     #[test]

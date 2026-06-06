@@ -46,10 +46,21 @@ pub const SCR_REG: u16 = 7; // Scratch Register
 
 /// Data Ready — set when there is a byte available to read.
 pub const LSR_DATA_READY: u8 = 0x01;
+/// Overrun Error — set when a received byte was lost because the RX FIFO was
+/// full. Sticky until the guest reads the LSR (matching the 16550).
+pub const LSR_OVERRUN_ERROR: u8 = 0x02;
 /// Transmitter Holding Register Empty — TX is ready to accept a byte.
 pub const LSR_THR_EMPTY: u8 = 0x20;
 /// Transmitter Empty — both THR and shift register are empty.
 pub const LSR_TEMT: u8 = 0x40;
+
+/// Bound on the host→guest RX FIFO. The 16550's hardware FIFO is 16 bytes; we
+/// allow a larger host-side queue so pasted/burst console input is not lost
+/// under normal operation, but cap it so a guest that never drains the port
+/// cannot make the host allocate without bound (rust-vmm `vm-superio` issue
+/// #17). When the cap is reached the incoming byte is dropped and the LSR
+/// Overrun Error bit is raised, exactly as real hardware reports an overrun.
+pub const RX_FIFO_CAPACITY: usize = 4096;
 
 // ---------------------------------------------------------------------------
 // IER bit flags (Interrupt Enable Register)
@@ -375,7 +386,12 @@ impl UartState {
             IIR_REG => self.read_iir(),
             LCR_REG => self.lcr,
             MCR_REG => self.mcr,
-            LSR_REG => self.compute_lsr(),
+            LSR_REG => {
+                let lsr = self.compute_lsr();
+                // Reading the LSR clears the sticky Overrun Error bit (16550).
+                self.lsr_overrides &= !LSR_OVERRUN_ERROR;
+                lsr
+            }
             MSR_REG => self.msr,
             SCR_REG => self.scr,
             _ => 0xFF, // unmapped
@@ -499,8 +515,21 @@ impl UartState {
     // -- Host-side helpers --
 
     /// Inject bytes into the RX FIFO (as if typed on the guest's console).
+    ///
+    /// The FIFO is bounded at [`RX_FIFO_CAPACITY`]: once full, further incoming
+    /// bytes are dropped and the LSR Overrun Error bit is set (the 16550's
+    /// overrun behaviour), so a guest that stops draining the port cannot grow
+    /// host memory without bound.
     pub fn inject_input(&mut self, data: &[u8]) {
-        self.rx_fifo.extend(data);
+        for &byte in data {
+            if self.rx_fifo.len() >= RX_FIFO_CAPACITY {
+                // FIFO full: drop the byte and flag the overrun (sticky until
+                // the guest reads the LSR). The already-queued bytes are kept.
+                self.lsr_overrides |= LSR_OVERRUN_ERROR;
+                break;
+            }
+            self.rx_fifo.push_back(byte);
+        }
         // New RX data may assert the RX-available interrupt.
         self.update_irq();
     }
@@ -863,6 +892,53 @@ mod tests {
         assert_eq!(uart.read_byte(), Some(b'B'));
         assert_eq!(uart.read_byte(), Some(b'C'));
         assert_eq!(uart.read_byte(), None);
+    }
+
+    #[test]
+    fn rx_fifo_is_bounded_and_flags_overrun() {
+        let mut uart = null_uart();
+        // Inject more than the FIFO can hold in one burst.
+        let flood = vec![b'.'; RX_FIFO_CAPACITY + 100];
+        uart.inject_input(&flood);
+
+        // The FIFO never grows past its cap...
+        assert_eq!(uart.rx_fifo.len(), RX_FIFO_CAPACITY);
+        // ...and the dropped bytes raised the Overrun Error in the LSR.
+        assert_ne!(uart.compute_lsr() & LSR_OVERRUN_ERROR, 0);
+
+        // Reading the LSR clears the sticky Overrun Error bit.
+        let lsr = uart.read_register(LSR_REG);
+        assert_ne!(lsr & LSR_OVERRUN_ERROR, 0, "OE reported on the read");
+        assert_eq!(
+            uart.read_register(LSR_REG) & LSR_OVERRUN_ERROR,
+            0,
+            "OE cleared by the previous LSR read"
+        );
+    }
+
+    #[test]
+    fn rx_overrun_drops_newest_and_keeps_earliest() {
+        let mut uart = null_uart();
+        // Fill exactly to capacity with a known first byte, then overflow.
+        let mut data = vec![b'x'; RX_FIFO_CAPACITY];
+        data[0] = b'A';
+        uart.inject_input(&data);
+        assert_eq!(
+            uart.compute_lsr() & LSR_OVERRUN_ERROR,
+            0,
+            "exactly full, no OE"
+        );
+
+        // One more byte overflows: it is dropped (not the earliest), and OE sets.
+        uart.inject_input(b"Z");
+        assert_ne!(uart.compute_lsr() & LSR_OVERRUN_ERROR, 0);
+        // The earliest byte is still first out of the FIFO.
+        assert_eq!(uart.read_byte(), Some(b'A'));
+        assert_eq!(
+            uart.rx_fifo.len(),
+            RX_FIFO_CAPACITY - 1,
+            "no 'Z' was queued"
+        );
     }
 
     #[test]

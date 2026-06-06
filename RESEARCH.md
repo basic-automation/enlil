@@ -606,3 +606,28 @@ back into the ECAM-style offset `PcieRootComplex::ecam_read/ecam_write` already 
 decode path). Without it the guest BIOS finds no host bridge at boot. **Follow-on:** mount ECAM
 on the MMIO bus over the same root complex — which will need shared ownership (`Rc<RefCell>` or
 equivalent) since both front-ends mutate the same device set.
+
+## 2026-06-06 (c) — ECAM MMIO front-end over a shared root complex
+
+- **PCIe ECAM addressing (OSDev "PCI Express" / Linux `PCI/acpi-info`)**
+  (https://wiki.osdev.org/PCI_Express, https://www.kernel.org/doc/html/latest/PCI/acpi-info.html):
+  re-confirmed the ECAM physical-address formula — `phys = ecam_base + ((bus << 20) | (device
+  << 15) | (function << 12) | reg)` — which is **exactly** the offset layout
+  `PcieRootComplex::ecam_read/ecam_write` already decode (`PciBdf::ecam_offset()` + reg). So the
+  MMIO front-end is a thin forward: `mmio_read(offset, size) → ecam_read(offset, size)` with no
+  new B/D/F decode. ECAM exposes the full 4 KiB extended config space (vs Mechanism #1's first
+  256 bytes), and the MCFG ACPI table (`acpi::mcfg`, base `0xB000_0000`, buses 0..=255) is what
+  tells the guest where the window lives — so the MMIO device must be mounted at that base over a
+  256-bus / 256 MiB (`256 << 20`) window to match what we advertise.
+- **cloud-hypervisor `PciConfigMmio` over a shared `PciBus` (`pci/src/bus.rs`)**: the canonical
+  Rust shape — the MMIO (ECAM) and PIO (CAM) front-ends both hold a handle to **one** config
+  store so a BAR programmed through either path is visible through the other. Confirms wrapping
+  `PcieRootComplex` in `Rc<RefCell<…>>` and giving both `PciConfigIo` and a new `EcamSpace`
+  clones of that handle, rather than two divergent device sets. (Single-threaded vCPU loop today,
+  so `Rc<RefCell>`; revisit to `Arc<Mutex>` only when the bus must cross vCPU threads.)
+
+**Changes what we build:** refactor `PciConfigIo` to hold `Rc<RefCell<PcieRootComplex>>`, add
+`EcamSpace` as an `MmioDevice` over `[ecam_base, ecam_base + 256<<20)` forwarding to the shared
+root, and a `DeviceBus::add_pcie(root)` helper that mounts CAM + ECAM over one root and seeds a
+default host bridge at 0:0.0 so a guest finds something at boot. Nothing fundamentally new beyond
+the 06-06 Mechanism #1 entry — this is the MMIO twin of the same single-decode-path design.

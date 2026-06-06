@@ -279,10 +279,41 @@ impl PitChannel {
     }
 }
 
+/// A host-side interrupt line the PIT drives to raise IRQ0.
+///
+/// Channel 0 of the 8254 is wired to IRQ0; in interrupt-on-terminal-count and
+/// rate-generator modes its OUT pin produces an *edge* on each terminal count.
+/// This trait lets the PIT signal that edge without knowing how it is delivered:
+/// the native-VMX backend forwards it to
+/// [`InterruptController::deliver_irq(0)`](crate::interrupt::InterruptController::deliver_irq),
+/// and under KVM it would drive `KVM_IRQ_LINE` (`vmm.set_irq_line(0, level)`)
+/// through the in-kernel IRQ chip — though KVM's *in-kernel* PIT normally owns
+/// IRQ0 directly, bypassing this userspace path. (Mirrors the 16550 UART's
+/// `IrqLine` in `enlil-core::serial`, kept here because `enlil-devices` is the
+/// lower crate and cannot depend on `enlil-core`.)
+///
+/// The PIT signals an edge as a `true` then `false` pair, so a level-driven
+/// `set_irq_line(0, level)` sink produces exactly one IRQ0 edge per terminal
+/// count (matching QEMU's `qemu_irq` pulse model).
+pub trait IrqLine: Send {
+    /// Drive the interrupt line: `true` asserts IRQ0, `false` deasserts it.
+    fn set_level(&self, level: bool);
+}
+
+/// Any `Fn(bool)` doubles as an [`IrqLine`], so a backend can wire one with a
+/// closure (e.g. `move |level| vm.set_irq_line(0, level)`).
+impl<F: Fn(bool) + Send> IrqLine for F {
+    fn set_level(&self, level: bool) {
+        self(level);
+    }
+}
+
 /// The full 8254 PIT with 3 channels.
 pub struct Pit {
     pub channels: [PitChannel; 3],
     accumulator_ns: u64,
+    /// Optional sink pulsed on each channel-0 (IRQ0) terminal-count edge.
+    irq0: Option<Box<dyn IrqLine>>,
 }
 
 impl Pit {
@@ -292,7 +323,16 @@ impl Pit {
         Self {
             channels: [PitChannel::new(), PitChannel::new(), PitChannel::new()],
             accumulator_ns: 0,
+            irq0: None,
         }
+    }
+
+    /// Attach a sink driven on every channel-0 (IRQ0) terminal-count edge.
+    ///
+    /// Replaces any previously attached line. See [`IrqLine`]; the PIT pulses
+    /// `set_level(true)` then `set_level(false)` once per edge from [`Self::tick`].
+    pub fn attach_irq0(&mut self, line: Box<dyn IrqLine>) {
+        self.irq0 = Some(line);
     }
 
     /// Read from a PIT I/O port (0x40-0x42).
@@ -380,6 +420,12 @@ impl Pit {
         for _ in 0..ticks {
             if self.channels[0].tick() {
                 irq = true;
+                if let Some(line) = &self.irq0 {
+                    // One IRQ0 edge: assert then deassert so a level-driven sink
+                    // (KVM_IRQ_LINE / deliver_irq) sees exactly one edge.
+                    line.set_level(true);
+                    line.set_level(false);
+                }
             }
             self.channels[1].tick();
             self.channels[2].tick();
@@ -546,6 +592,57 @@ mod tests {
         pit.write_port(0x43, 0xE2); // read-back status only (/STATUS=0), ch0
         let status = pit.read_port(0x40);
         assert_ne!(status & 0x40, 0, "null-count bit set before initial load");
+    }
+
+    /// Records every IRQ-line edge the PIT drives it through (Arc/Mutex so the
+    /// log stays inspectable after the sink is boxed into the PIT, and to satisfy
+    /// the `Send` bound on [`IrqLine`]).
+    #[derive(Clone)]
+    struct EdgeLog(std::sync::Arc<std::sync::Mutex<Vec<bool>>>);
+
+    impl IrqLine for EdgeLog {
+        fn set_level(&self, level: bool) {
+            self.0.lock().unwrap().push(level);
+        }
+    }
+
+    #[test]
+    fn channel0_pulses_irq_line_on_terminal_count() {
+        let log = EdgeLog(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let mut pit = Pit::new();
+        pit.attach_irq0(Box::new(log.clone()));
+
+        // Channel 0, lo/hi, mode 0 (interrupt on terminal count), reload = 2.
+        pit.write_port(0x43, 0x30);
+        pit.write_port(0x40, 0x02);
+        pit.write_port(0x40, 0x00);
+
+        // One tick: count 2 -> 1, no terminal count yet, no edge.
+        assert!(!pit.tick(NS_PER_TICK), "no edge before terminal count");
+        assert!(log.0.lock().unwrap().is_empty());
+
+        // Next tick: count 1 -> 0 is the terminal count -> exactly one IRQ0 edge
+        // signalled as an assert/deassert pair.
+        assert!(pit.tick(NS_PER_TICK), "tick should report the IRQ0 edge");
+        assert_eq!(&*log.0.lock().unwrap(), &[true, false]);
+    }
+
+    #[test]
+    fn no_irq_edge_for_other_channels() {
+        let log = EdgeLog(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let mut pit = Pit::new();
+        pit.attach_irq0(Box::new(log.clone()));
+
+        // Program only channel 2 (PC speaker), mode 0, reload = 1.
+        pit.write_port(0x43, 0xB0); // ch2, lo/hi, mode 0
+        pit.write_port(0x42, 0x01);
+        pit.write_port(0x42, 0x00);
+        // Plenty of ticks: channel 2 counting must not drive IRQ0.
+        let _ = pit.tick(NS_PER_TICK * 8);
+        assert!(
+            log.0.lock().unwrap().is_empty(),
+            "only channel 0 drives IRQ0"
+        );
     }
 
     #[test]
