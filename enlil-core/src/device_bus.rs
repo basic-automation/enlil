@@ -16,6 +16,7 @@
 use crate::kvm_backend::VmExitHandler;
 use crate::serial::SerialPort;
 use enlil_devices::bus::{MmioBus, MmioDevice, PioBus, PioDevice};
+use enlil_devices::timer::Pit;
 
 /// The system device bus: a PIO bus and an MMIO bus behind one exit handler.
 #[derive(Default)]
@@ -68,6 +69,21 @@ impl DeviceBus {
     /// overlaps an already-registered device.
     pub fn add_serial(&mut self, serial: SerialPort) -> Result<(), enlil_devices::bus::BusError> {
         self.add_pio(Box::new(serial))
+    }
+
+    /// Mount the 8254 [`Pit`] on the PIO bus over the four ports `0x40..=0x43`
+    /// (channel data `0x40`-`0x42` and the command/read-back port `0x43`).
+    ///
+    /// The PIT is one of the first devices a guest touches at boot; without it
+    /// the legacy timer ports read back as open-bus `0xFF`, which stalls or trips
+    /// up BIOS/early-kernel timer calibration. Channel-0 IRQ0 delivery is a
+    /// separate concern wired through the interrupt path.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if the PIT's range overlaps an
+    /// already-registered device.
+    pub fn add_pit(&mut self, pit: Pit) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_pio(Box::new(pit))
     }
 }
 
@@ -176,6 +192,59 @@ mod tests {
         // Writes to nothing are silently dropped.
         VmExitHandler::io_out(&mut bus, 0xCF8, &[0xDE, 0xAD]);
         VmExitHandler::mmio_write(&mut bus, 0x1234_0000, &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn pit_on_the_bus_programs_and_reads_back_a_channel_count() {
+        use enlil_devices::timer::Pit;
+
+        let mut bus = DeviceBus::new();
+        bus.add_pit(Pit::new()).unwrap();
+
+        // The PIT owns exactly its four ports 0x40..=0x43.
+        assert!(bus.pio.is_mapped(0x40));
+        assert!(bus.pio.is_mapped(0x43));
+        assert!(!bus.pio.is_mapped(0x44));
+
+        // Drive it the way the KVM backend would: byte-at-a-time `io_out`.
+        // Command 0x34 = channel 0, lo/hi access, mode 2 (rate generator).
+        VmExitHandler::io_out(&mut bus, 0x43, &[0x34]);
+        VmExitHandler::io_out(&mut bus, 0x40, &[0x34]); // reload low byte
+        VmExitHandler::io_out(&mut bus, 0x40, &[0x12]); // reload high byte
+
+        // Latch channel 0, then read its count back lo/hi through the bus.
+        VmExitHandler::io_out(&mut bus, 0x43, &[0x00]);
+        let mut lo = [0u8; 1];
+        let mut hi = [0u8; 1];
+        VmExitHandler::io_in(&mut bus, 0x40, &mut lo);
+        VmExitHandler::io_in(&mut bus, 0x40, &mut hi);
+        assert_eq!(u16::from_le_bytes([lo[0], hi[0]]), 0x1234);
+    }
+
+    #[test]
+    fn pit_and_serial_coexist_on_the_pio_bus() {
+        use crate::serial::{SerialOutput, SerialOutputMode, SerialPort, COM1};
+        use enlil_devices::timer::Pit;
+        use std::sync::{Arc, Mutex};
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let mut bus = DeviceBus::new();
+        bus.add_serial(SerialPort::com1(SerialOutput::new(
+            "guest",
+            SerialOutputMode::Shared(Arc::clone(&sink)),
+        )))
+        .unwrap();
+        // Non-overlapping ranges (0x40..0x44 vs 0x3F8..0x400) register cleanly.
+        bus.add_pit(Pit::new()).unwrap();
+
+        // Each device still answers on its own ports.
+        VmExitHandler::io_out(&mut bus, COM1, b"X");
+        assert_eq!(&*sink.lock().unwrap(), b"X");
+        VmExitHandler::io_out(&mut bus, 0x43, &[0x34]);
+        VmExitHandler::io_out(&mut bus, 0x40, &[0x01]);
+        VmExitHandler::io_out(&mut bus, 0x40, &[0x00]);
+        assert!(bus.pio.is_mapped(0x40));
+        assert!(bus.pio.is_mapped(COM1));
     }
 
     #[test]

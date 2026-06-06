@@ -7,12 +7,18 @@
 //!
 //! I/O ports: 0x40-0x43 (channels 0-2 data, 0x43 command)
 
+use crate::bus::PioDevice;
 use crate::truncate::u16_of;
 /// PIT oscillator frequency in Hz.
 pub const PIT_FREQUENCY: u32 = 1_193_182;
 
 /// Nanoseconds per PIT tick.
 const NS_PER_TICK: u64 = 838;
+
+/// First port the PIT claims on the I/O bus (channel-0 data).
+pub const PIT_PORT_BASE: u16 = 0x40;
+/// Number of contiguous ports the PIT claims: `0x40..=0x43`.
+pub const PIT_PORT_COUNT: u16 = 4;
 
 /// PIT channel operating modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +44,19 @@ impl ChannelMode {
             _ => Self::InterruptOnTerminalCount,
         }
     }
+
+    /// The 3-bit operating-mode field as it appears in a control/status word.
+    #[must_use]
+    const fn bits(self) -> u8 {
+        match self {
+            Self::InterruptOnTerminalCount => 0,
+            Self::HardwareRetriggerable => 1,
+            Self::RateGenerator => 2,
+            Self::SquareWave => 3,
+            Self::SoftwareStrobe => 4,
+            Self::HardwareStrobe => 5,
+        }
+    }
 }
 
 /// Access mode for reading/writing channel count.
@@ -60,6 +79,17 @@ impl AccessMode {
             _ => Self::Latch,
         }
     }
+
+    /// The 2-bit read/write-access field as it appears in a control/status word.
+    #[must_use]
+    const fn bits(self) -> u8 {
+        match self {
+            Self::Latch => 0,
+            Self::LoByte => 1,
+            Self::HiByte => 2,
+            Self::LoHiByte => 3,
+        }
+    }
 }
 
 /// A single PIT channel.
@@ -72,6 +102,17 @@ pub struct ByteLatch {
     pub write_hi: bool,
 }
 
+/// The two counting-element status bits surfaced by the read-back status byte
+/// (kept together so [`PitChannel`] stays under the bool-field threshold).
+#[derive(Debug, Clone, Default)]
+pub struct CounterStatus {
+    /// Current OUT-pin state (bit 7 of the status byte).
+    pub output: bool,
+    /// Set when a control word has been written but the initial count has not
+    /// yet been loaded into the counting element (bit 6, "null count").
+    pub null_count: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct PitChannel {
     pub count: u16,
@@ -79,9 +120,12 @@ pub struct PitChannel {
     pub mode: ChannelMode,
     pub access: AccessMode,
     pub latched_count: Option<u16>,
+    /// A read-back-latched status byte, returned ahead of any latched count on
+    /// the next data-port read (see [`Pit::read_back`]).
+    pub latched_status: Option<u8>,
     pub byte_latch: ByteLatch,
+    pub status: CounterStatus,
     pub gate: bool,
-    pub output: bool,
     pub enabled: bool,
 }
 
@@ -95,17 +139,37 @@ impl PitChannel {
             mode: ChannelMode::InterruptOnTerminalCount,
             access: AccessMode::LoHiByte,
             latched_count: None,
+            latched_status: None,
             byte_latch: ByteLatch {
                 read_hi: false,
                 write_hi: false,
             },
+            status: CounterStatus {
+                output: false,
+                null_count: false,
+            },
             gate: true,
-            output: false,
             enabled: false,
         }
     }
 
+    /// Build the read-back status byte for this channel (Intel 8254 §"Read-Back
+    /// Command"): bit 7 = output-pin state, bit 6 = null-count flag, bits 5-4 =
+    /// read/write-access field, bits 3-1 = operating mode, bit 0 = BCD (always
+    /// 0 — we count in binary).
+    #[must_use]
+    fn status_byte(&self) -> u8 {
+        (u8::from(self.status.output) << 7)
+            | (u8::from(self.status.null_count) << 6)
+            | (self.access.bits() << 4)
+            | (self.mode.bits() << 1)
+    }
+
     fn read_data(&mut self) -> u8 {
+        // A read-back-latched status byte is delivered before any latched count.
+        if let Some(status) = self.latched_status.take() {
+            return status;
+        }
         let value = self.latched_count.unwrap_or(self.count);
         match self.access {
             AccessMode::LoByte | AccessMode::Latch => (value & 0xFF) as u8,
@@ -155,7 +219,9 @@ impl PitChannel {
         };
         self.count = u16_of(effective);
         self.enabled = true;
-        self.output = false;
+        self.status.output = false;
+        // The initial count is now in the counting element.
+        self.status.null_count = false;
     }
 
     const fn tick(&mut self) -> bool {
@@ -166,12 +232,12 @@ impl PitChannel {
         match self.mode {
             ChannelMode::InterruptOnTerminalCount => {
                 if self.count == 0 {
-                    self.output = true;
+                    self.status.output = true;
                     return false;
                 }
                 self.count = self.count.wrapping_sub(1);
                 if self.count == 0 {
-                    self.output = true;
+                    self.status.output = true;
                     return true;
                 }
                 false
@@ -183,11 +249,11 @@ impl PitChannel {
                 }
                 self.count = self.count.wrapping_sub(1);
                 if self.count == 1 {
-                    self.output = false;
+                    self.status.output = false;
                     self.count = self.reload;
                     return true;
                 }
-                self.output = true;
+                self.status.output = true;
                 false
             }
             ChannelMode::SquareWave => {
@@ -197,9 +263,9 @@ impl PitChannel {
                 }
                 self.count = self.count.wrapping_sub(2);
                 if self.count <= 1 {
-                    self.output = !self.output;
+                    self.status.output = !self.status.output;
                     self.count = self.reload;
-                    return self.output;
+                    return self.status.output;
                 }
                 false
             }
@@ -255,7 +321,8 @@ impl Pit {
     fn write_command(&mut self, val: u8) {
         let channel_idx = ((val >> 6) & 0x3) as usize;
         if channel_idx >= 3 {
-            return; // Read-back command, ignore for now
+            self.read_back(val);
+            return;
         }
 
         let access = AccessMode::from_bits((val >> 4) & 0x3);
@@ -270,8 +337,34 @@ impl Pit {
         ch.mode = mode;
         ch.byte_latch.read_hi = false;
         ch.byte_latch.write_hi = false;
-        ch.output = false;
+        ch.status.output = false;
         ch.enabled = false;
+        // Control word written, initial count not yet loaded.
+        ch.status.null_count = true;
+    }
+
+    /// Handle the 8254 read-back command (control word with bits 7-6 = `11`).
+    ///
+    /// Bit 5 low (`/COUNT`) latches the current count of every selected channel;
+    /// bit 4 low (`/STATUS`) latches a status byte. Bits 3-1 select channels
+    /// 2/1/0. When both are requested the status byte is delivered first on the
+    /// next data-port read, then the latched count — matching real hardware.
+    fn read_back(&mut self, val: u8) {
+        let latch_count = val & 0x20 == 0;
+        let latch_status = val & 0x10 == 0;
+        for (idx, ch) in self.channels.iter_mut().enumerate() {
+            if val & (1u8 << (idx + 1)) == 0 {
+                continue;
+            }
+            // Per the datasheet, a status latch already pending is not overwritten
+            // by a second read-back until it has been read.
+            if latch_status && ch.latched_status.is_none() {
+                ch.latched_status = Some(ch.status_byte());
+            }
+            if latch_count && ch.latched_count.is_none() {
+                ch.latched_count = Some(ch.count);
+            }
+        }
     }
 
     /// Advance the PIT by `ns` nanoseconds.
@@ -309,6 +402,26 @@ impl Pit {
 impl Default for Pit {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Mounts the 8254 on the port-I/O bus over `0x40..=0x43`.
+///
+/// The PIT registers are byte-wide, so a guest accesses them one byte at a time;
+/// reads return the value in the low byte of the `u32` and writes consume the
+/// low byte. The bus only routes ports within the declared range here, so every
+/// `port` is one of the four PIT ports.
+impl PioDevice for Pit {
+    fn pio_read(&mut self, port: u16, _size: u8) -> u32 {
+        u32::from(self.read_port(port))
+    }
+
+    fn pio_write(&mut self, port: u16, _size: u8, data: u32) {
+        self.write_port(port, data.to_le_bytes()[0]);
+    }
+
+    fn port_range(&self) -> (u16, u16) {
+        (PIT_PORT_BASE, PIT_PORT_BASE + PIT_PORT_COUNT)
     }
 }
 
@@ -374,5 +487,75 @@ mod tests {
         pit.write_port(0x40, ((0x4A9 >> 8) & 0xFF) as u8);
         let freq = pit.channel0_frequency();
         assert!((999..=1001).contains(&freq));
+    }
+
+    #[test]
+    fn test_pio_device_claims_four_command_ports() {
+        let pit = Pit::new();
+        assert_eq!(PioDevice::port_range(&pit), (0x40, 0x44));
+    }
+
+    #[test]
+    fn test_pio_write_programs_channel_low_byte_only() {
+        let mut pit = Pit::new();
+        // Command: channel 0, lo/hi access, mode 2. Only the low byte counts.
+        pit.pio_write(0x43, 1, 0xFFFF_FF34);
+        assert_eq!(pit.channels[0].mode, ChannelMode::RateGenerator);
+        // Reload low byte then high byte via the data port.
+        pit.pio_write(0x40, 1, 0x9A);
+        pit.pio_write(0x40, 1, 0x02);
+        assert_eq!(pit.channels[0].reload, 0x029A);
+    }
+
+    #[test]
+    fn test_pio_read_returns_count_in_low_byte() {
+        let mut pit = Pit::new();
+        pit.pio_write(0x43, 1, 0x34); // ch0, lo/hi, mode 2
+        pit.pio_write(0x40, 1, 0x34);
+        pit.pio_write(0x40, 1, 0x12); // reload = 0x1234
+        // Latch then read back lo, hi through the PIO path.
+        pit.pio_write(0x43, 1, 0x00); // latch channel 0
+        assert_eq!(pit.pio_read(0x40, 1) & 0xFF, 0x34);
+        assert_eq!(pit.pio_read(0x40, 1) & 0xFF, 0x12);
+    }
+
+    #[test]
+    fn test_read_back_latches_status_before_count() {
+        let mut pit = Pit::new();
+        // Program channel 0: lo/hi access, mode 2 (rate generator), then load.
+        pit.write_port(0x43, 0x34);
+        pit.write_port(0x40, 0x10);
+        pit.write_port(0x40, 0x00); // reload = 0x0010, count loaded
+        // Read-back: latch both status and count of channel 0.
+        // 0b11_0_0_001_0 = 0xC2 (/STATUS=0, /COUNT=0, select ch0).
+        pit.write_port(0x43, 0xC2);
+        // Status byte comes first: access=LoHiByte (0b11<<4), mode=2 (010<<1).
+        let status = pit.read_port(0x40);
+        assert_eq!(status & 0x30, 0x30, "RW field should report lo/hi access");
+        assert_eq!((status >> 1) & 0x7, 2, "mode field should report rate-gen");
+        assert_eq!(status & 0x40, 0, "null-count clear after count loaded");
+        // Then the latched count's low byte.
+        assert_eq!(pit.read_port(0x40), 0x10);
+    }
+
+    #[test]
+    fn test_read_back_null_count_set_before_load() {
+        let mut pit = Pit::new();
+        // Control word written but no count loaded yet -> null count is set.
+        pit.write_port(0x43, 0x34);
+        pit.write_port(0x43, 0xE2); // read-back status only (/STATUS=0), ch0
+        let status = pit.read_port(0x40);
+        assert_ne!(status & 0x40, 0, "null-count bit set before initial load");
+    }
+
+    #[test]
+    fn test_read_back_only_selected_channels() {
+        let mut pit = Pit::new();
+        pit.write_port(0x43, 0x34); // ch0 program
+        pit.write_port(0x43, 0xB6); // ch2 program (lo/hi, mode 3)
+        // Read-back status of channel 2 only (bit3 set, bit1 clear): 0xE8.
+        pit.write_port(0x43, 0xE8);
+        assert!(pit.channels[0].latched_status.is_none());
+        assert!(pit.channels[2].latched_status.is_some());
     }
 }
