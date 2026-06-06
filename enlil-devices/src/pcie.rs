@@ -4,8 +4,21 @@
 //! a PCI Express bus with ECAM (Enhanced Configuration Access Mechanism)
 //! for device enumeration.
 
-use crate::bus::PioDevice;
-use crate::truncate::{u8_of, u16_of};
+use crate::bus::{MmioDevice, PioDevice};
+use crate::truncate::{u8_of, u16_of, u32_of};
+use std::cell::RefCell;
+use std::rc::Rc;
+
+/// A reference-counted, interior-mutable handle to a [`PcieRootComplex`].
+///
+/// Both config-space front-ends — the legacy PIO [`PciConfigIo`]
+/// (`0xCF8`/`0xCFC`) and the MMIO [`EcamSpace`] — hold a clone of one of these,
+/// so a register (e.g. a BAR) programmed through either path is immediately
+/// visible through the other: there is a *single* backing device set, not two
+/// divergent copies. The vCPU run loop is single-threaded today, so `Rc<RefCell>`
+/// is sufficient; revisit to `Arc<Mutex>` only when the bus must cross vCPU
+/// threads.
+pub type SharedRootComplex = Rc<RefCell<PcieRootComplex>>;
 /// PCI configuration space size per function
 pub const PCI_CONFIG_SPACE_SIZE: usize = 256;
 /// `PCIe` extended configuration space size per function
@@ -394,8 +407,10 @@ const CONFIG_ENABLE: u32 = 0x8000_0000;
 /// the latched B/D/F is folded back into an ECAM-style offset, whose low 8 bits
 /// cover the 256-byte legacy config space Mechanism #1 can reach.
 pub struct PciConfigIo {
-    /// The root complex whose devices are enumerated through these ports.
-    root: PcieRootComplex,
+    /// The (shared) root complex whose devices are enumerated through these
+    /// ports. Shared with the MMIO [`EcamSpace`] so both front-ends mutate one
+    /// device set.
+    root: SharedRootComplex,
     /// The latched `CONFIG_ADDRESS` value (port `0xCF8`).
     config_address: u32,
 }
@@ -410,24 +425,30 @@ const fn size_mask(size: u8) -> u32 {
 }
 
 impl PciConfigIo {
-    /// Wrap a root complex behind the legacy `CONFIG_ADDRESS`/`CONFIG_DATA` ports.
+    /// Wrap a root complex behind the legacy `CONFIG_ADDRESS`/`CONFIG_DATA`
+    /// ports, taking sole ownership of it (it is moved into a fresh shared
+    /// handle). Use [`PciConfigIo::with_shared`] to share a root complex with an
+    /// [`EcamSpace`].
     #[must_use]
-    pub const fn new(root: PcieRootComplex) -> Self {
+    pub fn new(root: PcieRootComplex) -> Self {
+        Self::with_shared(Rc::new(RefCell::new(root)))
+    }
+
+    /// Wrap an already-shared root complex behind the legacy ports, so an
+    /// [`EcamSpace`] mounted over the same handle sees the same device set.
+    #[must_use]
+    pub const fn with_shared(root: SharedRootComplex) -> Self {
         Self {
             root,
             config_address: 0,
         }
     }
 
-    /// Borrow the underlying root complex (e.g. to add devices).
+    /// A clone of the shared root-complex handle (e.g. to add devices or to
+    /// mount a matching [`EcamSpace`] over the same device set).
     #[must_use]
-    pub const fn root(&self) -> &PcieRootComplex {
-        &self.root
-    }
-
-    /// Mutably borrow the underlying root complex (e.g. to add devices).
-    pub const fn root_mut(&mut self) -> &mut PcieRootComplex {
-        &mut self.root
+    pub fn shared(&self) -> SharedRootComplex {
+        Rc::clone(&self.root)
     }
 
     /// Whether the enable bit (`CONFIG_ADDRESS` bit 31) is set — a config cycle
@@ -478,7 +499,7 @@ impl PioDevice for PciConfigIo {
                 return size_mask(size);
             }
             let offset = self.target_offset(port - CONFIG_DATA_PORT);
-            self.root.ecam_read(offset, size)
+            self.root.borrow().ecam_read(offset, size)
         }
     }
 
@@ -487,13 +508,92 @@ impl PioDevice for PciConfigIo {
             self.write_address(port - CONFIG_ADDRESS_PORT, size, data);
         } else if self.enabled() {
             let offset = self.target_offset(port - CONFIG_DATA_PORT);
-            self.root.ecam_write(offset, data, size);
+            self.root.borrow_mut().ecam_write(offset, data, size);
         }
     }
 
     fn port_range(&self) -> (u16, u16) {
         // Eight ports: CONFIG_ADDRESS (0xCF8-0xCFB) + CONFIG_DATA (0xCFC-0xCFF).
         (CONFIG_ADDRESS_PORT, CONFIG_DATA_PORT + 4)
+    }
+}
+
+/// Size of a single PCI segment's ECAM window: 256 buses × 1 MiB/bus
+/// (`bus << 20`), i.e. 256 MiB.
+///
+/// This matches the buses `0..=255` a standard single-segment MCFG advertises
+/// (see `acpi::mcfg`), so the MMIO window the guest is told about and the one we
+/// decode are the same span.
+pub const ECAM_SEGMENT_SIZE: u64 = 256 << 20;
+
+/// **ECAM** (Enhanced Configuration Access Mechanism) MMIO front-end over a
+/// [`PcieRootComplex`].
+///
+/// This is the memory-mapped config-space window a `PCIe`-aware guest (notably
+/// Windows, and any modern Linux that honours the MCFG table) uses *after* it
+/// has discovered the ECAM base from ACPI MCFG. The window lives at the root
+/// complex's `ecam_base` and spans [`ECAM_SEGMENT_SIZE`] (one PCI segment,
+/// buses 0..=255). An access at offset `o` within the window maps directly to
+/// config-space offset `o` via the ECAM addressing formula
+/// `(bus << 20) | (device << 15) | (function << 12) | reg` — which is exactly
+/// the encoding [`PcieRootComplex::ecam_read`]/[`PcieRootComplex::ecam_write`]
+/// already decode, so this device is a thin forward with **no** second B/D/F
+/// decode path. Unlike the legacy PIO [`PciConfigIo`] (which reaches only the
+/// first 256 bytes), ECAM exposes the full 4 KiB extended config space.
+///
+/// The root complex is shared (via [`SharedRootComplex`]) with the matching
+/// `PciConfigIo`, so a guest that programs a register through one mechanism sees
+/// it through the other.
+pub struct EcamSpace {
+    /// The shared root complex this window decodes into.
+    root: SharedRootComplex,
+    /// Guest-physical base of the ECAM window (the root complex's `ecam_base`).
+    base: u64,
+}
+
+impl EcamSpace {
+    /// Mount an ECAM window over `root` at its configured `ecam_base`.
+    #[must_use]
+    pub fn new(root: SharedRootComplex) -> Self {
+        let base = root.borrow().ecam_base;
+        Self { root, base }
+    }
+}
+
+impl MmioDevice for EcamSpace {
+    fn mmio_read(&mut self, offset: u64, size: u8) -> u64 {
+        match size {
+            1 | 2 | 4 => u64::from(self.root.borrow().ecam_read(offset, size)),
+            8 => {
+                // A naturally-aligned 8-byte config read is two adjacent dwords;
+                // ecam_read is dword-granular, so combine low + high.
+                let root = self.root.borrow();
+                let lo = u64::from(root.ecam_read(offset, 4));
+                let hi = u64::from(root.ecam_read(offset + 4, 4));
+                lo | (hi << 32)
+            }
+            // Any other width reads open-bus, matching an absent decode.
+            _ => u64::MAX,
+        }
+    }
+
+    fn mmio_write(&mut self, offset: u64, size: u8, data: u64) {
+        match size {
+            1 | 2 | 4 => self
+                .root
+                .borrow_mut()
+                .ecam_write(offset, u32_of(data), size),
+            8 => {
+                let mut root = self.root.borrow_mut();
+                root.ecam_write(offset, u32_of(data), 4);
+                root.ecam_write(offset + 4, u32_of(data >> 32), 4);
+            }
+            _ => {}
+        }
+    }
+
+    fn mmio_range(&self) -> (u64, u64) {
+        (self.base, self.base + ECAM_SEGMENT_SIZE)
     }
 }
 
@@ -651,7 +751,9 @@ mod tests {
         // Read it straight back through the same window.
         assert_eq!(io.pio_read(CONFIG_DATA_PORT, 1), 0x0B);
         // ...and it landed in the backing config space at offset 0x3C.
-        let dev = io.root().find_device(&PciBdf::new(0, 2, 0)).unwrap();
+        let root = io.shared();
+        let root = root.borrow();
+        let dev = root.find_device(&PciBdf::new(0, 2, 0)).unwrap();
         assert_eq!(dev.read_u8(cfg::INTERRUPT_LINE), 0x0B);
     }
 
@@ -664,7 +766,9 @@ mod tests {
             config_address(0, 2, 0, 0x3C) & !CONFIG_ENABLE,
         );
         io.pio_write(CONFIG_DATA_PORT, 1, 0xEE);
-        let dev = io.root().find_device(&PciBdf::new(0, 2, 0)).unwrap();
+        let root = io.shared();
+        let root = root.borrow();
+        let dev = root.find_device(&PciBdf::new(0, 2, 0)).unwrap();
         assert_eq!(
             dev.read_u8(cfg::INTERRUPT_LINE),
             0x00,
@@ -676,5 +780,80 @@ mod tests {
     fn port_range_claims_the_eight_legacy_cam_ports() {
         let io = PciConfigIo::new(PcieRootComplex::new(0));
         assert_eq!(io.port_range(), (0xCF8, 0xD00));
+    }
+
+    /// A shared root complex (base `0xB000_0000`) with one device at BDF 0:2.0.
+    fn shared_with_device() -> SharedRootComplex {
+        let mut rc = PcieRootComplex::new(0xB000_0000);
+        rc.add_device(PciConfigSpace::new(PciBdf::new(0, 2, 0), 0x8086, 0x5678));
+        Rc::new(RefCell::new(rc))
+    }
+
+    #[test]
+    fn ecam_window_spans_one_segment_at_the_base() {
+        let ecam = EcamSpace::new(Rc::new(RefCell::new(PcieRootComplex::new(0xB000_0000))));
+        // 256 buses × 1 MiB = 256 MiB → [0xB000_0000, 0xC000_0000).
+        assert_eq!(ecam.mmio_range(), (0xB000_0000, 0xC000_0000));
+    }
+
+    #[test]
+    fn ecam_reads_vendor_and_device_id() {
+        let mut ecam = EcamSpace::new(shared_with_device());
+        // Offset of BDF 0:2.0's config space within the window, register 0.
+        let offset = PciBdf::new(0, 2, 0).ecam_offset() as u64;
+        assert_eq!(ecam.mmio_read(offset, 4), 0x5678_8086);
+        // Word/byte sub-accesses steer within the dword like the PIO path.
+        assert_eq!(ecam.mmio_read(offset, 2), 0x8086);
+        assert_eq!(ecam.mmio_read(offset + 2, 2), 0x5678);
+    }
+
+    #[test]
+    fn ecam_absent_device_reads_all_ones() {
+        let mut ecam = EcamSpace::new(shared_with_device());
+        // BDF 0:3.0 has no device.
+        let offset = PciBdf::new(0, 3, 0).ecam_offset() as u64;
+        assert_eq!(ecam.mmio_read(offset, 4), 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn ecam_eight_byte_read_combines_two_adjacent_dwords() {
+        let shared = shared_with_device();
+        // Program a known dword at register 0x10 (BAR0) so the high half of an
+        // 8-byte read starting at register 0x0C is non-trivial.
+        shared
+            .borrow_mut()
+            .find_device_mut(&PciBdf::new(0, 2, 0))
+            .unwrap()
+            .write_u32(0x10, 0xCAFE_F00D);
+        let mut ecam = EcamSpace::new(shared);
+        let base = PciBdf::new(0, 2, 0).ecam_offset() as u64;
+        // dword at 0x0C is the BIST/header/latency/cache word (header type 0 →
+        // 0x0000_0000 by default); dword at 0x10 is the BAR we just set.
+        let lo = u64::from(0x0000_0000u32);
+        let hi = u64::from(0xCAFE_F00Du32);
+        assert_eq!(ecam.mmio_read(base + 0x0C, 8), lo | (hi << 32));
+    }
+
+    #[test]
+    fn cam_and_ecam_share_one_device_set() {
+        // One shared root complex behind both front-ends.
+        let shared = shared_with_device();
+        let mut cam = PciConfigIo::with_shared(Rc::clone(&shared));
+        let mut ecam = EcamSpace::new(Rc::clone(&shared));
+
+        // Program the interrupt-line register (0x3C) of 0:2.0 through the legacy
+        // CAM ports...
+        cam.pio_write(CONFIG_ADDRESS_PORT, 4, config_address(0, 2, 0, 0x3C));
+        cam.pio_write(CONFIG_DATA_PORT, 1, 0x0B);
+
+        // ...and read it straight back through the ECAM MMIO window: the write
+        // is visible because both front-ends decode into the same device set.
+        let offset = PciBdf::new(0, 2, 0).ecam_offset() as u64 + 0x3C;
+        assert_eq!(ecam.mmio_read(offset, 1), 0x0B);
+
+        // The reverse direction too: an ECAM write is seen through CAM.
+        ecam.mmio_write(offset, 1, 0x2A);
+        cam.pio_write(CONFIG_ADDRESS_PORT, 4, config_address(0, 2, 0, 0x3C));
+        assert_eq!(cam.pio_read(CONFIG_DATA_PORT, 1), 0x2A);
     }
 }
