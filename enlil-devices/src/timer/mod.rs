@@ -14,6 +14,6 @@ pub mod tsc;
 
 pub use hpet::Hpet;
 pub use paravirt::{HyperVReferenceTsc, KvmClock};
-pub use pit::{IrqLine, Pit};
+pub use pit::{IrqLine, Pit, PitPort, SharedPit};
 pub use rtc::{RTC_DATA, RTC_INDEX, RTC_IRQ, Rtc146818, RtcPort, RtcTime, SharedRtc};
 pub use tsc::TscManager;

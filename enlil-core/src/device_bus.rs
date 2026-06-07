@@ -21,7 +21,7 @@ use enlil_devices::pcie::{
     vendors, EcamSpace, PciBdf, PciConfigIo, PcieRootComplex, SharedRootComplex,
 };
 use enlil_devices::ps2::SharedI8042;
-use enlil_devices::timer::{Pit, SharedRtc};
+use enlil_devices::timer::{Pit, SharedPit, SharedRtc};
 
 /// The system device bus: a PIO bus and an MMIO bus behind one exit handler.
 #[derive(Default)]
@@ -89,6 +89,20 @@ impl DeviceBus {
     /// already-registered device.
     pub fn add_pit(&mut self, pit: Pit) -> Result<(), enlil_devices::bus::BusError> {
         self.add_pio(Box::new(pit))
+    }
+
+    /// Mount a [`SharedPit`] on the PIO bus over `0x40..=0x43`, like
+    /// [`add_pit`](Self::add_pit), but keeping a caller-owned handle to the same
+    /// PIT. A boxed `Pit` is reachable only through its `PioDevice` methods, so
+    /// nothing could advance it once mounted; with a `SharedPit` the run loop /
+    /// timer thread holds a clone and calls `tick` to drive channel-0 IRQ0 while
+    /// the guest programs the counters through the ports.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if the PIT's range overlaps an
+    /// already-registered device.
+    pub fn add_pit_shared(&mut self, pit: &SharedPit) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_pio(Box::new(pit.port()))
     }
 
     /// Mount the legacy PCI **Configuration Mechanism #1** front-end
@@ -848,6 +862,44 @@ mod tests {
         assert_eq!(pic.with(|p| p.pending_vector()), Some(0x24));
         // ...and the I/O APIC routed it to LAPIC 0 with its (different) vector.
         assert_eq!(ioapic.with(|c| c.pending_vector(0)), Some(0x34));
+    }
+
+    #[test]
+    fn shared_pit_ticked_from_a_handle_routes_irq0_to_gsi_2() {
+        use enlil_devices::interrupt::SharedInterruptController;
+        use enlil_devices::timer::SharedPit;
+
+        // The end-to-end PIT timer path the override-aware wiring enables: a
+        // guest reads GSI 2 for the timer from the MADT and programs that RTE;
+        // the PIT, wired via isa_line(0), must assert GSI 2 — and a SharedPit
+        // lets us actually tick it after it is mounted on the bus.
+        let pic = SharedInterruptController::new(1);
+        pic.with(|c| c.lapics[0].write_register(0x0F0, 0x1FF));
+        let pit = SharedPit::new();
+        pit.with(|p| p.attach_irq0(Box::new(pic.isa_line(0)))); // IRQ0 -> GSI 2
+
+        let mut bus = DeviceBus::new();
+        bus.add_pit_shared(&pit).unwrap();
+        bus.add_ioapic(&pic).unwrap();
+        assert!(bus.pio.is_mapped(0x40));
+
+        // Program GSI 2's RTE (REDTBL 0x10 + 2*2 = 0x14) -> vector 0x40, LAPIC 0.
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0000, &0x14u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0010, &0x40u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0000, &0x15u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0010, &0u32.to_le_bytes());
+
+        // Guest programs channel 0: mode 2 (rate generator), a short reload.
+        VmExitHandler::io_out(&mut bus, 0x43, &[0x34]); // ch0, lo/hi, mode 2
+        VmExitHandler::io_out(&mut bus, 0x40, &[2]); // reload low
+        VmExitHandler::io_out(&mut bus, 0x40, &[0]); // reload high
+
+        // No interrupt until the timer thread advances the PIT past its count.
+        assert!(!pic.with(|c| c.has_pending(0)));
+        for _ in 0..4 {
+            let _ = pit.tick(1000); // ~1.2 ticks each at 838 ns/tick
+        }
+        assert_eq!(pic.with(|c| c.pending_vector(0)), Some(0x40));
     }
 
     #[test]
