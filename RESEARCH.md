@@ -665,6 +665,40 @@ with a `.line(irq)` level-sink factory and a matching `clear_irq`; add `IoApicMm
 `MmioDevice` at `0xFEC0_0000`; and a `DeviceBus::standard_pc_with_interrupts` that attaches
 PIT→IRQ0 / UART→IRQ4 and mounts the I/O APIC aperture. Defer LAPIC MMIO to the per-vCPU path.
 
+## 2026-06-07 (c) — MADT ISO + 8259 ELCR, then the MC146818 RTC/CMOS
+
+Two interrupt-correctness items (MADT interrupt-source-override IRQ0→GSI 2; the chipset
+ELCR making PCI `INTx` level-triggered) plus the start of the RTC/CMOS. All ancient,
+stable silicon / firmware conventions — no recent paper changes the model; the
+authoritative sources are the primary datasheets and the ACPI spec. Logged for the design
+decisions that matter:
+
+- **ACPI MADT Interrupt Source Override** (ACPI spec §5.2.12.5): on a PC the 8254 timer
+  (ISA IRQ0) is reported as `(bus 0, source 0) → GSI 2`, so a guest in APIC mode programs
+  I/O APIC pin **2** for the timer, not pin 0. The line wiring and the emitted MADT must
+  agree or the timer interrupt is silently dropped. Polarity/trigger overrides (the
+  active-low, level SCI) keep their GSI *number* — only IRQ0 renumbers. **Changes what we
+  build:** a single `isa_to_gsi` map shared by the wiring (`isa_line`) and cross-checked
+  against the MADT, so the two can't drift.
+- **PIIX3 ELCR** (82371SB datasheet / "PCI interrupts are level-triggered, active-low"):
+  the chipset Edge/Level Control Register (`0x4D0` master / `0x4D1` slave) selects per-line
+  edge vs level for the 8259. A level line's request follows the input (withdrawn before
+  INTA, re-armed after EOI while still asserted) — this is what lets a shared PCI `INTx`
+  line work without being lost after the first EOI. IRQ0/1/2 (master) and IRQ8/13 (slave)
+  are hardwired edge and read back 0. **Changes what we build:** add the ELCR register +
+  level-triggered IRR semantics to `Pic8259`/`DualPic` and an `ElcrPort` bus device.
+- **MC146818 RTC/CMOS** (Motorola MC146818A datasheet + the PC/AT CMOS map): ports
+  `0x70` (index; **bit 7 is the NMI-disable**, not part of the CMOS address) / `0x71`
+  (data). Registers `0x00-0x09` are the BCD/binary time fields, `0x0A-0x0D` are status
+  A-D (A: UIP + rate select; B: SET/PIE/AIE/UIE + DM binary-vs-BCD + 24/12h + DSE; C:
+  read-clears the IRQF/PF/AF/UF flags; D: VRT). RTC IRQ is **IRQ8** (slave PIC line 0 /
+  GSI 8). Reg B's DM and 24/12h bits change how the *same* stored time reads back, so the
+  device stores canonical binary fields and formats on read. **Changes what we build:** a
+  new `enlil_devices::timer::rtc::Rtc146818` driven by an injected wall-clock (Unix
+  seconds → civil date by pure arithmetic, no time-crate dep), with a `PioDevice` adapter
+  and an `attach_irq8` `IrqLine`; wired into the bus / interrupt controllers in a later
+  increment.
+
 ## 2026-06-07 (b) — Legacy 8259A PIC: the early-boot interrupt controller
 
 Targeted check for the next unblocked step (per 06-07 hand-off #2): the dual-8259
