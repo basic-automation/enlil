@@ -23,7 +23,7 @@ use enlil_devices::pcie::{
 };
 use enlil_devices::ps2::{SharedI8042, PS2_KBD_IRQ, PS2_MOUSE_IRQ};
 use enlil_devices::timer::{
-    Pit, RtcTime, SharedHpet, SharedPit, SharedRtc, SystemControlPortB, RTC_IRQ,
+    Pit, RtcTime, SharedAcpiPmTimer, SharedHpet, SharedPit, SharedRtc, SystemControlPortB, RTC_IRQ,
 };
 
 /// The system device bus: a PIO bus and an MMIO bus behind one exit handler.
@@ -365,6 +365,23 @@ impl DeviceBus {
         self.add_mmio(Box::new(hpet.mmio()))
     }
 
+    /// Mount the **ACPI PM Timer** ([`SharedAcpiPmTimer`]) on the PIO bus at the
+    /// `PM_TMR_BLK` port (`0x608`) the emitted FADT advertises. An OS reads this
+    /// free-running 3.579545 MHz counter to calibrate and cross-check its other
+    /// clocks; without it the port reads open-bus `0xFFFF_FFFF` and the guest's
+    /// time calibration diverges. The caller owns `pmt` so the run loop can
+    /// advance the counter from elapsed wall-clock time.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if the `PM_TMR` window overlaps
+    /// an already-registered device.
+    pub fn add_acpi_pm_timer(
+        &mut self,
+        pmt: &SharedAcpiPmTimer,
+    ) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_pio(Box::new(pmt.port()))
+    }
+
     /// Like [`standard_pc`](Self::standard_pc), but wires the legacy devices'
     /// interrupt lines into the dual-8259 `pic` (the early-boot interrupt
     /// controller) and mounts its four ports: the 8254 PIT's channel-0 line
@@ -532,6 +549,11 @@ impl DeviceBus {
         let hpet = SharedHpet::new();
         bus.add_hpet(&hpet)?;
 
+        // ACPI PM timer (0x608) — the FADT-advertised free-running clock the OS
+        // calibrates against. Shared so the run loop can advance it.
+        let pm_timer = SharedAcpiPmTimer::new();
+        bus.add_acpi_pm_timer(&pm_timer)?;
+
         // PCIe config space (legacy CAM + ECAM), seeded with a host bridge.
         let pcie = bus.add_pcie(PcieRootComplex::new(DEFAULT_ECAM_BASE))?;
 
@@ -544,6 +566,7 @@ impl DeviceBus {
             ps2,
             pit,
             hpet,
+            pm_timer,
         })
     }
 }
@@ -590,6 +613,8 @@ pub struct StandardPc {
     pub pit: SharedPit,
     /// The HPET — `tick` the main counter from the run loop / timer thread.
     pub hpet: SharedHpet,
+    /// The ACPI PM timer — `advance` the counter from the run loop / timer thread.
+    pub pm_timer: SharedAcpiPmTimer,
 }
 
 /// Legacy ISA IRQ line for the 8254 PIT channel-0 (system timer).
@@ -1201,10 +1226,10 @@ mod tests {
 
         // Every legacy device a guest touches at boot is mounted at its canonical
         // address: COM1, PIT, System Control Port B (0x61), RTC, PS/2 data+cmd,
-        // System Control Port A (0x92), both 8259s, the ELCR, and the PCIe CAM
-        // ports — plus the I/O APIC page.
+        // System Control Port A (0x92), the ACPI PM timer (0x608), both 8259s, the
+        // ELCR, and the PCIe CAM ports — plus the I/O APIC page.
         for port in [
-            0x3F8u16, 0x40, 0x61, 0x70, 0x60, 0x64, 0x92, 0x20, 0xA0, 0x4D0, 0xCF8,
+            0x3F8u16, 0x40, 0x61, 0x70, 0x60, 0x64, 0x92, 0x608, 0x20, 0xA0, 0x4D0, 0xCF8,
         ] {
             assert!(
                 bus.pio.is_mapped(port),

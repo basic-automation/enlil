@@ -6,6 +6,7 @@
 //! - TSC management — per-vCPU TSC offset and scaling
 //! - Paravirt clocks — KVM clock (Linux) and Hyper-V reference TSC (Windows)
 
+pub mod acpi_pm;
 pub mod hpet;
 pub mod paravirt;
 pub mod pit;
@@ -13,6 +14,9 @@ pub mod rtc;
 pub mod speaker;
 pub mod tsc;
 
+pub use acpi_pm::{
+    AcpiPmTimer, AcpiPmTimerPort, PM_TIMER_FREQ_HZ, PM_TIMER_PORT, SharedAcpiPmTimer,
+};
 pub use hpet::{HPET_MMIO_BASE, HPET_MMIO_SIZE, Hpet, HpetMmio, SharedHpet};
 pub use paravirt::{HyperVReferenceTsc, KvmClock};
 pub use pit::{IrqLine, Pit, PitPort, SharedPit};
