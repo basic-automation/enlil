@@ -17,9 +17,10 @@ use crate::kvm_backend::VmExitHandler;
 use crate::serial::{SerialOutput, SerialPort};
 use enlil_devices::bus::{MmioBus, MmioDevice, PioBus, PioDevice};
 use enlil_devices::chipset::{Gpe0Block, SharedAcpiPm1Block, SharedSystemControlPortA};
-use enlil_devices::interrupt::{IoApicMmio, SharedInterruptController, SharedPic};
+use enlil_devices::interrupt::{IoApicMmio, PirqRouter, SharedInterruptController, SharedPic};
 use enlil_devices::pcie::{
     vendors, EcamSpace, PciBdf, PciConfigIo, PcieRootComplex, SharedRootComplex,
+    PIRQ_ROUTE_CONFIG_BASE,
 };
 use enlil_devices::ps2::{SharedI8042, PS2_KBD_IRQ, PS2_MOUSE_IRQ};
 use enlil_devices::timer::{
@@ -599,6 +600,19 @@ impl DeviceBus {
         // PCIe config space (legacy CAM + ECAM), seeded with a host bridge.
         let pcie = bus.add_pcie(PcieRootComplex::new(DEFAULT_ECAM_BASE))?;
 
+        // Seed the PIIX3 ISA bridge / PCI interrupt router at 00:01.0 (its config
+        // space holds the PIRQ routing registers a guest programs).
+        {
+            let mut rc = pcie.borrow_mut();
+            if rc.find_device(&PIIX_ISA_BRIDGE_BDF).is_none() {
+                rc.add_device(PcieRootComplex::create_isa_bridge(
+                    PIIX_ISA_BRIDGE_BDF,
+                    vendors::INTEL,
+                    PIIX3_ISA_DEVICE_ID,
+                ));
+            }
+        }
+
         Ok(StandardPc {
             bus,
             pcie,
@@ -698,6 +712,46 @@ impl StandardPc {
         None
     }
 
+    /// Drive a PCI device's level-triggered `INTx` line into the interrupt fabric,
+    /// the way a real south-bridge does. `slot` is the device's PCI device number,
+    /// `pin` its interrupt pin (`1`=INTA..`4`=INTD, from config `0x3D`), and
+    /// `level` the asserted state.
+    ///
+    /// The routing is read **live** from the PIIX3 bridge's config space (the
+    /// `PIRQRC[A-D]` registers a guest programmed), so it always reflects what the
+    /// guest configured. The line is driven into *both* controllers, matching the
+    /// hardware: the **8259** sees the routed ISA IRQ as a *level* line (the guest
+    /// must have set it level in the ELCR — what PCI interrupts require), and the
+    /// **I/O APIC** sees the PIRQ line's fixed GSI (16-19). Whichever path the
+    /// guest has unmasked delivers it; deasserting (`level = false`) withdraws it.
+    pub fn assert_pci_intx(&self, slot: u8, pin: u8, level: bool) {
+        // Read the four PIRQRC bytes the guest programmed in the bridge config.
+        let regs = {
+            let rc = self.pcie.borrow();
+            match rc.find_device(&PIIX_ISA_BRIDGE_BDF) {
+                Some(bridge) => [
+                    bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE),
+                    bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE + 1),
+                    bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE + 2),
+                    bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE + 3),
+                ],
+                None => return,
+            }
+        };
+        let mut router = PirqRouter::new();
+        router.sync_from_config(regs);
+
+        // 8259 path: the routed ISA IRQ as a level line (PCI INTx is level).
+        if let Some(irq) = router.device_isa_irq(slot, pin) {
+            self.pic.with(|p| p.set_irq_level(irq, level));
+        }
+        // I/O APIC path: the PIRQ line's fixed GSI 16-19.
+        if let Some(gsi) = PirqRouter::device_gsi(slot, pin) {
+            let line = self.ioapic.line(gsi);
+            line(level);
+        }
+    }
+
     /// Advance every free-running platform clock by one elapsed-time delta of `ns`
     /// nanoseconds, keeping the three timekeeping sources a guest cross-checks
     /// coherent from a single time base. This is the timekeeping core a vCPU run
@@ -745,6 +799,13 @@ impl StandardPc {
 pub const IRQ_PIT: u8 = 0;
 /// Legacy ISA IRQ line for the COM1 16550 UART.
 pub const IRQ_COM1: u8 = 4;
+
+/// BDF of the PIIX3 ISA bridge / PCI interrupt router (`00:01.0`) seeded by
+/// [`DeviceBus::standard_pc_complete`]; its config space holds the `PIRQRC[A-D]`
+/// routing registers.
+const PIIX_ISA_BRIDGE_BDF: PciBdf = PciBdf::new(0, 1, 0);
+/// PCI device ID of the PIIX3 ISA bridge (Intel 82371SB, function 0).
+const PIIX3_ISA_DEVICE_ID: u16 = 0x7000;
 
 /// Guest-physical base of the `PCIe` ECAM window for the default single-segment
 /// layout. Matches the MCFG table emitted by `enlil_devices::acpi`, so a guest
@@ -1493,6 +1554,68 @@ mod tests {
         VmExitHandler::io_out(&mut pc.bus, 0x92, &[0x01]);
         assert_eq!(pc.poll_platform_events(), Some(PlatformEvent::Reset));
         assert_eq!(pc.poll_platform_events(), None);
+    }
+
+    #[test]
+    fn pci_intx_routes_through_the_piix_bridge_to_both_controllers() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::interrupt::ELCR_SLAVE;
+        use enlil_devices::pcie::PciBdf;
+
+        let mut pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            1_780_838_055,
+            1,
+        )
+        .unwrap();
+        pc.ioapic.with(|c| c.lapics[0].write_register(0x0F0, 0x1FF));
+
+        // The guest enumerates the PIIX3 bridge (00:01.0) and routes PIRQB ->
+        // IRQ10 by writing its config register 0x61.
+        {
+            let mut rc = pc.pcie.borrow_mut();
+            let bridge = rc.find_device_mut(&PciBdf::new(0, 1, 0)).unwrap();
+            bridge.write_u8(0x61, 10);
+        }
+
+        // Program the 8259 (PC/AT layout) and mark IRQ10 (slave line 2) level in
+        // the ELCR — PCI interrupts are level-triggered.
+        pc.pic.with(|p| {
+            for (port, val) in [
+                (0x20u16, 0x11u8),
+                (0x21, 0x20),
+                (0x21, 0x04),
+                (0x21, 0x01),
+                (0xA0, 0x11),
+                (0xA1, 0x28),
+                (0xA1, 0x02),
+                (0xA1, 0x01),
+                (0x21, 0x00),
+                (0xA1, 0x00),
+            ] {
+                p.write_port(port, val);
+            }
+            p.write_elcr(ELCR_SLAVE, 1 << 2);
+        });
+
+        // Program PIRQB's I/O APIC GSI (16 + 1 = 17): vector 0x50 -> LAPIC 0.
+        // REDTBL base 0x10 + 17*2 = 0x32 (low), 0x33 (high).
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0000, &0x32u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0010, &0x50u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0000, &0x33u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0010, &0u32.to_le_bytes());
+
+        // A device in slot 1 asserts INTA: swizzles to PIRQB, which the guest
+        // routed to IRQ10 (PIC) and which wires to GSI 17 (I/O APIC).
+        pc.assert_pci_intx(1, 1, true);
+        // The 8259 presents IRQ10's vector (slave base 0x28 + line 2 = 0x2A)...
+        assert_eq!(pc.pic.with(|p| p.pending_vector()), Some(0x2A));
+        // ...and the I/O APIC delivered GSI 17's vector to LAPIC 0.
+        assert_eq!(pc.ioapic.with(|c| c.pending_vector(0)), Some(0x50));
+
+        // Deasserting the level line withdraws it from the 8259.
+        pc.assert_pci_intx(1, 1, false);
+        assert_eq!(pc.pic.with(|p| p.pending_vector()), None);
     }
 
     #[test]
