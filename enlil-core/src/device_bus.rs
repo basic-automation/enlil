@@ -20,6 +20,7 @@ use enlil_devices::interrupt::{IoApicMmio, SharedInterruptController, SharedPic}
 use enlil_devices::pcie::{
     vendors, EcamSpace, PciBdf, PciConfigIo, PcieRootComplex, SharedRootComplex,
 };
+use enlil_devices::ps2::SharedI8042;
 use enlil_devices::timer::{Pit, SharedRtc};
 
 /// The system device bus: a PIO bus and an MMIO bus behind one exit handler.
@@ -271,6 +272,26 @@ impl DeviceBus {
     /// already-registered device.
     pub fn add_rtc(&mut self, rtc: &SharedRtc) -> Result<(), enlil_devices::bus::BusError> {
         self.add_pio(Box::new(rtc.port()))
+    }
+
+    /// Mount the i8042 PS/2 controller front-end on the PIO bus: the data port
+    /// (`0x60`) and the status/command port (`0x64`). It deliberately leaves
+    /// `0x61`-`0x63` unclaimed — those are the PC-speaker / NMI status ports of
+    /// other chipset functions. A guest probes the keyboard/mouse here early in
+    /// boot (Windows before USB HID, Linux's `i8042` driver); without it the
+    /// ports read open-bus `0xFF`.
+    ///
+    /// The caller owns `ps2` (a [`SharedI8042`]) so it can inject host input and
+    /// attach the IRQ1 (keyboard) / IRQ12 (mouse) sinks — e.g.
+    /// `ps2.attach_kbd_irq(Box::new(pic.line(1)))`.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if either port overlaps an
+    /// already-registered device.
+    pub fn add_ps2(&mut self, ps2: &SharedI8042) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_pio(Box::new(ps2.data_port()))?;
+        self.add_pio(Box::new(ps2.cmd_port()))?;
+        Ok(())
     }
 
     /// Like [`standard_pc`](Self::standard_pc), but wires the legacy devices'
@@ -827,6 +848,42 @@ mod tests {
         assert_eq!(pic.with(|p| p.pending_vector()), Some(0x24));
         // ...and the I/O APIC routed it to LAPIC 0 with its (different) vector.
         assert_eq!(ioapic.with(|c| c.pending_vector(0)), Some(0x34));
+    }
+
+    #[test]
+    fn ps2_keyboard_irq1_routes_through_the_ioapic() {
+        use enlil_devices::interrupt::SharedInterruptController;
+        use enlil_devices::ps2::SharedI8042;
+
+        let pic = SharedInterruptController::new(1);
+        pic.with(|c| c.lapics[0].write_register(0x0F0, 0x1FF));
+        let ps2 = SharedI8042::new();
+        ps2.attach_kbd_irq(Box::new(pic.isa_line(1))); // IRQ1, identity GSI 1
+
+        let mut bus = DeviceBus::new();
+        bus.add_ps2(&ps2).unwrap();
+        bus.add_ioapic(&pic).unwrap();
+        assert!(bus.pio.is_mapped(0x60));
+        assert!(bus.pio.is_mapped(0x64));
+        assert!(
+            !bus.pio.is_mapped(0x61),
+            "speaker/NMI port must stay open-bus"
+        );
+
+        // Program GSI 1's RTE (REDTBL 0x10 + 1*2 = 0x12) -> vector 0x31, LAPIC 0.
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0000, &0x12u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0010, &0x31u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0000, &0x13u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0010, &0u32.to_le_bytes());
+
+        // A host keypress raises IRQ1, which routes through the RTE to LAPIC 0.
+        ps2.inject_key(0x1E);
+        assert_eq!(pic.with(|c| c.pending_vector(0)), Some(0x31));
+
+        // The guest reads the scancode from the data port; IRQ1 deasserts.
+        let mut sc = [0u8; 1];
+        VmExitHandler::io_in(&mut bus, 0x60, &mut sc);
+        assert_eq!(sc[0], 0x1E);
     }
 
     #[test]

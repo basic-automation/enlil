@@ -252,6 +252,166 @@ impl Default for I8042Controller {
     }
 }
 
+/// Keyboard ISA IRQ line (IR1 on the master 8259 / GSI 1).
+pub const PS2_KBD_IRQ: u8 = 1;
+/// Mouse ISA IRQ line (IR4 on the slave 8259 / GSI 12).
+pub const PS2_MOUSE_IRQ: u8 = 12;
+
+use std::sync::{Arc, Mutex};
+
+use crate::bus::PioDevice;
+use crate::timer::pit::IrqLine;
+use crate::truncate::u8_of;
+
+/// The controller plus its two interrupt sinks, reconciled after every access.
+struct I8042Inner {
+    ctrl: I8042Controller,
+    kbd_irq: Option<Box<dyn IrqLine>>,
+    mouse_irq: Option<Box<dyn IrqLine>>,
+}
+
+impl I8042Inner {
+    /// Drive the IRQ1/IRQ12 lines from the controller's pending flags. The
+    /// 8042 asserts a line while its output buffer holds data for that channel
+    /// (and the matching interrupt is enabled) and deasserts it once the guest
+    /// reads the data port — exactly what the flags track, so reconciling them
+    /// after each operation keeps the lines correct without touching the
+    /// register model.
+    fn sync_irqs(&self) {
+        if let Some(line) = &self.kbd_irq {
+            line.set_level(self.ctrl.kbd_irq_pending);
+        }
+        if let Some(line) = &self.mouse_irq {
+            line.set_level(self.ctrl.mouse_irq_pending);
+        }
+    }
+}
+
+/// A thread-safe, shareable handle to one [`I8042Controller`] with its IRQ
+/// lines, plus the bus port adapters a guest drives.
+///
+/// Mirrors [`SharedPic`](crate::interrupt::SharedPic) /
+/// [`SharedRtc`](crate::timer::SharedRtc): the data/command port adapters and
+/// the host-input injector hold independent clones of one controller, and every
+/// access reconciles the keyboard (IRQ1) and mouse (IRQ12) lines.
+#[derive(Clone)]
+pub struct SharedI8042(Arc<Mutex<I8042Inner>>);
+
+impl SharedI8042 {
+    /// Wrap a fresh i8042 with no interrupt sinks attached yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Arc::new(Mutex::new(I8042Inner {
+            ctrl: I8042Controller::new(),
+            kbd_irq: None,
+            mouse_irq: None,
+        })))
+    }
+
+    /// Run `f` with exclusive access to the controller, then reconcile the IRQ
+    /// lines from its pending flags.
+    ///
+    /// # Panics
+    /// Panics if the controller mutex has been poisoned by a prior panic.
+    pub fn with<R>(&self, f: impl FnOnce(&mut I8042Controller) -> R) -> R {
+        let mut inner = self.0.lock().expect("i8042 mutex poisoned");
+        let r = f(&mut inner.ctrl);
+        inner.sync_irqs();
+        r
+    }
+
+    /// Attach the keyboard IRQ1 sink (see [`IrqLine`]); reconciles immediately.
+    ///
+    /// # Panics
+    /// Panics if the controller mutex has been poisoned by a prior panic.
+    pub fn attach_kbd_irq(&self, line: Box<dyn IrqLine>) {
+        let mut inner = self.0.lock().expect("i8042 mutex poisoned");
+        inner.kbd_irq = Some(line);
+        inner.sync_irqs();
+    }
+
+    /// Attach the mouse IRQ12 sink (see [`IrqLine`]); reconciles immediately.
+    ///
+    /// # Panics
+    /// Panics if the controller mutex has been poisoned by a prior panic.
+    pub fn attach_mouse_irq(&self, line: Box<dyn IrqLine>) {
+        let mut inner = self.0.lock().expect("i8042 mutex poisoned");
+        inner.mouse_irq = Some(line);
+        inner.sync_irqs();
+    }
+
+    /// Inject a host keyboard scancode and reconcile the IRQ lines.
+    pub fn inject_key(&self, scancode: u8) {
+        self.with(|c| c.inject_key(scancode));
+    }
+
+    /// Inject host mouse movement/buttons and reconcile the IRQ lines.
+    pub fn inject_mouse_packet(&self, buttons: u8, dx: i16, dy: i16) {
+        self.with(|c| c.inject_mouse_packet(buttons, dx, dy));
+    }
+
+    /// The data port (`0x60`) as a bus [`PioDevice`].
+    #[must_use]
+    pub fn data_port(&self) -> Ps2DataPort {
+        Ps2DataPort { ps2: self.clone() }
+    }
+
+    /// The status/command port (`0x64`) as a bus [`PioDevice`].
+    #[must_use]
+    pub fn cmd_port(&self) -> Ps2CmdPort {
+        Ps2CmdPort { ps2: self.clone() }
+    }
+}
+
+impl Default for SharedI8042 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The i8042 data port (`0x60`) as a bus [`PioDevice`].
+///
+/// A single byte-wide port — `0x61`-`0x63` belong to other chipset functions
+/// (the PC-speaker / NMI status ports), so the adapter claims only `0x60` and
+/// the command adapter only `0x64`, never the gap between them.
+pub struct Ps2DataPort {
+    ps2: SharedI8042,
+}
+
+impl PioDevice for Ps2DataPort {
+    fn pio_read(&mut self, _port: u16, _size: u8) -> u32 {
+        u32::from(self.ps2.with(I8042Controller::read_data))
+    }
+
+    fn pio_write(&mut self, _port: u16, _size: u8, data: u32) {
+        self.ps2.with(|c| c.write_data(u8_of(data)));
+    }
+
+    fn port_range(&self) -> (u16, u16) {
+        (DATA_PORT, DATA_PORT + 1)
+    }
+}
+
+/// The i8042 status/command port (`0x64`) as a bus [`PioDevice`]: a read
+/// returns the status register, a write is a controller command.
+pub struct Ps2CmdPort {
+    ps2: SharedI8042,
+}
+
+impl PioDevice for Ps2CmdPort {
+    fn pio_read(&mut self, _port: u16, _size: u8) -> u32 {
+        u32::from(self.ps2.with(|c| c.read_status()))
+    }
+
+    fn pio_write(&mut self, _port: u16, _size: u8, data: u32) {
+        self.ps2.with(|c| c.write_command(u8_of(data)));
+    }
+
+    fn port_range(&self) -> (u16, u16) {
+        (STATUS_CMD_PORT, STATUS_CMD_PORT + 1)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,5 +498,71 @@ mod tests {
             ctrl.read_status() & STATUS_MOUSE_OUTPUT,
             STATUS_MOUSE_OUTPUT
         );
+    }
+
+    /// Record every IRQ level transition driven onto a sink.
+    fn irq_log() -> (Arc<Mutex<Vec<bool>>>, impl Fn(bool) + Send) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let log = Arc::clone(&log);
+            move |level: bool| log.lock().unwrap().push(level)
+        };
+        (log, sink)
+    }
+
+    #[test]
+    fn keyboard_injection_asserts_irq1_then_clears_on_data_read() {
+        let ps2 = SharedI8042::new();
+        let (log, sink) = irq_log();
+        ps2.attach_kbd_irq(Box::new(sink));
+        // Attaching with no pending output reconciles to a low line.
+        assert_eq!(&*log.lock().unwrap(), &[false]);
+
+        // A host keypress fills the output buffer and raises IRQ1.
+        ps2.inject_key(0x1E);
+        assert_eq!(log.lock().unwrap().last(), Some(&true));
+
+        // Reading the data port (0x60) through the bus clears it -> IRQ1 low.
+        let mut port = ps2.data_port();
+        assert_eq!(port.pio_read(DATA_PORT, 1) & 0xFF, 0x1E);
+        assert_eq!(log.lock().unwrap().last(), Some(&false));
+    }
+
+    #[test]
+    fn port_adapters_claim_only_0x60_and_0x64() {
+        let ps2 = SharedI8042::new();
+        // Never 0x61-0x63 (PC-speaker / NMI status ports).
+        assert_eq!(ps2.data_port().port_range(), (0x60, 0x61));
+        assert_eq!(ps2.cmd_port().port_range(), (0x64, 0x65));
+    }
+
+    #[test]
+    fn self_test_through_the_bus_ports() {
+        let ps2 = SharedI8042::new();
+        let mut cmd = ps2.cmd_port();
+        let mut data = ps2.data_port();
+        cmd.pio_write(STATUS_CMD_PORT, 1, 0xAA); // self-test command
+        // Status shows output-buffer-full, data port returns 0x55 (passed).
+        assert_ne!(
+            cmd.pio_read(STATUS_CMD_PORT, 1) & u32::from(STATUS_OUTPUT_FULL),
+            0
+        );
+        assert_eq!(data.pio_read(DATA_PORT, 1) & 0xFF, 0x55);
+    }
+
+    #[test]
+    fn mouse_packet_drives_irq12_when_enabled() {
+        let ps2 = SharedI8042::new();
+        let (log, sink) = irq_log();
+        ps2.attach_mouse_irq(Box::new(sink));
+        // Enable mouse data reporting (0xF4) through the controller (0xD4 routes
+        // the next data byte to the mouse), draining the ACK first.
+        ps2.with(|c| {
+            c.write_command(0xD4);
+            c.write_data(0xF4);
+            let _ack = c.read_data();
+        });
+        ps2.inject_mouse_packet(0, 4, -3);
+        assert_eq!(log.lock().unwrap().last(), Some(&true));
     }
 }
