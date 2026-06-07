@@ -91,6 +91,15 @@ impl PirqRouter {
         self.routes[pirq % PIRQ_LINES]
     }
 
+    /// Load all four routing registers at once from the `PIRQRC[A-D]` bytes a
+    /// guest has programmed in the PIIX3 bridge's config space (offsets
+    /// `0x60`..`0x63`, [`PIRQ_ROUTE_CONFIG_BASE`](crate::pcie::PIRQ_ROUTE_CONFIG_BASE)).
+    /// This is how the router picks up routing the guest configured through PCI
+    /// config writes, keeping a single source of truth in config space.
+    pub const fn sync_from_config(&mut self, pirq_registers: [u8; PIRQ_LINES]) {
+        self.routes = pirq_registers;
+    }
+
     /// The ISA IRQ a PIRQ line currently drives in **PIC mode**, or `None` if the
     /// register is disabled (bit 7) or programmed to an IRQ that cannot carry a
     /// PCI interrupt. The PIIX3 hardwires IRQ 0/1/2/8/13 (and the always-edge
@@ -249,6 +258,37 @@ mod tests {
         // Device deasserts -> request withdrawn.
         pic.set_irq_level(irq, false);
         assert_eq!(pic.pending_vector(), None);
+    }
+
+    #[test]
+    fn router_syncs_routing_a_guest_programmed_in_the_piix_bridge_config() {
+        use crate::pcie::{PIRQ_ROUTE_CONFIG_BASE, PciBdf, PcieRootComplex, vendors};
+
+        // A guest enumerates the PIIX3 ISA bridge (00:01.0) and programs PIRQB ->
+        // IRQ10 by writing config offset 0x61, leaving the others at reset (0x80).
+        let mut bridge =
+            PcieRootComplex::create_isa_bridge(PciBdf::new(0, 1, 0), vendors::INTEL, 0x7000);
+        assert_eq!(
+            bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE),
+            0x80,
+            "PIRQA resets to disabled"
+        );
+        bridge.write_u8(PIRQ_ROUTE_CONFIG_BASE + 1, 10); // PIRQB -> IRQ10
+
+        // The router reads the four PIRQRC bytes straight out of config space.
+        let regs = [
+            bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE),
+            bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE + 1),
+            bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE + 2),
+            bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE + 3),
+        ];
+        let mut router = PirqRouter::new();
+        router.sync_from_config(regs);
+
+        // A slot-1 INTA device swizzles to PIRQB, which now routes to IRQ10; the
+        // still-disabled PIRQA resolves to nothing.
+        assert_eq!(router.device_isa_irq(1, 1), Some(10));
+        assert_eq!(router.device_isa_irq(0, 1), None);
     }
 
     fn init_pc_at(pic: &mut DualPic) {

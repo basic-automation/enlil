@@ -364,15 +364,33 @@ impl PcieRootComplex {
         dev
     }
 
-    /// Create a standard ISA/LPC bridge device
+    /// Create a standard ISA/LPC bridge device.
+    ///
+    /// For a PIIX3-style bridge this is also the **PCI interrupt router**: the
+    /// four `PIRQRC[A-D]` routing registers live in this device's config space
+    /// (the four bytes from [`PIRQ_ROUTE_CONFIG_BASE`]), and reset to `0x80`
+    /// (routing disabled), which is what a guest reads before it programs them.
+    /// The [`PirqRouter`](crate::interrupt::PirqRouter) is synced from those bytes
+    /// via [`sync_from_config`](crate::interrupt::PirqRouter::sync_from_config).
     #[must_use]
     pub fn create_isa_bridge(bdf: PciBdf, vendor_id: u16, device_id: u16) -> PciConfigSpace {
         let mut dev = PciConfigSpace::new(bdf, vendor_id, device_id);
         dev.set_class(0x06, 0x01, 0x00, 0x00); // ISA bridge
         dev.set_header_type(0x00);
+        // PIIX3 PCI interrupt-router registers reset to "disabled" (bit 7 set).
+        for i in 0..4 {
+            dev.write_u8(PIRQ_ROUTE_CONFIG_BASE + i, 0x80);
+        }
         dev
     }
 }
+
+/// Config-space offset of the first PIIX3 PCI interrupt-routing register.
+///
+/// `PIRQRCA`; the four `PIRQRC[A-D]` registers are contiguous at `0x60`..`0x63`.
+/// A guest programs interrupt routing by writing these; the
+/// [`PirqRouter`](crate::interrupt::PirqRouter) reads them back.
+pub const PIRQ_ROUTE_CONFIG_BASE: u16 = 0x60;
 
 /// Legacy PCI Configuration Mechanism #1: the `CONFIG_ADDRESS` port (32-bit
 /// register at `0xCF8`).
