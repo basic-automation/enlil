@@ -6,6 +6,95 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-07 (d) — Session: assemble the complete transparent PC + its ACPI PM hardware, HPET, PIRQ, and the run-loop core (Phase 0.2)
+
+An 18-increment session, each a full orient→build→verify trip and an independently-green commit,
+forming one coherent arc: **take the legacy interrupt/device groundwork from the 06-07(c) hand-off
+and finish the transparent standard PC — assemble it in one call, model the ACPI power-management
+hardware a real OS drives (timer, shutdown, GPEs), mount and fully wire the HPET, build the PCI
+interrupt router and its live path, fix the FADT/HPET transparency drifts, and stand up the
+run-loop timekeeping + event core.** Every increment is pure-userspace, fully exercised by
+unit/integration tests. Workspace test count: **751 → 797 (+46)**. `/dev/kvm` is **still absent on
+this runner (verified: no `/dev/kvm`, no vmx/svm in `/proc/cpuinfo`)**; the one KVM-gated test
+self-skips (1 ignored).
+
+### Increments (each its own green commit)
+1. **`standard_pc_complete` + `StandardPc` bundle** — one factory assembling COM1, PIT, RTC, PS/2,
+   System Control Ports A/B, ACPI PM1a/PM_TMR/GPE0, both 8259s, the I/O APIC and PCIe, with **every**
+   device IRQ teed into both controllers (`dual_irq_line` helper, also refactored into
+   `standard_pc_with_dual_irq`). Returns shared handles the run loop binds to.
+2. **System Control Port B (`0x61`)** — PIT-ch2 gate + PC speaker + refresh-clock(bit4)/OUT(bit5)
+   readback, coupled to the shared PIT. (`enlil_devices::timer::speaker`.)
+3. **System Control Port A (`0x92`)** — fast A20 (enabled) + fast-reset latch. (new
+   `enlil_devices::chipset` module.)
+4. **PIIX3 PIRQ router model** — `interrupt::pirq::PirqRouter`: PIRQRC registers + PCI slot/pin
+   swizzle + PIC-mode ISA-IRQ / APIC-mode GSI-16-19 resolution, paired with the ELCR's level IRR.
+5. **HPET on the MMIO bus** — `HpetMmio` at `0xFED0_0000`, bridging the model's aligned-register
+   decode to 32/64-bit guest accesses (`SharedHpet`).
+6. **ACPI PM timer (`0x608`)** — free-running 32-bit (per FADT `TMR_VAL_EXT`) 3.579545 MHz counter.
+7. **ACPI PM1a event/control block (`0x600`/`0x604`)** — the `SLP_TYP|SLP_EN` **shutdown** path via a
+   `take_sleep` latch; PWRBTN status; SCI_EN. (`SharedAcpiPm1Block`.)
+8. **FADT: drop `HW_REDUCED_ACPI`** — it was set alongside the legacy PM hardware + `LEGACY_DEVICES`
+   (mutually exclusive); clearing it makes the PM1a/PM_TMR/GPE0 blocks the OS will actually use.
+9. **ACPI GPE0 block (`0x620`)** — status starts clear so ACPI init isn't flooded with phantom GPEs.
+10. **FADT PM-block ports derived from the device models** — single source of truth, cross-checked.
+11. **PIRQ registers located in the PIIX bridge config** — `create_isa_bridge` seeds PIRQRC=0x80,
+    `PirqRouter::sync_from_config` loads routing a guest programmed.
+12. **`StandardPc::advance_clocks`** — the run-loop timekeeping core: advance PIT/PM-timer/HPET
+    coherently from one `ns` delta (`HPET_TICK_NS = 100`).
+13. **HPET interrupt delivery (I/O APIC)** — `advance_clocks` delivers fired timers to their GSI.
+14. **`poll_platform_events`** — typed run-loop API returning `Sleep(SLP_TYP)` / `Reset` from the
+    PM1a + (now shared) port-A latches.
+15. **Live PCI INTx routing** — `StandardPc::assert_pci_intx` reads routing live from the seeded PIIX
+    bridge config, swizzles, and drives **both** controllers (8259 level via ELCR + I/O APIC GSI).
+16. **HPET capability register fixed** — advertise the 64-bit counter / legacy-replacement / Intel
+    vendor it actually implements (matched the ACPI HPET table; cross-checked).
+17. **HPET legacy-replacement delivery** — timer 0→IRQ0, timer 1→IRQ8 into both controllers.
+18. **DSDT describes the HPET (PNP0103)** — and uses the previously-dead `has_hpet` flag.
+
+### Research (informed the build)
+Logged under `RESEARCH.md` → "2026-06-07 (d)": ACPI 6.4 §4.8/§5.2.9 (PM register set; the
+**`HW_REDUCED_ACPI` ⊕ legacy PM hardware** finding; `TMR_VAL_EXT`→32-bit PM timer; `SLP_TYP|SLP_EN`
+shutdown; GPE-open-bus pitfall), the PIIX3 datasheet (PCI interrupt routing: swizzle, PIRQRC at
+config 0x60-0x63, PCI IRQs are level, APIC mode→GSI 16-19), the 8254/ICH 0x61/0x92 chipset ports,
+and IA-PC HPET 1.0a (1 KiB block, 32/64-bit register access). All stable silicon/firmware — the
+authoritative sources are the primary specs, not recent papers.
+
+### Test results (exact)
+- `cargo build --workspace` → **OK**.
+- `cargo fmt --all -- --check` → **OK**.
+- `cargo clippy --all-targets --workspace -- -D warnings` → **OK** (clean; new code lint-clean under
+  `enlil-devices`'s strict `deny(all, pedantic, nursery)` — narrowing via the `truncate` helpers,
+  `const fn`/`#[must_use]`/`# Panics` where asked, hex bitwise literals, split doc paragraphs).
+- `cargo test --workspace` → **797 passed, 0 failed, 1 ignored** (was 751). The 1 ignored is the
+  `/dev/kvm` self-skip.
+- `/dev/kvm` paths: **not run — no `/dev/kvm` (no nested virt)**; verified absent on this runner.
+- no_std custom-target build: **N/A** — no crate is `#![no_std]` yet.
+
+### Recommended next step (tomorrow)
+1. **DSDT `_CRS` resource descriptors (high value, medium effort).** The DSDT device objects (COM1,
+   RTC, PS/2, HPET, PCI) have `_HID`+`_STA` but **no `_CRS`** — Windows especially assigns resources
+   from `_CRS`. The `AmlBuilder` has no resource-descriptor helpers yet (only `raw`), so this is two
+   steps: add `AmlBuilder` helpers to emit a `ResourceTemplate` buffer (IO port descriptor `0x47`,
+   `Memory32Fixed` `0x86`, IRQ `0x22`/`0x23`, EndTag) — *verify the byte encoding carefully, ideally
+   against `iasl`/an AML disassembler since we have no runtime ACPI* — then give each device its
+   `_CRS` (COM1 `0x3F8`/8/IRQ4, RTC `0x70`/2/IRQ8, KBD `0x60`+`0x64`/IRQ1, HPET `Memory32Fixed`
+   `0xFED0_0000`/0x400). Do it per-device as its own increment.
+2. **8237 DMA controller (medium effort, lower modern value).** Ports `0x00`-`0x0F` (ch 0-3),
+   `0xC0`-`0xDF` (ch 4-7), page registers `0x80`-`0x8F`. Linux `request_region`s these at boot;
+   modelling the command/status/mask/mode + address/count flip-flop registers (storing writes,
+   returning sane reads) removes the open-bus surface. Pure userspace, unblocked.
+3. **Live PIRQ from a *real* `INTx` source.** `assert_pci_intx` works, but nothing in-tree asserts
+   `INTx` yet. When a PCI device model (virtio-blk/net) is wired onto the bus, route its INTx pin
+   through `assert_pci_intx`. Also fold `assert_pci_intx` into the eventual run loop.
+4. **KVM run-loop binding (still blocked on `/dev/kvm`).** When a nested-virt runner exists: have
+   `KvmBackend` build its bus via `standard_pc_complete`, drive `advance_clocks` + `tick_rtc` from a
+   timer thread, act on `poll_platform_events` (`Sleep(5)`→power off, `Reset`→re-init the vCPU), and
+   deliver HPET/PIT/RTC/PCI interrupts through `KVM_IRQ_LINE`/the in-kernel chip. **If still no
+   `/dev/kvm`, do #1/#2.**
+
+---
+
 ## 2026-06-07 (c) — Session: finish the interrupt-correctness gaps + the missing legacy PC devices (Phase 0.2)
 
 A six-increment session, each a full orient→build→verify trip and an independently-green commit.
