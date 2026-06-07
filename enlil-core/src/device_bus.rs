@@ -239,18 +239,20 @@ impl DeviceBus {
     }
 
     /// Mount the legacy dual-8259 [`SharedPic`] front-end on the PIO bus: the
-    /// master's two ports (`0x20`/`0x21`) and the slave's (`0xA0`/`0xA1`). This
-    /// is the interrupt controller early boot programs *before* the OS switches
-    /// to the I/O APIC; without it those ports read back as open-bus and the
-    /// guest cannot mask/EOI or read the PIC, stalling early-boot interrupt
-    /// setup.
+    /// master's two ports (`0x20`/`0x21`), the slave's (`0xA0`/`0xA1`), and the
+    /// chipset ELCR ports (`0x4D0`/`0x4D1`). This is the interrupt controller
+    /// early boot programs *before* the OS switches to the I/O APIC; without it
+    /// those ports read back as open-bus and the guest cannot mask/EOI or read
+    /// the PIC, stalling early-boot interrupt setup. The ELCR lets the guest
+    /// select per-line edge vs level triggering (PCI INTx lines are level).
     ///
     /// # Errors
-    /// Propagates [`enlil_devices::bus::BusError`] if either port pair overlaps
+    /// Propagates [`enlil_devices::bus::BusError`] if any port range overlaps
     /// an already-registered device.
     pub fn add_pic(&mut self, pic: &SharedPic) -> Result<(), enlil_devices::bus::BusError> {
         self.add_pio(Box::new(pic.master_port()))?;
         self.add_pio(Box::new(pic.slave_port()))?;
+        self.add_pio(Box::new(pic.elcr_port()))?;
         Ok(())
     }
 

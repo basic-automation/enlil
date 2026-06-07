@@ -65,6 +65,6 @@ pub use lapic::LocalApic;
 pub use line::{IoApicMmio, SharedInterruptController, isa_to_gsi};
 pub use msi::{MsiCapability, MsiMessage, MsixCapability, MsixTableEntry};
 pub use pic::{
-    DualPic, MASTER_CMD, MASTER_DATA, Pic8259, PicMasterPort, PicSlavePort, SLAVE_CMD, SLAVE_DATA,
-    SharedPic,
+    DualPic, ELCR_MASTER, ELCR_SLAVE, ElcrPort, MASTER_CMD, MASTER_DATA, Pic8259, PicMasterPort,
+    PicSlavePort, SLAVE_CMD, SLAVE_DATA, SharedPic,
 };
