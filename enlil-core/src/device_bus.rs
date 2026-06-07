@@ -16,7 +16,7 @@
 use crate::kvm_backend::VmExitHandler;
 use crate::serial::{SerialOutput, SerialPort};
 use enlil_devices::bus::{MmioBus, MmioDevice, PioBus, PioDevice};
-use enlil_devices::chipset::{Gpe0Block, SharedAcpiPm1Block, SystemControlPortA};
+use enlil_devices::chipset::{Gpe0Block, SharedAcpiPm1Block, SharedSystemControlPortA};
 use enlil_devices::interrupt::{IoApicMmio, SharedInterruptController, SharedPic};
 use enlil_devices::pcie::{
     vendors, EcamSpace, PciBdf, PciConfigIo, PcieRootComplex, SharedRootComplex,
@@ -339,16 +339,17 @@ impl DeviceBus {
     /// CPU-reset request edge. Without it `0x92` reads open-bus `0xFF`, so a
     /// guest confirming A20 there sees the wrong state.
     ///
-    /// The port is mounted as a plain device, so the one-shot reset latch
-    /// (`SystemControlPortA::take_reset`) is not reachable post-mount; binding it
-    /// to the vCPU run loop (a shared handle the loop polls to re-init the vCPU)
-    /// is deferred to when the KVM backend's run loop lands.
+    /// The caller owns `sysctl_a` (a [`SharedSystemControlPortA`]) so the run loop
+    /// can poll its one-shot fast-reset latch (`take_reset`) and re-init the vCPU.
     ///
     /// # Errors
     /// Propagates [`enlil_devices::bus::BusError`] if `0x92` overlaps an
     /// already-registered device.
-    pub fn add_system_control_a(&mut self) -> Result<(), enlil_devices::bus::BusError> {
-        self.add_pio(Box::new(SystemControlPortA::new()))
+    pub fn add_system_control_a(
+        &mut self,
+        sysctl_a: &SharedSystemControlPortA,
+    ) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_pio(Box::new(sysctl_a.port()))
     }
 
     /// Mount the **HPET** register block ([`SharedHpet`]) on the MMIO bus at
@@ -559,8 +560,10 @@ impl DeviceBus {
         // the same PIT handle.
         bus.add_system_control_b(&pit)?;
 
-        // System Control Port A (0x92): fast A20 (enabled) + fast reset.
-        bus.add_system_control_a()?;
+        // System Control Port A (0x92): fast A20 (enabled) + fast reset. Shared so
+        // the run loop can poll the reset latch.
+        let sysctl_a = SharedSystemControlPortA::new();
+        bus.add_system_control_a(&sysctl_a)?;
 
         // MC146818 RTC/CMOS (IRQ8).
         rtc.with(|r| r.attach_irq(Box::new(dual_irq_line(&pic, &ioapic, RTC_IRQ))));
@@ -607,8 +610,22 @@ impl DeviceBus {
             hpet,
             pm_timer,
             pm1,
+            sysctl_a,
         })
     }
+}
+
+/// A platform-level event a guest raised that the vCPU run loop must act on,
+/// surfaced by [`StandardPc::poll_platform_events`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlatformEvent {
+    /// The guest committed an ACPI sleep transition (the `SLP_TYP` value). The
+    /// DSDT's `_S5` value means **power off**; other values are lighter sleep
+    /// states the run loop maps as it implements them.
+    Sleep(u8),
+    /// The guest pulsed a fast/INIT CPU reset via System Control Port A (`0x92`
+    /// bit 0). The run loop should reinitialise the vCPU to its reset vector.
+    Reset,
 }
 
 /// Build one device-IRQ sink that drives **both** interrupt controllers from a
@@ -658,9 +675,29 @@ pub struct StandardPc {
     /// The ACPI PM1a block — poll `take_sleep` from the run loop to handle
     /// guest-initiated shutdown / sleep.
     pub pm1: SharedAcpiPm1Block,
+    /// System Control Port A (`0x92`) — poll `take_reset` from the run loop to
+    /// handle a guest-initiated fast/INIT reset, and read the live A20 state.
+    pub sysctl_a: SharedSystemControlPortA,
 }
 
 impl StandardPc {
+    /// Poll the platform-control latches a guest can raise that the vCPU run loop
+    /// must act on outside the normal exit path — currently an ACPI sleep/shutdown
+    /// ([`PlatformEvent::Sleep`], via the PM1a block) and a fast CPU reset
+    /// ([`PlatformEvent::Reset`], via System Control Port A). Returns the highest-
+    /// priority pending event (sleep before reset) and consumes its latch; the run
+    /// loop calls this each iteration and acts on what it returns.
+    #[must_use]
+    pub fn poll_platform_events(&self) -> Option<PlatformEvent> {
+        if let Some(slp_typ) = self.pm1.take_sleep() {
+            return Some(PlatformEvent::Sleep(slp_typ));
+        }
+        if self.sysctl_a.take_reset() {
+            return Some(PlatformEvent::Reset);
+        }
+        None
+    }
+
     /// Advance every free-running platform clock by one elapsed-time delta of `ns`
     /// nanoseconds, keeping the three timekeeping sources a guest cross-checks
     /// coherent from a single time base. This is the timekeeping core a vCPU run
@@ -1428,6 +1465,34 @@ mod tests {
         let fired = pc.advance_clocks(1_000_000);
         assert_eq!(fired, vec![(0, 16)], "HPET timer 0 fired, routed to GSI 16");
         assert_eq!(pc.ioapic.with(|c| c.pending_vector(0)), Some(0x40));
+    }
+
+    #[test]
+    fn poll_platform_events_surfaces_guest_shutdown_and_reset() {
+        use super::PlatformEvent;
+        use crate::serial::{SerialOutput, SerialOutputMode};
+
+        let mut pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            1_780_838_055,
+            1,
+        )
+        .unwrap();
+
+        // Nothing pending on a fresh machine.
+        assert_eq!(pc.poll_platform_events(), None);
+
+        // The guest writes the S5 ACPI transition to PM1a_CNT (0x604):
+        // SLP_TYP=5 | SLP_EN(1<<13).
+        let s5 = (5u16 << 10) | (1 << 13);
+        VmExitHandler::io_out(&mut pc.bus, 0x604, &s5.to_le_bytes());
+        assert_eq!(pc.poll_platform_events(), Some(PlatformEvent::Sleep(5)));
+        assert_eq!(pc.poll_platform_events(), None, "latch consumed");
+
+        // The guest pulses a fast reset through System Control Port A (0x92 bit 0).
+        VmExitHandler::io_out(&mut pc.bus, 0x92, &[0x01]);
+        assert_eq!(pc.poll_platform_events(), Some(PlatformEvent::Reset));
+        assert_eq!(pc.poll_platform_events(), None);
     }
 
     #[test]

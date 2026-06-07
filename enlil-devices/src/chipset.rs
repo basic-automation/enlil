@@ -98,6 +98,70 @@ impl PioDevice for SystemControlPortA {
     }
 }
 
+/// A shared [`SystemControlPortA`] behind an `Arc<Mutex<…>>`.
+///
+/// The [`SysCtlAPort`] bus adapter handles the guest's `0x92` accesses while the
+/// run loop holds a clone to poll [`take_reset`](Self::take_reset) (and reset the
+/// vCPU) and to read the live A20 state.
+#[derive(Clone, Default)]
+pub struct SharedSystemControlPortA(Arc<Mutex<SystemControlPortA>>);
+
+impl SharedSystemControlPortA {
+    /// Wrap a fresh port (A20 enabled, no pending reset).
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Arc::new(Mutex::new(SystemControlPortA::new())))
+    }
+
+    /// Run `f` with exclusive access to the port.
+    ///
+    /// # Panics
+    /// Panics if the mutex has been poisoned by a prior panic while held.
+    pub fn with<R>(&self, f: impl FnOnce(&mut SystemControlPortA) -> R) -> R {
+        f(&mut self.0.lock().expect("port A mutex poisoned"))
+    }
+
+    /// Consume a pending fast-reset request (see [`SystemControlPortA::take_reset`]).
+    pub fn take_reset(&self) -> bool {
+        self.with(SystemControlPortA::take_reset)
+    }
+
+    /// Whether the A20 gate is currently enabled.
+    #[must_use]
+    pub fn a20_enabled(&self) -> bool {
+        self.with(|p| p.a20_enabled())
+    }
+
+    /// The `0x92` port as a bus [`PioDevice`].
+    #[must_use]
+    pub fn port(&self) -> SysCtlAPort {
+        SysCtlAPort {
+            inner: self.clone(),
+        }
+    }
+}
+
+/// System Control Port A (`0x92`) as a bus [`PioDevice`], backed by a
+/// [`SharedSystemControlPortA`] so the guest's fast-reset write is visible to the
+/// run loop.
+pub struct SysCtlAPort {
+    inner: SharedSystemControlPortA,
+}
+
+impl PioDevice for SysCtlAPort {
+    fn pio_read(&mut self, port: u16, size: u8) -> u32 {
+        self.inner.with(|p| p.pio_read(port, size))
+    }
+
+    fn pio_write(&mut self, port: u16, size: u8, data: u32) {
+        self.inner.with(|p| p.pio_write(port, size, data));
+    }
+
+    fn port_range(&self) -> (u16, u16) {
+        (PORT_A, PORT_A + 1)
+    }
+}
+
 /// I/O port of the **`PM1a` event block** (`PM1a_EVT_BLK`).
 ///
 /// A 16-bit status register (write-1-to-clear) at `0x600` followed by a 16-bit
@@ -419,7 +483,7 @@ impl PioDevice for Gpe0Block {
 mod tests {
     use super::{
         A20_GATE, AcpiPm1Block, GPE0_PORT, Gpe0Block, PM1_CNT_PORT, PM1_EVT_PORT, PORT_A,
-        SharedAcpiPm1Block, SystemControlPortA,
+        SharedAcpiPm1Block, SharedSystemControlPortA, SystemControlPortA,
     };
     use crate::bus::PioDevice;
 
@@ -520,6 +584,19 @@ mod tests {
         // A 32-bit read of the event block sees enable in the high half.
         let evt = pm1.pio_read(PM1_EVT_PORT, 4);
         assert_eq!(evt >> 16, u32::from(1u16 << 8));
+    }
+
+    #[test]
+    fn shared_port_a_reset_through_the_bus_reaches_the_run_loop_handle() {
+        let shared = SharedSystemControlPortA::new();
+        let mut port = shared.port();
+        assert!(shared.a20_enabled());
+        assert!(!shared.take_reset());
+
+        // A guest pulses fast reset (bit 0) through the bus port.
+        port.pio_write(PORT_A, 1, 0x01);
+        assert!(shared.take_reset(), "reset seen by the run-loop handle");
+        assert!(!shared.take_reset(), "consumed once");
     }
 
     #[test]
