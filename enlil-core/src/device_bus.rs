@@ -670,21 +670,37 @@ impl StandardPc {
     ///   count, pulses its IRQ0 line — which the factory already teed into both
     ///   interrupt controllers, so the timer interrupt is delivered automatically;
     /// - the **HPET** main counter advances at its 10 MHz rate (only while the
-    ///   guest has enabled it), and the `(timer, irq)` pairs of any HPET timers
-    ///   that fired are **returned** for the caller to deliver (HPET interrupt
-    ///   routing — legacy-replacement vs I/O APIC GSI — is not yet wired);
+    ///   guest has enabled it); each HPET timer that fires while routed through
+    ///   the **I/O APIC** (the normal mode) is delivered to its configured GSI as
+    ///   an edge, and the fired `(timer, gsi)` pairs are also **returned** for
+    ///   observability;
     /// - the **ACPI PM timer** advances at its fixed 3.579545 MHz rate.
     ///
-    /// The MC146818 RTC is driven separately (`rtc.tick_second()` once per wall
-    /// second), since its resolution and update-interrupt semantics differ.
+    /// HPET **legacy-replacement** mode (where timer 0/1 stand in for the PIT/RTC
+    /// IRQs and those devices must be suppressed) is not auto-delivered here — its
+    /// fired timers are returned undelivered; wiring that mode (and the PIT/RTC
+    /// suppression it implies) is deferred. The MC146818 RTC is likewise driven
+    /// separately (`rtc.tick_second()` once per wall second).
     #[must_use]
     pub fn advance_clocks(&self, ns: u64) -> Vec<(usize, u8)> {
         // PIT: tick() takes nanoseconds directly and pulses the wired IRQ0 sink.
         let _ = self.pit.tick(ns);
         // ACPI PM timer: convert the elapsed time to its 3.579545 MHz ticks.
         self.pm_timer.advance(AcpiPmTimer::ns_to_ticks(ns));
-        // HPET: convert to its 10 MHz counter ticks; return any fired timers.
-        self.hpet.tick(ns / HPET_TICK_NS)
+        // HPET: convert to its 10 MHz counter ticks; collect any fired timers.
+        let fired = self.hpet.tick(ns / HPET_TICK_NS);
+
+        // Deliver each fired timer to its I/O APIC GSI as an edge (assert then
+        // deassert), unless the HPET is in legacy-replacement mode — those are
+        // left for the caller (see the method docs).
+        if !self.hpet.with(|h| h.legacy_routing()) {
+            for &(_timer, gsi) in &fired {
+                let line = self.ioapic.line(gsi);
+                line(true);
+                line(false);
+            }
+        }
+        fired
     }
 }
 
@@ -1374,6 +1390,44 @@ mod tests {
         assert_eq!(pc.pm_timer.read(), PM_TIMER_FREQ_HZ);
         // The HPET (10 MHz / 100 ns per tick) advanced by 10,000,000 ticks.
         assert_eq!(pc.hpet.with(|h| h.counter()), 10_000_000);
+    }
+
+    #[test]
+    fn advance_clocks_delivers_a_fired_hpet_timer_to_its_ioapic_gsi() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+
+        let mut pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            1_780_838_055,
+            1,
+        )
+        .unwrap();
+        pc.ioapic.with(|c| c.lapics[0].write_register(0x0F0, 0x1FF));
+
+        // Program HPET timer 0: interrupt-enable (bit 2) + route to GSI 16
+        // (bits 9-13 = 16 -> 16 << 9 = 0x2000), one-shot comparator 100, then
+        // enable the main counter.
+        pc.hpet.with(|h| {
+            h.write(0x100, 0x04 | 0x2000);
+            h.write(0x108, 100);
+            h.write(0x010, 1);
+        });
+
+        // Program GSI 16's RTE through the I/O APIC aperture: vector 0x40 ->
+        // LAPIC 0. REDTBL base 0x10 + 16*2 = 0x30 (low), 0x31 (high).
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0000, &0x30u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0010, &0x40u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0000, &0x31u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0010, &0u32.to_le_bytes());
+
+        // Nothing fired yet.
+        assert!(!pc.ioapic.with(|c| c.has_pending(0)));
+
+        // Advance past the comparator (>=100 HPET ticks = >=10,000 ns); the timer
+        // fires and advance_clocks delivers it to GSI 16 -> LAPIC 0.
+        let fired = pc.advance_clocks(1_000_000);
+        assert_eq!(fired, vec![(0, 16)], "HPET timer 0 fired, routed to GSI 16");
+        assert_eq!(pc.ioapic.with(|c| c.pending_vector(0)), Some(0x40));
     }
 
     #[test]
