@@ -290,6 +290,17 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > deliberately *not* on the shared bus (it's per-vCPU at one address — belongs in the per-vCPU
 > exit path / in-kernel chip). **Next:** the KVM `set_irq_line`/`irqfd` binding once a
 > `/dev/kvm`-capable runner exists; have `KvmBackend` build its bus via `standard_pc_with_interrupts`.
+>
+> **Status (2026-06-07b):** the **legacy 8259A PIC** — the controller early boot uses *before*
+> the OS switches to the I/O APIC — now has a pure model in `enlil_devices::interrupt::pic`:
+> `Pic8259` (single chip: ICW1-4 init sequence, OCW1 mask / OCW2 EOI / OCW3 read-select+poll+
+> special-mask, IRR/ISR/IMR, fully-nested fixed priority, auto-EOI) and the cascaded `DualPic`
+> (master `0x20`/`0x21` + slave `0xA0`/`0xA1`, slave INT → master IR2 computed on demand, INTA
+> `acknowledge()` → vector, `pending_vector()`/`has_interrupt()` for the INTR line). 16 unit
+> tests, no KVM needed. **Still to do for the PIC:** a bus front-end (two PIO port adapters over a
+> shared `DualPic`) + an `.line()` sink so devices assert into it like the I/O APIC, then a
+> `standard_pc` variant mounting both; eventual KVM binding routes PIC INTR via LAPIC LINT0
+> ExtINT (or the in-kernel `KVM_CREATE_IRQCHIP`, which already models the dual-8259).
 
 ### 0.3 USB Live Boot & Non-Destructive Testing (CRITICAL FOR ADOPTION)
 
