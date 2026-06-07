@@ -20,7 +20,7 @@ use enlil_devices::interrupt::{IoApicMmio, SharedInterruptController, SharedPic}
 use enlil_devices::pcie::{
     vendors, EcamSpace, PciBdf, PciConfigIo, PcieRootComplex, SharedRootComplex,
 };
-use enlil_devices::timer::Pit;
+use enlil_devices::timer::{Pit, SharedRtc};
 
 /// The system device bus: a PIO bus and an MMIO bus behind one exit handler.
 #[derive(Default)]
@@ -254,6 +254,23 @@ impl DeviceBus {
         self.add_pio(Box::new(pic.slave_port()))?;
         self.add_pio(Box::new(pic.elcr_port()))?;
         Ok(())
+    }
+
+    /// Mount the MC146818 RTC / CMOS front-end on the PIO bus over its index and
+    /// data ports (`0x70`/`0x71`). A guest reads the time-of-day and CMOS
+    /// equipment config here at boot, and writes the NMI-disable bit through the
+    /// index port; without it those ports read back open-bus `0xFF`.
+    ///
+    /// The caller owns `rtc` (a [`SharedRtc`]) so it can advance the wall clock
+    /// (`tick_second`), inject the guest's view of time, and attach the IRQ8
+    /// sink — e.g. `rtc.with(|r| r.attach_irq(Box::new(pic.line(8))))` for the
+    /// 8259, or `ioapic.isa_line(8)` for the I/O APIC.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if the port pair overlaps an
+    /// already-registered device.
+    pub fn add_rtc(&mut self, rtc: &SharedRtc) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_pio(Box::new(rtc.port()))
     }
 
     /// Like [`standard_pc`](Self::standard_pc), but wires the legacy devices'
@@ -810,6 +827,62 @@ mod tests {
         assert_eq!(pic.with(|p| p.pending_vector()), Some(0x24));
         // ...and the I/O APIC routed it to LAPIC 0 with its (different) vector.
         assert_eq!(ioapic.with(|c| c.pending_vector(0)), Some(0x34));
+    }
+
+    #[test]
+    fn rtc_reads_the_time_through_the_bus_ports() {
+        use enlil_devices::timer::{RtcTime, SharedRtc, RTC_INDEX};
+
+        // 2026-06-07T13:14:15Z.
+        let rtc = SharedRtc::new(RtcTime::from_unix(1_780_838_055));
+        let mut bus = DeviceBus::new();
+        bus.add_rtc(&rtc).unwrap();
+        assert!(bus.pio.is_mapped(RTC_INDEX));
+
+        // Select the hours register (index port), then read the data port — the
+        // RTC defaults to 24-hour binary mode, so 13 reads back as 13.
+        VmExitHandler::io_out(&mut bus, RTC_INDEX, &[0x04]);
+        let mut data = [0u8; 1];
+        VmExitHandler::io_in(&mut bus, 0x71, &mut data);
+        assert_eq!(data[0], 13);
+
+        // The index port is write-only: it reads back open-bus 0xFF.
+        let mut idx = [0u8; 1];
+        VmExitHandler::io_in(&mut bus, RTC_INDEX, &mut idx);
+        assert_eq!(idx[0], 0xFF);
+    }
+
+    #[test]
+    fn rtc_irq8_routes_through_the_ioapic_to_a_vcpu() {
+        use enlil_devices::interrupt::SharedInterruptController;
+        use enlil_devices::timer::{RtcTime, SharedRtc};
+
+        let pic = SharedInterruptController::new(1);
+        pic.with(|c| c.lapics[0].write_register(0x0F0, 0x1FF));
+        let rtc = SharedRtc::new(RtcTime::from_unix(1_780_838_055));
+        // Wire RTC IRQ8 into the I/O APIC (GSI 8, identity) and enable the
+        // update-ended interrupt (Register B: DM | 24H | UIE).
+        rtc.with(|r| {
+            r.attach_irq(Box::new(pic.isa_line(8)));
+            r.write_index(0x0B);
+            r.write_data(0x04 | 0x02 | 0x10);
+        });
+
+        let mut bus = DeviceBus::new();
+        bus.add_rtc(&rtc).unwrap();
+        bus.add_ioapic(&pic).unwrap();
+
+        // Program GSI 8's RTE through the aperture (vector 0x38 -> LAPIC 0):
+        // REDTBL base 0x10 + 8*2 = 0x20 (low), 0x21 (high).
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0000, &0x20u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0010, &0x38u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0000, &0x21u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0010, &0u32.to_le_bytes());
+
+        // A one-second tick raises the update-ended interrupt, which routes
+        // through GSI 8's RTE into LAPIC 0.
+        assert!(rtc.with(enlil_devices::timer::Rtc146818::tick_second));
+        assert_eq!(pic.with(|c| c.pending_vector(0)), Some(0x38));
     }
 
     #[test]
