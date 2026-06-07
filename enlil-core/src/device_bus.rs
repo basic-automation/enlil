@@ -20,8 +20,8 @@ use enlil_devices::interrupt::{IoApicMmio, SharedInterruptController, SharedPic}
 use enlil_devices::pcie::{
     vendors, EcamSpace, PciBdf, PciConfigIo, PcieRootComplex, SharedRootComplex,
 };
-use enlil_devices::ps2::SharedI8042;
-use enlil_devices::timer::{Pit, SharedPit, SharedRtc};
+use enlil_devices::ps2::{SharedI8042, PS2_KBD_IRQ, PS2_MOUSE_IRQ};
+use enlil_devices::timer::{Pit, RtcTime, SharedPit, SharedRtc, RTC_IRQ};
 
 /// The system device bus: a PIO bus and an MMIO bus behind one exit handler.
 #[derive(Default)]
@@ -379,25 +379,13 @@ impl DeviceBus {
     ) -> Result<(Self, SharedRootComplex), enlil_devices::bus::BusError> {
         let mut bus = Self::new();
 
-        // Tee each device line to both controllers: the closure calls both
-        // per-controller sinks, and is itself `Fn(bool) + Send`, so it satisfies
-        // both crate-local `IrqLine` traits via their blanket impls.
-        let com1_pic = pic.line(IRQ_COM1);
-        let com1_apic = ioapic.isa_line(IRQ_COM1);
+        // Tee each device line to both controllers (see [`dual_irq_line`]).
         let mut com1 = SerialPort::com1(serial_output);
-        com1.attach_irq_line(Box::new(move |level: bool| {
-            com1_pic(level);
-            com1_apic(level);
-        }));
+        com1.attach_irq_line(Box::new(dual_irq_line(pic, ioapic, IRQ_COM1)));
         bus.add_serial(com1)?;
 
-        let pit_pic = pic.line(IRQ_PIT);
-        let pit_apic = ioapic.isa_line(IRQ_PIT);
         let mut pit = Pit::new();
-        pit.attach_irq0(Box::new(move |level: bool| {
-            pit_pic(level);
-            pit_apic(level);
-        }));
+        pit.attach_irq0(Box::new(dual_irq_line(pic, ioapic, IRQ_PIT)));
         bus.add_pit(pit)?;
 
         bus.add_pic(pic)?;
@@ -406,6 +394,130 @@ impl DeviceBus {
         let pcie = bus.add_pcie(PcieRootComplex::new(DEFAULT_ECAM_BASE))?;
         Ok((bus, pcie))
     }
+
+    /// Assemble a **complete** transparent standard PC in one call: every legacy
+    /// device a guest touches at boot, mounted at its canonical address and with
+    /// its interrupt line teed into **both** the dual-8259 PIC and the I/O APIC
+    /// (the [`standard_pc_with_dual_irq`](Self::standard_pc_with_dual_irq) model),
+    /// so the boot-time PIC→APIC switchover is seamless on every line — not just
+    /// the PIT and COM1.
+    ///
+    /// On top of [`standard_pc_with_dual_irq`](Self::standard_pc_with_dual_irq)'s
+    /// COM1 (`IRQ_COM1`) and PIT (`IRQ_PIT`), this also mounts and IRQ-wires the
+    /// devices the earlier dual-IRQ factory left out:
+    /// - the **MC146818 RTC/CMOS** (`0x70`/`0x71`, `RTC_IRQ` = 8), its wall clock
+    ///   seeded from `rtc_unix_secs` (seconds since the Unix epoch);
+    /// - the **i8042 PS/2 controller** (`0x60`/`0x64`), keyboard on
+    ///   `PS2_KBD_IRQ` = 1 and mouse on `PS2_MOUSE_IRQ` = 12.
+    ///
+    /// The PIT is mounted as a [`SharedPit`] (not a boxed `Pit`) so the run loop /
+    /// timer thread can `tick` it after assembly; the RTC and PS/2 are likewise
+    /// returned as their shared handles so the caller can advance the clock
+    /// (`tick_second`) and inject host input. Both interrupt controllers are
+    /// created here (`vcpu_count` LAPICs) and returned, along with the
+    /// [`SharedRootComplex`], in a [`StandardPc`] bundle — the single entry point
+    /// the KVM run loop binds to.
+    ///
+    /// The APIC side of every line goes through
+    /// [`SharedInterruptController::isa_line`], which applies the MADT
+    /// interrupt-source overrides (the PIT lands on GSI 2); the PIC side takes the
+    /// bare ISA IRQ, exactly as a real PC/AT wires each line to both controllers.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if any two devices' ranges
+    /// overlap (they do not at these canonical addresses, so this is effectively
+    /// infallible for the default layout).
+    pub fn standard_pc_complete(
+        serial_output: SerialOutput,
+        rtc_unix_secs: u64,
+        vcpu_count: u8,
+    ) -> Result<StandardPc, enlil_devices::bus::BusError> {
+        let pic = SharedPic::new();
+        let ioapic = SharedInterruptController::new(vcpu_count);
+        let rtc = SharedRtc::new(RtcTime::from_unix(rtc_unix_secs));
+        let ps2 = SharedI8042::new();
+        let pit = SharedPit::new();
+
+        let mut bus = Self::new();
+
+        // COM1 16550 (IRQ4).
+        let mut com1 = SerialPort::com1(serial_output);
+        com1.attach_irq_line(Box::new(dual_irq_line(&pic, &ioapic, IRQ_COM1)));
+        bus.add_serial(com1)?;
+
+        // 8254 PIT channel-0 (IRQ0 → GSI 2 on the APIC path). Shared so the
+        // timer thread can tick it once mounted.
+        pit.with(|p| p.attach_irq0(Box::new(dual_irq_line(&pic, &ioapic, IRQ_PIT))));
+        bus.add_pit_shared(&pit)?;
+
+        // MC146818 RTC/CMOS (IRQ8).
+        rtc.with(|r| r.attach_irq(Box::new(dual_irq_line(&pic, &ioapic, RTC_IRQ))));
+        bus.add_rtc(&rtc)?;
+
+        // i8042 PS/2: keyboard (IRQ1) + mouse (IRQ12).
+        ps2.attach_kbd_irq(Box::new(dual_irq_line(&pic, &ioapic, PS2_KBD_IRQ)));
+        ps2.attach_mouse_irq(Box::new(dual_irq_line(&pic, &ioapic, PS2_MOUSE_IRQ)));
+        bus.add_ps2(&ps2)?;
+
+        // Both interrupt-controller front-ends.
+        bus.add_pic(&pic)?;
+        bus.add_ioapic(&ioapic)?;
+
+        // PCIe config space (legacy CAM + ECAM), seeded with a host bridge.
+        let pcie = bus.add_pcie(PcieRootComplex::new(DEFAULT_ECAM_BASE))?;
+
+        Ok(StandardPc {
+            bus,
+            pcie,
+            pic,
+            ioapic,
+            rtc,
+            ps2,
+            pit,
+        })
+    }
+}
+
+/// Build one device-IRQ sink that drives **both** interrupt controllers from a
+/// single line, as a real PC/AT wires each ISA IRQ to both the 8259 and the I/O
+/// APIC. The PIC takes the bare ISA `irq`; the APIC side goes through
+/// [`SharedInterruptController::isa_line`], which applies the MADT
+/// interrupt-source overrides (e.g. IRQ0 → GSI 2). The returned closure is
+/// `Fn(bool) + Send`, so it satisfies both crate-local `IrqLine` traits (the one
+/// in [`crate::serial`] and `enlil_devices`') via their blanket impls and can be
+/// boxed for either device's `attach_*` method.
+fn dual_irq_line(
+    pic: &SharedPic,
+    ioapic: &SharedInterruptController,
+    irq: u8,
+) -> impl Fn(bool) + Send + use<> {
+    let pic_sink = pic.line(irq);
+    let apic_sink = ioapic.isa_line(irq);
+    move |level: bool| {
+        pic_sink(level);
+        apic_sink(level);
+    }
+}
+
+/// A fully-assembled transparent standard PC: the [`DeviceBus`] with every legacy
+/// device mounted and IRQ-wired, plus the caller-owned shared handles for the
+/// pieces that must be driven or inspected from outside the bus. Produced by
+/// [`DeviceBus::standard_pc_complete`].
+pub struct StandardPc {
+    /// The assembled device bus (the [`VmExitHandler`] the backend binds to).
+    pub bus: DeviceBus,
+    /// The `PCIe` root complex, for attaching further PCI devices post-assembly.
+    pub pcie: SharedRootComplex,
+    /// The dual-8259 PIC — read the pending vector / acknowledge INTA from here.
+    pub pic: SharedPic,
+    /// The I/O APIC + LAPIC complex — read per-vCPU pending vectors from here.
+    pub ioapic: SharedInterruptController,
+    /// The MC146818 RTC/CMOS — advance the wall clock (`tick_second`) from here.
+    pub rtc: SharedRtc,
+    /// The i8042 PS/2 controller — inject host keyboard/mouse input from here.
+    pub ps2: SharedI8042,
+    /// The 8254 PIT — `tick` channel-0 from the run loop / timer thread.
+    pub pit: SharedPit,
 }
 
 /// Legacy ISA IRQ line for the 8254 PIT channel-0 (system timer).
@@ -992,6 +1104,77 @@ mod tests {
         // through GSI 8's RTE into LAPIC 0.
         assert!(rtc.with(enlil_devices::timer::Rtc146818::tick_second));
         assert_eq!(pic.with(|c| c.pending_vector(0)), Some(0x38));
+    }
+
+    #[test]
+    fn standard_pc_complete_mounts_every_legacy_device_and_dual_wires_irqs() {
+        use super::StandardPc;
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::interrupt::{MASTER_CMD, MASTER_DATA, SLAVE_CMD, SLAVE_DATA};
+
+        // 2026-06-07T13:14:15Z, one vCPU.
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            1_780_838_055,
+            1,
+        )
+        .unwrap();
+        let StandardPc {
+            mut bus,
+            pic,
+            ioapic,
+            ps2,
+            ..
+        } = pc;
+
+        // Every legacy device a guest touches at boot is mounted at its canonical
+        // address: COM1, PIT, RTC, PS/2 data+cmd, both 8259s, the ELCR, and the
+        // PCIe CAM ports — plus the I/O APIC MMIO page.
+        for port in [0x3F8u16, 0x40, 0x70, 0x60, 0x64, 0x20, 0xA0, 0x4D0, 0xCF8] {
+            assert!(
+                bus.pio.is_mapped(port),
+                "PIO port {port:#x} should be mapped"
+            );
+        }
+        assert!(
+            bus.mmio.is_mapped(0xFEC0_0000),
+            "I/O APIC page should be mapped"
+        );
+        // The PC-speaker / NMI status port is deliberately left open-bus.
+        assert!(!bus.pio.is_mapped(0x61), "0x61 must stay open-bus");
+
+        // Bring up LAPIC 0 and program the PC/AT 8259 layout (master base 0x20),
+        // then unmask every line on both chips.
+        ioapic.with(|c| c.lapics[0].write_register(0x0F0, 0x1FF));
+        for (port, val) in [
+            (MASTER_CMD, 0x11),
+            (MASTER_DATA, 0x20),
+            (MASTER_DATA, 0x04),
+            (MASTER_DATA, 0x01),
+            (SLAVE_CMD, 0x11),
+            (SLAVE_DATA, 0x28),
+            (SLAVE_DATA, 0x02),
+            (SLAVE_DATA, 0x01),
+            (MASTER_DATA, 0x00),
+            (SLAVE_DATA, 0x00),
+        ] {
+            VmExitHandler::io_out(&mut bus, port, &[val]);
+        }
+
+        // Program GSI 1's RTE (keyboard) through the aperture: vector 0x31 ->
+        // LAPIC 0. REDTBL base 0x10 + 1*2 = 0x12 (low), 0x13 (high).
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0000, &0x12u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0010, &0x31u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0000, &0x13u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0010, &0u32.to_le_bytes());
+
+        // A host keypress asserts the single IRQ1 line, which the factory tees
+        // into *both* controllers (the per-line helper every legacy device uses).
+        ps2.inject_key(0x1E);
+        // The 8259 master has it pending at vector base + 1 = 0x21...
+        assert_eq!(pic.with(|p| p.pending_vector()), Some(0x21));
+        // ...and the I/O APIC routed it to LAPIC 0 at the RTE's vector 0x31.
+        assert_eq!(ioapic.with(|c| c.pending_vector(0)), Some(0x31));
     }
 
     #[test]
