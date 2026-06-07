@@ -141,11 +141,14 @@ impl FadtBuilder {
             smi_command: 0xB2,
             acpi_enable: 0xA0,
             acpi_disable: 0xA1,
-            pm1a_event_block: 0x600,
-            pm1a_control_block: 0x604,
-            pm_timer_block: 0x608,
+            // The PM register-block ports are owned by the device models that
+            // implement them, so the table we hand the guest and the hardware the
+            // bus decodes can never drift apart (cross-checked by a test).
+            pm1a_event_block: u32::from(crate::chipset::PM1_EVT_PORT),
+            pm1a_control_block: u32::from(crate::chipset::PM1_CNT_PORT),
+            pm_timer_block: u32::from(crate::timer::PM_TIMER_PORT),
             pm_timer_length: 4,
-            gpe0_block: 0x620,
+            gpe0_block: u32::from(crate::chipset::GPE0_PORT),
             gpe0_length: 16,
             // NOTE: deliberately *not* HW_REDUCED_ACPI. Enlil presents a
             // transparent full-hardware PC — it advertises legacy devices
@@ -412,5 +415,22 @@ mod tests {
         // HW_REDUCED_ACPI (they are mutually exclusive in practice).
         let boot = u16::from_le_bytes(fadt[109..111].try_into().unwrap());
         assert_ne!(boot & boot_flags::LEGACY_DEVICES, 0);
+    }
+
+    #[test]
+    fn pm_block_ports_match_the_device_models_that_implement_them() {
+        // The FADT must advertise the same ports the bus actually decodes, or the
+        // guest looks for the PM hardware in the wrong place. Derive the table's
+        // ports from the device models' canonical constants and assert they agree.
+        let fadt = FadtBuilder::new(0).build();
+        let pm1a_evt = u32::from_le_bytes(fadt[56..60].try_into().unwrap());
+        let pm1a_cnt = u32::from_le_bytes(fadt[64..68].try_into().unwrap());
+        let pm_tmr = u32::from_le_bytes(fadt[76..80].try_into().unwrap());
+        let gpe0 = u32::from_le_bytes(fadt[80..84].try_into().unwrap());
+
+        assert_eq!(pm1a_evt, u32::from(crate::chipset::PM1_EVT_PORT));
+        assert_eq!(pm1a_cnt, u32::from(crate::chipset::PM1_CNT_PORT));
+        assert_eq!(pm_tmr, u32::from(crate::timer::PM_TIMER_PORT));
+        assert_eq!(gpe0, u32::from(crate::chipset::GPE0_PORT));
     }
 }
