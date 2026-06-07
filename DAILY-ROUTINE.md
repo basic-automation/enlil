@@ -25,13 +25,19 @@ move some roadmap phase toward that end state.
 
 ---
 
-## Session model — work the full 3–4 hours, many increments per run
+## Session model — work the full 3–4 wall-clock hours, many increments per run
 
-A run is **not** one task. Budget **3–4 hours** of wall-clock work and land **as many complete,
-tested increments as possible** in that window — typically several, not one. Each increment is
-one trip through steps 1–6 below; when you finish one, **loop straight back to step 1** and pick
-the next item. Keep going until the time budget is spent or you genuinely run out of tractable,
-unblocked work.
+A run is **not** one task, and it is **not** a fixed number of increments. The stopping
+criterion is **elapsed wall-clock time: keep working until 3–4 hours have actually passed.**
+Note the wall-clock time when you start; check it as you go and treat ~3–4 hours of real elapsed
+time as the budget. **Do not stop after 3–4 increments (or any other count) — a handful of
+commits is not "done" if only an hour has elapsed.** Land **as many complete, tested increments
+as possible** in that window — typically many, not a few. Each increment is one trip through
+steps 1–6 below; when you finish one, **loop straight back to step 1** and pick the next item.
+Keep going until the wall-clock budget is genuinely spent, or you truly run out of tractable,
+unblocked work (document the latter explicitly in `PROGRESS.md` rather than stopping early on a
+hunch). When one roadmap area is exhausted, move to the next viable item anywhere on the
+roadmap rather than ending the run.
 
 The discipline that makes this breadth safe is that **every increment is independently green and
 committed before you start the next** (step 6). A run is therefore a *sequence* of small,
@@ -85,11 +91,13 @@ Do these in order, looping for the whole session:
   message format `routine(phase-N): <what you did>`, **one commit per complete increment**.
   **Only commit work that builds and passes the tests you could run** — if an increment isn't
   green, commit nothing for it and record the blocker in `PROGRESS.md`.
-- **Then loop.** If time remains in the 3–4 hour budget and there's a tractable, unblocked next
-  item, go back to step 1 and build it as a *new* commit on the same branch. Don't stop after
-  one. Stop only when the budget is spent, every remaining item is blocked, or the only work
-  left is something you can't finish and test cleanly in the time remaining (in which case leave
-  it for tomorrow rather than committing it half-done).
+- **Then loop.** As long as the **wall-clock budget (3–4 hours of real elapsed time) has not run
+  out** and there's a tractable, unblocked next item, go back to step 1 and build it as a *new*
+  commit on the same branch. Don't stop after a few increments — finishing the PIC (or any one
+  feature) is not the end of the run if only an hour has passed; pick the next roadmap item and
+  keep going. Stop only when ~3–4 hours have actually elapsed, every remaining item is blocked,
+  or the only work left is something you can't finish and test cleanly in the time remaining (in
+  which case leave it for tomorrow rather than committing it half-done).
 - **Hand off once, at the end.** Append a single dated `PROGRESS.md` entry covering the whole
   session: each increment landed (with its commit) and the research that informed it, exact test
   results, and the recommended next step(s) for tomorrow. This file + `git log` are how the next
@@ -98,10 +106,13 @@ Do these in order, looping for the whole session:
 ---
 
 ### Guardrails
-- **Many increments per run, but each one complete.** Fill the 3–4 hour budget with as many
-  tested increments as you can — yet depth *per increment* still wins: a clean, documented trail
-  of small green commits beats a pile of half-finished features. Never stretch a single
-  increment across the "still broken" line just to claim another task.
+- **The budget is wall-clock time, not an increment count.** Fill the full **3–4 hours of real
+  elapsed time** with as many tested increments as you can — measure the budget in hours, not in
+  number of commits or "sessions," and don't wrap up after 3–4 increments when time remains.
+  Depth *per increment* still wins: a clean, documented trail of small green commits beats a pile
+  of half-finished features, and you never stretch a single increment across the "still broken"
+  line just to claim another task. But "I did a few good increments" is **not** a reason to
+  stop — only the clock or a genuine lack of unblocked work is.
 - **Never leave `master` unbuildable.** No green, no commit — enforced per increment, so a late
   failure never poisons the earlier good commits already on the branch.
 - **Keep the repo clean.** Put throwaway scripts/output in a git-ignored `scratch/` dir,
