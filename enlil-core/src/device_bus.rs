@@ -16,7 +16,7 @@
 use crate::kvm_backend::VmExitHandler;
 use crate::serial::{SerialOutput, SerialPort};
 use enlil_devices::bus::{MmioBus, MmioDevice, PioBus, PioDevice};
-use enlil_devices::chipset::{SharedAcpiPm1Block, SystemControlPortA};
+use enlil_devices::chipset::{Gpe0Block, SharedAcpiPm1Block, SystemControlPortA};
 use enlil_devices::interrupt::{IoApicMmio, SharedInterruptController, SharedPic};
 use enlil_devices::pcie::{
     vendors, EcamSpace, PciBdf, PciConfigIo, PcieRootComplex, SharedRootComplex,
@@ -399,6 +399,19 @@ impl DeviceBus {
         self.add_pio(Box::new(pm1.port()))
     }
 
+    /// Mount the **ACPI GPE0 block** ([`Gpe0Block`]) on the PIO bus over
+    /// `0x620`..`0x62F` — the `GPE0_BLK` the emitted FADT advertises. A guest's
+    /// ACPICA reads and clears these General-Purpose Event registers during ACPI
+    /// init; mounting the block makes its status read back clear (no phantom
+    /// events) instead of open-bus `0xFF`.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if the block overlaps an
+    /// already-registered device.
+    pub fn add_gpe0(&mut self) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_pio(Box::new(Gpe0Block::new()))
+    }
+
     /// Like [`standard_pc`](Self::standard_pc), but wires the legacy devices'
     /// interrupt lines into the dual-8259 `pic` (the early-boot interrupt
     /// controller) and mounts its four ports: the 8254 PIT's channel-0 line
@@ -575,6 +588,9 @@ impl DeviceBus {
         // path. Shared so the run loop can poll the S5 sleep request.
         let pm1 = SharedAcpiPm1Block::new();
         bus.add_acpi_pm1(&pm1)?;
+
+        // ACPI GPE0 block (0x620) — keep its status quiet during ACPI init.
+        bus.add_gpe0()?;
 
         // PCIe config space (legacy CAM + ECAM), seeded with a host bridge.
         let pcie = bus.add_pcie(PcieRootComplex::new(DEFAULT_ECAM_BASE))?;
@@ -1252,12 +1268,12 @@ mod tests {
 
         // Every legacy device a guest touches at boot is mounted at its canonical
         // address: COM1, PIT, System Control Port B (0x61), RTC, PS/2 data+cmd,
-        // System Control Port A (0x92), the ACPI PM1 block (0x600/0x604) and PM
-        // timer (0x608), both 8259s, the ELCR, and the PCIe CAM ports — plus the
-        // I/O APIC page.
+        // System Control Port A (0x92), the ACPI PM1 block (0x600/0x604), PM timer
+        // (0x608) and GPE0 block (0x620), both 8259s, the ELCR, and the PCIe CAM
+        // ports — plus the I/O APIC page.
         for port in [
-            0x3F8u16, 0x40, 0x61, 0x70, 0x60, 0x64, 0x92, 0x600, 0x604, 0x608, 0x20, 0xA0, 0x4D0,
-            0xCF8,
+            0x3F8u16, 0x40, 0x61, 0x70, 0x60, 0x64, 0x92, 0x600, 0x604, 0x608, 0x620, 0x20, 0xA0,
+            0x4D0, 0xCF8,
         ] {
             assert!(
                 bus.pio.is_mapped(port),

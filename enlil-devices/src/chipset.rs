@@ -322,11 +322,104 @@ impl PioDevice for Pm1Port {
     }
 }
 
+/// I/O port of the **`GPE0` block** (`GPE0_BLK`), the General-Purpose Event
+/// register block the FADT advertises (length 16 here: 8 status bytes followed by
+/// 8 enable bytes).
+pub const GPE0_PORT: u16 = 0x620;
+
+/// Number of status (and, separately, enable) bytes in the `GPE0` block — half of
+/// the 16-byte block length the FADT advertises.
+const GPE0_HALF: u16 = 8;
+
+/// One-past-the-end of the `GPE0` block (`0x620`..`0x630`).
+const GPE0_END: u16 = GPE0_PORT + 2 * GPE0_HALF;
+
+/// The **ACPI General-Purpose Event 0 block** (`GPE0_BLK`) as a bus [`PioDevice`].
+///
+/// A guest's ACPICA reads and clears these registers during ACPI init. The block
+/// is two byte arrays: a write-1-to-clear **status** array (`0x620`..`0x627`) and
+/// a read/write **enable** array (`0x628`..`0x62F`). Modelling it matters even
+/// with no GPEs wired: left as open bus the **status** bytes read back `0xFF`, so
+/// the OS would see every GPE asserted and spin trying to dispatch handlers for
+/// events that never happened. Here the status starts clear (no event pending)
+/// and the enable array round-trips, so ACPI init is quiet. The host raises a
+/// real event with [`raise_gpe`](Self::raise_gpe); generating the SCI from it is a
+/// run-loop concern and is deferred.
+#[derive(Debug, Clone, Default)]
+pub struct Gpe0Block {
+    /// `GPE0_STS` — write-1-to-clear status bits, one bit per GPE.
+    status: [u8; GPE0_HALF as usize],
+    /// `GPE0_EN` — per-GPE interrupt-enable bits.
+    enable: [u8; GPE0_HALF as usize],
+}
+
+impl Gpe0Block {
+    /// A new block with no events pending and all GPEs disabled.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            status: [0; GPE0_HALF as usize],
+            enable: [0; GPE0_HALF as usize],
+        }
+    }
+
+    /// Assert general-purpose event number `gpe` (sets its status bit), as a
+    /// host-side wake/notify source would. The run loop later turns an asserted,
+    /// enabled GPE into an SCI.
+    pub const fn raise_gpe(&mut self, gpe: usize) {
+        let byte = gpe / 8;
+        if byte < self.status.len() {
+            self.status[byte] |= 1 << (gpe % 8);
+        }
+    }
+}
+
+impl PioDevice for Gpe0Block {
+    fn pio_read(&mut self, port: u16, _size: u8) -> u32 {
+        let (arr, base) = if port < GPE0_PORT + GPE0_HALF {
+            (&self.status, GPE0_PORT)
+        } else {
+            (&self.enable, GPE0_PORT + GPE0_HALF)
+        };
+        let off = usize::from(port - base);
+        // Pack up to four bytes from the array; the bus keeps the low `size`.
+        let mut val = 0u32;
+        let mut i = 0;
+        while i < 4 && off + i < arr.len() {
+            val |= u32::from(arr[off + i]) << (i * 8);
+            i += 1;
+        }
+        val
+    }
+
+    fn pio_write(&mut self, port: u16, size: u8, data: u32) {
+        let count = if size == 0 { 1 } else { size };
+        for i in 0..u16::from(count) {
+            let p = port + i;
+            if p >= GPE0_END {
+                break;
+            }
+            let byte = u8_of(data >> (i * 8));
+            if p < GPE0_PORT + GPE0_HALF {
+                // Status: write-1-to-clear.
+                self.status[usize::from(p - GPE0_PORT)] &= !byte;
+            } else {
+                // Enable: stored.
+                self.enable[usize::from(p - (GPE0_PORT + GPE0_HALF))] = byte;
+            }
+        }
+    }
+
+    fn port_range(&self) -> (u16, u16) {
+        (GPE0_PORT, GPE0_END)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        A20_GATE, AcpiPm1Block, PM1_CNT_PORT, PM1_EVT_PORT, PORT_A, SharedAcpiPm1Block,
-        SystemControlPortA,
+        A20_GATE, AcpiPm1Block, GPE0_PORT, Gpe0Block, PM1_CNT_PORT, PM1_EVT_PORT, PORT_A,
+        SharedAcpiPm1Block, SystemControlPortA,
     };
     use crate::bus::PioDevice;
 
@@ -427,6 +520,32 @@ mod tests {
         // A 32-bit read of the event block sees enable in the high half.
         let evt = pm1.pio_read(PM1_EVT_PORT, 4);
         assert_eq!(evt >> 16, u32::from(1u16 << 8));
+    }
+
+    #[test]
+    fn gpe0_claims_the_16_byte_block_and_starts_quiet() {
+        let mut gpe = Gpe0Block::new();
+        assert_eq!(gpe.port_range(), (0x620, 0x630));
+        // Status reads back 0 (no event pending) rather than open-bus 0xFF, so
+        // ACPI init does not see phantom GPEs.
+        for off in 0..8u16 {
+            assert_eq!(gpe.pio_read(GPE0_PORT + off, 1) & 0xFF, 0);
+        }
+    }
+
+    #[test]
+    fn gpe0_status_is_write_one_to_clear_and_enable_round_trips() {
+        let mut gpe = Gpe0Block::new();
+        // Raise GPE 9 (status byte 1, bit 1) as a host event would.
+        gpe.raise_gpe(9);
+        assert_eq!(gpe.pio_read(GPE0_PORT + 1, 1) & 0xFF, 1 << 1);
+        // Write-1-to-clear it through the status port.
+        gpe.pio_write(GPE0_PORT + 1, 1, 1 << 1);
+        assert_eq!(gpe.pio_read(GPE0_PORT + 1, 1) & 0xFF, 0);
+
+        // The enable array (second half) stores what the guest writes.
+        gpe.pio_write(GPE0_PORT + 8, 1, 0xAA);
+        assert_eq!(gpe.pio_read(GPE0_PORT + 8, 1) & 0xFF, 0xAA);
     }
 
     #[test]
