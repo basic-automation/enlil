@@ -16,7 +16,7 @@
 use crate::kvm_backend::VmExitHandler;
 use crate::serial::{SerialOutput, SerialPort};
 use enlil_devices::bus::{MmioBus, MmioDevice, PioBus, PioDevice};
-use enlil_devices::chipset::SystemControlPortA;
+use enlil_devices::chipset::{SharedAcpiPm1Block, SystemControlPortA};
 use enlil_devices::interrupt::{IoApicMmio, SharedInterruptController, SharedPic};
 use enlil_devices::pcie::{
     vendors, EcamSpace, PciBdf, PciConfigIo, PcieRootComplex, SharedRootComplex,
@@ -382,6 +382,23 @@ impl DeviceBus {
         self.add_pio(Box::new(pmt.port()))
     }
 
+    /// Mount the **ACPI PM1a event/control block** ([`SharedAcpiPm1Block`]) on the
+    /// PIO bus over `0x600`..`0x605` — the `PM1a_EVT_BLK`/`PM1a_CNT_BLK` ports the
+    /// emitted FADT advertises. This is how a guest OS enters a sleep state; most
+    /// importantly, a write of `SLP_TYP | SLP_EN` to the control register is the
+    /// **shutdown** path. The caller owns `pm1` so the run loop can poll
+    /// `take_sleep` and tear the guest down (and press a virtual power button).
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if the block overlaps an
+    /// already-registered device.
+    pub fn add_acpi_pm1(
+        &mut self,
+        pm1: &SharedAcpiPm1Block,
+    ) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_pio(Box::new(pm1.port()))
+    }
+
     /// Like [`standard_pc`](Self::standard_pc), but wires the legacy devices'
     /// interrupt lines into the dual-8259 `pic` (the early-boot interrupt
     /// controller) and mounts its four ports: the 8254 PIT's channel-0 line
@@ -554,6 +571,11 @@ impl DeviceBus {
         let pm_timer = SharedAcpiPmTimer::new();
         bus.add_acpi_pm_timer(&pm_timer)?;
 
+        // ACPI PM1a event/control block (0x600/0x604) — the OS's sleep/shutdown
+        // path. Shared so the run loop can poll the S5 sleep request.
+        let pm1 = SharedAcpiPm1Block::new();
+        bus.add_acpi_pm1(&pm1)?;
+
         // PCIe config space (legacy CAM + ECAM), seeded with a host bridge.
         let pcie = bus.add_pcie(PcieRootComplex::new(DEFAULT_ECAM_BASE))?;
 
@@ -567,6 +589,7 @@ impl DeviceBus {
             pit,
             hpet,
             pm_timer,
+            pm1,
         })
     }
 }
@@ -615,6 +638,9 @@ pub struct StandardPc {
     pub hpet: SharedHpet,
     /// The ACPI PM timer — `advance` the counter from the run loop / timer thread.
     pub pm_timer: SharedAcpiPmTimer,
+    /// The ACPI PM1a block — poll `take_sleep` from the run loop to handle
+    /// guest-initiated shutdown / sleep.
+    pub pm1: SharedAcpiPm1Block,
 }
 
 /// Legacy ISA IRQ line for the 8254 PIT channel-0 (system timer).
@@ -1226,10 +1252,12 @@ mod tests {
 
         // Every legacy device a guest touches at boot is mounted at its canonical
         // address: COM1, PIT, System Control Port B (0x61), RTC, PS/2 data+cmd,
-        // System Control Port A (0x92), the ACPI PM timer (0x608), both 8259s, the
-        // ELCR, and the PCIe CAM ports — plus the I/O APIC page.
+        // System Control Port A (0x92), the ACPI PM1 block (0x600/0x604) and PM
+        // timer (0x608), both 8259s, the ELCR, and the PCIe CAM ports — plus the
+        // I/O APIC page.
         for port in [
-            0x3F8u16, 0x40, 0x61, 0x70, 0x60, 0x64, 0x92, 0x608, 0x20, 0xA0, 0x4D0, 0xCF8,
+            0x3F8u16, 0x40, 0x61, 0x70, 0x60, 0x64, 0x92, 0x600, 0x604, 0x608, 0x20, 0xA0, 0x4D0,
+            0xCF8,
         ] {
             assert!(
                 bus.pio.is_mapped(port),

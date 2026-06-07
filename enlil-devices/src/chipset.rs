@@ -2,12 +2,16 @@
 //!
 //! These are the small fixed-function I/O ports a PC chipset (the PIIX/ICH
 //! south-bridge, historically the PS/2 controller's "port A") exposes for
-//! platform control — distinct from device register files like the PIT or RTC.
-//! Today this is **System Control Port A** (`0x92`): the fast-A20 / fast-reset
-//! register every x86 boot path touches.
+//! platform control — distinct from device register files like the PIT or RTC:
+//! - **System Control Port A** (`0x92`): the fast-A20 / fast-reset register every
+//!   x86 boot path touches ([`SystemControlPortA`]).
+//! - **ACPI `PM1a` event/control block** (`0x600`/`0x604`): the registers an OS
+//!   uses to enter a sleep state — most importantly `S5` soft-off, i.e. shutdown
+//!   ([`AcpiPm1Block`]).
 
 use crate::bus::PioDevice;
-use crate::truncate::u8_of;
+use crate::truncate::{u8_of, u16_of};
+use std::sync::{Arc, Mutex};
 
 /// The port [`SystemControlPortA`] claims.
 pub const PORT_A: u16 = 0x92;
@@ -94,9 +98,236 @@ impl PioDevice for SystemControlPortA {
     }
 }
 
+/// I/O port of the **`PM1a` event block** (`PM1a_EVT_BLK`).
+///
+/// A 16-bit status register (write-1-to-clear) at `0x600` followed by a 16-bit
+/// enable register at `0x602`. Matches the address + 4-byte length the emitted
+/// FADT advertises.
+pub const PM1_EVT_PORT: u16 = 0x600;
+
+/// I/O port of the **`PM1a` control block** (`PM1a_CNT_BLK`).
+///
+/// A 16-bit control register at `0x604` (2-byte length per the FADT) carrying
+/// `SCI_EN` and the `SLP_TYP`/`SLP_EN` sleep-transition fields.
+pub const PM1_CNT_PORT: u16 = 0x604;
+
+/// One-past-the-end of the contiguous `PM1a` register block (`0x600`..`0x606`).
+const PM1_BLOCK_END: u16 = PM1_CNT_PORT + 2;
+
+/// `PWRBTN_STS`/`PWRBTN_EN` — the power-button event (bit 8).
+const PM1_PWRBTN: u16 = 1 << 8;
+
+// PM1 control bits.
+/// `SCI_EN` (bit 0): set once the OS has switched the platform into ACPI mode.
+const PM1_CNT_SCI_EN: u16 = 1 << 0;
+/// `SLP_EN` (bit 13): writing 1 commits the `SLP_TYP` sleep transition.
+const PM1_CNT_SLP_EN: u16 = 1 << 13;
+/// `SLP_TYP` (bits 10-12): which sleep state to enter (the DSDT's `_Sx` value).
+const PM1_CNT_SLP_TYP_MASK: u16 = 0x7 << 10;
+/// `SLP_TYP` field shift.
+const PM1_CNT_SLP_TYP_SHIFT: u16 = 10;
+/// Bits the guest can store in the control register (everything but the
+/// write-only `SLP_EN` edge and the `SLP_TYP` selector, which we capture).
+const PM1_CNT_STORED_MASK: u16 = !(PM1_CNT_SLP_EN | PM1_CNT_SLP_TYP_MASK);
+
+/// The **ACPI `PM1a` event + control block** as a bus [`PioDevice`].
+///
+/// This is the register set an ACPI OS drives to change the system power state
+/// (it spans `0x600`..`0x606`). The one that matters most for a usable guest is
+/// **shutdown**: the OS writes `SLP_TYP` (the `_S5` value) together with `SLP_EN`
+/// to the control register (`0x604`), which on real hardware powers the machine
+/// off. We capture that write as a
+/// [sleep request](Self::take_sleep) for the run loop to act on (tear the guest
+/// down), rather than letting the access fall into open bus where a shutdown
+/// would simply hang.
+///
+/// The event registers are modelled faithfully enough for an OS to probe them:
+/// `PM1a_STS` (`0x600`) is write-1-to-clear, `PM1a_EN` (`0x602`) is read/write,
+/// and the host can raise the power-button event ([`press_power_button`]) so a
+/// guest can shut down in response to a virtual power button. Generating the SCI
+/// interrupt itself is a run-loop concern (it needs the interrupt controller) and
+/// is deferred.
+///
+/// [`press_power_button`]: Self::press_power_button
+#[derive(Debug, Clone, Default)]
+pub struct AcpiPm1Block {
+    /// `PM1a_STS` (write-1-to-clear status bits).
+    status: u16,
+    /// `PM1a_EN` (interrupt-enable bits).
+    enable: u16,
+    /// `PM1a_CNT` stored bits (`SCI_EN`, `BM_RLD`, …; not `SLP_EN`/`SLP_TYP`).
+    control: u16,
+    /// The `SLP_TYP` captured when the guest last committed a sleep transition
+    /// (`SLP_EN` written 1), pending consumption by the run loop.
+    sleep_request: Option<u8>,
+}
+
+impl AcpiPm1Block {
+    /// A new block with all registers clear and no pending sleep.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            status: 0,
+            enable: 0,
+            control: 0,
+            sleep_request: None,
+        }
+    }
+
+    /// Whether the OS has switched the platform into ACPI mode (`SCI_EN`).
+    #[must_use]
+    pub const fn sci_enabled(&self) -> bool {
+        self.control & PM1_CNT_SCI_EN != 0
+    }
+
+    /// Raise the power-button status bit, as if the host pressed the (virtual)
+    /// power button. An ACPI OS with `PWRBTN_EN` set treats this as a request to
+    /// shut down, and responds by writing the S5 sleep transition.
+    pub const fn press_power_button(&mut self) {
+        self.status |= PM1_PWRBTN;
+    }
+
+    /// Consume a pending sleep transition: returns the `SLP_TYP` value the guest
+    /// committed (exactly once) so the run loop can enter that sleep state — for
+    /// the DSDT's `_S5` value, power the guest off.
+    pub const fn take_sleep(&mut self) -> Option<u8> {
+        let pending = self.sleep_request;
+        self.sleep_request = None;
+        pending
+    }
+
+    /// The 32-bit view of the event block: `PM1a_STS` in the low half, `PM1a_EN`
+    /// in the high half (the block is 4 bytes, so a 32-bit access spans both).
+    const fn evt_dword(&self) -> u32 {
+        (self.status as u32) | ((self.enable as u32) << 16)
+    }
+
+    /// Apply a write to `PM1a_STS` (write-1-to-clear).
+    const fn write_status(&mut self, value: u16) {
+        self.status &= !value;
+    }
+
+    /// Apply a write to `PM1a_CNT`: store the persistent bits, and if `SLP_EN` is
+    /// set, capture `SLP_TYP` as a pending sleep request.
+    fn write_control(&mut self, value: u16) {
+        if value & PM1_CNT_SLP_EN != 0 {
+            self.sleep_request = Some(u8_of(
+                (value & PM1_CNT_SLP_TYP_MASK) >> PM1_CNT_SLP_TYP_SHIFT,
+            ));
+        }
+        self.control = value & PM1_CNT_STORED_MASK;
+    }
+}
+
+impl PioDevice for AcpiPm1Block {
+    fn pio_read(&mut self, port: u16, _size: u8) -> u32 {
+        match port {
+            // Event block: a 32-bit window over status (low) + enable (high).
+            PM1_EVT_PORT..PM1_CNT_PORT => {
+                let off = u32::from(port - PM1_EVT_PORT);
+                self.evt_dword() >> (off * 8)
+            }
+            // Control register (SLP_EN reads back 0 — it is write-only).
+            PM1_CNT_PORT..PM1_BLOCK_END => {
+                let off = u32::from(port - PM1_CNT_PORT);
+                u32::from(self.control) >> (off * 8)
+            }
+            _ => 0xFFFF_FFFF,
+        }
+    }
+
+    fn pio_write(&mut self, port: u16, size: u8, data: u32) {
+        match port {
+            // Status (0x600) — and, for a 32-bit access, the enable in the high
+            // half. A 16-bit write touches only the status.
+            PM1_EVT_PORT => {
+                self.write_status(u16_of(data));
+                if size >= 4 {
+                    self.enable = u16_of(data >> 16);
+                }
+            }
+            // Enable register (0x602).
+            0x602 => self.enable = u16_of(data),
+            // Control register (0x604).
+            PM1_CNT_PORT => self.write_control(u16_of(data)),
+            _ => {}
+        }
+    }
+
+    fn port_range(&self) -> (u16, u16) {
+        (PM1_EVT_PORT, PM1_BLOCK_END)
+    }
+}
+
+/// A shared [`AcpiPm1Block`] behind an `Arc<Mutex<…>>`, mirroring the other shared
+/// devices.
+///
+/// The [`Pm1Port`] bus adapter handles the guest's register accesses while the
+/// run loop holds a clone to poll [`take_sleep`](Self::take_sleep) (and act on a
+/// shutdown) and to inject a virtual power-button press.
+#[derive(Clone, Default)]
+pub struct SharedAcpiPm1Block(Arc<Mutex<AcpiPm1Block>>);
+
+impl SharedAcpiPm1Block {
+    /// Wrap a fresh PM1 block.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Arc::new(Mutex::new(AcpiPm1Block::new())))
+    }
+
+    /// Run `f` with exclusive access to the block.
+    ///
+    /// # Panics
+    /// Panics if the mutex has been poisoned by a prior panic while held.
+    pub fn with<R>(&self, f: impl FnOnce(&mut AcpiPm1Block) -> R) -> R {
+        f(&mut self.0.lock().expect("PM1 block mutex poisoned"))
+    }
+
+    /// Consume a pending sleep transition (see [`AcpiPm1Block::take_sleep`]) — the
+    /// run loop polls this and powers the guest off on the `_S5` value.
+    pub fn take_sleep(&self) -> Option<u8> {
+        self.with(AcpiPm1Block::take_sleep)
+    }
+
+    /// Inject a virtual power-button press (see
+    /// [`AcpiPm1Block::press_power_button`]).
+    pub fn press_power_button(&self) {
+        self.with(AcpiPm1Block::press_power_button);
+    }
+
+    /// The `PM1a` register block as a bus [`PioDevice`].
+    #[must_use]
+    pub fn port(&self) -> Pm1Port {
+        Pm1Port { pm1: self.clone() }
+    }
+}
+
+/// The `PM1a` register block (`0x600`..`0x606`) as a bus [`PioDevice`], backed by
+/// a [`SharedAcpiPm1Block`] so a guest's sleep write is visible to the run loop.
+pub struct Pm1Port {
+    pm1: SharedAcpiPm1Block,
+}
+
+impl PioDevice for Pm1Port {
+    fn pio_read(&mut self, port: u16, size: u8) -> u32 {
+        self.pm1.with(|b| b.pio_read(port, size))
+    }
+
+    fn pio_write(&mut self, port: u16, size: u8, data: u32) {
+        self.pm1.with(|b| b.pio_write(port, size, data));
+    }
+
+    fn port_range(&self) -> (u16, u16) {
+        (PM1_EVT_PORT, PM1_BLOCK_END)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{A20_GATE, PORT_A, SystemControlPortA};
+    use super::{
+        A20_GATE, AcpiPm1Block, PM1_CNT_PORT, PM1_EVT_PORT, PORT_A, SharedAcpiPm1Block,
+        SystemControlPortA,
+    };
     use crate::bus::PioDevice;
 
     #[test]
@@ -141,5 +372,73 @@ mod tests {
         let mut port = SystemControlPortA::new();
         port.pio_write(PORT_A, 1, 0xFF);
         assert_eq!(port.pio_read(PORT_A, 1) & 0x01, 0, "bit 0 reads 0");
+    }
+
+    #[test]
+    fn pm1_block_claims_0x600_through_0x605() {
+        assert_eq!(AcpiPm1Block::new().port_range(), (0x600, 0x606));
+    }
+
+    #[test]
+    fn writing_slp_typ_and_slp_en_latches_a_one_shot_sleep_request() {
+        let mut pm1 = AcpiPm1Block::new();
+        assert_eq!(pm1.take_sleep(), None);
+
+        // The DSDT's _S5 object typically yields SLP_TYP = 5; an OS shutting down
+        // writes (5 << 10) | SLP_EN(1<<13) to the control register.
+        let s5 = (5u16 << 10) | (1 << 13);
+        pm1.pio_write(PM1_CNT_PORT, 2, u32::from(s5));
+        assert_eq!(pm1.take_sleep(), Some(5), "S5 sleep type captured");
+        assert_eq!(pm1.take_sleep(), None, "consumed exactly once");
+
+        // SLP_EN is write-only: the control register reads it back as 0.
+        assert_eq!(pm1.pio_read(PM1_CNT_PORT, 2) & (1 << 13), 0);
+    }
+
+    #[test]
+    fn sci_enable_sticks_but_sleep_bits_do_not() {
+        let mut pm1 = AcpiPm1Block::new();
+        // Entering ACPI mode sets SCI_EN (bit 0); it persists and reads back.
+        pm1.pio_write(PM1_CNT_PORT, 2, 1);
+        assert!(pm1.sci_enabled());
+        assert_eq!(pm1.pio_read(PM1_CNT_PORT, 2) & 1, 1);
+        // A later S5 write must not capture a sleep unless SLP_EN is set.
+        pm1.pio_write(PM1_CNT_PORT, 2, (5 << 10) | 1);
+        assert_eq!(pm1.take_sleep(), None, "no SLP_EN, no transition");
+    }
+
+    #[test]
+    fn power_button_status_is_write_one_to_clear() {
+        let mut pm1 = AcpiPm1Block::new();
+        pm1.press_power_button();
+        // PWRBTN_STS (bit 8) is set in the status register at 0x600.
+        assert_ne!(pm1.pio_read(PM1_EVT_PORT, 2) & (1 << 8), 0);
+        // Write 1 to that bit to clear it (ACPI write-1-to-clear semantics).
+        pm1.pio_write(PM1_EVT_PORT, 2, 1 << 8);
+        assert_eq!(pm1.pio_read(PM1_EVT_PORT, 2) & (1 << 8), 0);
+    }
+
+    #[test]
+    fn enable_register_round_trips_through_the_high_half() {
+        let mut pm1 = AcpiPm1Block::new();
+        // PM1a_EN is at 0x602; a 16-bit write there sets the enable bits.
+        pm1.pio_write(0x602, 2, 1 << 8); // PWRBTN_EN
+        assert_eq!(pm1.pio_read(0x602, 2) & 0xFFFF, 1 << 8);
+        // A 32-bit read of the event block sees enable in the high half.
+        let evt = pm1.pio_read(PM1_EVT_PORT, 4);
+        assert_eq!(evt >> 16, u32::from(1u16 << 8));
+    }
+
+    #[test]
+    fn shutdown_through_the_bus_port_reaches_the_run_loop_handle() {
+        // The end-to-end shutdown path: a guest writes the S5 transition through
+        // the bus adapter, and the run loop's clone observes the sleep request.
+        let pm1 = SharedAcpiPm1Block::new();
+        let mut port = pm1.port();
+        assert_eq!(pm1.take_sleep(), None);
+
+        let s5 = (5u16 << 10) | (1 << 13); // SLP_TYP=5 | SLP_EN
+        port.pio_write(PM1_CNT_PORT, 2, u32::from(s5));
+        assert_eq!(pm1.take_sleep(), Some(5), "guest S5 write seen by the host");
     }
 }
