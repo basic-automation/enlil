@@ -664,3 +664,41 @@ emulation that predates this routine). New, specifically-applied:
 with a `.line(irq)` level-sink factory and a matching `clear_irq`; add `IoApicMmio` as an
 `MmioDevice` at `0xFEC0_0000`; and a `DeviceBus::standard_pc_with_interrupts` that attaches
 PIT→IRQ0 / UART→IRQ4 and mounts the I/O APIC aperture. Defer LAPIC MMIO to the per-vCPU path.
+
+## 2026-06-07 (b) — Legacy 8259A PIC: the early-boot interrupt controller
+
+Targeted check for the next unblocked step (per 06-07 hand-off #2): the dual-8259
+PIC that early boot runs in *before* the OS brings up the I/O APIC. This is ancient,
+stable silicon — no recent research changes the model; the authoritative sources are the
+primary datasheet and the well-trodden PC/AT wiring. Logged because the design decisions
+matter for transparency and for how it pairs with the existing APIC path:
+
+- **Intel 8259A datasheet** (programmable interrupt controller): the four-byte ICW1-4
+  init sequence (ICW1 on the command port with bit 4 set arms it; ICW2 = vector base in
+  the upper 5 bits; ICW3 = cascade wiring; ICW4 = 8086/auto-EOI mode), then OCW1 (mask)
+  on the data port and OCW2 (EOI)/OCW3 (read-select, poll, special-mask) on the command
+  port. **Fully-nested fixed priority** with IR0 highest: a request is delivered only if
+  strictly higher priority than every in-service level — modelled as "lowest set ISR bit
+  is the ceiling". ICW1 clears the IMR and the edge-sense latch (datasheet §"Initialization
+  Command Words"). Confirms our register/state layout (IRR/ISR/IMR + init step machine).
+- **PC/AT dual-PIC cascade** (master `0x20`/`0x21`, slave `0xA0`/`0xA1`, slave INT → master
+  IR2): the slave's `INT` output is a *level* input to the master's IR2, **not** a latched
+  edge. Modelling IR2 as "computed on demand from the slave's deliverable state" (rather
+  than persisting a master IRR bit 2) avoids the classic cascade-bookkeeping bugs and makes
+  the two-INTA-pulse acknowledge fall out naturally: master IR2 → ISR, slave supplies the
+  vector. An OS must EOI **both** chips for a cascaded line — matched by our test.
+- **Transparency / DoS note:** a freshly-reset PIC must read back inertly and deliver
+  nothing until a guest runs the full ICW sequence and unmasks lines — a device asserting
+  before init must not reach the CPU, exactly as on bare metal. Rotating-priority OCW2
+  variants are accepted but treated as their non-rotating equivalent: PC OSes use fixed
+  priority + non-specific EOI, so this stays honest and fully testable rather than
+  half-implementing rotation (flagged for a later increment if a guest ever needs it).
+
+**Changes what we build:** add `enlil_devices::interrupt::pic` with a `Pic8259` single-chip
+model (ICW1-4, OCW1/2/3, IRR/ISR/IMR, fully-nested resolution, poll, special-mask, auto-EOI)
+and a cascaded `DualPic` (master/slave, IR2 cascade computed on demand, INTA `acknowledge()`
+→ vector, `pending_vector()`/`has_interrupt()` for the INTR line). Pure-userspace, no KVM
+needed. Next: a bus front-end (two PIO port adapters over a shared `DualPic`) + an `.line()`
+sink so devices assert into the PIC the same way they do the I/O APIC, then a `standard_pc`
+variant that mounts both. Eventual KVM binding routes PIC INTR through LAPIC LINT0 ExtINT
+(or the in-kernel chip's `KVM_CREATE_IRQCHIP`, which already models the dual-8259).

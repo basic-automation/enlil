@@ -6,6 +6,96 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-07 (b) — Session: legacy 8259A PIC — chip model → bus front-end → factories (Phase 0.2)
+
+A four-increment session, each a full orient→build→verify trip and an independently-green
+commit, forming one coherent arc: **build the legacy dual-8259 PIC — the interrupt controller
+early boot runs in *before* the OS switches to the I/O APIC — from the chip model up to a bus
+config where one device line drives both controllers.** This took the 06-07 hand-off's
+recommended next step #2 ("Legacy 8259 PIC, pure userspace, unblocked"). `/dev/kvm` is **still
+absent on this runner (no nested virt)**, so every increment is pure-userspace, fully exercised
+by unit/integration tests. Workspace test count: 693 → **717** (+24).
+
+### Increment 1 — `Pic8259` + cascaded `DualPic` chip model (`55a8973`)
+New `enlil_devices::interrupt::pic`. `Pic8259` single chip: the ICW1-4 init state machine
+(cascade/single, vector base, cascade wiring, 8086/auto-EOI), OCW1 (mask) / OCW2 (specific +
+non-specific EOI) / OCW3 (read-register select, poll command, special-mask mode), IRR/ISR/IMR,
+and **fully-nested fixed-priority** resolution (IR0 highest — "lowest set ISR bit is the
+ceiling"). `DualPic`: master (`0x20`/`0x21`) + slave (`0xA0`/`0xA1`) with the slave `INT` wired
+to master IR2, **computed on demand** so the two-INTA cascade `acknowledge()` and the
+both-chips EOI fall out naturally; `pending_vector()`/`has_interrupt()` expose the INTR line.
+16 unit tests (init, fixed priority, mask-latches-but-blocks, in-service nesting, specific +
+non-specific EOI, cascade routing + EOI + preemption, read-register select, poll, auto-EOI,
+special-mask, single mode, inert uninitialized ports).
+
+### Increment 2 — PIC bus front-end: `SharedPic` + PIO adapters + `.line()` (`f32f079`)
+`SharedPic` (`Arc<Mutex<DualPic>>`, mirroring `SharedInterruptController`) with `.with()` locked
+access, a `.line(irq)` `Fn(bool)+Send` level sink (rising edge → `raise_irq`; satisfies both
+crate `IrqLine` traits via their blanket impls), and `PicMasterPort`/`PicSlavePort` `PioDevice`
+adapters (byte-wide, two ports each) so a guest programs the PIC through the bus. +5 tests
+(port ranges, shared-line raise+route, cascade slave vector, mask read-back through the adapter,
+masked line delivers nothing).
+
+### Increment 3 — `DeviceBus::standard_pc_with_pic` (early-boot PIC config) (`9218e77`)
+In `enlil-core`. `add_pic` mounts both PIC port pairs; `standard_pc_with_pic` assembles COM1 +
+PIT + PCIe + the four PIC ports and wires PIT→`IRQ_PIT`(0) / UART→`IRQ_COM1`(4) into the
+`SharedPic` — the PIC counterpart to `standard_pc_with_interrupts`. +2 `DeviceBus` tests driving
+the real `VmExitHandler` path: a guest runs the PC/AT ICW sequence, then enabling the UART THRE
+interrupt asserts IRQ4 (vector 0x24, consumed via INTA `acknowledge`); a masked line is held off
+the CPU until unmasked through the bus.
+
+### Increment 4 — `standard_pc_with_dual_irq` (tee to PIC + I/O APIC) (`f744de5`)
+The transparent, hardware-accurate config: each legacy device line is **teed into both** the
+8259 PIC and the I/O APIC (a plain `Fn(bool)+Send` closure calling both per-controller sinks),
+mirroring real hardware where an ISA line is wired to both controllers and the OS leaves one
+path masked — so the boot-time PIC→APIC switchover is seamless. Mounts both front-ends. +1
+`DeviceBus` test: one IRQ4 line event latches on the 8259 (vector 0x24) **and** routes through
+the I/O APIC RTE to LAPIC 0 (vector 0x34) simultaneously.
+
+### Research (informed the build)
+Logged under `RESEARCH.md` → "2026-06-07 (b)". The 8259A is ancient, stable silicon — no recent
+paper changes it; the authoritative sources are the **Intel 8259A datasheet** (ICW1-4/OCW1-3
+register model, fully-nested fixed priority, ICW1 clears IMR + edge-sense latch) and the
+**PC/AT dual-PIC cascade** wiring (slave INT is a *level* input to master IR2, so modelling IR2
+"computed on demand from the slave's deliverable state" avoids the classic cascade-bookkeeping
+bugs and makes the two-INTA acknowledge natural). Transparency note: a reset PIC must read back
+inertly and deliver nothing until the full ICW sequence + unmask. Rotating-priority OCW2
+variants are accepted but treated as their non-rotating equivalent (PC OSes use fixed priority +
+non-specific EOI), flagged for a later increment.
+
+### Test results (exact)
+- `cargo build --workspace` → **OK**.
+- `cargo fmt --all -- --check` → **OK**.
+- `cargo clippy --all-targets --workspace -- -D warnings` → **OK** (clean). The new code is
+  lint-clean under the crate's strict `deny(all, pedantic, nursery)` with **zero** new `#[allow]`:
+  grouped the OCW3 bools into a `ReadState` sub-struct (struct-bool threshold), masked the
+  `trailing_zeros() & 0x07` casts, used `truncate::u8_of` for the byte-wide port writes, and
+  dropped an unused `icw3` field (cascade is fixed at IR2).
+- `cargo test --workspace` → **717 passed, 0 failed, 1 ignored** (was 693). The 1 ignored is the
+  `/dev/kvm` self-skip. New: 21 `interrupt::pic` unit tests + 3 `device_bus` tests.
+- `/dev/kvm` paths (`serial_console_smoke`, `kvm_create_vm_and_map_memory`): **not run — no
+  `/dev/kvm` (no nested virt)**; they self-skip.
+- no_std custom-target build: **N/A** — no crate is `#![no_std]` yet.
+
+### Recommended next step (tomorrow)
+1. **MADT interrupt-source-override (pure userspace, unblocked, small).** Both I/O APIC factories
+   identity-map ISA IRQ → I/O APIC pin, but a PC's MADT remaps ISA IRQ0 → GSI 2 (and marks
+   IRQ0's PIC line). `enlil_devices::acpi` emits the MADT; make the factory's pin wiring and the
+   emitted MADT agree (timer on GSI 2), and add an override-aware `.line()`/RTE mapping. This is
+   the last correctness gap flagged in the ROADMAP 0.2 status note and pairs directly with this
+   session's work.
+2. **8259 ELCR (edge/level control register, `0x4D0`/`0x4D1`), unblocked.** PCI interrupts are
+   level-triggered through the PIC; the ELCR selects per-line edge vs level. Our PIC is
+   edge-only. Add the ELCR port pair + level-triggered IRR semantics (a level line re-asserts
+   after EOI while still high). Small, self-contained, pairs with PCI INTx routing.
+3. **KVM binding (blocked on `/dev/kvm`).** When a nested-virt runner exists, bind `SharedPic` /
+   `SharedInterruptController` delivery to the in-kernel chip (`KVM_CREATE_IRQCHIP` already models
+   the dual-8259) or route PIC INTR via LAPIC LINT0 ExtINT, and have `KvmBackend` build its bus
+   via `standard_pc_with_dual_irq`. Add a `/dev/kvm`-gated boot-takes-an-interrupt test. **If
+   still no `/dev/kvm`, skip and do #1/#2.**
+
+---
+
 ## 2026-06-07 — Session: device IRQ delivery — line wiring, assembled-bus wiring, I/O APIC MMIO (Phase 0.2)
 
 A multi-increment session. Three complete, independently-green, tested commits on the branch,

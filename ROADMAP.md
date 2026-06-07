@@ -290,6 +290,31 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > deliberately *not* on the shared bus (it's per-vCPU at one address — belongs in the per-vCPU
 > exit path / in-kernel chip). **Next:** the KVM `set_irq_line`/`irqfd` binding once a
 > `/dev/kvm`-capable runner exists; have `KvmBackend` build its bus via `standard_pc_with_interrupts`.
+>
+> **Status (2026-06-07b):** the **legacy 8259A PIC** — the controller early boot uses *before*
+> the OS switches to the I/O APIC — now has a pure model in `enlil_devices::interrupt::pic`:
+> `Pic8259` (single chip: ICW1-4 init sequence, OCW1 mask / OCW2 EOI / OCW3 read-select+poll+
+> special-mask, IRR/ISR/IMR, fully-nested fixed priority, auto-EOI) and the cascaded `DualPic`
+> (master `0x20`/`0x21` + slave `0xA0`/`0xA1`, slave INT → master IR2 computed on demand, INTA
+> `acknowledge()` → vector, `pending_vector()`/`has_interrupt()` for the INTR line). The bus
+> front-end is also in: `SharedPic` (`Arc<Mutex<DualPic>>`, mirroring `SharedInterruptController`)
+> exposes `PicMasterPort`/`PicSlavePort` (`PioDevice` at `0x20`/`0x21` and `0xA0`/`0xA1`) and a
+> `.line(irq)` `Fn(bool)+Send` sink, so a guest programs the PIC through the bus and devices
+> assert into it exactly as they do the I/O APIC. 21 unit tests, no KVM needed.
+> `DeviceBus::standard_pc_with_pic` (+ `add_pic`) now assembles the early-boot config — COM1 +
+> PIT + PCIe + the four PIC ports, with PIT→IRQ0/UART→IRQ4 wired into the `SharedPic` — the PIC
+> counterpart to `standard_pc_with_interrupts`; a guest programs the PIC through the bus
+> (ICW1-4/OCW1) and a device IRQ routes through it to `pending_vector()`/`acknowledge()` (2
+> `DeviceBus` tests, no KVM). `DeviceBus::standard_pc_with_dual_irq` now provides the
+> transparent, hardware-accurate config: each legacy device line is *teed* into **both** the PIC
+> and the I/O APIC (real hardware wires the same IRQ to both; the OS masks the unused path), so one
+> device event drives both controllers and the PIC→I/O APIC switchover at boot is seamless — the
+> guest just masks whichever it isn't using (1 `DeviceBus` test asserting both controllers latch a
+> single IRQ4 with their own vectors). **Still to do for the PIC:** (1) the MADT
+> interrupt-source-override (ISA IRQ0→GSI 2) so the I/O APIC pin numbering matches what ACPI tells
+> the guest — currently identity-mapped in both APIC factories; (2) the KVM binding — route PIC
+> INTR via LAPIC LINT0 ExtINT (or the in-kernel `KVM_CREATE_IRQCHIP`, which already models the
+> dual-8259) once a `/dev/kvm`-capable runner exists.
 
 ### 0.3 USB Live Boot & Non-Destructive Testing (CRITICAL FOR ADOPTION)
 
