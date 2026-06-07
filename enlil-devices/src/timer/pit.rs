@@ -7,6 +7,8 @@
 //!
 //! I/O ports: 0x40-0x43 (channels 0-2 data, 0x43 command)
 
+use std::sync::{Arc, Mutex};
+
 use crate::bus::PioDevice;
 use crate::truncate::u16_of;
 /// PIT oscillator frequency in Hz.
@@ -464,6 +466,84 @@ impl PioDevice for Pit {
 
     fn pio_write(&mut self, port: u16, _size: u8, data: u32) {
         self.write_port(port, data.to_le_bytes()[0]);
+    }
+
+    fn port_range(&self) -> (u16, u16) {
+        (PIT_PORT_BASE, PIT_PORT_BASE + PIT_PORT_COUNT)
+    }
+}
+
+/// A thread-safe, shareable handle to one [`Pit`].
+///
+/// A boxed [`Pit`] on the bus is reachable only through its [`PioDevice`]
+/// methods, so nothing could call [`Pit::tick`] to advance the timer once it
+/// was mounted. [`SharedPit`] (mirroring [`SharedRtc`](super::SharedRtc) /
+/// [`SharedPic`](crate::interrupt::SharedPic)) fixes that: the [`PitPort`] bus
+/// adapter and the timer-thread `tick` driver hold independent clones of one
+/// PIT, so the run loop can advance channel 0 (pulsing IRQ0) while the guest
+/// programs the counters through the ports.
+#[derive(Clone)]
+pub struct SharedPit(Arc<Mutex<Pit>>);
+
+impl SharedPit {
+    /// Wrap a fresh PIT with all channels in their reset state.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Arc::new(Mutex::new(Pit::new())))
+    }
+
+    /// Wrap an already-built PIT (e.g. one with an IRQ0 sink attached).
+    #[must_use]
+    pub fn from_pit(pit: Pit) -> Self {
+        Self(Arc::new(Mutex::new(pit)))
+    }
+
+    /// Run `f` with exclusive access — to attach the IRQ0 sink, read counters,
+    /// or inspect channel state.
+    ///
+    /// # Panics
+    /// Panics if the PIT mutex has been poisoned by a prior panic while held.
+    pub fn with<R>(&self, f: impl FnOnce(&mut Pit) -> R) -> R {
+        f(&mut self.0.lock().expect("PIT mutex poisoned"))
+    }
+
+    /// Advance the PIT by `ns` nanoseconds (see [`Pit::tick`]); returns `true`
+    /// if channel 0 generated an IRQ0 this tick. The attached IRQ0 sink is
+    /// pulsed inside the tick, so the run loop just calls this periodically.
+    ///
+    /// # Panics
+    /// Panics if the PIT mutex has been poisoned by a prior panic while held.
+    #[must_use]
+    pub fn tick(&self, ns: u64) -> bool {
+        self.with(|p| p.tick(ns))
+    }
+
+    /// The four PIT ports (`0x40..=0x43`) as a bus [`PioDevice`].
+    #[must_use]
+    pub fn port(&self) -> PitPort {
+        PitPort { pit: self.clone() }
+    }
+}
+
+impl Default for SharedPit {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The PIT's four ports (`0x40..=0x43`) as a bus [`PioDevice`] over a
+/// [`SharedPit`], so the same PIT can be ticked from a timer thread.
+pub struct PitPort {
+    pit: SharedPit,
+}
+
+impl PioDevice for PitPort {
+    fn pio_read(&mut self, port: u16, _size: u8) -> u32 {
+        u32::from(self.pit.with(|p| p.read_port(port)))
+    }
+
+    fn pio_write(&mut self, port: u16, _size: u8, data: u32) {
+        self.pit.with(|p| p.write_port(port, data.to_le_bytes()[0]));
     }
 
     fn port_range(&self) -> (u16, u16) {

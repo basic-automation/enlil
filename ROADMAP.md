@@ -310,11 +310,22 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > and the I/O APIC (real hardware wires the same IRQ to both; the OS masks the unused path), so one
 > device event drives both controllers and the PIC→I/O APIC switchover at boot is seamless — the
 > guest just masks whichever it isn't using (1 `DeviceBus` test asserting both controllers latch a
-> single IRQ4 with their own vectors). **Still to do for the PIC:** (1) the MADT
-> interrupt-source-override (ISA IRQ0→GSI 2) so the I/O APIC pin numbering matches what ACPI tells
-> the guest — currently identity-mapped in both APIC factories; (2) the KVM binding — route PIC
-> INTR via LAPIC LINT0 ExtINT (or the in-kernel `KVM_CREATE_IRQCHIP`, which already models the
-> dual-8259) once a `/dev/kvm`-capable runner exists.
+> single IRQ4 with their own vectors).
+>
+> **Status (2026-06-07c):** two interrupt-correctness gaps closed (pure userspace, no KVM).
+> (1) **MADT interrupt-source-override is now modelled.** `enlil_devices::interrupt::isa_to_gsi`
+> (the single source of truth, cross-checked by a test against the GSI the emitted MADT
+> advertises) maps ISA IRQ0→GSI 2 and identity-maps the rest; `SharedInterruptController::isa_line`
+> resolves it, and both I/O APIC factories (`standard_pc_with_interrupts`, `standard_pc_with_dual_irq`)
+> now wire the PIT through it so the timer lands on GSI 2 (APIC path) and IRQ0 (8259 path) — the
+> guest programs the same pin ACPI told it about. (2) **8259 ELCR** (Edge/Level Control Register,
+> ports `0x4D0`/`0x4D1`) + per-line **level-triggered IRR**: `Pic8259::set_line` makes an edge line
+> latch one request and a level line's IRR follow the input (withdrawn before INTA, re-armed after
+> EOI while still asserted) — the semantics PCI `INTx` needs. `DualPic::set_irq_level`/`write_elcr`
+> with the PIIX hardwired-edge masks (master `0xF8`, slave `0xDE`), `SharedPic::line` forwards both
+> edges, and `ElcrPort` is a `PioDevice` mounted by `add_pic`. **Still to do for the PIC:** the KVM
+> binding — route PIC INTR via LAPIC LINT0 ExtINT (or the in-kernel `KVM_CREATE_IRQCHIP`, which
+> already models the dual-8259) once a `/dev/kvm`-capable runner exists.
 
 ### 0.3 USB Live Boot & Non-Destructive Testing (CRITICAL FOR ADOPTION)
 

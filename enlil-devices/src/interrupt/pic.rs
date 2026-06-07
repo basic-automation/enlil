@@ -48,6 +48,18 @@ pub const SLAVE_DATA: u16 = 0xA1;
 /// Master IR line the slave's `INT` output is cascaded into.
 const CASCADE_IRQ: u8 = 2;
 
+/// Master ELCR (Edge/Level Control Register) port — one bit per IRQ0-7.
+pub const ELCR_MASTER: u16 = 0x4D0;
+/// Slave ELCR port — one bit per IRQ8-15.
+pub const ELCR_SLAVE: u16 = 0x4D1;
+
+/// Writable ELCR bits on the master: IRQ0 (timer), IRQ1 (keyboard) and IRQ2
+/// (cascade) are hardwired edge-triggered and read back as 0.
+const ELCR_MASTER_WRITABLE: u8 = 0xF8;
+/// Writable ELCR bits on the slave: IRQ8 (RTC, bit 0) and IRQ13 (FPU, bit 5)
+/// are hardwired edge-triggered and read back as 0.
+const ELCR_SLAVE_WRITABLE: u8 = 0xDE;
+
 /// Steps of the ICW initialization sequence a write to the data port feeds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InitStep {
@@ -108,6 +120,13 @@ pub struct Pic8259 {
     single: bool,
     /// ICW4 bit 1 (AEOI): auto-EOI — clear the ISR bit on acknowledge.
     auto_eoi: bool,
+    /// Per-line edge/level control (the chipset ELCR): a set bit makes that line
+    /// level-triggered, a clear bit edge-triggered. Reset value is all-edge.
+    elcr: u8,
+    /// Current asserted state of each input line. Edge lines latch into the IRR
+    /// on assertion and ignore this; level lines keep the IRR following it (and
+    /// re-arm after EOI while the line is still high), so it must be tracked.
+    line_level: u8,
     /// OCW3 read-register / special-mask / poll state.
     read: ReadState,
 }
@@ -126,6 +145,8 @@ impl Pic8259 {
             expect_icw4: false,
             single: false,
             auto_eoi: false,
+            elcr: 0,
+            line_level: 0,
             read: ReadState::new(),
         }
     }
@@ -136,12 +157,54 @@ impl Pic8259 {
         self.vector_base
     }
 
-    /// Latch an edge on local line `irq` (0-7). A masked line still latches in
-    /// the IRR — masking only inhibits *delivery*, matching real hardware.
-    pub const fn raise(&mut self, irq: u8) {
-        if irq < 8 {
-            self.irr |= 1 << irq;
+    /// Drive local input line `irq` (0-7) to `level`, honoring its ELCR mode.
+    ///
+    /// An **edge-triggered** line latches a request in the IRR on assertion and
+    /// ignores deassertion (the latch is cleared on acknowledge). A
+    /// **level-triggered** line keeps its IRR bit following the input, so it is
+    /// withdrawn if the line drops before acknowledge and re-arms after EOI while
+    /// the line is still asserted. A masked line still latches/follows in the IRR
+    /// — masking only inhibits *delivery*, matching real hardware.
+    pub const fn set_line(&mut self, irq: u8, level: bool) {
+        if irq >= 8 {
+            return;
         }
+        let bit = 1u8 << irq;
+        if level {
+            self.line_level |= bit;
+        } else {
+            self.line_level &= !bit;
+        }
+        if self.elcr & bit != 0 {
+            // Level-triggered: the IRR follows the input line.
+            if level {
+                self.irr |= bit;
+            } else {
+                self.irr &= !bit;
+            }
+        } else if level {
+            // Edge-triggered: latch a request on the assertion.
+            self.irr |= bit;
+        }
+    }
+
+    /// Latch an edge on local line `irq` (0-7) — shorthand for asserting
+    /// [`set_line`](Self::set_line) with `level = true`.
+    pub const fn raise(&mut self, irq: u8) {
+        self.set_line(irq, true);
+    }
+
+    /// Program the edge/level control register (ELCR) for this chip. `writable`
+    /// masks off the lines the chipset hardwires to edge (the timer/keyboard/
+    /// cascade on the master, the RTC/FPU on the slave), which read back as 0.
+    pub const fn set_elcr(&mut self, val: u8, writable: u8) {
+        self.elcr = val & writable;
+    }
+
+    /// The edge/level control register (ELCR) — set bits are level-triggered.
+    #[must_use]
+    pub const fn elcr(&self) -> u8 {
+        self.elcr
     }
 
     /// Write to this chip's command port (`0x20`/`0xA0`).
@@ -335,9 +398,16 @@ impl Pic8259 {
     const fn acknowledge(&mut self) -> Option<u8> {
         match self.resolve(self.irr) {
             Some(irq) => {
-                self.irr &= !(1 << irq);
+                let bit = 1u8 << irq;
+                self.irr &= !bit;
+                // A level-triggered line that is still asserted keeps its IRR bit
+                // set — the in-service bit (set below) blocks re-delivery until
+                // EOI, after which it fires again while the line stays high.
+                if self.elcr & bit != 0 && self.line_level & bit != 0 {
+                    self.irr |= bit;
+                }
                 if !self.auto_eoi {
-                    self.isr |= 1 << irq;
+                    self.isr |= bit;
                 }
                 Some(irq)
             }
@@ -381,10 +451,39 @@ impl DualPic {
     /// master's IR2 cascade input is derived on demand, so raising a slave line
     /// needs no explicit master bookkeeping. Out-of-range lines are ignored.
     pub const fn raise_irq(&mut self, irq: u8) {
+        self.set_irq_level(irq, true);
+    }
+
+    /// Drive ISA line `irq` (0-15) to `level`: 0-7 → master, 8-15 → slave,
+    /// honoring each line's ELCR edge/level mode (see [`Pic8259::set_line`]).
+    /// Edge lines latch on the rising edge and ignore the rest; level lines
+    /// (e.g. PCI `INTx`) keep the IRR following the input. Out-of-range lines are
+    /// ignored.
+    pub const fn set_irq_level(&mut self, irq: u8, level: bool) {
         if irq < 8 {
-            self.master.raise(irq);
+            self.master.set_line(irq, level);
         } else if irq < 16 {
-            self.slave.raise(irq - 8);
+            self.slave.set_line(irq - 8, level);
+        }
+    }
+
+    /// Program one of the two ELCR ports (`0x4D0` master / `0x4D1` slave),
+    /// applying the hardwired-edge write mask for that chip.
+    pub const fn write_elcr(&mut self, port: u16, val: u8) {
+        match port {
+            ELCR_MASTER => self.master.set_elcr(val, ELCR_MASTER_WRITABLE),
+            ELCR_SLAVE => self.slave.set_elcr(val, ELCR_SLAVE_WRITABLE),
+            _ => {}
+        }
+    }
+
+    /// Read back one of the two ELCR ports; bits hardwired to edge read as 0.
+    #[must_use]
+    pub const fn read_elcr(&self, port: u16) -> u8 {
+        match port {
+            ELCR_MASTER => self.master.elcr(),
+            ELCR_SLAVE => self.slave.elcr(),
+            _ => 0xFF,
         }
     }
 
@@ -507,23 +606,29 @@ impl SharedPic {
         f(&mut self.0.lock().expect("PIC mutex poisoned"))
     }
 
-    /// Build an edge-triggered level sink for ISA line `irq`, suitable for
-    /// `attach_irq0` / `attach_irq_line`.
+    /// Build a level sink for ISA line `irq`, suitable for `attach_irq0` /
+    /// `attach_irq_line`.
     ///
-    /// A rising edge (`set_level(true)`) latches the request via
-    /// [`DualPic::raise_irq`]; a falling edge does nothing (the request is
-    /// edge-latched in the IRR and cleared on acknowledge), so a device that
-    /// pulses true-then-false produces exactly one request. The returned closure
-    /// is `Send` and owns a clone of this handle, so it outlives the borrow, and
-    /// satisfies both crate-local `IrqLine` traits via their `Fn(bool)+Send`
-    /// blanket impls.
+    /// Both edges are forwarded to [`DualPic::set_irq_level`], so the line's
+    /// behavior follows its ELCR mode: an **edge-triggered** line latches one
+    /// request on the rising edge and a device pulsing true-then-false produces
+    /// exactly one interrupt; a **level-triggered** line (a PCI `INTx`, once the
+    /// chipset ELCR selects level) keeps the request asserted while the input is
+    /// high and withdraws it on the falling edge. The returned closure is `Send`
+    /// and owns a clone of this handle, so it outlives the borrow, and satisfies
+    /// both crate-local `IrqLine` traits via their `Fn(bool)+Send` blanket impls.
     pub fn line(&self, irq: u8) -> impl Fn(bool) + Send + use<> {
         let pic = self.clone();
         move |level: bool| {
-            if level {
-                pic.with(|p| p.raise_irq(irq));
-            }
+            pic.with(|p| p.set_irq_level(irq, level));
         }
+    }
+
+    /// The ELCR's two ports (`0x4D0`/`0x4D1`) as a bus [`PioDevice`], so a guest
+    /// can select per-line edge/level triggering (PCI interrupts are level).
+    #[must_use]
+    pub fn elcr_port(&self) -> ElcrPort {
+        ElcrPort { pic: self.clone() }
     }
 
     /// The master 8259's PIO port adapter (`0x20`/`0x21`) for the bus.
@@ -588,6 +693,29 @@ impl PioDevice for PicSlavePort {
 
     fn port_range(&self) -> (u16, u16) {
         (SLAVE_CMD, SLAVE_CMD + 2)
+    }
+}
+
+/// The two ELCR ports (`0x4D0`/`0x4D1`) as a bus [`PioDevice`].
+///
+/// The chipset edge/level control register is byte-wide per port; a guest
+/// writes a 1 in a line's bit to make that ISA line level-triggered (as it does
+/// for PCI `INTx`) and reads it back, with the hardwired-edge bits returning 0.
+pub struct ElcrPort {
+    pic: SharedPic,
+}
+
+impl PioDevice for ElcrPort {
+    fn pio_read(&mut self, port: u16, _size: u8) -> u32 {
+        u32::from(self.pic.with(|p| p.read_elcr(port)))
+    }
+
+    fn pio_write(&mut self, port: u16, _size: u8, data: u32) {
+        self.pic.with(|p| p.write_elcr(port, u8_of(data)));
+    }
+
+    fn port_range(&self) -> (u16, u16) {
+        (ELCR_MASTER, ELCR_SLAVE + 1)
     }
 }
 
@@ -895,6 +1023,93 @@ mod tests {
         // Mask IRQ0 through the bus, then assert it: no INTR.
         pic.master_port().pio_write(MASTER_DATA, 1, 0x01);
         pic.line(0)(true);
+        assert!(!pic.with(|p| p.has_interrupt()));
+    }
+
+    #[test]
+    fn elcr_write_mask_forces_hardwired_lines_to_edge() {
+        let mut pic = DualPic::new();
+        // Try to make every line level; the hardwired-edge bits read back 0.
+        pic.write_elcr(ELCR_MASTER, 0xFF);
+        pic.write_elcr(ELCR_SLAVE, 0xFF);
+        assert_eq!(pic.read_elcr(ELCR_MASTER), 0xF8); // IRQ0/1/2 forced edge
+        assert_eq!(pic.read_elcr(ELCR_SLAVE), 0xDE); // IRQ8/13 forced edge
+    }
+
+    #[test]
+    fn edge_line_is_a_one_shot_per_assertion() {
+        // Default (ELCR=0) line: assert, ack, EOI — even though the input stays
+        // high, it does not re-fire (an edge line latches a single request).
+        let mut pic = DualPic::new();
+        init_pc_at(&mut pic);
+        pic.set_irq_level(3, true);
+        assert_eq!(pic.acknowledge(), Some(0x23));
+        pic.write_port(MASTER_CMD, 0x20); // non-specific EOI
+        // Input still held high, but no fresh request without a new edge.
+        assert_eq!(pic.pending_vector(), None);
+    }
+
+    #[test]
+    fn level_line_refires_while_asserted_and_withdraws_on_deassert() {
+        let mut pic = DualPic::new();
+        init_pc_at(&mut pic);
+        // Make IRQ5 (a PCI-style line) level-triggered.
+        pic.write_elcr(ELCR_MASTER, 1 << 5);
+
+        // Assert and service it.
+        pic.set_irq_level(5, true);
+        assert_eq!(pic.pending_vector(), Some(0x25));
+        assert_eq!(pic.acknowledge(), Some(0x25));
+        // In service blocks re-delivery until EOI...
+        assert_eq!(pic.pending_vector(), None);
+        // ...but after EOI, the still-asserted level line fires again.
+        pic.write_port(MASTER_CMD, 0x20);
+        assert_eq!(pic.pending_vector(), Some(0x25));
+
+        // Deasserting the input withdraws the request entirely.
+        pic.set_irq_level(5, false);
+        assert_eq!(pic.pending_vector(), None);
+    }
+
+    #[test]
+    fn level_line_dropped_before_ack_is_withdrawn() {
+        let mut pic = DualPic::new();
+        init_pc_at(&mut pic);
+        pic.write_elcr(ELCR_MASTER, 1 << 6);
+        pic.set_irq_level(6, true);
+        assert_eq!(pic.pending_vector(), Some(0x26));
+        // The device deasserts before the CPU takes the INTA: spurious-avoidance,
+        // the request vanishes from the IRR.
+        pic.set_irq_level(6, false);
+        assert_eq!(pic.pending_vector(), None);
+        assert_eq!(pic.master.irr(), 0);
+    }
+
+    #[test]
+    fn elcr_round_trips_through_the_bus_port() {
+        let pic = SharedPic::new();
+        let mut elcr = pic.elcr_port();
+        assert_eq!(elcr.port_range(), (0x4D0, 0x4D2));
+        elcr.pio_write(ELCR_MASTER, 1, 0xFF);
+        elcr.pio_write(ELCR_SLAVE, 1, 0xFF);
+        // Read back through the same adapter, with the forced-edge bits masked.
+        assert_eq!(elcr.pio_read(ELCR_MASTER, 1) & 0xFF, 0xF8);
+        assert_eq!(elcr.pio_read(ELCR_SLAVE, 1) & 0xFF, 0xDE);
+    }
+
+    #[test]
+    fn shared_level_line_follows_the_input_through_the_bus() {
+        let pic = SharedPic::new();
+        init_shared(&pic);
+        // Program IRQ7 level via the ELCR port, then drive the line.
+        pic.elcr_port().pio_write(ELCR_MASTER, 1, 1 << 7);
+
+        let line = pic.line(7);
+        line(true);
+        assert_eq!(pic.with(|p| p.pending_vector()), Some(0x27));
+        // A level line withdraws when the device deasserts (unlike an edge line,
+        // whose latched request would persist).
+        line(false);
         assert!(!pic.with(|p| p.has_interrupt()));
     }
 }

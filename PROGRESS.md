@@ -6,6 +6,99 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-07 (c) — Session: finish the interrupt-correctness gaps + the missing legacy PC devices (Phase 0.2)
+
+A six-increment session, each a full orient→build→verify trip and an independently-green commit.
+It started by closing the two interrupt-correctness items the 06-07(b) hand-off flagged (MADT
+override, ELCR), then — with the interrupt subsystem solid and `/dev/kvm` still absent — moved on
+to the legacy PC devices a guest touches at boot that Enlil hadn't modelled or bus-mounted yet
+(RTC/CMOS, PS/2), and finally fixed the long-standing "the PIT can't be ticked once it's on the
+bus" limitation. Every increment is pure-userspace, fully exercised by unit/integration tests.
+Workspace test count: 717 → **751** (+34). `/dev/kvm` is **still absent on this runner (no nested
+virt)**; the one `/dev/kvm`-gated test self-skips (1 ignored).
+
+### Increment 1 — MADT interrupt-source override: ISA IRQ0 → GSI 2 (`2ca41f5`)
+The MADT advertises the PC/AT timer on GSI 2 (`timer_override`), but the I/O APIC line wiring used
+an identity ISA-IRQ→pin map, so a guest programming GSI 2's RTE for the timer (per the MADT) would
+never get a PIT interrupt (the PIT drove pin 0). Added `enlil_devices::interrupt::isa_to_gsi` (the
+single source of truth, cross-checked by a test against the GSI the emitted MADT advertises) and
+`SharedInterruptController::isa_line`; wired the PIT through it in both I/O APIC factories. +5 tests.
+
+### Increment 2 — 8259 ELCR + level-triggered IRR for PCI `INTx` (`924724b`)
+The PIC was edge-only; PCI interrupts are level-triggered through the chipset ELCR (`0x4D0`/`0x4D1`).
+Added per-chip `elcr`/`line_level` + `Pic8259::set_line` (edge line latches one request; level line's
+IRR follows the input — withdrawn before INTA, re-armed after EOI while still asserted),
+`DualPic::set_irq_level`/`write_elcr` with the PIIX hardwired-edge masks (master `0xF8`, slave
+`0xDE`), `SharedPic::line` now forwards both edges, and an `ElcrPort` `PioDevice` mounted by
+`add_pic`. +6 tests. (`c26479b` folded both into the ROADMAP 0.2 status.)
+
+### Increment 3 — MC146818 RTC/CMOS device model (`e393123`)
+No RTC existed (ports `0x70`/`0x71` read open-bus). Added `enlil_devices::timer::rtc::Rtc146818`:
+128-byte CMOS, index/data ports with the **NMI-disable bit split out of the address**, the time/date
+registers driven by an injected Unix-epoch wall clock (civil-date conversion by pure unsigned
+arithmetic — no time-crate dep), status registers A-D with Register B's BCD/binary + 24/12-hour modes
+and Register C's read-to-clear flags, and `tick_second` raising IRQ8 for update-ended + alarm
+interrupts (frozen while SET held). `SharedRtc` + `RtcPort` bus adapter. +15 tests.
+
+### Increment 4 — mount the RTC on the bus + IRQ8 wiring (`37415e1`)
+`DeviceBus::add_rtc` mounts the `0x70`/`0x71` front-end; the caller owns the `SharedRtc` to drive the
+clock and attach the IRQ8 sink. +2 integration tests (read time through the ports; IRQ8 update-ended
+routes through a guest-programmed I/O APIC GSI-8 RTE into LAPIC 0).
+
+### Increment 5 — i8042 PS/2 controller on the bus + IRQ1/IRQ12 (`a59afec`)
+The i8042 model existed but wasn't bus-mountable or IRQ-wired. Added `SharedI8042` (holds the
+controller + keyboard/mouse `IrqLine` sinks, reconciled from the pending flags after each access, so
+the register model and its tests stayed untouched) and two **single-port** `PioDevice` adapters
+(`Ps2DataPort` `0x60`, `Ps2CmdPort` `0x64`) that deliberately leave `0x61`-`0x63` (PC-speaker/NMI
+ports) unclaimed. `DeviceBus::add_ps2`. +5 tests incl. a keyboard-IRQ1-through-the-I/O-APIC
+integration test.
+
+### Increment 6 — `SharedPit`: tick the PIT after it is bus-mounted (`711676c`)
+A boxed `Pit` was reachable only through `PioDevice`, so nothing could call `Pit::tick` once mounted
+(the limitation that blocked an assembled-bus IRQ0 test). Added `SharedPit` + `PitPort` +
+`DeviceBus::add_pit_shared`. This also closed the loop increment 1 couldn't test: an end-to-end test
+wires the PIT's IRQ0 via `isa_line(0)` to **GSI 2**, mounts it, programs channel 0 + GSI 2's RTE
+through the bus, ticks the PIT from the handle, and observes the timer interrupt land at LAPIC 0 on
+the overridden pin. +1 integration test.
+
+### Research (informed the build)
+Logged under `RESEARCH.md` → "2026-06-07 (c)": ACPI MADT Interrupt Source Override (spec §5.2.12.5),
+PIIX3 ELCR / PCI level-triggered `INTx`, and the MC146818 RTC/CMOS register map. All ancient/stable
+silicon + firmware conventions — no recent paper changes the models; the authoritative sources are
+the primary datasheets and the ACPI spec.
+
+### Test results (exact)
+- `cargo build --workspace` → **OK**.
+- `cargo fmt --all -- --check` → **OK**.
+- `cargo clippy --all-targets --workspace -- -D warnings` → **OK** (clean). New code is lint-clean
+  under `enlil-devices`'s strict `deny(all, pedantic, nursery)` (no blanket allow): unsigned-only
+  calendar math through the `truncate` helpers, `const fn` / `#[must_use]` / `# Panics` where clippy
+  asked, `is_multiple_of`, let-chains.
+- `cargo test --workspace` → **751 passed, 0 failed, 1 ignored** (was 717). The 1 ignored is the
+  `/dev/kvm` self-skip.
+- `/dev/kvm` paths: **not run — no `/dev/kvm` (no nested virt)**; they self-skip.
+- no_std custom-target build: **N/A** — no crate is `#![no_std]` yet.
+
+### Recommended next step (tomorrow)
+1. **Wire RTC + PS/2 (and the shared PIT) into the `standard_pc_*` factories**, so the assembled
+   "standard PC" is actually complete: mount the RTC/PS2 ports and tee IRQ8/IRQ1/IRQ12 into the
+   PIC + I/O APIC the way the PIT/UART already are. Needs the factories to take `&SharedRtc` /
+   `&SharedI8042` / `&SharedPit` (or to create+return them) — changes 3 signatures + ~6 test call
+   sites, so do it as its own increment. Pure userspace, unblocked.
+2. **System Control Port B (`0x61`) + PC speaker**, now tractable via `SharedPit`: bit 0 drives PIT
+   channel-2 gate, bit 1 the speaker enable, bit 5 reads back PIT ch2 OUT, bit 4 toggles the refresh
+   clock. Couples to `SharedPit` (channel 2). Small, pairs with this session. Also `0x92` (System
+   Control Port A: fast A20 + fast reset) as a trivial standalone if more is wanted.
+3. **PCI INTx → PIRQ routing (PIIX PIRQ router).** PCI devices' INTA-D pins route through the
+   chipset PIRQ registers to ISA IRQs (level, via the ELCR built this session) and to I/O APIC GSIs
+   16-19. This is the architecturally significant continuation of the interrupt work and the natural
+   pairing with the ELCR. Larger; needs the PCI-to-ISA bridge config registers.
+4. **KVM binding (still blocked on `/dev/kvm`).** When a nested-virt runner exists: bind the
+   `SharedPic`/`SharedInterruptController`/`SharedRtc`/`SharedPit`/`SharedI8042` to the run loop, have
+   `KvmBackend` build its bus via a `standard_pc_*` factory, and tick the PIT/RTC from a timer thread.
+
+---
+
 ## 2026-06-07 (b) — Session: legacy 8259A PIC — chip model → bus front-end → factories (Phase 0.2)
 
 A four-increment session, each a full orient→build→verify trip and an independently-green

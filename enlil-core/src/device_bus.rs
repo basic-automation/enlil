@@ -20,7 +20,8 @@ use enlil_devices::interrupt::{IoApicMmio, SharedInterruptController, SharedPic}
 use enlil_devices::pcie::{
     vendors, EcamSpace, PciBdf, PciConfigIo, PcieRootComplex, SharedRootComplex,
 };
-use enlil_devices::timer::Pit;
+use enlil_devices::ps2::SharedI8042;
+use enlil_devices::timer::{Pit, SharedPit, SharedRtc};
 
 /// The system device bus: a PIO bus and an MMIO bus behind one exit handler.
 #[derive(Default)]
@@ -88,6 +89,20 @@ impl DeviceBus {
     /// already-registered device.
     pub fn add_pit(&mut self, pit: Pit) -> Result<(), enlil_devices::bus::BusError> {
         self.add_pio(Box::new(pit))
+    }
+
+    /// Mount a [`SharedPit`] on the PIO bus over `0x40..=0x43`, like
+    /// [`add_pit`](Self::add_pit), but keeping a caller-owned handle to the same
+    /// PIT. A boxed `Pit` is reachable only through its `PioDevice` methods, so
+    /// nothing could advance it once mounted; with a `SharedPit` the run loop /
+    /// timer thread holds a clone and calls `tick` to drive channel-0 IRQ0 while
+    /// the guest programs the counters through the ports.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if the PIT's range overlaps an
+    /// already-registered device.
+    pub fn add_pit_shared(&mut self, pit: &SharedPit) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_pio(Box::new(pit.port()))
     }
 
     /// Mount the legacy PCI **Configuration Mechanism #1** front-end
@@ -179,9 +194,12 @@ impl DeviceBus {
     }
 
     /// Like [`standard_pc`](Self::standard_pc), but additionally wires the legacy
-    /// devices' interrupt lines into `pic` so they actually reach a vCPU: the
-    /// 8254 PIT's channel-0 line drives [`IRQ_PIT`] and the COM1 16550's line
-    /// drives [`IRQ_COM1`]. Each device pulses its line through `pic`, which
+    /// devices' interrupt lines into `pic` so they actually reach a vCPU. Each
+    /// line is wired through [`SharedInterruptController::isa_line`], which
+    /// applies the standard-PC interrupt-source overrides: the 8254 PIT's
+    /// channel-0 line ([`IRQ_PIT`]) lands on **GSI 2** — the pin the MADT
+    /// advertises for the timer — and the COM1 16550's line ([`IRQ_COM1`])
+    /// identity-maps to GSI 4. Each device pulses its line through `pic`, which
     /// routes it through the I/O APIC RTE to the destination LAPIC's IRR.
     ///
     /// The caller owns `pic` (it clones a handle into each line) so it can mount
@@ -202,12 +220,16 @@ impl DeviceBus {
     ) -> Result<(Self, SharedRootComplex), enlil_devices::bus::BusError> {
         let mut bus = Self::new();
 
+        // I/O APIC lines go through `isa_line`, which applies the standard-PC
+        // interrupt-source overrides: the PIT (ISA IRQ0) lands on GSI 2 — the
+        // pin the MADT advertises and the guest programs — while COM1 (IRQ4)
+        // identity-maps.
         let mut com1 = SerialPort::com1(serial_output);
-        com1.attach_irq_line(Box::new(pic.line(IRQ_COM1)));
+        com1.attach_irq_line(Box::new(pic.isa_line(IRQ_COM1)));
         bus.add_serial(com1)?;
 
         let mut pit = Pit::new();
-        pit.attach_irq0(Box::new(pic.line(IRQ_PIT)));
+        pit.attach_irq0(Box::new(pic.isa_line(IRQ_PIT)));
         bus.add_pit(pit)?;
 
         bus.add_ioapic(pic)?;
@@ -232,18 +254,57 @@ impl DeviceBus {
     }
 
     /// Mount the legacy dual-8259 [`SharedPic`] front-end on the PIO bus: the
-    /// master's two ports (`0x20`/`0x21`) and the slave's (`0xA0`/`0xA1`). This
-    /// is the interrupt controller early boot programs *before* the OS switches
-    /// to the I/O APIC; without it those ports read back as open-bus and the
-    /// guest cannot mask/EOI or read the PIC, stalling early-boot interrupt
-    /// setup.
+    /// master's two ports (`0x20`/`0x21`), the slave's (`0xA0`/`0xA1`), and the
+    /// chipset ELCR ports (`0x4D0`/`0x4D1`). This is the interrupt controller
+    /// early boot programs *before* the OS switches to the I/O APIC; without it
+    /// those ports read back as open-bus and the guest cannot mask/EOI or read
+    /// the PIC, stalling early-boot interrupt setup. The ELCR lets the guest
+    /// select per-line edge vs level triggering (PCI INTx lines are level).
     ///
     /// # Errors
-    /// Propagates [`enlil_devices::bus::BusError`] if either port pair overlaps
+    /// Propagates [`enlil_devices::bus::BusError`] if any port range overlaps
     /// an already-registered device.
     pub fn add_pic(&mut self, pic: &SharedPic) -> Result<(), enlil_devices::bus::BusError> {
         self.add_pio(Box::new(pic.master_port()))?;
         self.add_pio(Box::new(pic.slave_port()))?;
+        self.add_pio(Box::new(pic.elcr_port()))?;
+        Ok(())
+    }
+
+    /// Mount the MC146818 RTC / CMOS front-end on the PIO bus over its index and
+    /// data ports (`0x70`/`0x71`). A guest reads the time-of-day and CMOS
+    /// equipment config here at boot, and writes the NMI-disable bit through the
+    /// index port; without it those ports read back open-bus `0xFF`.
+    ///
+    /// The caller owns `rtc` (a [`SharedRtc`]) so it can advance the wall clock
+    /// (`tick_second`), inject the guest's view of time, and attach the IRQ8
+    /// sink — e.g. `rtc.with(|r| r.attach_irq(Box::new(pic.line(8))))` for the
+    /// 8259, or `ioapic.isa_line(8)` for the I/O APIC.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if the port pair overlaps an
+    /// already-registered device.
+    pub fn add_rtc(&mut self, rtc: &SharedRtc) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_pio(Box::new(rtc.port()))
+    }
+
+    /// Mount the i8042 PS/2 controller front-end on the PIO bus: the data port
+    /// (`0x60`) and the status/command port (`0x64`). It deliberately leaves
+    /// `0x61`-`0x63` unclaimed — those are the PC-speaker / NMI status ports of
+    /// other chipset functions. A guest probes the keyboard/mouse here early in
+    /// boot (Windows before USB HID, Linux's `i8042` driver); without it the
+    /// ports read open-bus `0xFF`.
+    ///
+    /// The caller owns `ps2` (a [`SharedI8042`]) so it can inject host input and
+    /// attach the IRQ1 (keyboard) / IRQ12 (mouse) sinks — e.g.
+    /// `ps2.attach_kbd_irq(Box::new(pic.line(1)))`.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if either port overlaps an
+    /// already-registered device.
+    pub fn add_ps2(&mut self, ps2: &SharedI8042) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_pio(Box::new(ps2.data_port()))?;
+        self.add_pio(Box::new(ps2.cmd_port()))?;
         Ok(())
     }
 
@@ -299,10 +360,12 @@ impl DeviceBus {
     /// controller the guest has unmasked delivers it. PIT channel-0 drives
     /// [`IRQ_PIT`] and COM1 drives [`IRQ_COM1`] on both controllers.
     ///
-    /// (The ISA-IRQ→GSI identity mapping here matches
-    /// [`standard_pc_with_interrupts`](Self::standard_pc_with_interrupts); the
-    /// MADT interrupt-source-override that remaps ISA IRQ0→GSI 2 is a separate
-    /// ACPI-correctness item and is not modelled yet.)
+    /// The two controllers see different "pins" for the same line: the 8259
+    /// takes the bare ISA IRQ (timer on IRQ0), while the I/O APIC side goes
+    /// through [`SharedInterruptController::isa_line`], which applies the MADT
+    /// interrupt-source overrides — so the PIT lands on GSI 2 (the pin the guest
+    /// programs from the MADT) on the APIC path and on IRQ0 on the PIC path,
+    /// exactly as a real PC/AT wires it.
     ///
     /// Returns the assembled bus and the [`SharedRootComplex`] handle.
     ///
@@ -320,7 +383,7 @@ impl DeviceBus {
         // per-controller sinks, and is itself `Fn(bool) + Send`, so it satisfies
         // both crate-local `IrqLine` traits via their blanket impls.
         let com1_pic = pic.line(IRQ_COM1);
-        let com1_apic = ioapic.line(IRQ_COM1);
+        let com1_apic = ioapic.isa_line(IRQ_COM1);
         let mut com1 = SerialPort::com1(serial_output);
         com1.attach_irq_line(Box::new(move |level: bool| {
             com1_pic(level);
@@ -329,7 +392,7 @@ impl DeviceBus {
         bus.add_serial(com1)?;
 
         let pit_pic = pic.line(IRQ_PIT);
-        let pit_apic = ioapic.line(IRQ_PIT);
+        let pit_apic = ioapic.isa_line(IRQ_PIT);
         let mut pit = Pit::new();
         pit.attach_irq0(Box::new(move |level: bool| {
             pit_pic(level);
@@ -799,6 +862,136 @@ mod tests {
         assert_eq!(pic.with(|p| p.pending_vector()), Some(0x24));
         // ...and the I/O APIC routed it to LAPIC 0 with its (different) vector.
         assert_eq!(ioapic.with(|c| c.pending_vector(0)), Some(0x34));
+    }
+
+    #[test]
+    fn shared_pit_ticked_from_a_handle_routes_irq0_to_gsi_2() {
+        use enlil_devices::interrupt::SharedInterruptController;
+        use enlil_devices::timer::SharedPit;
+
+        // The end-to-end PIT timer path the override-aware wiring enables: a
+        // guest reads GSI 2 for the timer from the MADT and programs that RTE;
+        // the PIT, wired via isa_line(0), must assert GSI 2 — and a SharedPit
+        // lets us actually tick it after it is mounted on the bus.
+        let pic = SharedInterruptController::new(1);
+        pic.with(|c| c.lapics[0].write_register(0x0F0, 0x1FF));
+        let pit = SharedPit::new();
+        pit.with(|p| p.attach_irq0(Box::new(pic.isa_line(0)))); // IRQ0 -> GSI 2
+
+        let mut bus = DeviceBus::new();
+        bus.add_pit_shared(&pit).unwrap();
+        bus.add_ioapic(&pic).unwrap();
+        assert!(bus.pio.is_mapped(0x40));
+
+        // Program GSI 2's RTE (REDTBL 0x10 + 2*2 = 0x14) -> vector 0x40, LAPIC 0.
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0000, &0x14u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0010, &0x40u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0000, &0x15u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0010, &0u32.to_le_bytes());
+
+        // Guest programs channel 0: mode 2 (rate generator), a short reload.
+        VmExitHandler::io_out(&mut bus, 0x43, &[0x34]); // ch0, lo/hi, mode 2
+        VmExitHandler::io_out(&mut bus, 0x40, &[2]); // reload low
+        VmExitHandler::io_out(&mut bus, 0x40, &[0]); // reload high
+
+        // No interrupt until the timer thread advances the PIT past its count.
+        assert!(!pic.with(|c| c.has_pending(0)));
+        for _ in 0..4 {
+            let _ = pit.tick(1000); // ~1.2 ticks each at 838 ns/tick
+        }
+        assert_eq!(pic.with(|c| c.pending_vector(0)), Some(0x40));
+    }
+
+    #[test]
+    fn ps2_keyboard_irq1_routes_through_the_ioapic() {
+        use enlil_devices::interrupt::SharedInterruptController;
+        use enlil_devices::ps2::SharedI8042;
+
+        let pic = SharedInterruptController::new(1);
+        pic.with(|c| c.lapics[0].write_register(0x0F0, 0x1FF));
+        let ps2 = SharedI8042::new();
+        ps2.attach_kbd_irq(Box::new(pic.isa_line(1))); // IRQ1, identity GSI 1
+
+        let mut bus = DeviceBus::new();
+        bus.add_ps2(&ps2).unwrap();
+        bus.add_ioapic(&pic).unwrap();
+        assert!(bus.pio.is_mapped(0x60));
+        assert!(bus.pio.is_mapped(0x64));
+        assert!(
+            !bus.pio.is_mapped(0x61),
+            "speaker/NMI port must stay open-bus"
+        );
+
+        // Program GSI 1's RTE (REDTBL 0x10 + 1*2 = 0x12) -> vector 0x31, LAPIC 0.
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0000, &0x12u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0010, &0x31u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0000, &0x13u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0010, &0u32.to_le_bytes());
+
+        // A host keypress raises IRQ1, which routes through the RTE to LAPIC 0.
+        ps2.inject_key(0x1E);
+        assert_eq!(pic.with(|c| c.pending_vector(0)), Some(0x31));
+
+        // The guest reads the scancode from the data port; IRQ1 deasserts.
+        let mut sc = [0u8; 1];
+        VmExitHandler::io_in(&mut bus, 0x60, &mut sc);
+        assert_eq!(sc[0], 0x1E);
+    }
+
+    #[test]
+    fn rtc_reads_the_time_through_the_bus_ports() {
+        use enlil_devices::timer::{RtcTime, SharedRtc, RTC_INDEX};
+
+        // 2026-06-07T13:14:15Z.
+        let rtc = SharedRtc::new(RtcTime::from_unix(1_780_838_055));
+        let mut bus = DeviceBus::new();
+        bus.add_rtc(&rtc).unwrap();
+        assert!(bus.pio.is_mapped(RTC_INDEX));
+
+        // Select the hours register (index port), then read the data port — the
+        // RTC defaults to 24-hour binary mode, so 13 reads back as 13.
+        VmExitHandler::io_out(&mut bus, RTC_INDEX, &[0x04]);
+        let mut data = [0u8; 1];
+        VmExitHandler::io_in(&mut bus, 0x71, &mut data);
+        assert_eq!(data[0], 13);
+
+        // The index port is write-only: it reads back open-bus 0xFF.
+        let mut idx = [0u8; 1];
+        VmExitHandler::io_in(&mut bus, RTC_INDEX, &mut idx);
+        assert_eq!(idx[0], 0xFF);
+    }
+
+    #[test]
+    fn rtc_irq8_routes_through_the_ioapic_to_a_vcpu() {
+        use enlil_devices::interrupt::SharedInterruptController;
+        use enlil_devices::timer::{RtcTime, SharedRtc};
+
+        let pic = SharedInterruptController::new(1);
+        pic.with(|c| c.lapics[0].write_register(0x0F0, 0x1FF));
+        let rtc = SharedRtc::new(RtcTime::from_unix(1_780_838_055));
+        // Wire RTC IRQ8 into the I/O APIC (GSI 8, identity) and enable the
+        // update-ended interrupt (Register B: DM | 24H | UIE).
+        rtc.with(|r| {
+            r.attach_irq(Box::new(pic.isa_line(8)));
+            r.write_index(0x0B);
+            r.write_data(0x04 | 0x02 | 0x10);
+        });
+
+        let mut bus = DeviceBus::new();
+        bus.add_rtc(&rtc).unwrap();
+        bus.add_ioapic(&pic).unwrap();
+
+        // Program GSI 8's RTE through the aperture (vector 0x38 -> LAPIC 0):
+        // REDTBL base 0x10 + 8*2 = 0x20 (low), 0x21 (high).
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0000, &0x20u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0010, &0x38u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0000, &0x21u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0010, &0u32.to_le_bytes());
+
+        // A one-second tick raises the update-ended interrupt, which routes
+        // through GSI 8's RTE into LAPIC 0.
+        assert!(rtc.with(enlil_devices::timer::Rtc146818::tick_second));
+        assert_eq!(pic.with(|c| c.pending_vector(0)), Some(0x38));
     }
 
     #[test]

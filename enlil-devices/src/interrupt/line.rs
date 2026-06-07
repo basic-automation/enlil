@@ -29,6 +29,37 @@ use crate::truncate::u32_of;
 /// Size of the I/O APIC MMIO aperture (one 4 KiB page at [`IOAPIC_BASE`]).
 const IOAPIC_MMIO_SIZE: u64 = 0x1000;
 
+/// Standard-PC ACPI interrupt-source overrides that change the *Global System
+/// Interrupt* (I/O APIC pin) number an ISA IRQ is delivered on.
+///
+/// On a PC/AT the only override that renumbers a GSI is the system timer:
+/// ISA IRQ0 (the 8254 PIT) is wired to I/O APIC pin 2, not pin 0 — the classic
+/// `(bus 0, source 0) -> GSI 2` MADT interrupt-source-override. Every other ISA
+/// IRQ identity-maps to its own GSI. This table is the wiring-side companion to
+/// the override `MadtBuilder::standard` advertises, so a guest that programs the
+/// I/O APIC from the MADT and the device line that feeds it agree on the pin
+/// (see [`SharedInterruptController::isa_line`]).
+///
+/// The polarity/trigger overrides (e.g. the active-low, level-triggered SCI)
+/// keep the same GSI number, so they do not appear here — they are encoded in
+/// the RTE the guest programs, not in this pin remapping.
+const STANDARD_PC_GSI_OVERRIDES: &[(u8, u32)] = &[(0, 2)];
+
+/// Resolve an ISA IRQ to the Global System Interrupt (I/O APIC pin) it is
+/// delivered on under the standard-PC interrupt-source overrides.
+///
+/// Returns GSI 2 for the PC/AT timer (ISA IRQ0) and an identity mapping for
+/// every other line. This is the single source of truth shared by the device
+/// line wiring ([`SharedInterruptController::isa_line`]) and cross-checked
+/// against the MADT the guest reads.
+#[must_use]
+pub fn isa_to_gsi(isa_irq: u8) -> u32 {
+    STANDARD_PC_GSI_OVERRIDES
+        .iter()
+        .find_map(|&(src, gsi)| (src == isa_irq).then_some(gsi))
+        .unwrap_or_else(|| u32::from(isa_irq))
+}
+
 /// A thread-safe, shareable handle to one [`InterruptController`].
 ///
 /// vCPUs run on separate threads and a device fires from whichever thread owns
@@ -80,6 +111,24 @@ impl SharedInterruptController {
                 }
             });
         }
+    }
+
+    /// Build a level sink for an ISA device IRQ, resolving the standard-PC
+    /// interrupt-source overrides ([`isa_to_gsi`]) to the I/O APIC pin the line
+    /// actually drives.
+    ///
+    /// This is the I/O APIC counterpart to [`line`](Self::line): a device named
+    /// by its legacy ISA IRQ (e.g. the 8254 PIT on IRQ0) is wired to the GSI the
+    /// MADT advertises (IRQ0 → GSI 2), so a guest that programs the redirection
+    /// table from the MADT unmasks the same pin the line asserts. For lines with
+    /// no override it is identical to [`line`](Self::line). Use this — not
+    /// [`line`](Self::line) — whenever an ISA device feeds the I/O APIC; the raw
+    /// [`line`](Self::line) (or the 8259 front-end) still takes the bare ISA IRQ.
+    pub fn isa_line(&self, isa_irq: u8) -> impl Fn(bool) + Send + use<> {
+        // GSIs for ISA lines fit in the 24-pin I/O APIC; fall back to the raw
+        // IRQ if a future override ever exceeds a u8.
+        let pin = u8::try_from(isa_to_gsi(isa_irq)).unwrap_or(isa_irq);
+        self.line(pin)
     }
 }
 
@@ -240,6 +289,90 @@ mod tests {
     fn mmio_aperture_covers_the_ioapic_page() {
         let mmio = IoApicMmio::new(SharedInterruptController::new(1));
         assert_eq!(mmio.mmio_range(), (0xFEC0_0000, 0xFEC0_1000));
+    }
+
+    #[test]
+    fn isa_to_gsi_remaps_only_the_timer() {
+        // PC/AT timer (ISA IRQ0) is on GSI 2; every other line identity-maps.
+        assert_eq!(isa_to_gsi(0), 2);
+        for irq in 1..16u8 {
+            assert_eq!(
+                isa_to_gsi(irq),
+                u32::from(irq),
+                "IRQ{irq} must identity-map"
+            );
+        }
+    }
+
+    /// The wiring-side override table ([`isa_to_gsi`]) must agree with the
+    /// timer interrupt-source-override the MADT advertises to the guest — if
+    /// they ever drift, a guest that programs the I/O APIC from the MADT would
+    /// unmask a pin the PIT line never drives, and the timer would silently die.
+    #[test]
+    fn isa_to_gsi_agrees_with_the_madt_timer_override() {
+        use crate::acpi::madt::MadtBuilder;
+
+        let madt = MadtBuilder::standard(1).build();
+
+        // Walk the variable-length entry list past the 36-byte SDT header and the
+        // 8 bytes of fixed MADT fields, looking for the type-2 override whose
+        // source bus/IRQ is ISA IRQ0.
+        let mut offset = 44;
+        let mut timer_gsi = None;
+        while offset + 1 < madt.len() {
+            let entry_type = madt[offset];
+            let entry_len = madt[offset + 1] as usize;
+            if entry_type == 2 && madt[offset + 2] == 0 && madt[offset + 3] == 0 {
+                timer_gsi = Some(u32::from_le_bytes(
+                    madt[offset + 4..offset + 8].try_into().unwrap(),
+                ));
+                break;
+            }
+            offset += entry_len.max(1);
+        }
+
+        assert_eq!(
+            timer_gsi,
+            Some(isa_to_gsi(0)),
+            "MADT timer override GSI must match the line wiring's isa_to_gsi(0)"
+        );
+    }
+
+    #[test]
+    fn isa_line_delivers_the_timer_on_gsi_2_not_pin_0() {
+        // A guest that reads the MADT programs the timer's RTE on GSI 2. The PIT
+        // line, wired via isa_line(IRQ0), must assert that pin — pin 0 stays dark.
+        let pic = SharedInterruptController::new(1);
+        program(&pic, 2, 0x20); // GSI 2 RTE -> vector 0x20 (the timer)
+        pic.with(|c| c.lapics[0].write_register(LAPIC_SVR, 0x1FF));
+
+        let timer = pic.isa_line(0);
+        timer(true);
+        assert_eq!(pic.with(|c| c.pending_vector(0)), Some(0x20));
+    }
+
+    #[test]
+    fn isa_line_leaving_pin_0_unprogrammed_delivers_nothing() {
+        // The flip side: if the guest had (incorrectly) programmed pin 0 instead
+        // of GSI 2, the override-aware line would deliver nothing — proving the
+        // line drives GSI 2 and not the bare IRQ number.
+        let pic = SharedInterruptController::new(1);
+        program(&pic, 0, 0x20); // pin 0, the pre-override (wrong) pin
+        pic.with(|c| c.lapics[0].write_register(LAPIC_SVR, 0x1FF));
+
+        pic.isa_line(0)(true);
+        assert!(!pic.with(|c| c.has_pending(0)));
+    }
+
+    #[test]
+    fn isa_line_is_identity_for_non_overridden_lines() {
+        // COM1 (IRQ4) has no override, so isa_line and line target the same pin.
+        let pic = SharedInterruptController::new(1);
+        program(&pic, 4, 0x24);
+        pic.with(|c| c.lapics[0].write_register(LAPIC_SVR, 0x1FF));
+
+        pic.isa_line(4)(true);
+        assert_eq!(pic.with(|c| c.pending_vector(0)), Some(0x24));
     }
 
     #[test]
