@@ -326,6 +326,30 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > edges, and `ElcrPort` is a `PioDevice` mounted by `add_pic`. **Still to do for the PIC:** the KVM
 > binding — route PIC INTR via LAPIC LINT0 ExtINT (or the in-kernel `KVM_CREATE_IRQCHIP`, which
 > already models the dual-8259) once a `/dev/kvm`-capable runner exists.
+>
+> **Status (2026-06-07d):** the **transparent standard PC is now assembled in one call and its
+> ACPI PM hardware is real.** `DeviceBus::standard_pc_complete` builds the full legacy PC —
+> COM1, PIT, RTC, PS/2, System Control Ports A/B, the ACPI PM1a/PM_TMR/GPE0 blocks, both 8259s,
+> the I/O APIC and PCIe — with **every** device IRQ teed into both the PIC and the I/O APIC
+> (the `dual_irq_line` helper), and returns a `StandardPc` bundle of shared handles (pic,
+> ioapic, rtc, ps2, pit, hpet, pm_timer, pm1) the run loop binds to. New legacy/chipset devices,
+> all pure-userspace and tested: **System Control Port B** (`0x61`: PIT-ch2 gate + PC speaker +
+> refresh/OUT readback), **System Control Port A** (`0x92`: fast A20 + fast-reset latch), the
+> **ACPI PM timer** (`0x608`, 32-bit per the FADT `TMR_VAL_EXT` flag), the **ACPI PM1a
+> event/control block** (`0x600`/`0x604`: the `SLP_TYP|SLP_EN` **shutdown** path via a
+> `take_sleep` latch), and the **GPE0 block** (`0x620`: status starts clear so ACPI init is
+> quiet). The **HPET** model is now bus-mounted (`HpetMmio` at `0xFED0_0000`, bridging the
+> aligned-register model to 32/64-bit guest accesses). **FADT transparency fix:**
+> `HW_REDUCED_ACPI` was wrongly set alongside the legacy PM hardware + `LEGACY_DEVICES`
+> (mutually exclusive); cleared it, and the FADT now **derives** its PM-block ports from the
+> device models (`chipset::{PM1_EVT_PORT,PM1_CNT_PORT,GPE0_PORT}`, `timer::PM_TIMER_PORT`) so
+> the table and the decoded hardware can't drift (cross-check test). A **PIIX3 PIRQ router**
+> model (`interrupt::pirq::PirqRouter`: PIRQRC registers + PCI slot/pin swizzle + PIC-mode
+> ISA-IRQ / APIC-mode GSI-16-19 resolution, paired with the ELCR's level IRR) is in;
+> **still to do:** the live PIRQ path (a PIIX bridge device whose config 0x60-0x63 writes drive
+> the router and PCI INTx assertions drive the controllers), HPET/PM1/GPE0 **SCI/IRQ delivery**
+> (needs the run loop), and the run-loop bindings for the A20/reset/sleep latches — all of which
+> wait on the `/dev/kvm` KVM binding (still no nested virt on the runner).
 
 ### 0.3 USB Live Boot & Non-Destructive Testing (CRITICAL FOR ADOPTION)
 
