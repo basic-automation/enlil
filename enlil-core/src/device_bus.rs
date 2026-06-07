@@ -21,7 +21,7 @@ use enlil_devices::pcie::{
     vendors, EcamSpace, PciBdf, PciConfigIo, PcieRootComplex, SharedRootComplex,
 };
 use enlil_devices::ps2::{SharedI8042, PS2_KBD_IRQ, PS2_MOUSE_IRQ};
-use enlil_devices::timer::{Pit, RtcTime, SharedPit, SharedRtc, RTC_IRQ};
+use enlil_devices::timer::{Pit, RtcTime, SharedPit, SharedRtc, SystemControlPortB, RTC_IRQ};
 
 /// The system device bus: a PIO bus and an MMIO bus behind one exit handler.
 #[derive(Default)]
@@ -308,6 +308,26 @@ impl DeviceBus {
         Ok(())
     }
 
+    /// Mount **System Control Port B** ([`SystemControlPortB`]) at `0x61` — the
+    /// chipset NMI status/control register that also gates the PIT's channel-2
+    /// tone (the PC speaker) and reports its OUT pin and the DRAM-refresh clock.
+    /// It lives between the i8042's two ports, which is why [`add_ps2`] leaves
+    /// `0x61` unclaimed; this method, coupled to the same [`SharedPit`] the run
+    /// loop ticks, fills it in. Without it a guest beeping through the speaker or
+    /// polling the refresh bit for timing reads back open-bus `0xFF`.
+    ///
+    /// [`add_ps2`]: Self::add_ps2
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if `0x61` overlaps an
+    /// already-registered device.
+    pub fn add_system_control_b(
+        &mut self,
+        pit: &SharedPit,
+    ) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_pio(Box::new(SystemControlPortB::new(pit.clone())))
+    }
+
     /// Like [`standard_pc`](Self::standard_pc), but wires the legacy devices'
     /// interrupt lines into the dual-8259 `pic` (the early-boot interrupt
     /// controller) and mounts its four ports: the 8254 PIT's channel-0 line
@@ -449,6 +469,10 @@ impl DeviceBus {
         // timer thread can tick it once mounted.
         pit.with(|p| p.attach_irq0(Box::new(dual_irq_line(&pic, &ioapic, IRQ_PIT))));
         bus.add_pit_shared(&pit)?;
+
+        // System Control Port B (0x61): PIT channel-2 gate + PC speaker, sharing
+        // the same PIT handle.
+        bus.add_system_control_b(&pit)?;
 
         // MC146818 RTC/CMOS (IRQ8).
         rtc.with(|r| r.attach_irq(Box::new(dual_irq_line(&pic, &ioapic, RTC_IRQ))));
@@ -1128,9 +1152,11 @@ mod tests {
         } = pc;
 
         // Every legacy device a guest touches at boot is mounted at its canonical
-        // address: COM1, PIT, RTC, PS/2 data+cmd, both 8259s, the ELCR, and the
-        // PCIe CAM ports — plus the I/O APIC MMIO page.
-        for port in [0x3F8u16, 0x40, 0x70, 0x60, 0x64, 0x20, 0xA0, 0x4D0, 0xCF8] {
+        // address: COM1, PIT, System Control Port B (0x61), RTC, PS/2 data+cmd,
+        // both 8259s, the ELCR, and the PCIe CAM ports — plus the I/O APIC page.
+        for port in [
+            0x3F8u16, 0x40, 0x61, 0x70, 0x60, 0x64, 0x20, 0xA0, 0x4D0, 0xCF8,
+        ] {
             assert!(
                 bus.pio.is_mapped(port),
                 "PIO port {port:#x} should be mapped"
@@ -1140,8 +1166,6 @@ mod tests {
             bus.mmio.is_mapped(0xFEC0_0000),
             "I/O APIC page should be mapped"
         );
-        // The PC-speaker / NMI status port is deliberately left open-bus.
-        assert!(!bus.pio.is_mapped(0x61), "0x61 must stay open-bus");
 
         // Bring up LAPIC 0 and program the PC/AT 8259 layout (master base 0x20),
         // then unmask every line on both chips.
