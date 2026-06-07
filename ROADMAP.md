@@ -305,9 +305,14 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > PIT + PCIe + the four PIC ports, with PIT→IRQ0/UART→IRQ4 wired into the `SharedPic` — the PIC
 > counterpart to `standard_pc_with_interrupts`; a guest programs the PIC through the bus
 > (ICW1-4/OCW1) and a device IRQ routes through it to `pending_vector()`/`acknowledge()` (2
-> `DeviceBus` tests, no KVM). **Still to do for the PIC:** (1) a *tee* so one device line drives
-> **both** the PIC and the I/O APIC inputs (real hardware wires the same IRQ to both; software
-> masks the unused one) rather than today's either/or factories; (2) the KVM binding — route PIC
+> `DeviceBus` tests, no KVM). `DeviceBus::standard_pc_with_dual_irq` now provides the
+> transparent, hardware-accurate config: each legacy device line is *teed* into **both** the PIC
+> and the I/O APIC (real hardware wires the same IRQ to both; the OS masks the unused path), so one
+> device event drives both controllers and the PIC→I/O APIC switchover at boot is seamless — the
+> guest just masks whichever it isn't using (1 `DeviceBus` test asserting both controllers latch a
+> single IRQ4 with their own vectors). **Still to do for the PIC:** (1) the MADT
+> interrupt-source-override (ISA IRQ0→GSI 2) so the I/O APIC pin numbering matches what ACPI tells
+> the guest — currently identity-mapped in both APIC factories; (2) the KVM binding — route PIC
 > INTR via LAPIC LINT0 ExtINT (or the in-kernel `KVM_CREATE_IRQCHIP`, which already models the
 > dual-8259) once a `/dev/kvm`-capable runner exists.
 

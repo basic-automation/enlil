@@ -285,6 +285,64 @@ impl DeviceBus {
         let pcie = bus.add_pcie(PcieRootComplex::new(DEFAULT_ECAM_BASE))?;
         Ok((bus, pcie))
     }
+
+    /// The transparent, hardware-accurate interrupt config: each legacy device
+    /// line drives **both** the dual-8259 `pic` and the I/O APIC `ioapic`, and
+    /// both front-ends are mounted (PIC ports `0x20`/`0x21`/`0xA0`/`0xA1` and the
+    /// I/O APIC aperture at `0xFEC0_0000`).
+    ///
+    /// On real hardware an ISA IRQ line is wired to *both* the 8259 input and the
+    /// I/O APIC pin; firmware/the OS leaves one path masked (PIC mode at boot,
+    /// then it masks the PIC and switches to the I/O APIC). Modelling both as
+    /// live — with the guest masking whichever it isn't using — is what keeps the
+    /// switchover transparent: the device asserts one line and whichever
+    /// controller the guest has unmasked delivers it. PIT channel-0 drives
+    /// [`IRQ_PIT`] and COM1 drives [`IRQ_COM1`] on both controllers.
+    ///
+    /// (The ISA-IRQ→GSI identity mapping here matches
+    /// [`standard_pc_with_interrupts`](Self::standard_pc_with_interrupts); the
+    /// MADT interrupt-source-override that remaps ISA IRQ0→GSI 2 is a separate
+    /// ACPI-correctness item and is not modelled yet.)
+    ///
+    /// Returns the assembled bus and the [`SharedRootComplex`] handle.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if any two devices' ranges
+    /// overlap (they do not at these canonical addresses).
+    pub fn standard_pc_with_dual_irq(
+        serial_output: SerialOutput,
+        pic: &SharedPic,
+        ioapic: &SharedInterruptController,
+    ) -> Result<(Self, SharedRootComplex), enlil_devices::bus::BusError> {
+        let mut bus = Self::new();
+
+        // Tee each device line to both controllers: the closure calls both
+        // per-controller sinks, and is itself `Fn(bool) + Send`, so it satisfies
+        // both crate-local `IrqLine` traits via their blanket impls.
+        let com1_pic = pic.line(IRQ_COM1);
+        let com1_apic = ioapic.line(IRQ_COM1);
+        let mut com1 = SerialPort::com1(serial_output);
+        com1.attach_irq_line(Box::new(move |level: bool| {
+            com1_pic(level);
+            com1_apic(level);
+        }));
+        bus.add_serial(com1)?;
+
+        let pit_pic = pic.line(IRQ_PIT);
+        let pit_apic = ioapic.line(IRQ_PIT);
+        let mut pit = Pit::new();
+        pit.attach_irq0(Box::new(move |level: bool| {
+            pit_pic(level);
+            pit_apic(level);
+        }));
+        bus.add_pit(pit)?;
+
+        bus.add_pic(pic)?;
+        bus.add_ioapic(ioapic)?;
+
+        let pcie = bus.add_pcie(PcieRootComplex::new(DEFAULT_ECAM_BASE))?;
+        Ok((bus, pcie))
+    }
 }
 
 /// Legacy ISA IRQ line for the 8254 PIT channel-0 (system timer).
@@ -689,6 +747,58 @@ mod tests {
         // Unmasking through the bus lets the latched request through.
         VmExitHandler::io_out(&mut bus, MASTER_DATA, &[0x00]);
         assert_eq!(pic.with(|p| p.pending_vector()), Some(0x24));
+    }
+
+    #[test]
+    fn standard_pc_with_dual_irq_drives_both_controllers_from_one_line() {
+        use crate::serial::{SerialOutput, SerialOutputMode, COM1, IER_REG};
+        use enlil_devices::interrupt::{
+            SharedInterruptController, SharedPic, MASTER_CMD, MASTER_DATA, SLAVE_CMD, SLAVE_DATA,
+        };
+
+        let pic = SharedPic::new();
+        let ioapic = SharedInterruptController::new(1);
+        // Enable LAPIC 0 (SVR) as the guest would when bringing up the APIC.
+        ioapic.with(|c| c.lapics[0].write_register(0x0F0, 0x1FF));
+
+        let (mut bus, _pcie) = DeviceBus::standard_pc_with_dual_irq(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            &pic,
+            &ioapic,
+        )
+        .unwrap();
+
+        // Both front-ends are present: the four PIC ports and the I/O APIC page.
+        assert!(bus.pio.is_mapped(MASTER_CMD));
+        assert!(bus.pio.is_mapped(SLAVE_CMD));
+        assert!(bus.mmio.is_mapped(0xFEC0_0000));
+
+        // Program the 8259 master for the PC/AT layout (IRQ4 -> vector 0x24).
+        VmExitHandler::io_out(&mut bus, MASTER_CMD, &[0x11]);
+        VmExitHandler::io_out(&mut bus, MASTER_DATA, &[0x20]);
+        VmExitHandler::io_out(&mut bus, MASTER_DATA, &[0x04]);
+        VmExitHandler::io_out(&mut bus, MASTER_DATA, &[0x01]);
+        VmExitHandler::io_out(&mut bus, SLAVE_CMD, &[0x11]);
+        VmExitHandler::io_out(&mut bus, SLAVE_DATA, &[0x28]);
+        VmExitHandler::io_out(&mut bus, SLAVE_DATA, &[0x02]);
+        VmExitHandler::io_out(&mut bus, SLAVE_DATA, &[0x01]);
+        VmExitHandler::io_out(&mut bus, MASTER_DATA, &[0x00]);
+        VmExitHandler::io_out(&mut bus, SLAVE_DATA, &[0x00]);
+
+        // Program IRQ4's I/O APIC RTE through the aperture (vector 0x34 -> LAPIC 0).
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0000, &0x18u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0010, &0x34u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0000, &0x19u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0010, &0u32.to_le_bytes());
+
+        // One device event (enable THRE interrupt) asserts the single IRQ4 line,
+        // which the tee drives into *both* controllers simultaneously.
+        VmExitHandler::io_out(&mut bus, COM1 + IER_REG, &[0x02]);
+
+        // The 8259 has it pending with its vector...
+        assert_eq!(pic.with(|p| p.pending_vector()), Some(0x24));
+        // ...and the I/O APIC routed it to LAPIC 0 with its (different) vector.
+        assert_eq!(ioapic.with(|c| c.pending_vector(0)), Some(0x34));
     }
 
     #[test]
