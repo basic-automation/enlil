@@ -24,6 +24,17 @@
 //! non-specific EOI, so this keeps the model honest and testable rather than
 //! half-implementing rotation. Lines are modelled edge-triggered (the ISA
 //! default); a request latches in the IRR and is cleared on acknowledge.
+//!
+//! [`SharedPic`] wraps a [`DualPic`] behind an `Arc<Mutex<_>>` (mirroring
+//! [`SharedInterruptController`](super::SharedInterruptController)) and exposes
+//! the two PIO port adapters a guest programs through ([`PicMasterPort`] /
+//! [`PicSlavePort`]) plus a `.line(irq)` level-sink factory so device models
+//! assert into the PIC exactly as they do the I/O APIC.
+
+use std::sync::{Arc, Mutex};
+
+use crate::bus::PioDevice;
+use crate::truncate::u8_of;
 
 /// Master PIC command port (ICW1 / OCW2 / OCW3).
 pub const MASTER_CMD: u16 = 0x20;
@@ -463,6 +474,123 @@ impl Default for DualPic {
     }
 }
 
+/// A thread-safe, shareable handle to one [`DualPic`].
+///
+/// vCPUs run on separate threads and a device fires its IRQ from whichever
+/// thread owns it, so the pair is guarded by a `Mutex` — matching the `Send`
+/// bound the device `IrqLine` traits require. Cloning shares the same PIC. This
+/// mirrors [`SharedInterruptController`](super::SharedInterruptController) so
+/// the legacy PIC and the I/O APIC are wired the same way.
+#[derive(Clone)]
+pub struct SharedPic(Arc<Mutex<DualPic>>);
+
+impl SharedPic {
+    /// Wrap a fresh, uninitialized master/slave pair.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Arc::new(Mutex::new(DualPic::new())))
+    }
+
+    /// Wrap an already-built pair (e.g. one initialized for the PC/AT layout).
+    #[must_use]
+    pub fn from_pic(pic: DualPic) -> Self {
+        Self(Arc::new(Mutex::new(pic)))
+    }
+
+    /// Run `f` with exclusive access to the PIC — to read the pending vector,
+    /// acknowledge an INTA, program the masks, etc.
+    ///
+    /// # Panics
+    /// Panics if the PIC mutex has been poisoned by a prior panic while the lock
+    /// was held.
+    pub fn with<R>(&self, f: impl FnOnce(&mut DualPic) -> R) -> R {
+        f(&mut self.0.lock().expect("PIC mutex poisoned"))
+    }
+
+    /// Build an edge-triggered level sink for ISA line `irq`, suitable for
+    /// `attach_irq0` / `attach_irq_line`.
+    ///
+    /// A rising edge (`set_level(true)`) latches the request via
+    /// [`DualPic::raise_irq`]; a falling edge does nothing (the request is
+    /// edge-latched in the IRR and cleared on acknowledge), so a device that
+    /// pulses true-then-false produces exactly one request. The returned closure
+    /// is `Send` and owns a clone of this handle, so it outlives the borrow, and
+    /// satisfies both crate-local `IrqLine` traits via their `Fn(bool)+Send`
+    /// blanket impls.
+    pub fn line(&self, irq: u8) -> impl Fn(bool) + Send + use<> {
+        let pic = self.clone();
+        move |level: bool| {
+            if level {
+                pic.with(|p| p.raise_irq(irq));
+            }
+        }
+    }
+
+    /// The master 8259's PIO port adapter (`0x20`/`0x21`) for the bus.
+    #[must_use]
+    pub fn master_port(&self) -> PicMasterPort {
+        PicMasterPort { pic: self.clone() }
+    }
+
+    /// The slave 8259's PIO port adapter (`0xA0`/`0xA1`) for the bus.
+    #[must_use]
+    pub fn slave_port(&self) -> PicSlavePort {
+        PicSlavePort { pic: self.clone() }
+    }
+}
+
+impl Default for SharedPic {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The master 8259's two ports (`0x20`/`0x21`) as a bus [`PioDevice`].
+///
+/// The 8259 registers are byte-wide, so a guest accesses them one byte at a
+/// time; reads return the value in the low byte of the `u32` and writes consume
+/// the low byte. The bus only routes ports within the declared range, so every
+/// `port` is one of the two master ports.
+pub struct PicMasterPort {
+    pic: SharedPic,
+}
+
+impl PioDevice for PicMasterPort {
+    fn pio_read(&mut self, port: u16, _size: u8) -> u32 {
+        u32::from(self.pic.with(|p| p.read_port(port)))
+    }
+
+    fn pio_write(&mut self, port: u16, _size: u8, data: u32) {
+        self.pic.with(|p| p.write_port(port, u8_of(data)));
+    }
+
+    fn port_range(&self) -> (u16, u16) {
+        (MASTER_CMD, MASTER_CMD + 2)
+    }
+}
+
+/// The slave 8259's two ports (`0xA0`/`0xA1`) as a bus [`PioDevice`].
+///
+/// Byte-wide like [`PicMasterPort`]; the bus routes only the two slave ports
+/// here.
+pub struct PicSlavePort {
+    pic: SharedPic,
+}
+
+impl PioDevice for PicSlavePort {
+    fn pio_read(&mut self, port: u16, _size: u8) -> u32 {
+        u32::from(self.pic.with(|p| p.read_port(port)))
+    }
+
+    fn pio_write(&mut self, port: u16, _size: u8, data: u32) {
+        self.pic.with(|p| p.write_port(port, u8_of(data)));
+    }
+
+    fn port_range(&self) -> (u16, u16) {
+        (SLAVE_CMD, SLAVE_CMD + 2)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -699,5 +827,74 @@ mod tests {
         assert_eq!(pic.read_port(0x1234), 0xFF);
         pic.write_port(0x1234, 0x55); // ignored, no panic
         assert!(!pic.has_interrupt());
+    }
+
+    /// Initialize a `SharedPic` for the PC/AT layout through its port adapters,
+    /// the way a guest BIOS drives the bus byte-at-a-time.
+    fn init_shared(pic: &SharedPic) {
+        let mut m = pic.master_port();
+        let mut s = pic.slave_port();
+        m.pio_write(MASTER_CMD, 1, 0x11);
+        m.pio_write(MASTER_DATA, 1, 0x20);
+        m.pio_write(MASTER_DATA, 1, 0x04);
+        m.pio_write(MASTER_DATA, 1, 0x01);
+        s.pio_write(SLAVE_CMD, 1, 0x11);
+        s.pio_write(SLAVE_DATA, 1, 0x28);
+        s.pio_write(SLAVE_DATA, 1, 0x02);
+        s.pio_write(SLAVE_DATA, 1, 0x01);
+        m.pio_write(MASTER_DATA, 1, 0x00);
+        s.pio_write(SLAVE_DATA, 1, 0x00);
+    }
+
+    #[test]
+    fn port_adapters_claim_the_two_byte_ranges() {
+        let pic = SharedPic::new();
+        assert_eq!(pic.master_port().port_range(), (0x20, 0x22));
+        assert_eq!(pic.slave_port().port_range(), (0xA0, 0xA2));
+    }
+
+    #[test]
+    fn shared_line_raises_and_routes_through_the_programmed_pic() {
+        let pic = SharedPic::new();
+        init_shared(&pic);
+
+        // No interrupt until a device asserts.
+        assert!(!pic.with(|p| p.has_interrupt()));
+
+        // A device pulses its line (true then false, as the PIT does); the PIC
+        // latches exactly one edge and asserts INTR with the master's vector.
+        let irq0 = pic.line(0);
+        irq0(true);
+        irq0(false);
+        assert_eq!(pic.with(|p| p.pending_vector()), Some(0x20));
+    }
+
+    #[test]
+    fn shared_cascade_line_delivers_a_slave_vector() {
+        let pic = SharedPic::new();
+        init_shared(&pic);
+
+        // ISA line 12 (slave line 4) asserts; INTR carries the slave's vector.
+        pic.line(12)(true);
+        assert_eq!(pic.with(|p| p.pending_vector()), Some(0x28 + 4));
+    }
+
+    #[test]
+    fn guest_reads_the_mask_back_through_the_master_port_adapter() {
+        let pic = SharedPic::new();
+        init_shared(&pic);
+        let mut m = pic.master_port();
+        m.pio_write(MASTER_DATA, 1, 0xC3); // OCW1: program the mask
+        assert_eq!(m.pio_read(MASTER_DATA, 1) & 0xFF, 0xC3);
+    }
+
+    #[test]
+    fn masked_shared_line_delivers_nothing() {
+        let pic = SharedPic::new();
+        init_shared(&pic);
+        // Mask IRQ0 through the bus, then assert it: no INTR.
+        pic.master_port().pio_write(MASTER_DATA, 1, 0x01);
+        pic.line(0)(true);
+        assert!(!pic.with(|p| p.has_interrupt()));
     }
 }

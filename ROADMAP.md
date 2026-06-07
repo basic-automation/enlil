@@ -296,11 +296,14 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > `Pic8259` (single chip: ICW1-4 init sequence, OCW1 mask / OCW2 EOI / OCW3 read-select+poll+
 > special-mask, IRR/ISR/IMR, fully-nested fixed priority, auto-EOI) and the cascaded `DualPic`
 > (master `0x20`/`0x21` + slave `0xA0`/`0xA1`, slave INT → master IR2 computed on demand, INTA
-> `acknowledge()` → vector, `pending_vector()`/`has_interrupt()` for the INTR line). 16 unit
-> tests, no KVM needed. **Still to do for the PIC:** a bus front-end (two PIO port adapters over a
-> shared `DualPic`) + an `.line()` sink so devices assert into it like the I/O APIC, then a
-> `standard_pc` variant mounting both; eventual KVM binding routes PIC INTR via LAPIC LINT0
-> ExtINT (or the in-kernel `KVM_CREATE_IRQCHIP`, which already models the dual-8259).
+> `acknowledge()` → vector, `pending_vector()`/`has_interrupt()` for the INTR line). The bus
+> front-end is also in: `SharedPic` (`Arc<Mutex<DualPic>>`, mirroring `SharedInterruptController`)
+> exposes `PicMasterPort`/`PicSlavePort` (`PioDevice` at `0x20`/`0x21` and `0xA0`/`0xA1`) and a
+> `.line(irq)` `Fn(bool)+Send` sink, so a guest programs the PIC through the bus and devices
+> assert into it exactly as they do the I/O APIC. 21 unit tests, no KVM needed. **Still to do for
+> the PIC:** a `DeviceBus` factory (e.g. `standard_pc_with_pic`) that mounts both PIC ports and
+> wires PIT→IRQ0/UART→IRQ4 into the `SharedPic`; eventual KVM binding routes PIC INTR via LAPIC
+> LINT0 ExtINT (or the in-kernel `KVM_CREATE_IRQCHIP`, which already models the dual-8259).
 
 ### 0.3 USB Live Boot & Non-Destructive Testing (CRITICAL FOR ADOPTION)
 
