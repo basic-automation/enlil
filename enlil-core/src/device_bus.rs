@@ -767,11 +767,14 @@ impl StandardPc {
     ///   observability;
     /// - the **ACPI PM timer** advances at its fixed 3.579545 MHz rate.
     ///
-    /// HPET **legacy-replacement** mode (where timer 0/1 stand in for the PIT/RTC
-    /// IRQs and those devices must be suppressed) is not auto-delivered here — its
-    /// fired timers are returned undelivered; wiring that mode (and the PIT/RTC
-    /// suppression it implies) is deferred. The MC146818 RTC is likewise driven
-    /// separately (`rtc.tick_second()` once per wall second).
+    /// In HPET **legacy-replacement** mode (the guest set the HPET's legacy bit),
+    /// timer 0 stands in for the **PIT** (IRQ0) and timer 1 for the **RTC** (IRQ8);
+    /// those fired timers are delivered through the ISA override path into *both*
+    /// controllers (like the legacy devices they replace). A guest that enables
+    /// legacy replacement drives its periodic interrupt from HPET timer 0 and does
+    /// not also program the PIT, so the PIT (still ticked above) stays idle and
+    /// does not double-fire. The MC146818 RTC is driven separately
+    /// (`rtc.tick_second()` once per wall second).
     #[must_use]
     pub fn advance_clocks(&self, ns: u64) -> Vec<(usize, u8)> {
         // PIT: tick() takes nanoseconds directly and pulses the wired IRQ0 sink.
@@ -781,11 +784,22 @@ impl StandardPc {
         // HPET: convert to its 10 MHz counter ticks; collect any fired timers.
         let fired = self.hpet.tick(ns / HPET_TICK_NS);
 
-        // Deliver each fired timer to its I/O APIC GSI as an edge (assert then
-        // deassert), unless the HPET is in legacy-replacement mode — those are
-        // left for the caller (see the method docs).
-        if !self.hpet.with(|h| h.legacy_routing()) {
-            for &(_timer, gsi) in &fired {
+        // Deliver each fired timer as an edge (assert then deassert).
+        let legacy = self.hpet.with(|h| h.legacy_routing());
+        for &(timer, gsi) in &fired {
+            if legacy && timer <= 1 {
+                // Legacy replacement: timer 0 -> IRQ0, timer 1 -> IRQ8, into both
+                // the 8259 and the I/O APIC (via the ISA-override path), exactly
+                // like the PIT/RTC lines this mode replaces.
+                let isa = if timer == 0 { IRQ_PIT } else { RTC_IRQ };
+                let pic_line = self.pic.line(isa);
+                let apic_line = self.ioapic.isa_line(isa);
+                pic_line(true);
+                pic_line(false);
+                apic_line(true);
+                apic_line(false);
+            } else {
+                // Normal mode: route to the timer's configured I/O APIC GSI.
                 let line = self.ioapic.line(gsi);
                 line(true);
                 line(false);
@@ -1526,6 +1540,41 @@ mod tests {
         let fired = pc.advance_clocks(1_000_000);
         assert_eq!(fired, vec![(0, 16)], "HPET timer 0 fired, routed to GSI 16");
         assert_eq!(pc.ioapic.with(|c| c.pending_vector(0)), Some(0x40));
+    }
+
+    #[test]
+    fn advance_clocks_legacy_hpet_timer0_replaces_the_pit_on_irq0() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+
+        let mut pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            1_780_838_055,
+            1,
+        )
+        .unwrap();
+        pc.ioapic.with(|c| c.lapics[0].write_register(0x0F0, 0x1FF));
+
+        // Program the I/O APIC GSI 2 RTE — where IRQ0 lands under the MADT
+        // override — to vector 0x60. REDTBL base 0x10 + 2*2 = 0x14 (low)/0x15.
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0000, &0x14u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0010, &0x60u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0000, &0x15u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0010, &0u32.to_le_bytes());
+
+        // Enable HPET legacy replacement (config bit 1) + counter (bit 0), and
+        // arm timer 0 (interrupt-enable, one-shot, comparator 100).
+        pc.hpet.with(|h| {
+            h.write(0x100, 0x04);
+            h.write(0x108, 100);
+            h.write(0x010, 0x03);
+        });
+
+        // Advance past the comparator: timer 0 fires and, in legacy mode, is
+        // delivered as IRQ0 -> GSI 2 -> LAPIC 0 (the PIT's path), not its own GSI.
+        let fired = pc.advance_clocks(1_000_000);
+        // Timer 0 fired (its configured route is irrelevant in legacy mode).
+        assert_eq!(fired, vec![(0, 0)]);
+        assert_eq!(pc.ioapic.with(|c| c.pending_vector(0)), Some(0x60));
     }
 
     #[test]
