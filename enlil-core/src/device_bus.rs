@@ -23,7 +23,8 @@ use enlil_devices::pcie::{
 };
 use enlil_devices::ps2::{SharedI8042, PS2_KBD_IRQ, PS2_MOUSE_IRQ};
 use enlil_devices::timer::{
-    Pit, RtcTime, SharedAcpiPmTimer, SharedHpet, SharedPit, SharedRtc, SystemControlPortB, RTC_IRQ,
+    AcpiPmTimer, Pit, RtcTime, SharedAcpiPmTimer, SharedHpet, SharedPit, SharedRtc,
+    SystemControlPortB, HPET_TICK_NS, RTC_IRQ,
 };
 
 /// The system device bus: a PIO bus and an MMIO bus behind one exit handler.
@@ -657,6 +658,34 @@ pub struct StandardPc {
     /// The ACPI PM1a block — poll `take_sleep` from the run loop to handle
     /// guest-initiated shutdown / sleep.
     pub pm1: SharedAcpiPm1Block,
+}
+
+impl StandardPc {
+    /// Advance every free-running platform clock by one elapsed-time delta of `ns`
+    /// nanoseconds, keeping the three timekeeping sources a guest cross-checks
+    /// coherent from a single time base. This is the timekeeping core a vCPU run
+    /// loop / timer thread calls each iteration:
+    ///
+    /// - the **8254 PIT** (channel 0) advances and, when it crosses terminal
+    ///   count, pulses its IRQ0 line — which the factory already teed into both
+    ///   interrupt controllers, so the timer interrupt is delivered automatically;
+    /// - the **HPET** main counter advances at its 10 MHz rate (only while the
+    ///   guest has enabled it), and the `(timer, irq)` pairs of any HPET timers
+    ///   that fired are **returned** for the caller to deliver (HPET interrupt
+    ///   routing — legacy-replacement vs I/O APIC GSI — is not yet wired);
+    /// - the **ACPI PM timer** advances at its fixed 3.579545 MHz rate.
+    ///
+    /// The MC146818 RTC is driven separately (`rtc.tick_second()` once per wall
+    /// second), since its resolution and update-interrupt semantics differ.
+    #[must_use]
+    pub fn advance_clocks(&self, ns: u64) -> Vec<(usize, u8)> {
+        // PIT: tick() takes nanoseconds directly and pulses the wired IRQ0 sink.
+        let _ = self.pit.tick(ns);
+        // ACPI PM timer: convert the elapsed time to its 3.579545 MHz ticks.
+        self.pm_timer.advance(AcpiPmTimer::ns_to_ticks(ns));
+        // HPET: convert to its 10 MHz counter ticks; return any fired timers.
+        self.hpet.tick(ns / HPET_TICK_NS)
+    }
 }
 
 /// Legacy ISA IRQ line for the 8254 PIT channel-0 (system timer).
@@ -1321,6 +1350,30 @@ mod tests {
         assert_eq!(pic.with(|p| p.pending_vector()), Some(0x21));
         // ...and the I/O APIC routed it to LAPIC 0 at the RTE's vector 0x31.
         assert_eq!(ioapic.with(|c| c.pending_vector(0)), Some(0x31));
+    }
+
+    #[test]
+    fn advance_clocks_keeps_the_platform_timers_coherent_from_one_time_base() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::timer::PM_TIMER_FREQ_HZ;
+
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            1_780_838_055,
+            1,
+        )
+        .unwrap();
+
+        // The HPET counter only advances once the guest enables it (config bit 0).
+        pc.hpet.with(|h| h.write(0x010, 1));
+
+        // Advance the whole platform by one wall-clock second.
+        let _ = pc.advance_clocks(1_000_000_000);
+
+        // The ACPI PM timer advanced by exactly its 3.579545 MHz frequency.
+        assert_eq!(pc.pm_timer.read(), PM_TIMER_FREQ_HZ);
+        // The HPET (10 MHz / 100 ns per tick) advanced by 10,000,000 ticks.
+        assert_eq!(pc.hpet.with(|h| h.counter()), 10_000_000);
     }
 
     #[test]

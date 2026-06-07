@@ -17,7 +17,7 @@ pub mod tsc;
 pub use acpi_pm::{
     AcpiPmTimer, AcpiPmTimerPort, PM_TIMER_FREQ_HZ, PM_TIMER_PORT, SharedAcpiPmTimer,
 };
-pub use hpet::{HPET_MMIO_BASE, HPET_MMIO_SIZE, Hpet, HpetMmio, SharedHpet};
+pub use hpet::{HPET_MMIO_BASE, HPET_MMIO_SIZE, HPET_TICK_NS, Hpet, HpetMmio, SharedHpet};
 pub use paravirt::{HyperVReferenceTsc, KvmClock};
 pub use pit::{IrqLine, Pit, PitPort, SharedPit};
 pub use rtc::{RTC_DATA, RTC_INDEX, RTC_IRQ, Rtc146818, RtcPort, RtcTime, SharedRtc};

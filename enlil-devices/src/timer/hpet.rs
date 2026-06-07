@@ -20,6 +20,11 @@ pub const HPET_MMIO_BASE: u64 = 0xFED0_0000;
 /// Size of the HPET memory-mapped register block: the spec-mandated 1 KiB.
 pub const HPET_MMIO_SIZE: u64 = 0x400;
 
+/// Nanoseconds per HPET main-counter tick (the 10 MHz / 100 ns period this model
+/// reports in its capability register). A run loop converts an elapsed-time delta
+/// to counter ticks by dividing by this.
+pub const HPET_TICK_NS: u64 = HPET_CLK_PERIOD_FS / 1_000_000;
+
 /// HPET capability/ID register value.
 /// Bits 31:16 = clock period in femtoseconds.
 /// Bits 15:8 = number of timers - 1.
