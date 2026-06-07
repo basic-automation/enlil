@@ -16,6 +16,7 @@
 use crate::kvm_backend::VmExitHandler;
 use crate::serial::{SerialOutput, SerialPort};
 use enlil_devices::bus::{MmioBus, MmioDevice, PioBus, PioDevice};
+use enlil_devices::chipset::SystemControlPortA;
 use enlil_devices::interrupt::{IoApicMmio, SharedInterruptController, SharedPic};
 use enlil_devices::pcie::{
     vendors, EcamSpace, PciBdf, PciConfigIo, PcieRootComplex, SharedRootComplex,
@@ -328,6 +329,25 @@ impl DeviceBus {
         self.add_pio(Box::new(SystemControlPortB::new(pit.clone())))
     }
 
+    /// Mount **System Control Port A** ([`SystemControlPortA`]) at `0x92` — the
+    /// chipset fast-A20 / fast-reset register every x86 boot path touches. The
+    /// A20 gate (bit 1) reads back enabled (Enlil runs no legacy BIOS A20 dance
+    /// and KVM keeps A20 open) and a guest write to it sticks; bit 0 latches a
+    /// CPU-reset request edge. Without it `0x92` reads open-bus `0xFF`, so a
+    /// guest confirming A20 there sees the wrong state.
+    ///
+    /// The port is mounted as a plain device, so the one-shot reset latch
+    /// (`SystemControlPortA::take_reset`) is not reachable post-mount; binding it
+    /// to the vCPU run loop (a shared handle the loop polls to re-init the vCPU)
+    /// is deferred to when the KVM backend's run loop lands.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if `0x92` overlaps an
+    /// already-registered device.
+    pub fn add_system_control_a(&mut self) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_pio(Box::new(SystemControlPortA::new()))
+    }
+
     /// Like [`standard_pc`](Self::standard_pc), but wires the legacy devices'
     /// interrupt lines into the dual-8259 `pic` (the early-boot interrupt
     /// controller) and mounts its four ports: the 8254 PIT's channel-0 line
@@ -473,6 +493,9 @@ impl DeviceBus {
         // System Control Port B (0x61): PIT channel-2 gate + PC speaker, sharing
         // the same PIT handle.
         bus.add_system_control_b(&pit)?;
+
+        // System Control Port A (0x92): fast A20 (enabled) + fast reset.
+        bus.add_system_control_a()?;
 
         // MC146818 RTC/CMOS (IRQ8).
         rtc.with(|r| r.attach_irq(Box::new(dual_irq_line(&pic, &ioapic, RTC_IRQ))));
@@ -1153,9 +1176,10 @@ mod tests {
 
         // Every legacy device a guest touches at boot is mounted at its canonical
         // address: COM1, PIT, System Control Port B (0x61), RTC, PS/2 data+cmd,
-        // both 8259s, the ELCR, and the PCIe CAM ports — plus the I/O APIC page.
+        // System Control Port A (0x92), both 8259s, the ELCR, and the PCIe CAM
+        // ports — plus the I/O APIC page.
         for port in [
-            0x3F8u16, 0x40, 0x61, 0x70, 0x60, 0x64, 0x20, 0xA0, 0x4D0, 0xCF8,
+            0x3F8u16, 0x40, 0x61, 0x70, 0x60, 0x64, 0x92, 0x20, 0xA0, 0x4D0, 0xCF8,
         ] {
             assert!(
                 bus.pio.is_mapped(port),

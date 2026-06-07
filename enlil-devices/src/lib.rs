@@ -39,6 +39,7 @@ pub mod acpi;
 pub mod block;
 pub mod bridge;
 pub mod bus;
+pub mod chipset;
 pub mod display;
 pub mod fw_cfg;
 pub mod hda;
