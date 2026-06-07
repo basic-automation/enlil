@@ -35,8 +35,25 @@ const HPET_CLK_PERIOD_FS: u64 = 100_000_000;
 /// Supported IRQ routing mask for timers.
 const TIMER_ROUTE_CAP: u32 = 0x000F_0000; // IRQs 16-19
 
-/// HPET capability register: revision 1, 3 timers, 64-bit counter, legacy capable.
-const HPET_CAP_VALUE: u64 = (HPET_CLK_PERIOD_FS << 32) | ((NUM_TIMERS as u64 - 1) << 8) | 0x01;
+/// HPET PCI vendor ID reported in the capability register (Intel). Mirrors the
+/// ACPI HPET table's Event Timer Block ID so the table and the MMIO register a
+/// guest reads agree (cross-checked by a test).
+const HPET_VENDOR_ID: u64 = 0x8086;
+/// `COUNT_SIZE_CAP` (bit 13): the main counter is 64-bit — which this model's
+/// `counter: u64` and the [`HpetMmio`] 64-bit accessors actually implement.
+const HPET_COUNT_SIZE_CAP: u64 = 1 << 13;
+/// `LEG_RT_CAP` (bit 15): legacy-replacement routing is supported (config bit 1).
+const HPET_LEG_RT_CAP: u64 = 1 << 15;
+
+/// HPET capability register: revision 1, 3 timers, 64-bit counter, legacy-
+/// replacement capable, Intel vendor. The low 32 bits mirror the ACPI HPET
+/// table's Event Timer Block ID; the high 32 carry the clock period.
+const HPET_CAP_VALUE: u64 = (HPET_CLK_PERIOD_FS << 32)
+    | (HPET_VENDOR_ID << 16)
+    | HPET_LEG_RT_CAP
+    | HPET_COUNT_SIZE_CAP
+    | ((NUM_TIMERS as u64 - 1) << 8)
+    | 0x01;
 
 /// Individual HPET timer state.
 #[derive(Debug, Clone)]
@@ -462,6 +479,18 @@ mod tests {
         // Clear it
         hpet.clear_interrupt(0);
         assert_eq!(hpet.read(0x020), 0);
+    }
+
+    #[test]
+    fn capability_register_matches_the_acpi_hpet_table_block_id() {
+        // The capability register a guest reads from MMIO (low 32 bits) must agree
+        // with the Event Timer Block ID the ACPI HPET table advertises — rev,
+        // comparator count, 64-bit counter, legacy-replacement, vendor — or the OS
+        // is told about a different HPET than the one at the registers.
+        let cap_low = u32::try_from(HPET_CAP_VALUE & 0xFFFF_FFFF).unwrap();
+        let table = crate::acpi::hpet::HpetBuilder::new().build();
+        let block_id = u32::from_le_bytes(table[36..40].try_into().unwrap());
+        assert_eq!(cap_low, block_id);
     }
 
     #[test]
