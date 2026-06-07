@@ -13,7 +13,7 @@ pub mod rtc;
 pub mod speaker;
 pub mod tsc;
 
-pub use hpet::Hpet;
+pub use hpet::{HPET_MMIO_BASE, HPET_MMIO_SIZE, Hpet, HpetMmio, SharedHpet};
 pub use paravirt::{HyperVReferenceTsc, KvmClock};
 pub use pit::{IrqLine, Pit, PitPort, SharedPit};
 pub use rtc::{RTC_DATA, RTC_INDEX, RTC_IRQ, Rtc146818, RtcPort, RtcTime, SharedRtc};

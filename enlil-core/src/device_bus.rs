@@ -22,7 +22,9 @@ use enlil_devices::pcie::{
     vendors, EcamSpace, PciBdf, PciConfigIo, PcieRootComplex, SharedRootComplex,
 };
 use enlil_devices::ps2::{SharedI8042, PS2_KBD_IRQ, PS2_MOUSE_IRQ};
-use enlil_devices::timer::{Pit, RtcTime, SharedPit, SharedRtc, SystemControlPortB, RTC_IRQ};
+use enlil_devices::timer::{
+    Pit, RtcTime, SharedHpet, SharedPit, SharedRtc, SystemControlPortB, RTC_IRQ,
+};
 
 /// The system device bus: a PIO bus and an MMIO bus behind one exit handler.
 #[derive(Default)]
@@ -348,6 +350,21 @@ impl DeviceBus {
         self.add_pio(Box::new(SystemControlPortA::new()))
     }
 
+    /// Mount the **HPET** register block ([`SharedHpet`]) on the MMIO bus at
+    /// [`HPET_MMIO_BASE`](enlil_devices::timer::HPET_MMIO_BASE) — the 1 KiB
+    /// aperture the ACPI HPET table points the guest at. Windows requires the
+    /// HPET for high-resolution timing and Linux uses it as a clocksource; both
+    /// read the capability/period and the 64-bit main counter here. The caller
+    /// owns `hpet` so the run loop can advance the counter (`tick`) and deliver
+    /// the timers' interrupts.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if the HPET aperture overlaps
+    /// an already-registered MMIO device.
+    pub fn add_hpet(&mut self, hpet: &SharedHpet) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_mmio(Box::new(hpet.mmio()))
+    }
+
     /// Like [`standard_pc`](Self::standard_pc), but wires the legacy devices'
     /// interrupt lines into the dual-8259 `pic` (the early-boot interrupt
     /// controller) and mounts its four ports: the 8254 PIT's channel-0 line
@@ -510,6 +527,11 @@ impl DeviceBus {
         bus.add_pic(&pic)?;
         bus.add_ioapic(&ioapic)?;
 
+        // HPET register block (0xFED0_0000) — Windows requires it, Linux uses it
+        // as a clocksource. Shared so the run loop can advance the counter.
+        let hpet = SharedHpet::new();
+        bus.add_hpet(&hpet)?;
+
         // PCIe config space (legacy CAM + ECAM), seeded with a host bridge.
         let pcie = bus.add_pcie(PcieRootComplex::new(DEFAULT_ECAM_BASE))?;
 
@@ -521,6 +543,7 @@ impl DeviceBus {
             rtc,
             ps2,
             pit,
+            hpet,
         })
     }
 }
@@ -565,6 +588,8 @@ pub struct StandardPc {
     pub ps2: SharedI8042,
     /// The 8254 PIT — `tick` channel-0 from the run loop / timer thread.
     pub pit: SharedPit,
+    /// The HPET — `tick` the main counter from the run loop / timer thread.
+    pub hpet: SharedHpet,
 }
 
 /// Legacy ISA IRQ line for the 8254 PIT channel-0 (system timer).
@@ -1189,6 +1214,10 @@ mod tests {
         assert!(
             bus.mmio.is_mapped(0xFEC0_0000),
             "I/O APIC page should be mapped"
+        );
+        assert!(
+            bus.mmio.is_mapped(0xFED0_0000),
+            "HPET register block should be mapped"
         );
 
         // Bring up LAPIC 0 and program the PC/AT 8259 layout (master base 0x20),
