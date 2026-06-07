@@ -179,9 +179,12 @@ impl DeviceBus {
     }
 
     /// Like [`standard_pc`](Self::standard_pc), but additionally wires the legacy
-    /// devices' interrupt lines into `pic` so they actually reach a vCPU: the
-    /// 8254 PIT's channel-0 line drives [`IRQ_PIT`] and the COM1 16550's line
-    /// drives [`IRQ_COM1`]. Each device pulses its line through `pic`, which
+    /// devices' interrupt lines into `pic` so they actually reach a vCPU. Each
+    /// line is wired through [`SharedInterruptController::isa_line`], which
+    /// applies the standard-PC interrupt-source overrides: the 8254 PIT's
+    /// channel-0 line ([`IRQ_PIT`]) lands on **GSI 2** — the pin the MADT
+    /// advertises for the timer — and the COM1 16550's line ([`IRQ_COM1`])
+    /// identity-maps to GSI 4. Each device pulses its line through `pic`, which
     /// routes it through the I/O APIC RTE to the destination LAPIC's IRR.
     ///
     /// The caller owns `pic` (it clones a handle into each line) so it can mount
@@ -202,12 +205,16 @@ impl DeviceBus {
     ) -> Result<(Self, SharedRootComplex), enlil_devices::bus::BusError> {
         let mut bus = Self::new();
 
+        // I/O APIC lines go through `isa_line`, which applies the standard-PC
+        // interrupt-source overrides: the PIT (ISA IRQ0) lands on GSI 2 — the
+        // pin the MADT advertises and the guest programs — while COM1 (IRQ4)
+        // identity-maps.
         let mut com1 = SerialPort::com1(serial_output);
-        com1.attach_irq_line(Box::new(pic.line(IRQ_COM1)));
+        com1.attach_irq_line(Box::new(pic.isa_line(IRQ_COM1)));
         bus.add_serial(com1)?;
 
         let mut pit = Pit::new();
-        pit.attach_irq0(Box::new(pic.line(IRQ_PIT)));
+        pit.attach_irq0(Box::new(pic.isa_line(IRQ_PIT)));
         bus.add_pit(pit)?;
 
         bus.add_ioapic(pic)?;
@@ -299,10 +306,12 @@ impl DeviceBus {
     /// controller the guest has unmasked delivers it. PIT channel-0 drives
     /// [`IRQ_PIT`] and COM1 drives [`IRQ_COM1`] on both controllers.
     ///
-    /// (The ISA-IRQ→GSI identity mapping here matches
-    /// [`standard_pc_with_interrupts`](Self::standard_pc_with_interrupts); the
-    /// MADT interrupt-source-override that remaps ISA IRQ0→GSI 2 is a separate
-    /// ACPI-correctness item and is not modelled yet.)
+    /// The two controllers see different "pins" for the same line: the 8259
+    /// takes the bare ISA IRQ (timer on IRQ0), while the I/O APIC side goes
+    /// through [`SharedInterruptController::isa_line`], which applies the MADT
+    /// interrupt-source overrides — so the PIT lands on GSI 2 (the pin the guest
+    /// programs from the MADT) on the APIC path and on IRQ0 on the PIC path,
+    /// exactly as a real PC/AT wires it.
     ///
     /// Returns the assembled bus and the [`SharedRootComplex`] handle.
     ///
@@ -320,7 +329,7 @@ impl DeviceBus {
         // per-controller sinks, and is itself `Fn(bool) + Send`, so it satisfies
         // both crate-local `IrqLine` traits via their blanket impls.
         let com1_pic = pic.line(IRQ_COM1);
-        let com1_apic = ioapic.line(IRQ_COM1);
+        let com1_apic = ioapic.isa_line(IRQ_COM1);
         let mut com1 = SerialPort::com1(serial_output);
         com1.attach_irq_line(Box::new(move |level: bool| {
             com1_pic(level);
@@ -329,7 +338,7 @@ impl DeviceBus {
         bus.add_serial(com1)?;
 
         let pit_pic = pic.line(IRQ_PIT);
-        let pit_apic = ioapic.line(IRQ_PIT);
+        let pit_apic = ioapic.isa_line(IRQ_PIT);
         let mut pit = Pit::new();
         pit.attach_irq0(Box::new(move |level: bool| {
             pit_pic(level);
