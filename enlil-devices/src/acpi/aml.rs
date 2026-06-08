@@ -356,6 +356,13 @@ pub struct ScopeHandle {
     content_start: usize,
 }
 
+/// Resource Type field of an Address Space descriptor: a memory range.
+const ADDR_MEMORY: u8 = 0;
+/// Resource Type field of an Address Space descriptor: an I/O range.
+const ADDR_IO: u8 = 1;
+/// Resource Type field of an Address Space descriptor: a bus-number range.
+const ADDR_BUS: u8 = 2;
+
 /// Accumulates ACPI resource descriptors for a `ResourceTemplate` buffer.
 ///
 /// Descriptors follow ACPI spec §6.4 and feed a device's `_CRS`/`_PRS`. The End
@@ -415,6 +422,68 @@ impl ResourceTemplate {
         self.data.push(u8::from(writable)); // Information: bit0 = write status
         self.data.extend_from_slice(&base.to_le_bytes());
         self.data.extend_from_slice(&length.to_le_bytes());
+        self
+    }
+
+    /// Word Address Space Descriptor (large type `0x88`, ACPI §6.4.3.5.3) for a
+    /// bus-number window a host bridge *produces* for its child bus.
+    pub fn word_bus_number(&mut self, min: u16, max: u16) -> &mut Self {
+        let len = max - min + 1;
+        // General flags 0x0C: producer (bit0=0), min/max fixed (_MIF/_MAF), positive
+        // decode. Bus-number resources have no type-specific flags.
+        self.data.push(0x88);
+        self.data.extend_from_slice(&13u16.to_le_bytes()); // body length: 3 + 5×2
+        self.data.push(ADDR_BUS);
+        self.data.push(0x0C);
+        self.data.push(0x00);
+        for f in [0u16, min, max, 0, len] {
+            self.data.extend_from_slice(&f.to_le_bytes());
+        }
+        self
+    }
+
+    /// Word Address Space Descriptor (large type `0x88`) for an I/O port window a
+    /// host bridge produces for its child bus (entire range, static translation).
+    pub fn word_io(&mut self, min: u16, max: u16) -> &mut Self {
+        let len = max - min + 1;
+        self.data.push(0x88);
+        self.data.extend_from_slice(&13u16.to_le_bytes());
+        self.data.push(ADDR_IO);
+        self.data.push(0x0C); // producer, min/max fixed, positive decode
+        self.data.push(0x03); // type flags: entire range (ISA + non-ISA)
+        for f in [0u16, min, max, 0, len] {
+            self.data.extend_from_slice(&f.to_le_bytes());
+        }
+        self
+    }
+
+    /// `DWord` Address Space Descriptor (large type `0x87`, ACPI §6.4.3.5.2) for a
+    /// 32-bit memory window a host bridge produces (e.g. the PCI MMIO hole).
+    pub fn dword_memory(&mut self, base: u32, length: u32, writable: bool) -> &mut Self {
+        let max = base + length - 1;
+        self.data.push(0x87);
+        self.data.extend_from_slice(&23u16.to_le_bytes()); // body length: 3 + 5×4
+        self.data.push(ADDR_MEMORY);
+        self.data.push(0x0C); // producer, min/max fixed, positive decode
+        self.data.push(u8::from(writable)); // type flags: bit0 = write status
+        for f in [0u32, base, max, 0, length] {
+            self.data.extend_from_slice(&f.to_le_bytes());
+        }
+        self
+    }
+
+    /// `QWord` Address Space Descriptor (large type `0x8A`, ACPI §6.4.3.5.1) for a
+    /// 64-bit memory window a host bridge produces (the high PCI MMIO hole).
+    pub fn qword_memory(&mut self, base: u64, length: u64, writable: bool) -> &mut Self {
+        let max = base + length - 1;
+        self.data.push(0x8A);
+        self.data.extend_from_slice(&43u16.to_le_bytes()); // body length: 3 + 5×8
+        self.data.push(ADDR_MEMORY);
+        self.data.push(0x0C); // producer, min/max fixed, positive decode
+        self.data.push(u8::from(writable)); // type flags: bit0 = write status
+        for f in [0u64, base, max, 0, length] {
+            self.data.extend_from_slice(&f.to_le_bytes());
+        }
         self
     }
 
@@ -641,6 +710,63 @@ mod tests {
         assert_eq!(u32::from_le_bytes([b[4], b[5], b[6], b[7]]), 0xFED0_0000);
         assert_eq!(u32::from_le_bytes([b[8], b[9], b[10], b[11]]), 0x400);
         assert_eq!(b.len(), 12); // 3 header + 9 body
+    }
+
+    #[test]
+    fn address_space_descriptor_bytes() {
+        let mut rt = ResourceTemplate::new();
+        rt.word_bus_number(0x00, 0xFF)
+            .word_io(0x0000, 0x0CF7)
+            .dword_memory(0xC000_0000, 0x3EC0_0000, true)
+            .qword_memory(0x8_0000_0000, 0x80_0000_0000, true);
+        let b = rt.as_bytes();
+
+        // WordBusNumber: 0x88, len 13, restype 2 (bus), genflags 0x0C, typeflags 0,
+        // gran 0, min 0, max 0xFF, xlat 0, len 0x100.
+        assert_eq!(b[0], 0x88);
+        assert_eq!(u16::from_le_bytes([b[1], b[2]]), 13);
+        assert_eq!(b[3], 2);
+        assert_eq!(b[4], 0x0C);
+        assert_eq!(u16::from_le_bytes([b[8], b[9]]), 0x00); // min
+        assert_eq!(u16::from_le_bytes([b[10], b[11]]), 0xFF); // max
+        assert_eq!(u16::from_le_bytes([b[14], b[15]]), 0x100); // len
+
+        // Next descriptor: WordIO (3 header + 13 body = 16 bytes in).
+        let io = &b[16..];
+        assert_eq!(io[0], 0x88);
+        assert_eq!(io[3], 1); // I/O
+        assert_eq!(io[4], 0x0C);
+        assert_eq!(io[5], 0x03); // entire range
+        assert_eq!(u16::from_le_bytes([io[10], io[11]]), 0x0CF7); // max
+
+        // DWordMemory: 16 (bus) + 16 (io) = 32 in. 4-byte fields: gran[6..10],
+        // min[10..14], max[14..18], xlat[18..22], len[22..26].
+        let mem = &b[32..];
+        assert_eq!(mem[0], 0x87);
+        assert_eq!(u16::from_le_bytes([mem[1], mem[2]]), 23);
+        assert_eq!(mem[3], 0); // memory
+        assert_eq!(mem[5], 0x01); // writable
+        assert_eq!(
+            u32::from_le_bytes([mem[10], mem[11], mem[12], mem[13]]),
+            0xC000_0000
+        ); // min
+        assert_eq!(
+            u32::from_le_bytes([mem[14], mem[15], mem[16], mem[17]]),
+            0xFEBF_FFFF
+        ); // max
+        assert_eq!(
+            u32::from_le_bytes([mem[22], mem[23], mem[24], mem[25]]),
+            0x3EC0_0000
+        ); // len
+
+        // QWordMemory: 32 + (3 + 23) = 58 in. 8-byte fields: gran[6..14],
+        // min[14..22].
+        let q = &b[58..];
+        assert_eq!(q[0], 0x8A);
+        assert_eq!(u16::from_le_bytes([q[1], q[2]]), 43);
+        assert_eq!(q[3], 0); // memory
+        let qmin = u64::from_le_bytes([q[14], q[15], q[16], q[17], q[18], q[19], q[20], q[21]]);
+        assert_eq!(qmin, 0x8_0000_0000);
     }
 
     #[test]

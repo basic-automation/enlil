@@ -127,6 +127,26 @@ impl DsdtBuilder {
         aml.return_integer(0x0F);
         aml.method_end(&sta);
 
+        // _CRS: the resources the host bridge *produces* for bus 0 — the bus-number
+        // window, the legacy I/O ports (split around the PCI config aperture), and
+        // the 32-/64-bit PCI MMIO holes. Without this Windows cannot enumerate or
+        // assign resources to PCI devices below the root.
+        let mut crs = ResourceTemplate::new();
+        crs.word_bus_number(0x00, 0xFF)
+            .word_io(0x0000, 0x0CF7)
+            .word_io(0x0D00, 0xFFFF)
+            .dword_memory(
+                self.config.pci_hole_start,
+                self.config.pci_hole_end - self.config.pci_hole_start + 1,
+                true,
+            )
+            .qword_memory(
+                self.config.pci_hole_64_start,
+                self.config.pci_hole_64_size,
+                true,
+            );
+        aml.name_resource_template(b"_CRS", &crs);
+
         // ISA/LPC bridge
         self.build_isa_bridge(aml);
 
@@ -334,6 +354,29 @@ mod tests {
         };
         let dsdt = DsdtBuilder::new(config).build();
         assert!(dsdt.len() > 36);
+        let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        assert_eq!(sum, 0);
+    }
+
+    #[test]
+    fn dsdt_pci_root_has_crs_with_bus_io_and_memory_windows() {
+        let dsdt = DsdtBuilder::new(DsdtConfig::default()).build();
+        // WordBusNumber producing bus 0-0xFF: 0x88, len 13, restype 2.
+        let bus = [0x88u8, 0x0D, 0x00, 0x02];
+        assert!(
+            dsdt.windows(bus.len()).any(|w| w == bus),
+            "PCI0 _CRS must produce a bus-number window"
+        );
+        // DWord memory descriptor (0x87) for the 32-bit hole present.
+        assert!(
+            dsdt.windows(3).any(|w| w == [0x87u8, 0x17, 0x00]),
+            "PCI0 _CRS must contain the 32-bit MMIO window"
+        );
+        // QWord memory descriptor (0x8A) for the 64-bit hole present.
+        assert!(
+            dsdt.windows(3).any(|w| w == [0x8Au8, 0x2B, 0x00]),
+            "PCI0 _CRS must contain the 64-bit MMIO window"
+        );
         let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         assert_eq!(sum, 0);
     }
