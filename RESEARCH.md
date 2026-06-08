@@ -836,3 +836,32 @@ not recent papers. Logged so the next run doesn't re-derive them.
   `Name(_S5_, 0)`, so a guest had no usable S5 object and could not ACPI-shutdown.
   **Changes what we build:** `name_package` + `Name(_S5_, Package(){5,5,0,0})`,
   SLP_TYP 5 matching the value `enlil_devices::chipset` captures as a shutdown.
+
+---
+
+## 2026-06-08 (b) — 8237A DMA controller + DMA page registers (Phase 0.2)
+
+- **Intel 8237A datasheet (DMA controller) + IBM PC/AT system architecture.** The
+  PC/AT wires two cascaded 8237As: **DMA-1** (8-bit, channels 0-3) at ports
+  `0x00-0x0F` and **DMA-2** (16-bit, channels 4-7) at `0xC0-0xDF` with its
+  registers at 2-byte spacing (`offset = (port - 0xC0) >> 1`). Each channel has a
+  16-bit base/current **address** and **count** register pair accessed through a
+  shared **byte-pointer flip-flop** (low byte then high byte; cleared by a write
+  to the clear-flip-flop register or by master clear). Per controller: command
+  (W) / status (R) at offset 8, request (W) at 9, single-mask-bit (W) at 0x0A,
+  mode (W) at 0x0B, clear-flip-flop (W) at 0x0C, master-clear (W) / temp (R) at
+  0x0D, clear-mask (W) at 0x0E, all-mask (W) at 0x0F. Channel 4 (DMA-2 ch 0) is
+  the cascade for DMA-1 and is masked/unusable for transfers.
+- **DMA page registers (74LS612 / chipset, ports `0x80-0x8F`).** Latch A16-A23 of
+  the 24-bit transfer address; the channel→port map is non-linear:
+  ch0=`0x87`, ch1=`0x83`, ch2=`0x81`, ch3=`0x82`, ch5=`0x8B`, ch6=`0x89`,
+  ch7=`0x8A`, refresh=`0x8F`; `0x80/0x84/0x85/0x86/0x88/0x8C-0x8E` are scratch
+  (`0x80` is the classic POST diagnostic port). All read back what was written.
+- **Changes what we build:** model the register *file* (flip-flop, command/status/
+  mask/mode, base+current addr/count, page latches, master clear) so a guest that
+  `request_region`s and probes ISA DMA at boot — Linux always does, via
+  `reserve_dma_pages`/`dma_init` — sees coherent values instead of open-bus `0xFF`
+  (an open-bus DMA window is a cheap VM tell). No transfer *engine* is needed:
+  nothing in-tree (no floppy/SB16) drives a DMA channel yet, so this is a faithful
+  passive register model, fully unblocked and pure-userspace. The claimed I/O
+  (`0x00-0x0F`, `0x80-0x8F`, `0xC0-0xDF`) also belongs in the `SYSR` `_CRS`.
