@@ -147,10 +147,41 @@ impl DsdtBuilder {
             );
         aml.name_resource_template(b"_CRS", &crs);
 
+        // _PRT — PCI interrupt routing for bus 0.
+        Self::build_pci_routing_table(aml);
+
         // ISA/LPC bridge
         self.build_isa_bridge(aml);
 
         aml.device_end(&pci0);
+    }
+
+    /// Build the PCI interrupt routing table (`_PRT`) for bus 0.
+    ///
+    /// This is a static **APIC-mode** table: each `(slot, pin)` resolves through
+    /// the standard PCI swizzle to I/O APIC GSI 16-19, generated from
+    /// [`PirqRouter::device_gsi`] so the DSDT and the live `assert_pci_intx` path
+    /// agree on routing by construction. Each entry is
+    /// `{ (slot << 16) | 0xFFFF, pin, 0, GSI }` — `Source = 0` with `SourceIndex`
+    /// = the GSI, per ACPI §6.2.13.
+    ///
+    /// Modern guests switch to APIC mode (`_PIC(1)`) and use this table; a
+    /// PIC-mode-only guest would need the programmable PIRQ routes exposed through
+    /// link devices and a `_PIC`-method-selected second table — a documented
+    /// follow-up (needs If/Else AML), tracked in `PROGRESS.md`.
+    fn build_pci_routing_table(aml: &mut AmlBuilder) {
+        use crate::interrupt::PirqRouter;
+        let mut entries: Vec<[u64; 4]> = Vec::with_capacity(32 * 4);
+        for slot in 0u8..32 {
+            for prt_pin in 0u8..4 {
+                // _PRT pin 0=INTA..3=INTD; the router uses 1=INTA..4=INTD.
+                if let Some(gsi) = PirqRouter::device_gsi(slot, prt_pin + 1) {
+                    let address = (u64::from(slot) << 16) | 0xFFFF;
+                    entries.push([address, u64::from(prt_pin), 0, u64::from(gsi)]);
+                }
+            }
+        }
+        aml.name_routing_table(b"_PRT", &entries);
     }
 
     /// Build ISA/LPC bridge under PCI0
@@ -382,6 +413,33 @@ mod tests {
         };
         let dsdt = DsdtBuilder::new(config).build();
         assert!(dsdt.len() > 36);
+        let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        assert_eq!(sum, 0);
+    }
+
+    #[test]
+    fn dsdt_pci_root_has_prt_matching_the_router() {
+        use crate::interrupt::PirqRouter;
+        let dsdt = DsdtBuilder::new(DsdtConfig::default()).build();
+        assert!(
+            dsdt.windows(4).any(|w| w == b"_PRT"),
+            "PCI0 must carry a _PRT"
+        );
+        // Slot 1 INTA (_PRT pin 0) must route to the GSI the router resolves (17).
+        assert_eq!(PirqRouter::device_gsi(1, 1), Some(17));
+        // Its sub-package content: NumElements 4, DWord addr 0x0001FFFF, pin ZERO,
+        // source ZERO, GSI byte-const 17.
+        let entry = [0x04u8, 0x0C, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x0A, 0x11];
+        assert!(
+            dsdt.windows(entry.len()).any(|w| w == entry),
+            "_PRT must contain the slot-1 INTA -> GSI17 entry"
+        );
+        // Slot 0 INTA -> GSI16, Word addr 0x0000FFFF.
+        let entry0 = [0x04u8, 0x0B, 0xFF, 0xFF, 0x00, 0x00, 0x0A, 0x10];
+        assert!(
+            dsdt.windows(entry0.len()).any(|w| w == entry0),
+            "_PRT must contain the slot-0 INTA -> GSI16 entry"
+        );
         let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         assert_eq!(sum, 0);
     }

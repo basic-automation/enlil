@@ -272,23 +272,45 @@ impl AmlBuilder {
         }
     }
 
-    /// `Name(name, Package(){ ...integers... })` — a fixed package of integer
-    /// constants, e.g. the `_Sx` sleep-state packages whose elements are the
-    /// `PM1a`/`PM1b` `SLP_TYP` values the OS writes to enter that state.
-    pub fn name_package(&mut self, name: &[u8; 4], values: &[u64]) -> &mut Self {
-        self.data.push(opcode::NAME_OP);
-        self.data.extend_from_slice(&Self::encode_name(*name));
-
-        // Body = NumElements (ByteData) + element encodings.
+    /// Encode `Package(){ ...integers... }` as a standalone byte sequence (for use
+    /// as an element of an outer package, e.g. one `_PRT` entry).
+    fn encode_integer_package(values: &[u64]) -> Vec<u8> {
         let mut body = vec![values.len().to_le_bytes()[0]];
         for &v in values {
             body.extend_from_slice(&Self::encode_integer_const(v));
         }
+        let mut out = vec![opcode::PACKAGE_OP];
+        out.extend_from_slice(&Self::encode_self_pkg_length(body.len()));
+        out.extend_from_slice(&body);
+        out
+    }
 
-        // PackageOp PkgLength NumElements PackageElementList.
-        self.data.push(opcode::PACKAGE_OP);
-        let pkg = Self::encode_self_pkg_length(body.len());
+    /// `Name(name, Package(){ ...integers... })` — a fixed package of integer
+    /// constants, e.g. the `_Sx` sleep-state packages whose elements are the
+    /// `PM1a`/`PM1b` `SLP_TYP` values the OS writes to enter that state.
+    pub fn name_package(&mut self, name: &[u8; 4], values: &[u64]) -> &mut Self {
+        let pkg = Self::encode_integer_package(values);
+        self.data.push(opcode::NAME_OP);
+        self.data.extend_from_slice(&Self::encode_name(*name));
         self.data.extend_from_slice(&pkg);
+        self
+    }
+
+    /// `Name(name, Package(){ <sub-package> ... })` — a package whose every
+    /// element is itself a fixed integer package. Used for a `_PRT` (each entry is
+    /// `{ Address, Pin, Source, SourceIndex }`); `entries` is one 4-tuple per row.
+    pub fn name_routing_table(&mut self, name: &[u8; 4], entries: &[[u64; 4]]) -> &mut Self {
+        // Body = NumElements + each entry encoded as a sub-package.
+        let mut body = vec![entries.len().to_le_bytes()[0]];
+        for entry in entries {
+            body.extend_from_slice(&Self::encode_integer_package(entry));
+        }
+
+        self.data.push(opcode::NAME_OP);
+        self.data.extend_from_slice(&Self::encode_name(*name));
+        self.data.push(opcode::PACKAGE_OP);
+        self.data
+            .extend_from_slice(&Self::encode_self_pkg_length(body.len()));
         self.data.extend_from_slice(&body);
         self
     }
@@ -678,6 +700,38 @@ mod tests {
         let num_pos = 6 + pkg_field;
         assert_eq!(bytes[num_pos], 4, "four elements");
         assert_eq!(&bytes[num_pos + 1..], &[0x0A, 0x05, 0x0A, 0x05, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn name_routing_table_nests_packages() {
+        let mut aml = AmlBuilder::new();
+        // Two _PRT rows: slot 0 INTA -> GSI 16, slot 0 INTB -> GSI 17.
+        let entries = [[0x0000_FFFF, 0, 0, 16], [0x0000_FFFF, 1, 0, 17]];
+        aml.name_routing_table(b"_PRT", &entries);
+        let bytes = aml.into_bytes();
+
+        assert_eq!(bytes[0], opcode::NAME_OP);
+        assert_eq!(&bytes[1..5], b"_PRT");
+        assert_eq!(bytes[5], opcode::PACKAGE_OP);
+        let (val, field) = decode_pkg_length(&bytes[6..]);
+        assert_eq!(
+            val,
+            bytes.len() - 6,
+            "outer _PRT package is self-consistent"
+        );
+
+        // NumElements = 2, then the first sub-package begins with PACKAGE_OP.
+        let num_pos = 6 + field;
+        assert_eq!(bytes[num_pos], 2);
+        assert_eq!(bytes[num_pos + 1], opcode::PACKAGE_OP);
+
+        // The first sub-package's own PkgLength is self-consistent.
+        let (sub_val, sub_field) = decode_pkg_length(&bytes[num_pos + 2..]);
+        let sub_start = num_pos + 2; // position of the sub PkgLength field
+        let sub_end = sub_start + sub_val;
+        assert!(sub_end <= bytes.len());
+        // Sub NumElements = 4.
+        assert_eq!(bytes[sub_start + sub_field], 4);
     }
 
     #[test]
