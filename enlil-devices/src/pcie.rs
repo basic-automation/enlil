@@ -417,6 +417,12 @@ const RST_CNT_FULL_RST: u8 = 1 << 3;
 /// The `RST_CNT` bits that latch and read back (`RST_CPU` is write-only / self-
 /// clearing, so it is not stored).
 const RST_CNT_STORED: u8 = RST_CNT_SYS_RST | RST_CNT_FULL_RST;
+/// The `RST_CNT` value that triggers a (hard) reboot: `SYS_RST | RST_CPU`.
+///
+/// This is what the FADT's `RESET_VALUE` advertises for the `0xCF9` reset
+/// register, so an OS resetting through the ACPI-advertised register hits the same
+/// byte this model acts on.
+pub const RST_CNT_REBOOT_VALUE: u8 = RST_CNT_SYS_RST | RST_CNT_RST_CPU;
 
 /// The mutable state behind a [`PciResetControl`]: the read-back `RST_CNT` value
 /// and the one-shot reboot latch.

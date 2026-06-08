@@ -378,7 +378,11 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > `add_pcie` (via `DeviceBus::pci_reset_handle`), so
 > `StandardPc::poll_platform_events` now returns `PlatformEvent::Reset` for the
 > `0xCF9` path too (alongside `0x92`); both latches are drained each poll. The vCPU
-> run loop acts on that event once `/dev/kvm` is available.
+> run loop acts on that event once `/dev/kvm` is available. The FADT's `RESET_REG`/
+> `RESET_VALUE` (already `io(0xCF9)`/`0x06`) now source those values from the
+> `pcie::{RESET_CONTROL_PORT,RST_CNT_REBOOT_VALUE}` constants the model decodes, so
+> the ACPI-advertised reset register and the hardware behind it can't drift
+> (cross-check test).
 >
 > **Status (2026-06-08d):** the **SMI command port** (`0xB2`, the FADT's `SMI_CMD`)
 > is now modelled (`chipset::SmiCommandPort`) and wired into `standard_pc_complete`.
