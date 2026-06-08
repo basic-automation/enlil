@@ -361,9 +361,11 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > exists for transparency: a guest that `request_region`s and probes ISA DMA at
 > boot (Linux always does) now reads coherent register state instead of open-bus
 > `0xFF`, closing a cheap VM tell. Wired into `standard_pc_complete` and claimed in
-> the DSDT's `SYSR` `_CRS`. **Follow-up:** drive a real channel only when a DMA
-> consumer (floppy/SB16) is added, and fold the page latch + channel addr/count
-> into a 24-bit transfer address at that point.
+> the DSDT's `SYSR` `_CRS`. The physical-address composition (page latch + channel
+> address → 24-bit byte address, including DMA-2's word-addressing and ignored
+> page bit 0) is modelled as `dma::transfer_address`/`transfer_byte_count`.
+> **Follow-up:** drive a real channel (decrement current addr/count, raise TC,
+> handle autoinit) only when a DMA consumer (floppy/SB16) is added.
 
 ### 0.3 USB Live Boot & Non-Destructive Testing (CRITICAL FOR ADOPTION)
 

@@ -340,6 +340,42 @@ impl PioDevice for DmaPageRegisters {
     }
 }
 
+/// Compose the **physical transfer address** a DMA cycle would target.
+///
+/// Combines a channel's current address register with its page register, per the
+/// PC/AT's 24-bit address generation:
+///
+/// - **8-bit channels (DMA-1):** the page register supplies A16-A23 and the
+///   16-bit channel address supplies A0-A15, so the address is
+///   `(page << 16) | channel_addr` — a flat byte address.
+/// - **16-bit channels (DMA-2):** the channel address is a *word* address (A1-A16
+///   = `channel_addr << 1`, with A0 forced to 0) and the page register's bit 0 is
+///   ignored, so A17-A23 come from `page & 0xFE`. The address is
+///   `((page & 0xFE) << 16) | (channel_addr << 1)`.
+///
+/// This is the passive-model counterpart to a transfer: it tells an inspector (or
+/// a future DMA consumer) exactly which guest-physical byte the channel points
+/// at, without moving any data.
+#[must_use]
+pub fn transfer_address(page: u8, channel_addr: u16, is_16bit: bool) -> u32 {
+    if is_16bit {
+        ((u32::from(page) & 0xFE) << 16) | (u32::from(channel_addr) << 1)
+    } else {
+        (u32::from(page) << 16) | u32::from(channel_addr)
+    }
+}
+
+/// The **byte length** of the transfer a channel's current-count register
+/// describes.
+///
+/// The 8237 transfers `count + 1` units; a unit is one byte on an 8-bit channel
+/// and one 16-bit word (two bytes) on a 16-bit channel.
+#[must_use]
+pub fn transfer_byte_count(channel_count: u16, is_16bit: bool) -> u32 {
+    let units = u32::from(channel_count) + 1;
+    if is_16bit { units * 2 } else { units }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,6 +518,41 @@ mod tests {
         assert_eq!(DmaPageRegisters::page_port_for_channel(7), Some(0x8A));
         // Channel 4 is the cascade — no page register.
         assert_eq!(DmaPageRegisters::page_port_for_channel(4), None);
+    }
+
+    #[test]
+    fn eight_bit_transfer_address_is_flat() {
+        // DMA-1: page = A16-A23, channel addr = A0-A15.
+        assert_eq!(transfer_address(0x12, 0x3456, false), 0x0012_3456);
+        assert_eq!(transfer_address(0xFF, 0xFFFF, false), 0x00FF_FFFF);
+        assert_eq!(transfer_address(0x00, 0x0000, false), 0);
+    }
+
+    #[test]
+    fn sixteen_bit_transfer_address_is_word_addressed() {
+        // DMA-2: channel addr is a word address (<<1, A0 forced 0); page bit 0
+        // is ignored (A17-A23 from page & 0xFE).
+        assert_eq!(
+            transfer_address(0x12, 0x3456, true),
+            (0x12 << 16) | (0x3456 << 1)
+        );
+        // Page bit 0 set must not appear in the result.
+        assert_eq!(transfer_address(0x01, 0x0000, true), 0);
+        assert_eq!(transfer_address(0x03, 0x0000, true), 0x0002_0000);
+        // The address is always even (A0 = 0).
+        assert_eq!(transfer_address(0x00, 0xFFFF, true) & 1, 0);
+    }
+
+    #[test]
+    fn transfer_count_is_units_plus_one() {
+        // count register holds (length - 1); 8-bit => bytes, 16-bit => words*2.
+        assert_eq!(transfer_byte_count(0x0000, false), 1);
+        assert_eq!(transfer_byte_count(0x01FF, false), 0x0200);
+        assert_eq!(transfer_byte_count(0x0000, true), 2);
+        assert_eq!(transfer_byte_count(0x01FF, true), 0x0400);
+        // A full 64Ki-unit transfer (count = 0xFFFF).
+        assert_eq!(transfer_byte_count(0xFFFF, false), 0x1_0000);
+        assert_eq!(transfer_byte_count(0xFFFF, true), 0x2_0000);
     }
 
     #[test]
