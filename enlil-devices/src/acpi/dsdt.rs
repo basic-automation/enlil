@@ -152,21 +152,30 @@ impl DsdtBuilder {
         aml.device_end(&isa);
     }
 
-    /// Build RTC device
+    /// Build RTC device. `_CRS` reports the CMOS index/data ports (0x70-0x71) and
+    /// the periodic/alarm interrupt (IRQ8).
     fn build_rtc(aml: &mut AmlBuilder) {
         let rtc = aml.device_start(b"RTC_");
         aml.name_string(b"_HID", "PNP0B00");
+        let mut crs = ResourceTemplate::new();
+        crs.io_port(0x70, 2).irq(8);
+        aml.name_resource_template(b"_CRS", &crs);
         let sta = aml.method_start(b"_STA", 0, false);
         aml.return_integer(0x0F);
         aml.method_end(&sta);
         aml.device_end(&rtc);
     }
 
-    /// Build PS/2 keyboard and mouse
+    /// Build PS/2 keyboard and mouse. The i8042 data/command ports (0x60, 0x64)
+    /// live on the keyboard's `_CRS` (with IRQ1); the mouse shares those ports and
+    /// reports only its own interrupt (IRQ12), matching real ACPI namespaces.
     fn build_ps2(aml: &mut AmlBuilder) {
         // Keyboard
         let kbd = aml.device_start(b"KBD_");
         aml.name_string(b"_HID", "PNP0303");
+        let mut kbd_crs = ResourceTemplate::new();
+        kbd_crs.io_port(0x60, 1).io_port(0x64, 1).irq(1);
+        aml.name_resource_template(b"_CRS", &kbd_crs);
         let sta = aml.method_start(b"_STA", 0, false);
         aml.return_integer(0x0F);
         aml.method_end(&sta);
@@ -175,6 +184,9 @@ impl DsdtBuilder {
         // Mouse
         let mou = aml.device_start(b"MOU_");
         aml.name_string(b"_HID", "PNP0F13");
+        let mut mou_crs = ResourceTemplate::new();
+        mou_crs.irq(12);
+        aml.name_resource_template(b"_CRS", &mou_crs);
         let sta = aml.method_start(b"_STA", 0, false);
         aml.return_integer(0x0F);
         aml.method_end(&sta);
@@ -342,6 +354,35 @@ mod tests {
             "COM1 _CRS must contain the IRQ4 descriptor"
         );
         // Checksum still valid.
+        let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        assert_eq!(sum, 0);
+    }
+
+    #[test]
+    fn dsdt_rtc_and_ps2_carry_crs() {
+        let dsdt = DsdtBuilder::new(DsdtConfig::default()).build();
+        // RTC: I/O 0x70 len 2 + IRQ8.
+        let rtc_io = [0x47u8, 0x01, 0x70, 0x00, 0x70, 0x00, 0x01, 0x02];
+        assert!(
+            dsdt.windows(rtc_io.len()).any(|w| w == rtc_io),
+            "RTC _CRS must contain the 0x70/len-2 I/O descriptor"
+        );
+        let rtc_irq = [0x23u8, 0x00, 0x01, 0x01]; // IRQ8 → mask 0x0100
+        assert!(
+            dsdt.windows(rtc_irq.len()).any(|w| w == rtc_irq),
+            "RTC _CRS must contain the IRQ8 descriptor"
+        );
+        // Keyboard: I/O 0x60 len 1 and 0x64 len 1.
+        let kbd_io_60 = [0x47u8, 0x01, 0x60, 0x00, 0x60, 0x00, 0x01, 0x01];
+        let kbd_io_64 = [0x47u8, 0x01, 0x64, 0x00, 0x64, 0x00, 0x01, 0x01];
+        assert!(dsdt.windows(kbd_io_60.len()).any(|w| w == kbd_io_60));
+        assert!(dsdt.windows(kbd_io_64.len()).any(|w| w == kbd_io_64));
+        // Mouse: IRQ12 → mask 0x1000.
+        let mou_irq = [0x23u8, 0x00, 0x10, 0x01];
+        assert!(
+            dsdt.windows(mou_irq.len()).any(|w| w == mou_irq),
+            "mouse _CRS must contain the IRQ12 descriptor"
+        );
         let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         assert_eq!(sum, 0);
     }
