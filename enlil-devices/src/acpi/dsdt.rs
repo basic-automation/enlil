@@ -8,7 +8,7 @@
 //! - Processor objects
 //! - Power management (_S5 sleep state for shutdown)
 
-use super::aml::AmlBuilder;
+use super::aml::{AmlBuilder, ResourceTemplate};
 use super::tables::{AcpiSdtHeader, OemInfo};
 use crate::truncate::u32_of;
 
@@ -147,7 +147,7 @@ impl DsdtBuilder {
         }
 
         // COM1 serial port
-        Self::build_com1(aml);
+        self.build_com1(aml);
 
         aml.device_end(&isa);
     }
@@ -181,11 +181,17 @@ impl DsdtBuilder {
         aml.device_end(&mou);
     }
 
-    /// Build COM1 serial port
-    fn build_com1(aml: &mut AmlBuilder) {
+    /// Build COM1 serial port. `_CRS` reports the configured I/O window (8 ports)
+    /// and IRQ so the OS — Windows in particular — assigns the port resources
+    /// from the namespace rather than guessing.
+    fn build_com1(&self, aml: &mut AmlBuilder) {
         let com1 = aml.device_start(b"COM1");
         aml.name_string(b"_HID", "PNP0501");
         aml.name_integer(b"_UID", 1);
+        let mut crs = ResourceTemplate::new();
+        crs.io_port(self.config.com1_port, 8)
+            .irq(self.config.com1_irq);
+        aml.name_resource_template(b"_CRS", &crs);
         let sta = aml.method_start(b"_STA", 0, false);
         aml.return_integer(0x0F);
         aml.method_end(&sta);
@@ -307,6 +313,35 @@ mod tests {
         };
         let dsdt = DsdtBuilder::new(config).build();
         assert!(dsdt.len() > 36);
+        let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        assert_eq!(sum, 0);
+    }
+
+    #[test]
+    fn dsdt_com1_has_crs_with_configured_port_and_irq() {
+        let config = DsdtConfig {
+            com1_port: 0x3F8,
+            com1_irq: 4,
+            ..DsdtConfig::default()
+        };
+        let dsdt = DsdtBuilder::new(config).build();
+        // The _CRS name and a fixed I/O Port Descriptor (0x47) for 0x3F8 must
+        // appear in the AML, followed by an IRQ descriptor (0x23) with IRQ4.
+        let found_crs = dsdt.windows(4).any(|w| w == b"_CRS");
+        assert!(found_crs, "COM1 must carry a _CRS");
+        // I/O Port Descriptor: 0x47, info, min(LE)=F8 03, max=F8 03, align, len=8.
+        let io = [0x47u8, 0x01, 0xF8, 0x03, 0xF8, 0x03, 0x01, 0x08];
+        assert!(
+            dsdt.windows(io.len()).any(|w| w == io),
+            "COM1 _CRS must contain the 0x3F8/len-8 I/O descriptor"
+        );
+        // IRQ descriptor for IRQ4: 0x23, mask=0x0010, flags=0x01.
+        let irq = [0x23u8, 0x10, 0x00, 0x01];
+        assert!(
+            dsdt.windows(irq.len()).any(|w| w == irq),
+            "COM1 _CRS must contain the IRQ4 descriptor"
+        );
+        // Checksum still valid.
         let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         assert_eq!(sum, 0);
     }
