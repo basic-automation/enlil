@@ -209,28 +209,46 @@ impl AmlBuilder {
         self
     }
 
+    /// Encode a self-inclusive `PkgLength` for a package whose body (everything
+    /// after the `PkgLength` field) is `content_len` bytes.
+    ///
+    /// A `PkgLength` counts from its own first byte to the end of the package
+    /// (ACPI spec §20.2.4), so the encoded value must include the size of the
+    /// field itself. The field is 1–4 bytes; a forward pass from the 1-byte form
+    /// upward finds the smallest field that can hold `content_len + field_len`
+    /// (growing the field only ever grows the total, so the first fit is minimal).
+    fn encode_self_pkg_length(content_len: usize) -> Vec<u8> {
+        for field_len in 1..=4 {
+            let encoded = Self::encode_pkg_length(content_len + field_len);
+            if encoded.len() == field_len {
+                return encoded;
+            }
+        }
+        // content_len + 4 always fits the 4-byte form for any realistic table.
+        Self::encode_pkg_length(content_len + 4)
+    }
+
     /// Patch a `PkgLength` at the given position
     fn patch_pkg_length(&mut self, length_pos: usize, _content_start: usize) {
-        let total_len = self.data.len() - length_pos;
-        let encoded = Self::encode_pkg_length(total_len);
-
-        // We reserved 4 bytes. Replace with actual encoding + shift if needed.
+        // We reserved 4 bytes for the field; the body is everything after them.
         let reserved = 4;
+        let content_len = self.data.len() - length_pos - reserved;
+        let encoded = Self::encode_self_pkg_length(content_len);
         let actual = encoded.len();
 
-        if actual <= reserved {
-            // Copy encoded bytes, shift remaining content left
-            let shift = reserved - actual;
-            for (i, &b) in encoded.iter().enumerate() {
-                self.data[length_pos + i] = b;
-            }
-            if shift > 0 {
-                let src_start = length_pos + reserved;
-                let remaining = self.data.len() - src_start;
-                self.data
-                    .copy_within(src_start..src_start + remaining, length_pos + actual);
-                self.data.truncate(self.data.len() - shift);
-            }
+        // Overwrite the reserved field with the real encoding, then close the
+        // gap by shifting the body left (the value already accounts for `actual`,
+        // not `reserved`, so the package stays self-consistent after the shift).
+        for (i, &b) in encoded.iter().enumerate() {
+            self.data[length_pos + i] = b;
+        }
+        let shift = reserved - actual;
+        if shift > 0 {
+            let src_start = length_pos + reserved;
+            let remaining = self.data.len() - src_start;
+            self.data
+                .copy_within(src_start..src_start + remaining, length_pos + actual);
+            self.data.truncate(self.data.len() - shift);
         }
     }
 }
@@ -316,6 +334,92 @@ mod tests {
         aml.method_end(&method);
         let bytes = aml.into_bytes();
         assert_eq!(bytes[0], opcode::METHOD_OP);
+    }
+
+    /// Decode an ACPI `PkgLength` field (ACPI spec §20.2.4): returns the encoded
+    /// value and the number of bytes the field occupies.
+    fn decode_pkg_length(b: &[u8]) -> (usize, usize) {
+        let lead = b[0];
+        let nbytes = usize::from(lead >> 6);
+        if nbytes == 0 {
+            (usize::from(lead & 0x3F), 1)
+        } else {
+            let mut val = usize::from(lead & 0x0F);
+            for (i, &byte) in b[1..=nbytes].iter().enumerate() {
+                val |= usize::from(byte) << (4 + 8 * i);
+            }
+            (val, 1 + nbytes)
+        }
+    }
+
+    #[test]
+    fn scope_pkg_length_matches_actual_package_size() {
+        // A PkgLength counts from its own first byte to the end of the package.
+        // The buggy encoder overshot by the shift amount, which would make a real
+        // ACPI interpreter read past the scope and corrupt all following AML.
+        let mut aml = AmlBuilder::new();
+        let scope = aml.scope_start(b"_SB_");
+        aml.name_integer(b"TEST", 1);
+        aml.scope_end(&scope);
+        let bytes = aml.into_bytes();
+
+        assert_eq!(bytes[0], opcode::SCOPE_OP);
+        let (val, field_len) = decode_pkg_length(&bytes[1..]);
+        assert_eq!(
+            val,
+            bytes.len() - 1,
+            "PkgLength must equal the bytes from the field to the package end"
+        );
+        assert_eq!(field_len, 1, "a tiny scope uses a one-byte PkgLength");
+    }
+
+    #[test]
+    fn large_package_pkg_length_is_self_consistent() {
+        // Force a body large enough to need a two-byte PkgLength, exercising the
+        // field-shrink/shift path with a multi-byte field.
+        let mut aml = AmlBuilder::new();
+        let scope = aml.scope_start(b"_SB_");
+        for _ in 0..40 {
+            // each name_integer(BYTE) is NAME_OP + 4 name + BYTE_PREFIX + value = 7 bytes
+            aml.name_integer(b"PADX", 0x42);
+        }
+        aml.scope_end(&scope);
+        let bytes = aml.into_bytes();
+
+        let (val, field_len) = decode_pkg_length(&bytes[1..]);
+        assert_eq!(
+            field_len, 2,
+            "a body over 0x3F bytes needs a two-byte field"
+        );
+        assert_eq!(val, bytes.len() - 1);
+    }
+
+    #[test]
+    fn nested_package_lengths_are_each_correct() {
+        // Outer scope contains a device; both PkgLengths must point exactly to
+        // their own package end.
+        let mut aml = AmlBuilder::new();
+        let sb = aml.scope_start(b"_SB_");
+        let dev = aml.device_start(b"PCI0");
+        aml.name_string(b"_HID", "PNP0A08");
+        aml.device_end(&dev);
+        aml.scope_end(&sb);
+        let bytes = aml.into_bytes();
+
+        // Outer Scope(_SB_): SCOPE_OP at 0, PkgLength at 1.
+        assert_eq!(bytes[0], opcode::SCOPE_OP);
+        let (outer_val, outer_field) = decode_pkg_length(&bytes[1..]);
+        assert_eq!(outer_val, bytes.len() - 1);
+
+        // Inner Device: ExtOpPrefix + DEVICE_OP, then its PkgLength. It sits
+        // right after the outer name (SCOPE_OP + field + "_SB_").
+        let dev_op = 1 + outer_field + 4;
+        assert_eq!(bytes[dev_op], opcode::EXT_OP_PREFIX);
+        assert_eq!(bytes[dev_op + 1], opcode::DEVICE_OP);
+        let (inner_val, _) = decode_pkg_length(&bytes[dev_op + 2..]);
+        // Inner package runs from its PkgLength field to the end of the device,
+        // which is the end of the whole buffer here.
+        assert_eq!(inner_val, bytes.len() - (dev_op + 2));
     }
 
     #[test]
