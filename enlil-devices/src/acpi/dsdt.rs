@@ -8,7 +8,7 @@
 //! - Processor objects
 //! - Power management (_S5 sleep state for shutdown)
 
-use super::aml::{AmlBuilder, ResourceTemplate};
+use super::aml::{AmlBuilder, ResourceTemplate, opcode};
 use super::tables::{AcpiSdtHeader, OemInfo};
 use crate::truncate::u32_of;
 
@@ -67,10 +67,25 @@ impl DsdtBuilder {
     /// Generate the AML bytecode for the DSDT
     fn generate_aml(&self) -> Vec<u8> {
         let mut aml = AmlBuilder::new();
+        Self::build_pic_method(&mut aml);
         self.build_system_bus(&mut aml);
         self.build_processors(&mut aml);
         Self::build_sleep_states(&mut aml);
         aml.into_bytes()
+    }
+
+    /// Build the global interrupt-model flag `PICF` and the `_PIC` control method
+    /// the OS calls to announce whether it drives the legacy 8259 PICs (`_PIC(0)`)
+    /// or the I/O APIC (`_PIC(1)`). The method stores the argument into `PICF`,
+    /// exactly as real firmware does — a missing `_PIC` is a VM tell. Our `_PRT`
+    /// is currently a static APIC table that ignores `PICF`; wiring a mode-
+    /// selecting `_PRT` onto this flag is the documented follow-up.
+    fn build_pic_method(aml: &mut AmlBuilder) {
+        aml.name_integer(b"PICF", 0);
+        let m = aml.method_start(b"_PIC", 1, false);
+        // Store(Arg0, PICF): StoreOp Arg0 NameString("PICF").
+        aml.raw(&[opcode::STORE_OP, opcode::ARG0]).raw(b"PICF");
+        aml.method_end(&m);
     }
 
     /// Build \_SB scope with PCI root and ISA devices
@@ -413,6 +428,33 @@ mod tests {
         };
         let dsdt = DsdtBuilder::new(config).build();
         assert!(dsdt.len() > 36);
+        let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        assert_eq!(sum, 0);
+    }
+
+    #[test]
+    fn dsdt_defines_pic_method_and_flag() {
+        let dsdt = DsdtBuilder::new(DsdtConfig::default()).build();
+        // PICF global and the _PIC method both present.
+        assert!(
+            dsdt.windows(4).any(|w| w == b"PICF"),
+            "DSDT must define the PICF interrupt-model flag"
+        );
+        let pos = dsdt
+            .windows(4)
+            .position(|w| w == b"_PIC")
+            .expect("DSDT must define a _PIC method");
+        // _PIC is a Method: the byte before the name is the METHOD_OP's PkgLength,
+        // and before that the METHOD_OP. Find the METHOD_OP preceding the name.
+        // Simpler: the method's flags byte (argc=1) follows the name.
+        let flags = dsdt[pos + 4];
+        assert_eq!(flags & 0x07, 1, "_PIC takes one argument");
+        // Body contains Store(Arg0, PICF): STORE_OP, ARG0, then "PICF".
+        let store = [opcode::STORE_OP, opcode::ARG0, b'P', b'I', b'C', b'F'];
+        assert!(
+            dsdt.windows(store.len()).any(|w| w == store),
+            "_PIC must store its argument into PICF"
+        );
         let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         assert_eq!(sum, 0);
     }
