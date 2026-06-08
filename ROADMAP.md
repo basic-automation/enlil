@@ -374,10 +374,11 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > (not a leaked config byte), and a `RST_CPU` (bit 2) write latches a reboot
 > request (`take_reset`), with `SYS_RST`/`FULL_RST` reading back. This is the
 > `0xCF9`/`reboot=pci` path every modern OS uses, mirroring the existing `0x92`
-> fast-reset latch. **Follow-up:** surface `PciConfigIo::take_reset` out of
-> `add_pcie` so `StandardPc::poll_platform_events` returns `PlatformEvent::Reset`
-> for the `0xCF9` path too (alongside `0x92`) — wired into the vCPU run loop once
-> `/dev/kvm` is available.
+> fast-reset latch. The latch is shared (`PciResetControl`) and surfaced out of
+> `add_pcie` (via `DeviceBus::pci_reset_handle`), so
+> `StandardPc::poll_platform_events` now returns `PlatformEvent::Reset` for the
+> `0xCF9` path too (alongside `0x92`); both latches are drained each poll. The vCPU
+> run loop acts on that event once `/dev/kvm` is available.
 
 ### 0.3 USB Live Boot & Non-Destructive Testing (CRITICAL FOR ADOPTION)
 

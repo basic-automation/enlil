@@ -418,6 +418,53 @@ const RST_CNT_FULL_RST: u8 = 1 << 3;
 /// clearing, so it is not stored).
 const RST_CNT_STORED: u8 = RST_CNT_SYS_RST | RST_CNT_FULL_RST;
 
+/// The mutable state behind a [`PciResetControl`]: the read-back `RST_CNT` value
+/// and the one-shot reboot latch.
+#[derive(Default)]
+struct ResetState {
+    /// Stored `SYS_RST`/`FULL_RST` bits (what a guest reads back from `0xCF9`).
+    rcr: u8,
+    /// Set on a `RST_CPU` write; consumed by [`PciResetControl::take_reset`].
+    reset_requested: bool,
+}
+
+/// A shareable handle to a [`PciConfigIo`]'s `0xCF9` Reset Control Register.
+///
+/// The register lives inside the boxed `PciConfigIo` on the bus, so the run loop
+/// can't reach it directly; this clone of the same latch lets the platform layer
+/// poll the reboot request (`take_reset`) — mirroring
+/// [`SharedSystemControlPortA`](crate::chipset::SharedSystemControlPortA) for the
+/// `0x92` fast-reset path.
+#[derive(Clone, Default)]
+pub struct PciResetControl(Rc<RefCell<ResetState>>);
+
+impl PciResetControl {
+    /// Apply a guest write to `RST_CNT`: a `RST_CPU` (bit 2) write latches a
+    /// reboot request; the `SYS_RST`/`FULL_RST` bits are stored for read-back.
+    fn write(&self, val: u8) {
+        let mut state = self.0.borrow_mut();
+        if val & RST_CNT_RST_CPU != 0 {
+            state.reset_requested = true;
+        }
+        state.rcr = val & RST_CNT_STORED;
+    }
+
+    /// The current `RST_CNT` read-back value.
+    #[must_use]
+    pub fn value(&self) -> u8 {
+        self.0.borrow().rcr
+    }
+
+    /// Consume the one-shot reboot latch: `true` exactly once per `RST_CPU` write.
+    #[must_use]
+    pub fn take_reset(&self) -> bool {
+        let mut state = self.0.borrow_mut();
+        let requested = state.reset_requested;
+        state.reset_requested = false;
+        requested
+    }
+}
+
 /// Legacy PCI **Configuration Mechanism #1** front-end (the `0xCF8`/`0xCFC` port
 /// pair) over a [`PcieRootComplex`].
 ///
@@ -448,14 +495,9 @@ pub struct PciConfigIo {
     root: SharedRootComplex,
     /// The latched `CONFIG_ADDRESS` value (port `0xCF8`).
     config_address: u32,
-    /// The chipset Reset Control Register (`0xCF9`): the stored `SYS_RST`/
-    /// `FULL_RST` bits a guest reads back (`RST_CPU` is not stored).
-    rcr: u8,
-    /// One-shot latch: set when a guest wrote `RST_CPU` to `0xCF9` (a reboot
-    /// request). Consumed by [`PciConfigIo::take_reset`] from the run loop, which
-    /// then re-inits the vCPU to its reset vector — exactly as the `0x92`
-    /// fast-reset latch is handled.
-    reset_requested: bool,
+    /// The chipset Reset Control Register (`0xCF9`), shared so the run loop can
+    /// poll the reboot latch from outside the boxed device. See [`PciResetControl`].
+    reset: PciResetControl,
 }
 
 /// Low-`size`-byte mask (1/2/4 bytes → `0xFF`/`0xFFFF`/`0xFFFF_FFFF`).
@@ -480,13 +522,19 @@ impl PciConfigIo {
     /// Wrap an already-shared root complex behind the legacy ports, so an
     /// [`EcamSpace`] mounted over the same handle sees the same device set.
     #[must_use]
-    pub const fn with_shared(root: SharedRootComplex) -> Self {
+    pub fn with_shared(root: SharedRootComplex) -> Self {
         Self {
             root,
             config_address: 0,
-            rcr: 0,
-            reset_requested: false,
+            reset: PciResetControl::default(),
         }
+    }
+
+    /// A clone of the shared `0xCF9` Reset Control latch, so the platform layer
+    /// can poll the guest's reboot request after the device is boxed onto the bus.
+    #[must_use]
+    pub fn reset_handle(&self) -> PciResetControl {
+        self.reset.clone()
     }
 
     /// A clone of the shared root-complex handle (e.g. to add devices or to
@@ -537,28 +585,17 @@ impl PciConfigIo {
         port == RESET_CONTROL_PORT && size == 1
     }
 
-    /// Apply a guest write to the Reset Control Register (`0xCF9`). The stored
-    /// `SYS_RST`/`FULL_RST` bits are kept for read-back; a `RST_CPU` (bit 2) write
-    /// latches a reboot request for the run loop to act on.
-    const fn write_reset_control(&mut self, val: u8) {
-        if val & RST_CNT_RST_CPU != 0 {
-            self.reset_requested = true;
-        }
-        self.rcr = val & RST_CNT_STORED;
-    }
-
     /// Consume the one-shot `0xCF9` reboot latch: returns `true` exactly once per
     /// `RST_CPU` write, so the run loop re-inits the vCPU to its reset vector.
-    pub const fn take_reset(&mut self) -> bool {
-        let requested = self.reset_requested;
-        self.reset_requested = false;
-        requested
+    #[must_use]
+    pub fn take_reset(&self) -> bool {
+        self.reset.take_reset()
     }
 
     /// The current Reset Control Register read-back value (`0xCF9`).
     #[must_use]
-    pub const fn reset_control(&self) -> u8 {
-        self.rcr
+    pub fn reset_control(&self) -> u8 {
+        self.reset.value()
     }
 }
 
@@ -587,7 +624,7 @@ impl PioDevice for PciConfigIo {
         if Self::is_reset_control(port, size) {
             // 0xCF9 byte: the Reset Control Register (reboot path), not a byte of
             // CONFIG_ADDRESS.
-            self.write_reset_control(u8_of(data));
+            self.reset.write(u8_of(data));
         } else if port < CONFIG_DATA_PORT {
             self.write_address(port - CONFIG_ADDRESS_PORT, size, data);
         } else if self.enabled() {

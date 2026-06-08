@@ -20,7 +20,7 @@ use enlil_devices::chipset::{Gpe0Block, SharedAcpiPm1Block, SharedSystemControlP
 use enlil_devices::dma::{Dma8237, DmaPageRegisters};
 use enlil_devices::interrupt::{IoApicMmio, PirqRouter, SharedInterruptController, SharedPic};
 use enlil_devices::pcie::{
-    vendors, EcamSpace, PciBdf, PciConfigIo, PcieRootComplex, SharedRootComplex,
+    vendors, EcamSpace, PciBdf, PciConfigIo, PciResetControl, PcieRootComplex, SharedRootComplex,
     PIRQ_ROUTE_CONFIG_BASE,
 };
 use enlil_devices::ps2::{SharedI8042, PS2_KBD_IRQ, PS2_MOUSE_IRQ};
@@ -36,6 +36,10 @@ pub struct DeviceBus {
     pub pio: PioBus,
     /// Memory-mapped devices (e.g. LAPIC, IOAPIC, HPET, PCIe ECAM).
     pub mmio: MmioBus,
+    /// A clone of the PCI config front-end's `0xCF9` reset latch, captured when
+    /// [`add_pcie`](Self::add_pcie) mounts it, so the platform layer can poll the
+    /// guest's reboot request. `None` until `add_pcie` runs.
+    pci_reset: Option<PciResetControl>,
 }
 
 impl DeviceBus {
@@ -45,6 +49,7 @@ impl DeviceBus {
         Self {
             pio: PioBus::new(),
             mmio: MmioBus::new(),
+            pci_reset: None,
         }
     }
 
@@ -157,6 +162,7 @@ impl DeviceBus {
     ) -> Result<SharedRootComplex, enlil_devices::bus::BusError> {
         let cam = PciConfigIo::new(root);
         let shared = cam.shared();
+        self.pci_reset = Some(cam.reset_handle());
         {
             let mut rc = shared.borrow_mut();
             if rc.find_device(&PciBdf::new(0, 0, 0)).is_none() {
@@ -166,6 +172,14 @@ impl DeviceBus {
         self.add_pci_config_io(cam)?;
         self.add_mmio(Box::new(EcamSpace::new(shared.clone())))?;
         Ok(shared)
+    }
+
+    /// A clone of the PCI config front-end's `0xCF9` Reset Control latch, set once
+    /// [`add_pcie`](Self::add_pcie) has mounted the front-end. Lets the platform
+    /// layer poll a guest's `0xCF9`/`reboot=pci` reboot request.
+    #[must_use]
+    pub fn pci_reset_handle(&self) -> Option<PciResetControl> {
+        self.pci_reset.clone()
     }
 
     /// Assemble a bus with the legacy devices a PC guest expects to find at the
@@ -622,6 +636,10 @@ impl DeviceBus {
 
         // PCIe config space (legacy CAM + ECAM), seeded with a host bridge.
         let pcie = bus.add_pcie(PcieRootComplex::new(DEFAULT_ECAM_BASE))?;
+        // The 0xCF9 reset latch the CAM front-end just mounted (reboot=pci path).
+        let pci_reset = bus
+            .pci_reset_handle()
+            .expect("add_pcie mounts the 0xCF9 reset latch");
 
         // Seed the PIIX3 ISA bridge / PCI interrupt router at 00:01.0 (its config
         // space holds the PIRQ routing registers a guest programs).
@@ -648,6 +666,7 @@ impl DeviceBus {
             pm_timer,
             pm1,
             sysctl_a,
+            pci_reset,
         })
     }
 }
@@ -715,21 +734,29 @@ pub struct StandardPc {
     /// System Control Port A (`0x92`) — poll `take_reset` from the run loop to
     /// handle a guest-initiated fast/INIT reset, and read the live A20 state.
     pub sysctl_a: SharedSystemControlPortA,
+    /// The chipset Reset Control Register (`0xCF9`) — poll `take_reset` from the
+    /// run loop to handle a guest-initiated `reboot=pci` reset (the modern path,
+    /// alongside `0x92`).
+    pub pci_reset: PciResetControl,
 }
 
 impl StandardPc {
     /// Poll the platform-control latches a guest can raise that the vCPU run loop
     /// must act on outside the normal exit path — currently an ACPI sleep/shutdown
-    /// ([`PlatformEvent::Sleep`], via the PM1a block) and a fast CPU reset
-    /// ([`PlatformEvent::Reset`], via System Control Port A). Returns the highest-
-    /// priority pending event (sleep before reset) and consumes its latch; the run
-    /// loop calls this each iteration and acts on what it returns.
+    /// ([`PlatformEvent::Sleep`], via the PM1a block) and a CPU reset
+    /// ([`PlatformEvent::Reset`], via either System Control Port A `0x92` or the
+    /// chipset Reset Control Register `0xCF9`). Returns the highest-priority
+    /// pending event (sleep before reset) and consumes its latch; the run loop
+    /// calls this each iteration and acts on what it returns.
     #[must_use]
     pub fn poll_platform_events(&self) -> Option<PlatformEvent> {
         if let Some(slp_typ) = self.pm1.take_sleep() {
             return Some(PlatformEvent::Sleep(slp_typ));
         }
-        if self.sysctl_a.take_reset() {
+        // Both reset latches must be drained, so a pending request on the
+        // not-first source isn't stranded behind an early return.
+        let reset = self.sysctl_a.take_reset() | self.pci_reset.take_reset();
+        if reset {
             return Some(PlatformEvent::Reset);
         }
         None
@@ -1626,6 +1653,13 @@ mod tests {
         VmExitHandler::io_out(&mut pc.bus, 0x92, &[0x01]);
         assert_eq!(pc.poll_platform_events(), Some(PlatformEvent::Reset));
         assert_eq!(pc.poll_platform_events(), None);
+
+        // The guest reboots via the chipset Reset Control Register (0xCF9): a
+        // byte write with RST_CPU set (SYS_RST|RST_CPU = 0x06) — the reboot=pci
+        // path — also surfaces as a Reset event.
+        VmExitHandler::io_out(&mut pc.bus, 0xCF9, &[0x06]);
+        assert_eq!(pc.poll_platform_events(), Some(PlatformEvent::Reset));
+        assert_eq!(pc.poll_platform_events(), None, "0xCF9 latch consumed");
     }
 
     #[test]
