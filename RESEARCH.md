@@ -783,3 +783,56 @@ here so the next run doesn't re-research them.
   8-byte-aligned 64-bit registers accessed 32- or 64-bit (caps period and the main counter are
   read as two 32-bit halves on 32-bit access). **Changes what we build:** a HpetMmio adapter
   bridging the existing model's aligned decode to sub-register 32/64-bit guest accesses.
+
+---
+
+## 2026-06-08 — DSDT correctness: AML PkgLength, ACPI resource descriptors, _PRT/_PIC, _S5
+
+A spec-driven session on the AML the DSDT emits — well-stabilised firmware
+conventions, so the authoritative sources are the primary ACPI spec sections,
+not recent papers. Logged so the next run doesn't re-derive them.
+
+- **ACPI 6.x §20.2.4 (PkgLength encoding).** A `PkgLength` is *self-inclusive*:
+  the encoded value counts from the field's own first byte to the end of the
+  package, so it must include the size of the `PkgLength` field itself (1-4
+  bytes). **Bug found & fixed:** `AmlBuilder::patch_pkg_length` encoded the total
+  including the 4 reserved bytes and then shifted the body left without
+  recomputing, overshooting by the shift amount — a real ACPI interpreter would
+  read past every scope/device/method and corrupt all following AML. The DSDT had
+  never been parsed (no `/dev/kvm`), so it stayed latent. `ssdt.rs` already did
+  the self-reference correctly; the `AmlBuilder` (DSDT) path did not. **Changes
+  what we build:** `encode_self_pkg_length` + decode-based regression tests; a
+  prerequisite for every `_CRS`/`_PRT`/package below.
+
+- **ACPI 6.x §6.4 (resource descriptors).** Small descriptors: I/O Port `0x47`
+  (info, min/max u16, align, len), IRQ `0x22`/`0x23` (mask u16 + flags), End Tag
+  `0x79` + checksum. Large: Memory32Fixed `0x86` (9-byte body), and the Address
+  Space descriptors Word `0x88` / DWord `0x87` / QWord `0x8A` (res-type, general
+  flags, type flags, then gran/min/max/xlat/len in the field width). A
+  `ResourceTemplate` in ASL is just a `Buffer{ descriptors + End Tag }`. General
+  flags `0x0C` = producer + min/max fixed (host-bridge windows); I/O type-flags
+  `0x03` = entire range; memory type-flags bit0 = write status. **Changes what we
+  build:** `ResourceTemplate` + `name_resource_template`, then `_CRS` for COM1/
+  RTC/PS2/HPET (legacy devices) and the PCI root's resource-*producer* `_CRS`
+  (bus-number + I/O + 32/64-bit MMIO windows) Windows needs to enumerate PCI; a
+  `PNP0C02` motherboard-resources device claiming the fixed legacy controller I/O.
+
+- **ACPI 6.x §6.2.13 (_PRT) + §5.8.1 (_PIC).** `_PRT` is a package of
+  `{ Address=(dev<<16)|0xFFFF, Pin(0=INTA..3=INTD), Source, SourceIndex }`. With
+  `Source=0` the routing is hard-wired and `SourceIndex` is the GSI (APIC mode).
+  `_PIC(mode)` lets the OS announce PIC(0)/APIC(1) delivery; firmware stores it in
+  a global a method-based `_PRT` branches on. **Changes what we build:** a static
+  APIC-mode `_PRT` for PCI0 generated from `PirqRouter::device_gsi` (DSDT and the
+  live `assert_pci_intx` path agree by construction: swizzle → GSI 16-19), plus a
+  `_PIC` method + `PICF` flag matching real firmware. **Follow-up (pitfall):** a
+  PIC-mode-only guest needs PCI Link Devices (`PNP0C0F` with `_CRS`/`_PRS`/`_SRS`
+  over the programmable PIRQRC registers) and a `_PIC`-selected second `_PRT` —
+  deferred because it needs If/Else/Store control-flow AML we can't validate
+  without `iasl` on the runner.
+
+- **ACPI 6.x §7.4.2.6 (_Sx).** `_S5` (and every `_Sx`) must be a **Package** of
+  `{ PM1a_CNT.SLP_TYP, PM1b_CNT.SLP_TYP, ... }`, not an integer — the OS
+  evaluates it and writes element 0 to PM1a_CNT to power off. The DSDT emitted
+  `Name(_S5_, 0)`, so a guest had no usable S5 object and could not ACPI-shutdown.
+  **Changes what we build:** `name_package` + `Name(_S5_, Package(){5,5,0,0})`,
+  SLP_TYP 5 matching the value `enlil_devices::chipset` captures as a shutdown.
