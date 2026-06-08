@@ -366,6 +366,18 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > page bit 0) is modelled as `dma::transfer_address`/`transfer_byte_count`.
 > **Follow-up:** drive a real channel (decrement current addr/count, raise TC,
 > handle autoinit) only when a DMA consumer (floppy/SB16) is added.
+>
+> **Status (2026-06-08c):** the chipset **Reset Control Register** (`RST_CNT`,
+> port `0xCF9`) is now decoded by `pcie::PciConfigIo`. `0xCF9` physically sits
+> inside the `CONFIG_ADDRESS` dword window, but a *byte* access hits `RST_CNT`, not
+> config-address byte 1 — so a guest reading `0xCF9` now gets the reset register
+> (not a leaked config byte), and a `RST_CPU` (bit 2) write latches a reboot
+> request (`take_reset`), with `SYS_RST`/`FULL_RST` reading back. This is the
+> `0xCF9`/`reboot=pci` path every modern OS uses, mirroring the existing `0x92`
+> fast-reset latch. **Follow-up:** surface `PciConfigIo::take_reset` out of
+> `add_pcie` so `StandardPc::poll_platform_events` returns `PlatformEvent::Reset`
+> for the `0xCF9` path too (alongside `0x92`) — wired into the vCPU run loop once
+> `/dev/kvm` is available.
 
 ### 0.3 USB Live Boot & Non-Destructive Testing (CRITICAL FOR ADOPTION)
 
