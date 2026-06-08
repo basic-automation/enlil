@@ -97,6 +97,10 @@ impl DsdtBuilder {
         let hpet = aml.device_start(b"HPET");
         aml.name_string(b"_HID", "PNP0103");
         aml.name_integer(b"_UID", 0);
+        // _CRS: the 1 KiB read/write MMIO register block at the fixed HPET base.
+        let mut crs = ResourceTemplate::new();
+        crs.memory32_fixed(u32_of(super::hpet::HPET_BASE_ADDRESS), 0x400, true);
+        aml.name_resource_template(b"_CRS", &crs);
         let sta = aml.method_start(b"_STA", 0, false);
         aml.return_integer(0x0F);
         aml.method_end(&sta);
@@ -394,6 +398,16 @@ mod tests {
         let dsdt = DsdtBuilder::new(DsdtConfig::default()).build();
         let found = dsdt.windows(7).any(|w| w == b"PNP0103");
         assert!(found, "DSDT must contain the HPET device HID");
+
+        // The HPET device carries a Memory32Fixed _CRS for its 1 KiB block.
+        // 0x86, body-len 0x0009, info=1(rw), base 0xFED00000, len 0x400.
+        let mem = [
+            0x86u8, 0x09, 0x00, 0x01, 0x00, 0x00, 0xD0, 0xFE, 0x00, 0x04, 0x00, 0x00,
+        ];
+        assert!(
+            dsdt.windows(mem.len()).any(|w| w == mem),
+            "HPET _CRS must contain the Memory32Fixed descriptor"
+        );
 
         // And with has_hpet cleared, the device is absent.
         let config = DsdtConfig {
