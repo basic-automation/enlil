@@ -80,7 +80,27 @@ impl DsdtBuilder {
         // PCI0 — PCI Express Root Complex
         self.build_pci_root(aml);
 
+        // HPET — a top-level _SB device so the OS can bind its driver.
+        if self.config.has_hpet {
+            Self::build_hpet(aml);
+        }
+
         aml.scope_end(&sb);
+    }
+
+    /// Build the HPET device (HID `PNP0103`). The OS reads the HPET's MMIO
+    /// resources from the dedicated HPET ACPI table; this namespace device lets it
+    /// find the timer in the ACPI namespace and bind its HPET driver. Gated on the
+    /// `has_hpet` config flag so a guest told the platform has an HPET (in the
+    /// FADT/HPET tables) also finds the matching device object here.
+    fn build_hpet(aml: &mut AmlBuilder) {
+        let hpet = aml.device_start(b"HPET");
+        aml.name_string(b"_HID", "PNP0103");
+        aml.name_integer(b"_UID", 0);
+        let sta = aml.method_start(b"_STA", 0, false);
+        aml.return_integer(0x0F);
+        aml.method_end(&sta);
+        aml.device_end(&hpet);
     }
 
     /// Build PCI Express Root Complex (PCI0)
@@ -288,6 +308,29 @@ mod tests {
         let dsdt = DsdtBuilder::new(config).build();
         assert!(dsdt.len() > 36);
         let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        assert_eq!(sum, 0);
+    }
+
+    #[test]
+    fn dsdt_describes_the_hpet_when_present() {
+        // With has_hpet (the default), the namespace must contain the HPET device
+        // (HID PNP0103) so the OS finds the timer it was told about in the tables.
+        let dsdt = DsdtBuilder::new(DsdtConfig::default()).build();
+        let found = dsdt.windows(7).any(|w| w == b"PNP0103");
+        assert!(found, "DSDT must contain the HPET device HID");
+
+        // And with has_hpet cleared, the device is absent.
+        let config = DsdtConfig {
+            has_hpet: false,
+            ..DsdtConfig::default()
+        };
+        let no_hpet = DsdtBuilder::new(config).build();
+        assert!(
+            !no_hpet.windows(7).any(|w| w == b"PNP0103"),
+            "no HPET device when has_hpet is cleared"
+        );
+        // The checksum must still be valid in both cases.
+        let sum: u8 = no_hpet.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         assert_eq!(sum, 0);
     }
 }

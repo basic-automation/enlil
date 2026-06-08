@@ -16,12 +16,17 @@
 use crate::kvm_backend::VmExitHandler;
 use crate::serial::{SerialOutput, SerialPort};
 use enlil_devices::bus::{MmioBus, MmioDevice, PioBus, PioDevice};
-use enlil_devices::interrupt::{IoApicMmio, SharedInterruptController, SharedPic};
+use enlil_devices::chipset::{Gpe0Block, SharedAcpiPm1Block, SharedSystemControlPortA};
+use enlil_devices::interrupt::{IoApicMmio, PirqRouter, SharedInterruptController, SharedPic};
 use enlil_devices::pcie::{
     vendors, EcamSpace, PciBdf, PciConfigIo, PcieRootComplex, SharedRootComplex,
+    PIRQ_ROUTE_CONFIG_BASE,
 };
-use enlil_devices::ps2::SharedI8042;
-use enlil_devices::timer::{Pit, SharedPit, SharedRtc};
+use enlil_devices::ps2::{SharedI8042, PS2_KBD_IRQ, PS2_MOUSE_IRQ};
+use enlil_devices::timer::{
+    AcpiPmTimer, Pit, RtcTime, SharedAcpiPmTimer, SharedHpet, SharedPit, SharedRtc,
+    SystemControlPortB, HPET_TICK_NS, RTC_IRQ,
+};
 
 /// The system device bus: a PIO bus and an MMIO bus behind one exit handler.
 #[derive(Default)]
@@ -308,6 +313,108 @@ impl DeviceBus {
         Ok(())
     }
 
+    /// Mount **System Control Port B** ([`SystemControlPortB`]) at `0x61` — the
+    /// chipset NMI status/control register that also gates the PIT's channel-2
+    /// tone (the PC speaker) and reports its OUT pin and the DRAM-refresh clock.
+    /// It lives between the i8042's two ports, which is why [`add_ps2`] leaves
+    /// `0x61` unclaimed; this method, coupled to the same [`SharedPit`] the run
+    /// loop ticks, fills it in. Without it a guest beeping through the speaker or
+    /// polling the refresh bit for timing reads back open-bus `0xFF`.
+    ///
+    /// [`add_ps2`]: Self::add_ps2
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if `0x61` overlaps an
+    /// already-registered device.
+    pub fn add_system_control_b(
+        &mut self,
+        pit: &SharedPit,
+    ) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_pio(Box::new(SystemControlPortB::new(pit.clone())))
+    }
+
+    /// Mount **System Control Port A** ([`SystemControlPortA`]) at `0x92` — the
+    /// chipset fast-A20 / fast-reset register every x86 boot path touches. The
+    /// A20 gate (bit 1) reads back enabled (Enlil runs no legacy BIOS A20 dance
+    /// and KVM keeps A20 open) and a guest write to it sticks; bit 0 latches a
+    /// CPU-reset request edge. Without it `0x92` reads open-bus `0xFF`, so a
+    /// guest confirming A20 there sees the wrong state.
+    ///
+    /// The caller owns `sysctl_a` (a [`SharedSystemControlPortA`]) so the run loop
+    /// can poll its one-shot fast-reset latch (`take_reset`) and re-init the vCPU.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if `0x92` overlaps an
+    /// already-registered device.
+    pub fn add_system_control_a(
+        &mut self,
+        sysctl_a: &SharedSystemControlPortA,
+    ) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_pio(Box::new(sysctl_a.port()))
+    }
+
+    /// Mount the **HPET** register block ([`SharedHpet`]) on the MMIO bus at
+    /// [`HPET_MMIO_BASE`](enlil_devices::timer::HPET_MMIO_BASE) — the 1 KiB
+    /// aperture the ACPI HPET table points the guest at. Windows requires the
+    /// HPET for high-resolution timing and Linux uses it as a clocksource; both
+    /// read the capability/period and the 64-bit main counter here. The caller
+    /// owns `hpet` so the run loop can advance the counter (`tick`) and deliver
+    /// the timers' interrupts.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if the HPET aperture overlaps
+    /// an already-registered MMIO device.
+    pub fn add_hpet(&mut self, hpet: &SharedHpet) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_mmio(Box::new(hpet.mmio()))
+    }
+
+    /// Mount the **ACPI PM Timer** ([`SharedAcpiPmTimer`]) on the PIO bus at the
+    /// `PM_TMR_BLK` port (`0x608`) the emitted FADT advertises. An OS reads this
+    /// free-running 3.579545 MHz counter to calibrate and cross-check its other
+    /// clocks; without it the port reads open-bus `0xFFFF_FFFF` and the guest's
+    /// time calibration diverges. The caller owns `pmt` so the run loop can
+    /// advance the counter from elapsed wall-clock time.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if the `PM_TMR` window overlaps
+    /// an already-registered device.
+    pub fn add_acpi_pm_timer(
+        &mut self,
+        pmt: &SharedAcpiPmTimer,
+    ) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_pio(Box::new(pmt.port()))
+    }
+
+    /// Mount the **ACPI PM1a event/control block** ([`SharedAcpiPm1Block`]) on the
+    /// PIO bus over `0x600`..`0x605` — the `PM1a_EVT_BLK`/`PM1a_CNT_BLK` ports the
+    /// emitted FADT advertises. This is how a guest OS enters a sleep state; most
+    /// importantly, a write of `SLP_TYP | SLP_EN` to the control register is the
+    /// **shutdown** path. The caller owns `pm1` so the run loop can poll
+    /// `take_sleep` and tear the guest down (and press a virtual power button).
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if the block overlaps an
+    /// already-registered device.
+    pub fn add_acpi_pm1(
+        &mut self,
+        pm1: &SharedAcpiPm1Block,
+    ) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_pio(Box::new(pm1.port()))
+    }
+
+    /// Mount the **ACPI GPE0 block** ([`Gpe0Block`]) on the PIO bus over
+    /// `0x620`..`0x62F` — the `GPE0_BLK` the emitted FADT advertises. A guest's
+    /// ACPICA reads and clears these General-Purpose Event registers during ACPI
+    /// init; mounting the block makes its status read back clear (no phantom
+    /// events) instead of open-bus `0xFF`.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if the block overlaps an
+    /// already-registered device.
+    pub fn add_gpe0(&mut self) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_pio(Box::new(Gpe0Block::new()))
+    }
+
     /// Like [`standard_pc`](Self::standard_pc), but wires the legacy devices'
     /// interrupt lines into the dual-8259 `pic` (the early-boot interrupt
     /// controller) and mounts its four ports: the 8254 PIT's channel-0 line
@@ -379,25 +486,13 @@ impl DeviceBus {
     ) -> Result<(Self, SharedRootComplex), enlil_devices::bus::BusError> {
         let mut bus = Self::new();
 
-        // Tee each device line to both controllers: the closure calls both
-        // per-controller sinks, and is itself `Fn(bool) + Send`, so it satisfies
-        // both crate-local `IrqLine` traits via their blanket impls.
-        let com1_pic = pic.line(IRQ_COM1);
-        let com1_apic = ioapic.isa_line(IRQ_COM1);
+        // Tee each device line to both controllers (see [`dual_irq_line`]).
         let mut com1 = SerialPort::com1(serial_output);
-        com1.attach_irq_line(Box::new(move |level: bool| {
-            com1_pic(level);
-            com1_apic(level);
-        }));
+        com1.attach_irq_line(Box::new(dual_irq_line(pic, ioapic, IRQ_COM1)));
         bus.add_serial(com1)?;
 
-        let pit_pic = pic.line(IRQ_PIT);
-        let pit_apic = ioapic.isa_line(IRQ_PIT);
         let mut pit = Pit::new();
-        pit.attach_irq0(Box::new(move |level: bool| {
-            pit_pic(level);
-            pit_apic(level);
-        }));
+        pit.attach_irq0(Box::new(dual_irq_line(pic, ioapic, IRQ_PIT)));
         bus.add_pit(pit)?;
 
         bus.add_pic(pic)?;
@@ -406,12 +501,325 @@ impl DeviceBus {
         let pcie = bus.add_pcie(PcieRootComplex::new(DEFAULT_ECAM_BASE))?;
         Ok((bus, pcie))
     }
+
+    /// Assemble a **complete** transparent standard PC in one call: every legacy
+    /// device a guest touches at boot, mounted at its canonical address and with
+    /// its interrupt line teed into **both** the dual-8259 PIC and the I/O APIC
+    /// (the [`standard_pc_with_dual_irq`](Self::standard_pc_with_dual_irq) model),
+    /// so the boot-time PIC→APIC switchover is seamless on every line — not just
+    /// the PIT and COM1.
+    ///
+    /// On top of [`standard_pc_with_dual_irq`](Self::standard_pc_with_dual_irq)'s
+    /// COM1 (`IRQ_COM1`) and PIT (`IRQ_PIT`), this also mounts and IRQ-wires the
+    /// devices the earlier dual-IRQ factory left out:
+    /// - the **MC146818 RTC/CMOS** (`0x70`/`0x71`, `RTC_IRQ` = 8), its wall clock
+    ///   seeded from `rtc_unix_secs` (seconds since the Unix epoch);
+    /// - the **i8042 PS/2 controller** (`0x60`/`0x64`), keyboard on
+    ///   `PS2_KBD_IRQ` = 1 and mouse on `PS2_MOUSE_IRQ` = 12.
+    ///
+    /// The PIT is mounted as a [`SharedPit`] (not a boxed `Pit`) so the run loop /
+    /// timer thread can `tick` it after assembly; the RTC and PS/2 are likewise
+    /// returned as their shared handles so the caller can advance the clock
+    /// (`tick_second`) and inject host input. Both interrupt controllers are
+    /// created here (`vcpu_count` LAPICs) and returned, along with the
+    /// [`SharedRootComplex`], in a [`StandardPc`] bundle — the single entry point
+    /// the KVM run loop binds to.
+    ///
+    /// The APIC side of every line goes through
+    /// [`SharedInterruptController::isa_line`], which applies the MADT
+    /// interrupt-source overrides (the PIT lands on GSI 2); the PIC side takes the
+    /// bare ISA IRQ, exactly as a real PC/AT wires each line to both controllers.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if any two devices' ranges
+    /// overlap (they do not at these canonical addresses, so this is effectively
+    /// infallible for the default layout).
+    pub fn standard_pc_complete(
+        serial_output: SerialOutput,
+        rtc_unix_secs: u64,
+        vcpu_count: u8,
+    ) -> Result<StandardPc, enlil_devices::bus::BusError> {
+        let pic = SharedPic::new();
+        let ioapic = SharedInterruptController::new(vcpu_count);
+        let rtc = SharedRtc::new(RtcTime::from_unix(rtc_unix_secs));
+        let ps2 = SharedI8042::new();
+        let pit = SharedPit::new();
+
+        let mut bus = Self::new();
+
+        // COM1 16550 (IRQ4).
+        let mut com1 = SerialPort::com1(serial_output);
+        com1.attach_irq_line(Box::new(dual_irq_line(&pic, &ioapic, IRQ_COM1)));
+        bus.add_serial(com1)?;
+
+        // 8254 PIT channel-0 (IRQ0 → GSI 2 on the APIC path). Shared so the
+        // timer thread can tick it once mounted.
+        pit.with(|p| p.attach_irq0(Box::new(dual_irq_line(&pic, &ioapic, IRQ_PIT))));
+        bus.add_pit_shared(&pit)?;
+
+        // System Control Port B (0x61): PIT channel-2 gate + PC speaker, sharing
+        // the same PIT handle.
+        bus.add_system_control_b(&pit)?;
+
+        // System Control Port A (0x92): fast A20 (enabled) + fast reset. Shared so
+        // the run loop can poll the reset latch.
+        let sysctl_a = SharedSystemControlPortA::new();
+        bus.add_system_control_a(&sysctl_a)?;
+
+        // MC146818 RTC/CMOS (IRQ8).
+        rtc.with(|r| r.attach_irq(Box::new(dual_irq_line(&pic, &ioapic, RTC_IRQ))));
+        bus.add_rtc(&rtc)?;
+
+        // i8042 PS/2: keyboard (IRQ1) + mouse (IRQ12).
+        ps2.attach_kbd_irq(Box::new(dual_irq_line(&pic, &ioapic, PS2_KBD_IRQ)));
+        ps2.attach_mouse_irq(Box::new(dual_irq_line(&pic, &ioapic, PS2_MOUSE_IRQ)));
+        bus.add_ps2(&ps2)?;
+
+        // Both interrupt-controller front-ends.
+        bus.add_pic(&pic)?;
+        bus.add_ioapic(&ioapic)?;
+
+        // HPET register block (0xFED0_0000) — Windows requires it, Linux uses it
+        // as a clocksource. Shared so the run loop can advance the counter.
+        let hpet = SharedHpet::new();
+        bus.add_hpet(&hpet)?;
+
+        // ACPI PM timer (0x608) — the FADT-advertised free-running clock the OS
+        // calibrates against. Shared so the run loop can advance it.
+        let pm_timer = SharedAcpiPmTimer::new();
+        bus.add_acpi_pm_timer(&pm_timer)?;
+
+        // ACPI PM1a event/control block (0x600/0x604) — the OS's sleep/shutdown
+        // path. Shared so the run loop can poll the S5 sleep request.
+        let pm1 = SharedAcpiPm1Block::new();
+        bus.add_acpi_pm1(&pm1)?;
+
+        // ACPI GPE0 block (0x620) — keep its status quiet during ACPI init.
+        bus.add_gpe0()?;
+
+        // PCIe config space (legacy CAM + ECAM), seeded with a host bridge.
+        let pcie = bus.add_pcie(PcieRootComplex::new(DEFAULT_ECAM_BASE))?;
+
+        // Seed the PIIX3 ISA bridge / PCI interrupt router at 00:01.0 (its config
+        // space holds the PIRQ routing registers a guest programs).
+        {
+            let mut rc = pcie.borrow_mut();
+            if rc.find_device(&PIIX_ISA_BRIDGE_BDF).is_none() {
+                rc.add_device(PcieRootComplex::create_isa_bridge(
+                    PIIX_ISA_BRIDGE_BDF,
+                    vendors::INTEL,
+                    PIIX3_ISA_DEVICE_ID,
+                ));
+            }
+        }
+
+        Ok(StandardPc {
+            bus,
+            pcie,
+            pic,
+            ioapic,
+            rtc,
+            ps2,
+            pit,
+            hpet,
+            pm_timer,
+            pm1,
+            sysctl_a,
+        })
+    }
+}
+
+/// A platform-level event a guest raised that the vCPU run loop must act on,
+/// surfaced by [`StandardPc::poll_platform_events`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlatformEvent {
+    /// The guest committed an ACPI sleep transition (the `SLP_TYP` value). The
+    /// DSDT's `_S5` value means **power off**; other values are lighter sleep
+    /// states the run loop maps as it implements them.
+    Sleep(u8),
+    /// The guest pulsed a fast/INIT CPU reset via System Control Port A (`0x92`
+    /// bit 0). The run loop should reinitialise the vCPU to its reset vector.
+    Reset,
+}
+
+/// Build one device-IRQ sink that drives **both** interrupt controllers from a
+/// single line, as a real PC/AT wires each ISA IRQ to both the 8259 and the I/O
+/// APIC. The PIC takes the bare ISA `irq`; the APIC side goes through
+/// [`SharedInterruptController::isa_line`], which applies the MADT
+/// interrupt-source overrides (e.g. IRQ0 → GSI 2). The returned closure is
+/// `Fn(bool) + Send`, so it satisfies both crate-local `IrqLine` traits (the one
+/// in [`crate::serial`] and `enlil_devices`') via their blanket impls and can be
+/// boxed for either device's `attach_*` method.
+fn dual_irq_line(
+    pic: &SharedPic,
+    ioapic: &SharedInterruptController,
+    irq: u8,
+) -> impl Fn(bool) + Send + use<> {
+    let pic_sink = pic.line(irq);
+    let apic_sink = ioapic.isa_line(irq);
+    move |level: bool| {
+        pic_sink(level);
+        apic_sink(level);
+    }
+}
+
+/// A fully-assembled transparent standard PC: the [`DeviceBus`] with every legacy
+/// device mounted and IRQ-wired, plus the caller-owned shared handles for the
+/// pieces that must be driven or inspected from outside the bus. Produced by
+/// [`DeviceBus::standard_pc_complete`].
+pub struct StandardPc {
+    /// The assembled device bus (the [`VmExitHandler`] the backend binds to).
+    pub bus: DeviceBus,
+    /// The `PCIe` root complex, for attaching further PCI devices post-assembly.
+    pub pcie: SharedRootComplex,
+    /// The dual-8259 PIC — read the pending vector / acknowledge INTA from here.
+    pub pic: SharedPic,
+    /// The I/O APIC + LAPIC complex — read per-vCPU pending vectors from here.
+    pub ioapic: SharedInterruptController,
+    /// The MC146818 RTC/CMOS — advance the wall clock (`tick_second`) from here.
+    pub rtc: SharedRtc,
+    /// The i8042 PS/2 controller — inject host keyboard/mouse input from here.
+    pub ps2: SharedI8042,
+    /// The 8254 PIT — `tick` channel-0 from the run loop / timer thread.
+    pub pit: SharedPit,
+    /// The HPET — `tick` the main counter from the run loop / timer thread.
+    pub hpet: SharedHpet,
+    /// The ACPI PM timer — `advance` the counter from the run loop / timer thread.
+    pub pm_timer: SharedAcpiPmTimer,
+    /// The ACPI PM1a block — poll `take_sleep` from the run loop to handle
+    /// guest-initiated shutdown / sleep.
+    pub pm1: SharedAcpiPm1Block,
+    /// System Control Port A (`0x92`) — poll `take_reset` from the run loop to
+    /// handle a guest-initiated fast/INIT reset, and read the live A20 state.
+    pub sysctl_a: SharedSystemControlPortA,
+}
+
+impl StandardPc {
+    /// Poll the platform-control latches a guest can raise that the vCPU run loop
+    /// must act on outside the normal exit path — currently an ACPI sleep/shutdown
+    /// ([`PlatformEvent::Sleep`], via the PM1a block) and a fast CPU reset
+    /// ([`PlatformEvent::Reset`], via System Control Port A). Returns the highest-
+    /// priority pending event (sleep before reset) and consumes its latch; the run
+    /// loop calls this each iteration and acts on what it returns.
+    #[must_use]
+    pub fn poll_platform_events(&self) -> Option<PlatformEvent> {
+        if let Some(slp_typ) = self.pm1.take_sleep() {
+            return Some(PlatformEvent::Sleep(slp_typ));
+        }
+        if self.sysctl_a.take_reset() {
+            return Some(PlatformEvent::Reset);
+        }
+        None
+    }
+
+    /// Drive a PCI device's level-triggered `INTx` line into the interrupt fabric,
+    /// the way a real south-bridge does. `slot` is the device's PCI device number,
+    /// `pin` its interrupt pin (`1`=INTA..`4`=INTD, from config `0x3D`), and
+    /// `level` the asserted state.
+    ///
+    /// The routing is read **live** from the PIIX3 bridge's config space (the
+    /// `PIRQRC[A-D]` registers a guest programmed), so it always reflects what the
+    /// guest configured. The line is driven into *both* controllers, matching the
+    /// hardware: the **8259** sees the routed ISA IRQ as a *level* line (the guest
+    /// must have set it level in the ELCR — what PCI interrupts require), and the
+    /// **I/O APIC** sees the PIRQ line's fixed GSI (16-19). Whichever path the
+    /// guest has unmasked delivers it; deasserting (`level = false`) withdraws it.
+    pub fn assert_pci_intx(&self, slot: u8, pin: u8, level: bool) {
+        // Read the four PIRQRC bytes the guest programmed in the bridge config.
+        let regs = {
+            let rc = self.pcie.borrow();
+            match rc.find_device(&PIIX_ISA_BRIDGE_BDF) {
+                Some(bridge) => [
+                    bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE),
+                    bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE + 1),
+                    bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE + 2),
+                    bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE + 3),
+                ],
+                None => return,
+            }
+        };
+        let mut router = PirqRouter::new();
+        router.sync_from_config(regs);
+
+        // 8259 path: the routed ISA IRQ as a level line (PCI INTx is level).
+        if let Some(irq) = router.device_isa_irq(slot, pin) {
+            self.pic.with(|p| p.set_irq_level(irq, level));
+        }
+        // I/O APIC path: the PIRQ line's fixed GSI 16-19.
+        if let Some(gsi) = PirqRouter::device_gsi(slot, pin) {
+            let line = self.ioapic.line(gsi);
+            line(level);
+        }
+    }
+
+    /// Advance every free-running platform clock by one elapsed-time delta of `ns`
+    /// nanoseconds, keeping the three timekeeping sources a guest cross-checks
+    /// coherent from a single time base. This is the timekeeping core a vCPU run
+    /// loop / timer thread calls each iteration:
+    ///
+    /// - the **8254 PIT** (channel 0) advances and, when it crosses terminal
+    ///   count, pulses its IRQ0 line — which the factory already teed into both
+    ///   interrupt controllers, so the timer interrupt is delivered automatically;
+    /// - the **HPET** main counter advances at its 10 MHz rate (only while the
+    ///   guest has enabled it); each HPET timer that fires while routed through
+    ///   the **I/O APIC** (the normal mode) is delivered to its configured GSI as
+    ///   an edge, and the fired `(timer, gsi)` pairs are also **returned** for
+    ///   observability;
+    /// - the **ACPI PM timer** advances at its fixed 3.579545 MHz rate.
+    ///
+    /// In HPET **legacy-replacement** mode (the guest set the HPET's legacy bit),
+    /// timer 0 stands in for the **PIT** (IRQ0) and timer 1 for the **RTC** (IRQ8);
+    /// those fired timers are delivered through the ISA override path into *both*
+    /// controllers (like the legacy devices they replace). A guest that enables
+    /// legacy replacement drives its periodic interrupt from HPET timer 0 and does
+    /// not also program the PIT, so the PIT (still ticked above) stays idle and
+    /// does not double-fire. The MC146818 RTC is driven separately
+    /// (`rtc.tick_second()` once per wall second).
+    #[must_use]
+    pub fn advance_clocks(&self, ns: u64) -> Vec<(usize, u8)> {
+        // PIT: tick() takes nanoseconds directly and pulses the wired IRQ0 sink.
+        let _ = self.pit.tick(ns);
+        // ACPI PM timer: convert the elapsed time to its 3.579545 MHz ticks.
+        self.pm_timer.advance(AcpiPmTimer::ns_to_ticks(ns));
+        // HPET: convert to its 10 MHz counter ticks; collect any fired timers.
+        let fired = self.hpet.tick(ns / HPET_TICK_NS);
+
+        // Deliver each fired timer as an edge (assert then deassert).
+        let legacy = self.hpet.with(|h| h.legacy_routing());
+        for &(timer, gsi) in &fired {
+            if legacy && timer <= 1 {
+                // Legacy replacement: timer 0 -> IRQ0, timer 1 -> IRQ8, into both
+                // the 8259 and the I/O APIC (via the ISA-override path), exactly
+                // like the PIT/RTC lines this mode replaces.
+                let isa = if timer == 0 { IRQ_PIT } else { RTC_IRQ };
+                let pic_line = self.pic.line(isa);
+                let apic_line = self.ioapic.isa_line(isa);
+                pic_line(true);
+                pic_line(false);
+                apic_line(true);
+                apic_line(false);
+            } else {
+                // Normal mode: route to the timer's configured I/O APIC GSI.
+                let line = self.ioapic.line(gsi);
+                line(true);
+                line(false);
+            }
+        }
+        fired
+    }
 }
 
 /// Legacy ISA IRQ line for the 8254 PIT channel-0 (system timer).
 pub const IRQ_PIT: u8 = 0;
 /// Legacy ISA IRQ line for the COM1 16550 UART.
 pub const IRQ_COM1: u8 = 4;
+
+/// BDF of the PIIX3 ISA bridge / PCI interrupt router (`00:01.0`) seeded by
+/// [`DeviceBus::standard_pc_complete`]; its config space holds the `PIRQRC[A-D]`
+/// routing registers.
+const PIIX_ISA_BRIDGE_BDF: PciBdf = PciBdf::new(0, 1, 0);
+/// PCI device ID of the PIIX3 ISA bridge (Intel 82371SB, function 0).
+const PIIX3_ISA_DEVICE_ID: u16 = 0x7000;
 
 /// Guest-physical base of the `PCIe` ECAM window for the default single-segment
 /// layout. Matches the MCFG table emitted by `enlil_devices::acpi`, so a guest
@@ -992,6 +1400,271 @@ mod tests {
         // through GSI 8's RTE into LAPIC 0.
         assert!(rtc.with(enlil_devices::timer::Rtc146818::tick_second));
         assert_eq!(pic.with(|c| c.pending_vector(0)), Some(0x38));
+    }
+
+    #[test]
+    fn standard_pc_complete_mounts_every_legacy_device_and_dual_wires_irqs() {
+        use super::StandardPc;
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::interrupt::{MASTER_CMD, MASTER_DATA, SLAVE_CMD, SLAVE_DATA};
+
+        // 2026-06-07T13:14:15Z, one vCPU.
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            1_780_838_055,
+            1,
+        )
+        .unwrap();
+        let StandardPc {
+            mut bus,
+            pic,
+            ioapic,
+            ps2,
+            ..
+        } = pc;
+
+        // Every legacy device a guest touches at boot is mounted at its canonical
+        // address: COM1, PIT, System Control Port B (0x61), RTC, PS/2 data+cmd,
+        // System Control Port A (0x92), the ACPI PM1 block (0x600/0x604), PM timer
+        // (0x608) and GPE0 block (0x620), both 8259s, the ELCR, and the PCIe CAM
+        // ports — plus the I/O APIC page.
+        for port in [
+            0x3F8u16, 0x40, 0x61, 0x70, 0x60, 0x64, 0x92, 0x600, 0x604, 0x608, 0x620, 0x20, 0xA0,
+            0x4D0, 0xCF8,
+        ] {
+            assert!(
+                bus.pio.is_mapped(port),
+                "PIO port {port:#x} should be mapped"
+            );
+        }
+        assert!(
+            bus.mmio.is_mapped(0xFEC0_0000),
+            "I/O APIC page should be mapped"
+        );
+        assert!(
+            bus.mmio.is_mapped(0xFED0_0000),
+            "HPET register block should be mapped"
+        );
+
+        // Bring up LAPIC 0 and program the PC/AT 8259 layout (master base 0x20),
+        // then unmask every line on both chips.
+        ioapic.with(|c| c.lapics[0].write_register(0x0F0, 0x1FF));
+        for (port, val) in [
+            (MASTER_CMD, 0x11),
+            (MASTER_DATA, 0x20),
+            (MASTER_DATA, 0x04),
+            (MASTER_DATA, 0x01),
+            (SLAVE_CMD, 0x11),
+            (SLAVE_DATA, 0x28),
+            (SLAVE_DATA, 0x02),
+            (SLAVE_DATA, 0x01),
+            (MASTER_DATA, 0x00),
+            (SLAVE_DATA, 0x00),
+        ] {
+            VmExitHandler::io_out(&mut bus, port, &[val]);
+        }
+
+        // Program GSI 1's RTE (keyboard) through the aperture: vector 0x31 ->
+        // LAPIC 0. REDTBL base 0x10 + 1*2 = 0x12 (low), 0x13 (high).
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0000, &0x12u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0010, &0x31u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0000, &0x13u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut bus, 0xFEC0_0010, &0u32.to_le_bytes());
+
+        // A host keypress asserts the single IRQ1 line, which the factory tees
+        // into *both* controllers (the per-line helper every legacy device uses).
+        ps2.inject_key(0x1E);
+        // The 8259 master has it pending at vector base + 1 = 0x21...
+        assert_eq!(pic.with(|p| p.pending_vector()), Some(0x21));
+        // ...and the I/O APIC routed it to LAPIC 0 at the RTE's vector 0x31.
+        assert_eq!(ioapic.with(|c| c.pending_vector(0)), Some(0x31));
+    }
+
+    #[test]
+    fn advance_clocks_keeps_the_platform_timers_coherent_from_one_time_base() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::timer::PM_TIMER_FREQ_HZ;
+
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            1_780_838_055,
+            1,
+        )
+        .unwrap();
+
+        // The HPET counter only advances once the guest enables it (config bit 0).
+        pc.hpet.with(|h| h.write(0x010, 1));
+
+        // Advance the whole platform by one wall-clock second.
+        let _ = pc.advance_clocks(1_000_000_000);
+
+        // The ACPI PM timer advanced by exactly its 3.579545 MHz frequency.
+        assert_eq!(pc.pm_timer.read(), PM_TIMER_FREQ_HZ);
+        // The HPET (10 MHz / 100 ns per tick) advanced by 10,000,000 ticks.
+        assert_eq!(pc.hpet.with(|h| h.counter()), 10_000_000);
+    }
+
+    #[test]
+    fn advance_clocks_delivers_a_fired_hpet_timer_to_its_ioapic_gsi() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+
+        let mut pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            1_780_838_055,
+            1,
+        )
+        .unwrap();
+        pc.ioapic.with(|c| c.lapics[0].write_register(0x0F0, 0x1FF));
+
+        // Program HPET timer 0: interrupt-enable (bit 2) + route to GSI 16
+        // (bits 9-13 = 16 -> 16 << 9 = 0x2000), one-shot comparator 100, then
+        // enable the main counter.
+        pc.hpet.with(|h| {
+            h.write(0x100, 0x04 | 0x2000);
+            h.write(0x108, 100);
+            h.write(0x010, 1);
+        });
+
+        // Program GSI 16's RTE through the I/O APIC aperture: vector 0x40 ->
+        // LAPIC 0. REDTBL base 0x10 + 16*2 = 0x30 (low), 0x31 (high).
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0000, &0x30u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0010, &0x40u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0000, &0x31u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0010, &0u32.to_le_bytes());
+
+        // Nothing fired yet.
+        assert!(!pc.ioapic.with(|c| c.has_pending(0)));
+
+        // Advance past the comparator (>=100 HPET ticks = >=10,000 ns); the timer
+        // fires and advance_clocks delivers it to GSI 16 -> LAPIC 0.
+        let fired = pc.advance_clocks(1_000_000);
+        assert_eq!(fired, vec![(0, 16)], "HPET timer 0 fired, routed to GSI 16");
+        assert_eq!(pc.ioapic.with(|c| c.pending_vector(0)), Some(0x40));
+    }
+
+    #[test]
+    fn advance_clocks_legacy_hpet_timer0_replaces_the_pit_on_irq0() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+
+        let mut pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            1_780_838_055,
+            1,
+        )
+        .unwrap();
+        pc.ioapic.with(|c| c.lapics[0].write_register(0x0F0, 0x1FF));
+
+        // Program the I/O APIC GSI 2 RTE — where IRQ0 lands under the MADT
+        // override — to vector 0x60. REDTBL base 0x10 + 2*2 = 0x14 (low)/0x15.
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0000, &0x14u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0010, &0x60u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0000, &0x15u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0010, &0u32.to_le_bytes());
+
+        // Enable HPET legacy replacement (config bit 1) + counter (bit 0), and
+        // arm timer 0 (interrupt-enable, one-shot, comparator 100).
+        pc.hpet.with(|h| {
+            h.write(0x100, 0x04);
+            h.write(0x108, 100);
+            h.write(0x010, 0x03);
+        });
+
+        // Advance past the comparator: timer 0 fires and, in legacy mode, is
+        // delivered as IRQ0 -> GSI 2 -> LAPIC 0 (the PIT's path), not its own GSI.
+        let fired = pc.advance_clocks(1_000_000);
+        // Timer 0 fired (its configured route is irrelevant in legacy mode).
+        assert_eq!(fired, vec![(0, 0)]);
+        assert_eq!(pc.ioapic.with(|c| c.pending_vector(0)), Some(0x60));
+    }
+
+    #[test]
+    fn poll_platform_events_surfaces_guest_shutdown_and_reset() {
+        use super::PlatformEvent;
+        use crate::serial::{SerialOutput, SerialOutputMode};
+
+        let mut pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            1_780_838_055,
+            1,
+        )
+        .unwrap();
+
+        // Nothing pending on a fresh machine.
+        assert_eq!(pc.poll_platform_events(), None);
+
+        // The guest writes the S5 ACPI transition to PM1a_CNT (0x604):
+        // SLP_TYP=5 | SLP_EN(1<<13).
+        let s5 = (5u16 << 10) | (1 << 13);
+        VmExitHandler::io_out(&mut pc.bus, 0x604, &s5.to_le_bytes());
+        assert_eq!(pc.poll_platform_events(), Some(PlatformEvent::Sleep(5)));
+        assert_eq!(pc.poll_platform_events(), None, "latch consumed");
+
+        // The guest pulses a fast reset through System Control Port A (0x92 bit 0).
+        VmExitHandler::io_out(&mut pc.bus, 0x92, &[0x01]);
+        assert_eq!(pc.poll_platform_events(), Some(PlatformEvent::Reset));
+        assert_eq!(pc.poll_platform_events(), None);
+    }
+
+    #[test]
+    fn pci_intx_routes_through_the_piix_bridge_to_both_controllers() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::interrupt::ELCR_SLAVE;
+        use enlil_devices::pcie::PciBdf;
+
+        let mut pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            1_780_838_055,
+            1,
+        )
+        .unwrap();
+        pc.ioapic.with(|c| c.lapics[0].write_register(0x0F0, 0x1FF));
+
+        // The guest enumerates the PIIX3 bridge (00:01.0) and routes PIRQB ->
+        // IRQ10 by writing its config register 0x61.
+        {
+            let mut rc = pc.pcie.borrow_mut();
+            let bridge = rc.find_device_mut(&PciBdf::new(0, 1, 0)).unwrap();
+            bridge.write_u8(0x61, 10);
+        }
+
+        // Program the 8259 (PC/AT layout) and mark IRQ10 (slave line 2) level in
+        // the ELCR — PCI interrupts are level-triggered.
+        pc.pic.with(|p| {
+            for (port, val) in [
+                (0x20u16, 0x11u8),
+                (0x21, 0x20),
+                (0x21, 0x04),
+                (0x21, 0x01),
+                (0xA0, 0x11),
+                (0xA1, 0x28),
+                (0xA1, 0x02),
+                (0xA1, 0x01),
+                (0x21, 0x00),
+                (0xA1, 0x00),
+            ] {
+                p.write_port(port, val);
+            }
+            p.write_elcr(ELCR_SLAVE, 1 << 2);
+        });
+
+        // Program PIRQB's I/O APIC GSI (16 + 1 = 17): vector 0x50 -> LAPIC 0.
+        // REDTBL base 0x10 + 17*2 = 0x32 (low), 0x33 (high).
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0000, &0x32u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0010, &0x50u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0000, &0x33u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0010, &0u32.to_le_bytes());
+
+        // A device in slot 1 asserts INTA: swizzles to PIRQB, which the guest
+        // routed to IRQ10 (PIC) and which wires to GSI 17 (I/O APIC).
+        pc.assert_pci_intx(1, 1, true);
+        // The 8259 presents IRQ10's vector (slave base 0x28 + line 2 = 0x2A)...
+        assert_eq!(pc.pic.with(|p| p.pending_vector()), Some(0x2A));
+        // ...and the I/O APIC delivered GSI 17's vector to LAPIC 0.
+        assert_eq!(pc.ioapic.with(|c| c.pending_vector(0)), Some(0x50));
+
+        // Deasserting the level line withdraws it from the 8259.
+        pc.assert_pci_intx(1, 1, false);
+        assert_eq!(pc.pic.with(|p| p.pending_vector()), None);
     }
 
     #[test]

@@ -3,8 +3,27 @@
 //! Provides a virtual HPET device with configurable timers,
 //! periodic and one-shot modes, and interrupt routing.
 
+use crate::bus::MmioDevice;
+use std::sync::{Arc, Mutex};
+
 /// Number of HPET timers.
 const NUM_TIMERS: usize = 3;
+
+/// Guest-physical base of the HPET register block.
+///
+/// Matches the address the ACPI HPET table advertises
+/// ([`crate::acpi::hpet::HPET_BASE_ADDRESS`]), so a guest that discovers the HPET
+/// from ACPI finds its registers where the bus decodes them. Cross-checked by a
+/// unit test.
+pub const HPET_MMIO_BASE: u64 = 0xFED0_0000;
+
+/// Size of the HPET memory-mapped register block: the spec-mandated 1 KiB.
+pub const HPET_MMIO_SIZE: u64 = 0x400;
+
+/// Nanoseconds per HPET main-counter tick (the 10 MHz / 100 ns period this model
+/// reports in its capability register). A run loop converts an elapsed-time delta
+/// to counter ticks by dividing by this.
+pub const HPET_TICK_NS: u64 = HPET_CLK_PERIOD_FS / 1_000_000;
 
 /// HPET capability/ID register value.
 /// Bits 31:16 = clock period in femtoseconds.
@@ -16,8 +35,25 @@ const HPET_CLK_PERIOD_FS: u64 = 100_000_000;
 /// Supported IRQ routing mask for timers.
 const TIMER_ROUTE_CAP: u32 = 0x000F_0000; // IRQs 16-19
 
-/// HPET capability register: revision 1, 3 timers, 64-bit counter, legacy capable.
-const HPET_CAP_VALUE: u64 = (HPET_CLK_PERIOD_FS << 32) | ((NUM_TIMERS as u64 - 1) << 8) | 0x01;
+/// HPET PCI vendor ID reported in the capability register (Intel). Mirrors the
+/// ACPI HPET table's Event Timer Block ID so the table and the MMIO register a
+/// guest reads agree (cross-checked by a test).
+const HPET_VENDOR_ID: u64 = 0x8086;
+/// `COUNT_SIZE_CAP` (bit 13): the main counter is 64-bit — which this model's
+/// `counter: u64` and the [`HpetMmio`] 64-bit accessors actually implement.
+const HPET_COUNT_SIZE_CAP: u64 = 1 << 13;
+/// `LEG_RT_CAP` (bit 15): legacy-replacement routing is supported (config bit 1).
+const HPET_LEG_RT_CAP: u64 = 1 << 15;
+
+/// HPET capability register: revision 1, 3 timers, 64-bit counter, legacy-
+/// replacement capable, Intel vendor. The low 32 bits mirror the ACPI HPET
+/// table's Event Timer Block ID; the high 32 carry the clock period.
+const HPET_CAP_VALUE: u64 = (HPET_CLK_PERIOD_FS << 32)
+    | (HPET_VENDOR_ID << 16)
+    | HPET_LEG_RT_CAP
+    | HPET_COUNT_SIZE_CAP
+    | ((NUM_TIMERS as u64 - 1) << 8)
+    | 0x01;
 
 /// Individual HPET timer state.
 #[derive(Debug, Clone)]
@@ -258,6 +294,98 @@ impl Hpet {
     }
 }
 
+/// A shared [`Hpet`] behind an `Arc<Mutex<…>>`, mirroring `SharedPit`/`SharedRtc`.
+///
+/// The [`HpetMmio`] bus adapter and the run loop's `tick` driver hold independent
+/// handles to one device, so the guest programs the timers through MMIO while a
+/// timer thread advances the main counter.
+#[derive(Clone)]
+pub struct SharedHpet(Arc<Mutex<Hpet>>);
+
+impl Default for SharedHpet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SharedHpet {
+    /// Wrap a fresh HPET (counter disabled, all timers masked).
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Arc::new(Mutex::new(Hpet::new())))
+    }
+
+    /// Run `f` with exclusive access — to program a timer, read state, or attach
+    /// the run loop.
+    ///
+    /// # Panics
+    /// Panics if the HPET mutex has been poisoned by a prior panic while held.
+    pub fn with<R>(&self, f: impl FnOnce(&mut Hpet) -> R) -> R {
+        f(&mut self.0.lock().expect("HPET mutex poisoned"))
+    }
+
+    /// Advance the main counter by `ticks`, returning the `(timer, irq)` pairs of
+    /// any timers that fired (for the run loop to deliver).
+    #[must_use]
+    pub fn tick(&self, ticks: u64) -> Vec<(usize, u8)> {
+        self.with(|h| h.tick(ticks))
+    }
+
+    /// The HPET register block as a bus [`MmioDevice`] at [`HPET_MMIO_BASE`].
+    #[must_use]
+    pub fn mmio(&self) -> HpetMmio {
+        HpetMmio { hpet: self.clone() }
+    }
+}
+
+/// The HPET's 1 KiB register block ([`HPET_MMIO_BASE`]) as a bus [`MmioDevice`].
+///
+/// The [`Hpet`] model decodes only 8-byte-aligned register offsets and returns
+/// the full 64-bit register; this adapter bridges that to the guest's 32-bit
+/// *and* 64-bit MMIO accesses. A 32-bit read of the high dword (offset `… + 4`)
+/// returns the upper half of the aligned register — important because a guest
+/// reads the HPET capability's femtosecond clock period and a 64-bit counter as
+/// two 32-bit halves. Sub-register writes are read-modify-write so a 32-bit store
+/// to one half preserves the other (the model's read-only masks still apply).
+pub struct HpetMmio {
+    hpet: SharedHpet,
+}
+
+impl MmioDevice for HpetMmio {
+    fn mmio_read(&mut self, offset: u64, _size: u8) -> u64 {
+        let aligned = offset & !0x7;
+        let full = self.hpet.with(|h| h.read(aligned));
+        // A 4-byte access at the odd dword wants the high half; the bus then
+        // takes the low `size` bytes of what we return.
+        if offset & 0x4 != 0 { full >> 32 } else { full }
+    }
+
+    fn mmio_write(&mut self, offset: u64, size: u8, data: u64) {
+        let aligned = offset & !0x7;
+        if size >= 8 {
+            // A full 64-bit store goes straight through.
+            self.hpet.with(|h| h.write(aligned, data));
+            return;
+        }
+        // Splice a 32-bit (or narrower) store into the right half of the 64-bit
+        // register, preserving the other half.
+        let dword = data & 0xFFFF_FFFF;
+        self.hpet.with(|h| {
+            let current = h.read(aligned);
+            let merged = if offset & 0x4 != 0 {
+                (current & 0xFFFF_FFFF) | (dword << 32)
+            } else {
+                (current & 0xFFFF_FFFF_0000_0000) | dword
+            };
+            h.write(aligned, merged);
+        });
+    }
+
+    fn mmio_range(&self) -> (u64, u64) {
+        (HPET_MMIO_BASE, HPET_MMIO_BASE + HPET_MMIO_SIZE)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,5 +479,73 @@ mod tests {
         // Clear it
         hpet.clear_interrupt(0);
         assert_eq!(hpet.read(0x020), 0);
+    }
+
+    #[test]
+    fn capability_register_matches_the_acpi_hpet_table_block_id() {
+        // The capability register a guest reads from MMIO (low 32 bits) must agree
+        // with the Event Timer Block ID the ACPI HPET table advertises — rev,
+        // comparator count, 64-bit counter, legacy-replacement, vendor — or the OS
+        // is told about a different HPET than the one at the registers.
+        let cap_low = u32::try_from(HPET_CAP_VALUE & 0xFFFF_FFFF).unwrap();
+        let table = crate::acpi::hpet::HpetBuilder::new().build();
+        let block_id = u32::from_le_bytes(table[36..40].try_into().unwrap());
+        assert_eq!(cap_low, block_id);
+    }
+
+    #[test]
+    fn mmio_base_matches_the_acpi_hpet_table() {
+        // The address the bus decodes must equal the one the ACPI HPET table
+        // tells the guest about, or the guest looks in the wrong place.
+        assert_eq!(HPET_MMIO_BASE, crate::acpi::hpet::HPET_BASE_ADDRESS);
+    }
+
+    #[test]
+    fn mmio_adapter_claims_the_1kib_block_at_the_hpet_base() {
+        let dev = SharedHpet::new().mmio();
+        assert_eq!(dev.mmio_range(), (0xFED0_0000, 0xFED0_0400));
+    }
+
+    #[test]
+    fn mmio_reads_the_capability_period_as_two_32bit_halves() {
+        let mut dev = SharedHpet::new().mmio();
+        // A 64-bit read of caps at offset 0 returns the whole register.
+        assert_eq!(dev.mmio_read(0x000, 8), HPET_CAP_VALUE);
+        // A 32-bit read of the high dword (offset 4) returns the femtosecond
+        // clock period — the bus then keeps its low 4 bytes.
+        assert_eq!(dev.mmio_read(0x004, 4), HPET_CLK_PERIOD_FS);
+        // The low dword (offset 0) carries the revision/timer-count fields.
+        assert_eq!(
+            dev.mmio_read(0x000, 4) & 0xFFFF_FFFF,
+            HPET_CAP_VALUE & 0xFFFF_FFFF
+        );
+    }
+
+    #[test]
+    fn mmio_counter_survives_two_32bit_write_halves() {
+        let dev = SharedHpet::new();
+        let mut mmio = dev.mmio();
+        // Counter is writable only while disabled (config bit 0 clear at reset).
+        // Write the low and high dwords of the 64-bit counter separately; each
+        // partial store must preserve the other half.
+        mmio.mmio_write(0x0F0, 4, 0xDEAD_BEEF);
+        mmio.mmio_write(0x0F4, 4, 0x0000_1234);
+        assert_eq!(dev.with(|h| h.counter()), 0x0000_1234_DEAD_BEEF);
+        // And a 64-bit read brings it back whole.
+        assert_eq!(mmio.mmio_read(0x0F0, 8), 0x0000_1234_DEAD_BEEF);
+    }
+
+    #[test]
+    fn shared_hpet_ticks_through_the_handle() {
+        let dev = SharedHpet::new();
+        let mut mmio = dev.mmio();
+        // Program timer 0 (enable interrupt) + comparator + enable counter via
+        // the MMIO adapter, then tick from the shared handle.
+        mmio.mmio_write(0x100, 4, 0x04);
+        mmio.mmio_write(0x108, 8, 100);
+        mmio.mmio_write(0x010, 4, 1);
+        let fired = dev.tick(150);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].0, 0);
     }
 }

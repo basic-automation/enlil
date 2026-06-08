@@ -736,3 +736,50 @@ needed. Next: a bus front-end (two PIO port adapters over a shared `DualPic`) + 
 sink so devices assert into the PIC the same way they do the I/O APIC, then a `standard_pc`
 variant that mounts both. Eventual KVM binding routes PIC INTR through LAPIC LINT0 ExtINT
 (or the in-kernel chip's `KVM_CREATE_IRQCHIP`, which already models the dual-8259).
+
+---
+
+## 2026-06-07 (d) — Completing the transparent legacy PC: chipset ports, ACPI PM hardware, PIRQ, HPET
+
+A breadth session over well-stabilised silicon + firmware conventions — no recent paper
+changes these models; the authoritative sources are the primary specs and datasheets. Logged
+here so the next run doesn't re-research them.
+
+- **ACPI 6.4 spec, §4.8 (ACPI hardware) & §5.2.9 (FADT).** The fixed PM registers an ACPI OS
+  drives: **PM1a_EVT** (status W1C + enable, 0x600/4 here), **PM1a_CNT** (SCI_EN + SLP_TYP/
+  SLP_EN, 0x604/2), **PM_TMR** (the 3.579545 MHz timer, 0x608/4), **GPE0_BLK** (N status + N
+  enable bytes, 0x620/16). Key correctness points we folded in: (1) `SLP_TYP|SLP_EN` write to
+  PM1a_CNT is the **shutdown** mechanism (the DSDT's `_S5` value), so leaving 0x604 open-bus
+  hangs guest shutdown; (2) GPE0 status left open-bus reads 0xFF → the OS sees phantom GPEs
+  and spins; (3) `TMR_VAL_EXT` (FADT.Flags bit 8) promises a **32-bit** PM timer, so the model
+  must be 32-bit, not the 24-bit default; (4) **HW_REDUCED_ACPI (bit 20) is mutually exclusive
+  with the legacy PM hardware + LEGACY_DEVICES** — a hardware-reduced OS ignores all of these
+  blocks and drives sleep via SLEEP_*_REG, so a transparent full-hardware PC must clear it
+  (it was wrongly set). SCI delivery from PM1/GPE events is a run-loop concern (deferred).
+  **Changes what we build:** model PM1a/PM_TMR/GPE0 as bus devices, clear HW_REDUCED_ACPI, and
+  derive the FADT's advertised ports from the device models so the table and the decoded
+  hardware can't drift.
+
+- **PIIX3 datasheet (Intel 290550-002), §PCI interrupt routing.** PCI devices assert one of
+  four level-triggered pins INTA-D (config 0x3D); the south-bridge swizzles them by slot —
+  `PIRQ[(slot + pin - 1) mod 4]` — and four PIRQRC registers (config 0x60-0x63: bit7=disabled,
+  bits3:0=ISA IRQ) route each PIRQ line to a legacy IRQ. PCI IRQs are **level** (need the ELCR
+  built last session). Non-PCI-routable IRQs are the hardwired 0/1/2/8/13. In APIC mode the
+  four PIRQ lines instead wire straight to I/O APIC GSIs 16-19, bypassing the routing
+  registers. **Changes what we build:** a `PirqRouter` model (registers + swizzle + PIC-mode
+  ISA-IRQ / APIC-mode GSI resolution); the live path (a PIIX bridge device in config space
+  whose 0x60-0x63 writes drive the router, and PCI INTx assertions driving SharedPic/ioapic)
+  is the follow-up once a PCI device actually asserts INTx.
+
+- **Intel 8254 (PIT) §System Control Port B / Intel ICH "NMI Status and Control" (0x61).**
+  Bit 0 gates PIT channel 2 (the speaker tone), bit 1 is speaker-data-enable, bit 4 is the
+  toggling DRAM-refresh clock (polled as a coarse delay), bit 5 mirrors PIT ch2 OUT, bits 6-7
+  are the parity/IO-check error latches (no error → 0). **Port A (0x92):** bit 1 = fast A20
+  (enabled post-firmware; KVM keeps A20 open), bit 0 = fast-reset edge. **Changes what we
+  build:** the 0x61/0x92 chipset ports coupled to the shared PIT, filling the open-bus holes a
+  guest hits at boot.
+
+- **IA-PC HPET spec 1.0a.** 1 KiB MMIO block at 0xFED0_0000 (matches the ACPI HPET table);
+  8-byte-aligned 64-bit registers accessed 32- or 64-bit (caps period and the main counter are
+  read as two 32-bit halves on 32-bit access). **Changes what we build:** a HpetMmio adapter
+  bridging the existing model's aligned decode to sub-register 32/64-bit guest accesses.

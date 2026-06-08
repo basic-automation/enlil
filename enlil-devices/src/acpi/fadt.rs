@@ -141,18 +141,28 @@ impl FadtBuilder {
             smi_command: 0xB2,
             acpi_enable: 0xA0,
             acpi_disable: 0xA1,
-            pm1a_event_block: 0x600,
-            pm1a_control_block: 0x604,
-            pm_timer_block: 0x608,
+            // The PM register-block ports are owned by the device models that
+            // implement them, so the table we hand the guest and the hardware the
+            // bus decodes can never drift apart (cross-checked by a test).
+            pm1a_event_block: u32::from(crate::chipset::PM1_EVT_PORT),
+            pm1a_control_block: u32::from(crate::chipset::PM1_CNT_PORT),
+            pm_timer_block: u32::from(crate::timer::PM_TIMER_PORT),
             pm_timer_length: 4,
-            gpe0_block: 0x620,
+            gpe0_block: u32::from(crate::chipset::GPE0_PORT),
             gpe0_length: 16,
+            // NOTE: deliberately *not* HW_REDUCED_ACPI. Enlil presents a
+            // transparent full-hardware PC — it advertises legacy devices
+            // (LEGACY_DEVICES | PS2_8042 below) and populates the legacy ACPI PM
+            // hardware (PM1a event/control, PM_TMR, GPE0). On a hardware-reduced
+            // platform the OS *ignores* all of those blocks and drives sleep via
+            // the FADT SLEEP_*_REG fields instead, so setting that flag here would
+            // both contradict the legacy hardware we model (breaking ACPI shutdown
+            // through PM1a) and be an oddity a real consumer PC never exhibits.
             flags: fadt_flags::WBINVD
                 | fadt_flags::PROC_C1
                 | fadt_flags::SLP_BUTTON
                 | fadt_flags::TMR_VAL_EXT
-                | fadt_flags::RESET_REG_SUP
-                | fadt_flags::HW_REDUCED_ACPI,
+                | fadt_flags::RESET_REG_SUP,
             boot_arch_flags: boot_flags::LEGACY_DEVICES | boot_flags::PS2_8042,
             reset_register: GenericAddress::io(0x0CF9, 8),
             reset_value: 0x06,
@@ -376,5 +386,51 @@ mod tests {
         let fadt = FadtBuilder::new(0).sci_interrupt(11).build();
         let sci = u16::from_le_bytes(fadt[46..48].try_into().unwrap());
         assert_eq!(sci, 11);
+    }
+
+    #[test]
+    fn fadt_is_not_hardware_reduced_and_keeps_its_legacy_pm_blocks() {
+        // A transparent full-hardware PC must NOT set HW_REDUCED_ACPI: on a
+        // hardware-reduced platform the OS ignores the legacy PM blocks and the
+        // legacy devices, which would both contradict the PS/2/PIT/PIC/RTC/PM1
+        // hardware Enlil models and break ACPI shutdown via PM1a.
+        let fadt = FadtBuilder::new(0xDEAD_0000).build();
+
+        // Flags at offset 112.
+        let flags = u32::from_le_bytes(fadt[112..116].try_into().unwrap());
+        assert_eq!(
+            flags & fadt_flags::HW_REDUCED_ACPI,
+            0,
+            "HW_REDUCED_ACPI must be clear for a full-hardware PC"
+        );
+
+        // Consistency: not hardware-reduced => the legacy PM blocks the OS will
+        // actually use must be populated. PM1a_CNT_BLK at 64, PM_TMR_BLK at 76.
+        let pm1a_cnt = u32::from_le_bytes(fadt[64..68].try_into().unwrap());
+        let pm_tmr = u32::from_le_bytes(fadt[76..80].try_into().unwrap());
+        assert_eq!(pm1a_cnt, 0x604, "PM1a_CNT_BLK must point at the PM1 block");
+        assert_eq!(pm_tmr, 0x608, "PM_TMR_BLK must point at the PM timer");
+
+        // And the legacy-devices boot flag is set, matching the cleared
+        // HW_REDUCED_ACPI (they are mutually exclusive in practice).
+        let boot = u16::from_le_bytes(fadt[109..111].try_into().unwrap());
+        assert_ne!(boot & boot_flags::LEGACY_DEVICES, 0);
+    }
+
+    #[test]
+    fn pm_block_ports_match_the_device_models_that_implement_them() {
+        // The FADT must advertise the same ports the bus actually decodes, or the
+        // guest looks for the PM hardware in the wrong place. Derive the table's
+        // ports from the device models' canonical constants and assert they agree.
+        let fadt = FadtBuilder::new(0).build();
+        let pm1a_evt = u32::from_le_bytes(fadt[56..60].try_into().unwrap());
+        let pm1a_cnt = u32::from_le_bytes(fadt[64..68].try_into().unwrap());
+        let pm_tmr = u32::from_le_bytes(fadt[76..80].try_into().unwrap());
+        let gpe0 = u32::from_le_bytes(fadt[80..84].try_into().unwrap());
+
+        assert_eq!(pm1a_evt, u32::from(crate::chipset::PM1_EVT_PORT));
+        assert_eq!(pm1a_cnt, u32::from(crate::chipset::PM1_CNT_PORT));
+        assert_eq!(pm_tmr, u32::from(crate::timer::PM_TIMER_PORT));
+        assert_eq!(gpe0, u32::from(crate::chipset::GPE0_PORT));
     }
 }
