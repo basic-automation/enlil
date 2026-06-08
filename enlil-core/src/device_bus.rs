@@ -417,6 +417,22 @@ impl DeviceBus {
         self.add_pio(Box::new(pm1.port()))
     }
 
+    /// Mount the **SMI command port** (`0xB2`, the FADT's `SMI_CMD`) on the PIO
+    /// bus, wired to `pm1`'s `SCI_EN`. An ACPI OS enters ACPI mode by writing
+    /// `ACPI_ENABLE` here and polling `SCI_EN`; without this port the write hits
+    /// open bus, `SCI_EN` never sets, and the OS aborts ACPI init. The same `pm1`
+    /// must back the `PM1a` block so the OS sees its poll succeed.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if `0xB2` overlaps an
+    /// already-registered device.
+    pub fn add_smi_command(
+        &mut self,
+        pm1: &SharedAcpiPm1Block,
+    ) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_pio(Box::new(pm1.smi_command_port()))
+    }
+
     /// Mount the **ACPI GPE0 block** ([`Gpe0Block`]) on the PIO bus over
     /// `0x620`..`0x62F` — the `GPE0_BLK` the emitted FADT advertises. A guest's
     /// ACPICA reads and clears these General-Purpose Event registers during ACPI
@@ -625,6 +641,10 @@ impl DeviceBus {
         // path. Shared so the run loop can poll the S5 sleep request.
         let pm1 = SharedAcpiPm1Block::new();
         bus.add_acpi_pm1(&pm1)?;
+
+        // SMI command port (0xB2) — wired to the same PM1 block so the OS's
+        // ACPI-enable handshake (write ACPI_ENABLE, poll SCI_EN) completes.
+        bus.add_smi_command(&pm1)?;
 
         // ACPI GPE0 block (0x620) — keep its status quiet during ACPI init.
         bus.add_gpe0()?;
@@ -1625,6 +1645,43 @@ mod tests {
         // Timer 0 fired (its configured route is irrelevant in legacy mode).
         assert_eq!(fired, vec![(0, 0)]);
         assert_eq!(pc.ioapic.with(|c| c.pending_vector(0)), Some(0x60));
+    }
+
+    #[test]
+    fn smi_command_enables_acpi_mode_through_the_bus() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+
+        let mut pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            1_780_838_055,
+            1,
+        )
+        .unwrap();
+
+        // Fresh machine: legacy mode, SCI_EN clear in PM1a_CNT (0x604).
+        let mut cnt = [0u8; 2];
+        VmExitHandler::io_in(&mut pc.bus, 0x604, &mut cnt);
+        assert_eq!(u16::from_le_bytes(cnt) & 1, 0, "SCI_EN clear before enable");
+
+        // The OS writes ACPI_ENABLE (0xA0) to the SMI command port (0xB2), then
+        // polls PM1a_CNT until SCI_EN reads back set — the ACPICA handshake.
+        VmExitHandler::io_out(&mut pc.bus, 0xB2, &[0xA0]);
+        VmExitHandler::io_in(&mut pc.bus, 0x604, &mut cnt);
+        assert_eq!(
+            u16::from_le_bytes(cnt) & 1,
+            1,
+            "SCI_EN set after ACPI_ENABLE"
+        );
+        assert!(pc.pm1.with(|b| b.sci_enabled()));
+
+        // ACPI_DISABLE (0xA1) returns to legacy mode.
+        VmExitHandler::io_out(&mut pc.bus, 0xB2, &[0xA1]);
+        VmExitHandler::io_in(&mut pc.bus, 0x604, &mut cnt);
+        assert_eq!(
+            u16::from_le_bytes(cnt) & 1,
+            0,
+            "SCI_EN clear after ACPI_DISABLE"
+        );
     }
 
     #[test]

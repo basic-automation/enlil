@@ -138,9 +138,13 @@ impl FadtBuilder {
             oem: OemInfo::default(),
             dsdt_address,
             sci_interrupt: 9,
-            smi_command: 0xB2,
-            acpi_enable: 0xA0,
-            acpi_disable: 0xA1,
+            // SMI command port + enable/disable values are owned by the
+            // SMI-command device model, so the table and the port that actually
+            // toggles SCI_EN can't drift (the OS's ACPI-enable handshake targets
+            // exactly the port/value pair advertised here).
+            smi_command: u32::from(crate::chipset::SMI_CMD_PORT),
+            acpi_enable: crate::chipset::ACPI_ENABLE_VALUE,
+            acpi_disable: crate::chipset::ACPI_DISABLE_VALUE,
             // The PM register-block ports are owned by the device models that
             // implement them, so the table we hand the guest and the hardware the
             // bus decodes can never drift apart (cross-checked by a test).

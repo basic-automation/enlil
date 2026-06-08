@@ -379,6 +379,18 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > `StandardPc::poll_platform_events` now returns `PlatformEvent::Reset` for the
 > `0xCF9` path too (alongside `0x92`); both latches are drained each poll. The vCPU
 > run loop acts on that event once `/dev/kvm` is available.
+>
+> **Status (2026-06-08d):** the **SMI command port** (`0xB2`, the FADT's `SMI_CMD`)
+> is now modelled (`chipset::SmiCommandPort`) and wired into `standard_pc_complete`.
+> The FADT advertises a non-zero `SMI_CMD` with `ACPI_ENABLE`/`ACPI_DISABLE`
+> (`0xA0`/`0xA1`), so ACPICA switches to ACPI mode by writing `ACPI_ENABLE` to
+> `0xB2` and **polling `SCI_EN`** in `PM1a_CNT`. There's no SMM, so the port sets
+> `SCI_EN` directly in the shared `PM1a` block (and `ACPI_DISABLE` clears it) —
+> without it the write hit open bus, `SCI_EN` never set, and the OS aborted ACPI
+> init ("Could not enable ACPI mode"): a hard boot failure and a VM tell. The FADT
+> now sources `SMI_CMD`/`ACPI_ENABLE`/`ACPI_DISABLE` from the
+> `chipset::{SMI_CMD_PORT,ACPI_ENABLE_VALUE,ACPI_DISABLE_VALUE}` constants the port
+> uses, so the advertised handshake and the decoding hardware can't drift.
 
 ### 0.3 USB Live Boot & Non-Destructive Testing (CRITICAL FOR ADOPTION)
 
