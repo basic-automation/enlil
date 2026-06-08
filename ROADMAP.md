@@ -1435,6 +1435,16 @@ Physical USB Devices
   - MCFG: PCI Express config space for virtual PCI devices
 - Use `acpi_tables` crate or write raw AML generation
 - Tables must look like they came from a real motherboard vendor (use realistic OEM strings)
+- **DSDT status (2026-06-08):** the hand-rolled `AmlBuilder` now emits correct
+  self-inclusive `PkgLength` (a prior overshoot bug would have corrupted all AML),
+  `_CRS` resource templates for COM1/RTC/PS2/HPET and the PCI-root resource
+  producer (bus/IO/MMIO windows), a `PNP0C02` motherboard-resources device, a
+  static **APIC-mode** `_PRT` generated from `PirqRouter` (so DSDT and the live
+  INTx path agree), a `_PIC`/`PICF` pair, and a proper `Name(_S5_, Package)` for
+  ACPI shutdown. **Remaining:** a PIC-mode `_PRT` via PCI Link Devices
+  (`PNP0C0F` + `_PRS`/`_SRS` over the PIRQRC registers) selected by a method-based
+  `_PRT` keyed on `PICF` — needs If/Else/Store AML helpers, and ideally an `iasl`
+  check on the runner to validate control-flow AML.
 
 ### 5.2 SMBIOS Synthesis
 - Generate SMBIOS/DMI tables that report:

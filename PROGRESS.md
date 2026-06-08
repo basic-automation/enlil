@@ -6,6 +6,100 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-08 — Session: make the synthesized DSDT actually correct — AML PkgLength, `_CRS`, `_PRT`/`_PIC`, `_S5` (Phase 0.2 / 5.1)
+
+An 11-increment session, each a full orient→build→verify trip and an independently-green commit,
+forming one coherent arc: **the DSDT the previous sessions built had never been parsed by a real
+ACPI interpreter (no `/dev/kvm`), and it turned out to be malformed — fix the foundational AML
+encoder bug, then add the device-resource and interrupt-routing objects a guest actually needs to
+discover and drive the hardware.** Every increment is pure-userspace, fully exercised by unit
+tests that *decode the emitted bytes*. Workspace test count: **797 → 814 (+17)**. `/dev/kvm` is
+**still absent on this runner (verified: no `/dev/kvm`, no vmx/svm in `/proc/cpuinfo`)**; the one
+KVM-gated test self-skips (1 ignored). `iasl`/`acpidump` are **not installed** on the runner, so
+AML was validated by hand-written decode tests rather than a reference disassembler.
+
+### The headline finding (increment 1)
+**`AmlBuilder::patch_pkg_length` produced a wrong, self-overshooting `PkgLength` for every
+scope/device/method in the DSDT.** It encoded `total_len` *including* the 4 reserved bytes and
+then shifted the body left without recomputing, so the field claimed `+shift` too many bytes. A
+real ACPI interpreter reads `PkgLength` as "bytes from this field to package end," so it would
+have run past every package and corrupted all following AML — i.e. the DSDT was unparseable. It
+stayed latent only because no guest had ever booted. (`ssdt.rs`'s hand-rolled path already did the
+self-reference correctly; the `AmlBuilder` used by the DSDT did not.) Fixed with
+`encode_self_pkg_length` (counts the field's own size per ACPI §20.2.4) + decode-based regression
+tests (1-byte, 2-byte, nested). **This was a prerequisite for everything else below.**
+
+### Increments (each its own green commit)
+1. **`38c850d` PkgLength self-reference fix** — see above.
+2. **`a9064a0` `ResourceTemplate` + `name_resource_template`** — I/O Port (`0x47`), IRQ (`0x23`),
+   Memory32Fixed (`0x86`) descriptors; wraps them in a `Buffer` with End Tag + self-consistent
+   `PkgLength`/`BufferSize` (ACPI §6.4).
+3. **`dfc7067` COM1 `_CRS`** — configured I/O window (8 ports) + IRQ from `DsdtConfig`.
+4. **`11d82f8` RTC + PS/2 `_CRS`** — RTC 0x70-0x71/IRQ8; keyboard 0x60+0x64/IRQ1; mouse IRQ12
+   (shares the i8042 ports), matching how real namespaces split the i8042.
+5. **`3227e7c` HPET `_CRS`** — Memory32Fixed for the 1 KiB block at the fixed HPET base.
+6. **`4befddb` `_S5` is now a Package** — `name_package`; `Name(_S5_, Package(){5,5,0,0})`. Was a
+   bare integer, so a guest had **no usable S5 object and could not ACPI-shutdown**. SLP_TYP 5
+   matches what `enlil_devices::chipset` captures as a shutdown request.
+7. **`1c0a617` PCI root `_CRS`** — Word/DWord/QWord Address Space descriptors (`0x88`/`0x87`/
+   `0x8A`); PCI0 produces bus 0-0xFF, the legacy I/O ports (split around the config aperture), and
+   the 32-/64-bit MMIO holes from `DsdtConfig`. Required for Windows PCI enumeration.
+8. **`f25ba01` `PNP0C02` motherboard-resources device** — `SYSR` claims the fixed legacy I/O Enlil
+   models (both 8259s, PIT, ports 0x61/0x92, ELCR) so the guest's PnP manager treats them as
+   consumed, not free.
+9. **`e06defb` PCI `_PRT` (APIC mode)** — `name_routing_table` (package of integer sub-packages);
+   PCI0's `_PRT` generated from `PirqRouter::device_gsi` so the DSDT and the live `assert_pci_intx`
+   path agree by construction (swizzle → GSI 16-19, `{(slot<<16)|0xFFFF, pin, 0, GSI}`). Without
+   `_PRT` a guest can route **no** PCI interrupt.
+10. **`eca2ea3` `_PIC` method + `PICF` flag** — matches real firmware (a missing `_PIC` is a VM
+    tell); stores the announced interrupt mode into `PICF` for a future mode-selecting `_PRT`.
+
+(That's 10 code commits + this hand-off = the 11 increments; #1 spanned the fix and its tests.)
+
+### Research (informed the build)
+Logged under `RESEARCH.md` → "2026-06-08": ACPI 6.x §20.2.4 (self-inclusive PkgLength — the bug),
+§6.4 (small/large/address-space resource descriptors + flags), §6.2.13/§5.8.1 (`_PRT`/`_PIC`),
+§7.4.2.6 (`_Sx` packages). All stable firmware conventions — the authoritative sources are the
+primary ACPI spec, not recent papers. Roadmap updated surgically at §5.1 (DSDT status + the
+PIC-mode `_PRT` follow-up).
+
+### Test results (exact)
+- `cargo build --workspace` → **OK**.
+- `cargo fmt --all -- --check` → **OK**.
+- `cargo clippy --all-targets --workspace -- -D warnings` → **OK** (clean; new code lint-clean
+  under `enlil-devices`'s strict `deny(all, pedantic, nursery)`).
+- `cargo test --workspace` → **814 passed, 0 failed, 1 ignored** (was 797). +17 tests, all
+  decode-the-emitted-bytes checks. The 1 ignored is the `/dev/kvm` self-skip.
+- `/dev/kvm` paths: **not run — no `/dev/kvm` (no nested virt)**; verified absent on this runner.
+- no_std custom-target build: **N/A** — no crate is `#![no_std]` yet.
+- **`iasl`/AML disassembler: not available on the runner** — AML validated by hand-written decode
+  tests (PkgLength self-consistency, descriptor field offsets, nested packages), not a reference
+  tool. Worth installing `acpica-tools` on a future runner to cross-check.
+
+### Recommended next step (tomorrow)
+1. **PIC-mode `_PRT` via PCI Link Devices + a method-based `_PRT` (high value, medium-high effort,
+   needs new AML helpers).** Add `AmlBuilder` control-flow helpers — `Store(arg, name)`, `If`/
+   `Else` (with the same self-inclusive `PkgLength`), `Return(name-ref)`, `LEqual` — then model
+   four `PNP0C0F` PCI Link Devices (`LNKA`-`LNKD`) whose `_STA`/`_DIS`/`_CRS`/`_PRS`/`_SRS` read
+   and write the PIIX3 PIRQRC registers, and make `_PRT` a *method* that returns the APIC table
+   when `PICF==1` and a link-device-sourced table otherwise. **Strongly want `iasl` on the runner
+   first** to validate the control-flow AML (the PkgLength bug class is exactly what a disassembler
+   catches). If `iasl` can't be installed, keep deferring and pick #2/#3.
+2. **8237 DMA controller (medium effort, lower modern value, fully unblocked).** Ports 0x00-0x0F
+   (ch 0-3), 0xC0-0xDF (ch 4-7), page registers 0x80-0x8F; command/status/mask/mode + the
+   address/count flip-flop. Linux `request_region`s these at boot; modelling them removes an
+   open-bus surface. Pure userspace. (Its I/O would also belong in the `SYSR` `_CRS` once modelled.)
+3. **Live PIRQ from a real INTx source.** `assert_pci_intx` and the new `_PRT` both exist, but
+   nothing in-tree asserts INTx yet. When a PCI device model (virtio-blk/net) is wired onto the
+   bus, route its INTx pin through `assert_pci_intx`, and fold `assert_pci_intx` + the run-loop
+   tick into the eventual KVM run loop.
+4. **KVM run-loop binding (still blocked on `/dev/kvm`).** Unchanged from prior hand-offs: when a
+   nested-virt runner exists, have `KvmBackend` build its bus via `standard_pc_complete`, drive
+   `advance_clocks`/`tick_rtc` from a timer thread, act on `poll_platform_events`, and deliver
+   interrupts through `KVM_IRQ_LINE`/the in-kernel chip. **If still no `/dev/kvm`, do #1-#3.**
+
+---
+
 ## 2026-06-07 (d) — Session: assemble the complete transparent PC + its ACPI PM hardware, HPET, PIRQ, and the run-loop core (Phase 0.2)
 
 An 18-increment session, each a full orient→build→verify trip and an independently-green commit,
