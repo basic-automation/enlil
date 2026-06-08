@@ -350,6 +350,20 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > the router and PCI INTx assertions drive the controllers), HPET/PM1/GPE0 **SCI/IRQ delivery**
 > (needs the run loop), and the run-loop bindings for the A20/reset/sleep latches — all of which
 > wait on the `/dev/kvm` KVM binding (still no nested virt on the runner).
+>
+> **Status (2026-06-08b):** the **8237A ISA DMA controllers** are now modelled
+> (`devices::dma`): DMA-1 (`0x00-0x0F`), DMA-2 (`0xC0-0xDF`, registers on 2-byte
+> spacing) and the DMA **page registers** (`0x80-0x8F`, with the PC/AT non-linear
+> channel→port map). It is a faithful **passive** register model — base/current
+> address+count per channel behind the shared byte-pointer flip-flop, plus the
+> command/status/request/single+all-mask/mode registers and master clear — but no
+> transfer *engine*, since nothing in-tree owns a channel yet (no floppy/SB16). It
+> exists for transparency: a guest that `request_region`s and probes ISA DMA at
+> boot (Linux always does) now reads coherent register state instead of open-bus
+> `0xFF`, closing a cheap VM tell. Wired into `standard_pc_complete` and claimed in
+> the DSDT's `SYSR` `_CRS`. **Follow-up:** drive a real channel only when a DMA
+> consumer (floppy/SB16) is added, and fold the page latch + channel addr/count
+> into a 24-bit transfer address at that point.
 
 ### 0.3 USB Live Boot & Non-Destructive Testing (CRITICAL FOR ADOPTION)
 

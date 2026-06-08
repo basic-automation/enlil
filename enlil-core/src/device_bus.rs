@@ -17,6 +17,7 @@ use crate::kvm_backend::VmExitHandler;
 use crate::serial::{SerialOutput, SerialPort};
 use enlil_devices::bus::{MmioBus, MmioDevice, PioBus, PioDevice};
 use enlil_devices::chipset::{Gpe0Block, SharedAcpiPm1Block, SharedSystemControlPortA};
+use enlil_devices::dma::{Dma8237, DmaPageRegisters};
 use enlil_devices::interrupt::{IoApicMmio, PirqRouter, SharedInterruptController, SharedPic};
 use enlil_devices::pcie::{
     vendors, EcamSpace, PciBdf, PciConfigIo, PcieRootComplex, SharedRootComplex,
@@ -415,6 +416,23 @@ impl DeviceBus {
         self.add_pio(Box::new(Gpe0Block::new()))
     }
 
+    /// Mount the **8237A DMA controllers** and the **DMA page registers** on the
+    /// PIO bus: DMA-1 over `0x00`..`0x0F`, DMA-2 over `0xC0`..`0xDF`, and the page
+    /// registers over `0x80`..`0x8F`. The model is passive (no transfer engine —
+    /// nothing in-tree owns a channel yet), but mounting it means a guest that
+    /// `request_region`s and probes ISA DMA at boot (Linux always does) reads back
+    /// coherent register state instead of open-bus `0xFF` — an open DMA window is
+    /// otherwise a cheap VM tell.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if any of the three windows
+    /// overlaps an already-registered device.
+    pub fn add_dma_controllers(&mut self) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_pio(Box::new(Dma8237::primary()))?;
+        self.add_pio(Box::new(Dma8237::secondary()))?;
+        self.add_pio(Box::new(DmaPageRegisters::new()))
+    }
+
     /// Like [`standard_pc`](Self::standard_pc), but wires the legacy devices'
     /// interrupt lines into the dual-8259 `pic` (the early-boot interrupt
     /// controller) and mounts its four ports: the 8254 PIT's channel-0 line
@@ -596,6 +614,11 @@ impl DeviceBus {
 
         // ACPI GPE0 block (0x620) — keep its status quiet during ACPI init.
         bus.add_gpe0()?;
+
+        // 8237A DMA controllers (0x00-0x0F, 0xC0-0xDF) + page registers
+        // (0x80-0x8F) — passive register model so an ISA-DMA probe reads coherent
+        // state, not open bus. Claimed in the DSDT's SYSR _CRS.
+        bus.add_dma_controllers()?;
 
         // PCIe config space (legacy CAM + ECAM), seeded with a host bridge.
         let pcie = bus.add_pcie(PcieRootComplex::new(DEFAULT_ECAM_BASE))?;

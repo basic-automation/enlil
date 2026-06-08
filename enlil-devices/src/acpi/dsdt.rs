@@ -228,20 +228,24 @@ impl DsdtBuilder {
 
     /// Build the PNP motherboard-resources device (HID `PNP0C02`). Its `_CRS`
     /// claims the fixed-function legacy controller I/O that Enlil actually models
-    /// (the two 8259 PICs, the 8254 PIT, System Control Ports A/B, and the PIIX
-    /// ELCR) so the guest's plug-and-play manager reports them as consumed —
-    /// matching what a real chipset's firmware reserves. The RTC/COM/keyboard
-    /// ports are claimed by their own device objects above.
+    /// (the two 8259 PICs, the 8254 PIT, the two 8237A DMA controllers and DMA
+    /// page registers, System Control Ports A/B, and the PIIX ELCR) so the guest's
+    /// plug-and-play manager reports them as consumed — matching what a real
+    /// chipset's firmware reserves. The RTC/COM/keyboard ports are claimed by
+    /// their own device objects above.
     fn build_motherboard_resources(aml: &mut AmlBuilder) {
         let dev = aml.device_start(b"SYSR");
         aml.name_string(b"_HID", "PNP0C02");
         aml.name_integer(b"_UID", 1);
         let mut crs = ResourceTemplate::new();
-        crs.io_port(0x0020, 2) // master 8259A
+        crs.io_port(0x0000, 0x10) // 8237A DMA-1 (channels 0-3)
+            .io_port(0x0020, 2) // master 8259A
             .io_port(0x0040, 4) // 8254 PIT
             .io_port(0x0061, 1) // System Control Port B (NMI/speaker)
+            .io_port(0x0080, 0x10) // DMA page registers
             .io_port(0x0092, 1) // System Control Port A (fast A20/reset)
             .io_port(0x00A0, 2) // slave 8259A
+            .io_port(0x00C0, 0x20) // 8237A DMA-2 (channels 4-7)
             .io_port(0x04D0, 2); // PIIX ELCR
         aml.name_resource_template(b"_CRS", &crs);
         let sta = aml.method_start(b"_STA", 0, false);
@@ -578,6 +582,24 @@ mod tests {
         assert!(
             dsdt.windows(elcr.len()).any(|w| w == elcr),
             "SYSR _CRS must claim the ELCR I/O window"
+        );
+        // 8237A DMA-1 window 0x0000 len 0x10.
+        let dma1 = [0x47u8, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x10];
+        assert!(
+            dsdt.windows(dma1.len()).any(|w| w == dma1),
+            "SYSR _CRS must claim the DMA-1 I/O window"
+        );
+        // 8237A DMA-2 window 0x00C0 len 0x20.
+        let dma2 = [0x47u8, 0x01, 0xC0, 0x00, 0xC0, 0x00, 0x01, 0x20];
+        assert!(
+            dsdt.windows(dma2.len()).any(|w| w == dma2),
+            "SYSR _CRS must claim the DMA-2 I/O window"
+        );
+        // DMA page-register window 0x0080 len 0x10.
+        let dmapg = [0x47u8, 0x01, 0x80, 0x00, 0x80, 0x00, 0x01, 0x10];
+        assert!(
+            dsdt.windows(dmapg.len()).any(|w| w == dmapg),
+            "SYSR _CRS must claim the DMA page-register I/O window"
         );
         let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         assert_eq!(sum, 0);
