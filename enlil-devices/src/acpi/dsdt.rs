@@ -173,7 +173,35 @@ impl DsdtBuilder {
         // COM1 serial port
         self.build_com1(aml);
 
+        // Motherboard-reserved legacy I/O so the OS doesn't reassign PnP devices
+        // onto the fixed controllers.
+        Self::build_motherboard_resources(aml);
+
         aml.device_end(&isa);
+    }
+
+    /// Build the PNP motherboard-resources device (HID `PNP0C02`). Its `_CRS`
+    /// claims the fixed-function legacy controller I/O that Enlil actually models
+    /// (the two 8259 PICs, the 8254 PIT, System Control Ports A/B, and the PIIX
+    /// ELCR) so the guest's plug-and-play manager reports them as consumed —
+    /// matching what a real chipset's firmware reserves. The RTC/COM/keyboard
+    /// ports are claimed by their own device objects above.
+    fn build_motherboard_resources(aml: &mut AmlBuilder) {
+        let dev = aml.device_start(b"SYSR");
+        aml.name_string(b"_HID", "PNP0C02");
+        aml.name_integer(b"_UID", 1);
+        let mut crs = ResourceTemplate::new();
+        crs.io_port(0x0020, 2) // master 8259A
+            .io_port(0x0040, 4) // 8254 PIT
+            .io_port(0x0061, 1) // System Control Port B (NMI/speaker)
+            .io_port(0x0092, 1) // System Control Port A (fast A20/reset)
+            .io_port(0x00A0, 2) // slave 8259A
+            .io_port(0x04D0, 2); // PIIX ELCR
+        aml.name_resource_template(b"_CRS", &crs);
+        let sta = aml.method_start(b"_STA", 0, false);
+        aml.return_integer(0x0F);
+        aml.method_end(&sta);
+        aml.device_end(&dev);
     }
 
     /// Build RTC device. `_CRS` reports the CMOS index/data ports (0x70-0x71) and
@@ -427,6 +455,30 @@ mod tests {
             "COM1 _CRS must contain the IRQ4 descriptor"
         );
         // Checksum still valid.
+        let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        assert_eq!(sum, 0);
+    }
+
+    #[test]
+    fn dsdt_motherboard_resources_claim_fixed_legacy_io() {
+        let dsdt = DsdtBuilder::new(DsdtConfig::default()).build();
+        // PNP0C02 motherboard-resources HID present.
+        assert!(
+            dsdt.windows(7).any(|w| w == b"PNP0C02"),
+            "DSDT must contain the motherboard-resources device"
+        );
+        // PIT window 0x40 len 4.
+        let pit = [0x47u8, 0x01, 0x40, 0x00, 0x40, 0x00, 0x01, 0x04];
+        assert!(
+            dsdt.windows(pit.len()).any(|w| w == pit),
+            "SYSR _CRS must claim the PIT I/O window"
+        );
+        // ELCR window 0x4D0 len 2.
+        let elcr = [0x47u8, 0x01, 0xD0, 0x04, 0xD0, 0x04, 0x01, 0x02];
+        assert!(
+            dsdt.windows(elcr.len()).any(|w| w == elcr),
+            "SYSR _CRS must claim the ELCR I/O window"
+        );
         let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         assert_eq!(sum, 0);
     }
