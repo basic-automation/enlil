@@ -232,8 +232,13 @@ impl DsdtBuilder {
 
     /// Build sleep state objects (\S5 for shutdown)
     fn build_sleep_states(aml: &mut AmlBuilder) {
-        // \_S5 (soft off) — required for ACPI shutdown
-        aml.name_integer(b"_S5_", 0);
+        // \_S5 (soft off) — required for ACPI shutdown. _Sx must be a *Package*
+        // of { PM1a_CNT.SLP_TYP, PM1b_CNT.SLP_TYP, reserved, reserved }; the OS
+        // evaluates it and writes element 0 to PM1a_CNT to power off. SLP_TYP = 5
+        // matches the value the chipset PM1a model captures as a shutdown request
+        // (see enlil_devices::chipset). Emitting it as a bare integer (as before)
+        // left the guest with no usable S5 object, breaking ACPI shutdown.
+        aml.name_package(b"_S5_", &[5, 5, 0, 0]);
     }
 
     /// Build the DSDT as a byte vector
@@ -329,6 +334,27 @@ mod tests {
         };
         let dsdt = DsdtBuilder::new(config).build();
         assert!(dsdt.len() > 36);
+        let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        assert_eq!(sum, 0);
+    }
+
+    #[test]
+    fn dsdt_s5_is_a_package_yielding_slp_typ_5() {
+        use super::super::aml::opcode;
+        let dsdt = DsdtBuilder::new(DsdtConfig::default()).build();
+        // Find Name(_S5_, ...) and confirm it is a PackageOp (0x12), not an integer.
+        let pos = dsdt
+            .windows(4)
+            .position(|w| w == b"_S5_")
+            .expect("DSDT must define _S5");
+        // After NAME_OP + name come the object bytes.
+        assert_eq!(dsdt[pos + 4], opcode::PACKAGE_OP, "_S5 must be a Package");
+        // The package must contain SLP_TYP = 5 (BYTE_PREFIX 0x05) for PM1a/PM1b.
+        let slp = [0x0Au8, 0x05, 0x0A, 0x05];
+        assert!(
+            dsdt[pos..].windows(slp.len()).any(|w| w == slp),
+            "_S5 package must yield SLP_TYP 5 for PM1a and PM1b"
+        );
         let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         assert_eq!(sum, 0);
     }

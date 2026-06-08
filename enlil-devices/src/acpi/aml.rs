@@ -246,6 +246,53 @@ impl AmlBuilder {
         }
     }
 
+    /// Encode an integer as an AML data-object constant (the same encoding as
+    /// [`Self::name_integer`]'s value, for use as a package element).
+    fn encode_integer_const(value: u64) -> Vec<u8> {
+        if value == 0 {
+            vec![opcode::ZERO]
+        } else if value == 1 {
+            vec![opcode::ONE]
+        } else if value <= 0xFF {
+            vec![opcode::BYTE_PREFIX, value.to_le_bytes()[0]]
+        } else if value <= 0xFFFF {
+            vec![
+                opcode::WORD_PREFIX,
+                value.to_le_bytes()[0],
+                value.to_le_bytes()[1],
+            ]
+        } else if value <= 0xFFFF_FFFF {
+            let mut v = vec![opcode::DWORD_PREFIX];
+            v.extend_from_slice(&value.to_le_bytes()[..4]);
+            v
+        } else {
+            let mut v = vec![opcode::QWORD_PREFIX];
+            v.extend_from_slice(&value.to_le_bytes());
+            v
+        }
+    }
+
+    /// `Name(name, Package(){ ...integers... })` — a fixed package of integer
+    /// constants, e.g. the `_Sx` sleep-state packages whose elements are the
+    /// `PM1a`/`PM1b` `SLP_TYP` values the OS writes to enter that state.
+    pub fn name_package(&mut self, name: &[u8; 4], values: &[u64]) -> &mut Self {
+        self.data.push(opcode::NAME_OP);
+        self.data.extend_from_slice(&Self::encode_name(*name));
+
+        // Body = NumElements (ByteData) + element encodings.
+        let mut body = vec![values.len().to_le_bytes()[0]];
+        for &v in values {
+            body.extend_from_slice(&Self::encode_integer_const(v));
+        }
+
+        // PackageOp PkgLength NumElements PackageElementList.
+        self.data.push(opcode::PACKAGE_OP);
+        let pkg = Self::encode_self_pkg_length(body.len());
+        self.data.extend_from_slice(&pkg);
+        self.data.extend_from_slice(&body);
+        self
+    }
+
     /// `Name(name, ResourceTemplate{ ... })` — emit a `_CRS`/`_PRS`-style buffer.
     ///
     /// Appends the End Tag (`0x79`) with a zero checksum byte (ACPI treats `0` as
@@ -538,6 +585,30 @@ mod tests {
         // Inner package runs from its PkgLength field to the end of the device,
         // which is the end of the whole buffer here.
         assert_eq!(inner_val, bytes.len() - (dev_op + 2));
+    }
+
+    #[test]
+    fn name_package_encodes_elements_and_count() {
+        let mut aml = AmlBuilder::new();
+        aml.name_package(b"_S5_", &[5, 5, 0, 0]);
+        let bytes = aml.into_bytes();
+
+        assert_eq!(bytes[0], opcode::NAME_OP);
+        assert_eq!(&bytes[1..5], b"_S5_");
+        assert_eq!(bytes[5], opcode::PACKAGE_OP);
+
+        let (pkg_val, pkg_field) = decode_pkg_length(&bytes[6..]);
+        assert_eq!(
+            pkg_val,
+            bytes.len() - 6,
+            "package PkgLength is self-consistent"
+        );
+
+        // NumElements, then the four element encodings: BYTE_PREFIX 5, BYTE_PREFIX 5,
+        // ZERO, ZERO.
+        let num_pos = 6 + pkg_field;
+        assert_eq!(bytes[num_pos], 4, "four elements");
+        assert_eq!(&bytes[num_pos + 1..], &[0x0A, 0x05, 0x0A, 0x05, 0x00, 0x00]);
     }
 
     #[test]
