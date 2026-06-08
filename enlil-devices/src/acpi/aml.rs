@@ -228,6 +228,50 @@ impl AmlBuilder {
         Self::encode_pkg_length(content_len + 4)
     }
 
+    /// Encode an integer as an inline `TermArg` constant (used for a `Buffer`'s
+    /// `BufferSize`). Resource templates are small, so a byte/word const suffices.
+    fn encode_integer_arg(value: usize) -> Vec<u8> {
+        if value == 0 {
+            vec![opcode::ZERO]
+        } else if value == 1 {
+            vec![opcode::ONE]
+        } else if value <= 0xFF {
+            vec![opcode::BYTE_PREFIX, value.to_le_bytes()[0]]
+        } else {
+            vec![
+                opcode::WORD_PREFIX,
+                value.to_le_bytes()[0],
+                value.to_le_bytes()[1],
+            ]
+        }
+    }
+
+    /// `Name(name, ResourceTemplate{ ... })` — emit a `_CRS`/`_PRS`-style buffer.
+    ///
+    /// Appends the End Tag (`0x79`) with a zero checksum byte (ACPI treats `0` as
+    /// "valid, checksum not computed") and wraps the descriptors in a `Buffer`
+    /// whose `BufferSize` is the total descriptor byte count, per ACPI 6.x §6.4 /
+    /// §19.6.114. `ResourceTemplate` in ASL is just sugar for such a buffer.
+    pub fn name_resource_template(&mut self, name: &[u8; 4], rt: &ResourceTemplate) -> &mut Self {
+        self.data.push(opcode::NAME_OP);
+        self.data.extend_from_slice(&Self::encode_name(*name));
+
+        // Body = descriptors + End Tag + checksum byte.
+        let mut body = rt.as_bytes().to_vec();
+        body.push(0x79);
+        body.push(0x00);
+
+        // BufferOp PkgLength BufferSize ByteList. The PkgLength counts the
+        // BufferSize term + the byte list + itself.
+        let size_arg = Self::encode_integer_arg(body.len());
+        self.data.push(opcode::BUFFER_OP);
+        let pkg = Self::encode_self_pkg_length(size_arg.len() + body.len());
+        self.data.extend_from_slice(&pkg);
+        self.data.extend_from_slice(&size_arg);
+        self.data.extend_from_slice(&body);
+        self
+    }
+
     /// Patch a `PkgLength` at the given position
     fn patch_pkg_length(&mut self, length_pos: usize, _content_start: usize) {
         // We reserved 4 bytes for the field; the body is everything after them.
@@ -263,6 +307,80 @@ impl Default for AmlBuilder {
 pub struct ScopeHandle {
     length_pos: usize,
     content_start: usize,
+}
+
+/// Accumulates ACPI resource descriptors for a `ResourceTemplate` buffer.
+///
+/// Descriptors follow ACPI spec §6.4 and feed a device's `_CRS`/`_PRS`. The End
+/// Tag is appended by [`AmlBuilder::name_resource_template`], so callers only
+/// push the resources a device actually consumes.
+#[derive(Default)]
+pub struct ResourceTemplate {
+    data: Vec<u8>,
+}
+
+impl ResourceTemplate {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { data: Vec::new() }
+    }
+
+    /// Fixed I/O Port Descriptor (small type `0x47`) for a `length`-byte port
+    /// window at `base`, decoding the full 16-bit ISA address space. This is the
+    /// common case for legacy devices (COM, RTC, keyboard).
+    pub fn io_port(&mut self, base: u16, length: u8) -> &mut Self {
+        self.io_port_range(base, base, 1, length, true)
+    }
+
+    /// General I/O Port Descriptor (small type `0x47`, ACPI §6.4.2.5). `decode16`
+    /// selects 16-bit (vs. 10-bit) ISA address decoding.
+    pub fn io_port_range(
+        &mut self,
+        min: u16,
+        max: u16,
+        align: u8,
+        length: u8,
+        decode16: bool,
+    ) -> &mut Self {
+        self.data.push(0x47);
+        self.data.push(u8::from(decode16)); // Information: bit0 = _DEC (16-bit decode)
+        self.data.extend_from_slice(&min.to_le_bytes());
+        self.data.extend_from_slice(&max.to_le_bytes());
+        self.data.push(align);
+        self.data.push(length);
+        self
+    }
+
+    /// IRQ Descriptor in its 3-byte form (small type `0x23`, ACPI §6.4.2.1) for a
+    /// single edge-triggered, active-high, exclusive ISA interrupt.
+    pub fn irq(&mut self, irq: u8) -> &mut Self {
+        let mask: u16 = if irq < 16 { 1u16 << irq } else { 0 };
+        self.data.push(0x23);
+        self.data.extend_from_slice(&mask.to_le_bytes());
+        self.data.push(0x01); // bit0=edge, bit3=exclusive, bit4=active-high
+        self
+    }
+
+    /// 32-bit Fixed Memory Range Descriptor (large type `0x86`, ACPI §6.4.3.4).
+    pub fn memory32_fixed(&mut self, base: u32, length: u32, writable: bool) -> &mut Self {
+        self.data.push(0x86);
+        self.data.extend_from_slice(&9u16.to_le_bytes()); // length of the descriptor body
+        self.data.push(u8::from(writable)); // Information: bit0 = write status
+        self.data.extend_from_slice(&base.to_le_bytes());
+        self.data.extend_from_slice(&length.to_le_bytes());
+        self
+    }
+
+    /// The accumulated descriptor bytes (without the End Tag).
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8] {
+        self.data.as_slice()
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -420,6 +538,91 @@ mod tests {
         // Inner package runs from its PkgLength field to the end of the device,
         // which is the end of the whole buffer here.
         assert_eq!(inner_val, bytes.len() - (dev_op + 2));
+    }
+
+    #[test]
+    fn resource_template_descriptor_bytes() {
+        // A COM1-style _CRS: I/O 0x3F8 len 8 + IRQ4.
+        let mut rt = ResourceTemplate::new();
+        rt.io_port(0x3F8, 8).irq(4);
+        let bytes = rt.as_bytes();
+        // I/O Port Descriptor: 0x47, info=1 (16-bit decode), min, max, align, len.
+        assert_eq!(bytes[0], 0x47);
+        assert_eq!(bytes[1], 0x01);
+        assert_eq!(u16::from_le_bytes([bytes[2], bytes[3]]), 0x3F8);
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 0x3F8);
+        assert_eq!(bytes[6], 1); // alignment
+        assert_eq!(bytes[7], 8); // length
+        // IRQ Descriptor: 0x23, mask, flags.
+        assert_eq!(bytes[8], 0x23);
+        assert_eq!(u16::from_le_bytes([bytes[9], bytes[10]]), 1 << 4); // IRQ4
+        assert_eq!(bytes[11], 0x01);
+    }
+
+    #[test]
+    fn memory32_fixed_descriptor_bytes() {
+        let mut rt = ResourceTemplate::new();
+        rt.memory32_fixed(0xFED0_0000, 0x400, false);
+        let b = rt.as_bytes();
+        assert_eq!(b[0], 0x86); // large type 0x86
+        assert_eq!(u16::from_le_bytes([b[1], b[2]]), 9); // body length
+        assert_eq!(b[3], 0); // read-only
+        assert_eq!(u32::from_le_bytes([b[4], b[5], b[6], b[7]]), 0xFED0_0000);
+        assert_eq!(u32::from_le_bytes([b[8], b[9], b[10], b[11]]), 0x400);
+        assert_eq!(b.len(), 12); // 3 header + 9 body
+    }
+
+    #[test]
+    fn name_resource_template_wraps_buffer_with_end_tag() {
+        let mut aml = AmlBuilder::new();
+        let mut rt = ResourceTemplate::new();
+        rt.io_port(0x60, 1).io_port(0x64, 1).irq(1);
+        aml.name_resource_template(b"_CRS", &rt);
+        let bytes = aml.into_bytes();
+
+        // Name(_CRS, Buffer(...))
+        assert_eq!(bytes[0], opcode::NAME_OP);
+        assert_eq!(&bytes[1..5], b"_CRS");
+        assert_eq!(bytes[5], opcode::BUFFER_OP);
+
+        // PkgLength is self-consistent (field value == bytes from field to end).
+        let (pkg_val, pkg_field) = decode_pkg_length(&bytes[6..]);
+        assert_eq!(pkg_val, bytes.len() - 6);
+
+        // BufferSize term immediately follows the PkgLength field.
+        let size_pos = 6 + pkg_field;
+        // descriptors (8+8+4=20) + End Tag (2) = 22 bytes → a byte const.
+        assert_eq!(bytes[size_pos], opcode::BYTE_PREFIX);
+        let buf_size = usize::from(bytes[size_pos + 1]);
+        let byte_list = &bytes[size_pos + 2..];
+        assert_eq!(
+            buf_size,
+            byte_list.len(),
+            "BufferSize must match the byte list"
+        );
+
+        // The byte list ends with the End Tag (0x79) + checksum (0x00).
+        assert_eq!(byte_list[byte_list.len() - 2], 0x79);
+        assert_eq!(byte_list[byte_list.len() - 1], 0x00);
+    }
+
+    #[test]
+    fn device_with_crs_has_consistent_lengths() {
+        // A device carrying a _CRS: the device PkgLength must still cover the whole
+        // (variable-length) resource buffer exactly.
+        let mut aml = AmlBuilder::new();
+        let dev = aml.device_start(b"COM1");
+        aml.name_string(b"_HID", "PNP0501");
+        let mut rt = ResourceTemplate::new();
+        rt.io_port(0x3F8, 8).irq(4);
+        aml.name_resource_template(b"_CRS", &rt);
+        aml.device_end(&dev);
+        let bytes = aml.into_bytes();
+
+        assert_eq!(bytes[0], opcode::EXT_OP_PREFIX);
+        assert_eq!(bytes[1], opcode::DEVICE_OP);
+        let (dev_val, _) = decode_pkg_length(&bytes[2..]);
+        assert_eq!(dev_val, bytes.len() - 2);
     }
 
     #[test]
