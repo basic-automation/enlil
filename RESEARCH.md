@@ -902,3 +902,41 @@ tests only approximated.
 - **Unblocks:** the deferred **PIC-mode `_PRT` via PCI Link Devices** (needs If/Else AML
   + `LNKA-D` PNP0C0F devices) can now be authored against a validating compiler rather
   than blind byte emission — the next ACPI increment.
+
+---
+
+## 2026-06-09 (b) — `dmidecode` validates SMBIOS; FACS; link-device PCI routing
+
+Same reference-parser approach, applied to the rest of the firmware-description surface
+and finished against the validating tools.
+
+- **`dmidecode --from-dump` (`dmidecode` 3.5) installs from the distro repo** — the DMI
+  analog of `iasl`. Run over the synthesized SMBIOS (entry point at offset 0, structure
+  table at `0x20`, the `--dump-bin` layout) it found three latent defects the per-field
+  unit tests missed: (1) Type 0 BIOS Characteristics Extension Byte 2 **bit 4 = "describes
+  a virtual machine"** was set — a direct VM tell; (2) Type 3 (System Enclosure) declared
+  `Length` 22 but wrote 21 bytes — the SMBIOS 2.7+ **SKU Number** byte was missing, so the
+  parser ate the first string's leading byte and read a `<BAD INDEX>` SKU; (3) Type 4
+  (Processor) declared `Length` 48 (SMBIOS 3.0) but wrote 42 — the 16-bit **Core/Enabled/
+  Thread Count 2** fields were missing, shifting the whole string table (the processor
+  Manufacturer decoded as the CPU brand, Part Number as `<BAD INDEX>`). **Changed what we
+  build:** all three fixed; an integration test now round-trips the table through
+  `dmidecode` (no `<BAD INDEX>`, no "virtual machine"), self-skipping when absent.
+- **FACS (ACPI 6.x §5.2.10).** The FADT's `FIRMWARE_CTRL`/`X_FIRMWARE_CTRL` were zero — no
+  FACS was published. Every real PC firmware provides one (firmware waking vector, hardware
+  signature, ACPI global lock); a zero pointer is a tell and a gap for the Windows target.
+  The FACS uniquely has **no SDT header and no checksum**. **Changed what we build:** emit
+  the 64-byte v2 FACS, 64-byte aligned in the XSDT→FADT padding, pointed to by both
+  `FIRMWARE_CTRL` and `X_FIRMWARE_CTRL`.
+- **PCI interrupt link devices (`PNP0C0F`, the PIIX/ICH pattern).** A `_PRT` with only
+  integer sources lacks the `LNKA-D` link devices every real PIIX/ICH platform exposes
+  (`_PRS`/`_CRS`/`_STA`/`_DIS`/`_SRS`). **Changed what we build:** the mode-selecting `_PRT`'s
+  PIC branch now routes through `\LNK[A-D]` (Source = the link `NameSeg`); the links report
+  the firmware-default IRQ in `_CRS`; and `standard_pc_complete` programs the live `PIRQRC[A-D]`
+  registers to the same `PIRQ_DEFAULT_IRQS`, so the table, the links, the `PirqRouter`, and the
+  bytes a guest reads from config space all agree by construction. All `iasl`-validated.
+- **CPUID (`enlil-devices::stealth::cpuid`) — noted, not yet changed.** Hypervisor bit clear
+  and `0x40000000` leaves zeroed are correct. Two items want a real-CPU reference before
+  touching: leaf `0x1` `EBX` max-addressable-IDs is a fixed constant (doesn't track
+  `vcpu_count`), and leaf `0x80000008`'s address-size value vs. its comment look swapped.
+  There is no `iasl`/`dmidecode`-style validator for CPUID, so this is a focused future pass.

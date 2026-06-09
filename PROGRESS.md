@@ -6,6 +6,95 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-09 — Session: validate the firmware-description surface with real reference parsers (`iasl` + `dmidecode`), fix every bug they flag (Phase 0.2 / 5.1 / 5.2)
+
+**The unlock:** `acpica-tools` (`iasl` 20230628) **and** `dmidecode` 3.5 both install cleanly
+from the distro repo on this runner — the previous sessions kept deferring AML/ACPI
+correctness because no ACPI disassembler was present. So for the first time the synthesized
+ACPI and SMBIOS were parsed by the *same* reference tools a real OS uses. This caught a string
+of latent bugs that byte-level unit tests had missed, and unblocked the long-deferred PIC-mode
+`_PRT`. **15 commits, each independently green.** `/dev/kvm` is **still absent** (verified, no
+nested virt). Workspace tests **839 → 860** (`cargo test --workspace`: 860 passed, 0 failed, 1
+ignored — the `/dev/kvm` self-skip). All of `cargo fmt --all -- --check`, `cargo clippy
+--all-targets --workspace -- -D warnings`, and `cargo test --workspace` are green.
+
+### Arc 1 — `iasl` ACPI validation + the bugs it found
+- **`4700b04`** validation harness + **drop spurious `_ADR` from PCI0**. The PCI host bridge
+  carried both `_HID` and `_ADR` (ACPI §6.1: a Device uses one or the other; iasl warns 3073).
+  Removed `_ADR` — DSDT now compiles 0 errors / 0 warnings.
+- **`2964e45`** integration test that round-trips **every** table through `iasl -d` + recompile,
+  asserting 0 errors / 0 warnings; self-skips when iasl absent.
+- **`960528a`** **TPM2 was truncated**: declared revision 4 but emitted the 52-byte rev-3 body,
+  so iasl reported "table terminates in the middle of a data structure." Emit the full 76-byte
+  rev-4 layout (Start Method params + Laml/Lasa log fields).
+- **`9ad349d`** **emit a FACS** + point the FADT's `FIRMWARE_CTRL`/`X_FIRMWARE_CTRL` at it (was
+  zero — no FACS at all). 64-byte v2 structure, no header/checksum, 64-byte aligned in the
+  XSDT→FADT padding.
+- **`0519cfc`** test the **RSDP→XSDT→table→DSDT pointer chain** (every guest-physical pointer
+  resolves to a signature-valid, checksummed table); **`<cross-table>`** DSDT processor devices
+  ↔ SSDT power scopes stay in lock step.
+
+### Arc 2 — interrupt routing: dual-mode `_PRT` + PCI link devices, end-to-end consistent
+- **`8cb3618`** `_PRT` is now a **mode-selecting method** — `If (PICF) Return (APIC GSIs); Return
+  (PIC IRQs)` — so a PIC-mode guest (or the window before `_PIC(1)`) gets working routing. New
+  AML primitives: `if_name_start`/`if_end`, `return_routing_table`; shared `PIRQ_DEFAULT_IRQS`
+  ([11,10,5,6]).
+- **`<link devices>`** added the four **`PNP0C0F` link devices** (`LNKA-D`, `_PRS`/`_CRS`/`_STA`/
+  `_DIS`/`_SRS`) and routed the PIC `_PRT` through them (Source = link `NameSeg`). New AML:
+  `ResourceTemplate::irq_flags`, `return_routing_table_via_links`.
+- **`<pirq program>`** `standard_pc_complete` now **programs the live `PIRQRC[A-D]`** registers to
+  `PIRQ_DEFAULT_IRQS` (out of their 0x80 reset state) — the firmware step — so the `_PRT`, the
+  link `_CRS`, the `PirqRouter`, and the config-space bytes all agree.
+- **`417958d`** SSDT now defines **per-vCPU** `_PSS`/`_CST` (was CPU0-only on a false "Windows
+  inherits" premise). iasl-validated across 1/2/4/16/255 vCPUs.
+- **`4b4abdc`** fixed the **DSDT ISA bridge `_ADR`** from `0x001F0000` (ICH 1F.0) to `0x00010000`
+  (the PIIX3 at 00:01.0 the bus actually mounts), sourced from a shared `pcie::PIIX3_ISA_BRIDGE_BDF`.
+
+### Arc 3 — `dmidecode` SMBIOS validation + the bugs it found
+- **`e03d0b9`** three fixes: (1) BIOS **"virtual machine" characteristic** bit cleared (a VM tell);
+  (2) Type 3 missing the SMBIOS-2.7+ **SKU byte** (Length 22 vs 21 written → eaten string char +
+  `<BAD INDEX>`); (3) Type 4 missing the SMBIOS-3.0 **16-bit core/thread counts** (Length 48 vs 42
+  → shifted string table, wrong Manufacturer, `<BAD INDEX>` Part Number).
+- **`f204b08`** `dmidecode --from-dump` integration test (no `<BAD INDEX>`, no "virtual machine",
+  string table aligned); self-skips when dmidecode absent.
+- **`315bc08`** folded the iasl findings into `RESEARCH.md` + `ROADMAP.md`.
+
+### Test results (exact)
+- `cargo build --workspace` → OK. `cargo fmt --all -- --check` → OK. `cargo clippy --all-targets
+  --workspace -- -D warnings` → OK. `cargo test --workspace` → **860 passed, 0 failed, 1 ignored**.
+- `iasl` round-trips **all** ACPI tables (and the DSDT under default + 8 config variants, 1-255
+  vCPUs) at **0 errors / 0 warnings**; the DSDT+SSDT cross-disassemble cleanly (externals resolve).
+- `dmidecode --from-dump` parses the SMBIOS table with **no `<BAD INDEX>`** and no VM tell.
+- `/dev/kvm`: **not run — absent (no nested virt)**, verified. no_std custom-target: N/A (no crate
+  is `#![no_std]`).
+
+### Recommended next steps (tomorrow)
+> The ACPI + SMBIOS firmware-description surface is now **reference-validated and clean**. CI
+> should install `acpica-tools` + `dmidecode` to make the two integration tests hard gates.
+1. **CPUID stealth pass (`enlil-devices::stealth::cpuid`).** Highest-value remaining transparency
+   surface (primary VM-detection vector). Hypervisor bit / `0x40000000` zeroing are correct; two
+   items need a **real-CPU reference dump** to fix confidently: leaf `0x1` `EBX`
+   max-addressable-IDs is a fixed constant (should track `vcpu_count`/HTT), and leaf `0x80000008`'s
+   address-size value vs. its comment look swapped. No `iasl`/`dmidecode`-style validator exists, so
+   this is a careful, reference-backed pass — don't guess.
+2. **Reprogrammable PIC link routing.** `_SRS`/`_DIS` on `LNKA-D` are accepted no-ops today. To let
+   a PIC-mode guest *re*-route, give them an `OperationRegion(PCI_Config)` + `Field` over the bridge
+   config (`0x60-0x63`) and the buffer-manipulation AML (`CreateField`/`FindSetRightBit`/`And`/`Or`/
+   `Store`) — new `AmlBuilder` primitives, all `iasl`-validatable now.
+3. **Chipset identity (cross-cutting, deferred).** Host bridge advertises `0x1237` (i440FX) while the
+   platform exposes PCIe ECAM/MCFG and the LPC is at PIIX3 `00:01.0`. A fully consistent modern
+   machine is **q35** (MCH `0x29C0`, ICH9 LPC at `00:1F.0`); converting touches `device_bus`, the
+   bridge BDF, the host-bridge ID, several tests, and would revert the `00:01.0` `_ADR` fix — do it
+   as a deliberate, focused architectural pass, not a drive-by.
+4. **Consolidate the two SMBIOS builders** (`enlil-devices::smbios` canonical vs the unused
+   `enlil-core::smbios`) and wire the canonical one into the boot/`fw_cfg` delivery path.
+5. **KVM run loop** (blocked on `/dev/kvm`). Unchanged: ask for a nested-virt runner. When available,
+   the `KvmBackend` builds its bus via `standard_pc_complete`, applies the `CpuidStealthTable` via
+   `KVM_SET_CPUID2`, loads the now-clean ACPI table set at `table_base_address`, and drives
+   `poll_platform_events`.
+
+---
+
 ## 2026-06-08 (b) — Session: finish the legacy-PC transparency surface — 8237 DMA, `0xCF9` reboot, the `0xB2` ACPI-enable handshake (Phase 0.2)
 
 A 7-increment session, each a full orient→build→verify trip and an independently-green commit,
