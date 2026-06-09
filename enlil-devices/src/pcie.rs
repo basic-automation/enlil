@@ -96,6 +96,15 @@ impl PciBdf {
         }
     }
 
+    /// The ACPI `_ADR` value for this function: `(device << 16) | function`
+    /// (ACPI §6.1.1). A device object under a PCI bus uses this to bind to the
+    /// PCI function at this address. The bus number is *not* part of `_ADR` — the
+    /// parent bus device fixes it.
+    #[must_use]
+    pub const fn acpi_adr(&self) -> u32 {
+        ((self.device as u32) << 16) | (self.function as u32)
+    }
+
     /// Convert BDF to ECAM offset
     #[must_use]
     pub const fn ecam_offset(&self) -> usize {
@@ -384,6 +393,15 @@ impl PcieRootComplex {
         dev
     }
 }
+
+/// The PCI location of the PIIX3 ISA/LPC bridge: `00:01.0`.
+///
+/// Function 0 of device 1 on bus 0, on the 440FX/PIIX3 chipset Enlil models. This
+/// is the single source of truth for the bridge's address — the device bus mounts
+/// the live bridge here and the DSDT's `ISA_` device object derives its `_ADR`
+/// from it ([`PciBdf::acpi_adr`]), so the ACPI namespace binds to the real bridge
+/// instead of an empty slot.
+pub const PIIX3_ISA_BRIDGE_BDF: PciBdf = PciBdf::new(0, 1, 0);
 
 /// Config-space offset of the first PIIX3 PCI interrupt-routing register.
 ///

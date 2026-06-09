@@ -231,8 +231,15 @@ impl DsdtBuilder {
     fn build_isa_bridge(&self, aml: &mut AmlBuilder) {
         let isa = aml.device_start(b"ISA_");
 
-        // ISA bridge at PCI 00:1F.0 (standard Intel ICH location)
-        aml.name_integer(b"_ADR", 0x001F_0000);
+        // The ISA/LPC bridge's _ADR must point at the PIIX3 bridge the device bus
+        // actually mounts — function 0 of device 1 (00:01.0) on the 440FX/PIIX3
+        // chipset — not the ICH-era 1F.0 location. Deriving it from the shared
+        // PIIX3_ISA_BRIDGE_BDF keeps the ACPI object and the live bridge from
+        // drifting, so the guest's ISA device binds to the real PIRQ-router bridge.
+        aml.name_integer(
+            b"_ADR",
+            u64::from(crate::pcie::PIIX3_ISA_BRIDGE_BDF.acpi_adr()),
+        );
 
         // RTC
         if self.config.has_rtc {
@@ -582,7 +589,8 @@ mod tests {
             adr_count, 1,
             "only the ISA bridge may carry _ADR; the PCI root must use _HID alone"
         );
-        // The ISA bridge's _ADR (0x001F0000) is the one that remains.
+        // The ISA bridge's _ADR (00:01.0 -> 0x00010000) is the one that remains.
+        assert_eq!(crate::pcie::PIIX3_ISA_BRIDGE_BDF.acpi_adr(), 0x0001_0000);
         let isa_adr = [
             b'_',
             b'A',
@@ -591,12 +599,12 @@ mod tests {
             opcode::DWORD_PREFIX,
             0x00,
             0x00,
-            0x1F,
+            0x01,
             0x00,
         ];
         assert!(
             dsdt.windows(isa_adr.len()).any(|w| w == isa_adr),
-            "the surviving _ADR must be the ISA bridge at 00:1F.0"
+            "the surviving _ADR must be the ISA bridge at 00:01.0"
         );
         let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         assert_eq!(sum, 0);

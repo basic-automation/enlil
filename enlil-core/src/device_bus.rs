@@ -886,8 +886,10 @@ pub const IRQ_COM1: u8 = 4;
 
 /// BDF of the PIIX3 ISA bridge / PCI interrupt router (`00:01.0`) seeded by
 /// [`DeviceBus::standard_pc_complete`]; its config space holds the `PIRQRC[A-D]`
-/// routing registers.
-const PIIX_ISA_BRIDGE_BDF: PciBdf = PciBdf::new(0, 1, 0);
+/// routing registers. Sourced from the shared
+/// [`enlil_devices::pcie::PIIX3_ISA_BRIDGE_BDF`] so the live bridge and the DSDT's
+/// `ISA_` `_ADR` cannot drift to different PCI locations.
+const PIIX_ISA_BRIDGE_BDF: PciBdf = enlil_devices::pcie::PIIX3_ISA_BRIDGE_BDF;
 /// PCI device ID of the PIIX3 ISA bridge (Intel 82371SB, function 0).
 const PIIX3_ISA_DEVICE_ID: u16 = 0x7000;
 
