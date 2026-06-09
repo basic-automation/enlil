@@ -130,8 +130,12 @@ impl DsdtBuilder {
         aml.name_string(b"_HID", "PNP0A08");
         // _CID: PCI compatible
         aml.name_string(b"_CID", "PNP0A03");
-        // _ADR: 0
-        aml.name_integer(b"_ADR", 0);
+        // No _ADR: the host bridge is enumerated through the ACPI namespace by its
+        // _HID, and its parent is \_SB (not an enumerable PCI bus), so an _ADR here
+        // is meaningless. ACPI §6.1 says a Device must carry either _HID or _ADR but
+        // not both; emitting _ADR=0 alongside _HID makes a real ACPI compiler warn
+        // (iasl 3073) and is a divergence from how firmware describes a PCI root.
+        // The _ADR on the ISA bridge below is correct — it *is* a PCI child function.
         // _UID: 0
         aml.name_integer(b"_UID", 0);
         // _BBN: bus base number 0
@@ -485,6 +489,39 @@ mod tests {
         assert!(
             dsdt.windows(entry0.len()).any(|w| w == entry0),
             "_PRT must contain the slot-0 INTA -> GSI16 entry"
+        );
+        let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        assert_eq!(sum, 0);
+    }
+
+    #[test]
+    fn dsdt_pci_root_uses_hid_not_adr() {
+        // ACPI §6.1: a Device carries either _HID or _ADR, not both. The PCI host
+        // bridge is ACPI-enumerated via _HID, so it must NOT also carry _ADR (a real
+        // ACPI compiler warns — iasl 3073 — and it is a firmware-description tell).
+        // The only _ADR in the DSDT is the ISA bridge (a genuine PCI child function),
+        // so exactly one _ADR name may appear in the whole table.
+        let dsdt = DsdtBuilder::new(DsdtConfig::default()).build();
+        let adr_count = dsdt.windows(4).filter(|w| *w == b"_ADR").count();
+        assert_eq!(
+            adr_count, 1,
+            "only the ISA bridge may carry _ADR; the PCI root must use _HID alone"
+        );
+        // The ISA bridge's _ADR (0x001F0000) is the one that remains.
+        let isa_adr = [
+            b'_',
+            b'A',
+            b'D',
+            b'R',
+            opcode::DWORD_PREFIX,
+            0x00,
+            0x00,
+            0x1F,
+            0x00,
+        ];
+        assert!(
+            dsdt.windows(isa_adr.len()).any(|w| w == isa_adr),
+            "the surviving _ADR must be the ISA bridge at 00:1F.0"
         );
         let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         assert_eq!(sum, 0);
