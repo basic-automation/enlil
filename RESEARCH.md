@@ -865,3 +865,78 @@ not recent papers. Logged so the next run doesn't re-derive them.
   nothing in-tree (no floppy/SB16) drives a DMA channel yet, so this is a faithful
   passive register model, fully unblocked and pure-userspace. The claimed I/O
   (`0x00-0x0F`, `0x80-0x8F`, `0xC0-0xDF`) also belongs in the `SYSR` `_CRS`.
+
+---
+
+## 2026-06-09 — Reference-compiler validation of the synthesized ACPI (iasl/acpica-tools)
+
+**Tooling unblock.** Prior sessions repeatedly deferred AML/ACPI correctness work and
+the PIC-mode `_PRT` because no ACPI disassembler was installed; the DSDT had only ever
+been checked by hand-written byte-decode tests, never parsed by a real interpreter
+(`/dev/kvm` is still absent, so no guest has booted it either). `acpica-tools`
+(`iasl` 20230628) **installs cleanly from the distro repo** on this runner, so the
+emitted tables can now be round-tripped through the Intel ACPI compiler:
+`iasl -d <table>.aml` disassembles and `iasl <table>.dsl` recompiles, with the summary
+line tallying errors/warnings. This is the authoritative cross-check the hand-decode
+tests only approximated.
+
+- **ACPI 6.x §6.1 (`_HID` vs `_ADR`).** A `Device` is enumerated by *either* `_HID`
+  (ACPI namespace) *or* `_ADR` (address on an enumerable parent bus), **not both**
+  (iasl warns 3073). Our PCI root `PCI0` carried both; its parent is `\_SB`, not a PCI
+  bus, so `_ADR=0` is meaningless and a firmware-description tell. **Changed what we
+  build:** dropped `_ADR` from the host bridge (the ISA bridge keeps its real
+  `_ADR=0x001F0000`); DSDT now compiles 0 errors / 0 warnings.
+- **TCG ACPI Specification — TPM2 table, revision 4.** A revision-4 TPM2 is **not** the
+  bare 52-byte revision-3 structure. After Start Method it carries a 12-byte *Start
+  Method Specific Parameters* block, then *Log Area Minimum Length* (4) + *Log Area
+  Start Address* (8) — **76 bytes** total (iasl's own `-T TPM2` template confirms
+  `0x4C`). Emitting rev 4 with only 52 bytes leaves the table truncated mid-structure;
+  iasl rejects it outright ("terminates in the middle of a data structure"). **Changed
+  what we build:** emit the full 76-byte rev-4 layout (zeroed params/log by default,
+  `log_area()` setter for a real TCG log).
+- **Methodology, durable.** Added an integration test that round-trips *every* generated
+  table through iasl and asserts 0 errors / 0 warnings, **self-skipping when iasl is
+  absent** (mirroring the `/dev/kvm` test). Installing `acpica-tools` in CI makes the
+  whole ACPI surface a hard gate — this is the regression net for the PkgLength/HID-ADR/
+  truncation bug classes that only a real interpreter catches.
+- **Unblocks:** the deferred **PIC-mode `_PRT` via PCI Link Devices** (needs If/Else AML
+  + `LNKA-D` PNP0C0F devices) can now be authored against a validating compiler rather
+  than blind byte emission — the next ACPI increment.
+
+---
+
+## 2026-06-09 (b) — `dmidecode` validates SMBIOS; FACS; link-device PCI routing
+
+Same reference-parser approach, applied to the rest of the firmware-description surface
+and finished against the validating tools.
+
+- **`dmidecode --from-dump` (`dmidecode` 3.5) installs from the distro repo** — the DMI
+  analog of `iasl`. Run over the synthesized SMBIOS (entry point at offset 0, structure
+  table at `0x20`, the `--dump-bin` layout) it found three latent defects the per-field
+  unit tests missed: (1) Type 0 BIOS Characteristics Extension Byte 2 **bit 4 = "describes
+  a virtual machine"** was set — a direct VM tell; (2) Type 3 (System Enclosure) declared
+  `Length` 22 but wrote 21 bytes — the SMBIOS 2.7+ **SKU Number** byte was missing, so the
+  parser ate the first string's leading byte and read a `<BAD INDEX>` SKU; (3) Type 4
+  (Processor) declared `Length` 48 (SMBIOS 3.0) but wrote 42 — the 16-bit **Core/Enabled/
+  Thread Count 2** fields were missing, shifting the whole string table (the processor
+  Manufacturer decoded as the CPU brand, Part Number as `<BAD INDEX>`). **Changed what we
+  build:** all three fixed; an integration test now round-trips the table through
+  `dmidecode` (no `<BAD INDEX>`, no "virtual machine"), self-skipping when absent.
+- **FACS (ACPI 6.x §5.2.10).** The FADT's `FIRMWARE_CTRL`/`X_FIRMWARE_CTRL` were zero — no
+  FACS was published. Every real PC firmware provides one (firmware waking vector, hardware
+  signature, ACPI global lock); a zero pointer is a tell and a gap for the Windows target.
+  The FACS uniquely has **no SDT header and no checksum**. **Changed what we build:** emit
+  the 64-byte v2 FACS, 64-byte aligned in the XSDT→FADT padding, pointed to by both
+  `FIRMWARE_CTRL` and `X_FIRMWARE_CTRL`.
+- **PCI interrupt link devices (`PNP0C0F`, the PIIX/ICH pattern).** A `_PRT` with only
+  integer sources lacks the `LNKA-D` link devices every real PIIX/ICH platform exposes
+  (`_PRS`/`_CRS`/`_STA`/`_DIS`/`_SRS`). **Changed what we build:** the mode-selecting `_PRT`'s
+  PIC branch now routes through `\LNK[A-D]` (Source = the link `NameSeg`); the links report
+  the firmware-default IRQ in `_CRS`; and `standard_pc_complete` programs the live `PIRQRC[A-D]`
+  registers to the same `PIRQ_DEFAULT_IRQS`, so the table, the links, the `PirqRouter`, and the
+  bytes a guest reads from config space all agree by construction. All `iasl`-validated.
+- **CPUID (`enlil-devices::stealth::cpuid`) — noted, not yet changed.** Hypervisor bit clear
+  and `0x40000000` leaves zeroed are correct. Two items want a real-CPU reference before
+  touching: leaf `0x1` `EBX` max-addressable-IDs is a fixed constant (doesn't track
+  `vcpu_count`), and leaf `0x80000008`'s address-size value vs. its comment look swapped.
+  There is no `iasl`/`dmidecode`-style validator for CPUID, so this is a focused future pass.

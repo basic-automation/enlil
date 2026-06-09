@@ -341,39 +341,36 @@ impl SsdtBuilder {
         let pss_bytes = self.build_pss_object();
         let cst_bytes = self.build_cst_object();
 
-        // Build a Scope(\_PR) containing each processor's _PSS and _CST
-        // For CPU0 we define the objects directly, for others we reference CPU0
-        // (Windows only needs them on one processor to inherit)
-        let mut aml = Vec::new();
-
-        // Scope(\_PR) { Scope(C00_) { _PSS, _CST } }
-        // We emit the full objects inside CPU0's scope
+        // Build a Scope(\_PR) that augments *every* processor object the DSDT
+        // declares (C00..C0{n-1}) with its own _PSS and _CST. ACPI power states
+        // are per-processor — there is no implicit inheritance from CPU0 — so a
+        // multi-vCPU guest must find the objects on each processor or OSPM will
+        // manage P-/C-states on CPU0 alone (a functional gap and a firmware tell).
+        // The objects carry identical data (the vCPUs are homogeneous); real
+        // firmware additionally declares _PSD/_CSD domain coordination, a noted
+        // follow-up.
         let mut pr_body = Vec::new();
 
-        // CPU0 scope with _PSS and _CST
-        {
-            let cpu0_name = Self::processor_name(0);
-            let mut cpu0_body = Vec::new();
-            cpu0_body.extend_from_slice(&pss_bytes);
-            cpu0_body.extend_from_slice(&cst_bytes);
+        for cpu in 0..self.vcpu_count {
+            let name = Self::processor_name(cpu);
+            let mut cpu_body = Vec::new();
+            cpu_body.extend_from_slice(&pss_bytes);
+            cpu_body.extend_from_slice(&cst_bytes);
 
-            let mut cpu0_scope = Vec::new();
-            cpu0_scope.push(opcode::SCOPE_OP);
-            let scope_inner_len = 4 + cpu0_body.len(); // 4 for name
+            let mut cpu_scope = Vec::new();
+            cpu_scope.push(opcode::SCOPE_OP);
+            let scope_inner_len = 4 + cpu_body.len(); // 4 for name
             let scope_pkg_len = Self::encode_pkg_length(
                 scope_inner_len + Self::encode_pkg_length(scope_inner_len).len(),
             );
-            cpu0_scope.extend_from_slice(&scope_pkg_len);
-            cpu0_scope.extend_from_slice(&cpu0_name);
-            cpu0_scope.extend_from_slice(&cpu0_body);
-            pr_body.extend_from_slice(&cpu0_scope);
+            cpu_scope.extend_from_slice(&scope_pkg_len);
+            cpu_scope.extend_from_slice(&name);
+            cpu_scope.extend_from_slice(&cpu_body);
+            pr_body.extend_from_slice(&cpu_scope);
         }
 
-        // For CPUs 1..N, emit a Scope with a method that returns CPU0's objects
-        // Actually, Windows derives all CPUs from CPU0's _PSS/_CST automatically
-        // when OSPM processes _PPC/_PCT. No need to duplicate.
-
         // Wrap in Scope(\_PR_)
+        let mut aml = Vec::new();
         aml.push(opcode::SCOPE_OP);
         let pr_inner_len = 4 + pr_body.len(); // 4 for name "_PR_"
         let pr_pkg_len =
@@ -455,6 +452,28 @@ mod tests {
         let aml = &ssdt[AcpiSdtHeader::SIZE..];
         let found = aml.windows(4).any(|w| w == b"_CST");
         assert!(found, "SSDT must contain _CST object");
+    }
+
+    #[test]
+    fn ssdt_defines_power_objects_for_every_vcpu() {
+        // ACPI power states are per-processor; each declared CPU (C00..C0{n-1})
+        // must carry its own _PSS/_CST, not just CPU0. Verify a Scope for each
+        // processor name and that the count of _PSS objects equals the vCPU count.
+        let n = 4u8;
+        let ssdt = SsdtBuilder::new(n).build();
+        for cpu in 0..n {
+            let name = SsdtBuilder::processor_name(cpu);
+            assert!(
+                ssdt.windows(4).any(|w| w == name),
+                "SSDT must scope into processor {cpu:?}",
+            );
+        }
+        let pss_count = ssdt.windows(4).filter(|w| *w == b"_PSS").count();
+        let cst_count = ssdt.windows(4).filter(|w| *w == b"_CST").count();
+        assert_eq!(pss_count, usize::from(n), "one _PSS per vCPU");
+        assert_eq!(cst_count, usize::from(n), "one _CST per vCPU");
+        let sum: u8 = ssdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        assert_eq!(sum, 0);
     }
 
     #[test]

@@ -18,7 +18,9 @@ use crate::serial::{SerialOutput, SerialPort};
 use enlil_devices::bus::{MmioBus, MmioDevice, PioBus, PioDevice};
 use enlil_devices::chipset::{Gpe0Block, SharedAcpiPm1Block, SharedSystemControlPortA};
 use enlil_devices::dma::{Dma8237, DmaPageRegisters};
-use enlil_devices::interrupt::{IoApicMmio, PirqRouter, SharedInterruptController, SharedPic};
+use enlil_devices::interrupt::{
+    IoApicMmio, PirqRouter, SharedInterruptController, SharedPic, PIRQ_DEFAULT_IRQS,
+};
 use enlil_devices::pcie::{
     vendors, EcamSpace, PciBdf, PciConfigIo, PciResetControl, PcieRootComplex, SharedRootComplex,
     PIRQ_ROUTE_CONFIG_BASE,
@@ -666,11 +668,20 @@ impl DeviceBus {
         {
             let mut rc = pcie.borrow_mut();
             if rc.find_device(&PIIX_ISA_BRIDGE_BDF).is_none() {
-                rc.add_device(PcieRootComplex::create_isa_bridge(
+                let mut bridge = PcieRootComplex::create_isa_bridge(
                     PIIX_ISA_BRIDGE_BDF,
                     vendors::INTEL,
                     PIIX3_ISA_DEVICE_ID,
-                ));
+                );
+                // Firmware programs the PIRQ routing registers out of their 0x80
+                // reset (disabled) state to the defaults the DSDT advertises — the
+                // same PIRQ_DEFAULT_IRQS the link devices' _CRS reports — so a guest
+                // reading PIRQRC[A-D], the PirqRouter that syncs from it, and the
+                // ACPI namespace all agree on PCI-mode routing.
+                for (line, &irq) in PIRQ_DEFAULT_IRQS.iter().enumerate() {
+                    bridge.write_u8(PIRQ_ROUTE_CONFIG_BASE + line as u16, irq);
+                }
+                rc.add_device(bridge);
             }
         }
 
@@ -886,8 +897,10 @@ pub const IRQ_COM1: u8 = 4;
 
 /// BDF of the PIIX3 ISA bridge / PCI interrupt router (`00:01.0`) seeded by
 /// [`DeviceBus::standard_pc_complete`]; its config space holds the `PIRQRC[A-D]`
-/// routing registers.
-const PIIX_ISA_BRIDGE_BDF: PciBdf = PciBdf::new(0, 1, 0);
+/// routing registers. Sourced from the shared
+/// [`enlil_devices::pcie::PIIX3_ISA_BRIDGE_BDF`] so the live bridge and the DSDT's
+/// `ISA_` `_ADR` cannot drift to different PCI locations.
+const PIIX_ISA_BRIDGE_BDF: PciBdf = enlil_devices::pcie::PIIX3_ISA_BRIDGE_BDF;
 /// PCI device ID of the PIIX3 ISA bridge (Intel 82371SB, function 0).
 const PIIX3_ISA_DEVICE_ID: u16 = 0x7000;
 
@@ -1548,6 +1561,44 @@ mod tests {
         assert_eq!(pic.with(|p| p.pending_vector()), Some(0x21));
         // ...and the I/O APIC routed it to LAPIC 0 at the RTE's vector 0x31.
         assert_eq!(ioapic.with(|c| c.pending_vector(0)), Some(0x31));
+    }
+
+    #[test]
+    fn standard_pc_complete_programs_the_default_pirq_routing() {
+        use super::{
+            PirqRouter, StandardPc, PIIX_ISA_BRIDGE_BDF, PIRQ_DEFAULT_IRQS, PIRQ_ROUTE_CONFIG_BASE,
+        };
+        use crate::serial::{SerialOutput, SerialOutputMode};
+
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            1_780_838_055,
+            1,
+        )
+        .unwrap();
+        let StandardPc { pcie, .. } = pc;
+
+        // The firmware programmed the PIIX3 bridge's PIRQRC[A-D] out of their 0x80
+        // reset state to the advertised defaults, so the live router agrees with the
+        // DSDT link devices.
+        let rc = pcie.borrow();
+        let bridge = rc
+            .find_device(&PIIX_ISA_BRIDGE_BDF)
+            .expect("PIIX3 ISA bridge is mounted");
+        let mut regs = [0u8; 4];
+        for (line, slot) in regs.iter_mut().enumerate() {
+            *slot = bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE + line as u16);
+        }
+        assert_eq!(
+            regs, PIRQ_DEFAULT_IRQS,
+            "PIRQRC[A-D] must hold the firmware-default routing"
+        );
+
+        // A router synced from those bytes resolves a slot-0 INTA device (PIRQA) to
+        // PIRQ_DEFAULT_IRQS[0] — the same IRQ the LNKA _CRS reports.
+        let mut router = PirqRouter::new();
+        router.sync_from_config(regs);
+        assert_eq!(router.device_isa_irq(0, 1), Some(PIRQ_DEFAULT_IRQS[0]));
     }
 
     #[test]

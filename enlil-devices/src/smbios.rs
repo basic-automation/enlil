@@ -220,9 +220,13 @@ impl SmbiosBuilder {
         header.push(0xFF); // 16MB
         // BIOS Characteristics (8 bytes)
         header.extend_from_slice(&0x0000_0003_0000_0000u64.to_le_bytes());
-        // BIOS Characteristics Extension Bytes
-        header.push(0x01); // ACPI supported
-        header.push(0x1C); // UEFI, target content dist
+        // BIOS Characteristics Extension Bytes (SMBIOS §7.1.2.2).
+        header.push(0x01); // byte 1: ACPI supported (bit 0)
+        // byte 2: targeted content distribution (bit 2) + UEFI (bit 3). Bit 4 —
+        // "SMBIOS table describes a virtual machine" — MUST stay clear: it is a
+        // direct VM tell (dmidecode prints "System is a virtual machine"), exactly
+        // what a transparent hypervisor must not advertise. Was 0x1C (bit 4 set).
+        header.push(0x0C);
         // System BIOS Major Release
         header.push(5);
         // System BIOS Minor Release
@@ -359,10 +363,17 @@ impl SmbiosBuilder {
         header.push(0);
         // Contained Element Record Length: 0
         header.push(0);
+        // SKU Number (string ref, SMBIOS 2.7+). The Length field (22) accounts for
+        // this byte; omitting it left the formatted area one byte short, so a real
+        // parser (dmidecode) consumed the first string's leading byte as the SKU
+        // index — yielding "efault string" for the manufacturer and a <BAD INDEX>
+        // SKU. Reference the 5th string below.
+        header.push(5);
 
         append_strings(
             &mut header,
             &[
+                "Default string",
                 "Default string",
                 "Default string",
                 "Default string",
@@ -425,6 +436,15 @@ impl SmbiosBuilder {
         header.extend_from_slice(&0x00FCu16.to_le_bytes());
         // Processor Family 2
         header.extend_from_slice(&0x0108u16.to_le_bytes()); // Zen 4
+        // SMBIOS 3.0 adds the 16-bit core/thread counts (offsets 0x2A-0x2F). The
+        // Length field (48) accounts for these 6 bytes; omitting them left the
+        // formatted area at 42 bytes, so a real parser read 6 bytes of the string
+        // section as fields and then mis-aligned the whole string table — the
+        // processor Manufacturer came out as the CPU brand and the Part Number as
+        // <BAD INDEX>. Mirror the 8-bit counts above.
+        header.extend_from_slice(&u16::from(self.config.cpu_cores).to_le_bytes()); // Core Count 2
+        header.extend_from_slice(&u16::from(self.config.cpu_cores).to_le_bytes()); // Core Enabled 2
+        header.extend_from_slice(&u16::from(self.config.cpu_threads).to_le_bytes()); // Thread Count 2
 
         append_strings(
             &mut header,
@@ -676,5 +696,97 @@ mod tests {
             }
         }
         assert!(found, "SMBIOS must end with Type 127");
+    }
+
+    /// Walk the structure table, returning for each structure its
+    /// `(type, declared_len, strings)` where `strings` are decoded using the
+    /// declared formatted-area `Length`. If `Length` overshoots or undershoots the
+    /// real formatted area (the Type 3 / Type 4 bug class), the strings parsed here
+    /// come out shifted/garbled — exactly how a real DMI parser (dmidecode) mis-reads
+    /// the table — so asserting the expected strings catches the defect.
+    fn walk(data: &[u8]) -> Vec<(u8, usize, Vec<String>)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 1 < data.len() {
+            let ty = data[i];
+            let len = data[i + 1] as usize;
+            let mut strings = Vec::new();
+            let mut j = i + len; // strings start right after the formatted area
+            // String set: NUL-terminated strings until a double NUL (or a single
+            // NUL immediately, meaning "no strings").
+            if j < data.len() && data[j] == 0 {
+                j += 2; // empty string set: just the terminating double NUL
+            } else {
+                while j < data.len() {
+                    let start = j;
+                    while j < data.len() && data[j] != 0 {
+                        j += 1;
+                    }
+                    strings.push(String::from_utf8_lossy(&data[start..j]).into_owned());
+                    j += 1; // skip the NUL
+                    if j < data.len() && data[j] == 0 {
+                        j += 1; // skip the second NUL ending the set
+                        break;
+                    }
+                }
+            }
+            out.push((ty, len, strings));
+            if ty == 127 {
+                break;
+            }
+            i = j;
+        }
+        out
+    }
+
+    #[test]
+    fn smbios_type0_does_not_advertise_a_virtual_machine() {
+        // BIOS Characteristics Extension Byte 2 (offset 19 in the Type 0 struct)
+        // bit 4 = "SMBIOS table describes a virtual machine" — a VM tell that must
+        // stay clear for a transparent hypervisor.
+        let data = SmbiosBuilder::new(SmbiosConfig::default()).build_structures();
+        // Type 0 is first.
+        assert_eq!(data[0], 0, "Type 0 leads the table");
+        assert_eq!(
+            data[19] & 0x10,
+            0,
+            "the BIOS must not set the 'virtual machine' characteristic bit"
+        );
+    }
+
+    #[test]
+    fn smbios_structure_lengths_match_their_formatted_area() {
+        // For each structure, decode its strings using the declared Length. A wrong
+        // Length shifts the string table; checking known strings parse correctly is
+        // the same end-to-end check dmidecode performs.
+        let data = SmbiosBuilder::new(SmbiosConfig::default()).build_structures();
+        let structs = walk(&data);
+
+        // Type 3 (System Enclosure): first string is the manufacturer "Default
+        // string" — a one-byte-short formatted area used to yield "efault string".
+        let t3 = structs
+            .iter()
+            .find(|(t, ..)| *t == 3)
+            .expect("Type 3 present");
+        assert_eq!(t3.1, 22, "Type 3 Length is 22 (includes the SKU byte)");
+        assert_eq!(
+            t3.2.first().map(String::as_str),
+            Some("Default string"),
+            "Type 3 strings must not be shifted (the missing SKU byte ate the 'D')"
+        );
+
+        // Type 4 (Processor): the formatted area is the full 48-byte SMBIOS 3.0
+        // layout, so string #2 is the manufacturer "Advanced Micro Devices, Inc.",
+        // not the CPU brand (the symptom of the 6-byte-short formatted area).
+        let t4 = structs
+            .iter()
+            .find(|(t, ..)| *t == 4)
+            .expect("Type 4 present");
+        assert_eq!(t4.1, 48, "Type 4 Length is the full 3.0 size");
+        assert_eq!(
+            t4.2.get(1).map(String::as_str),
+            Some("Advanced Micro Devices, Inc."),
+            "Type 4 string table must not be shifted by a short formatted area"
+        );
     }
 }

@@ -69,4 +69,4 @@ pub use pic::{
     DualPic, ELCR_MASTER, ELCR_SLAVE, ElcrPort, MASTER_CMD, MASTER_DATA, Pic8259, PicMasterPort,
     PicSlavePort, SLAVE_CMD, SLAVE_DATA, SharedPic,
 };
-pub use pirq::{PIRQ_GSI_BASE, PIRQ_LINES, PIRQ_ROUTE_BASE, PirqRouter};
+pub use pirq::{PIRQ_DEFAULT_IRQS, PIRQ_GSI_BASE, PIRQ_LINES, PIRQ_ROUTE_BASE, PirqRouter};

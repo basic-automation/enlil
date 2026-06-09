@@ -296,23 +296,97 @@ impl AmlBuilder {
         self
     }
 
-    /// `Name(name, Package(){ <sub-package> ... })` — a package whose every
-    /// element is itself a fixed integer package. Used for a `_PRT` (each entry is
-    /// `{ Address, Pin, Source, SourceIndex }`); `entries` is one 4-tuple per row.
-    pub fn name_routing_table(&mut self, name: &[u8; 4], entries: &[[u64; 4]]) -> &mut Self {
-        // Body = NumElements + each entry encoded as a sub-package.
+    /// Encode `Package(){ <sub-package> ... }` (a `_PRT`-shaped package: every
+    /// element is itself a `{ Address, Pin, Source, SourceIndex }` integer
+    /// sub-package) as a standalone data object, for use as a `Name` value or a
+    /// `Return` operand.
+    fn encode_routing_package(entries: &[[u64; 4]]) -> Vec<u8> {
         let mut body = vec![entries.len().to_le_bytes()[0]];
         for entry in entries {
             body.extend_from_slice(&Self::encode_integer_package(entry));
         }
+        let mut out = vec![opcode::PACKAGE_OP];
+        out.extend_from_slice(&Self::encode_self_pkg_length(body.len()));
+        out.extend_from_slice(&body);
+        out
+    }
 
+    /// `Name(name, Package(){ <sub-package> ... })` — a package whose every
+    /// element is itself a fixed integer package. Used for a `_PRT` (each entry is
+    /// `{ Address, Pin, Source, SourceIndex }`); `entries` is one 4-tuple per row.
+    pub fn name_routing_table(&mut self, name: &[u8; 4], entries: &[[u64; 4]]) -> &mut Self {
+        let pkg = Self::encode_routing_package(entries);
         self.data.push(opcode::NAME_OP);
         self.data.extend_from_slice(&Self::encode_name(*name));
+        self.data.extend_from_slice(&pkg);
+        self
+    }
+
+    /// `Return(Package(){ <sub-package> ... })` — return a `_PRT`-shaped routing
+    /// package from inside a method body (e.g. a mode-selecting `_PRT` method).
+    pub fn return_routing_table(&mut self, entries: &[[u64; 4]]) -> &mut Self {
+        let pkg = Self::encode_routing_package(entries);
+        self.data.push(opcode::RETURN_OP);
+        self.data.extend_from_slice(&pkg);
+        self
+    }
+
+    /// Encode one `_PRT` sub-package whose **Source** is a reference to a PCI
+    /// interrupt link device (a `NameString`), not the integer 0: `{ Address, Pin,
+    /// \\link, SourceIndex }`. `link` is a 4-char `NameSeg` (e.g. `b"LNKA"`) that
+    /// resolves relative to the `_PRT`'s scope. In a package, a bare `NameSeg` is a
+    /// reference the OS follows to the link device's `_CRS`/`_PRS`/`_SRS`.
+    fn encode_named_prt_entry(address: u64, pin: u64, link: [u8; 4], source_index: u64) -> Vec<u8> {
+        let mut body = vec![4u8]; // NumElements
+        body.extend_from_slice(&Self::encode_integer_const(address));
+        body.extend_from_slice(&Self::encode_integer_const(pin));
+        body.extend_from_slice(&link); // NameSeg reference to the link device
+        body.extend_from_slice(&Self::encode_integer_const(source_index));
+        let mut out = vec![opcode::PACKAGE_OP];
+        out.extend_from_slice(&Self::encode_self_pkg_length(body.len()));
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// `Return(Package(){ ... })` for a PIC-mode `_PRT` that routes each entry
+    /// through a named PCI interrupt **link device** (the PIIX/ICH firmware
+    /// pattern). Each entry is `(address, pin, link_nameseg)`; `SourceIndex` is
+    /// always 0 (the link's first/only resource).
+    pub fn return_routing_table_via_links(&mut self, entries: &[(u64, u64, [u8; 4])]) -> &mut Self {
+        let mut body = vec![entries.len().to_le_bytes()[0]];
+        for (address, pin, link) in entries {
+            body.extend_from_slice(&Self::encode_named_prt_entry(*address, *pin, *link, 0));
+        }
+        self.data.push(opcode::RETURN_OP);
         self.data.push(opcode::PACKAGE_OP);
         self.data
             .extend_from_slice(&Self::encode_self_pkg_length(body.len()));
         self.data.extend_from_slice(&body);
         self
+    }
+
+    /// Start an `If (<name>)` block whose predicate is the value of a named object
+    /// (a `TermArg` that evaluates the integer the name holds, e.g. the `PICF`
+    /// interrupt-model flag). Returns a handle to close with [`Self::if_end`].
+    ///
+    /// `If` is `IfOp PkgLength Predicate TermList`; the `PkgLength` spans the
+    /// predicate and the body, exactly like a scope, so the shared
+    /// [`Self::patch_pkg_length`] closes it.
+    pub fn if_name_start(&mut self, name: &[u8; 4]) -> ScopeHandle {
+        self.data.push(opcode::IF_OP);
+        let length_pos = self.data.len();
+        self.data.extend_from_slice(&[0, 0, 0, 0]);
+        // Predicate: a bare NameString references the object and yields its value.
+        self.data.extend_from_slice(&Self::encode_name(*name));
+        ScopeHandle {
+            length_pos,
+            content_start: self.data.len(),
+        }
+    }
+
+    /// Close an `If` block opened with [`Self::if_name_start`].
+    pub fn if_end(&mut self, handle: &ScopeHandle) {
+        self.patch_pkg_length(handle.length_pos, handle.content_start);
     }
 
     /// `Name(name, ResourceTemplate{ ... })` — emit a `_CRS`/`_PRS`-style buffer.
@@ -434,6 +508,42 @@ impl ResourceTemplate {
         self.data.push(0x23);
         self.data.extend_from_slice(&mask.to_le_bytes());
         self.data.push(0x01); // bit0=edge, bit3=exclusive, bit4=active-high
+        self
+    }
+
+    /// IRQ Descriptor (small type `0x23`, ACPI §6.4.2.1) carrying a *set* of
+    /// candidate IRQs and explicit mode/polarity/sharing flags. Used for a PCI
+    /// interrupt link device's `_PRS` (every IRQ the link may be routed to) and
+    /// `_CRS` (the single IRQ it currently drives). PCI interrupts are
+    /// level-triggered, active-low and shared.
+    pub fn irq_flags(
+        &mut self,
+        irqs: &[u8],
+        edge: bool,
+        active_low: bool,
+        shared: bool,
+    ) -> &mut Self {
+        let mut mask: u16 = 0;
+        for &irq in irqs {
+            if irq < 16 {
+                mask |= 1u16 << irq;
+            }
+        }
+        self.data.push(0x23);
+        self.data.extend_from_slice(&mask.to_le_bytes());
+        // Information byte: bit0 = mode (1=edge, 0=level), bit3 = sharing
+        // (1=shared), bit4 = polarity (1=active low).
+        let mut flags = 0u8;
+        if edge {
+            flags |= 1 << 0;
+        }
+        if shared {
+            flags |= 1 << 3;
+        }
+        if active_low {
+            flags |= 1 << 4;
+        }
+        self.data.push(flags);
         self
     }
 
@@ -732,6 +842,93 @@ mod tests {
         assert!(sub_end <= bytes.len());
         // Sub NumElements = 4.
         assert_eq!(bytes[sub_start + sub_field], 4);
+    }
+
+    #[test]
+    fn if_name_block_pkg_length_spans_predicate_and_body() {
+        // Method (_PRT) { If (PICF) { Return (Package(){...}) } Return (Package(){...}) }
+        let mut aml = AmlBuilder::new();
+        let m = aml.method_start(b"_PRT", 0, false);
+        let if_h = aml.if_name_start(b"PICF");
+        aml.return_routing_table(&[[0x0000_FFFF, 0, 0, 16]]);
+        aml.if_end(&if_h);
+        aml.return_routing_table(&[[0x0000_FFFF, 0, 0, 11]]);
+        aml.method_end(&m);
+        let bytes = aml.into_bytes();
+
+        // Method(_PRT, 0): METHOD_OP, PkgLength, name, flags.
+        assert_eq!(bytes[0], opcode::METHOD_OP);
+        let (mval, mfield) = decode_pkg_length(&bytes[1..]);
+        assert_eq!(mval, bytes.len() - 1, "method PkgLength self-consistent");
+        // After PkgLength field: name (4) + flags (1) = method body start.
+        let body = 1 + mfield + 4 + 1;
+        // The body opens with If (PICF): IF_OP, PkgLength, then "PICF".
+        assert_eq!(bytes[body], opcode::IF_OP);
+        let (ifval, iffield) = decode_pkg_length(&bytes[body + 1..]);
+        // Predicate immediately follows the If PkgLength field.
+        let pred = body + 1 + iffield;
+        assert_eq!(&bytes[pred..pred + 4], b"PICF", "If predicate is PICF");
+        // The If package spans the predicate + the inner Return; its end must land
+        // before the trailing (else-branch) Return that follows in the method body.
+        let if_end = body + 1 + ifval;
+        assert_eq!(
+            bytes[if_end],
+            opcode::RETURN_OP,
+            "fall-through Return follows If"
+        );
+        // The inner Return (APIC, GSI16) sits inside the If.
+        assert_eq!(bytes[pred + 4], opcode::RETURN_OP);
+        assert_eq!(bytes[pred + 5], opcode::PACKAGE_OP);
+    }
+
+    #[test]
+    fn return_routing_table_via_links_encodes_a_named_source() {
+        let mut aml = AmlBuilder::new();
+        // slot 0 INTA -> LNKA: { 0x0000FFFF, 0, LNKA, 0 }.
+        aml.return_routing_table_via_links(&[(0x0000_FFFF, 0, *b"LNKA")]);
+        let bytes = aml.into_bytes();
+        assert_eq!(bytes[0], opcode::RETURN_OP);
+        assert_eq!(bytes[1], opcode::PACKAGE_OP);
+        let (val, field) = decode_pkg_length(&bytes[2..]);
+        assert_eq!(val, bytes.len() - 2, "outer package self-consistent");
+        // NumElements 1, then a sub-package.
+        let num = 2 + field;
+        assert_eq!(bytes[num], 1);
+        assert_eq!(bytes[num + 1], opcode::PACKAGE_OP);
+        // The Source element is the bare NameSeg "LNKA" (not an integer 0), and the
+        // SourceIndex after it is ZERO.
+        let seg = bytes
+            .windows(5)
+            .find(|w| w[..4] == *b"LNKA")
+            .expect("link NameSeg present");
+        assert_eq!(seg[4], opcode::ZERO, "SourceIndex follows the link name");
+    }
+
+    #[test]
+    fn irq_flags_descriptor_encodes_mask_and_mode() {
+        // A PCI-link _PRS: level, active-low, shared over IRQs {10, 11}.
+        let mut rt = ResourceTemplate::new();
+        rt.irq_flags(&[10, 11], false, true, true);
+        let b = rt.as_bytes();
+        assert_eq!(b[0], 0x23);
+        let mask = u16::from_le_bytes([b[1], b[2]]);
+        assert_eq!(mask, (1 << 10) | (1 << 11));
+        // flags: level (bit0=0), shared (bit3=1), active-low (bit4=1) => 0x18.
+        assert_eq!(b[3], 0x18);
+    }
+
+    #[test]
+    fn return_routing_table_emits_return_then_package() {
+        let mut aml = AmlBuilder::new();
+        aml.return_routing_table(&[[0x0001_FFFF, 1, 0, 10]]);
+        let bytes = aml.into_bytes();
+        assert_eq!(bytes[0], opcode::RETURN_OP);
+        assert_eq!(bytes[1], opcode::PACKAGE_OP);
+        let (val, field) = decode_pkg_length(&bytes[2..]);
+        assert_eq!(val, bytes.len() - 2, "returned package is self-consistent");
+        // NumElements = 1, then a sub-package.
+        assert_eq!(bytes[2 + field], 1);
+        assert_eq!(bytes[2 + field + 1], opcode::PACKAGE_OP);
     }
 
     #[test]

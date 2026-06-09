@@ -130,8 +130,12 @@ impl DsdtBuilder {
         aml.name_string(b"_HID", "PNP0A08");
         // _CID: PCI compatible
         aml.name_string(b"_CID", "PNP0A03");
-        // _ADR: 0
-        aml.name_integer(b"_ADR", 0);
+        // No _ADR: the host bridge is enumerated through the ACPI namespace by its
+        // _HID, and its parent is \_SB (not an enumerable PCI bus), so an _ADR here
+        // is meaningless. ACPI §6.1 says a Device must carry either _HID or _ADR but
+        // not both; emitting _ADR=0 alongside _HID makes a real ACPI compiler warn
+        // (iasl 3073) and is a divergence from how firmware describes a PCI root.
+        // The _ADR on the ISA bridge below is correct — it *is* a PCI child function.
         // _UID: 0
         aml.name_integer(b"_UID", 0);
         // _BBN: bus base number 0
@@ -162,6 +166,11 @@ impl DsdtBuilder {
             );
         aml.name_resource_template(b"_CRS", &crs);
 
+        // PCI interrupt link devices (PNP0C0F) — LNKA..LNKD — that the PIC-mode
+        // _PRT routes through. Defined under PCI0 so the _PRT's bare NameSeg
+        // references resolve.
+        Self::build_pci_link_devices(aml);
+
         // _PRT — PCI interrupt routing for bus 0.
         Self::build_pci_routing_table(aml);
 
@@ -171,40 +180,123 @@ impl DsdtBuilder {
         aml.device_end(&pci0);
     }
 
+    /// The four PCI interrupt link-device names (`PIRQ[A-D]`), in line order.
+    const LINK_NAMES: [[u8; 4]; 4] = [*b"LNKA", *b"LNKB", *b"LNKC", *b"LNKD"];
+
+    /// Build the four PCI interrupt **link devices** (`PNP0C0F`), one per `PIRQ`
+    /// line, exactly as a real PIIX/ICH DSDT does. Each link carries:
+    /// - `_PRS`: the set of ISA IRQs the line *may* be routed to (level, active-low,
+    ///   shared — PCI interrupt electrical characteristics);
+    /// - `_CRS`: the single IRQ it currently drives — its firmware-default
+    ///   [`PIRQ_DEFAULT_IRQS`] entry, so it agrees with the PIC `_PRT` and the
+    ///   routing the firmware programs;
+    /// - `_STA`/`_DIS`/`_SRS`: present-and-enabled status, plus the disable/set
+    ///   methods the OS calls. Routing is fixed in this model, so `_SRS`/`_DIS` are
+    ///   accepted no-ops and `_CRS` stays authoritative.
+    ///
+    /// Their absence (a `_PRT` with only integer GSI/IRQ sources) is itself a
+    /// divergence from how every real PIIX/ICH platform describes PCI interrupts.
+    fn build_pci_link_devices(aml: &mut AmlBuilder) {
+        use crate::interrupt::PIRQ_DEFAULT_IRQS;
+        // The IRQs a PIRQ line may be routed to (PCI-routable ISA IRQs).
+        const ROUTABLE: &[u8] = &[3, 4, 5, 6, 7, 9, 10, 11, 12, 14, 15];
+
+        for (i, name) in Self::LINK_NAMES.iter().enumerate() {
+            let dev = aml.device_start(name);
+            aml.name_string(b"_HID", "PNP0C0F");
+            aml.name_integer(b"_UID", (i + 1) as u64);
+
+            // _PRS — possible IRQ settings (level, active-low, shared).
+            let mut prs = ResourceTemplate::new();
+            prs.irq_flags(ROUTABLE, false, true, true);
+            aml.name_resource_template(b"_PRS", &prs);
+
+            // _CRS — the IRQ currently driven (the firmware default for this line).
+            let mut crs = ResourceTemplate::new();
+            crs.irq_flags(&[PIRQ_DEFAULT_IRQS[i]], false, true, true);
+            aml.name_resource_template(b"_CRS", &crs);
+
+            // _STA — present, enabled (0x0B = bits 0,1,3).
+            let sta = aml.method_start(b"_STA", 0, false);
+            aml.return_integer(0x0B);
+            aml.method_end(&sta);
+
+            // _DIS / _SRS — accepted no-ops (routing is fixed).
+            let dis = aml.method_start(b"_DIS", 0, false);
+            aml.method_end(&dis);
+            let srs = aml.method_start(b"_SRS", 1, false);
+            aml.method_end(&srs);
+
+            aml.device_end(&dev);
+        }
+    }
+
     /// Build the PCI interrupt routing table (`_PRT`) for bus 0.
     ///
-    /// This is a static **APIC-mode** table: each `(slot, pin)` resolves through
-    /// the standard PCI swizzle to I/O APIC GSI 16-19, generated from
-    /// [`PirqRouter::device_gsi`] so the DSDT and the live `assert_pci_intx` path
-    /// agree on routing by construction. Each entry is
-    /// `{ (slot << 16) | 0xFFFF, pin, 0, GSI }` — `Source = 0` with `SourceIndex`
-    /// = the GSI, per ACPI §6.2.13.
+    /// Emitted as a **mode-selecting method**, matching real firmware:
     ///
-    /// Modern guests switch to APIC mode (`_PIC(1)`) and use this table; a
-    /// PIC-mode-only guest would need the programmable PIRQ routes exposed through
-    /// link devices and a `_PIC`-method-selected second table — a documented
-    /// follow-up (needs If/Else AML), tracked in `PROGRESS.md`.
+    /// ```asl
+    /// Method (_PRT, 0) {
+    ///     If (PICF) { Return (Package { ...APIC GSIs... }) }
+    ///     Return (Package { ...PIC ISA IRQs... })
+    /// }
+    /// ```
+    ///
+    /// `PICF` is the interrupt-model flag the OS sets via `_PIC` (0 = 8259 PIC,
+    /// 1 = I/O APIC). Until the OS calls `_PIC(1)` the flag is 0 and the method
+    /// returns the **PIC-mode** table; after switching to APIC mode it returns the
+    /// **APIC-mode** table. A static APIC-only `_PRT` (the previous shape) left a
+    /// PIC-mode guest — or the window before `_PIC(1)` — with no usable routing,
+    /// itself a divergence from how a real PIIX/ICH DSDT is written.
+    ///
+    /// - APIC: each `(slot, pin)` swizzles to I/O APIC GSI 16-19 via
+    ///   [`PirqRouter::device_gsi`]; `Source = 0`, `SourceIndex` = the GSI.
+    /// - PIC: each `(slot, pin)` swizzles onto `PIRQ[A-D]` and routes through the
+    ///   matching **link device** `LNK[A-D]` (`Source` = the link, `SourceIndex` =
+    ///   0). The OS reads the link's `_CRS` for the actual IRQ — the firmware
+    ///   default for that line — so the table, the links, and the routing the
+    ///   firmware programs all agree, per ACPI §6.2.13.
     fn build_pci_routing_table(aml: &mut AmlBuilder) {
         use crate::interrupt::PirqRouter;
-        let mut entries: Vec<[u64; 4]> = Vec::with_capacity(32 * 4);
+
+        let mut apic: Vec<[u64; 4]> = Vec::with_capacity(32 * 4);
+        let mut pic: Vec<(u64, u64, [u8; 4])> = Vec::with_capacity(32 * 4);
         for slot in 0u8..32 {
             for prt_pin in 0u8..4 {
                 // _PRT pin 0=INTA..3=INTD; the router uses 1=INTA..4=INTD.
+                let address = (u64::from(slot) << 16) | 0xFFFF;
                 if let Some(gsi) = PirqRouter::device_gsi(slot, prt_pin + 1) {
-                    let address = (u64::from(slot) << 16) | 0xFFFF;
-                    entries.push([address, u64::from(prt_pin), 0, u64::from(gsi)]);
+                    apic.push([address, u64::from(prt_pin), 0, u64::from(gsi)]);
+                }
+                // PIC mode routes through the link device for this PIRQ line.
+                if let Some(line) = PirqRouter::pirq_line(slot, prt_pin + 1) {
+                    pic.push((address, u64::from(prt_pin), Self::LINK_NAMES[line]));
                 }
             }
         }
-        aml.name_routing_table(b"_PRT", &entries);
+
+        let method = aml.method_start(b"_PRT", 0, false);
+        let if_apic = aml.if_name_start(b"PICF");
+        aml.return_routing_table(&apic);
+        aml.if_end(&if_apic);
+        // Fall-through (PICF == 0): PIC mode, routed through the LNK[A-D] devices.
+        aml.return_routing_table_via_links(&pic);
+        aml.method_end(&method);
     }
 
     /// Build ISA/LPC bridge under PCI0
     fn build_isa_bridge(&self, aml: &mut AmlBuilder) {
         let isa = aml.device_start(b"ISA_");
 
-        // ISA bridge at PCI 00:1F.0 (standard Intel ICH location)
-        aml.name_integer(b"_ADR", 0x001F_0000);
+        // The ISA/LPC bridge's _ADR must point at the PIIX3 bridge the device bus
+        // actually mounts — function 0 of device 1 (00:01.0) on the 440FX/PIIX3
+        // chipset — not the ICH-era 1F.0 location. Deriving it from the shared
+        // PIIX3_ISA_BRIDGE_BDF keeps the ACPI object and the live bridge from
+        // drifting, so the guest's ISA device binds to the real PIRQ-router bridge.
+        aml.name_integer(
+            b"_ADR",
+            u64::from(crate::pcie::PIIX3_ISA_BRIDGE_BDF.acpi_adr()),
+        );
 
         // RTC
         if self.config.has_rtc {
@@ -465,26 +557,118 @@ mod tests {
 
     #[test]
     fn dsdt_pci_root_has_prt_matching_the_router() {
+        use super::super::aml::opcode;
         use crate::interrupt::PirqRouter;
         let dsdt = DsdtBuilder::new(DsdtConfig::default()).build();
+        // _PRT is now a mode-selecting Method: METHOD_OP ... "_PRT" ... and the
+        // method body opens with If (PICF).
+        let pos = dsdt
+            .windows(4)
+            .position(|w| w == b"_PRT")
+            .expect("PCI0 must carry a _PRT");
+        // The method's arg-count flags byte (argc 0) follows the name; the body
+        // then opens with IF_OP + PkgLength + the "PICF" predicate.
+        let flags = dsdt[pos + 4];
+        assert_eq!(flags & 0x07, 0, "_PRT takes no arguments");
+        let after = &dsdt[pos + 5..];
+        assert_eq!(after[0], opcode::IF_OP, "_PRT body opens with If");
+        // After IF_OP comes the PkgLength field (1-3 bytes), then the "PICF"
+        // predicate NameString — it appears within the first few bytes of the body.
         assert!(
-            dsdt.windows(4).any(|w| w == b"_PRT"),
-            "PCI0 must carry a _PRT"
+            after[1..8].windows(4).any(|w| w == b"PICF"),
+            "the If predicate is PICF"
         );
-        // Slot 1 INTA (_PRT pin 0) must route to the GSI the router resolves (17).
+
+        // APIC-mode table (inside the If). Slot 1 INTA -> GSI 17.
         assert_eq!(PirqRouter::device_gsi(1, 1), Some(17));
-        // Its sub-package content: NumElements 4, DWord addr 0x0001FFFF, pin ZERO,
-        // source ZERO, GSI byte-const 17.
         let entry = [0x04u8, 0x0C, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x0A, 0x11];
         assert!(
             dsdt.windows(entry.len()).any(|w| w == entry),
-            "_PRT must contain the slot-1 INTA -> GSI17 entry"
+            "_PRT must contain the APIC slot-1 INTA -> GSI17 entry"
         );
         // Slot 0 INTA -> GSI16, Word addr 0x0000FFFF.
         let entry0 = [0x04u8, 0x0B, 0xFF, 0xFF, 0x00, 0x00, 0x0A, 0x10];
         assert!(
             dsdt.windows(entry0.len()).any(|w| w == entry0),
-            "_PRT must contain the slot-0 INTA -> GSI16 entry"
+            "_PRT must contain the APIC slot-0 INTA -> GSI16 entry"
+        );
+
+        // PIC-mode fall-through table routes through the link devices: slot 0 INTA
+        // -> PIRQA -> LNKA, encoded { Word 0x0000FFFF, pin ZERO, NameSeg LNKA,
+        // SourceIndex ZERO }.
+        let pic0 = [0x04u8, 0x0B, 0xFF, 0xFF, 0x00, b'L', b'N', b'K', b'A', 0x00];
+        assert!(
+            dsdt.windows(pic0.len()).any(|w| w == pic0),
+            "_PRT PIC entry must route slot-0 INTA through link LNKA"
+        );
+        // Slot 1 INTA -> PIRQB -> LNKB, DWord addr 0x0001FFFF.
+        let pic1 = [
+            0x04u8, 0x0C, 0xFF, 0xFF, 0x01, 0x00, 0x00, b'L', b'N', b'K', b'B', 0x00,
+        ];
+        assert!(
+            dsdt.windows(pic1.len()).any(|w| w == pic1),
+            "_PRT PIC entry must route slot-1 INTA through link LNKB"
+        );
+        let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        assert_eq!(sum, 0);
+    }
+
+    #[test]
+    fn dsdt_defines_pci_interrupt_link_devices() {
+        use crate::interrupt::PIRQ_DEFAULT_IRQS;
+        let dsdt = DsdtBuilder::new(DsdtConfig::default()).build();
+        // All four PNP0C0F link devices are present.
+        assert!(
+            dsdt.windows(7).any(|w| w == b"PNP0C0F"),
+            "DSDT must define PCI interrupt link devices"
+        );
+        for name in [b"LNKA", b"LNKB", b"LNKC", b"LNKD"] {
+            assert!(
+                dsdt.windows(4).any(|w| w == name),
+                "link device {name:?} must be defined"
+            );
+        }
+        // LNKA's _CRS reports its firmware-default IRQ (PIRQ_DEFAULT_IRQS[0]=11) as a
+        // single-IRQ level/active-low/shared descriptor: 0x23, mask=1<<11, flags 0x18.
+        let mask = 1u16 << PIRQ_DEFAULT_IRQS[0];
+        let crs = [0x23u8, (mask & 0xFF) as u8, (mask >> 8) as u8, 0x18];
+        assert!(
+            dsdt.windows(crs.len()).any(|w| w == crs),
+            "a link _CRS must report its default IRQ as a level/active-low/shared descriptor"
+        );
+        let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        assert_eq!(sum, 0);
+    }
+
+    #[test]
+    fn dsdt_pci_root_uses_hid_not_adr() {
+        // ACPI §6.1: a Device carries either _HID or _ADR, not both. The PCI host
+        // bridge is ACPI-enumerated via _HID, so it must NOT also carry _ADR (a real
+        // ACPI compiler warns — iasl 3073 — and it is a firmware-description tell).
+        // The only _ADR in the DSDT is the ISA bridge (a genuine PCI child function),
+        // so exactly one _ADR name may appear in the whole table.
+        let dsdt = DsdtBuilder::new(DsdtConfig::default()).build();
+        let adr_count = dsdt.windows(4).filter(|w| *w == b"_ADR").count();
+        assert_eq!(
+            adr_count, 1,
+            "only the ISA bridge may carry _ADR; the PCI root must use _HID alone"
+        );
+        // The ISA bridge's _ADR (00:01.0 -> 0x00010000) is the one that remains.
+        assert_eq!(crate::pcie::PIIX3_ISA_BRIDGE_BDF.acpi_adr(), 0x0001_0000);
+        let isa_adr = [
+            b'_',
+            b'A',
+            b'D',
+            b'R',
+            opcode::DWORD_PREFIX,
+            0x00,
+            0x00,
+            0x01,
+            0x00,
+        ];
+        assert!(
+            dsdt.windows(isa_adr.len()).any(|w| w == isa_adr),
+            "the surviving _ADR must be the ISA bridge at 00:01.0"
         );
         let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         assert_eq!(sum, 0);

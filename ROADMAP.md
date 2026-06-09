@@ -1490,6 +1490,27 @@ Physical USB Devices
   (`PNP0C0F` + `_PRS`/`_SRS` over the PIRQRC registers) selected by a method-based
   `_PRT` keyed on `PICF` — needs If/Else/Store AML helpers, and ideally an `iasl`
   check on the runner to validate control-flow AML.
+- **Reference-compiler validation (2026-06-09):** `acpica-tools`/`iasl` installs from
+  the distro repo on the runner, so the synthesized tables are now round-tripped
+  through the Intel ACPI compiler (`iasl -d` then recompile) by a self-skipping
+  integration test that asserts 0 errors / 0 warnings on **every** table. This first
+  full validation found and fixed two latent bugs the byte-decode tests missed: the
+  PCI root carried both `_HID` and `_ADR` (§6.1 violation, iasl 3073), and the TPM2
+  table declared revision 4 but emitted the 52-byte rev-3 body (truncated
+  mid-structure — must be the full 76-byte layout with Start Method params + log
+  fields). The full ACPI surface now compiles clean. Install `acpica-tools` in CI to
+  make this a hard gate.
+- **PIC-mode `_PRT` via link devices — DONE (2026-06-09):** the static APIC-only `_PRT`
+  is now a **mode-selecting method** (`If (PICF) Return APIC-table; Return PIC-table`).
+  The PIC branch routes through four `PNP0C0F` **link devices** (`LNKA-D`, with
+  `_PRS`/`_CRS`/`_STA`/`_DIS`/`_SRS`), and `standard_pc_complete` programs the live
+  `PIRQRC[A-D]` registers to the same `PIRQ_DEFAULT_IRQS` the links' `_CRS` advertises —
+  so the `_PRT`, the link devices, the `PirqRouter`, and the config-space bytes a guest
+  reads all agree. A **FACS** is now emitted and pointed to by the FADT (was a zero
+  `FIRMWARE_CTRL`). The SSDT now defines per-vCPU power objects (was CPU0-only).
+  **Remaining (future):** make `_SRS`/`_DIS` actually reprogram `PIRQRC` via an
+  `OperationRegion`/`Field` over the bridge config space (needs those AML primitives) so a
+  PIC-mode guest can *re*-route; add `_PSD`/`_CSD` SSDT domain coordination.
 
 ### 5.2 SMBIOS Synthesis
 - Generate SMBIOS/DMI tables that report:
@@ -1498,6 +1519,14 @@ Physical USB Devices
   - Correct memory configuration matching allocated RAM
   - BIOS vendor string (match a common vendor like AMI or Phoenix)
 - Windows reads these extensively during setup and activation
+- **`dmidecode` validation (2026-06-09):** `dmidecode --from-dump` round-trips the table
+  in a self-skipping integration test. The first pass fixed three latent bugs: the BIOS
+  advertised the **"virtual machine" characteristic** (a VM tell — cleared), and Type 3 /
+  Type 4 declared a `Length` longer than the formatted area they wrote (missing SKU byte /
+  missing the SMBIOS-3.0 16-bit core counts), which shifted their string tables
+  (`<BAD INDEX>`). All fixed; install `dmidecode` in CI to gate it. **Note:** two SMBIOS
+  builders exist (`enlil-devices::smbios` — canonical — and `enlil-core::smbios`); neither
+  is wired into a delivery path yet, and they should be consolidated.
 
 ### 5.3 CPUID Stealth
 - Intercept all CPUID exits and craft responses:
