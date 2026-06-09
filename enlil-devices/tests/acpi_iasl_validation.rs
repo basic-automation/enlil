@@ -123,3 +123,25 @@ fn ssdt_round_trips_through_iasl_clean() {
     assert_clean("SSDT", &report);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Round-trip *every* generated table (not just the AML ones) through iasl. The
+/// fixed-format data tables (FADT, MADT, MCFG, HPET, SRAT, SLIT, WAET, BGRT,
+/// TPM2, XSDT) have their own structural rules — e.g. a revision-4 TPM2 must
+/// carry its Start Method parameters and log-area fields, or a real parser sees
+/// the table terminate mid-structure. Disassembling and recompiling each one
+/// asserts the whole set is well-formed by a reference implementation.
+#[test]
+fn all_tables_round_trip_through_iasl_clean() {
+    if !iasl_available() {
+        eprintln!("skipping: iasl (acpica-tools) not installed on this runner");
+        return;
+    }
+    let set = build_acpi_tables(&AcpiTableSetConfig::default());
+    let dir = scratch_dir("all");
+    for (name, _) in &set.table_offsets {
+        std::fs::write(dir.join(format!("{name}.aml")), table_bytes(&set, name)).unwrap();
+        let report = iasl_round_trip(&dir, name);
+        assert_clean(name, &report);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
