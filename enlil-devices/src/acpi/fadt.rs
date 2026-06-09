@@ -138,9 +138,13 @@ impl FadtBuilder {
             oem: OemInfo::default(),
             dsdt_address,
             sci_interrupt: 9,
-            smi_command: 0xB2,
-            acpi_enable: 0xA0,
-            acpi_disable: 0xA1,
+            // SMI command port + enable/disable values are owned by the
+            // SMI-command device model, so the table and the port that actually
+            // toggles SCI_EN can't drift (the OS's ACPI-enable handshake targets
+            // exactly the port/value pair advertised here).
+            smi_command: u32::from(crate::chipset::SMI_CMD_PORT),
+            acpi_enable: crate::chipset::ACPI_ENABLE_VALUE,
+            acpi_disable: crate::chipset::ACPI_DISABLE_VALUE,
             // The PM register-block ports are owned by the device models that
             // implement them, so the table we hand the guest and the hardware the
             // bus decodes can never drift apart (cross-checked by a test).
@@ -164,8 +168,11 @@ impl FadtBuilder {
                 | fadt_flags::TMR_VAL_EXT
                 | fadt_flags::RESET_REG_SUP,
             boot_arch_flags: boot_flags::LEGACY_DEVICES | boot_flags::PS2_8042,
-            reset_register: GenericAddress::io(0x0CF9, 8),
-            reset_value: 0x06,
+            // The reset register is owned by the `0xCF9` RST_CNT model
+            // (`pcie::PciConfigIo`), so the FADT's advertised reset port + value
+            // and the hardware that acts on the write can't drift.
+            reset_register: GenericAddress::io(u64::from(crate::pcie::RESET_CONTROL_PORT), 8),
+            reset_value: crate::pcie::RST_CNT_REBOOT_VALUE,
             hypervisor_vendor_id: 0,
         }
     }
@@ -365,6 +372,35 @@ mod tests {
         let fadt = FadtBuilder::new(0xDEAD_0000).build();
         let sum: u8 = fadt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         assert_eq!(sum, 0, "FADT checksum must sum to 0");
+    }
+
+    #[test]
+    fn fadt_reset_register_matches_the_modeled_cf9_hardware() {
+        let fadt = FadtBuilder::new(0).build();
+        // RESET_REG is a 12-byte GAS at offset 116: space id, then the 8-byte
+        // address at offset 120; RESET_VALUE is the byte at offset 128.
+        assert_eq!(fadt[116], 1, "RESET_REG must be System I/O");
+        let reset_addr = u64::from_le_bytes(fadt[120..128].try_into().unwrap());
+        assert_eq!(
+            reset_addr,
+            u64::from(crate::pcie::RESET_CONTROL_PORT),
+            "FADT reset port must equal the 0xCF9 RST_CNT the bus decodes"
+        );
+        assert_eq!(
+            fadt[128],
+            crate::pcie::RST_CNT_REBOOT_VALUE,
+            "FADT reset value must equal the RST_CNT reboot byte"
+        );
+    }
+
+    #[test]
+    fn fadt_smi_command_matches_the_modeled_b2_port() {
+        let fadt = FadtBuilder::new(0).build();
+        // SMI_CMD at offset 48, ACPI_ENABLE at 52, ACPI_DISABLE at 53.
+        let smi = u32::from_le_bytes(fadt[48..52].try_into().unwrap());
+        assert_eq!(smi, u32::from(crate::chipset::SMI_CMD_PORT));
+        assert_eq!(fadt[52], crate::chipset::ACPI_ENABLE_VALUE);
+        assert_eq!(fadt[53], crate::chipset::ACPI_DISABLE_VALUE);
     }
 
     #[test]

@@ -41,6 +41,7 @@ pub mod bridge;
 pub mod bus;
 pub mod chipset;
 pub mod display;
+pub mod dma;
 pub mod fw_cfg;
 pub mod hda;
 pub mod interrupt;

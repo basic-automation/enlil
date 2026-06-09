@@ -6,6 +6,115 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-08 (b) — Session: finish the legacy-PC transparency surface — 8237 DMA, `0xCF9` reboot, the `0xB2` ACPI-enable handshake (Phase 0.2)
+
+A 7-increment session, each a full orient→build→verify trip and an independently-green commit,
+forming **three coherent arcs** that close the remaining *unblocked* open-bus / boot-correctness
+gaps a guest hits before it ever reaches userspace. `/dev/kvm` is **still absent** (verified: no
+`/dev/kvm`); `iasl`/`acpidump` are **not installed**. Workspace tests **814 → 839** (`cargo test
+--workspace`: 839 passed, 0 failed, 1 ignored — the one ignored is the `/dev/kvm` self-skip).
+Picked up from the prior hand-off's option list: #1 (PIC-mode `_PRT`) stays deferred (needs
+`iasl`), #4 (KVM run loop) stays blocked (no `/dev/kvm`), so I built #2 (8237 DMA) and then the
+next viable unblocked items.
+
+### Arc 1 — 8237A DMA subsystem (increments 1-3, the prior hand-off's #2)
+1. **`536da02`** `enlil-devices::dma` — the two cascaded **8237A DMA controllers** (DMA-1 8-bit at
+   `0x00-0x0F`; DMA-2 16-bit at `0xC0-0xDF`, registers on 2-byte spacing) + the **DMA page
+   registers** (`0x80-0x8F`, with the PC/AT non-linear channel→port map). A faithful **passive**
+   register model: base/current address+count per channel behind the shared byte-pointer
+   flip-flop, command/status/request/single+all-mask/mode registers, master clear. *No transfer
+   engine* — nothing in-tree owns a channel yet. 18 unit tests (decode-the-bytes).
+2. **`4b1b22c`** wired into `DeviceBus::standard_pc_complete` (`add_dma_controllers`) and the
+   three windows claimed in the DSDT's `SYSR` `_CRS` (`PNP0C02`), so an ISA-DMA probe (Linux
+   always does at boot) reads coherent state, not open-bus `0xFF`.
+3. **`8135a29`** `dma::transfer_address`/`transfer_byte_count` — the page-latch + channel-address
+   → 24-bit physical-address composition, including DMA-2's word-addressing (`addr << 1`, A0=0)
+   and ignored page bit 0. Completes the address model; the *data-movement* engine still waits on
+   a consumer (floppy/SB16).
+
+### Arc 2 — chipset Reset Control Register `0xCF9` (increments 4-5)
+4. **`606cc6f`** `pcie::PciConfigIo` now decodes **`RST_CNT` at `0xCF9`** (`reboot=pci`, the path
+   every modern OS uses). `0xCF9` physically sits inside the `CONFIG_ADDRESS` dword window, but a
+   *byte* access hits `RST_CNT`, not config-address byte 1 — so a guest reading `0xCF9` gets the
+   reset register (not a leaked config byte), and a `RST_CPU` (bit 2) write latches a reboot
+   (`SYS_RST`/`FULL_RST` read back). Dword `CONFIG_ADDRESS` writes (`0xCF8`) and `0xCFA`/`0xCFB`
+   are untouched. (Updated the one existing test that byte-read `0xCF9` — real HW never exposed
+   config byte 1 there.)
+5. **`86a79f3`** surfaced the latch (`PciResetControl`, a shared `Rc<RefCell>`) out of `add_pcie`
+   via `DeviceBus::pci_reset_handle` (no signature change → no caller breakage), so
+   `StandardPc::poll_platform_events` now returns `PlatformEvent::Reset` for the `0xCF9` path too
+   (alongside `0x92`); **both reset latches are drained each poll** (`|`, not `||`) so neither is
+   stranded.
+
+### Arc 3 — SMI command port / ACPI-enable handshake (increment 6)
+6. **`6b4640b`** `chipset::SmiCommandPort` (`0xB2`, the FADT's `SMI_CMD`), wired into
+   `standard_pc_complete` (`add_smi_command`). **This was a real boot blocker:** the FADT
+   advertises a non-zero `SMI_CMD` with `ACPI_ENABLE=0xA0`, so ACPICA enters ACPI mode by writing
+   `0xA0` to `0xB2` and **polling `SCI_EN`** in `PM1a_CNT`. Port `0xB2` was unmodelled → the write
+   hit open bus, `SCI_EN` never set, and the OS would abort with "Could not enable ACPI mode."
+   There's no SMM, so the port now sets `SCI_EN` directly in the shared `PM1a` block
+   (`AcpiPm1Block::set_acpi_mode`); `ACPI_DISABLE=0xA1` clears it. The FADT now sources
+   `SMI_CMD`/`ACPI_ENABLE`/`ACPI_DISABLE` from the `chipset::{SMI_CMD_PORT,ACPI_ENABLE_VALUE,
+   ACPI_DISABLE_VALUE}` constants the port uses, so the advertised handshake and the decoding
+   hardware can't drift. Verified end-to-end through the bus (write `0xB2`, read `SCI_EN` set).
+
+### Arc 2 (closeout) — drift-proof the FADT reset register (increment 7)
+7. **`<this commit>`** The FADT already advertised `RESET_REG = io(0xCF9, 8)` / `RESET_VALUE =
+   0x06` — increments 4-5 just made that advertisement *functional*. Sourced those FADT literals
+   from the new `pcie::{RESET_CONTROL_PORT, RST_CNT_REBOOT_VALUE}` constants (mirroring how the PM
+   ports + `SMI_CMD` already derive from device constants), so the ACPI-advertised reset register
+   and the `0xCF9` hardware behind it provably can't drift. +2 cross-check tests (FADT reset reg
+   ↔ pcie constant; FADT `SMI_CMD`/enable/disable ↔ chipset constants).
+
+### Research (informed the build)
+Logged under `RESEARCH.md` → "2026-06-08 (b)": Intel **8237A** datasheet + IBM PC/AT DMA wiring
+(cascaded controllers, 2-byte DMA-2 stride, non-linear page-register map, word-addressing). The
+`0xCF9` `RST_CNT` and `0xB2` `SMI_CMD` behaviours are from the PIIX/ICH datasheets + the ACPI
+spec's mode-switch handshake (ACPICA `AcpiHwSetMode` writes `ACPI_ENABLE` to `SMI_CMD` and polls
+`SCI_EN`) + QEMU's no-SMM `cf9`/`rcr` and SMI conventions — all stable, primary-source firmware
+behaviour, not recent papers. Roadmap updated surgically at §0.2 (three dated status notes).
+
+### Test results (exact)
+- `cargo build --workspace` → **OK**.
+- `cargo fmt --all -- --check` → **OK**.
+- `cargo clippy --all-targets --workspace -- -D warnings` → **OK** (new code clean under
+  `enlil-devices`'s strict `deny(all, pedantic, nursery)`).
+- `cargo test --workspace` → **839 passed, 0 failed, 1 ignored** (was 814). +25 tests
+  (15 dma controllers/pages, 3 dma address-composition, 2 `0xCF9`, 2 SMI port, 1 core SMI bus
+  integration, 2 FADT drift cross-checks; the `0xCF9` poll/handshake reused/extended existing
+  tests).
+- `/dev/kvm` paths: **not run — no `/dev/kvm` (no nested virt)**; verified absent.
+- no_std custom-target build: **N/A** — no crate is `#![no_std]` yet.
+- `iasl`/AML disassembler: **not installed** on the runner (no new raw-AML emission this session,
+  so nothing newly needs it).
+
+### Recommended next step (tomorrow)
+> The legacy-PC / ACPI-init *open-bus* surface is now thoroughly covered (DMA, `0xCF9`, `0xB2`,
+> PM1/PM_TMR/GPE0, PIC/PIT/RTC/PS2/HPET, PCI CAM+ECAM). What's left is either **blocked** (needs
+> `/dev/kvm` or `iasl`) or **large/cross-cutting** (needs a PCI INTx source). There's no longer a
+> small fully-unblocked legacy-register increment lying around — the next real progress wants one
+> of: a KVM-capable runner, `acpica-tools`, or starting a virtio PCI device.
+1. **8237 transfer engine + a consumer.** Deferred by design until a DMA *consumer* exists. If you
+   add a **floppy controller (8272A, `0x3F0-0x3F7`, DMA ch 2)** or SB16, drive a real channel
+   (decrement current addr/count via `transfer_address`/`transfer_byte_count`, raise TC, handle
+   autoinit) at that point. Floppy is the classic unblocked legacy device still missing, though
+   modern guests rarely need it (absence is also valid — no `PNP0700` is declared).
+2. **PIC-mode `_PRT` via PCI Link Devices (still wants `iasl`).** Unchanged from prior hand-off:
+   needs `If`/`Else`/`Store` control-flow AML helpers; **strongly want `acpica-tools` installed**
+   first to validate (the PkgLength bug class is exactly what a disassembler catches). Defer if
+   `iasl` still absent.
+3. **Live PIRQ INTx source.** `assert_pci_intx` + the `_PRT` exist but nothing asserts INTx yet.
+   When a PCI device model (virtio-blk/net) lands on the bus, route its INTx pin through
+   `assert_pci_intx`. This is the prerequisite that unblocks the roadmap's named "live PIRQ path".
+4. **KVM run loop (blocked on `/dev/kvm`).** Unchanged: when a nested-virt runner exists, have
+   `KvmBackend` build its bus via `standard_pc_complete`, drive `advance_clocks`/`tick_rtc` from a
+   timer thread, act on `poll_platform_events` (now incl. `0xCF9` reset + ACPI-enabled `SCI_EN`),
+   and deliver interrupts through `KVM_IRQ_LINE`. **Consider asking for a KVM-enabled runner +
+   `acpica-tools`** — those two unblock the largest remaining chunks (1-3 above are what's left
+   without them, and none is a small fully-unblocked register increment).
+
+---
+
 ## 2026-06-08 — Session: make the synthesized DSDT actually correct — AML PkgLength, `_CRS`, `_PRT`/`_PIC`, `_S5` (Phase 0.2 / 5.1)
 
 An 11-increment session, each a full orient→build→verify trip and an independently-green commit,

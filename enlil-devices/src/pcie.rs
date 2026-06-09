@@ -401,6 +401,76 @@ pub const CONFIG_DATA_PORT: u16 = 0xCFC;
 /// Bit 31 of `CONFIG_ADDRESS` enables a configuration cycle.
 const CONFIG_ENABLE: u32 = 0x8000_0000;
 
+/// The chipset **Reset Control Register** (`RST_CNT`) port.
+///
+/// A single byte the PIIX/ICH south-bridge decodes at `0xCF9` — physically inside
+/// the `CONFIG_ADDRESS` dword window, but a *byte* access to `0xCF9` hits this
+/// register, not config address byte 1. Writing it is the standard way modern
+/// firmware and OSes reboot (Linux `BOOT_CF9`/`reboot=pci`).
+pub const RESET_CONTROL_PORT: u16 = 0xCF9;
+/// `RST_CNT` bit 1 (`SYS_RST`): selects a hard (1) vs soft (0) reset.
+const RST_CNT_SYS_RST: u8 = 1 << 1;
+/// `RST_CNT` bit 2 (`RST_CPU`): a 0→1 write triggers the reset.
+const RST_CNT_RST_CPU: u8 = 1 << 2;
+/// `RST_CNT` bit 3 (`FULL_RST`): with `SYS_RST`, requests a full power-cycle.
+const RST_CNT_FULL_RST: u8 = 1 << 3;
+/// The `RST_CNT` bits that latch and read back (`RST_CPU` is write-only / self-
+/// clearing, so it is not stored).
+const RST_CNT_STORED: u8 = RST_CNT_SYS_RST | RST_CNT_FULL_RST;
+/// The `RST_CNT` value that triggers a (hard) reboot: `SYS_RST | RST_CPU`.
+///
+/// This is what the FADT's `RESET_VALUE` advertises for the `0xCF9` reset
+/// register, so an OS resetting through the ACPI-advertised register hits the same
+/// byte this model acts on.
+pub const RST_CNT_REBOOT_VALUE: u8 = RST_CNT_SYS_RST | RST_CNT_RST_CPU;
+
+/// The mutable state behind a [`PciResetControl`]: the read-back `RST_CNT` value
+/// and the one-shot reboot latch.
+#[derive(Default)]
+struct ResetState {
+    /// Stored `SYS_RST`/`FULL_RST` bits (what a guest reads back from `0xCF9`).
+    rcr: u8,
+    /// Set on a `RST_CPU` write; consumed by [`PciResetControl::take_reset`].
+    reset_requested: bool,
+}
+
+/// A shareable handle to a [`PciConfigIo`]'s `0xCF9` Reset Control Register.
+///
+/// The register lives inside the boxed `PciConfigIo` on the bus, so the run loop
+/// can't reach it directly; this clone of the same latch lets the platform layer
+/// poll the reboot request (`take_reset`) — mirroring
+/// [`SharedSystemControlPortA`](crate::chipset::SharedSystemControlPortA) for the
+/// `0x92` fast-reset path.
+#[derive(Clone, Default)]
+pub struct PciResetControl(Rc<RefCell<ResetState>>);
+
+impl PciResetControl {
+    /// Apply a guest write to `RST_CNT`: a `RST_CPU` (bit 2) write latches a
+    /// reboot request; the `SYS_RST`/`FULL_RST` bits are stored for read-back.
+    fn write(&self, val: u8) {
+        let mut state = self.0.borrow_mut();
+        if val & RST_CNT_RST_CPU != 0 {
+            state.reset_requested = true;
+        }
+        state.rcr = val & RST_CNT_STORED;
+    }
+
+    /// The current `RST_CNT` read-back value.
+    #[must_use]
+    pub fn value(&self) -> u8 {
+        self.0.borrow().rcr
+    }
+
+    /// Consume the one-shot reboot latch: `true` exactly once per `RST_CPU` write.
+    #[must_use]
+    pub fn take_reset(&self) -> bool {
+        let mut state = self.0.borrow_mut();
+        let requested = state.reset_requested;
+        state.reset_requested = false;
+        requested
+    }
+}
+
 /// Legacy PCI **Configuration Mechanism #1** front-end (the `0xCF8`/`0xCFC` port
 /// pair) over a [`PcieRootComplex`].
 ///
@@ -431,6 +501,9 @@ pub struct PciConfigIo {
     root: SharedRootComplex,
     /// The latched `CONFIG_ADDRESS` value (port `0xCF8`).
     config_address: u32,
+    /// The chipset Reset Control Register (`0xCF9`), shared so the run loop can
+    /// poll the reboot latch from outside the boxed device. See [`PciResetControl`].
+    reset: PciResetControl,
 }
 
 /// Low-`size`-byte mask (1/2/4 bytes → `0xFF`/`0xFFFF`/`0xFFFF_FFFF`).
@@ -455,11 +528,19 @@ impl PciConfigIo {
     /// Wrap an already-shared root complex behind the legacy ports, so an
     /// [`EcamSpace`] mounted over the same handle sees the same device set.
     #[must_use]
-    pub const fn with_shared(root: SharedRootComplex) -> Self {
+    pub fn with_shared(root: SharedRootComplex) -> Self {
         Self {
             root,
             config_address: 0,
+            reset: PciResetControl::default(),
         }
+    }
+
+    /// A clone of the shared `0xCF9` Reset Control latch, so the platform layer
+    /// can poll the guest's reboot request after the device is boxed onto the bus.
+    #[must_use]
+    pub fn reset_handle(&self) -> PciResetControl {
+        self.reset.clone()
     }
 
     /// A clone of the shared root-complex handle (e.g. to add devices or to
@@ -501,11 +582,35 @@ impl PciConfigIo {
         let value = (data & size_mask(size)) << shift;
         self.config_address = (self.config_address & !mask) | value;
     }
+
+    /// Whether a *byte* access to `port` targets the Reset Control Register
+    /// (`0xCF9`) rather than a byte of `CONFIG_ADDRESS`. The chipset decodes the
+    /// `0xCF9` byte specially; dword `CONFIG_ADDRESS` writes (port `0xCF8`) and
+    /// accesses to `0xCFA`/`0xCFB` are untouched.
+    const fn is_reset_control(port: u16, size: u8) -> bool {
+        port == RESET_CONTROL_PORT && size == 1
+    }
+
+    /// Consume the one-shot `0xCF9` reboot latch: returns `true` exactly once per
+    /// `RST_CPU` write, so the run loop re-inits the vCPU to its reset vector.
+    #[must_use]
+    pub fn take_reset(&self) -> bool {
+        self.reset.take_reset()
+    }
+
+    /// The current Reset Control Register read-back value (`0xCF9`).
+    #[must_use]
+    pub fn reset_control(&self) -> u8 {
+        self.reset.value()
+    }
 }
 
 impl PioDevice for PciConfigIo {
     fn pio_read(&mut self, port: u16, size: u8) -> u32 {
-        if port < CONFIG_DATA_PORT {
+        if Self::is_reset_control(port, size) {
+            // 0xCF9 byte: the Reset Control Register, not CONFIG_ADDRESS byte 1.
+            u32::from(self.reset_control())
+        } else if port < CONFIG_DATA_PORT {
             // CONFIG_ADDRESS window (0xCF8-0xCFB): return the latched value with
             // the addressed byte shifted down into the low bits.
             let shift = u32::from(port - CONFIG_ADDRESS_PORT) * 8;
@@ -522,7 +627,11 @@ impl PioDevice for PciConfigIo {
     }
 
     fn pio_write(&mut self, port: u16, size: u8, data: u32) {
-        if port < CONFIG_DATA_PORT {
+        if Self::is_reset_control(port, size) {
+            // 0xCF9 byte: the Reset Control Register (reboot path), not a byte of
+            // CONFIG_ADDRESS.
+            self.reset.write(u8_of(data));
+        } else if port < CONFIG_DATA_PORT {
             self.write_address(port - CONFIG_ADDRESS_PORT, size, data);
         } else if self.enabled() {
             let offset = self.target_offset(port - CONFIG_DATA_PORT);
@@ -707,8 +816,40 @@ mod tests {
         let mut io = PciConfigIo::new(PcieRootComplex::new(0));
         io.pio_write(CONFIG_ADDRESS_PORT, 4, 0x8000_1234);
         assert_eq!(io.pio_read(CONFIG_ADDRESS_PORT, 4), 0x8000_1234);
-        // A byte read of 0xCF9 returns byte 1 of the latched value (0x12).
-        assert_eq!(io.pio_read(CONFIG_ADDRESS_PORT + 1, 1), 0x12);
+        // The full dword still holds byte 1 (0x12) — a byte read of 0xCF9 itself
+        // is the Reset Control Register, not CONFIG_ADDRESS byte 1
+        // (see reset_control_register_is_decoded_at_cf9).
+        assert_eq!((io.pio_read(CONFIG_ADDRESS_PORT, 4) >> 8) & 0xFF, 0x12);
+    }
+
+    #[test]
+    fn reset_control_register_is_decoded_at_cf9() {
+        let mut io = PciConfigIo::new(PcieRootComplex::new(0));
+        // A 32-bit CONFIG_ADDRESS write must not disturb the RCR or trigger reset.
+        io.pio_write(CONFIG_ADDRESS_PORT, 4, 0x8000_1234);
+        assert_eq!(io.pio_read(RESET_CONTROL_PORT, 1) & 0xFF, 0x00);
+        assert!(!io.take_reset());
+
+        // Arm a hard reset (SYS_RST), then pulse RST_CPU — the canonical reboot.
+        io.pio_write(RESET_CONTROL_PORT, 1, 0x02); // SYS_RST, no reboot yet
+        assert!(!io.take_reset());
+        assert_eq!(io.pio_read(RESET_CONTROL_PORT, 1) & 0xFF, 0x02);
+        io.pio_write(RESET_CONTROL_PORT, 1, 0x06); // SYS_RST | RST_CPU -> reboot
+        assert!(io.take_reset(), "RST_CPU write latches a reboot request");
+        // The latch is one-shot.
+        assert!(!io.take_reset());
+        // RST_CPU is not stored; only SYS_RST reads back.
+        assert_eq!(io.pio_read(RESET_CONTROL_PORT, 1) & 0xFF, 0x02);
+        // The CONFIG_ADDRESS dword is untouched by the 0xCF9 byte traffic.
+        assert_eq!(io.pio_read(CONFIG_ADDRESS_PORT, 4), 0x8000_1234);
+    }
+
+    #[test]
+    fn full_reset_bit_reads_back() {
+        let mut io = PciConfigIo::new(PcieRootComplex::new(0));
+        io.pio_write(RESET_CONTROL_PORT, 1, 0x0E); // FULL_RST | SYS_RST | RST_CPU
+        assert!(io.take_reset());
+        assert_eq!(io.pio_read(RESET_CONTROL_PORT, 1) & 0xFF, 0x0A);
     }
 
     #[test]

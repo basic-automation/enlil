@@ -17,9 +17,10 @@ use crate::kvm_backend::VmExitHandler;
 use crate::serial::{SerialOutput, SerialPort};
 use enlil_devices::bus::{MmioBus, MmioDevice, PioBus, PioDevice};
 use enlil_devices::chipset::{Gpe0Block, SharedAcpiPm1Block, SharedSystemControlPortA};
+use enlil_devices::dma::{Dma8237, DmaPageRegisters};
 use enlil_devices::interrupt::{IoApicMmio, PirqRouter, SharedInterruptController, SharedPic};
 use enlil_devices::pcie::{
-    vendors, EcamSpace, PciBdf, PciConfigIo, PcieRootComplex, SharedRootComplex,
+    vendors, EcamSpace, PciBdf, PciConfigIo, PciResetControl, PcieRootComplex, SharedRootComplex,
     PIRQ_ROUTE_CONFIG_BASE,
 };
 use enlil_devices::ps2::{SharedI8042, PS2_KBD_IRQ, PS2_MOUSE_IRQ};
@@ -35,6 +36,10 @@ pub struct DeviceBus {
     pub pio: PioBus,
     /// Memory-mapped devices (e.g. LAPIC, IOAPIC, HPET, PCIe ECAM).
     pub mmio: MmioBus,
+    /// A clone of the PCI config front-end's `0xCF9` reset latch, captured when
+    /// [`add_pcie`](Self::add_pcie) mounts it, so the platform layer can poll the
+    /// guest's reboot request. `None` until `add_pcie` runs.
+    pci_reset: Option<PciResetControl>,
 }
 
 impl DeviceBus {
@@ -44,6 +49,7 @@ impl DeviceBus {
         Self {
             pio: PioBus::new(),
             mmio: MmioBus::new(),
+            pci_reset: None,
         }
     }
 
@@ -156,6 +162,7 @@ impl DeviceBus {
     ) -> Result<SharedRootComplex, enlil_devices::bus::BusError> {
         let cam = PciConfigIo::new(root);
         let shared = cam.shared();
+        self.pci_reset = Some(cam.reset_handle());
         {
             let mut rc = shared.borrow_mut();
             if rc.find_device(&PciBdf::new(0, 0, 0)).is_none() {
@@ -165,6 +172,14 @@ impl DeviceBus {
         self.add_pci_config_io(cam)?;
         self.add_mmio(Box::new(EcamSpace::new(shared.clone())))?;
         Ok(shared)
+    }
+
+    /// A clone of the PCI config front-end's `0xCF9` Reset Control latch, set once
+    /// [`add_pcie`](Self::add_pcie) has mounted the front-end. Lets the platform
+    /// layer poll a guest's `0xCF9`/`reboot=pci` reboot request.
+    #[must_use]
+    pub fn pci_reset_handle(&self) -> Option<PciResetControl> {
+        self.pci_reset.clone()
     }
 
     /// Assemble a bus with the legacy devices a PC guest expects to find at the
@@ -402,6 +417,22 @@ impl DeviceBus {
         self.add_pio(Box::new(pm1.port()))
     }
 
+    /// Mount the **SMI command port** (`0xB2`, the FADT's `SMI_CMD`) on the PIO
+    /// bus, wired to `pm1`'s `SCI_EN`. An ACPI OS enters ACPI mode by writing
+    /// `ACPI_ENABLE` here and polling `SCI_EN`; without this port the write hits
+    /// open bus, `SCI_EN` never sets, and the OS aborts ACPI init. The same `pm1`
+    /// must back the `PM1a` block so the OS sees its poll succeed.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if `0xB2` overlaps an
+    /// already-registered device.
+    pub fn add_smi_command(
+        &mut self,
+        pm1: &SharedAcpiPm1Block,
+    ) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_pio(Box::new(pm1.smi_command_port()))
+    }
+
     /// Mount the **ACPI GPE0 block** ([`Gpe0Block`]) on the PIO bus over
     /// `0x620`..`0x62F` — the `GPE0_BLK` the emitted FADT advertises. A guest's
     /// ACPICA reads and clears these General-Purpose Event registers during ACPI
@@ -413,6 +444,23 @@ impl DeviceBus {
     /// already-registered device.
     pub fn add_gpe0(&mut self) -> Result<(), enlil_devices::bus::BusError> {
         self.add_pio(Box::new(Gpe0Block::new()))
+    }
+
+    /// Mount the **8237A DMA controllers** and the **DMA page registers** on the
+    /// PIO bus: DMA-1 over `0x00`..`0x0F`, DMA-2 over `0xC0`..`0xDF`, and the page
+    /// registers over `0x80`..`0x8F`. The model is passive (no transfer engine —
+    /// nothing in-tree owns a channel yet), but mounting it means a guest that
+    /// `request_region`s and probes ISA DMA at boot (Linux always does) reads back
+    /// coherent register state instead of open-bus `0xFF` — an open DMA window is
+    /// otherwise a cheap VM tell.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if any of the three windows
+    /// overlaps an already-registered device.
+    pub fn add_dma_controllers(&mut self) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_pio(Box::new(Dma8237::primary()))?;
+        self.add_pio(Box::new(Dma8237::secondary()))?;
+        self.add_pio(Box::new(DmaPageRegisters::new()))
     }
 
     /// Like [`standard_pc`](Self::standard_pc), but wires the legacy devices'
@@ -594,11 +642,24 @@ impl DeviceBus {
         let pm1 = SharedAcpiPm1Block::new();
         bus.add_acpi_pm1(&pm1)?;
 
+        // SMI command port (0xB2) — wired to the same PM1 block so the OS's
+        // ACPI-enable handshake (write ACPI_ENABLE, poll SCI_EN) completes.
+        bus.add_smi_command(&pm1)?;
+
         // ACPI GPE0 block (0x620) — keep its status quiet during ACPI init.
         bus.add_gpe0()?;
 
+        // 8237A DMA controllers (0x00-0x0F, 0xC0-0xDF) + page registers
+        // (0x80-0x8F) — passive register model so an ISA-DMA probe reads coherent
+        // state, not open bus. Claimed in the DSDT's SYSR _CRS.
+        bus.add_dma_controllers()?;
+
         // PCIe config space (legacy CAM + ECAM), seeded with a host bridge.
         let pcie = bus.add_pcie(PcieRootComplex::new(DEFAULT_ECAM_BASE))?;
+        // The 0xCF9 reset latch the CAM front-end just mounted (reboot=pci path).
+        let pci_reset = bus
+            .pci_reset_handle()
+            .expect("add_pcie mounts the 0xCF9 reset latch");
 
         // Seed the PIIX3 ISA bridge / PCI interrupt router at 00:01.0 (its config
         // space holds the PIRQ routing registers a guest programs).
@@ -625,6 +686,7 @@ impl DeviceBus {
             pm_timer,
             pm1,
             sysctl_a,
+            pci_reset,
         })
     }
 }
@@ -692,21 +754,29 @@ pub struct StandardPc {
     /// System Control Port A (`0x92`) — poll `take_reset` from the run loop to
     /// handle a guest-initiated fast/INIT reset, and read the live A20 state.
     pub sysctl_a: SharedSystemControlPortA,
+    /// The chipset Reset Control Register (`0xCF9`) — poll `take_reset` from the
+    /// run loop to handle a guest-initiated `reboot=pci` reset (the modern path,
+    /// alongside `0x92`).
+    pub pci_reset: PciResetControl,
 }
 
 impl StandardPc {
     /// Poll the platform-control latches a guest can raise that the vCPU run loop
     /// must act on outside the normal exit path — currently an ACPI sleep/shutdown
-    /// ([`PlatformEvent::Sleep`], via the PM1a block) and a fast CPU reset
-    /// ([`PlatformEvent::Reset`], via System Control Port A). Returns the highest-
-    /// priority pending event (sleep before reset) and consumes its latch; the run
-    /// loop calls this each iteration and acts on what it returns.
+    /// ([`PlatformEvent::Sleep`], via the PM1a block) and a CPU reset
+    /// ([`PlatformEvent::Reset`], via either System Control Port A `0x92` or the
+    /// chipset Reset Control Register `0xCF9`). Returns the highest-priority
+    /// pending event (sleep before reset) and consumes its latch; the run loop
+    /// calls this each iteration and acts on what it returns.
     #[must_use]
     pub fn poll_platform_events(&self) -> Option<PlatformEvent> {
         if let Some(slp_typ) = self.pm1.take_sleep() {
             return Some(PlatformEvent::Sleep(slp_typ));
         }
-        if self.sysctl_a.take_reset() {
+        // Both reset latches must be drained, so a pending request on the
+        // not-first source isn't stranded behind an early return.
+        let reset = self.sysctl_a.take_reset() | self.pci_reset.take_reset();
+        if reset {
             return Some(PlatformEvent::Reset);
         }
         None
@@ -1578,6 +1648,43 @@ mod tests {
     }
 
     #[test]
+    fn smi_command_enables_acpi_mode_through_the_bus() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+
+        let mut pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            1_780_838_055,
+            1,
+        )
+        .unwrap();
+
+        // Fresh machine: legacy mode, SCI_EN clear in PM1a_CNT (0x604).
+        let mut cnt = [0u8; 2];
+        VmExitHandler::io_in(&mut pc.bus, 0x604, &mut cnt);
+        assert_eq!(u16::from_le_bytes(cnt) & 1, 0, "SCI_EN clear before enable");
+
+        // The OS writes ACPI_ENABLE (0xA0) to the SMI command port (0xB2), then
+        // polls PM1a_CNT until SCI_EN reads back set — the ACPICA handshake.
+        VmExitHandler::io_out(&mut pc.bus, 0xB2, &[0xA0]);
+        VmExitHandler::io_in(&mut pc.bus, 0x604, &mut cnt);
+        assert_eq!(
+            u16::from_le_bytes(cnt) & 1,
+            1,
+            "SCI_EN set after ACPI_ENABLE"
+        );
+        assert!(pc.pm1.with(|b| b.sci_enabled()));
+
+        // ACPI_DISABLE (0xA1) returns to legacy mode.
+        VmExitHandler::io_out(&mut pc.bus, 0xB2, &[0xA1]);
+        VmExitHandler::io_in(&mut pc.bus, 0x604, &mut cnt);
+        assert_eq!(
+            u16::from_le_bytes(cnt) & 1,
+            0,
+            "SCI_EN clear after ACPI_DISABLE"
+        );
+    }
+
+    #[test]
     fn poll_platform_events_surfaces_guest_shutdown_and_reset() {
         use super::PlatformEvent;
         use crate::serial::{SerialOutput, SerialOutputMode};
@@ -1603,6 +1710,13 @@ mod tests {
         VmExitHandler::io_out(&mut pc.bus, 0x92, &[0x01]);
         assert_eq!(pc.poll_platform_events(), Some(PlatformEvent::Reset));
         assert_eq!(pc.poll_platform_events(), None);
+
+        // The guest reboots via the chipset Reset Control Register (0xCF9): a
+        // byte write with RST_CPU set (SYS_RST|RST_CPU = 0x06) — the reboot=pci
+        // path — also surfaces as a Reset event.
+        VmExitHandler::io_out(&mut pc.bus, 0xCF9, &[0x06]);
+        assert_eq!(pc.poll_platform_events(), Some(PlatformEvent::Reset));
+        assert_eq!(pc.poll_platform_events(), None, "0xCF9 latch consumed");
     }
 
     #[test]

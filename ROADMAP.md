@@ -350,6 +350,51 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > the router and PCI INTx assertions drive the controllers), HPET/PM1/GPE0 **SCI/IRQ delivery**
 > (needs the run loop), and the run-loop bindings for the A20/reset/sleep latches — all of which
 > wait on the `/dev/kvm` KVM binding (still no nested virt on the runner).
+>
+> **Status (2026-06-08b):** the **8237A ISA DMA controllers** are now modelled
+> (`devices::dma`): DMA-1 (`0x00-0x0F`), DMA-2 (`0xC0-0xDF`, registers on 2-byte
+> spacing) and the DMA **page registers** (`0x80-0x8F`, with the PC/AT non-linear
+> channel→port map). It is a faithful **passive** register model — base/current
+> address+count per channel behind the shared byte-pointer flip-flop, plus the
+> command/status/request/single+all-mask/mode registers and master clear — but no
+> transfer *engine*, since nothing in-tree owns a channel yet (no floppy/SB16). It
+> exists for transparency: a guest that `request_region`s and probes ISA DMA at
+> boot (Linux always does) now reads coherent register state instead of open-bus
+> `0xFF`, closing a cheap VM tell. Wired into `standard_pc_complete` and claimed in
+> the DSDT's `SYSR` `_CRS`. The physical-address composition (page latch + channel
+> address → 24-bit byte address, including DMA-2's word-addressing and ignored
+> page bit 0) is modelled as `dma::transfer_address`/`transfer_byte_count`.
+> **Follow-up:** drive a real channel (decrement current addr/count, raise TC,
+> handle autoinit) only when a DMA consumer (floppy/SB16) is added.
+>
+> **Status (2026-06-08c):** the chipset **Reset Control Register** (`RST_CNT`,
+> port `0xCF9`) is now decoded by `pcie::PciConfigIo`. `0xCF9` physically sits
+> inside the `CONFIG_ADDRESS` dword window, but a *byte* access hits `RST_CNT`, not
+> config-address byte 1 — so a guest reading `0xCF9` now gets the reset register
+> (not a leaked config byte), and a `RST_CPU` (bit 2) write latches a reboot
+> request (`take_reset`), with `SYS_RST`/`FULL_RST` reading back. This is the
+> `0xCF9`/`reboot=pci` path every modern OS uses, mirroring the existing `0x92`
+> fast-reset latch. The latch is shared (`PciResetControl`) and surfaced out of
+> `add_pcie` (via `DeviceBus::pci_reset_handle`), so
+> `StandardPc::poll_platform_events` now returns `PlatformEvent::Reset` for the
+> `0xCF9` path too (alongside `0x92`); both latches are drained each poll. The vCPU
+> run loop acts on that event once `/dev/kvm` is available. The FADT's `RESET_REG`/
+> `RESET_VALUE` (already `io(0xCF9)`/`0x06`) now source those values from the
+> `pcie::{RESET_CONTROL_PORT,RST_CNT_REBOOT_VALUE}` constants the model decodes, so
+> the ACPI-advertised reset register and the hardware behind it can't drift
+> (cross-check test).
+>
+> **Status (2026-06-08d):** the **SMI command port** (`0xB2`, the FADT's `SMI_CMD`)
+> is now modelled (`chipset::SmiCommandPort`) and wired into `standard_pc_complete`.
+> The FADT advertises a non-zero `SMI_CMD` with `ACPI_ENABLE`/`ACPI_DISABLE`
+> (`0xA0`/`0xA1`), so ACPICA switches to ACPI mode by writing `ACPI_ENABLE` to
+> `0xB2` and **polling `SCI_EN`** in `PM1a_CNT`. There's no SMM, so the port sets
+> `SCI_EN` directly in the shared `PM1a` block (and `ACPI_DISABLE` clears it) —
+> without it the write hit open bus, `SCI_EN` never set, and the OS aborted ACPI
+> init ("Could not enable ACPI mode"): a hard boot failure and a VM tell. The FADT
+> now sources `SMI_CMD`/`ACPI_ENABLE`/`ACPI_DISABLE` from the
+> `chipset::{SMI_CMD_PORT,ACPI_ENABLE_VALUE,ACPI_DISABLE_VALUE}` constants the port
+> uses, so the advertised handshake and the decoding hardware can't drift.
 
 ### 0.3 USB Live Boot & Non-Destructive Testing (CRITICAL FOR ADOPTION)
 

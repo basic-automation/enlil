@@ -244,6 +244,20 @@ impl AcpiPm1Block {
         self.control & PM1_CNT_SCI_EN != 0
     }
 
+    /// Set or clear `SCI_EN` — i.e. enter or leave ACPI mode. On real hardware
+    /// the OS can't write `SCI_EN` in `PM1a_CNT` directly; it asks the chipset's
+    /// SMI handler to do it by writing `ACPI_ENABLE`/`ACPI_DISABLE` to the SMI
+    /// command port (`0xB2`). [`SmiCommandPort`] calls this in response to that
+    /// write, so ACPICA's mode-switch handshake (write `0xA0`, poll `SCI_EN`)
+    /// completes instead of timing out.
+    pub const fn set_acpi_mode(&mut self, enabled: bool) {
+        if enabled {
+            self.control |= PM1_CNT_SCI_EN;
+        } else {
+            self.control &= !PM1_CNT_SCI_EN;
+        }
+    }
+
     /// Raise the power-button status bit, as if the host pressed the (virtual)
     /// power button. An ACPI OS with `PWRBTN_EN` set treats this as a request to
     /// shut down, and responds by writing the S5 sleep transition.
@@ -364,6 +378,67 @@ impl SharedAcpiPm1Block {
     pub fn port(&self) -> Pm1Port {
         Pm1Port { pm1: self.clone() }
     }
+
+    /// The SMI command port (`0xB2`) as a bus [`PioDevice`], driving this PM1
+    /// block's `SCI_EN` so the OS's ACPI-enable handshake completes.
+    #[must_use]
+    pub fn smi_command_port(&self) -> SmiCommandPort {
+        SmiCommandPort {
+            pm1: self.clone(),
+            last_command: 0,
+        }
+    }
+}
+
+/// I/O port of the chipset **SMI command register** (`SMI_CMD`), the FADT's
+/// `SMI_CMD` field. An ACPI OS writes here to ask the platform to switch ACPI
+/// mode on or off.
+pub const SMI_CMD_PORT: u16 = 0xB2;
+
+/// The `SMI_CMD` value (`ACPI_ENABLE`) the OS writes to enter ACPI mode — matches
+/// the FADT's `ACPI_ENABLE` field.
+pub const ACPI_ENABLE_VALUE: u8 = 0xA0;
+
+/// The `SMI_CMD` value (`ACPI_DISABLE`) the OS writes to leave ACPI mode — matches
+/// the FADT's `ACPI_DISABLE` field.
+pub const ACPI_DISABLE_VALUE: u8 = 0xA1;
+
+/// The **SMI command port** (`0xB2`, `SMI_CMD`) as a bus [`PioDevice`].
+///
+/// The FADT advertises a non-zero `SMI_CMD` with `ACPI_ENABLE`/`ACPI_DISABLE`
+/// values, so an ACPI OS (ACPICA) switches into ACPI mode by writing
+/// [`ACPI_ENABLE_VALUE`] here and then **polling `SCI_EN`** in `PM1a_CNT` until it
+/// reads back set. On real hardware the chipset's SMI handler sets `SCI_EN` in
+/// response; there is no SMM here, so this port performs that side effect
+/// directly. Without it the write would fall into open bus, `SCI_EN` would never
+/// set, and the OS would abort ACPI init with "Could not enable ACPI mode" — a
+/// hard boot failure and an obvious VM tell. Writing [`ACPI_DISABLE_VALUE`] clears
+/// `SCI_EN` (legacy mode); any other command byte is stored but otherwise ignored.
+pub struct SmiCommandPort {
+    /// The PM1 block whose `SCI_EN` this port toggles.
+    pm1: SharedAcpiPm1Block,
+    /// The last command byte written (read back from `0xB2`).
+    last_command: u8,
+}
+
+impl PioDevice for SmiCommandPort {
+    fn pio_read(&mut self, _port: u16, _size: u8) -> u32 {
+        u32::from(self.last_command)
+    }
+
+    fn pio_write(&mut self, _port: u16, _size: u8, data: u32) {
+        let command = u8_of(data);
+        self.last_command = command;
+        match command {
+            ACPI_ENABLE_VALUE => self.pm1.with(|b| b.set_acpi_mode(true)),
+            ACPI_DISABLE_VALUE => self.pm1.with(|b| b.set_acpi_mode(false)),
+            _ => {}
+        }
+    }
+
+    fn port_range(&self) -> (u16, u16) {
+        (SMI_CMD_PORT, SMI_CMD_PORT + 1)
+    }
 }
 
 /// The `PM1a` register block (`0x600`..`0x606`) as a bus [`PioDevice`], backed by
@@ -482,8 +557,9 @@ impl PioDevice for Gpe0Block {
 #[cfg(test)]
 mod tests {
     use super::{
-        A20_GATE, AcpiPm1Block, GPE0_PORT, Gpe0Block, PM1_CNT_PORT, PM1_EVT_PORT, PORT_A,
-        SharedAcpiPm1Block, SharedSystemControlPortA, SystemControlPortA,
+        A20_GATE, ACPI_DISABLE_VALUE, ACPI_ENABLE_VALUE, AcpiPm1Block, GPE0_PORT, Gpe0Block,
+        PM1_CNT_PORT, PM1_EVT_PORT, PORT_A, SMI_CMD_PORT, SharedAcpiPm1Block,
+        SharedSystemControlPortA, SystemControlPortA,
     };
     use crate::bus::PioDevice;
 
@@ -562,6 +638,37 @@ mod tests {
         // A later S5 write must not capture a sleep unless SLP_EN is set.
         pm1.pio_write(PM1_CNT_PORT, 2, (5 << 10) | 1);
         assert_eq!(pm1.take_sleep(), None, "no SLP_EN, no transition");
+    }
+
+    #[test]
+    fn smi_command_acpi_enable_sets_sci_en() {
+        let pm1 = SharedAcpiPm1Block::new();
+        let mut smi = pm1.smi_command_port();
+        assert_eq!(PioDevice::port_range(&smi), (0xB2, 0xB3));
+        assert!(!pm1.with(|b| b.sci_enabled()));
+
+        // The OS writes ACPI_ENABLE (0xA0) to 0xB2 — SCI_EN must come up so its
+        // poll of PM1a_CNT succeeds.
+        smi.pio_write(SMI_CMD_PORT, 1, u32::from(ACPI_ENABLE_VALUE));
+        assert!(pm1.with(|b| b.sci_enabled()), "ACPI mode entered");
+        // The command byte reads back.
+        assert_eq!(
+            smi.pio_read(SMI_CMD_PORT, 1) & 0xFF,
+            u32::from(ACPI_ENABLE_VALUE)
+        );
+
+        // ACPI_DISABLE (0xA1) drops back to legacy mode.
+        smi.pio_write(SMI_CMD_PORT, 1, u32::from(ACPI_DISABLE_VALUE));
+        assert!(!pm1.with(|b| b.sci_enabled()), "ACPI mode left");
+    }
+
+    #[test]
+    fn smi_command_ignores_unknown_bytes() {
+        let pm1 = SharedAcpiPm1Block::new();
+        let mut smi = pm1.smi_command_port();
+        smi.pio_write(SMI_CMD_PORT, 1, 0x12);
+        assert!(!pm1.with(|b| b.sci_enabled()), "unknown command is a no-op");
+        assert_eq!(smi.pio_read(SMI_CMD_PORT, 1) & 0xFF, 0x12);
     }
 
     #[test]
