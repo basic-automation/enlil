@@ -291,6 +291,47 @@ mod tests {
     }
 
     #[test]
+    fn dsdt_processor_devices_and_ssdt_power_scopes_agree() {
+        // The SSDT augments each processor's power objects via Scope(C0n); those
+        // names must match the processor Devices the DSDT declares, or the _PSS/_CST
+        // attach to nothing. Both derive from vcpu_count — assert they stay in lock
+        // step for a representative count.
+        let config = AcpiTableSetConfig {
+            vcpu_count: 6,
+            ..AcpiTableSetConfig::default()
+        };
+        let ts = build_acpi_tables(&config);
+        let off = |name: &str| ts.table_offsets.iter().find(|(n, _)| n == name).unwrap().1;
+        let dsdt = &ts.tables[off("DSDT")..];
+        let ssdt = &ts.tables[off("SSDT")..];
+        // Processor names C00..C05 (6 vCPUs) must appear in BOTH tables.
+        for cpu in 0u8..6 {
+            let hex = b"0123456789ABCDEF";
+            let name = [
+                b'C',
+                hex[((cpu >> 4) & 0xF) as usize],
+                hex[(cpu & 0xF) as usize],
+                b'_',
+            ];
+            assert!(
+                dsdt.windows(4).any(|w| w == name),
+                "DSDT must declare processor {cpu}"
+            );
+            assert!(
+                ssdt.windows(4).any(|w| w == name),
+                "SSDT must scope power objects into processor {cpu}"
+            );
+        }
+        // And neither references a processor beyond the count (C06 absent in both).
+        let c06 = *b"C06_";
+        assert!(
+            !dsdt.windows(4).any(|w| w == c06),
+            "no extra DSDT processor"
+        );
+        assert!(!ssdt.windows(4).any(|w| w == c06), "no extra SSDT scope");
+    }
+
+    #[test]
     fn rsdp_xsdt_pointer_chain_resolves_to_valid_tables() {
         // Walk the address chain a guest's ACPICA follows — RSDP → XSDT → each
         // table — and confirm every guest-physical pointer lands on a table whose
