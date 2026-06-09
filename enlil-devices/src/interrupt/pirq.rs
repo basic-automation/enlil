@@ -33,6 +33,20 @@ pub const PIRQ_ROUTE_BASE: u16 = 0x60;
 /// First I/O APIC GSI the four PIRQ lines wire to in APIC mode (`PIRQA`→16).
 pub const PIRQ_GSI_BASE: u8 = 16;
 
+/// The default ISA IRQ each PIRQ line (`A`,`B`,`C`,`D`) drives in **PIC mode**.
+///
+/// These are the values the firmware programs into the routing registers at
+/// power-on and that the static PIC-mode `_PRT` advertises, so the table a guest
+/// reads and the routing the firmware programs into `PIRQRC[A-D]` agree by
+/// construction (the same discipline the APIC-mode `_PRT` already follows for
+/// GSIs).
+///
+/// All four are PCI-routable (3-7, 9-12, 14, 15) and avoid the IRQs Enlil's
+/// modeled legacy devices already own — IRQ1 (keyboard), IRQ4 (COM1), IRQ8
+/// (RTC), IRQ12 (mouse) — and the ACPI SCI (IRQ9). They are distinct so the four
+/// lines do not needlessly share a vector.
+pub const PIRQ_DEFAULT_IRQS: [u8; PIRQ_LINES] = [11, 10, 5, 6];
+
 /// A set routing register's bit 7 means the line is **not routed** to any IRQ
 /// (the PIIX3 reset state — firmware must program a valid IRQ to enable it).
 const ROUTE_DISABLED: u8 = 0x80;
@@ -130,6 +144,29 @@ impl PirqRouter {
         }
     }
 
+    /// A router programmed with the firmware [`PIRQ_DEFAULT_IRQS`] routing — the
+    /// state a guest finds after power-on, and the routing the static PIC-mode
+    /// `_PRT` advertises.
+    #[must_use]
+    pub const fn firmware_default() -> Self {
+        Self {
+            routes: PIRQ_DEFAULT_IRQS,
+        }
+    }
+
+    /// The ISA IRQ a device's `(slot, pin)` resolves to under the **default**
+    /// PIC-mode routing ([`PIRQ_DEFAULT_IRQS`]): the swizzle onto `PIRQ[A..D]`,
+    /// then the firmware-default IRQ for that line. `None` if the device declares
+    /// no pin. Used to build the static PIC-mode `_PRT` so it matches the routing
+    /// the firmware programs.
+    #[must_use]
+    pub const fn default_device_isa_irq(slot: u8, pin: u8) -> Option<u8> {
+        match Self::pirq_line(slot, pin) {
+            Some(line) => Some(PIRQ_DEFAULT_IRQS[line]),
+            None => None,
+        }
+    }
+
     /// The I/O APIC GSI a device's `(slot, pin)` resolves to in **APIC mode**:
     /// the swizzle onto `PIRQ[A..D]`, then the fixed `PIRQA`→16 .. `PIRQD`→19
     /// wiring (independent of the routing registers). `None` if the device
@@ -215,6 +252,35 @@ mod tests {
         assert_eq!(r.device_isa_irq(0, 2), Some(10));
         // A device on an unrouted line resolves to nothing.
         assert_eq!(r.device_isa_irq(0, 1), None); // PIRQA still disabled
+    }
+
+    #[test]
+    fn firmware_default_routing_resolves_pic_mode_irqs() {
+        use super::PIRQ_DEFAULT_IRQS;
+        // The default routes are all PCI-routable and avoid the modeled legacy
+        // IRQs (1,4,8,12) and the SCI (9).
+        for irq in PIRQ_DEFAULT_IRQS {
+            assert!(
+                matches!(irq, 3..=7 | 9..=12 | 14 | 15),
+                "default IRQ {irq} must be PCI-routable"
+            );
+            assert!(
+                !matches!(irq, 1 | 4 | 8 | 12 | 9),
+                "default IRQ {irq} must not collide with a modeled legacy line"
+            );
+        }
+        // A firmware-default router resolves a device through the swizzle + default.
+        let r = PirqRouter::firmware_default();
+        // slot 0 INTA -> PIRQA -> PIRQ_DEFAULT_IRQS[0].
+        assert_eq!(r.device_isa_irq(0, 1), Some(PIRQ_DEFAULT_IRQS[0]));
+        // slot 1 INTA -> PIRQB -> PIRQ_DEFAULT_IRQS[1].
+        assert_eq!(r.device_isa_irq(1, 1), Some(PIRQ_DEFAULT_IRQS[1]));
+        // The const resolver agrees with the live router.
+        assert_eq!(
+            PirqRouter::default_device_isa_irq(2, 1),
+            Some(PIRQ_DEFAULT_IRQS[2])
+        );
+        assert_eq!(PirqRouter::default_device_isa_irq(0, 0), None);
     }
 
     #[test]

@@ -177,30 +177,54 @@ impl DsdtBuilder {
 
     /// Build the PCI interrupt routing table (`_PRT`) for bus 0.
     ///
-    /// This is a static **APIC-mode** table: each `(slot, pin)` resolves through
-    /// the standard PCI swizzle to I/O APIC GSI 16-19, generated from
-    /// [`PirqRouter::device_gsi`] so the DSDT and the live `assert_pci_intx` path
-    /// agree on routing by construction. Each entry is
-    /// `{ (slot << 16) | 0xFFFF, pin, 0, GSI }` — `Source = 0` with `SourceIndex`
-    /// = the GSI, per ACPI §6.2.13.
+    /// Emitted as a **mode-selecting method**, matching real firmware:
     ///
-    /// Modern guests switch to APIC mode (`_PIC(1)`) and use this table; a
-    /// PIC-mode-only guest would need the programmable PIRQ routes exposed through
-    /// link devices and a `_PIC`-method-selected second table — a documented
-    /// follow-up (needs If/Else AML), tracked in `PROGRESS.md`.
+    /// ```asl
+    /// Method (_PRT, 0) {
+    ///     If (PICF) { Return (Package { ...APIC GSIs... }) }
+    ///     Return (Package { ...PIC ISA IRQs... })
+    /// }
+    /// ```
+    ///
+    /// `PICF` is the interrupt-model flag the OS sets via `_PIC` (0 = 8259 PIC,
+    /// 1 = I/O APIC). Until the OS calls `_PIC(1)` the flag is 0 and the method
+    /// returns the **PIC-mode** table; after switching to APIC mode it returns the
+    /// **APIC-mode** table. A static APIC-only `_PRT` (the previous shape) left a
+    /// PIC-mode guest — or the window before `_PIC(1)` — with no usable routing,
+    /// itself a divergence from how a real PIIX/ICH DSDT is written.
+    ///
+    /// Both tables agree with the live router by construction:
+    /// - APIC: each `(slot, pin)` swizzles to I/O APIC GSI 16-19 via
+    ///   [`PirqRouter::device_gsi`].
+    /// - PIC: each `(slot, pin)` swizzles onto `PIRQ[A-D]` and takes that line's
+    ///   firmware-default ISA IRQ via [`PirqRouter::default_device_isa_irq`]
+    ///   (the same `PIRQ_DEFAULT_IRQS` the firmware programs into the routing
+    ///   registers). `Source = 0` with `SourceIndex` = the IRQ, per ACPI §6.2.13.
     fn build_pci_routing_table(aml: &mut AmlBuilder) {
         use crate::interrupt::PirqRouter;
-        let mut entries: Vec<[u64; 4]> = Vec::with_capacity(32 * 4);
+
+        let mut apic: Vec<[u64; 4]> = Vec::with_capacity(32 * 4);
+        let mut pic: Vec<[u64; 4]> = Vec::with_capacity(32 * 4);
         for slot in 0u8..32 {
             for prt_pin in 0u8..4 {
                 // _PRT pin 0=INTA..3=INTD; the router uses 1=INTA..4=INTD.
+                let address = (u64::from(slot) << 16) | 0xFFFF;
                 if let Some(gsi) = PirqRouter::device_gsi(slot, prt_pin + 1) {
-                    let address = (u64::from(slot) << 16) | 0xFFFF;
-                    entries.push([address, u64::from(prt_pin), 0, u64::from(gsi)]);
+                    apic.push([address, u64::from(prt_pin), 0, u64::from(gsi)]);
+                }
+                if let Some(irq) = PirqRouter::default_device_isa_irq(slot, prt_pin + 1) {
+                    pic.push([address, u64::from(prt_pin), 0, u64::from(irq)]);
                 }
             }
         }
-        aml.name_routing_table(b"_PRT", &entries);
+
+        let method = aml.method_start(b"_PRT", 0, false);
+        let if_apic = aml.if_name_start(b"PICF");
+        aml.return_routing_table(&apic);
+        aml.if_end(&if_apic);
+        // Fall-through (PICF == 0): PIC mode.
+        aml.return_routing_table(&pic);
+        aml.method_end(&method);
     }
 
     /// Build ISA/LPC bridge under PCI0
@@ -469,26 +493,77 @@ mod tests {
 
     #[test]
     fn dsdt_pci_root_has_prt_matching_the_router() {
-        use crate::interrupt::PirqRouter;
+        use super::super::aml::opcode;
+        use crate::interrupt::{PIRQ_DEFAULT_IRQS, PirqRouter};
         let dsdt = DsdtBuilder::new(DsdtConfig::default()).build();
+        // _PRT is now a mode-selecting Method: METHOD_OP ... "_PRT" ... and the
+        // method body opens with If (PICF).
+        let pos = dsdt
+            .windows(4)
+            .position(|w| w == b"_PRT")
+            .expect("PCI0 must carry a _PRT");
+        // The method's arg-count flags byte (argc 0) follows the name; the body
+        // then opens with IF_OP + PkgLength + the "PICF" predicate.
+        let flags = dsdt[pos + 4];
+        assert_eq!(flags & 0x07, 0, "_PRT takes no arguments");
+        let after = &dsdt[pos + 5..];
+        assert_eq!(after[0], opcode::IF_OP, "_PRT body opens with If");
+        // After IF_OP comes the PkgLength field (1-3 bytes), then the "PICF"
+        // predicate NameString — it appears within the first few bytes of the body.
         assert!(
-            dsdt.windows(4).any(|w| w == b"_PRT"),
-            "PCI0 must carry a _PRT"
+            after[1..8].windows(4).any(|w| w == b"PICF"),
+            "the If predicate is PICF"
         );
-        // Slot 1 INTA (_PRT pin 0) must route to the GSI the router resolves (17).
+
+        // APIC-mode table (inside the If). Slot 1 INTA -> GSI 17.
         assert_eq!(PirqRouter::device_gsi(1, 1), Some(17));
-        // Its sub-package content: NumElements 4, DWord addr 0x0001FFFF, pin ZERO,
-        // source ZERO, GSI byte-const 17.
         let entry = [0x04u8, 0x0C, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x0A, 0x11];
         assert!(
             dsdt.windows(entry.len()).any(|w| w == entry),
-            "_PRT must contain the slot-1 INTA -> GSI17 entry"
+            "_PRT must contain the APIC slot-1 INTA -> GSI17 entry"
         );
         // Slot 0 INTA -> GSI16, Word addr 0x0000FFFF.
         let entry0 = [0x04u8, 0x0B, 0xFF, 0xFF, 0x00, 0x00, 0x0A, 0x10];
         assert!(
             dsdt.windows(entry0.len()).any(|w| w == entry0),
-            "_PRT must contain the slot-0 INTA -> GSI16 entry"
+            "_PRT must contain the APIC slot-0 INTA -> GSI16 entry"
+        );
+
+        // PIC-mode fall-through table. Slot 0 INTA -> PIRQA -> PIRQ_DEFAULT_IRQS[0].
+        assert_eq!(
+            PirqRouter::default_device_isa_irq(0, 1),
+            Some(PIRQ_DEFAULT_IRQS[0])
+        );
+        let pic0 = [
+            0x04u8,
+            0x0B,
+            0xFF,
+            0xFF,
+            0x00,
+            0x00,
+            0x0A,
+            PIRQ_DEFAULT_IRQS[0],
+        ];
+        assert!(
+            dsdt.windows(pic0.len()).any(|w| w == pic0),
+            "_PRT must contain the PIC slot-0 INTA -> default-IRQ entry"
+        );
+        // Slot 1 INTA -> PIRQB -> PIRQ_DEFAULT_IRQS[1], DWord addr 0x0001FFFF.
+        let pic1 = [
+            0x04u8,
+            0x0C,
+            0xFF,
+            0xFF,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+            0x0A,
+            PIRQ_DEFAULT_IRQS[1],
+        ];
+        assert!(
+            dsdt.windows(pic1.len()).any(|w| w == pic1),
+            "_PRT must contain the PIC slot-1 INTA -> default-IRQ entry"
         );
         let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         assert_eq!(sum, 0);

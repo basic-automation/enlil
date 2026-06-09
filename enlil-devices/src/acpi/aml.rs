@@ -296,23 +296,63 @@ impl AmlBuilder {
         self
     }
 
-    /// `Name(name, Package(){ <sub-package> ... })` — a package whose every
-    /// element is itself a fixed integer package. Used for a `_PRT` (each entry is
-    /// `{ Address, Pin, Source, SourceIndex }`); `entries` is one 4-tuple per row.
-    pub fn name_routing_table(&mut self, name: &[u8; 4], entries: &[[u64; 4]]) -> &mut Self {
-        // Body = NumElements + each entry encoded as a sub-package.
+    /// Encode `Package(){ <sub-package> ... }` (a `_PRT`-shaped package: every
+    /// element is itself a `{ Address, Pin, Source, SourceIndex }` integer
+    /// sub-package) as a standalone data object, for use as a `Name` value or a
+    /// `Return` operand.
+    fn encode_routing_package(entries: &[[u64; 4]]) -> Vec<u8> {
         let mut body = vec![entries.len().to_le_bytes()[0]];
         for entry in entries {
             body.extend_from_slice(&Self::encode_integer_package(entry));
         }
+        let mut out = vec![opcode::PACKAGE_OP];
+        out.extend_from_slice(&Self::encode_self_pkg_length(body.len()));
+        out.extend_from_slice(&body);
+        out
+    }
 
+    /// `Name(name, Package(){ <sub-package> ... })` — a package whose every
+    /// element is itself a fixed integer package. Used for a `_PRT` (each entry is
+    /// `{ Address, Pin, Source, SourceIndex }`); `entries` is one 4-tuple per row.
+    pub fn name_routing_table(&mut self, name: &[u8; 4], entries: &[[u64; 4]]) -> &mut Self {
+        let pkg = Self::encode_routing_package(entries);
         self.data.push(opcode::NAME_OP);
         self.data.extend_from_slice(&Self::encode_name(*name));
-        self.data.push(opcode::PACKAGE_OP);
-        self.data
-            .extend_from_slice(&Self::encode_self_pkg_length(body.len()));
-        self.data.extend_from_slice(&body);
+        self.data.extend_from_slice(&pkg);
         self
+    }
+
+    /// `Return(Package(){ <sub-package> ... })` — return a `_PRT`-shaped routing
+    /// package from inside a method body (e.g. a mode-selecting `_PRT` method).
+    pub fn return_routing_table(&mut self, entries: &[[u64; 4]]) -> &mut Self {
+        let pkg = Self::encode_routing_package(entries);
+        self.data.push(opcode::RETURN_OP);
+        self.data.extend_from_slice(&pkg);
+        self
+    }
+
+    /// Start an `If (<name>)` block whose predicate is the value of a named object
+    /// (a `TermArg` that evaluates the integer the name holds, e.g. the `PICF`
+    /// interrupt-model flag). Returns a handle to close with [`Self::if_end`].
+    ///
+    /// `If` is `IfOp PkgLength Predicate TermList`; the `PkgLength` spans the
+    /// predicate and the body, exactly like a scope, so the shared
+    /// [`Self::patch_pkg_length`] closes it.
+    pub fn if_name_start(&mut self, name: &[u8; 4]) -> ScopeHandle {
+        self.data.push(opcode::IF_OP);
+        let length_pos = self.data.len();
+        self.data.extend_from_slice(&[0, 0, 0, 0]);
+        // Predicate: a bare NameString references the object and yields its value.
+        self.data.extend_from_slice(&Self::encode_name(*name));
+        ScopeHandle {
+            length_pos,
+            content_start: self.data.len(),
+        }
+    }
+
+    /// Close an `If` block opened with [`Self::if_name_start`].
+    pub fn if_end(&mut self, handle: &ScopeHandle) {
+        self.patch_pkg_length(handle.length_pos, handle.content_start);
     }
 
     /// `Name(name, ResourceTemplate{ ... })` — emit a `_CRS`/`_PRS`-style buffer.
@@ -732,6 +772,57 @@ mod tests {
         assert!(sub_end <= bytes.len());
         // Sub NumElements = 4.
         assert_eq!(bytes[sub_start + sub_field], 4);
+    }
+
+    #[test]
+    fn if_name_block_pkg_length_spans_predicate_and_body() {
+        // Method (_PRT) { If (PICF) { Return (Package(){...}) } Return (Package(){...}) }
+        let mut aml = AmlBuilder::new();
+        let m = aml.method_start(b"_PRT", 0, false);
+        let if_h = aml.if_name_start(b"PICF");
+        aml.return_routing_table(&[[0x0000_FFFF, 0, 0, 16]]);
+        aml.if_end(&if_h);
+        aml.return_routing_table(&[[0x0000_FFFF, 0, 0, 11]]);
+        aml.method_end(&m);
+        let bytes = aml.into_bytes();
+
+        // Method(_PRT, 0): METHOD_OP, PkgLength, name, flags.
+        assert_eq!(bytes[0], opcode::METHOD_OP);
+        let (mval, mfield) = decode_pkg_length(&bytes[1..]);
+        assert_eq!(mval, bytes.len() - 1, "method PkgLength self-consistent");
+        // After PkgLength field: name (4) + flags (1) = method body start.
+        let body = 1 + mfield + 4 + 1;
+        // The body opens with If (PICF): IF_OP, PkgLength, then "PICF".
+        assert_eq!(bytes[body], opcode::IF_OP);
+        let (ifval, iffield) = decode_pkg_length(&bytes[body + 1..]);
+        // Predicate immediately follows the If PkgLength field.
+        let pred = body + 1 + iffield;
+        assert_eq!(&bytes[pred..pred + 4], b"PICF", "If predicate is PICF");
+        // The If package spans the predicate + the inner Return; its end must land
+        // before the trailing (else-branch) Return that follows in the method body.
+        let if_end = body + 1 + ifval;
+        assert_eq!(
+            bytes[if_end],
+            opcode::RETURN_OP,
+            "fall-through Return follows If"
+        );
+        // The inner Return (APIC, GSI16) sits inside the If.
+        assert_eq!(bytes[pred + 4], opcode::RETURN_OP);
+        assert_eq!(bytes[pred + 5], opcode::PACKAGE_OP);
+    }
+
+    #[test]
+    fn return_routing_table_emits_return_then_package() {
+        let mut aml = AmlBuilder::new();
+        aml.return_routing_table(&[[0x0001_FFFF, 1, 0, 10]]);
+        let bytes = aml.into_bytes();
+        assert_eq!(bytes[0], opcode::RETURN_OP);
+        assert_eq!(bytes[1], opcode::PACKAGE_OP);
+        let (val, field) = decode_pkg_length(&bytes[2..]);
+        assert_eq!(val, bytes.len() - 2, "returned package is self-consistent");
+        // NumElements = 1, then a sub-package.
+        assert_eq!(bytes[2 + field], 1);
+        assert_eq!(bytes[2 + field + 1], opcode::PACKAGE_OP);
     }
 
     #[test]
