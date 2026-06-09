@@ -291,6 +291,59 @@ mod tests {
     }
 
     #[test]
+    fn rsdp_xsdt_pointer_chain_resolves_to_valid_tables() {
+        // Walk the address chain a guest's ACPICA follows — RSDP → XSDT → each
+        // table — and confirm every guest-physical pointer lands on a table whose
+        // signature is well-formed and whose checksum is valid. This catches any
+        // layout/offset drift that would leave a pointer dangling.
+        let config = AcpiTableSetConfig::default();
+        let ts = build_acpi_tables(&config);
+        let base = config.table_base_address;
+        let to_off = |gpa: u64| usize::try_from(gpa - base).unwrap();
+
+        let valid_table = |bytes: &[u8]| -> bool {
+            if bytes.len() < 36 {
+                return false;
+            }
+            let len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+            if len < 36 || len > bytes.len() {
+                return false;
+            }
+            // 4-char ASCII signature and a zero 8-bit checksum over `len` bytes.
+            bytes[..4]
+                .iter()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+                && bytes[..len].iter().fold(0u8, |a, &b| a.wrapping_add(b)) == 0
+        };
+
+        // RSDP (revision 2) carries the 64-bit XSDT address at offset 24.
+        let xsdt_gpa = u64::from_le_bytes(ts.rsdp[24..32].try_into().unwrap());
+        let xsdt = &ts.tables[to_off(xsdt_gpa)..];
+        assert_eq!(&xsdt[0..4], b"XSDT");
+        assert!(valid_table(xsdt), "XSDT must be self-consistent");
+
+        // Each 8-byte XSDT entry points to a valid table; one of them is the FADT.
+        let xsdt_len = u32::from_le_bytes(xsdt[4..8].try_into().unwrap()) as usize;
+        let mut saw_fadt = false;
+        for entry in xsdt[36..xsdt_len].chunks_exact(8) {
+            let gpa = u64::from_le_bytes(entry.try_into().unwrap());
+            let tbl = &ts.tables[to_off(gpa)..];
+            assert!(
+                valid_table(tbl),
+                "XSDT entry -> invalid table (sig {:?})",
+                &tbl[0..4]
+            );
+            if &tbl[0..4] == b"FACP" {
+                saw_fadt = true;
+                // The FADT's X_DSDT (offset 140) must resolve to the DSDT.
+                let x_dsdt = u64::from_le_bytes(tbl[140..148].try_into().unwrap());
+                assert_eq!(&ts.tables[to_off(x_dsdt)..to_off(x_dsdt) + 4], b"DSDT");
+            }
+        }
+        assert!(saw_fadt, "XSDT must reference the FADT");
+    }
+
+    #[test]
     fn fadt_points_to_a_valid_facs_in_the_buffer() {
         let config = AcpiTableSetConfig::default();
         let table_set = build_acpi_tables(&config);
