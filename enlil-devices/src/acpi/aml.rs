@@ -331,6 +331,40 @@ impl AmlBuilder {
         self
     }
 
+    /// Encode one `_PRT` sub-package whose **Source** is a reference to a PCI
+    /// interrupt link device (a `NameString`), not the integer 0: `{ Address, Pin,
+    /// \\link, SourceIndex }`. `link` is a 4-char `NameSeg` (e.g. `b"LNKA"`) that
+    /// resolves relative to the `_PRT`'s scope. In a package, a bare `NameSeg` is a
+    /// reference the OS follows to the link device's `_CRS`/`_PRS`/`_SRS`.
+    fn encode_named_prt_entry(address: u64, pin: u64, link: [u8; 4], source_index: u64) -> Vec<u8> {
+        let mut body = vec![4u8]; // NumElements
+        body.extend_from_slice(&Self::encode_integer_const(address));
+        body.extend_from_slice(&Self::encode_integer_const(pin));
+        body.extend_from_slice(&link); // NameSeg reference to the link device
+        body.extend_from_slice(&Self::encode_integer_const(source_index));
+        let mut out = vec![opcode::PACKAGE_OP];
+        out.extend_from_slice(&Self::encode_self_pkg_length(body.len()));
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// `Return(Package(){ ... })` for a PIC-mode `_PRT` that routes each entry
+    /// through a named PCI interrupt **link device** (the PIIX/ICH firmware
+    /// pattern). Each entry is `(address, pin, link_nameseg)`; `SourceIndex` is
+    /// always 0 (the link's first/only resource).
+    pub fn return_routing_table_via_links(&mut self, entries: &[(u64, u64, [u8; 4])]) -> &mut Self {
+        let mut body = vec![entries.len().to_le_bytes()[0]];
+        for (address, pin, link) in entries {
+            body.extend_from_slice(&Self::encode_named_prt_entry(*address, *pin, *link, 0));
+        }
+        self.data.push(opcode::RETURN_OP);
+        self.data.push(opcode::PACKAGE_OP);
+        self.data
+            .extend_from_slice(&Self::encode_self_pkg_length(body.len()));
+        self.data.extend_from_slice(&body);
+        self
+    }
+
     /// Start an `If (<name>)` block whose predicate is the value of a named object
     /// (a `TermArg` that evaluates the integer the name holds, e.g. the `PICF`
     /// interrupt-model flag). Returns a handle to close with [`Self::if_end`].
@@ -474,6 +508,42 @@ impl ResourceTemplate {
         self.data.push(0x23);
         self.data.extend_from_slice(&mask.to_le_bytes());
         self.data.push(0x01); // bit0=edge, bit3=exclusive, bit4=active-high
+        self
+    }
+
+    /// IRQ Descriptor (small type `0x23`, ACPI §6.4.2.1) carrying a *set* of
+    /// candidate IRQs and explicit mode/polarity/sharing flags. Used for a PCI
+    /// interrupt link device's `_PRS` (every IRQ the link may be routed to) and
+    /// `_CRS` (the single IRQ it currently drives). PCI interrupts are
+    /// level-triggered, active-low and shared.
+    pub fn irq_flags(
+        &mut self,
+        irqs: &[u8],
+        edge: bool,
+        active_low: bool,
+        shared: bool,
+    ) -> &mut Self {
+        let mut mask: u16 = 0;
+        for &irq in irqs {
+            if irq < 16 {
+                mask |= 1u16 << irq;
+            }
+        }
+        self.data.push(0x23);
+        self.data.extend_from_slice(&mask.to_le_bytes());
+        // Information byte: bit0 = mode (1=edge, 0=level), bit3 = sharing
+        // (1=shared), bit4 = polarity (1=active low).
+        let mut flags = 0u8;
+        if edge {
+            flags |= 1 << 0;
+        }
+        if shared {
+            flags |= 1 << 3;
+        }
+        if active_low {
+            flags |= 1 << 4;
+        }
+        self.data.push(flags);
         self
     }
 
@@ -809,6 +879,42 @@ mod tests {
         // The inner Return (APIC, GSI16) sits inside the If.
         assert_eq!(bytes[pred + 4], opcode::RETURN_OP);
         assert_eq!(bytes[pred + 5], opcode::PACKAGE_OP);
+    }
+
+    #[test]
+    fn return_routing_table_via_links_encodes_a_named_source() {
+        let mut aml = AmlBuilder::new();
+        // slot 0 INTA -> LNKA: { 0x0000FFFF, 0, LNKA, 0 }.
+        aml.return_routing_table_via_links(&[(0x0000_FFFF, 0, *b"LNKA")]);
+        let bytes = aml.into_bytes();
+        assert_eq!(bytes[0], opcode::RETURN_OP);
+        assert_eq!(bytes[1], opcode::PACKAGE_OP);
+        let (val, field) = decode_pkg_length(&bytes[2..]);
+        assert_eq!(val, bytes.len() - 2, "outer package self-consistent");
+        // NumElements 1, then a sub-package.
+        let num = 2 + field;
+        assert_eq!(bytes[num], 1);
+        assert_eq!(bytes[num + 1], opcode::PACKAGE_OP);
+        // The Source element is the bare NameSeg "LNKA" (not an integer 0), and the
+        // SourceIndex after it is ZERO.
+        let seg = bytes
+            .windows(5)
+            .find(|w| w[..4] == *b"LNKA")
+            .expect("link NameSeg present");
+        assert_eq!(seg[4], opcode::ZERO, "SourceIndex follows the link name");
+    }
+
+    #[test]
+    fn irq_flags_descriptor_encodes_mask_and_mode() {
+        // A PCI-link _PRS: level, active-low, shared over IRQs {10, 11}.
+        let mut rt = ResourceTemplate::new();
+        rt.irq_flags(&[10, 11], false, true, true);
+        let b = rt.as_bytes();
+        assert_eq!(b[0], 0x23);
+        let mask = u16::from_le_bytes([b[1], b[2]]);
+        assert_eq!(mask, (1 << 10) | (1 << 11));
+        // flags: level (bit0=0), shared (bit3=1), active-low (bit4=1) => 0x18.
+        assert_eq!(b[3], 0x18);
     }
 
     #[test]
