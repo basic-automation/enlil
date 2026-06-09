@@ -1490,6 +1490,17 @@ Physical USB Devices
   (`PNP0C0F` + `_PRS`/`_SRS` over the PIRQRC registers) selected by a method-based
   `_PRT` keyed on `PICF` — needs If/Else/Store AML helpers, and ideally an `iasl`
   check on the runner to validate control-flow AML.
+- **Reference-compiler validation (2026-06-09):** `acpica-tools`/`iasl` installs from
+  the distro repo on the runner, so the synthesized tables are now round-tripped
+  through the Intel ACPI compiler (`iasl -d` then recompile) by a self-skipping
+  integration test that asserts 0 errors / 0 warnings on **every** table. This first
+  full validation found and fixed two latent bugs the byte-decode tests missed: the
+  PCI root carried both `_HID` and `_ADR` (§6.1 violation, iasl 3073), and the TPM2
+  table declared revision 4 but emitted the 52-byte rev-3 body (truncated
+  mid-structure — must be the full 76-byte layout with Start Method params + log
+  fields). The full ACPI surface now compiles clean, **unblocking** the PIC-mode
+  `_PRT` work above (author the If/Else AML + link devices against the validating
+  compiler). Install `acpica-tools` in CI to make this a hard gate.
 
 ### 5.2 SMBIOS Synthesis
 - Generate SMBIOS/DMI tables that report:
