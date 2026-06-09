@@ -114,6 +114,7 @@ impl GenericAddress {
 pub struct FadtBuilder {
     oem: OemInfo,
     dsdt_address: u64,
+    facs_address: u64,
     sci_interrupt: u16,
     smi_command: u32,
     acpi_enable: u8,
@@ -137,6 +138,7 @@ impl FadtBuilder {
         Self {
             oem: OemInfo::default(),
             dsdt_address,
+            facs_address: 0,
             sci_interrupt: 9,
             // SMI command port + enable/disable values are owned by the
             // SMI-command device model, so the table and the port that actually
@@ -189,6 +191,14 @@ impl FadtBuilder {
         self
     }
 
+    /// Set the physical address of the FACS (the FADT's `FIRMWARE_CTRL` /
+    /// `X_FIRMWARE_CTRL`). Leave at the default `0` for a FADT with no FACS.
+    #[must_use]
+    pub const fn firmware_ctrl(mut self, facs_address: u64) -> Self {
+        self.facs_address = facs_address;
+        self
+    }
+
     #[must_use]
     pub const fn flags(mut self, flags: u32) -> Self {
         self.flags = flags;
@@ -228,8 +238,10 @@ impl FadtBuilder {
         let header = AcpiSdtHeader::new(*b"FACP", FADT_LENGTH, FADT_REVISION, &self.oem);
         buf.extend_from_slice(&header.to_bytes());
 
-        // Offset 36: FIRMWARE_CTRL (4 bytes) — 32-bit physical address of FACS
-        buf.extend_from_slice(&0u32.to_le_bytes());
+        // Offset 36: FIRMWARE_CTRL (4 bytes) — 32-bit physical address of FACS.
+        // Set when the FACS is below 4 GiB; the 64-bit X_FIRMWARE_CTRL below
+        // mirrors it (both set and equal, matching the DSDT/X_DSDT pattern).
+        buf.extend_from_slice(&(u32_of(self.facs_address)).to_le_bytes());
         // Offset 40: DSDT (4 bytes) — 32-bit physical address of DSDT
         buf.extend_from_slice(&(u32_of(self.dsdt_address)).to_le_bytes());
         // Offset 44: Reserved (was INT_MODEL in ACPI 1.0)
@@ -312,8 +324,8 @@ impl FadtBuilder {
         buf.extend_from_slice(&0u16.to_le_bytes());
         // Offset 131: FADT Minor Version
         buf.push(1); // 6.1
-        // Offset 132: X_FIRMWARE_CTRL (8 bytes)
-        buf.extend_from_slice(&0u64.to_le_bytes());
+        // Offset 132: X_FIRMWARE_CTRL (8 bytes) — 64-bit physical address of FACS.
+        buf.extend_from_slice(&self.facs_address.to_le_bytes());
         // Offset 140: X_DSDT (8 bytes)
         buf.extend_from_slice(&self.dsdt_address.to_le_bytes());
         // Offset 148: X_PM1a_EVT_BLK (12 bytes GAS)

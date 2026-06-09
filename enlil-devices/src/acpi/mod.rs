@@ -21,6 +21,7 @@
 pub mod aml;
 pub mod bgrt;
 pub mod dsdt;
+pub mod facs;
 pub mod fadt;
 pub mod hpet;
 pub mod madt;
@@ -170,9 +171,19 @@ pub fn build_acpi_tables(config: &AcpiTableSetConfig) -> AcpiTableSet {
     let tpm2_start = bgrt_start + bgrt_bytes.len();
     let dsdt_start = tpm2_start + tpm2_bytes.len();
 
-    // Build FADT with DSDT address
+    // The FACS lives in the 64-byte-aligned padding between the XSDT and the
+    // FADT (the region is zero-filled to `fadt_offset` below). It is referenced
+    // only through the FADT's FIRMWARE_CTRL, never the XSDT, so it is not a
+    // table-set entry. ACPI requires 64-byte alignment; offset 128 over the
+    // 64-byte-aligned table base satisfies that and fits before the FADT at 256.
+    let facs_offset = 128usize;
+    let facs_bytes = facs::FacsBuilder::new().build();
+    let facs_gpa = base + facs_offset as u64;
+
+    // Build FADT with DSDT + FACS addresses
     let dsdt_gpa = base + dsdt_start as u64;
     let fadt_bytes = fadt::FadtBuilder::new(dsdt_gpa)
+        .firmware_ctrl(facs_gpa)
         .oem_info(config.oem.clone())
         .build();
 
@@ -206,6 +217,9 @@ pub fn build_acpi_tables(config: &AcpiTableSetConfig) -> AcpiTableSet {
     tables.resize(fadt_offset, 0);
     tables[xsdt_offset..xsdt_offset + xsdt_bytes.len()].copy_from_slice(&xsdt_bytes);
     offsets.push(("XSDT".to_string(), xsdt_offset));
+    // Place the FACS in the aligned padding (not an XSDT entry; reached via the
+    // FADT's FIRMWARE_CTRL set above).
+    tables[facs_offset..facs_offset + facs_bytes.len()].copy_from_slice(&facs_bytes);
     for (name, bytes) in [
         ("FADT", &fadt_bytes),
         ("MADT", &madt_bytes),
@@ -274,6 +288,43 @@ mod tests {
         assert!(names.contains(&"BGRT"));
         assert!(names.contains(&"TPM2"));
         assert!(names.contains(&"DSDT"));
+    }
+
+    #[test]
+    fn fadt_points_to_a_valid_facs_in_the_buffer() {
+        let config = AcpiTableSetConfig::default();
+        let table_set = build_acpi_tables(&config);
+        let base = config.table_base_address;
+
+        // Locate the FADT and read its FIRMWARE_CTRL (offset 36) and
+        // X_FIRMWARE_CTRL (offset 132); both must agree and be non-zero.
+        let fadt_off = table_set
+            .table_offsets
+            .iter()
+            .find(|(n, _)| n == "FADT")
+            .expect("FADT present")
+            .1;
+        let fadt = &table_set.tables[fadt_off..];
+        let firmware_ctrl = u32::from_le_bytes(fadt[36..40].try_into().unwrap());
+        let x_firmware_ctrl = u64::from_le_bytes(fadt[132..140].try_into().unwrap());
+        assert_ne!(firmware_ctrl, 0, "FADT must reference a FACS");
+        assert_eq!(
+            u64::from(firmware_ctrl),
+            x_firmware_ctrl,
+            "32/64-bit FACS pointers agree"
+        );
+
+        // The pointer is a guest-physical address; convert back to a buffer offset
+        // and confirm a 64-byte, version-2 "FACS" sits there, 64-byte aligned.
+        let facs_off = usize::try_from(x_firmware_ctrl - base).unwrap();
+        assert_eq!(facs_off % 64, 0, "FACS must be 64-byte aligned");
+        let facs = &table_set.tables[facs_off..];
+        assert_eq!(&facs[0..4], b"FACS");
+        assert_eq!(u32::from_le_bytes(facs[4..8].try_into().unwrap()), 64);
+        assert_eq!(facs[32], facs::FACS_VERSION);
+        // The FACS must not overlap the XSDT (which starts at offset 0).
+        let xsdt_len = u32::from_le_bytes(table_set.tables[4..8].try_into().unwrap()) as usize;
+        assert!(facs_off >= xsdt_len, "FACS must sit past the XSDT");
     }
 
     #[test]
