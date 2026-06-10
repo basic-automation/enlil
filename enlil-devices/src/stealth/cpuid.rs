@@ -310,6 +310,57 @@ impl CpuidStealthTable {
             });
         }
 
+        // 0x80000005/0x80000006: legacy L1/L2/L3 cache + TLB info (field
+        // layouts per AMD APM Fn8000_0005/6, cross-checked against Linux's
+        // cacheinfo.c `union l1_cache`/`l2_cache`/`l3_cache`). Both were
+        // in-range zeros: on Intel that contradicts the leaf-4 hierarchy
+        // ("no L2" vs a 256 KiB L2 — a one-instruction cross-check for a
+        // detector); on AMD these legacy leaves are the *primary* cache
+        // enumeration a guest parses.
+        match config.vendor {
+            CpuVendor::Intel => {
+                // Intel implements only ECX (L2): 256 KiB, 4-way (encoding 4),
+                // 64-byte lines — matching leaf-4 subleaf 2. 0x80000005 stays
+                // reserved-zero on Intel.
+                entries.push(CpuidCacheEntry {
+                    leaf: 0x8000_0006,
+                    subleaf: 0,
+                    result: CpuidResult {
+                        ecx: 64 | (4 << 12) | (256 << 16),
+                        ..CpuidResult::default()
+                    },
+                });
+            }
+            CpuVendor::Amd => {
+                // L1d/L1i: 32 KiB, 8-way (direct encoding), 1 line/tag,
+                // 64-byte lines; 64-entry fully-associative (0xFF) I/D TLBs
+                // for both 2M/4M (EAX) and 4K (EBX) pages — Zen-typical.
+                let l1 = 64 | (1 << 8) | (8 << 16) | (32 << 24);
+                let tlb = 0xFF40_FF40;
+                entries.push(CpuidCacheEntry {
+                    leaf: 0x8000_0005,
+                    subleaf: 0,
+                    result: CpuidResult {
+                        eax: tlb,
+                        ebx: tlb,
+                        ecx: l1, // L1 data
+                        edx: l1, // L1 instruction
+                    },
+                });
+                // L2 (ECX): 1 MiB, 8-way (encoding 6). L3 (EDX): 32 MiB
+                // (size_encoded × 512 KiB → 64), 16-way (encoding 8).
+                entries.push(CpuidCacheEntry {
+                    leaf: 0x8000_0006,
+                    subleaf: 0,
+                    result: CpuidResult {
+                        ecx: 64 | (6 << 12) | (1024 << 16),
+                        edx: 64 | (8 << 12) | (64 << 18),
+                        ..CpuidResult::default()
+                    },
+                });
+            }
+        }
+
         // 0x80000007 EDX[8]: invariant TSC (same bit on Intel and AMD). Every
         // CPU of the advertised generation sets it; leaving it clear tells the
         // guest the TSC stops in deep C-states / varies with P-states, so
@@ -929,6 +980,41 @@ mod tests {
         let table = CpuidStealthTable::build(&cfg);
         assert_eq!(table.lookup(1, 0).ecx & (1 << 3), 0, "MONITOR hidden");
         assert_eq!(table.lookup(5, 0), CpuidResult::default(), "leaf 5 empty");
+    }
+
+    #[test]
+    fn intel_extended_l2_matches_the_leaf_4_hierarchy() {
+        // 0x80000006 ECX must describe the same L2 as leaf 4 subleaf 2: a
+        // detector can compare the two with one instruction each.
+        let table = CpuidStealthTable::build(&intel_config());
+        let ecx = table.lookup(0x8000_0006, 0).ecx;
+        let (size_kb, assoc_code, line) = (ecx >> 16, (ecx >> 12) & 0xF, ecx & 0xFF);
+        assert_eq!(assoc_code, 4, "4-way (legacy encoding)");
+        assert_eq!(line, 64);
+
+        let (_, lvl, l4_size, _) = decode_cache(table.lookup(4, 2));
+        assert_eq!(lvl, 2);
+        assert_eq!(u64::from(size_kb) * 1024, l4_size, "L2 sizes must agree");
+    }
+
+    #[test]
+    fn amd_legacy_cache_leaves_are_populated() {
+        let table = CpuidStealthTable::build(&test_config());
+
+        // Fn8000_0005: L1d (ECX) and L1i (EDX): 32 KiB, 8-way, 64-byte lines.
+        let r5 = table.lookup(0x8000_0005, 0);
+        for l1 in [r5.ecx, r5.edx] {
+            assert_eq!(l1 >> 24, 32, "size KiB");
+            assert_eq!((l1 >> 16) & 0xFF, 8, "associativity (direct)");
+            assert_eq!(l1 & 0xFF, 64, "line size");
+        }
+        assert_ne!(r5.eax, 0, "TLB info present");
+
+        // Fn8000_0006: L2 = 1 MiB 8-way (encoding 6); L3 = 32 MiB (64 × 512 KiB).
+        let r6 = table.lookup(0x8000_0006, 0);
+        assert_eq!(r6.ecx >> 16, 1024, "L2 KiB");
+        assert_eq!((r6.ecx >> 12) & 0xF, 6, "L2 8-way encoding");
+        assert_eq!(r6.edx >> 18, 64, "L3 size_encoded × 512 KiB = 32 MiB");
     }
 
     #[test]
