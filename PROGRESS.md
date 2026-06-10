@@ -8,7 +8,7 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ## 2026-06-10 (b) — Session: vPMU/CPUID cross-surface consistency arc + TPM/LBR consolidation + CI validator gates
 
-**15 commits, each independently green** (PR #19, branch `claude/awesome-faraday-yud61k`).
+**14 code/CI increments + docs/hand-off commits, each independently green** (PR #19, branch `claude/awesome-faraday-yud61k`).
 Second session today; picked up the morning hand-off's items 1, 2, 4 and 5 and extended them
 into a coherent arc: *every guest-visible surface that encodes the same fact must agree*.
 Workspace tests **881 → 897** (`cargo test --workspace`: 897 passed, 0 failed, 1 ignored =
