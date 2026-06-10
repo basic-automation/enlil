@@ -377,11 +377,20 @@ impl AmlBuilder {
     /// \\link, SourceIndex }`. `link` is a 4-char `NameSeg` (e.g. `b"LNKA"`) that
     /// resolves relative to the `_PRT`'s scope. In a package, a bare `NameSeg` is a
     /// reference the OS follows to the link device's `_CRS`/`_PRS`/`_SRS`.
-    fn encode_named_prt_entry(address: u64, pin: u64, link: [u8; 4], source_index: u64) -> Vec<u8> {
+    fn encode_named_prt_entry(
+        address: u64,
+        pin: u64,
+        link: &[[u8; 4]],
+        source_index: u64,
+    ) -> Vec<u8> {
         let mut body = vec![4u8]; // NumElements
         body.extend_from_slice(&Self::encode_integer_const(address));
         body.extend_from_slice(&Self::encode_integer_const(pin));
-        body.extend_from_slice(&link); // NameSeg reference to the link device
+        // Absolute (root-anchored) path to the link device. A `_PRT` is a Method, so
+        // its body adds a scope level; a *relative* multi-seg path would resolve under
+        // `…._PRT` (multi-seg paths get no upward search) and not exist. A rooted path
+        // resolves unambiguously regardless of the enclosing method scope.
+        body.extend_from_slice(&Self::encode_rooted_name_path(link));
         body.extend_from_slice(&Self::encode_integer_const(source_index));
         let mut out = vec![opcode::PACKAGE_OP];
         out.extend_from_slice(&Self::encode_self_pkg_length(body.len()));
@@ -389,14 +398,52 @@ impl AmlBuilder {
         out
     }
 
+    /// Encode a `NameString` from its path segments: a bare `NameSeg` (1), a
+    /// `DualNamePrefix` pair (2), or a `MultiNamePrefix` run (≥3), per ACPI 6.x
+    /// §20.2.2. A multi-segment name resolves *relative to the current scope*
+    /// (no upward search), which is how a `_PRT` under `PCI0` points at a link
+    /// device nested under the ISA bridge (`ISA_.LNKA`).
+    fn encode_name_path(segs: &[[u8; 4]]) -> Vec<u8> {
+        match segs {
+            [one] => one.to_vec(),
+            [a, b] => {
+                let mut v = vec![0x2E]; // DualNamePrefix
+                v.extend_from_slice(a);
+                v.extend_from_slice(b);
+                v
+            }
+            many => {
+                let mut v = vec![0x2F, many.len().to_le_bytes()[0]]; // MultiNamePrefix + SegCount
+                for s in many {
+                    v.extend_from_slice(s);
+                }
+                v
+            }
+        }
+    }
+
+    /// A root-anchored `NameString`: `RootChar` (`\`) followed by the name path
+    /// (ACPI 6.x §20.2.2). Resolves from the namespace root regardless of the
+    /// current scope — used for a `_PRT` `Source` that must point at a link device
+    /// by absolute path from inside the `_PRT` method.
+    fn encode_rooted_name_path(segs: &[[u8; 4]]) -> Vec<u8> {
+        let mut v = vec![0x5C]; // RootChar
+        v.extend_from_slice(&Self::encode_name_path(segs));
+        v
+    }
+
     /// `Return(Package(){ ... })` for a PIC-mode `_PRT` that routes each entry
     /// through a named PCI interrupt **link device** (the PIIX/ICH firmware
-    /// pattern). Each entry is `(address, pin, link_nameseg)`; `SourceIndex` is
+    /// pattern). Each entry is `(address, pin, link_path)` where `link_path` is the
+    /// link device's name segments (e.g. `&[*b"ISA_", *b"LNKA"]`); `SourceIndex` is
     /// always 0 (the link's first/only resource).
-    pub fn return_routing_table_via_links(&mut self, entries: &[(u64, u64, [u8; 4])]) -> &mut Self {
+    pub fn return_routing_table_via_links(
+        &mut self,
+        entries: &[(u64, u64, &[[u8; 4]])],
+    ) -> &mut Self {
         let mut body = vec![entries.len().to_le_bytes()[0]];
         for (address, pin, link) in entries {
-            body.extend_from_slice(&Self::encode_named_prt_entry(*address, *pin, *link, 0));
+            body.extend_from_slice(&Self::encode_named_prt_entry(*address, *pin, link, 0));
         }
         self.data.push(opcode::RETURN_OP);
         self.data.push(opcode::PACKAGE_OP);
@@ -1048,8 +1095,12 @@ mod tests {
     #[test]
     fn return_routing_table_via_links_encodes_a_named_source() {
         let mut aml = AmlBuilder::new();
-        // slot 0 INTA -> LNKA: { 0x0000FFFF, 0, LNKA, 0 }.
-        aml.return_routing_table_via_links(&[(0x0000_FFFF, 0, *b"LNKA")]);
+        // slot 0 INTA -> \_SB.PCI0.ISA_.LNKA: { 0x0000FFFF, 0, \_SB.PCI0.ISA_.LNKA, 0 }.
+        aml.return_routing_table_via_links(&[(
+            0x0000_FFFF,
+            0,
+            &[*b"_SB_", *b"PCI0", *b"ISA_", *b"LNKA"],
+        )]);
         let bytes = aml.into_bytes();
         assert_eq!(bytes[0], opcode::RETURN_OP);
         assert_eq!(bytes[1], opcode::PACKAGE_OP);
@@ -1059,13 +1110,34 @@ mod tests {
         let num = 2 + field;
         assert_eq!(bytes[num], 1);
         assert_eq!(bytes[num + 1], opcode::PACKAGE_OP);
-        // The Source element is the bare NameSeg "LNKA" (not an integer 0), and the
-        // SourceIndex after it is ZERO.
+        // The Source element is a rooted MultiName path \_SB.PCI0.ISA_.LNKA:
+        // RootChar 0x5C, MultiNamePrefix 0x2F, SegCount 4, then the four segs.
         let seg = bytes
-            .windows(5)
-            .find(|w| w[..4] == *b"LNKA")
-            .expect("link NameSeg present");
-        assert_eq!(seg[4], opcode::ZERO, "SourceIndex follows the link name");
+            .windows(20)
+            .find(|w| {
+                w[0] == 0x5C
+                    && w[1] == 0x2F
+                    && w[2] == 0x04
+                    && w[3..7] == *b"_SB_"
+                    && w[7..11] == *b"PCI0"
+                    && w[11..15] == *b"ISA_"
+                    && w[15..19] == *b"LNKA"
+            })
+            .expect("rooted multiname link path present");
+        assert_eq!(seg[19], opcode::ZERO, "SourceIndex follows the link path");
+    }
+
+    #[test]
+    fn encode_name_path_handles_single_dual_and_multi() {
+        assert_eq!(AmlBuilder::encode_name_path(&[*b"LNKA"]), b"LNKA".to_vec());
+        assert_eq!(
+            AmlBuilder::encode_name_path(&[*b"ISA_", *b"LNKA"]),
+            [&[0x2E][..], b"ISA_", b"LNKA"].concat()
+        );
+        assert_eq!(
+            AmlBuilder::encode_name_path(&[*b"PCI0", *b"ISA_", *b"LNKA"]),
+            [&[0x2F, 0x03][..], b"PCI0", b"ISA_", b"LNKA"].concat()
+        );
     }
 
     #[test]

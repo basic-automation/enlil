@@ -166,16 +166,16 @@ impl DsdtBuilder {
             );
         aml.name_resource_template(b"_CRS", &crs);
 
-        // PCI interrupt link devices (PNP0C0F) — LNKA..LNKD — that the PIC-mode
-        // _PRT routes through. Defined under PCI0 so the _PRT's bare NameSeg
-        // references resolve.
-        Self::build_pci_link_devices(aml);
-
-        // _PRT — PCI interrupt routing for bus 0.
-        Self::build_pci_routing_table(aml);
-
-        // ISA/LPC bridge
+        // ISA/LPC bridge — carries the PIRQ OperationRegion/Field and the LNKA..LNKD
+        // link devices. Emitted *before* the _PRT so the routing table's `ISA_.LNKx`
+        // references resolve to already-defined objects (a forward reference would make
+        // a disassembler treat them as External and break the round-trip).
         self.build_isa_bridge(aml);
+
+        // _PRT — PCI interrupt routing for bus 0. The PIC-mode branch routes through
+        // the link devices under the ISA bridge above, referenced by the path
+        // `ISA_.LNKx`.
+        Self::build_pci_routing_table(aml);
 
         aml.device_end(&pci0);
     }
@@ -183,25 +183,36 @@ impl DsdtBuilder {
     /// The four PCI interrupt link-device names (`PIRQ[A-D]`), in line order.
     const LINK_NAMES: [[u8; 4]; 4] = [*b"LNKA", *b"LNKB", *b"LNKC", *b"LNKD"];
 
+    /// The four `Field` names overlaying the PIIX3 PIRQRC[A-D] route-control bytes
+    /// (config 0x60-0x63), one per PIRQ line, in line order.
+    const PIRQ_FIELDS: [[u8; 4]; 4] = [*b"PIRA", *b"PIRB", *b"PIRC", *b"PIRD"];
+
     /// Build the four PCI interrupt **link devices** (`PNP0C0F`), one per `PIRQ`
     /// line, exactly as a real PIIX/ICH DSDT does. Each link carries:
     /// - `_PRS`: the set of ISA IRQs the line *may* be routed to (level, active-low,
     ///   shared — PCI interrupt electrical characteristics);
-    /// - `_CRS`: the single IRQ it currently drives — its firmware-default
-    ///   [`PIRQ_DEFAULT_IRQS`] entry, so it agrees with the PIC `_PRT` and the
-    ///   routing the firmware programs;
-    /// - `_STA`/`_DIS`/`_SRS`: present-and-enabled status, plus the disable/set
-    ///   methods the OS calls. Routing is fixed in this model, so `_SRS`/`_DIS` are
-    ///   accepted no-ops and `_CRS` stays authoritative.
+    /// - `_STA`: present-and-enabled (0x0B);
+    /// - `_CRS`/`_DIS`/`_SRS`: **live** routing — they read and rewrite the PIIX3
+    ///   PIRQRC register (the `PIRA..PIRD` field over this bridge's config space).
+    ///
+    /// `_CRS` reports the IRQ the register currently selects (`PIRx & 0x0F`) by
+    /// building the IRQ mask `1 << irq` into a resource buffer; `_DIS` sets the
+    /// route-disable bit (`Or(PIRx, 0x80)`); `_SRS` extracts the chosen IRQ from the
+    /// passed resource buffer (`FindSetRightBit` of the IRQ mask, minus one) and
+    /// stores it into `PIRx`, which clears the disable bit and reprograms the line.
+    /// Because `PIRx` is the same config byte the live `PirqRouter` reads back via
+    /// `sync_from_config`, a PIC-mode guest that reroutes a PCI interrupt actually
+    /// moves it and `_CRS` reflects the change — no longer an accepted no-op.
     ///
     /// Their absence (a `_PRT` with only integer GSI/IRQ sources) is itself a
     /// divergence from how every real PIIX/ICH platform describes PCI interrupts.
     fn build_pci_link_devices(aml: &mut AmlBuilder) {
-        use crate::interrupt::PIRQ_DEFAULT_IRQS;
+        use crate::acpi::aml::Operand;
         // The IRQs a PIRQ line may be routed to (PCI-routable ISA IRQs).
         const ROUTABLE: &[u8] = &[3, 4, 5, 6, 7, 9, 10, 11, 12, 14, 15];
 
         for (i, name) in Self::LINK_NAMES.iter().enumerate() {
+            let pirx = &Self::PIRQ_FIELDS[i];
             let dev = aml.device_start(name);
             aml.name_string(b"_HID", "PNP0C0F");
             aml.name_integer(b"_UID", (i + 1) as u64);
@@ -211,20 +222,35 @@ impl DsdtBuilder {
             prs.irq_flags(ROUTABLE, false, true, true);
             aml.name_resource_template(b"_PRS", &prs);
 
-            // _CRS — the IRQ currently driven (the firmware default for this line).
-            let mut crs = ResourceTemplate::new();
-            crs.irq_flags(&[PIRQ_DEFAULT_IRQS[i]], false, true, true);
-            aml.name_resource_template(b"_CRS", &crs);
-
             // _STA — present, enabled (0x0B = bits 0,1,3).
             let sta = aml.method_start(b"_STA", 0, false);
             aml.return_integer(0x0B);
             aml.method_end(&sta);
 
-            // _DIS / _SRS — accepted no-ops (routing is fixed).
+            // _CRS — build a single-IRQ resource buffer from the live register.
+            // Serialized: it creates the BUF0/IRQM named objects.
+            let crs = aml.method_start(b"_CRS", 0, true);
+            let mut tmpl = ResourceTemplate::new();
+            tmpl.irq_flags(&[], false, true, true); // placeholder mask, overwritten below
+            aml.name_resource_template(b"BUF0", &tmpl);
+            aml.create_word_field(Operand::Name(b"BUF0"), 0x01, b"IRQM");
+            aml.and_op(Operand::Name(pirx), Operand::Int(0x0F), Operand::Local(0));
+            aml.shift_left(Operand::Int(1), Operand::Local(0), Operand::Name(b"IRQM"));
+            aml.return_name(b"BUF0");
+            aml.method_end(&crs);
+
+            // _DIS — set the route-disable bit (bit 7) in the register.
             let dis = aml.method_start(b"_DIS", 0, false);
+            aml.or_op(Operand::Name(pirx), Operand::Int(0x80), Operand::Name(pirx));
             aml.method_end(&dis);
-            let srs = aml.method_start(b"_SRS", 1, false);
+
+            // _SRS(Arg0) — program the register from the chosen IRQ in the buffer.
+            // Serialized: it creates the IRQM named object over Arg0.
+            let srs = aml.method_start(b"_SRS", 1, true);
+            aml.create_word_field(Operand::Arg(0), 0x01, b"IRQM");
+            aml.find_set_right_bit(Operand::Name(b"IRQM"), Operand::Local(0));
+            aml.subtract(Operand::Local(0), Operand::Int(1), Operand::Local(0));
+            aml.store(Operand::Local(0), Operand::Name(pirx));
             aml.method_end(&srs);
 
             aml.device_end(&dev);
@@ -260,7 +286,9 @@ impl DsdtBuilder {
         use crate::interrupt::PirqRouter;
 
         let mut apic: Vec<[u64; 4]> = Vec::with_capacity(32 * 4);
-        let mut pic: Vec<(u64, u64, [u8; 4])> = Vec::with_capacity(32 * 4);
+        // Each PIC entry carries the absolute path `\_SB.PCI0.ISA_.LNKx` to the link
+        // device, which lives under the ISA bridge alongside its PIRQ register.
+        let mut pic_paths: Vec<(u64, u64, [[u8; 4]; 4])> = Vec::with_capacity(32 * 4);
         for slot in 0u8..32 {
             for prt_pin in 0u8..4 {
                 // _PRT pin 0=INTA..3=INTD; the router uses 1=INTA..4=INTD.
@@ -270,16 +298,24 @@ impl DsdtBuilder {
                 }
                 // PIC mode routes through the link device for this PIRQ line.
                 if let Some(line) = PirqRouter::pirq_line(slot, prt_pin + 1) {
-                    pic.push((address, u64::from(prt_pin), Self::LINK_NAMES[line]));
+                    pic_paths.push((
+                        address,
+                        u64::from(prt_pin),
+                        [*b"_SB_", *b"PCI0", *b"ISA_", Self::LINK_NAMES[line]],
+                    ));
                 }
             }
         }
+        let pic: Vec<(u64, u64, &[[u8; 4]])> = pic_paths
+            .iter()
+            .map(|(addr, pin, path)| (*addr, *pin, &path[..]))
+            .collect();
 
         let method = aml.method_start(b"_PRT", 0, false);
         let if_apic = aml.if_name_start(b"PICF");
         aml.return_routing_table(&apic);
         aml.if_end(&if_apic);
-        // Fall-through (PICF == 0): PIC mode, routed through the LNK[A-D] devices.
+        // Fall-through (PICF == 0): PIC mode, routed through the ISA_.LNK[A-D] devices.
         aml.return_routing_table_via_links(&pic);
         aml.method_end(&method);
     }
@@ -297,6 +333,33 @@ impl DsdtBuilder {
             b"_ADR",
             u64::from(crate::pcie::PIIX3_ISA_BRIDGE_BDF.acpi_adr()),
         );
+
+        // PIRQ route-control registers (PIIX3 config 0x60-0x63) as an OperationRegion
+        // over *this* bridge's PCI config space, with one byte-wide Field per PIRQ
+        // line. The link devices below read and rewrite these to report and reprogram
+        // their routing — so a guest's _SRS actually lands in the same config bytes the
+        // live PirqRouter reads. Declared here (not under PCI0) because a PCI_Config
+        // region resolves to the enclosing device's _ADR (00:01.0), which is where the
+        // PIRQRC registers actually live.
+        aml.operation_region(
+            b"PIRR",
+            crate::acpi::aml::opcode::REGION_SPACE_PCI_CONFIG,
+            0x60,
+            0x04,
+        );
+        aml.field(
+            b"PIRR",
+            &[
+                (Some(Self::PIRQ_FIELDS[0]), 8),
+                (Some(Self::PIRQ_FIELDS[1]), 8),
+                (Some(Self::PIRQ_FIELDS[2]), 8),
+                (Some(Self::PIRQ_FIELDS[3]), 8),
+            ],
+        );
+
+        // PCI interrupt link devices (PNP0C0F) — LNKA..LNKD — nested here so their
+        // methods reference the PIRA..PIRD fields above by bare NameSeg.
+        Self::build_pci_link_devices(aml);
 
         // RTC
         if self.config.has_rtc {
@@ -593,21 +656,29 @@ mod tests {
             "_PRT must contain the APIC slot-0 INTA -> GSI16 entry"
         );
 
-        // PIC-mode fall-through table routes through the link devices: slot 0 INTA
-        // -> PIRQA -> LNKA, encoded { Word 0x0000FFFF, pin ZERO, NameSeg LNKA,
+        // PIC-mode fall-through table routes through the link devices by absolute
+        // path: slot 0 INTA -> PIRQA -> \_SB.PCI0.ISA_.LNKA, encoded { Word 0x0000FFFF,
+        // pin ZERO, RootChar 0x5C MultiNamePrefix 0x2F SegCount 4 _SB_ PCI0 ISA_ LNKA,
         // SourceIndex ZERO }.
-        let pic0 = [0x04u8, 0x0B, 0xFF, 0xFF, 0x00, b'L', b'N', b'K', b'A', 0x00];
+        let pic0 = [
+            0x04u8, 0x0B, 0xFF, 0xFF, 0x00, // NumElements, Word addr 0xFFFF, pin ZERO
+            0x5C, 0x2F, 0x04, b'_', b'S', b'B', b'_', b'P', b'C', b'I', b'0', b'I', b'S', b'A',
+            b'_', b'L', b'N', b'K', b'A', // \_SB.PCI0.ISA_.LNKA
+            0x00, // SourceIndex ZERO
+        ];
         assert!(
             dsdt.windows(pic0.len()).any(|w| w == pic0),
-            "_PRT PIC entry must route slot-0 INTA through link LNKA"
+            "_PRT PIC entry must route slot-0 INTA through \\_SB.PCI0.ISA_.LNKA"
         );
-        // Slot 1 INTA -> PIRQB -> LNKB, DWord addr 0x0001FFFF.
+        // Slot 1 INTA -> PIRQB -> \_SB.PCI0.ISA_.LNKB, DWord addr 0x0001FFFF.
         let pic1 = [
-            0x04u8, 0x0C, 0xFF, 0xFF, 0x01, 0x00, 0x00, b'L', b'N', b'K', b'B', 0x00,
+            0x04u8, 0x0C, 0xFF, 0xFF, 0x01, 0x00, 0x00, // NumElements, DWord addr, pin ZERO
+            0x5C, 0x2F, 0x04, b'_', b'S', b'B', b'_', b'P', b'C', b'I', b'0', b'I', b'S', b'A',
+            b'_', b'L', b'N', b'K', b'B', 0x00,
         ];
         assert!(
             dsdt.windows(pic1.len()).any(|w| w == pic1),
-            "_PRT PIC entry must route slot-1 INTA through link LNKB"
+            "_PRT PIC entry must route slot-1 INTA through \\_SB.PCI0.ISA_.LNKB"
         );
         let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         assert_eq!(sum, 0);
@@ -615,7 +686,7 @@ mod tests {
 
     #[test]
     fn dsdt_defines_pci_interrupt_link_devices() {
-        use crate::interrupt::PIRQ_DEFAULT_IRQS;
+        use super::super::aml::opcode;
         let dsdt = DsdtBuilder::new(DsdtConfig::default()).build();
         // All four PNP0C0F link devices are present.
         assert!(
@@ -628,13 +699,42 @@ mod tests {
                 "link device {name:?} must be defined"
             );
         }
-        // LNKA's _CRS reports its firmware-default IRQ (PIRQ_DEFAULT_IRQS[0]=11) as a
-        // single-IRQ level/active-low/shared descriptor: 0x23, mask=1<<11, flags 0x18.
-        let mask = 1u16 << PIRQ_DEFAULT_IRQS[0];
-        let crs = [0x23u8, (mask & 0xFF) as u8, (mask >> 8) as u8, 0x18];
+        // The PIRQ route-control registers are exposed: an OperationRegion named PIRR
+        // and a Field naming the four PIRA..PIRD bytes.
         assert!(
-            dsdt.windows(crs.len()).any(|w| w == crs),
-            "a link _CRS must report its default IRQ as a level/active-low/shared descriptor"
+            dsdt.windows(4).any(|w| w == b"PIRR"),
+            "the PIRQ OperationRegion (PIRR) must be declared"
+        );
+        for f in [b"PIRA", b"PIRB", b"PIRC", b"PIRD"] {
+            assert!(
+                dsdt.windows(4).any(|w| w == f),
+                "field {f:?} must overlay its PIRQRC byte"
+            );
+        }
+        // _DIS sets the disable bit: Or(PIRA, 0x80, PIRA) =
+        // OR_OP "PIRA" BYTE_PREFIX 0x80 "PIRA".
+        let dis = [
+            opcode::OR_OP,
+            b'P',
+            b'I',
+            b'R',
+            b'A',
+            opcode::BYTE_PREFIX,
+            0x80,
+            b'P',
+            b'I',
+            b'R',
+            b'A',
+        ];
+        assert!(
+            dsdt.windows(dis.len()).any(|w| w == dis),
+            "a link _DIS must Or the route-disable bit into its PIRQ register"
+        );
+        // _SRS programs the register: Store(Local0, PIRA) = STORE_OP LOCAL0 "PIRA".
+        let srs = [opcode::STORE_OP, opcode::LOCAL0, b'P', b'I', b'R', b'A'];
+        assert!(
+            dsdt.windows(srs.len()).any(|w| w == srs),
+            "a link _SRS must Store the chosen IRQ into its PIRQ register"
         );
         let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         assert_eq!(sum, 0);
