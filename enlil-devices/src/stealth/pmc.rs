@@ -29,9 +29,10 @@ pub const MAX_FIXED_PMCS: usize = 4;
 /// no-op this repo already fixed: a detector cross-checking RDPMC against
 /// RDTSC (or APERF/MPERF) sees three perfectly identical counters.
 ///
-/// **Consistency requirement:** the KVM run loop must seed the
-/// `VcpuTimingState` APERF/MPERF shadows with the same core/ref ratio used
-/// here (`core_per_kilo_ref`), or the two surfaces contradict each other.
+/// **Consistency requirement:** the KVM run loop must drive the
+/// `VcpuTimingState` APERF/MPERF shadows (`enlil-core`, via its
+/// model-driven `advance`) with the same model and reference-cycle delta
+/// used here, or the two surfaces contradict each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PmcRateModel {
     /// Core cycles per 1000 reference cycles (the APERF/MPERF ratio × 1000).

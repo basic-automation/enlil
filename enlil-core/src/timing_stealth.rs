@@ -4,6 +4,7 @@
 //! divergence detection and timing-based VM detectors. (LBR sanitization lives
 //! in the canonical `enlil_devices::stealth::lbr` — see the note below.)
 
+use enlil_devices::stealth::pmc::PmcRateModel;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -73,6 +74,24 @@ impl VcpuTimingState {
         );
 
         self.last_guest_rip.store(guest_rip, Ordering::Release);
+    }
+
+    /// Advance the shadow counters for guest execution time, at the rates of
+    /// the PMC rate model: MPERF at the reference (TSC) rate, APERF at the
+    /// model's core rate.
+    ///
+    /// This is the cross-surface consistency requirement documented on
+    /// [`PmcRateModel`]: a detector can compare the APERF/MPERF ratio against
+    /// RDPMC's `CPU_CLK_UNHALTED.THREAD / REF_TSC` — both surfaces must encode
+    /// the same core/ref ratio, so the run loop must drive this and
+    /// `PmcState::advance_counters` with the *same* model and the same
+    /// reference-cycle delta. It also establishes a non-1.0 ratio from the
+    /// first guest read (the shadows previously only ever decremented on
+    /// exits, leaving the default ratio at exactly 1.0 — its own tell).
+    pub fn advance(&self, guest_ref_cycles: u64, model: &PmcRateModel) {
+        self.mperf.fetch_add(guest_ref_cycles, Ordering::AcqRel);
+        self.aperf
+            .fetch_add(model.core_cycles(guest_ref_cycles), Ordering::AcqRel);
     }
 
     /// Handle RDMSR 0xE8 (IA32_APERF) — actual performance counter
@@ -182,6 +201,36 @@ mod tests {
         state.on_vmresume(1000, 0);
         assert_eq!(state.read_aperf(), 0);
         assert_eq!(state.read_mperf(), 0);
+    }
+
+    #[test]
+    fn advance_tracks_the_pmc_rate_model_ratio() {
+        // Drive the MSR-surface shadows and the RDPMC-surface fixed counters
+        // with the same model and delta: the two surfaces must agree exactly,
+        // and the ratio must not be the 1.0 identity.
+        use enlil_devices::stealth::pmc::PmcState;
+
+        let model = PmcRateModel::DEFAULT;
+        let state = VcpuTimingState::new();
+        let mut pmc = PmcState::new();
+        pmc.fixed_ctr_ctrl = 0x330; // enable core + ref fixed counters
+
+        state.advance(1_000_000, &model);
+        pmc.advance_counters(1_000_000);
+
+        assert_eq!(state.read_mperf(), pmc.fixed_counters[2], "ref surfaces");
+        assert_eq!(state.read_aperf(), pmc.fixed_counters[1], "core surfaces");
+        assert_ne!(state.read_aperf(), state.read_mperf(), "ratio ≠ 1.0");
+
+        // An exit hidden by on_vmresume must preserve that same ratio.
+        state.on_vmexit(0);
+        state.on_vmresume(50_000, 0);
+        let ratio = state.read_aperf() as f64 / state.read_mperf() as f64;
+        let model_ratio = model.core_per_kilo_ref as f64 / 1000.0;
+        assert!(
+            (ratio - model_ratio).abs() < 1e-3,
+            "exit hiding must preserve the model ratio (got {ratio}, want {model_ratio})"
+        );
     }
 
     #[test]
