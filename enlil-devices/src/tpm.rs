@@ -120,6 +120,8 @@ pub struct VirtualTpm {
     pub rsp_buffer: Vec<u8>,
     /// Persistent state file path (for `BitLocker`, Windows Hello, etc.)
     pub state_path: Option<String>,
+    /// `GetRandom` PRNG state (xorshift64*); seeded deterministically at creation.
+    rng_state: u64,
 }
 
 impl VirtualTpm {
@@ -139,6 +141,7 @@ impl VirtualTpm {
             cmd_buffer: vec![0u8; 4096],
             rsp_buffer: vec![0u8; 4096],
             state_path: None,
+            rng_state: 0x9E37_79B9_7F4A_7C15, // nonzero seed (xorshift requires it)
         }
     }
 
@@ -371,10 +374,24 @@ impl VirtualTpm {
         self.rsp_buffer[10..12].copy_from_slice(&(u16_of(bytes_requested)).to_be_bytes());
         self.rsp_buffer[12..14].copy_from_slice(&(u16_of(bytes_requested)).to_be_bytes());
 
-        // Fill with deterministic "random" bytes (real impl would use entropy)
+        // Fill from the per-instance PRNG so successive GetRandom calls differ (a fixed
+        // pattern both breaks a guest seeding its CSPRNG and is a detection tell). The
+        // stream is seeded deterministically; a production build should reseed from a
+        // host entropy source.
         for i in 0..bytes_requested {
-            self.rsp_buffer[14 + i] = u8_of((i * 7 + 13) & 0xFF);
+            self.rsp_buffer[14 + i] = self.next_random_byte();
         }
+    }
+
+    /// One step of an `xorshift64*` generator — fast, non-cryptographic; adequate for a
+    /// model TPM's `GetRandom` where the requirement is that successive reads differ.
+    fn next_random_byte(&mut self) -> u8 {
+        let mut x = self.rng_state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.rng_state = x;
+        u8_of((x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) & 0xFF)
     }
 }
 
@@ -443,6 +460,32 @@ mod tests {
 
         let rc = u32::from_be_bytes(tpm.rsp_buffer[6..10].try_into().unwrap());
         assert_eq!(rc, 0); // Success
+    }
+
+    #[test]
+    fn tpm_get_random_successive_calls_differ() {
+        // GetRandom must not return a fixed byte pattern: successive calls must yield
+        // different bytes (a constant stream breaks guest entropy and is a VM tell).
+        let mut tpm = VirtualTpm::new(TpmInterface::Crb);
+        tpm.started = true;
+        let cmd = [
+            0x80, 0x01, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x01, 0x7B, // GetRandom
+            0x00, 0x10, // 16 bytes
+        ];
+        tpm.cmd_buffer[..cmd.len()].copy_from_slice(&cmd);
+        tpm.process_command();
+        let first = tpm.rsp_buffer[14..30].to_vec();
+        tpm.cmd_buffer[..cmd.len()].copy_from_slice(&cmd);
+        tpm.process_command();
+        let second = tpm.rsp_buffer[14..30].to_vec();
+        assert_ne!(first, second, "successive GetRandom outputs must differ");
+        // Not the old fixed (i*7+13) pattern.
+        assert_ne!(
+            first,
+            (0..16u8)
+                .map(|i| i.wrapping_mul(7).wrapping_add(13))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
