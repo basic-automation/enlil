@@ -6,6 +6,103 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-10 — Session: transparency-surface correctness sweep — CPUID, reprogrammable PIRQ links, timing/LBR stealth, and a real TPM (SHA-256)
+
+**20 commits, each independently green.** `acpica-tools` (`iasl` 20230628) + `dmidecode`
+3.5 install cleanly and were used as hard validators; the ACPI integration tests now
+actually run (not self-skip). `/dev/kvm` is **still absent** (verified — no nested virt),
+so KVM/guest-boot paths were not run. Workspace tests **860 → 881** (`cargo test
+--workspace`: 881 passed, 0 failed, 1 ignored = the `/dev/kvm` self-skip). `cargo build
+--workspace`, `cargo fmt --all -- --check`, and `cargo clippy --all-targets --workspace -- -D
+warnings` all green. no_std custom-target: N/A (no crate is `#![no_std]`).
+
+### Arc 1 — CPUID stealth correctness (`enlil-devices::stealth::cpuid`), web-researched
+- **`304b445`** Out-of-range leaves now mirror **bare metal**: Intel returns the highest
+  basic leaf's data for any out-of-range leaf (incl. the `0x4000_0000` hypervisor region);
+  AMD returns zeros. The table previously returned **zeros** everywhere out of range — which
+  no real Intel CPU does and is a detection vector. Verified with a real-CPU reference dump
+  taken on the runner (`__cpuid_count`) + Intel SDM / QEMU's "return highest basic leaf"
+  behaviour.
+- **`86345ca`** Leaf `0x1` EBX[23:16] (max addressable IDs) now tracks `vcpu_count` (power-of-two,
+  gated on HTT) instead of a fixed constant that disagreed with leaf-0xB topology.
+- **`be2c3ae`** Removed the now-dead cached `0x4000_0000` zero entries (lookup routes that
+  region through the out-of-range value).
+- **`3cda674`** Leaf `0x80000008` fixed to 48/48 address sizes (was `0x3930` = 57-bit linear =
+  phantom LA57 inconsistent with leaf-7 ECX; comment had the fields swapped).
+
+### Arc 2 — Reprogrammable PIC interrupt link routing (ACPI / `iasl`-validated)
+- **`28a3bea`** New `AmlBuilder` expression primitives: `OperationRegion`, `Field`, `Store`,
+  `And`/`Or`/`ShiftLeft`/`Subtract`, `FindSetRightBit`, `CreateWordField`, `Return(name)`,
+  rooted/multi-seg name paths, an `Operand` model — all byte-decode unit-tested.
+- **`04ec209`** `LNKA-D` `_CRS`/`_DIS`/`_SRS` are now **live** against the PIIX3 PIRQRC
+  registers (OperationRegion+Field over the ISA bridge config 0x60-0x63), so a PIC-mode guest
+  can actually reroute a PCI interrupt and `_CRS` reflects it. The `_PRT` references the links
+  by the rooted path `\_SB.PCI0.ISA_.LNKx`, emitted before the `_PRT`. Whole DSDT round-trips
+  through `iasl` at 0 errors / 0 warnings.
+- **`ae22dfa`** `_STA` reflects the route-disable bit (returns 0x09 when disabled) via a new
+  `if_start()` (caller-built predicate). **`c3c6f55`** corrected a stale `_PIC`/`_PRT` doc.
+
+### Arc 3 — Timing/branch stealth correctness (Phase 5.4, `enlil-core::timing_stealth`)
+- **`4213a21`** APERF/MPERF VMEXIT hiding: the MPERF adjustment was an algebraic no-op
+  (`aperf/(aperf/mperf)==mperf`), so MPERF never hid exit overhead and the APERF/MPERF ratio
+  skewed. Now decrements both counters proportionally (ratio preserved).
+- **`b0df46d`** LBR sanitizer overwrote only `from`, leaving the hypervisor address in `to`
+  (the field a detector reads); now erases both endpoints, matching the canonical
+  `enlil-devices::stealth::lbr`.
+
+### Arc 4 — A real TPM: SHA-256 + PCR semantics (Phase 5.5)
+- **`8505e33`** New dependency-free **SHA-256** (FIPS 180-4) in `enlil-devices::crypto`,
+  verified against the FIPS vectors (empty, "abc", two-block, 56-byte boundary).
+- **`c9cc40c`** `enlil-core::vtpm` PCR extend now uses real `SHA256(old || measurement)`
+  instead of XOR. **`68c0083`** fixed wrong TPM2 command codes in the vTPM dispatcher
+  (Extend 0x182 / Read 0x017E / GetCapability 0x017A — they were 0x17E/0x17F/0x100).
+- **`889ad26`** The **device** TPM (CRB MMIO at 0xFED40000) now handles `PCR_Extend`/`PCR_Read`
+  against its SHA-256 bank (were a permissive no-op). **`572de5d`** `GetRandom` returns a
+  varying xorshift64* stream instead of a fixed `(i*7+13)` pattern.
+
+### Arc 5 — Consolidation (the hand-off's dedup items)
+- **`d94deab`** Removed the dead, duplicate `enlil-core::smbios` module (unused, no
+  serialization path; canonical is `enlil-devices::smbios::SmbiosBuilder`).
+- **`da318fd`** Removed the unused, buggy `CpuidCachingHelper` stub from `timing_stealth`
+  (duplicated the canonical `CpuidStealthTable` with the all-zeros `0x4000_0000` tell).
+
+### Research (informed the build)
+`RESEARCH.md` → "2026-06-10" (CPUID out-of-range, web-researched) and "2026-06-10 (b)"
+(reprogrammable PIRQ links, APERF/MPERF, LBR, TPM/SHA — primary specs: ACPI 6.x, PIIX3
+datasheet, Intel SDM, TCG TPM 2.0, FIPS 180-4).
+
+### Test results (exact)
+- `cargo build --workspace` → OK. `cargo fmt --all -- --check` → OK. `cargo clippy
+  --all-targets --workspace -- -D warnings` → OK. `cargo test --workspace` → **881 passed,
+  0 failed, 1 ignored**.
+- `iasl` round-trips all ACPI tables (incl. the new reprogrammable-link DSDT) at 0/0;
+  `dmidecode` parses the SMBIOS cleanly. Both tools installed on the runner this session.
+- `/dev/kvm`: **not run — absent (no nested virt)**, verified.
+
+### Recommended next steps (tomorrow)
+1. **CI should install `acpica-tools` + `dmidecode`** to make the ACPI/SMBIOS integration
+   tests hard gates (they self-skip when absent; they were exercised this session).
+2. **Two TPM models exist** — `enlil-core::vtpm::VirtualTpm` (management/dispatcher, byte-vec
+   I/O) and `enlil-devices::tpm::VirtualTpm` (CRB MMIO at 0xFED40000). Both now share the
+   `crypto::sha256` PCR semantics but are separate types. Decide which is canonical for the
+   bus path and consolidate (the device one is bus-facing). **Flagged, not done** — needs a
+   deliberate pass, not a drive-by.
+3. **TPM `GetCapability` is a stub** on both (returns success with little/no `TPML_CAPABILITY_DATA`),
+   and EK/AIK/SRK are zero-filled with no real keygen (needs RSA/ECC — a large crypto addition).
+   The TPM2 command wire formats here are *pragmatic, not spec-exact* (auth area / digest list
+   simplified); a real Windows guest will need spec-exact parsing — **best validated against a
+   guest or swtpm, so blocked on a KVM runner / oracle.**
+4. **PMC fixed counters** (`enlil-devices::stealth::pmc`) advance instructions-retired, core
+   cycles, and reference cycles by the *same* `guest_cycles` (IPC exactly 1.0, core==ref) —
+   analogous to the APERF/MPERF ratio tell, but "fixing" it needs a chosen plausible IPC /
+   freq ratio. **Flagged** as a model refinement (not a clear-cut bug).
+5. **`LbrSanitizer::expected_guest_branch_target`** field is now unused (the fix uses the guest
+   RIP for both endpoints); either wire it (a real "next instruction" target) or drop it.
+6. **q35 chipset identity** (host bridge advertises i440FX while exposing PCIe ECAM/PIIX3) and
+   the **KVM run loop** remain the big items — q35 is a deliberate architectural pass; the KVM
+   loop is blocked on `/dev/kvm`. **Ask for a nested-virt runner** to unblock guest-boot and the
+   spec-exact-TPM validation.
+
 ## 2026-06-09 — Session: validate the firmware-description surface with real reference parsers (`iasl` + `dmidecode`), fix every bug they flag (Phase 0.2 / 5.1 / 5.2)
 
 **The unlock:** `acpica-tools` (`iasl` 20230628) **and** `dmidecode` 3.5 both install cleanly

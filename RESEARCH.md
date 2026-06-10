@@ -973,3 +973,34 @@ compiled with `rustc -O`) plus the Intel SDM / AMD APM and the Intel-vs-AMD dist
   hypervisor leaves are *indistinguishable from bare metal* on Intel and correctly zero on AMD. In-range
   but unpopulated leaves keep returning zeros (real CPUs do that for reserved leaves). No CPUID validator
   exists, so this is reference-dump-backed, not tool-validated.
+
+---
+
+## 2026-06-10 (b) — Reprogrammable PIRQ links, APERF/MPERF & LBR stealth, TPM SHA-256 (primary specs)
+
+The rest of this session built against primary specs rather than new papers — logged here
+so the next run sees the authoritative sources without re-deriving them.
+
+- **Reprogrammable PCI interrupt links (ACPI 6.x §6.2.13 `_PRT`, PIIX3 datasheet PIRQRC).**
+  A faithful `LNKA-D` (`PNP0C0F`) link device exposes its routing through an
+  `OperationRegion(PCI_Config)` + `Field` over the PIIX3 config 0x60-0x63 (PIRQRC[A-D]),
+  with `_CRS`/`_DIS`/`_SRS` reading and rewriting it (`PIRx & 0x0F` = IRQ, bit 7 = disable).
+  **AML name-resolution pitfall (validated with iasl):** a `_PRT` is a Method, so a *relative*
+  multi-seg `Source` path resolves under `…._PRT` (multi-seg names get no upward search) and
+  fails — the link `Source` must be a **root-anchored** path (`\_SB.PCI0.ISA_.LNKx`), and the
+  referenced device must be defined *before* the `_PRT` or a disassembler emits `External`
+  and the round-trip breaks.
+- **APERF/MPERF (Intel SDM Vol 3, IA32_APERF 0xE8 / IA32_MPERF 0xE7).** MPERF counts at the
+  nominal/TSC rate; APERF at the core frequency, so the APERF/MPERF ratio is the
+  frequency/utilization signal an IET divergence detector inspects. To hide a VMEXIT both
+  shadow counters must be decremented and the ratio preserved (decrement MPERF by the TSC
+  overhead, APERF by `ratio * overhead`).
+- **LBR sanitization (Intel SDM, LBR MSRs 0x680-0x6CF; DebugCtl 0x1D9).** After a CPUID-forced
+  VMEXIT the top LBR entry's **TO** holds the hypervisor entry — TO (not FROM) is the field a
+  detector reads, so sanitization must overwrite TO (set FROM=TO=guest RIP → reads as a
+  non-branch).
+- **TPM 2.0 (TCG spec Part 1 §17.2 PCR_Extend, Part 2 command codes; FIPS 180-4 SHA-256).**
+  `TPM2_PCR_Extend` = `SHA256(pcr_old || digest)` (needs a real hash, not a placeholder).
+  Authoritative command codes: `PCR_Extend=0x0000_0182`, `PCR_Read=0x0000_017E`,
+  `GetCapability=0x0000_017A`. `GetRandom` must vary across calls. No new dependency was
+  added — SHA-256 is implemented in-tree (no_std-friendly), verified against FIPS vectors.
