@@ -202,7 +202,7 @@ impl TpmDispatcher {
         let response_code = match cc {
             0x00000144 => self.tpm.startup(0),  // TPM2_CC_Startup
             0x00000145 => self.tpm.shutdown(0), // TPM2_CC_Shutdown
-            0x0000017E => {
+            0x0000_0182 => {
                 // TPM2_CC_PCR_Extend
                 if command.len() >= 18 {
                     let pcr_index =
@@ -212,7 +212,7 @@ impl TpmDispatcher {
                     0x0000_0001
                 }
             }
-            0x0000017F => {
+            0x0000_017E => {
                 // TPM2_CC_PCR_Read
                 if command.len() >= 14 {
                     let pcr_index =
@@ -232,7 +232,7 @@ impl TpmDispatcher {
                     0x0000_0001
                 }
             }
-            0x0000_0100 => {
+            0x0000_017A => {
                 // TPM2_CC_GetCapability
                 if command.len() >= 14 {
                     let cap =
@@ -316,5 +316,43 @@ mod tests {
         let mut tpm = VirtualTpm::new();
         tpm.nv_write(0x01000001, vec![1, 2, 3]);
         assert_eq!(tpm.nv_read(0x01000001), Some(vec![1, 2, 3]));
+    }
+
+    /// Build a TPM2 command: 2-byte tag, 4-byte size, 4-byte command code, payload.
+    fn tpm_cmd(cc: u32, payload: &[u8]) -> Vec<u8> {
+        let size = (10 + payload.len()) as u32;
+        let mut c = vec![0x80, 0x01];
+        c.extend_from_slice(&size.to_be_bytes());
+        c.extend_from_slice(&cc.to_be_bytes());
+        c.extend_from_slice(payload);
+        c
+    }
+
+    #[test]
+    fn dispatcher_pcr_extend_then_read_uses_correct_command_codes() {
+        // Drive the dispatcher with the real TCG command codes (Extend 0x182, Read
+        // 0x017E) to prove they are wired correctly — previously Extend was 0x17E
+        // (actually PCR_Read) and Read was 0x17F (PolicyOR), so neither worked.
+        let mut d = TpmDispatcher::new();
+
+        // PCR_Extend(index=0, measurement="m"): pcr_index at [10..14], measurement
+        // from [18..] (the dispatcher skips a 4-byte field at [14..18]).
+        let meas = b"m";
+        let mut extend_payload = 0u32.to_be_bytes().to_vec(); // pcr_index = 0
+        extend_payload.extend_from_slice(&[0, 0, 0, 0]); // skipped field
+        extend_payload.extend_from_slice(meas);
+        let resp = d.dispatch(&tpm_cmd(0x0000_0182, &extend_payload));
+        // Success response code (bytes 6..10) is 0.
+        assert_eq!(&resp[6..10], &[0, 0, 0, 0], "PCR_Extend must succeed");
+
+        // PCR_Read(index=0): pcr_index at [10..14].
+        let resp = d.dispatch(&tpm_cmd(0x0000_017E, &0u32.to_be_bytes()));
+        assert_eq!(&resp[6..10], &[0, 0, 0, 0], "PCR_Read must succeed");
+        let pcr = &resp[10..];
+
+        // It must equal SHA256(0x00*32 || "m").
+        let mut input = vec![0u8; 32];
+        input.extend_from_slice(meas);
+        assert_eq!(pcr, enlil_devices::crypto::sha256(&input));
     }
 }
