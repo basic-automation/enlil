@@ -216,12 +216,16 @@ impl CpuidStealthTable {
             });
         }
 
-        // 0x80000008: Virtual/Physical address sizes
+        // 0x80000008 EAX: address sizes. EAX[7:0] = physical address bits, EAX[15:8] = linear
+        // (virtual) address bits (Intel SDM / AMD APM). The old value 0x3930 decoded as 57-bit
+        // linear (LA57) + 48-bit physical — both the comment (fields swapped) and the LA57 claim
+        // were wrong: leaf 7 ECX does not advertise LA57, so 57-bit linear is an inconsistency a
+        // guest can catch. Use the common, internally-consistent 48/48 (no LA57): 0x3030.
         entries.push(CpuidCacheEntry {
             leaf: 0x8000_0008,
             subleaf: 0,
             result: CpuidResult {
-                eax: 0x0000_3930, // 48-bit virtual, 57-bit physical (common)
+                eax: 0x0000_3030, // 48-bit linear, 48-bit physical
                 ..CpuidResult::default()
             },
         });
@@ -497,6 +501,24 @@ mod tests {
         };
         let ebx = CpuidStealthTable::build(&cfg).lookup(1, 0).ebx;
         assert_eq!((ebx >> 16) & 0xFF, 1);
+    }
+
+    #[test]
+    fn leaf_80000008_address_sizes_consistent() {
+        // Physical (EAX[7:0]) and linear (EAX[15:8]) address bits must be plausible and the linear
+        // width must not imply LA57 (57) while leaf 7 ECX advertises no LA57.
+        let table = CpuidStealthTable::build(&intel_config());
+        let eax = table.lookup(0x8000_0008, 0).eax;
+        let phys = eax & 0xFF;
+        let linear = (eax >> 8) & 0xFF;
+        assert_eq!(phys, 48, "physical address bits");
+        assert_eq!(linear, 48, "linear address bits (no LA57)");
+        // Cross-check: leaf 7 ECX bit 16 (LA57) is clear, so 57-bit linear would be inconsistent.
+        assert_eq!(
+            table.lookup(7, 0).ecx & (1 << 16),
+            0,
+            "LA57 must be unadvertised"
+        );
     }
 
     #[test]
