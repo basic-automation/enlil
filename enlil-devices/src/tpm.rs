@@ -120,6 +120,8 @@ pub struct VirtualTpm {
     pub rsp_buffer: Vec<u8>,
     /// Persistent state file path (for `BitLocker`, Windows Hello, etc.)
     pub state_path: Option<String>,
+    /// `GetRandom` PRNG state (xorshift64*); seeded deterministically at creation.
+    rng_state: u64,
 }
 
 impl VirtualTpm {
@@ -139,6 +141,7 @@ impl VirtualTpm {
             cmd_buffer: vec![0u8; 4096],
             rsp_buffer: vec![0u8; 4096],
             state_path: None,
+            rng_state: 0x9E37_79B9_7F4A_7C15, // nonzero seed (xorshift requires it)
         }
     }
 
@@ -263,11 +266,66 @@ impl VirtualTpm {
             TpmCommand::GetRandom => {
                 self.handle_get_random();
             }
+            TpmCommand::PcrExtend => {
+                self.handle_pcr_extend();
+            }
+            TpmCommand::PcrRead => {
+                self.handle_pcr_read();
+            }
             _ => {
                 // Return success for unknown commands (permissive mode)
                 self.write_success_response();
             }
         }
+    }
+
+    /// Handle `TPM2_PCR_Extend`: `pcr[idx] = SHA256(pcr[idx] || digest)`.
+    ///
+    /// Command layout (the pragmatic convention shared with the management vTPM):
+    /// header (10) + `pcrHandle` (4, big-endian) + a 4-byte field + the digest bytes
+    /// to fold in, up to the header's declared size. The PCR bank is SHA-256, so the
+    /// extension uses the real hash from [`crate::crypto::sha256`].
+    fn handle_pcr_extend(&mut self) {
+        let size = usize_of(u32::from_be_bytes(
+            self.cmd_buffer[2..6].try_into().unwrap_or([0; 4]),
+        ));
+        if size < 18 || size > self.cmd_buffer.len() {
+            self.write_error_response(0x0000_0101); // TPM_RC_FAILURE
+            return;
+        }
+        let pcr_index = usize_of(u32::from_be_bytes(
+            self.cmd_buffer[10..14].try_into().unwrap_or([0; 4]),
+        ));
+        if pcr_index >= PCR_COUNT {
+            self.write_error_response(0x0000_0101);
+            return;
+        }
+        let mut input = self.pcr_sha256[pcr_index].to_vec();
+        input.extend_from_slice(&self.cmd_buffer[18..size]);
+        self.pcr_sha256[pcr_index] = crate::crypto::sha256(&input);
+        self.write_success_response();
+    }
+
+    /// Handle `TPM2_PCR_Read`: return the addressed PCR's 32-byte SHA-256 value.
+    /// Command layout: header (10) + `pcrHandle` (4). Response: header (10) + digest.
+    fn handle_pcr_read(&mut self) {
+        if self.cmd_buffer.len() < 14 {
+            self.write_error_response(0x0000_0101);
+            return;
+        }
+        let pcr_index = usize_of(u32::from_be_bytes(
+            self.cmd_buffer[10..14].try_into().unwrap_or([0; 4]),
+        ));
+        if pcr_index >= PCR_COUNT {
+            self.write_error_response(0x0000_0101);
+            return;
+        }
+        let pcr = self.pcr_sha256[pcr_index];
+        let response_size = 10 + SHA256_DIGEST_SIZE;
+        self.rsp_buffer[0..2].copy_from_slice(&[0x00, 0xC4]); // TPM_ST_NO_SESSIONS
+        self.rsp_buffer[2..6].copy_from_slice(&u32_of(response_size).to_be_bytes());
+        self.rsp_buffer[6..10].copy_from_slice(&0u32.to_be_bytes()); // success
+        self.rsp_buffer[10..10 + SHA256_DIGEST_SIZE].copy_from_slice(&pcr);
     }
 
     /// Write a TPM success response
@@ -316,10 +374,24 @@ impl VirtualTpm {
         self.rsp_buffer[10..12].copy_from_slice(&(u16_of(bytes_requested)).to_be_bytes());
         self.rsp_buffer[12..14].copy_from_slice(&(u16_of(bytes_requested)).to_be_bytes());
 
-        // Fill with deterministic "random" bytes (real impl would use entropy)
+        // Fill from the per-instance PRNG so successive GetRandom calls differ (a fixed
+        // pattern both breaks a guest seeding its CSPRNG and is a detection tell). The
+        // stream is seeded deterministically; a production build should reseed from a
+        // host entropy source.
         for i in 0..bytes_requested {
-            self.rsp_buffer[14 + i] = u8_of((i * 7 + 13) & 0xFF);
+            self.rsp_buffer[14 + i] = self.next_random_byte();
         }
+    }
+
+    /// One step of an `xorshift64*` generator — fast, non-cryptographic; adequate for a
+    /// model TPM's `GetRandom` where the requirement is that successive reads differ.
+    fn next_random_byte(&mut self) -> u8 {
+        let mut x = self.rng_state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.rng_state = x;
+        u8_of((x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) & 0xFF)
     }
 }
 
@@ -388,6 +460,75 @@ mod tests {
 
         let rc = u32::from_be_bytes(tpm.rsp_buffer[6..10].try_into().unwrap());
         assert_eq!(rc, 0); // Success
+    }
+
+    #[test]
+    fn tpm_get_random_successive_calls_differ() {
+        // GetRandom must not return a fixed byte pattern: successive calls must yield
+        // different bytes (a constant stream breaks guest entropy and is a VM tell).
+        let mut tpm = VirtualTpm::new(TpmInterface::Crb);
+        tpm.started = true;
+        let cmd = [
+            0x80, 0x01, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x01, 0x7B, // GetRandom
+            0x00, 0x10, // 16 bytes
+        ];
+        tpm.cmd_buffer[..cmd.len()].copy_from_slice(&cmd);
+        tpm.process_command();
+        let first = tpm.rsp_buffer[14..30].to_vec();
+        tpm.cmd_buffer[..cmd.len()].copy_from_slice(&cmd);
+        tpm.process_command();
+        let second = tpm.rsp_buffer[14..30].to_vec();
+        assert_ne!(first, second, "successive GetRandom outputs must differ");
+        // Not the old fixed (i*7+13) pattern.
+        assert_ne!(
+            first,
+            (0..16u8)
+                .map(|i| i.wrapping_mul(7).wrapping_add(13))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn tpm_pcr_extend_then_read_uses_real_sha256() {
+        let mut tpm = VirtualTpm::new(TpmInterface::Crb);
+        tpm.started = true;
+
+        // PCR_Extend(index=0) folding in a single digest byte 0xAB.
+        // header(10) + pcrHandle(4=0) + 4-byte field + digest(1).
+        let extend = [
+            0x80, 0x01, 0x00, 0x00, 0x00, 0x13, // tag, size = 19
+            0x00, 0x00, 0x01, 0x82, // TPM2_CC_PCR_Extend
+            0x00, 0x00, 0x00, 0x00, // pcrHandle = 0
+            0x00, 0x00, 0x00, 0x00, // skipped field
+            0xAB, // digest byte
+        ];
+        tpm.cmd_buffer[..extend.len()].copy_from_slice(&extend);
+        tpm.process_command();
+        assert_eq!(
+            u32::from_be_bytes(tpm.rsp_buffer[6..10].try_into().unwrap()),
+            0,
+            "extend succeeds"
+        );
+
+        // PCR0 must now equal SHA256(0x00*32 || 0xAB).
+        let mut input = vec![0u8; 32];
+        input.push(0xAB);
+        let expected = crate::crypto::sha256(&input);
+        assert_eq!(tpm.pcr_sha256[0], expected);
+
+        // PCR_Read(index=0) returns that digest in the response body.
+        let read = [
+            0x80, 0x01, 0x00, 0x00, 0x00, 0x0E, // tag, size = 14
+            0x00, 0x00, 0x01, 0x7E, // TPM2_CC_PCR_Read
+            0x00, 0x00, 0x00, 0x00, // pcrHandle = 0
+        ];
+        tpm.cmd_buffer[..read.len()].copy_from_slice(&read);
+        tpm.process_command();
+        assert_eq!(
+            u32::from_be_bytes(tpm.rsp_buffer[6..10].try_into().unwrap()),
+            0
+        );
+        assert_eq!(&tpm.rsp_buffer[10..10 + 32], &expected);
     }
 
     #[test]

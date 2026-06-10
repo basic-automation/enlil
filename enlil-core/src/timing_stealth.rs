@@ -39,25 +39,37 @@ impl VcpuTimingState {
         self.last_exit_tsc.store(exit_tsc, Ordering::Release);
     }
 
-    /// Called before VMRESUME: account for exit time and adjust shadow counters
+    /// Called before VMRESUME: account for exit time and adjust shadow counters.
+    ///
+    /// The VMEXIT must be hidden from *both* APERF and MPERF so neither shadow counter
+    /// advances across the exit, and the decrement must be proportional so the
+    /// APERF/MPERF ratio — the frequency/utilization signal an IET detector inspects —
+    /// is unchanged. `exit_overhead_cycles` is a TSC delta, which is in MPERF units
+    /// (MPERF runs at the nominal/TSC rate); APERF runs at the core frequency, i.e.
+    /// `ratio * MPERF`, so its decrement is scaled by the established ratio.
     pub fn on_vmresume(&self, entry_tsc: u64, guest_rip: u64) {
         let last_tsc = self.last_exit_tsc.load(Ordering::Acquire);
         let exit_overhead_cycles = entry_tsc.saturating_sub(last_tsc);
 
-        // Subtract exit overhead from shadow APERF to hide hypervisor time
         let current_aperf = self.aperf.load(Ordering::Relaxed);
+        let current_mperf = self.mperf.load(Ordering::Relaxed);
+
+        // Preserve APERF/MPERF (default 1.0 before MPERF has advanced).
+        let ratio = if current_mperf > 0 {
+            (current_aperf as f64) / (current_mperf as f64)
+        } else {
+            1.0
+        };
+        let aperf_overhead = (exit_overhead_cycles as f64 * ratio) as u64;
+
         self.aperf.store(
-            current_aperf.saturating_sub(exit_overhead_cycles),
+            current_aperf.saturating_sub(aperf_overhead),
             Ordering::Release,
         );
-
-        // Keep MPERF proportional (APERF/MPERF ratio ~1.0 for high performance)
-        let current_mperf = self.mperf.load(Ordering::Relaxed);
-        if current_mperf > 0 {
-            let ratio = (current_aperf as f64) / (current_mperf as f64);
-            self.mperf
-                .store((current_aperf as f64 / ratio) as u64, Ordering::Release);
-        }
+        self.mperf.store(
+            current_mperf.saturating_sub(exit_overhead_cycles),
+            Ordering::Release,
+        );
 
         self.last_guest_rip.store(guest_rip, Ordering::Release);
     }
@@ -126,93 +138,26 @@ impl LbrSanitizer {
         }
     }
 
-    /// Sanitize LBR stack after a detected VMEXIT (e.g., via CPUID trap)
-    /// Removes or falsifies the branch record that shows branch-to-hypervisor
+    /// Sanitize LBR stack after a detected VMEXIT (e.g., via CPUID trap).
+    /// Removes the branch record that shows the branch into the hypervisor.
     pub fn sanitize_lbr(&self, lbr_stack: &mut [(u64, u64)], guest_rip: u64) {
-        if let Some((from, _to)) = lbr_stack.last_mut() {
-            // The most recent LBR entry shows: from=guest_instruction, to=hypervisor_entry
-            // Replace the "to" with the next expected guest instruction (to hide the VMEXIT)
+        if let Some((from, to)) = lbr_stack.last_mut() {
+            // The most recent entry shows from=guest instruction, to=hypervisor entry.
+            // The hypervisor address sits in `to`, so that is the field a detector reads
+            // — the old code only rewrote `from` and left the hypervisor address exposed.
+            // Overwrite both endpoints so the entry reads as a non-branch within the
+            // guest (matching the canonical enlil_devices::stealth::lbr sanitizer).
             *from = guest_rip;
+            *to = guest_rip;
         }
     }
 }
 
-/// CPUID response pre-computation for constant-time handling
-pub struct CpuidCachingHelper {
-    /// Pre-computed CPUID responses
-    cache: Vec<CpuidResponse>,
-}
-
-#[derive(Clone, Debug)]
-pub struct CpuidResponse {
-    pub leaf: u32,
-    pub subleaf: u32,
-    pub eax: u32,
-    pub ebx: u32,
-    pub ecx: u32,
-    pub edx: u32,
-}
-
-impl Default for CpuidCachingHelper {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CpuidCachingHelper {
-    pub fn new() -> Self {
-        Self { cache: Vec::new() }
-    }
-
-    /// Build CPUID cache for all relevant leaves
-    /// Should be called at guest boot with stealth values pre-computed
-    pub fn cache_cpuid(&mut self, response: CpuidResponse) {
-        self.cache.push(response);
-    }
-
-    /// Lookup CPUID response in cache (< 100 cycles)
-    pub fn lookup(&self, leaf: u32, subleaf: u32) -> Option<CpuidResponse> {
-        self.cache
-            .iter()
-            .find(|r| r.leaf == leaf && r.subleaf == subleaf)
-            .cloned()
-    }
-
-    /// Pre-populate with Intel stealth values
-    pub fn populate_intel_stealth(&mut self) {
-        // Leaf 0x00: Vendor string
-        self.cache_cpuid(CpuidResponse {
-            leaf: 0x00,
-            subleaf: 0,
-            eax: 0x16,       // Max leaf
-            ebx: 0x756e6547, // "Genu"
-            ecx: 0x6c65746e, // "ntel"
-            edx: 0x49656e69, // "ineI"
-        });
-
-        // Leaf 0x01: Feature flags (clear hypervisor bit)
-        self.cache_cpuid(CpuidResponse {
-            leaf: 0x01,
-            subleaf: 0,
-            eax: 0x000006c2, // Family 6, Model C, Stepping 2
-            ebx: 0x01100800,
-            ecx: 0x7fffbfff, // ECX bit 31 (hypervisor bit) = 0
-            edx: 0xbfebfbff,
-        });
-
-        // Leaf 0x40000000+: Return zeros (no hypervisor signature)
-        for i in 0..16 {
-            self.cache_cpuid(CpuidResponse {
-                leaf: 0x40000000 + i,
-                subleaf: 0,
-                eax: 0,
-                ebx: 0,
-                ecx: 0,
-                edx: 0,
-            });
-        }
-    }
-}
+// The CPUID pre-computation cache lives in the canonical, reference-corrected
+// `enlil_devices::stealth::cpuid::CpuidStealthTable` (with proper vendor-specific
+// out-of-range semantics). A skeletal `CpuidCachingHelper` stub used to sit here and
+// duplicated it — incompletely and with the all-zeros `0x40000000` tell — so it was
+// removed; the KVM backend (which can reach `enlil-devices`) should use that table.
 
 #[cfg(test)]
 mod tests {
@@ -226,6 +171,46 @@ mod tests {
     }
 
     #[test]
+    fn vmexit_overhead_hidden_from_both_counters_preserving_ratio() {
+        // Ratio 1.0: both counters must drop by the exit overhead, ratio unchanged.
+        let state = VcpuTimingState::new();
+        state.write_aperf(1000);
+        state.write_mperf(1000);
+        state.on_vmexit(100);
+        state.on_vmresume(150, 0xDEAD); // 50 cycles of exit overhead
+        assert_eq!(state.read_mperf(), 950, "MPERF must hide the exit overhead");
+        assert_eq!(state.read_aperf(), 950, "APERF must hide the exit overhead");
+        // The old code left MPERF at 1000 (ratio 0.95) — a detectable anomaly.
+    }
+
+    #[test]
+    fn vmexit_overhead_scales_aperf_by_ratio() {
+        // Ratio 0.8 (core running below nominal): APERF decrement is ratio-scaled so
+        // the APERF/MPERF ratio is preserved across the hidden exit.
+        let state = VcpuTimingState::new();
+        state.write_aperf(800);
+        state.write_mperf(1000);
+        state.on_vmexit(0);
+        state.on_vmresume(50, 0); // overhead 50
+        assert_eq!(state.read_mperf(), 950); // 1000 - 50
+        assert_eq!(state.read_aperf(), 760); // 800 - (50 * 0.8)
+                                             // Ratio preserved: 760/950 == 0.8 == 800/1000.
+        assert!((state.read_aperf() as f64 / state.read_mperf() as f64 - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn vmexit_counters_saturate_at_zero() {
+        // A large exit overhead must not underflow the shadow counters.
+        let state = VcpuTimingState::new();
+        state.write_aperf(10);
+        state.write_mperf(10);
+        state.on_vmexit(0);
+        state.on_vmresume(1000, 0);
+        assert_eq!(state.read_aperf(), 0);
+        assert_eq!(state.read_mperf(), 0);
+    }
+
+    #[test]
     fn test_tsc_offset_calculation() {
         let mut helper = TscOffsetHelper::new(0);
         helper.calculate_offset(1000, 2000);
@@ -233,11 +218,18 @@ mod tests {
     }
 
     #[test]
-    fn test_cpuid_caching() {
-        let mut cache = CpuidCachingHelper::new();
-        cache.populate_intel_stealth();
-        let resp = cache.lookup(0x01, 0).unwrap();
-        // Hypervisor bit should be 0
-        assert_eq!(resp.ecx & (1 << 31), 0);
+    fn lbr_sanitize_hides_hypervisor_address_in_both_endpoints() {
+        let san = LbrSanitizer::new();
+        let hypervisor = 0xFFFF_8000_0010_0000u64; // a hypervisor-range target
+        let guest_rip = 0x0000_0000_0040_1234u64;
+        let mut stack = vec![(0x0040_1000u64, 0x0040_1010u64), (guest_rip, hypervisor)];
+        san.sanitize_lbr(&mut stack, guest_rip);
+        let (from, to) = *stack.last().unwrap();
+        assert_eq!(
+            to, guest_rip,
+            "the hypervisor address in `to` must be erased"
+        );
+        assert_eq!(from, guest_rip);
+        assert_ne!(to, hypervisor, "hypervisor address must not remain");
     }
 }

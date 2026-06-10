@@ -8,7 +8,6 @@ pub mod exit_handler;
 pub mod kvm_backend;
 pub mod memory;
 pub mod serial;
-pub mod smbios;
 pub mod timing_stealth;
 pub mod vcpu;
 pub mod vm;

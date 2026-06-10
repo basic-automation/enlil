@@ -3,13 +3,16 @@
 //! Intercepts all CPUID exits and crafts responses that hide hypervisor
 //! presence. Critical for anti-detection:
 //! - Leaf 0x1 ECX bit 31: clear hypervisor present bit
-//! - Leaf 0x40000000-0x400000FF: return zeros
+//! - Leaf 0x40000000-0x400000FF: no hypervisor signature — treated as out-of-range, so on
+//!   Intel it mirrors the highest basic leaf and on AMD it returns zeros, exactly like bare
+//!   metal. (Returning zeros unconditionally is itself a tell: no real Intel CPU does.)
 //! - Leaf 0x0: correct vendor string
 //! - Leaf 0x80000002-4: pass through real CPU brand string
-//! - All undefined/reserved leaves: return 0
+//! - Out-of-range leaves: highest basic leaf data (Intel) / zeros (AMD), per the SDM/APM;
+//!   in-range but reserved leaves return 0.
 
 /// CPUID register set for a single leaf result
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CpuidResult {
     pub eax: u32,
     pub ebx: u32,
@@ -27,6 +30,11 @@ pub struct CpuidStealthTable {
     max_standard_leaf: u32,
     /// Maximum extended leaf
     max_extended_leaf: u32,
+    /// Result returned for any *out-of-range* leaf (above the basic max — including the
+    /// `0x4000_0000` hypervisor region — or above the extended max). Real Intel CPUs return
+    /// the highest basic leaf's data here; AMD returns zeros. Returning zeros on Intel (as the
+    /// table used to) is itself a VM tell, so this is precomputed per-vendor at build time.
+    out_of_range: CpuidResult,
 }
 
 #[derive(Debug, Clone)]
@@ -142,16 +150,10 @@ impl CpuidStealthTable {
             },
         });
 
-        // Leaves 0x40000000-0x400000FF: MUST return zeros when hiding
-        if config.hide_hypervisor {
-            for leaf in 0x4000_0000..=0x4000_00FF {
-                entries.push(CpuidCacheEntry {
-                    leaf,
-                    subleaf: 0,
-                    result: CpuidResult::default(),
-                });
-            }
-        }
+        // Leaves 0x40000000-0x400000FF (the hypervisor region) are deliberately NOT cached: they
+        // are out-of-range of the advertised basic max, so `lookup` resolves them through the
+        // vendor-correct `out_of_range` value (highest basic leaf on Intel, zeros on AMD) — exactly
+        // like bare metal. Caching zeros here would both waste 256 entries and be an Intel tell.
     }
 
     /// Push the extended (0x80000000+) CPUID leaves.
@@ -214,12 +216,16 @@ impl CpuidStealthTable {
             });
         }
 
-        // 0x80000008: Virtual/Physical address sizes
+        // 0x80000008 EAX: address sizes. EAX[7:0] = physical address bits, EAX[15:8] = linear
+        // (virtual) address bits (Intel SDM / AMD APM). The old value 0x3930 decoded as 57-bit
+        // linear (LA57) + 48-bit physical — both the comment (fields swapped) and the LA57 claim
+        // were wrong: leaf 7 ECX does not advertise LA57, so 57-bit linear is an inconsistency a
+        // guest can catch. Use the common, internally-consistent 48/48 (no LA57): 0x3030.
         entries.push(CpuidCacheEntry {
             leaf: 0x8000_0008,
             subleaf: 0,
             result: CpuidResult {
-                eax: 0x0000_3930, // 48-bit virtual, 57-bit physical (common)
+                eax: 0x0000_3030, // 48-bit linear, 48-bit physical
                 ..CpuidResult::default()
             },
         });
@@ -235,34 +241,57 @@ impl CpuidStealthTable {
         Self::push_standard_leaves(config, max_standard_leaf, &mut entries);
         Self::push_extended_leaves(config, max_extended_leaf, &mut entries);
 
+        let out_of_range = Self::out_of_range_result(config.vendor, &entries);
+
         Self {
             entries,
             max_standard_leaf,
             max_extended_leaf,
+            out_of_range,
         }
     }
 
-    /// Look up a CPUID leaf/subleaf. Returns zeros for unknown leaves.
+    /// Compute the value an out-of-range leaf must return for this vendor.
+    ///
+    /// Intel returns the data of the **highest basic leaf** for any out-of-range input
+    /// (Intel SDM Vol 2A, CPUID); we mirror the highest populated basic-range entry, which is
+    /// the canonical bare-metal behaviour a detector checks for. AMD returns zeros for
+    /// undefined leaves (AMD APM Vol 3), so the default all-zero result is correct there.
+    fn out_of_range_result(vendor: CpuVendor, entries: &[CpuidCacheEntry]) -> CpuidResult {
+        match vendor {
+            CpuVendor::Amd => CpuidResult::default(),
+            CpuVendor::Intel => entries
+                .iter()
+                .filter(|e| e.leaf < 0x4000_0000)
+                .max_by_key(|e| e.leaf)
+                .map_or_else(CpuidResult::default, |e| e.result),
+        }
+    }
+
+    /// Look up a CPUID leaf/subleaf.
+    ///
+    /// In-range leaves return their cached entry, or zeros if the leaf is in range but
+    /// reserved/unpopulated (real CPUs do that for reserved leaves). **Out-of-range** leaves —
+    /// above the basic max (including the whole `0x4000_0000` hypervisor region, so it is
+    /// indistinguishable from bare metal) or above the extended max — return the vendor-correct
+    /// `out_of_range` value: the highest basic leaf's data on Intel, zeros on AMD.
     #[must_use]
     pub fn lookup(&self, leaf: u32, subleaf: u32) -> CpuidResult {
-        // Fast path: hypervisor leaves always return zero
-        if (0x4000_0000..=0x4000_00FF).contains(&leaf) {
-            return CpuidResult::default();
-        }
+        let in_range = leaf <= self.max_standard_leaf
+            || (0x8000_0000..=self.max_extended_leaf).contains(&leaf);
 
-        // Bounds check
-        if leaf <= self.max_standard_leaf || (0x8000_0000..=self.max_extended_leaf).contains(&leaf)
-        {
+        if in_range {
             for entry in &self.entries {
                 if entry.leaf == leaf && entry.subleaf == subleaf {
                     return entry.result;
                 }
             }
-            // Known range but no specific entry — return zeros
-            // This is safer than returning garbage
+            // In range but no specific entry — reserved leaf, return zeros (matches real HW).
+            return CpuidResult::default();
         }
 
-        CpuidResult::default()
+        // Out of range (incl. the 0x4000_0000 hypervisor region): mirror real-CPU semantics.
+        self.out_of_range
     }
 
     const fn build_leaf_1(config: &CpuidStealthConfig) -> CpuidResult {
@@ -272,9 +301,25 @@ impl CpuidStealthTable {
             ecx &= !(1 << 31);
         }
 
+        // EBX[23:16] = max number of addressable logical-processor IDs in the package. Real CPUs
+        // advertise this (rounded up to a power of two) only when HTT (EDX bit 28) is set, and it
+        // tracks the actual topology — a fixed constant that disagrees with the leaf-0xB topology
+        // and the vCPU count is a tell. EBX[15:8] = CLFLUSH line size / 8 (64-byte lines);
+        // EBX[31:24] (initial APIC ID) is filled in per-vCPU at runtime, so it stays 0 here.
+        let htt = (config.features_edx & (1 << 28)) != 0;
+        let mut max_ids = if htt {
+            config.vcpu_count.next_power_of_two()
+        } else {
+            1
+        };
+        if max_ids > 0xFF {
+            max_ids = 0xFF;
+        }
+        let ebx = 0x0000_0800 | (max_ids << 16);
+
         CpuidResult {
             eax: config.family_model_stepping,
-            ebx: 0x0010_0800, // CLFLUSH size=8, max CPUs=1
+            ebx,
             ecx,
             edx: config.features_edx,
         }
@@ -369,7 +414,8 @@ mod tests {
     }
 
     #[test]
-    fn hypervisor_leaves_return_zero() {
+    fn amd_hypervisor_leaves_return_zero() {
+        // AMD returns zeros for out-of-range/undefined leaves (AMD APM Vol 3); test_config is AMD.
         let table = CpuidStealthTable::build(&test_config());
         for leaf in 0x4000_0000..=0x4000_0010 {
             let result = table.lookup(leaf, 0);
@@ -378,6 +424,109 @@ mod tests {
             assert_eq!(result.ecx, 0);
             assert_eq!(result.edx, 0);
         }
+    }
+
+    fn intel_config() -> CpuidStealthConfig {
+        CpuidStealthConfig {
+            vendor: CpuVendor::Intel,
+            ..test_config()
+        }
+    }
+
+    #[test]
+    fn intel_out_of_range_mirrors_highest_basic_leaf() {
+        // Intel SDM: an out-of-range leaf returns the highest basic leaf's data, NOT zeros.
+        // The highest populated basic-range leaf in the table is 0xD.
+        let table = CpuidStealthTable::build(&intel_config());
+        let highest_basic = table.lookup(0xD, 0);
+        assert_ne!(
+            highest_basic,
+            CpuidResult::default(),
+            "leaf 0xD must be populated for this test to be meaningful"
+        );
+
+        // Above the basic max but below 0x4000_0000.
+        assert_eq!(table.lookup(0x20, 0), highest_basic);
+        assert_eq!(table.lookup(0x1337, 0), highest_basic);
+        // Above the extended max.
+        assert_eq!(table.lookup(0x8000_0009, 0), highest_basic);
+        assert_eq!(table.lookup(0xFFFF_FFFF, 0), highest_basic);
+    }
+
+    #[test]
+    fn intel_hypervisor_region_indistinguishable_from_bare_metal() {
+        // The 0x4000_0000 region must look exactly like an out-of-range leaf on Intel, so a
+        // detector comparing CPUID(0x40000000) to a bogus leaf sees no mismatch — and crucially
+        // sees no all-zeros (which no real Intel CPU returns out of range).
+        let table = CpuidStealthTable::build(&intel_config());
+        let bogus = table.lookup(0x1337_1337, 0);
+        for leaf in [0x4000_0000, 0x4000_0001, 0x4000_00FF] {
+            let hv = table.lookup(leaf, 0);
+            assert_eq!(
+                hv, bogus,
+                "hypervisor leaf {leaf:#x} must match a bogus leaf"
+            );
+            assert_ne!(hv, CpuidResult::default(), "must not be all-zeros on Intel");
+        }
+    }
+
+    #[test]
+    fn leaf_1_ebx_tracks_vcpu_count() {
+        // test_config: 8 vCPUs, HTT set in features_edx → EBX[23:16] = 8 (power of two).
+        let table = CpuidStealthTable::build(&test_config());
+        let ebx = table.lookup(1, 0).ebx;
+        assert_eq!(
+            (ebx >> 16) & 0xFF,
+            8,
+            "max addressable IDs must equal vCPU count"
+        );
+        assert_eq!((ebx >> 8) & 0xFF, 0x08, "CLFLUSH line size byte preserved");
+        assert_eq!(ebx & 0xFF, 0, "brand index byte stays 0");
+
+        // 6 vCPUs rounds up to the next power of two (8).
+        let cfg = CpuidStealthConfig {
+            vcpu_count: 6,
+            ..test_config()
+        };
+        let ebx = CpuidStealthTable::build(&cfg).lookup(1, 0).ebx;
+        assert_eq!((ebx >> 16) & 0xFF, 8);
+    }
+
+    #[test]
+    fn leaf_1_ebx_without_htt_is_one() {
+        // HTT (EDX bit 28) clear → max addressable IDs = 1 regardless of vCPU count.
+        let cfg = CpuidStealthConfig {
+            features_edx: test_config().features_edx & !(1 << 28),
+            ..test_config()
+        };
+        let ebx = CpuidStealthTable::build(&cfg).lookup(1, 0).ebx;
+        assert_eq!((ebx >> 16) & 0xFF, 1);
+    }
+
+    #[test]
+    fn leaf_80000008_address_sizes_consistent() {
+        // Physical (EAX[7:0]) and linear (EAX[15:8]) address bits must be plausible and the linear
+        // width must not imply LA57 (57) while leaf 7 ECX advertises no LA57.
+        let table = CpuidStealthTable::build(&intel_config());
+        let eax = table.lookup(0x8000_0008, 0).eax;
+        let phys = eax & 0xFF;
+        let linear = (eax >> 8) & 0xFF;
+        assert_eq!(phys, 48, "physical address bits");
+        assert_eq!(linear, 48, "linear address bits (no LA57)");
+        // Cross-check: leaf 7 ECX bit 16 (LA57) is clear, so 57-bit linear would be inconsistent.
+        assert_eq!(
+            table.lookup(7, 0).ecx & (1 << 16),
+            0,
+            "LA57 must be unadvertised"
+        );
+    }
+
+    #[test]
+    fn in_range_reserved_leaf_returns_zero() {
+        // Leaf 0x3 is in the advertised basic range but unpopulated → zeros (matches real HW),
+        // distinct from the out-of-range mirror.
+        let table = CpuidStealthTable::build(&intel_config());
+        assert_eq!(table.lookup(0x3, 0), CpuidResult::default());
     }
 
     #[test]

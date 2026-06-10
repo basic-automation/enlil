@@ -940,3 +940,67 @@ and finished against the validating tools.
   touching: leaf `0x1` `EBX` max-addressable-IDs is a fixed constant (doesn't track
   `vcpu_count`), and leaf `0x80000008`'s address-size value vs. its comment look swapped.
   There is no `iasl`/`dmidecode`-style validator for CPUID, so this is a focused future pass.
+
+---
+
+## 2026-06-10 — CPUID out-of-range semantics: the `0x40000000`-zeroing is itself a tell (Phase 0.2 / 5.x stealth)
+
+Verified against a **real CPU reference dump** taken on this runner (`std::arch::x86_64::__cpuid_count`,
+compiled with `rustc -O`) plus the Intel SDM / AMD APM and the Intel-vs-AMD distinguisher folklore.
+
+- **Intel: every out-of-range leaf returns the highest *basic* leaf's data — not zeros.** On the
+  reference Intel CPU (max basic leaf `0xD`, whose result was `eax=0x000000e7 ebx=0x00000a80
+  ecx=0x00000a80 edx=0`), querying leaves `0x20`, `0x100`, `0x1337` (above the basic max, below
+  `0x4000_0000`), and `0x8000_0009`…`0xFFFF_FFFF` (above the extended max) **all returned that same
+  leaf-`0xD` value**. This is the documented Intel rule (Intel SDM Vol 2A, CPUID: "If a value entered
+  for CPUID.EAX is higher than the maximum input value for basic or extended function… the data for
+  the highest basic information leaf is returned"). QEMU implements exactly this
+  (`target-i386: return highest basic leaf if eax out of range`, lists.gnu.org/archive/html/qemu-devel/2012-12).
+- **AMD: out-of-range/undefined leaves return zeros** (AMD APM Vol 3; the standard/extended ranges are
+  the only defined ones). So the correct stealth behaviour is **vendor-specific**, and the difference is
+  itself a known Intel-vs-AMD probe.
+- **The detection vector (websec.net "Ophion: Building a Stealth Intel VT-x Hypervisor"; CPUID
+  Wikipedia).** A detector reads an obviously-bogus leaf (e.g. `0x13371337`) and compares it to
+  `CPUID(0x4000_0000)`. On bare-metal **Intel** both return the highest-basic-leaf data and are equal;
+  most hypervisors answer `0x4000_0000` with a vendor signature (or, like Enlil today, with zeros) while
+  the bogus leaf returns *something else* — the mismatch (or the all-zeros, which no real Intel CPU ever
+  returns for an out-of-range leaf) is the tell.
+- **Changed what we build:** `CpuidStealthTable::lookup` was returning `CpuidResult::default()` (zeros)
+  for the `0x4000_0000-0x4000_00FF` region *and* for every leaf outside the populated ranges. Replace
+  that with **faithful out-of-range emulation**: precompute an `out_of_range` result at build time
+  (Intel → the highest populated basic leaf's data; AMD → zeros) and return it for any leaf above the
+  advertised basic max (including the hypervisor region while hiding) and above the extended max — so the
+  hypervisor leaves are *indistinguishable from bare metal* on Intel and correctly zero on AMD. In-range
+  but unpopulated leaves keep returning zeros (real CPUs do that for reserved leaves). No CPUID validator
+  exists, so this is reference-dump-backed, not tool-validated.
+
+---
+
+## 2026-06-10 (b) — Reprogrammable PIRQ links, APERF/MPERF & LBR stealth, TPM SHA-256 (primary specs)
+
+The rest of this session built against primary specs rather than new papers — logged here
+so the next run sees the authoritative sources without re-deriving them.
+
+- **Reprogrammable PCI interrupt links (ACPI 6.x §6.2.13 `_PRT`, PIIX3 datasheet PIRQRC).**
+  A faithful `LNKA-D` (`PNP0C0F`) link device exposes its routing through an
+  `OperationRegion(PCI_Config)` + `Field` over the PIIX3 config 0x60-0x63 (PIRQRC[A-D]),
+  with `_CRS`/`_DIS`/`_SRS` reading and rewriting it (`PIRx & 0x0F` = IRQ, bit 7 = disable).
+  **AML name-resolution pitfall (validated with iasl):** a `_PRT` is a Method, so a *relative*
+  multi-seg `Source` path resolves under `…._PRT` (multi-seg names get no upward search) and
+  fails — the link `Source` must be a **root-anchored** path (`\_SB.PCI0.ISA_.LNKx`), and the
+  referenced device must be defined *before* the `_PRT` or a disassembler emits `External`
+  and the round-trip breaks.
+- **APERF/MPERF (Intel SDM Vol 3, IA32_APERF 0xE8 / IA32_MPERF 0xE7).** MPERF counts at the
+  nominal/TSC rate; APERF at the core frequency, so the APERF/MPERF ratio is the
+  frequency/utilization signal an IET divergence detector inspects. To hide a VMEXIT both
+  shadow counters must be decremented and the ratio preserved (decrement MPERF by the TSC
+  overhead, APERF by `ratio * overhead`).
+- **LBR sanitization (Intel SDM, LBR MSRs 0x680-0x6CF; DebugCtl 0x1D9).** After a CPUID-forced
+  VMEXIT the top LBR entry's **TO** holds the hypervisor entry — TO (not FROM) is the field a
+  detector reads, so sanitization must overwrite TO (set FROM=TO=guest RIP → reads as a
+  non-branch).
+- **TPM 2.0 (TCG spec Part 1 §17.2 PCR_Extend, Part 2 command codes; FIPS 180-4 SHA-256).**
+  `TPM2_PCR_Extend` = `SHA256(pcr_old || digest)` (needs a real hash, not a placeholder).
+  Authoritative command codes: `PCR_Extend=0x0000_0182`, `PCR_Read=0x0000_017E`,
+  `GetCapability=0x0000_017A`. `GetRandom` must vary across calls. No new dependency was
+  added — SHA-256 is implemented in-tree (no_std-friendly), verified against FIPS vectors.

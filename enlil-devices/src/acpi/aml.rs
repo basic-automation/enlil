@@ -33,6 +33,47 @@ pub mod opcode {
     pub const LOCAL0: u8 = 0x60;
     pub const ARG0: u8 = 0x68;
     pub const BUFFER_OP: u8 = 0x11;
+    pub const SUBTRACT_OP: u8 = 0x74;
+    pub const SHIFT_LEFT_OP: u8 = 0x79;
+    pub const AND_OP: u8 = 0x7B;
+    pub const OR_OP: u8 = 0x7D;
+    pub const FIND_SET_RIGHT_BIT_OP: u8 = 0x82;
+    pub const CREATE_WORD_FIELD_OP: u8 = 0x8B;
+    pub const CREATE_BYTE_FIELD_OP: u8 = 0x8C;
+
+    /// `RegionSpace` byte for an `OperationRegion` over PCI configuration space
+    /// (ACPI 6.x §19.6.102: `PCI_Config` = 2).
+    pub const REGION_SPACE_PCI_CONFIG: u8 = 0x02;
+}
+
+/// A term-argument operand for the small expression helpers
+/// ([`AmlBuilder::store`], [`AmlBuilder::and_op`], …).
+///
+/// AML term args are self-describing byte sequences: an integer constant, a
+/// `NameSeg` reference, or an `ArgN`/`LocalN` opcode. The same encoding serves
+/// both as a source operand and (for `Name`/`Arg`/`Local`) as a store target.
+#[derive(Debug, Clone, Copy)]
+pub enum Operand<'a> {
+    /// Integer constant (encoded as the smallest `Byte`/`Word`/`DWord`/`QWord`).
+    Int(u64),
+    /// Reference to a named object by its 4-char `NameSeg`.
+    Name(&'a [u8; 4]),
+    /// Method argument `Arg0..Arg6`.
+    Arg(u8),
+    /// Method local `Local0..Local7`.
+    Local(u8),
+}
+
+impl Operand<'_> {
+    /// Encode this operand as an AML `TermArg` / `SuperName` byte sequence.
+    fn encode(self) -> Vec<u8> {
+        match self {
+            Self::Int(v) => AmlBuilder::encode_integer_const(v),
+            Self::Name(n) => AmlBuilder::encode_name(*n).to_vec(),
+            Self::Arg(i) => vec![opcode::ARG0 + i],
+            Self::Local(i) => vec![opcode::LOCAL0 + i],
+        }
+    }
 }
 
 /// AML bytecode builder — low-level byte emission
@@ -336,11 +377,20 @@ impl AmlBuilder {
     /// \\link, SourceIndex }`. `link` is a 4-char `NameSeg` (e.g. `b"LNKA"`) that
     /// resolves relative to the `_PRT`'s scope. In a package, a bare `NameSeg` is a
     /// reference the OS follows to the link device's `_CRS`/`_PRS`/`_SRS`.
-    fn encode_named_prt_entry(address: u64, pin: u64, link: [u8; 4], source_index: u64) -> Vec<u8> {
+    fn encode_named_prt_entry(
+        address: u64,
+        pin: u64,
+        link: &[[u8; 4]],
+        source_index: u64,
+    ) -> Vec<u8> {
         let mut body = vec![4u8]; // NumElements
         body.extend_from_slice(&Self::encode_integer_const(address));
         body.extend_from_slice(&Self::encode_integer_const(pin));
-        body.extend_from_slice(&link); // NameSeg reference to the link device
+        // Absolute (root-anchored) path to the link device. A `_PRT` is a Method, so
+        // its body adds a scope level; a *relative* multi-seg path would resolve under
+        // `…._PRT` (multi-seg paths get no upward search) and not exist. A rooted path
+        // resolves unambiguously regardless of the enclosing method scope.
+        body.extend_from_slice(&Self::encode_rooted_name_path(link));
         body.extend_from_slice(&Self::encode_integer_const(source_index));
         let mut out = vec![opcode::PACKAGE_OP];
         out.extend_from_slice(&Self::encode_self_pkg_length(body.len()));
@@ -348,14 +398,52 @@ impl AmlBuilder {
         out
     }
 
+    /// Encode a `NameString` from its path segments: a bare `NameSeg` (1), a
+    /// `DualNamePrefix` pair (2), or a `MultiNamePrefix` run (≥3), per ACPI 6.x
+    /// §20.2.2. A multi-segment name resolves *relative to the current scope*
+    /// (no upward search), which is how a `_PRT` under `PCI0` points at a link
+    /// device nested under the ISA bridge (`ISA_.LNKA`).
+    fn encode_name_path(segs: &[[u8; 4]]) -> Vec<u8> {
+        match segs {
+            [one] => one.to_vec(),
+            [a, b] => {
+                let mut v = vec![0x2E]; // DualNamePrefix
+                v.extend_from_slice(a);
+                v.extend_from_slice(b);
+                v
+            }
+            many => {
+                let mut v = vec![0x2F, many.len().to_le_bytes()[0]]; // MultiNamePrefix + SegCount
+                for s in many {
+                    v.extend_from_slice(s);
+                }
+                v
+            }
+        }
+    }
+
+    /// A root-anchored `NameString`: `RootChar` (`\`) followed by the name path
+    /// (ACPI 6.x §20.2.2). Resolves from the namespace root regardless of the
+    /// current scope — used for a `_PRT` `Source` that must point at a link device
+    /// by absolute path from inside the `_PRT` method.
+    fn encode_rooted_name_path(segs: &[[u8; 4]]) -> Vec<u8> {
+        let mut v = vec![0x5C]; // RootChar
+        v.extend_from_slice(&Self::encode_name_path(segs));
+        v
+    }
+
     /// `Return(Package(){ ... })` for a PIC-mode `_PRT` that routes each entry
     /// through a named PCI interrupt **link device** (the PIIX/ICH firmware
-    /// pattern). Each entry is `(address, pin, link_nameseg)`; `SourceIndex` is
+    /// pattern). Each entry is `(address, pin, link_path)` where `link_path` is the
+    /// link device's name segments (e.g. `&[*b"ISA_", *b"LNKA"]`); `SourceIndex` is
     /// always 0 (the link's first/only resource).
-    pub fn return_routing_table_via_links(&mut self, entries: &[(u64, u64, [u8; 4])]) -> &mut Self {
+    pub fn return_routing_table_via_links(
+        &mut self,
+        entries: &[(u64, u64, &[[u8; 4]])],
+    ) -> &mut Self {
         let mut body = vec![entries.len().to_le_bytes()[0]];
         for (address, pin, link) in entries {
-            body.extend_from_slice(&Self::encode_named_prt_entry(*address, *pin, *link, 0));
+            body.extend_from_slice(&Self::encode_named_prt_entry(*address, *pin, link, 0));
         }
         self.data.push(opcode::RETURN_OP);
         self.data.push(opcode::PACKAGE_OP);
@@ -384,9 +472,147 @@ impl AmlBuilder {
         }
     }
 
-    /// Close an `If` block opened with [`Self::if_name_start`].
+    /// Start an `If` block with a caller-built predicate: emit `IfOp` + a reserved
+    /// `PkgLength`, then the caller emits the predicate expression (e.g. an
+    /// [`Self::and_op`] with a null target) followed by the body, and closes with
+    /// [`Self::if_end`]. Unlike [`Self::if_name_start`] the predicate is whatever the
+    /// caller writes next, so a computed test like `If (And (PIRx, 0x80))` is possible.
+    pub fn if_start(&mut self) -> ScopeHandle {
+        self.data.push(opcode::IF_OP);
+        let length_pos = self.data.len();
+        self.data.extend_from_slice(&[0, 0, 0, 0]);
+        ScopeHandle {
+            length_pos,
+            content_start: self.data.len(),
+        }
+    }
+
+    /// Close an `If` block opened with [`Self::if_name_start`] or [`Self::if_start`].
     pub fn if_end(&mut self, handle: &ScopeHandle) {
         self.patch_pkg_length(handle.length_pos, handle.content_start);
+    }
+
+    /// `OperationRegion(name, space, offset, length)` — declare a region the
+    /// `Field` below names into. Used to expose the PIIX3 PCI-config PIRQ
+    /// route-control bytes so the link devices can read/write live routing.
+    /// `DefOpRegion := ExtOpPrefix OpRegionOp NameString RegionSpace
+    /// RegionOffset RegionLen` — no `PkgLength` (ACPI 6.x §20.2.5.2).
+    pub fn operation_region(
+        &mut self,
+        name: &[u8; 4],
+        space: u8,
+        offset: u64,
+        length: u64,
+    ) -> &mut Self {
+        self.data.push(opcode::EXT_OP_PREFIX);
+        self.data.push(opcode::OPERATION_REGION_OP);
+        self.data.extend_from_slice(&Self::encode_name(*name));
+        self.data.push(space);
+        self.data
+            .extend_from_slice(&Self::encode_integer_const(offset));
+        self.data
+            .extend_from_slice(&Self::encode_integer_const(length));
+        self
+    }
+
+    /// `Field(region, ByteAcc, NoLock, Preserve){ ... }` — name sub-fields into a
+    /// region declared with [`Self::operation_region`]. Each entry is
+    /// `(name, bit_width)`; `name` is `None` for a reserved gap that advances the
+    /// bit offset without naming it. `DefField := ExtOpPrefix FieldOp PkgLength
+    /// NameString FieldFlags FieldList`; the `PkgLength` spans the name, flags and
+    /// field list (ACPI 6.x §20.2.5.2). Field flags `0x01` = `ByteAcc`/`NoLock`/
+    /// `Preserve`, the PIIX/ICH convention for the byte-wide PIRQ registers.
+    pub fn field(&mut self, region: &[u8; 4], entries: &[(Option<[u8; 4]>, u32)]) -> &mut Self {
+        let mut body = Vec::new();
+        body.extend_from_slice(&Self::encode_name(*region));
+        body.push(0x01); // FieldFlags: ByteAcc, NoLock, Preserve
+        for (name, bits) in entries {
+            match name {
+                Some(seg) => body.extend_from_slice(seg),
+                None => body.push(0x00), // ReservedField marker
+            }
+            // The field-element length uses the PkgLength encoding for its bit count.
+            body.extend_from_slice(&Self::encode_pkg_length(*bits as usize));
+        }
+        self.data.push(opcode::EXT_OP_PREFIX);
+        self.data.push(opcode::FIELD_OP);
+        self.data
+            .extend_from_slice(&Self::encode_self_pkg_length(body.len()));
+        self.data.extend_from_slice(&body);
+        self
+    }
+
+    /// `Store(source, target)` — `StoreOp TermArg SuperName` (ACPI 6.x §20.2.5.4).
+    pub fn store(&mut self, source: Operand, target: Operand) -> &mut Self {
+        self.data.push(opcode::STORE_OP);
+        self.data.extend_from_slice(&source.encode());
+        self.data.extend_from_slice(&target.encode());
+        self
+    }
+
+    /// Emit a dyadic operator `op a, b, target` (`And`/`Or`/`ShiftLeft`/
+    /// `Subtract` — `Op Operand Operand Target`).
+    fn dyadic(&mut self, op: u8, a: Operand, b: Operand, target: Operand) -> &mut Self {
+        self.data.push(op);
+        self.data.extend_from_slice(&a.encode());
+        self.data.extend_from_slice(&b.encode());
+        self.data.extend_from_slice(&target.encode());
+        self
+    }
+
+    /// `And(a, b, target)`.
+    pub fn and_op(&mut self, a: Operand, b: Operand, target: Operand) -> &mut Self {
+        self.dyadic(opcode::AND_OP, a, b, target)
+    }
+
+    /// `Or(a, b, target)`.
+    pub fn or_op(&mut self, a: Operand, b: Operand, target: Operand) -> &mut Self {
+        self.dyadic(opcode::OR_OP, a, b, target)
+    }
+
+    /// `ShiftLeft(value, count, target)`.
+    pub fn shift_left(&mut self, value: Operand, count: Operand, target: Operand) -> &mut Self {
+        self.dyadic(opcode::SHIFT_LEFT_OP, value, count, target)
+    }
+
+    /// `Subtract(a, b, target)`.
+    pub fn subtract(&mut self, a: Operand, b: Operand, target: Operand) -> &mut Self {
+        self.dyadic(opcode::SUBTRACT_OP, a, b, target)
+    }
+
+    /// `FindSetRightBit(source, target)` — `FindSetRightBitOp Operand Target`.
+    /// Returns the 1-based index of the least-significant set bit (0 if none),
+    /// the standard way a `_SRS` turns an IRQ mask into an IRQ number.
+    pub fn find_set_right_bit(&mut self, source: Operand, target: Operand) -> &mut Self {
+        self.data.push(opcode::FIND_SET_RIGHT_BIT_OP);
+        self.data.extend_from_slice(&source.encode());
+        self.data.extend_from_slice(&target.encode());
+        self
+    }
+
+    /// `CreateWordField(buffer, byte_index, name)` — overlay a 16-bit field on a
+    /// buffer (`CreateWordFieldOp SourceBuff ByteIndex NameString`). Used to reach
+    /// the 16-bit IRQ mask inside an `_SRS`/`_CRS` resource buffer.
+    pub fn create_word_field(
+        &mut self,
+        buffer: Operand,
+        byte_index: u64,
+        name: &[u8; 4],
+    ) -> &mut Self {
+        self.data.push(opcode::CREATE_WORD_FIELD_OP);
+        self.data.extend_from_slice(&buffer.encode());
+        self.data
+            .extend_from_slice(&Self::encode_integer_const(byte_index));
+        self.data.extend_from_slice(&Self::encode_name(*name));
+        self
+    }
+
+    /// `Return(<name>)` — return the value of a named object (e.g. a `_CRS`
+    /// resource buffer built in the method body).
+    pub fn return_name(&mut self, name: &[u8; 4]) -> &mut Self {
+        self.data.push(opcode::RETURN_OP);
+        self.data.extend_from_slice(&Self::encode_name(*name));
+        self
     }
 
     /// `Name(name, ResourceTemplate{ ... })` — emit a `_CRS`/`_PRS`-style buffer.
@@ -884,8 +1110,12 @@ mod tests {
     #[test]
     fn return_routing_table_via_links_encodes_a_named_source() {
         let mut aml = AmlBuilder::new();
-        // slot 0 INTA -> LNKA: { 0x0000FFFF, 0, LNKA, 0 }.
-        aml.return_routing_table_via_links(&[(0x0000_FFFF, 0, *b"LNKA")]);
+        // slot 0 INTA -> \_SB.PCI0.ISA_.LNKA: { 0x0000FFFF, 0, \_SB.PCI0.ISA_.LNKA, 0 }.
+        aml.return_routing_table_via_links(&[(
+            0x0000_FFFF,
+            0,
+            &[*b"_SB_", *b"PCI0", *b"ISA_", *b"LNKA"],
+        )]);
         let bytes = aml.into_bytes();
         assert_eq!(bytes[0], opcode::RETURN_OP);
         assert_eq!(bytes[1], opcode::PACKAGE_OP);
@@ -895,13 +1125,34 @@ mod tests {
         let num = 2 + field;
         assert_eq!(bytes[num], 1);
         assert_eq!(bytes[num + 1], opcode::PACKAGE_OP);
-        // The Source element is the bare NameSeg "LNKA" (not an integer 0), and the
-        // SourceIndex after it is ZERO.
+        // The Source element is a rooted MultiName path \_SB.PCI0.ISA_.LNKA:
+        // RootChar 0x5C, MultiNamePrefix 0x2F, SegCount 4, then the four segs.
         let seg = bytes
-            .windows(5)
-            .find(|w| w[..4] == *b"LNKA")
-            .expect("link NameSeg present");
-        assert_eq!(seg[4], opcode::ZERO, "SourceIndex follows the link name");
+            .windows(20)
+            .find(|w| {
+                w[0] == 0x5C
+                    && w[1] == 0x2F
+                    && w[2] == 0x04
+                    && w[3..7] == *b"_SB_"
+                    && w[7..11] == *b"PCI0"
+                    && w[11..15] == *b"ISA_"
+                    && w[15..19] == *b"LNKA"
+            })
+            .expect("rooted multiname link path present");
+        assert_eq!(seg[19], opcode::ZERO, "SourceIndex follows the link path");
+    }
+
+    #[test]
+    fn encode_name_path_handles_single_dual_and_multi() {
+        assert_eq!(AmlBuilder::encode_name_path(&[*b"LNKA"]), b"LNKA".to_vec());
+        assert_eq!(
+            AmlBuilder::encode_name_path(&[*b"ISA_", *b"LNKA"]),
+            [&[0x2E][..], b"ISA_", b"LNKA"].concat()
+        );
+        assert_eq!(
+            AmlBuilder::encode_name_path(&[*b"PCI0", *b"ISA_", *b"LNKA"]),
+            [&[0x2F, 0x03][..], b"PCI0", b"ISA_", b"LNKA"].concat()
+        );
     }
 
     #[test]
@@ -1081,5 +1332,98 @@ mod tests {
         assert_eq!(AmlBuilder::encode_pkg_length(0x100).len(), 2);
         // Large values should be 3 bytes
         assert_eq!(AmlBuilder::encode_pkg_length(0x10000).len(), 3);
+    }
+
+    #[test]
+    fn operation_region_encodes_space_offset_length() {
+        let mut aml = AmlBuilder::new();
+        aml.operation_region(b"PIRQ", opcode::REGION_SPACE_PCI_CONFIG, 0x60, 0x04);
+        let bytes = aml.into_bytes();
+        assert_eq!(bytes[0], opcode::EXT_OP_PREFIX);
+        assert_eq!(bytes[1], opcode::OPERATION_REGION_OP);
+        assert_eq!(&bytes[2..6], b"PIRQ");
+        assert_eq!(bytes[6], 0x02); // PCI_Config
+        // Offset 0x60 and length 0x04 as byte consts.
+        assert_eq!(&bytes[7..9], &[opcode::BYTE_PREFIX, 0x60]);
+        assert_eq!(bytes[9], opcode::BYTE_PREFIX);
+        assert_eq!(bytes[10], 0x04);
+    }
+
+    #[test]
+    fn field_encodes_named_bytes_with_self_consistent_pkg_length() {
+        let mut aml = AmlBuilder::new();
+        aml.field(
+            b"PIRQ",
+            &[
+                (Some(*b"PIRA"), 8),
+                (Some(*b"PIRB"), 8),
+                (Some(*b"PIRC"), 8),
+                (Some(*b"PIRD"), 8),
+            ],
+        );
+        let bytes = aml.into_bytes();
+        assert_eq!(bytes[0], opcode::EXT_OP_PREFIX);
+        assert_eq!(bytes[1], opcode::FIELD_OP);
+        let (pkg_val, pkg_field) = decode_pkg_length(&bytes[2..]);
+        assert_eq!(pkg_val, bytes.len() - 2, "field PkgLength spans to end");
+        let body = &bytes[2 + pkg_field..];
+        assert_eq!(&body[0..4], b"PIRQ", "region name");
+        assert_eq!(body[4], 0x01, "ByteAcc/NoLock/Preserve flags");
+        // First named field: NameSeg "PIRA" then a 1-byte PkgLength of 8.
+        assert_eq!(&body[5..9], b"PIRA");
+        assert_eq!(body[9], 8);
+    }
+
+    #[test]
+    fn store_and_dyadic_ops_encode_operands_and_target() {
+        let mut aml = AmlBuilder::new();
+        aml.store(Operand::Int(0), Operand::Name(b"PIRA"));
+        aml.and_op(
+            Operand::Name(b"PIRA"),
+            Operand::Int(0x0F),
+            Operand::Local(0),
+        );
+        aml.or_op(
+            Operand::Name(b"PIRA"),
+            Operand::Int(0x80),
+            Operand::Name(b"PIRA"),
+        );
+        aml.shift_left(Operand::Int(1), Operand::Local(0), Operand::Name(b"IRQM"));
+        aml.subtract(Operand::Local(0), Operand::Int(1), Operand::Local(0));
+        aml.find_set_right_bit(Operand::Name(b"IRQM"), Operand::Local(0));
+        let bytes = aml.into_bytes();
+
+        // Store(Zero, PIRA): 0x70 0x00 'P' 'I' 'R' 'A'
+        assert_eq!(bytes[0], opcode::STORE_OP);
+        assert_eq!(bytes[1], opcode::ZERO);
+        assert_eq!(&bytes[2..6], b"PIRA");
+        // And(PIRA, 0x0F, Local0): 0x7B 'PIRA' 0x0A 0x0F 0x60
+        let and_pos = 6;
+        assert_eq!(bytes[and_pos], opcode::AND_OP);
+        assert_eq!(&bytes[and_pos + 1..and_pos + 5], b"PIRA");
+        assert_eq!(
+            &bytes[and_pos + 5..and_pos + 7],
+            &[opcode::BYTE_PREFIX, 0x0F]
+        );
+        assert_eq!(bytes[and_pos + 7], opcode::LOCAL0);
+        // Spot-check the remaining opcodes are present in order.
+        assert!(bytes.contains(&opcode::OR_OP));
+        assert!(bytes.contains(&opcode::SHIFT_LEFT_OP));
+        assert!(bytes.contains(&opcode::SUBTRACT_OP));
+        assert!(bytes.contains(&opcode::FIND_SET_RIGHT_BIT_OP));
+    }
+
+    #[test]
+    fn create_word_field_and_return_name_encode() {
+        let mut aml = AmlBuilder::new();
+        aml.create_word_field(Operand::Name(b"BUF0"), 1, b"IRQM");
+        aml.return_name(b"BUF0");
+        let bytes = aml.into_bytes();
+        assert_eq!(bytes[0], opcode::CREATE_WORD_FIELD_OP);
+        assert_eq!(&bytes[1..5], b"BUF0");
+        assert_eq!(bytes[5], opcode::ONE); // byte index 1
+        assert_eq!(&bytes[6..10], b"IRQM");
+        assert_eq!(bytes[10], opcode::RETURN_OP);
+        assert_eq!(&bytes[11..15], b"BUF0");
     }
 }
