@@ -65,6 +65,12 @@ pub struct CpuidStealthConfig {
     pub hide_hypervisor: bool,
     /// Physical cache info to pass through
     pub cache_info: Vec<CpuidResult>,
+    /// Processor base frequency in MHz (leaf 0x16 EAX; also fixes the TSC
+    /// rate enumerated by leaf 0x15 — modern Intel clocks the TSC at the
+    /// base frequency)
+    pub base_frequency_mhz: u32,
+    /// Maximum turbo frequency in MHz (leaf 0x16 EBX)
+    pub max_frequency_mhz: u32,
 }
 
 /// CPU vendor
@@ -161,6 +167,39 @@ impl CpuidStealthTable {
                 edx: 0,
             },
         });
+
+        // Leaves 0x15/0x16: TSC/crystal ratio + processor frequencies (Intel
+        // only). The table advertises max basic leaf 0x16, so leaving these
+        // unpopulated returned in-range zeros — "frequency not enumerated" on
+        // a CPU model that always enumerates it, and no TSC rate for the guest
+        // OS to calibrate against (Linux falls back to noisy PIT/HPET
+        // calibration, whose result then has to agree with our virtual timers).
+        if config.vendor == CpuVendor::Intel {
+            // Leaf 0x15: TSC = crystal × EBX/EAX (Intel SDM Vol 2A). With a
+            // 24 MHz crystal and EAX = 24, EBX = base MHz makes the TSC rate
+            // exactly base_frequency_mhz × 1e6 — integer-exact, no rounding.
+            entries.push(CpuidCacheEntry {
+                leaf: 0x15,
+                subleaf: 0,
+                result: CpuidResult {
+                    eax: 24,
+                    ebx: config.base_frequency_mhz,
+                    ecx: 24_000_000, // crystal: 24 MHz
+                    edx: 0,
+                },
+            });
+            // Leaf 0x16: base / max-turbo / bus frequencies in MHz.
+            entries.push(CpuidCacheEntry {
+                leaf: 0x16,
+                subleaf: 0,
+                result: CpuidResult {
+                    eax: config.base_frequency_mhz,
+                    ebx: config.max_frequency_mhz,
+                    ecx: 100, // bus/reference: 100 MHz
+                    edx: 0,
+                },
+            });
+        }
 
         // Leaves 0x40000000-0x400000FF (the hypervisor region) are deliberately NOT cached: they
         // are out-of-range of the advertised basic max, so `lookup` resolves them through the
@@ -442,6 +481,8 @@ mod tests {
             threads_per_core: 2,
             hide_hypervisor: true,
             cache_info: Vec::new(),
+            base_frequency_mhz: 2800,
+            max_frequency_mhz: 3300,
         }
     }
 
@@ -475,9 +516,9 @@ mod tests {
     #[test]
     fn intel_out_of_range_mirrors_highest_basic_leaf() {
         // Intel SDM: an out-of-range leaf returns the highest basic leaf's data, NOT zeros.
-        // The highest populated basic-range leaf in the table is 0xD.
+        // The highest populated basic-range leaf in the table is 0x16 (frequencies).
         let table = CpuidStealthTable::build(&intel_config());
-        let highest_basic = table.lookup(0xD, 0);
+        let highest_basic = table.lookup(0x16, 0);
         assert_ne!(
             highest_basic,
             CpuidResult::default(),
@@ -593,9 +634,38 @@ mod tests {
 
     #[test]
     fn amd_leaf_a_stays_reserved_zero() {
-        // Leaf 0xA is Intel-only; on AMD it is reserved and must return zeros.
+        // Leaves 0xA/0x15/0x16 are Intel-only; on AMD they stay reserved-zero.
         let table = CpuidStealthTable::build(&test_config());
         assert_eq!(table.lookup(0xA, 0), CpuidResult::default());
+        assert_eq!(table.lookup(0x15, 0), CpuidResult::default());
+        assert_eq!(table.lookup(0x16, 0), CpuidResult::default());
+    }
+
+    #[test]
+    fn intel_frequency_leaves_are_enumerated_and_consistent() {
+        let table = CpuidStealthTable::build(&intel_config());
+
+        // Leaf 0x15: TSC rate = crystal × EBX/EAX must equal the base
+        // frequency exactly (the guest OS calibrates its clocks from this).
+        let r15 = table.lookup(0x15, 0);
+        assert_ne!(r15.ebx, 0, "TSC/crystal ratio must be enumerated");
+        let tsc_hz = u64::from(r15.ecx) * u64::from(r15.ebx) / u64::from(r15.eax);
+        assert_eq!(tsc_hz, 2800 * 1_000_000, "TSC rate = base frequency");
+
+        // Leaf 0x16: base/max/bus in MHz.
+        let r16 = table.lookup(0x16, 0);
+        assert_eq!(r16.eax, 2800, "base MHz");
+        assert_eq!(r16.ebx, 3300, "max turbo MHz");
+        assert_eq!(r16.ecx, 100, "bus MHz");
+
+        // Cross-surface: the PMC rate model claims core = 1.15 × ref; the
+        // advertised turbo headroom (3300/2800 ≈ 1.18) must cover it, or the
+        // counters imply a frequency above the CPU's own stated maximum.
+        let model = crate::stealth::pmc::PmcRateModel::DEFAULT;
+        assert!(
+            u64::from(r16.ebx) * 1000 >= u64::from(r16.eax) * model.core_per_kilo_ref,
+            "turbo headroom must cover the PMC core/ref ratio"
+        );
     }
 
     #[test]
