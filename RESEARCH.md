@@ -1053,3 +1053,25 @@ OS read" oracles when the SDM/APM PDFs are paywalled/blocked from this runner:
   surface that encodes the same fact (leaf 4 L2 ↔ 0x80000006 L2; leaf 0x16 turbo ↔ leaf 6 IDA
   ↔ PMC core/ref ratio; leaf 0xD subleaf 0 size ↔ subleaf 2 offset+size; leaf 1 MONITOR ↔
   leaf 5). The tests now pin each of these pairs.
+
+---
+
+## 2026-06-10 (e) — Heterogeneous-ISA pools: the execution-mode model (design discussion w/ owner)
+
+Design session on what a mixed x86/ARM/RISC-V pool presents to a guest. Outcome folded into
+ROADMAP.md → Core Model → "Execution modes" + Phase 11 intro. Prior art that shaped it:
+
+- **TidalScale / ScaleMP (software-defined SMP):** single unmodified OS over multiple x86
+  machines via page-granular software DSM + migrating vCPUs/pages. Proves single-kernel-over-
+  N-nodes is possible and that page-fault-granularity coherence is the bottleneck (acceptable
+  only for partitionable working sets). Same-ISA only. → mesh-mode baseline + its ceiling.
+- **Rosetta 2 / FEX-Emu vs QEMU TCG:** the x86-on-ARM gap (~1.3–2× vs 5–20×) is mostly the
+  memory model — x86 guests assume TSO; Apple ships hardware TSO mode, generic ARM needs
+  per-access fencing. Translation direction matters (ARM-guest-on-x86 gets TSO ≥ weak for
+  free). Rosetta is openly detectable (sysctl) → translation = compatibility, not stealth.
+- **QEMU's KVM↔TCG state model:** native and translated execution share one architectural
+  vCPU state definition, so native↔JIT handoff at an instruction boundary is a pause +
+  register/FPU capture — the mechanism behind the runtime mode-switch requirement.
+- **JIT-instrumented DSM (mesh-mode thesis):** a translator observes every load/store, so
+  coherence can be word/object-granular with access-stream-driven co-scheduling — translation
+  doesn't remove distance, it instruments it. This is the Phase 11 research track.

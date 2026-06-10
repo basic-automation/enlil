@@ -110,12 +110,61 @@ poolable, with **latency-aware placement**.
 **Placement policy (heart of Phase 9):** classify each workload — coupled-and-hot → local;
 decomposable / replicable → fabric. Enlil presents the aggregate as ordinary virtual
 hardware to the guest; behind that front-end the fabric fulfills it with whichever pattern
-fits the device's latency class.
+fits the device's latency class. vCPU placement is additionally keyed by
+`(ISA, vendor, feature baseline)` — see **Execution modes** below; everything else is keyed
+by latency class alone.
 
 **Design rule (applies from Phase 3 onward):** build *every* device as a front-end/back-end
 pair behind a pluggable transport (`local | CXL | RDMA | network`), even while only `local`
 is implemented — so remoting is a transport swap, not a rewrite. VirtIO / vhost-user / vDPA
 is already exactly this shape.
+
+### Execution modes — ISA sets the boundary of a logical machine
+
+The latency law has an ISA twin: **a single kernel's execution cannot span an ISA
+boundary**. Page-table formats, the interrupt model, atomics, and the memory-consistency
+model are ISA-fixed, and no machine model a stock OS accepts (ACPI or device tree)
+describes mixed-ISA SMP — so ISA is a *placement constraint*, exactly like latency class.
+A logical machine is born with a **placement key** `(ISA, vendor, feature baseline)`: its
+CPUID/MSR surface is frozen at creation to the common denominator of its placement class
+(still shaped as a plausible real CPU — the Phase 5.4 consistency rules apply to the
+baseline, not just the host), its vCPUs run natively only on nodes matching the key, and
+the key defines its live-migration domain.
+
+Foreign-ISA nodes still serve every *other* lane — device back-ends, memory tiers, fabric
+work units are ISA-blind by the design rule above. Whether a guest may additionally execute
+via binary translation is a per-guest **execution mode**, and **runtime switchability is a
+requirement, not a nicety**:
+
+| Mode | vCPUs | Foreign-ISA / remote nodes contribute | Transparency |
+|---|---|---|---|
+| **transparent** | native, on matching nodes | device back-ends only | full — the product |
+| **hybrid** | native, plus a translated **compute device** | back-ends + fabric compute (portable IR or guest-ISA fragments) | native surface fully stealthed; the accelerator is an opt-in paravirtual device (a cold PCI device if its driver never loads) |
+| **mesh** | all translated (JIT) | everything — vCPUs are ISA- and location-free | none — compatibility only, explicitly detectable |
+
+- **Admission rule:** the guest manifest declares the floor it accepts (`require =
+  transparent` … `allow = mesh`); the pool's composition decides what is achievable.
+  Windows-for-ARM on an all-x86 pool admits only in mesh mode (or not at all).
+- **Runtime switching:** native↔translated vCPU handoff is a pause at an instruction
+  boundary plus a same-ISA register/FPU state capture — the QEMU KVM↔TCG state model;
+  the compute device toggles via PCI hot(un)plug. A guest can start hybrid, drop to
+  transparent before detection-sensitive work, and return — switching modes must not
+  require a guest reboot.
+- **The compute layer is never presented as CPUs.** An unmodified OS cannot accept
+  foreign-ISA processors, and even same-ISA cross-node vCPUs violate memory coherence
+  (below). The translated layer enters the guest as a *device*: the Phase 9 compute-queue /
+  vGPU-offload front-end, fulfilled fabric-wide.
+- **Translation decouples ISA, not memory.** Even in mesh mode the guest is one kernel
+  with one coherent RAM image; distributing its vCPUs across nodes still hits the latency
+  law and requires software DSM (TidalScale/ScaleMP prior art: page-granular, same-ISA,
+  acceptable only for partitionable workloads). The mesh-mode research thesis (Phase 11):
+  a JIT observes every load and store, enabling word/object-granular coherence and
+  access-stream-driven co-scheduling — translation does not remove distance, it
+  *instruments* it.
+- **Translation is compatibility, never transparency:** per-block overhead skews every
+  RDTSC-bracketed measurement, self-modifying code forces retranslation stalls, and perf
+  counters count host events at a workload-varying ratio — the Phase 5.4 consistency
+  surfaces cannot be faked under translation. Mesh/hybrid compute make no stealth claim.
 
 ### Distributed-compute planes (Phase 9 Fabric / Phase 11 Mesh)
 
@@ -2960,6 +3009,17 @@ ARCHITECTURE-SPECIFIC (must be re-implemented per arch):
 **Why ZK proofs make this fundamentally different:** Every existing multi-machine hypervisor (VMware vSphere/DRS, Proxmox cluster, XCP-ng pool, GiantVM) requires all nodes to implicitly trust each other or trust a central management server. If one node is compromised, every guest on every node is potentially compromised. Enlil Mesh eliminates this with the ZK attestation system from Phases 8.7/8.9: each node cryptographically proves its integrity to every other node. No trust assumptions. No central authority. A guest can verify — with a 200-byte SNARK proof — that every machine touching its memory, CPU, or GPU is running genuine Enlil with correct isolation.
 
 This is the Ethereum model applied to infrastructure: replace N-of-N trust (every node re-verifies every other node's state) with 1-of-N proof (each node proves once, all others verify a tiny proof).
+
+**How a guest "spans machines" — by execution mode (see Core Model → Execution modes):** in
+*transparent/hybrid* mode only the guest's devices, memory tiers, and fabric compute span the
+mesh — its vCPUs stay native on one node (or one CXL domain) and "spanning" means routing,
+replication, and migration within the placement key's domain. A single kernel executing
+across nodes is exclusive to *mesh* mode and is the research track of this phase:
+JIT-instrumented software DSM (word/object-granular coherence from the translator's view of
+every load/store, vCPU/page co-scheduling against the observed access stream), with
+TidalScale/ScaleMP as the page-granular prior art and the latency tiers below bounding what
+working sets can ever be split. Runtime mode switching (a requirement — no guest reboot)
+lets one guest move between these postures as its workload and the pool change.
 
 ---
 
