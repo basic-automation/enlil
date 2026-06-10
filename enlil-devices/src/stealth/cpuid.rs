@@ -150,16 +150,10 @@ impl CpuidStealthTable {
             },
         });
 
-        // Leaves 0x40000000-0x400000FF: MUST return zeros when hiding
-        if config.hide_hypervisor {
-            for leaf in 0x4000_0000..=0x4000_00FF {
-                entries.push(CpuidCacheEntry {
-                    leaf,
-                    subleaf: 0,
-                    result: CpuidResult::default(),
-                });
-            }
-        }
+        // Leaves 0x40000000-0x400000FF (the hypervisor region) are deliberately NOT cached: they
+        // are out-of-range of the advertised basic max, so `lookup` resolves them through the
+        // vendor-correct `out_of_range` value (highest basic leaf on Intel, zeros on AMD) — exactly
+        // like bare metal. Caching zeros here would both waste 256 entries and be an Intel tell.
     }
 
     /// Push the extended (0x80000000+) CPUID leaves.
