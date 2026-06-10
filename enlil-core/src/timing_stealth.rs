@@ -1,7 +1,8 @@
 //! Timing Stealth — Hide VM exit overhead
 //!
-//! Implements APERF/MPERF shadow counters, TSC offsetting, and LBR sanitization
-//! to defeat IET divergence detection and timing-based VM detectors.
+//! Implements APERF/MPERF shadow counters and TSC offsetting to defeat IET
+//! divergence detection and timing-based VM detectors. (LBR sanitization lives
+//! in the canonical `enlil_devices::stealth::lbr` — see the note below.)
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -119,39 +120,12 @@ impl TscOffsetHelper {
     }
 }
 
-/// LBR (Last Branch Record) sanitization for detection evasion
-pub struct LbrSanitizer {
-    /// The branch target that points back into the guest (should be hidden)
-    pub expected_guest_branch_target: u64,
-}
-
-impl Default for LbrSanitizer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl LbrSanitizer {
-    pub fn new() -> Self {
-        Self {
-            expected_guest_branch_target: 0,
-        }
-    }
-
-    /// Sanitize LBR stack after a detected VMEXIT (e.g., via CPUID trap).
-    /// Removes the branch record that shows the branch into the hypervisor.
-    pub fn sanitize_lbr(&self, lbr_stack: &mut [(u64, u64)], guest_rip: u64) {
-        if let Some((from, to)) = lbr_stack.last_mut() {
-            // The most recent entry shows from=guest instruction, to=hypervisor entry.
-            // The hypervisor address sits in `to`, so that is the field a detector reads
-            // — the old code only rewrote `from` and left the hypervisor address exposed.
-            // Overwrite both endpoints so the entry reads as a non-branch within the
-            // guest (matching the canonical enlil_devices::stealth::lbr sanitizer).
-            *from = guest_rip;
-            *to = guest_rip;
-        }
-    }
-}
+// LBR sanitization lives in the canonical `enlil_devices::stealth::lbr::LbrState`
+// (`sanitize_after_exit`), which erases both branch endpoints *and* the LBR_INFO
+// cycle count, gates on the guest's DEBUGCTL.LBR enable, and tracks the full
+// 32-entry MSR-indexed stack. A skeletal `LbrSanitizer` used to sit here with a
+// never-wired `expected_guest_branch_target` field and no info-field clearing —
+// a partial duplicate, so it was removed; the KVM backend should use `LbrState`.
 
 // The CPUID pre-computation cache lives in the canonical, reference-corrected
 // `enlil_devices::stealth::cpuid::CpuidStealthTable` (with proper vendor-specific
@@ -215,21 +189,5 @@ mod tests {
         let mut helper = TscOffsetHelper::new(0);
         helper.calculate_offset(1000, 2000);
         assert_eq!(helper.tsc_offset, 1000);
-    }
-
-    #[test]
-    fn lbr_sanitize_hides_hypervisor_address_in_both_endpoints() {
-        let san = LbrSanitizer::new();
-        let hypervisor = 0xFFFF_8000_0010_0000u64; // a hypervisor-range target
-        let guest_rip = 0x0000_0000_0040_1234u64;
-        let mut stack = vec![(0x0040_1000u64, 0x0040_1010u64), (guest_rip, hypervisor)];
-        san.sanitize_lbr(&mut stack, guest_rip);
-        let (from, to) = *stack.last().unwrap();
-        assert_eq!(
-            to, guest_rip,
-            "the hypervisor address in `to` must be erased"
-        );
-        assert_eq!(from, guest_rip);
-        assert_ne!(to, hypervisor, "hypervisor address must not remain");
     }
 }
