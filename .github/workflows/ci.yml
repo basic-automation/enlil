@@ -15,9 +15,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Reference validators: the ACPI (iasl) and SMBIOS (dmidecode) integration
+      # tests self-skip when these binaries are absent. Installing them makes
+      # those tests hard gates instead of silent skips.
+      - run: sudo apt-get update && sudo apt-get install -y acpica-tools dmidecode
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all
+      - run: cargo clippy --all-targets --workspace -- -D warnings
+      - run: cargo test --workspace

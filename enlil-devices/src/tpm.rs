@@ -5,6 +5,7 @@
 //! virtual TPM with separate PCR banks, endorsement keys, etc.
 
 use crate::truncate::{u8_of, u16_of, u32_of, usize_of};
+use std::collections::HashMap;
 /// Standard TPM MMIO base address
 pub const TPM_MMIO_BASE: u64 = 0xFED4_0000;
 /// TPM MMIO region size (4KB for CRB interface)
@@ -120,6 +121,9 @@ pub struct VirtualTpm {
     pub rsp_buffer: Vec<u8>,
     /// Persistent state file path (for `BitLocker`, Windows Hello, etc.)
     pub state_path: Option<String>,
+    /// NV index storage — persistent blobs a guest seals/reads back
+    /// (`BitLocker` metadata, Windows Hello, EK certificate indices, …)
+    nv_storage: HashMap<u32, Vec<u8>>,
     /// `GetRandom` PRNG state (xorshift64*); seeded deterministically at creation.
     rng_state: u64,
 }
@@ -141,8 +145,26 @@ impl VirtualTpm {
             cmd_buffer: vec![0u8; 4096],
             rsp_buffer: vec![0u8; 4096],
             state_path: None,
+            nv_storage: HashMap::new(),
             rng_state: 0x9E37_79B9_7F4A_7C15, // nonzero seed (xorshift requires it)
         }
+    }
+
+    /// Dispatch a raw TPM2 command buffer against this TPM and return the
+    /// response bytes. This is the byte-vec front the management plane uses;
+    /// it shares all state (PCR bank, NV storage, RNG) with the CRB MMIO
+    /// front, so measurements made over either path agree.
+    pub fn execute_command(&mut self, command: &[u8]) -> Vec<u8> {
+        let len = command.len().min(self.cmd_buffer.len());
+        self.cmd_buffer[..len].copy_from_slice(&command[..len]);
+        self.process_command();
+        let declared = usize_of(u32::from_be_bytes(
+            self.rsp_buffer[2..6].try_into().unwrap_or([0; 4]),
+        ));
+        // A response is at least the 10-byte header; trust the declared size
+        // only up to the buffer's bounds.
+        let rsp_len = declared.clamp(10, self.rsp_buffer.len());
+        self.rsp_buffer[..rsp_len].to_vec()
     }
 
     /// Handle MMIO read at given offset from `TPM_MMIO_BASE`
@@ -272,6 +294,12 @@ impl VirtualTpm {
             TpmCommand::PcrRead => {
                 self.handle_pcr_read();
             }
+            TpmCommand::NvWrite => {
+                self.handle_nv_write();
+            }
+            TpmCommand::NvRead => {
+                self.handle_nv_read();
+            }
             _ => {
                 // Return success for unknown commands (permissive mode)
                 self.write_success_response();
@@ -328,6 +356,51 @@ impl VirtualTpm {
         self.rsp_buffer[10..10 + SHA256_DIGEST_SIZE].copy_from_slice(&pcr);
     }
 
+    /// Handle `TPM2_NV_Write`: store a blob under an NV index.
+    ///
+    /// Command layout (the pragmatic convention this TPM uses — auth areas
+    /// elided): header (10) + `nvIndex` (4, big-endian) + the data bytes, up
+    /// to the header's declared size. Previously `NV_Read`/`NV_Write` fell
+    /// through to the permissive success path, silently discarding writes —
+    /// a guest sealing `BitLocker` metadata would read back nothing.
+    fn handle_nv_write(&mut self) {
+        let size = usize_of(u32::from_be_bytes(
+            self.cmd_buffer[2..6].try_into().unwrap_or([0; 4]),
+        ));
+        if size < 14 || size > self.cmd_buffer.len() {
+            self.write_error_response(0x0000_0101); // TPM_RC_FAILURE
+            return;
+        }
+        let nv_index = u32::from_be_bytes(self.cmd_buffer[10..14].try_into().unwrap_or([0; 4]));
+        let data = self.cmd_buffer[14..size].to_vec();
+        self.nv_storage.insert(nv_index, data);
+        self.write_success_response();
+    }
+
+    /// Handle `TPM2_NV_Read`: return the blob stored under an NV index.
+    /// Command layout: header (10) + `nvIndex` (4). Response: header (10) +
+    /// length (2, big-endian) + data. An undefined index returns
+    /// `TPM_RC_HANDLE` (0x18B), as on a real TPM.
+    fn handle_nv_read(&mut self) {
+        if self.cmd_buffer.len() < 14 {
+            self.write_error_response(0x0000_0101);
+            return;
+        }
+        let nv_index = u32::from_be_bytes(self.cmd_buffer[10..14].try_into().unwrap_or([0; 4]));
+        let Some(data) = self.nv_storage.get(&nv_index).cloned() else {
+            self.write_error_response(0x0000_018B); // TPM_RC_HANDLE
+            return;
+        };
+        let max_data = self.rsp_buffer.len() - 12;
+        let data_len = data.len().min(max_data);
+        let response_size = 12 + data_len;
+        self.rsp_buffer[0..2].copy_from_slice(&[0x00, 0xC4]); // TPM_ST_NO_SESSIONS
+        self.rsp_buffer[2..6].copy_from_slice(&u32_of(response_size).to_be_bytes());
+        self.rsp_buffer[6..10].copy_from_slice(&0u32.to_be_bytes()); // success
+        self.rsp_buffer[10..12].copy_from_slice(&u16_of(data_len).to_be_bytes());
+        self.rsp_buffer[12..12 + data_len].copy_from_slice(&data[..data_len]);
+    }
+
     /// Write a TPM success response
     fn write_success_response(&mut self) {
         // Response: tag (2) + size (4) + response_code (4)
@@ -348,11 +421,81 @@ impl VirtualTpm {
         self.rsp_buffer[..10].copy_from_slice(&response);
     }
 
-    /// Handle `TPM2_GetCapability` — returns basic TPM properties
+    /// Handle `TPM2_GetCapability` (TCG TPM 2.0 Part 3 §30.2).
+    ///
+    /// Command: header (10) + `capability` (4) + `property` (4) +
+    /// `propertyCount` (4). Response: header (10) + `moreData` (1) +
+    /// `TPMS_CAPABILITY_DATA` (`capability` (4) + the capability-specific
+    /// list). Previously this returned a bare 10-byte success with **no**
+    /// capability data at all — the first thing a Windows TPM driver does is
+    /// query `TPM_CAP_PCRS` / `TPM_CAP_TPM_PROPERTIES`, and an empty body
+    /// fails its parse. Supported here:
+    ///
+    /// - `TPM_CAP_PCRS` (0x5): one `TPMS_PCR_SELECTION` — SHA-256 bank, all
+    ///   [`PCR_COUNT`] PCRs allocated.
+    /// - `TPM_CAP_TPM_PROPERTIES` (0x6): a fixed property set (family "2.0",
+    ///   spec level/revision, manufacturer, PCR count). Pragmatic deviation:
+    ///   the `property`/`propertyCount` window is ignored and the full set is
+    ///   returned (spec-exact windowing needs a guest/swtpm oracle to verify).
+    /// - `TPM_CAP_ALGS` (0x0): one `TPMS_ALG_PROPERTY` for SHA-256.
+    ///
+    /// Anything else returns `TPM_RC_VALUE` for parameter 1 (0x1C4).
     fn handle_get_capability(&mut self) {
-        // Simplified: return a minimal capability response
-        // Real implementation would parse the capability type from cmd_buffer
-        self.write_success_response();
+        if self.cmd_buffer.len() < 22 {
+            self.write_error_response(0x0000_0101); // TPM_RC_FAILURE
+            return;
+        }
+        let capability = u32::from_be_bytes(self.cmd_buffer[10..14].try_into().unwrap_or([0; 4]));
+
+        // Capability-specific payload (the part after `capability` in
+        // TPMS_CAPABILITY_DATA), all big-endian per the TPM wire format.
+        let payload: Vec<u8> = match capability {
+            // TPM_CAP_ALGS → TPML_ALG_PROPERTY: count + (alg, attributes)
+            0x0000_0000 => {
+                let mut p = 1u32.to_be_bytes().to_vec();
+                p.extend_from_slice(&0x000Bu16.to_be_bytes()); // TPM_ALG_SHA256
+                p.extend_from_slice(&0x0000_0004u32.to_be_bytes()); // attributes: hash
+                p
+            }
+            // TPM_CAP_PCRS → TPML_PCR_SELECTION: count + TPMS_PCR_SELECTION
+            0x0000_0005 => {
+                let mut p = 1u32.to_be_bytes().to_vec();
+                p.extend_from_slice(&0x000Bu16.to_be_bytes()); // hash = SHA-256
+                p.push(3); // sizeofSelect: 3 bytes cover 24 PCRs
+                p.extend_from_slice(&[0xFF, 0xFF, 0xFF]); // all 24 PCRs allocated
+                p
+            }
+            // TPM_CAP_TPM_PROPERTIES → TPML_TAGGED_TPM_PROPERTY:
+            // count + count × (property, value)
+            0x0000_0006 => {
+                let props: [(u32, u32); 6] = [
+                    (0x0000_0100, u32::from_be_bytes(*b"2.0\0")), // TPM_PT_FAMILY_INDICATOR
+                    (0x0000_0101, 0),                             // TPM_PT_LEVEL
+                    (0x0000_0102, 138),                           // TPM_PT_REVISION (1.38)
+                    (0x0000_0105, u32::from_be_bytes(*b"INTC")),  // TPM_PT_MANUFACTURER
+                    (0x0000_010B, 0x0007_0002),                   // TPM_PT_FIRMWARE_VERSION_1
+                    (0x0000_0112, u32_of(PCR_COUNT)),             // TPM_PT_PCR_COUNT
+                ];
+                let mut p = u32_of(props.len()).to_be_bytes().to_vec();
+                for (property, value) in props {
+                    p.extend_from_slice(&property.to_be_bytes());
+                    p.extend_from_slice(&value.to_be_bytes());
+                }
+                p
+            }
+            _ => {
+                self.write_error_response(0x0000_01C4); // TPM_RC_VALUE, parameter 1
+                return;
+            }
+        };
+
+        let response_size = 10 + 1 + 4 + payload.len();
+        self.rsp_buffer[0..2].copy_from_slice(&[0x00, 0xC4]); // TPM_ST_NO_SESSIONS
+        self.rsp_buffer[2..6].copy_from_slice(&u32_of(response_size).to_be_bytes());
+        self.rsp_buffer[6..10].copy_from_slice(&0u32.to_be_bytes()); // success
+        self.rsp_buffer[10] = 0; // moreData = NO
+        self.rsp_buffer[11..15].copy_from_slice(&capability.to_be_bytes());
+        self.rsp_buffer[15..15 + payload.len()].copy_from_slice(&payload);
     }
 
     /// Handle `TPM2_GetRandom` — returns pseudo-random bytes
@@ -529,6 +672,120 @@ mod tests {
             0
         );
         assert_eq!(&tpm.rsp_buffer[10..10 + 32], &expected);
+    }
+
+    /// Build a TPM2 command: 2-byte tag, 4-byte size, 4-byte command code, payload.
+    fn tpm_cmd(cc: u32, payload: &[u8]) -> Vec<u8> {
+        let mut c = vec![0x80, 0x01];
+        c.extend_from_slice(&u32_of(10 + payload.len()).to_be_bytes());
+        c.extend_from_slice(&cc.to_be_bytes());
+        c.extend_from_slice(payload);
+        c
+    }
+
+    #[test]
+    fn execute_command_dispatches_and_returns_the_response() {
+        let mut tpm = VirtualTpm::new(TpmInterface::Crb);
+        let rsp = tpm.execute_command(&tpm_cmd(0x0000_0144, &[0x00, 0x00])); // Startup(CLEAR)
+        assert!(tpm.started, "byte-vec front drives the same TPM state");
+        assert_eq!(rsp.len(), 10);
+        assert_eq!(&rsp[6..10], &[0, 0, 0, 0], "success response code");
+    }
+
+    #[test]
+    fn nv_write_then_read_round_trips() {
+        let mut tpm = VirtualTpm::new(TpmInterface::Crb);
+        tpm.started = true;
+
+        // NV_Write(index = 0x0100_0001, data = "sealed-blob")
+        let mut payload = 0x0100_0001u32.to_be_bytes().to_vec();
+        payload.extend_from_slice(b"sealed-blob");
+        let rsp = tpm.execute_command(&tpm_cmd(0x0000_0137, &payload));
+        assert_eq!(&rsp[6..10], &[0, 0, 0, 0], "NV_Write must succeed");
+
+        // NV_Read(index = 0x0100_0001) returns the stored blob.
+        let rsp = tpm.execute_command(&tpm_cmd(0x0000_014E, &0x0100_0001u32.to_be_bytes()));
+        assert_eq!(&rsp[6..10], &[0, 0, 0, 0], "NV_Read must succeed");
+        let len = usize::from(u16::from_be_bytes([rsp[10], rsp[11]]));
+        assert_eq!(&rsp[12..12 + len], b"sealed-blob");
+    }
+
+    #[test]
+    fn nv_read_of_undefined_index_returns_rc_handle() {
+        let mut tpm = VirtualTpm::new(TpmInterface::Crb);
+        tpm.started = true;
+        let rsp = tpm.execute_command(&tpm_cmd(0x0000_014E, &0x0100_0099u32.to_be_bytes()));
+        assert_eq!(
+            u32::from_be_bytes(rsp[6..10].try_into().unwrap()),
+            0x0000_018B,
+            "undefined NV index is TPM_RC_HANDLE, not permissive success"
+        );
+    }
+
+    #[test]
+    fn get_capability_pcrs_returns_a_sha256_bank_of_24() {
+        let mut tpm = VirtualTpm::new(TpmInterface::Crb);
+        tpm.started = true;
+        // GetCapability(TPM_CAP_PCRS, property=0, count=1)
+        let mut payload = 0x0000_0005u32.to_be_bytes().to_vec();
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        payload.extend_from_slice(&1u32.to_be_bytes());
+        let rsp = tpm.execute_command(&tpm_cmd(0x0000_017A, &payload));
+
+        assert_eq!(&rsp[6..10], &[0, 0, 0, 0], "must succeed");
+        assert_eq!(rsp[10], 0, "moreData = NO");
+        assert_eq!(&rsp[11..15], &0x0000_0005u32.to_be_bytes(), "capability");
+        assert_eq!(&rsp[15..19], &1u32.to_be_bytes(), "one TPMS_PCR_SELECTION");
+        assert_eq!(&rsp[19..21], &0x000Bu16.to_be_bytes(), "SHA-256 bank");
+        assert_eq!(rsp[21], 3, "sizeofSelect");
+        assert_eq!(&rsp[22..25], &[0xFF, 0xFF, 0xFF], "all 24 PCRs allocated");
+    }
+
+    #[test]
+    fn get_capability_properties_carry_family_and_manufacturer() {
+        let mut tpm = VirtualTpm::new(TpmInterface::Crb);
+        tpm.started = true;
+        let mut payload = 0x0000_0006u32.to_be_bytes().to_vec();
+        payload.extend_from_slice(&0x100u32.to_be_bytes());
+        payload.extend_from_slice(&8u32.to_be_bytes());
+        let rsp = tpm.execute_command(&tpm_cmd(0x0000_017A, &payload));
+
+        assert_eq!(&rsp[6..10], &[0, 0, 0, 0], "must succeed");
+        let count = u32::from_be_bytes(rsp[15..19].try_into().unwrap());
+        let mut props = std::collections::HashMap::new();
+        for i in 0..usize_of(count) {
+            let off = 19 + i * 8;
+            props.insert(
+                u32::from_be_bytes(rsp[off..off + 4].try_into().unwrap()),
+                u32::from_be_bytes(rsp[off + 4..off + 8].try_into().unwrap()),
+            );
+        }
+        assert_eq!(
+            props.get(&0x100),
+            Some(&u32::from_be_bytes(*b"2.0\0")),
+            "TPM_PT_FAMILY_INDICATOR"
+        );
+        assert_eq!(
+            props.get(&0x105),
+            Some(&u32::from_be_bytes(*b"INTC")),
+            "TPM_PT_MANUFACTURER"
+        );
+        assert_eq!(props.get(&0x112), Some(&24), "TPM_PT_PCR_COUNT");
+    }
+
+    #[test]
+    fn get_capability_unknown_returns_rc_value() {
+        let mut tpm = VirtualTpm::new(TpmInterface::Crb);
+        tpm.started = true;
+        let mut payload = 0x0000_00FFu32.to_be_bytes().to_vec();
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        payload.extend_from_slice(&1u32.to_be_bytes());
+        let rsp = tpm.execute_command(&tpm_cmd(0x0000_017A, &payload));
+        assert_eq!(
+            u32::from_be_bytes(rsp[6..10].try_into().unwrap()),
+            0x0000_01C4,
+            "unsupported capability is TPM_RC_VALUE, not an empty success"
+        );
     }
 
     #[test]

@@ -1004,3 +1004,74 @@ so the next run sees the authoritative sources without re-deriving them.
   Authoritative command codes: `PCR_Extend=0x0000_0182`, `PCR_Read=0x0000_017E`,
   `GetCapability=0x0000_017A`. `GetRandom` must vary across calls. No new dependency was
   added — SHA-256 is implemented in-tree (no_std-friendly), verified against FIPS vectors.
+
+---
+
+## 2026-06-10 (c) — vPMU as a transparency surface: distinct fixed-counter rates + CPUID leaf 0xA
+
+Web research for the PMC-model increment, plus primary-source layout verification.
+
+- **KVM passthrough vPMU (LWN, "KVM: x86/pmu: Introduce passthrough vPMU",
+  <https://lwn.net/Articles/959653/>).** KVM's two vPMU models: trap-and-emulate (our shadow
+  model — every PMC MSR access exits) vs. passthrough (guest owns the real GP counters and
+  "some of the fixed counters"). Confirms the fixed counters are a first-class guest-visible
+  surface; our trap path must therefore return *plausible* values, not placeholders.
+- **IET divergence detection reads APERF (secret.club, "BattlEye hypervisor detection",
+  <https://secret.club/2020/01/12/battleye-hypervisor-detection.html>); the rdtsc;cpuid;rdtsc
+  timing attack is standard in BattlEye/EAC (VIC, arXiv:2502.12322,
+  <https://arxiv.org/abs/2502.12322>).** Consequence for what we build: a detector can
+  cross-check RDPMC's CPU_CLK_UNHALTED.THREAD/REF_TSC against APERF/MPERF — the two surfaces
+  must encode the *same* core/ref ratio, and IPC ≡ 1.0 / core ≡ ref (all counters advancing
+  by the same delta) is the RDPMC version of the APERF/MPERF-no-op tell. Drove the
+  `PmcRateModel` (ref rate / core = 1.15×ref / instr = 1.31×core / slots = 4×core), with the
+  seeding requirement documented on the type.
+- **CPUID leaf 0xA layout (Intel SDM Vol 2A; cross-checked against Linux
+  `arch/x86/include/asm/perf_event.h` `union cpuid10_{eax,ebx,edx}`).** EAX: version[7:0],
+  GP-counter count[15:8], GP width[23:16], event-vector length[31:24]; EBX: 7
+  event-unavailable bits; ECX (v5): supported-fixed-counter bitmask; EDX: fixed count[4:0],
+  fixed width[12:5], AnyThread-deprecated[15]. **Tell found:** our table left 0xA unpopulated
+  → all-zeros → "PMU version 0", which only vPMU-less VMs report (this runner's own cloud
+  guest CPUID returns exactly that) and which contradicts the PMC shadow servicing RDPMC.
+  Fixed: Intel tables advertise version 5 matching `stealth::pmc`'s counter counts.
+
+---
+
+## 2026-06-10 (d) — CPUID consistency sweep: the kernel parsers as layout oracles
+
+The session's later CPUID work (leaves 0x2/0x4/0x5/0x6/0xD/0x15/0x16, 0x80000005-7) was
+verified against the Linux kernel's own parsers — useful as free, precise "what does a real
+OS read" oracles when the SDM/APM PDFs are paywalled/blocked from this runner:
+
+- `arch/x86/kernel/cpu/scattered.c`: `X86_FEATURE_APERFMPERF` ← leaf 0x6 **ECX[0]**, both
+  vendors (AMD calls it the effective-frequency interface). If we serve APERF/MPERF, leaf 6
+  must advertise them; turbo (Intel IDA, EAX[1]) must back any max>base frequency claim.
+- `arch/x86/include/asm/perf_event.h` `union cpuid10_*`: leaf 0xA layout (used 2026-06-10 (c)).
+- `arch/x86/kernel/cpu/cacheinfo.c` `union l1_cache/l2_cache/l3_cache` + `assocs[]`: the
+  legacy AMD Fn8000_0005/6 field layouts and the L2/L3 associativity *encoding* table
+  (4→4-way, 6→8-way, 8→16-way, L3 size = size_encoded × 512 KiB).
+- **Pattern worth keeping:** every populated leaf must be cross-checkable against every other
+  surface that encodes the same fact (leaf 4 L2 ↔ 0x80000006 L2; leaf 0x16 turbo ↔ leaf 6 IDA
+  ↔ PMC core/ref ratio; leaf 0xD subleaf 0 size ↔ subleaf 2 offset+size; leaf 1 MONITOR ↔
+  leaf 5). The tests now pin each of these pairs.
+
+---
+
+## 2026-06-10 (e) — Heterogeneous-ISA pools: the execution-mode model (design discussion w/ owner)
+
+Design session on what a mixed x86/ARM/RISC-V pool presents to a guest. Outcome folded into
+ROADMAP.md → Core Model → "Execution modes" + Phase 11 intro. Prior art that shaped it:
+
+- **TidalScale / ScaleMP (software-defined SMP):** single unmodified OS over multiple x86
+  machines via page-granular software DSM + migrating vCPUs/pages. Proves single-kernel-over-
+  N-nodes is possible and that page-fault-granularity coherence is the bottleneck (acceptable
+  only for partitionable working sets). Same-ISA only. → mesh-mode baseline + its ceiling.
+- **Rosetta 2 / FEX-Emu vs QEMU TCG:** the x86-on-ARM gap (~1.3–2× vs 5–20×) is mostly the
+  memory model — x86 guests assume TSO; Apple ships hardware TSO mode, generic ARM needs
+  per-access fencing. Translation direction matters (ARM-guest-on-x86 gets TSO ≥ weak for
+  free). Rosetta is openly detectable (sysctl) → translation = compatibility, not stealth.
+- **QEMU's KVM↔TCG state model:** native and translated execution share one architectural
+  vCPU state definition, so native↔JIT handoff at an instruction boundary is a pause +
+  register/FPU capture — the mechanism behind the runtime mode-switch requirement.
+- **JIT-instrumented DSM (mesh-mode thesis):** a translator observes every load/store, so
+  coherence can be word/object-granular with access-stream-driven co-scheduling — translation
+  doesn't remove distance, it instruments it. This is the Phase 11 research track.
