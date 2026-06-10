@@ -126,14 +126,27 @@ impl CpuidStealthTable {
             result: Self::build_leaf_1(config),
         });
 
-        // Leaf 0x2: Cache/TLB (Intel) or reserved (AMD)
-        entries.push(CpuidCacheEntry {
-            leaf: 2,
-            subleaf: 0,
-            result: CpuidResult::default(),
-        });
+        // Leaf 0x2: Cache/TLB descriptors (Intel; reserved-zero on AMD).
+        // The SDM requires AL = 01H always — an all-zero EAX is a tell. The
+        // 0xFF descriptor says "no cache info here, use leaf 4", which is what
+        // real modern Intel CPUs report for the cache side.
+        if config.vendor == CpuVendor::Intel {
+            entries.push(CpuidCacheEntry {
+                leaf: 2,
+                subleaf: 0,
+                result: CpuidResult {
+                    eax: 0x0000_FF01,
+                    ..CpuidResult::default()
+                },
+            });
+        }
 
-        // Leaf 0x4: Deterministic Cache Parameters (Intel)
+        // Leaf 0x4: Deterministic Cache Parameters (Intel only; AMD enumerates
+        // caches via leaf 0x8000001D instead).
+        if config.vendor == CpuVendor::Intel {
+            Self::push_cache_leaves(config, entries);
+        }
+
         // Leaf 0x5: MONITOR/MWAIT
         // Leaf 0x6: Thermal and Power Management
         entries.push(CpuidCacheEntry {
@@ -380,6 +393,65 @@ impl CpuidStealthTable {
             ecx,
             edx: config.features_edx,
         }
+    }
+
+    /// Encode one leaf-0x4 subleaf (Intel SDM Vol. 2A, "Deterministic Cache
+    /// Parameters"). `cache_type`: 1 = data, 2 = instruction, 3 = unified.
+    /// EAX[25:14] = max logical processors sharing the cache − 1;
+    /// EAX[31:26] = max core IDs in the package − 1. EBX packs
+    /// (ways − 1, partitions − 1, line size − 1); ECX = sets − 1; so
+    /// size = ways × partitions × line × sets.
+    fn cache_subleaf(
+        config: &CpuidStealthConfig,
+        cache_type: u32,
+        level: u32,
+        ways: u32,
+        line_size: u32,
+        sets: u32,
+        shared_by: u32,
+    ) -> CpuidResult {
+        let cores = (config.vcpu_count / config.threads_per_core).max(1);
+        CpuidResult {
+            eax: cache_type
+                | (level << 5)
+                | (1 << 8) // self-initializing
+                | ((shared_by - 1) << 14)
+                | ((cores - 1) << 26),
+            ebx: (line_size - 1) | ((ways - 1) << 22), // partitions = 1
+            ecx: sets - 1,
+            edx: 0,
+        }
+    }
+
+    /// Push the leaf-0x4 cache hierarchy. An all-zero leaf 4 ("no caches")
+    /// is something no real CPU reports. If the config carries real
+    /// pass-through cache info, use it; otherwise synthesize a standard
+    /// client hierarchy: 32 KiB L1d + 32 KiB L1i (8-way, per-core),
+    /// 256 KiB unified L2 (4-way, per-core), 16 MiB unified L3 (16-way,
+    /// package-wide). Sharing IDs track the configured topology. A null
+    /// subleaf (type 0) terminates the enumeration, as on real hardware.
+    fn push_cache_leaves(config: &CpuidStealthConfig, entries: &mut Vec<CpuidCacheEntry>) {
+        let subleaves: Vec<CpuidResult> = if config.cache_info.is_empty() {
+            let smt = config.threads_per_core;
+            vec![
+                Self::cache_subleaf(config, 1, 1, 8, 64, 64, smt), // 32 KiB L1d
+                Self::cache_subleaf(config, 2, 1, 8, 64, 64, smt), // 32 KiB L1i
+                Self::cache_subleaf(config, 3, 2, 4, 64, 1024, smt), // 256 KiB L2
+                Self::cache_subleaf(config, 3, 3, 16, 64, 16384, config.vcpu_count), // 16 MiB L3
+            ]
+        } else {
+            config.cache_info.clone()
+        };
+
+        for (i, result) in subleaves.into_iter().enumerate() {
+            entries.push(CpuidCacheEntry {
+                leaf: 4,
+                subleaf: u32_of(i),
+                result,
+            });
+        }
+        // Terminator: in-range zero is the real null-subleaf encoding, so no
+        // explicit entry is needed — lookup() already returns zeros there.
     }
 
     /// Leaf 0x6 — Thermal and Power Management.
@@ -674,6 +746,79 @@ mod tests {
         assert_eq!(table.lookup(0xA, 0), CpuidResult::default());
         assert_eq!(table.lookup(0x15, 0), CpuidResult::default());
         assert_eq!(table.lookup(0x16, 0), CpuidResult::default());
+    }
+
+    /// Decode a leaf-0x4 subleaf into (type, level, size-in-bytes, sharing IDs).
+    fn decode_cache(r: CpuidResult) -> (u32, u32, u64, u32) {
+        let ways = u64::from((r.ebx >> 22) & 0x3FF) + 1;
+        let partitions = u64::from((r.ebx >> 12) & 0x3FF) + 1;
+        let line = u64::from(r.ebx & 0xFFF) + 1;
+        let sets = u64::from(r.ecx) + 1;
+        (
+            r.eax & 0x1F,
+            (r.eax >> 5) & 0x7,
+            ways * partitions * line * sets,
+            ((r.eax >> 14) & 0xFFF) + 1,
+        )
+    }
+
+    #[test]
+    fn intel_leaf_2_reports_al_01_and_defers_to_leaf_4() {
+        // SDM: leaf 2 AL always returns 01H (all-zero EAX is a tell); the 0xFF
+        // descriptor defers cache enumeration to leaf 4.
+        let r = CpuidStealthTable::build(&intel_config()).lookup(2, 0);
+        assert_eq!(r.eax & 0xFF, 0x01);
+        assert_eq!((r.eax >> 8) & 0xFF, 0xFF);
+
+        // AMD: leaf 2 is reserved-zero.
+        let amd = CpuidStealthTable::build(&test_config()).lookup(2, 0);
+        assert_eq!(amd, CpuidResult::default());
+    }
+
+    #[test]
+    fn intel_leaf_4_enumerates_a_plausible_cache_hierarchy() {
+        let table = CpuidStealthTable::build(&intel_config());
+
+        // (type, level, size, sharing): L1d, L1i, L2, L3 — and termination.
+        let expect = [
+            (1, 1, 32 * 1024, 2u32),     // 32 KiB L1d, shared by 2 SMT threads
+            (2, 1, 32 * 1024, 2),        // 32 KiB L1i
+            (3, 2, 256 * 1024, 2),       // 256 KiB unified L2
+            (3, 3, 16 * 1024 * 1024, 8), // 16 MiB unified L3, package-wide (8 vCPUs)
+        ];
+        for (i, &(ty, lvl, size, shared)) in expect.iter().enumerate() {
+            let r = table.lookup(4, u32_of(i));
+            let (got_ty, got_lvl, got_size, got_shared) = decode_cache(r);
+            assert_eq!(got_ty, ty, "subleaf {i} cache type");
+            assert_eq!(got_lvl, lvl, "subleaf {i} level");
+            assert_eq!(got_size, size, "subleaf {i} size");
+            assert_eq!(got_shared, shared, "subleaf {i} sharing IDs");
+            assert_eq!(r.eax & (1 << 8), 1 << 8, "subleaf {i} self-initializing");
+        }
+
+        // Subleaf 4 terminates with a null type, like real hardware.
+        assert_eq!(table.lookup(4, 4).eax & 0x1F, 0, "null terminator");
+
+        // AMD enumerates caches via 0x8000001D; leaf 4 stays zero.
+        let amd = CpuidStealthTable::build(&test_config()).lookup(4, 0);
+        assert_eq!(amd, CpuidResult::default());
+    }
+
+    #[test]
+    fn leaf_4_passes_through_configured_cache_info() {
+        let custom = CpuidResult {
+            eax: 1 | (1 << 5) | (1 << 8),
+            ebx: 63 | (11 << 22), // 12-way, 64-byte lines
+            ecx: 63,              // 64 sets → 48 KiB
+            edx: 0,
+        };
+        let cfg = CpuidStealthConfig {
+            cache_info: vec![custom],
+            ..intel_config()
+        };
+        let table = CpuidStealthTable::build(&cfg);
+        assert_eq!(table.lookup(4, 0), custom, "pass-through wins");
+        assert_eq!(table.lookup(4, 1).eax & 0x1F, 0, "then terminates");
     }
 
     #[test]
