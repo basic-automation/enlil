@@ -149,82 +149,11 @@ impl LbrSanitizer {
     }
 }
 
-/// CPUID response pre-computation for constant-time handling
-pub struct CpuidCachingHelper {
-    /// Pre-computed CPUID responses
-    cache: Vec<CpuidResponse>,
-}
-
-#[derive(Clone, Debug)]
-pub struct CpuidResponse {
-    pub leaf: u32,
-    pub subleaf: u32,
-    pub eax: u32,
-    pub ebx: u32,
-    pub ecx: u32,
-    pub edx: u32,
-}
-
-impl Default for CpuidCachingHelper {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CpuidCachingHelper {
-    pub fn new() -> Self {
-        Self { cache: Vec::new() }
-    }
-
-    /// Build CPUID cache for all relevant leaves
-    /// Should be called at guest boot with stealth values pre-computed
-    pub fn cache_cpuid(&mut self, response: CpuidResponse) {
-        self.cache.push(response);
-    }
-
-    /// Lookup CPUID response in cache (< 100 cycles)
-    pub fn lookup(&self, leaf: u32, subleaf: u32) -> Option<CpuidResponse> {
-        self.cache
-            .iter()
-            .find(|r| r.leaf == leaf && r.subleaf == subleaf)
-            .cloned()
-    }
-
-    /// Pre-populate with Intel stealth values
-    pub fn populate_intel_stealth(&mut self) {
-        // Leaf 0x00: Vendor string
-        self.cache_cpuid(CpuidResponse {
-            leaf: 0x00,
-            subleaf: 0,
-            eax: 0x16,       // Max leaf
-            ebx: 0x756e6547, // "Genu"
-            ecx: 0x6c65746e, // "ntel"
-            edx: 0x49656e69, // "ineI"
-        });
-
-        // Leaf 0x01: Feature flags (clear hypervisor bit)
-        self.cache_cpuid(CpuidResponse {
-            leaf: 0x01,
-            subleaf: 0,
-            eax: 0x000006c2, // Family 6, Model C, Stepping 2
-            ebx: 0x01100800,
-            ecx: 0x7fffbfff, // ECX bit 31 (hypervisor bit) = 0
-            edx: 0xbfebfbff,
-        });
-
-        // Leaf 0x40000000+: Return zeros (no hypervisor signature)
-        for i in 0..16 {
-            self.cache_cpuid(CpuidResponse {
-                leaf: 0x40000000 + i,
-                subleaf: 0,
-                eax: 0,
-                ebx: 0,
-                ecx: 0,
-                edx: 0,
-            });
-        }
-    }
-}
+// The CPUID pre-computation cache lives in the canonical, reference-corrected
+// `enlil_devices::stealth::cpuid::CpuidStealthTable` (with proper vendor-specific
+// out-of-range semantics). A skeletal `CpuidCachingHelper` stub used to sit here and
+// duplicated it — incompletely and with the all-zeros `0x40000000` tell — so it was
+// removed; the KVM backend (which can reach `enlil-devices`) should use that table.
 
 #[cfg(test)]
 mod tests {
@@ -282,14 +211,5 @@ mod tests {
         let mut helper = TscOffsetHelper::new(0);
         helper.calculate_offset(1000, 2000);
         assert_eq!(helper.tsc_offset, 1000);
-    }
-
-    #[test]
-    fn test_cpuid_caching() {
-        let mut cache = CpuidCachingHelper::new();
-        cache.populate_intel_stealth();
-        let resp = cache.lookup(0x01, 0).unwrap();
-        // Hypervisor bit should be 0
-        assert_eq!(resp.ecx & (1 << 31), 0);
     }
 }
