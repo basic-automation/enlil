@@ -36,17 +36,14 @@ impl TpmPcr {
         }
     }
 
-    /// Extend PCR: pcr_new = hash(pcr_old || measurement)
+    /// Extend the PCR: `pcr_new = SHA256(pcr_old || measurement)`, the TPM 2.0
+    /// `TPM2_PCR_Extend` semantics (TPM 2.0 spec, Part 1 §17.2). A real hash (not a
+    /// placeholder) is required for the PCR values to match what a guest's boot
+    /// measurements and BitLocker/attestation expect.
     pub fn extend(&mut self, measurement: &[u8]) {
-        // Simple SHA-256 extension (would use actual SHA-256 in production)
         let mut combined = self.value.clone();
         combined.extend_from_slice(measurement);
-        // For testing: just xor the measurement into the PCR
-        for (i, &byte) in measurement.iter().enumerate() {
-            if i < self.value.len() {
-                self.value[i] ^= byte;
-            }
-        }
+        self.value = enlil_devices::crypto::sha256(&combined).to_vec();
     }
 }
 
@@ -278,6 +275,31 @@ mod tests {
         tpm.pcr_extend(0, b"measurement");
         let pcr0 = tpm.pcr_read(0).unwrap();
         assert!(!pcr0.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn pcr_extend_is_sha256_of_old_concat_measurement() {
+        // TPM2_PCR_Extend: a zero-initialized PCR extended with `meas` must equal
+        // SHA256(0x00*32 || meas), and a second extend must chain on the new value.
+        let mut pcr = TpmPcr::new_sha256();
+        let meas = b"boot-stage-1";
+
+        let mut input = vec![0u8; 32];
+        input.extend_from_slice(meas);
+        let expected = enlil_devices::crypto::sha256(&input).to_vec();
+        pcr.extend(meas);
+        assert_eq!(
+            pcr.value, expected,
+            "extend must be SHA256(old || measurement)"
+        );
+        assert_eq!(pcr.value.len(), 32);
+
+        let prev = pcr.value.clone();
+        pcr.extend(meas);
+        let mut chained = prev.clone();
+        chained.extend_from_slice(meas);
+        assert_eq!(pcr.value, enlil_devices::crypto::sha256(&chained).to_vec());
+        assert_ne!(pcr.value, prev, "chaining must change the PCR");
     }
 
     #[test]
