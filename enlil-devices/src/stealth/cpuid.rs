@@ -175,7 +175,10 @@ impl CpuidStealthTable {
         // Leaf 0xB: Extended Topology
         Self::build_topology_leaves(config, entries);
 
-        // Leaf 0xD: XSAVE features
+        // Leaf 0xD: XSAVE features. Subleaf 0 advertises x87+SSE+AVX with an
+        // 832-byte (0x340) area: 512 legacy + 64 header + 256 AVX. Subleaves
+        // 1 and 2 are required for that to be usable — without subleaf 2 the
+        // guest cannot locate the AVX region it was just promised.
         entries.push(CpuidCacheEntry {
             leaf: 0xD,
             subleaf: 0,
@@ -184,6 +187,27 @@ impl CpuidStealthTable {
                 ebx: 0x340,
                 ecx: 0x340,
                 edx: 0,
+            },
+        });
+        // Subleaf 1: XSAVEOPT available; XSAVEC/XSAVES not advertised (XSAVES
+        // would require IA32_XSS virtualization).
+        entries.push(CpuidCacheEntry {
+            leaf: 0xD,
+            subleaf: 1,
+            result: CpuidResult {
+                eax: 0x1, // XSAVEOPT
+                ..CpuidResult::default()
+            },
+        });
+        // Subleaf 2: the AVX (YMM-high) state component — 256 bytes at the
+        // standard offset 576 (right after legacy area + XSAVE header).
+        entries.push(CpuidCacheEntry {
+            leaf: 0xD,
+            subleaf: 2,
+            result: CpuidResult {
+                eax: 256, // size
+                ebx: 576, // offset
+                ..CpuidResult::default()
             },
         });
 
@@ -285,6 +309,21 @@ impl CpuidStealthTable {
                 },
             });
         }
+
+        // 0x80000007 EDX[8]: invariant TSC (same bit on Intel and AMD). Every
+        // CPU of the advertised generation sets it; leaving it clear tells the
+        // guest the TSC stops in deep C-states / varies with P-states, so
+        // Linux marks the TSC unstable and falls back to HPET — more traffic
+        // through our slower timer paths AND a tell. Our virtual TSC is
+        // offset-based and never stops, so claiming invariance is truthful.
+        entries.push(CpuidCacheEntry {
+            leaf: 0x8000_0007,
+            subleaf: 0,
+            result: CpuidResult {
+                edx: 1 << 8,
+                ..CpuidResult::default()
+            },
+        });
 
         // 0x80000008 EAX: address sizes. EAX[7:0] = physical address bits, EAX[15:8] = linear
         // (virtual) address bits (Intel SDM / AMD APM). The old value 0x3930 decoded as 57-bit
@@ -871,6 +910,32 @@ mod tests {
         // distinct from the out-of-range mirror.
         let table = CpuidStealthTable::build(&intel_config());
         assert_eq!(table.lookup(0x3, 0), CpuidResult::default());
+    }
+
+    #[test]
+    fn invariant_tsc_is_advertised() {
+        // 0x80000007 EDX[8] on both vendors: without it the guest treats the
+        // TSC as unstable and routes timekeeping through HPET.
+        for cfg in [test_config(), intel_config()] {
+            let r = CpuidStealthTable::build(&cfg).lookup(0x8000_0007, 0);
+            assert_eq!(r.edx & (1 << 8), 1 << 8, "invariant TSC");
+        }
+    }
+
+    #[test]
+    fn xsave_subleaves_locate_the_advertised_avx_state() {
+        let table = CpuidStealthTable::build(&intel_config());
+        let main = table.lookup(0xD, 0);
+        assert_eq!(main.eax & 0x4, 0x4, "AVX state advertised in subleaf 0");
+
+        let avx = table.lookup(0xD, 2);
+        assert_eq!(avx.eax, 256, "AVX component size");
+        assert_eq!(avx.ebx, 576, "AVX component offset (512 legacy + 64 hdr)");
+        // The advertised total area must cover offset + size exactly.
+        assert_eq!(main.ebx, avx.ebx + avx.eax, "XSAVE area size consistent");
+
+        let sub1 = table.lookup(0xD, 1);
+        assert_eq!(sub1.eax, 0x1, "XSAVEOPT only (no XSAVEC/XSAVES)");
     }
 
     #[test]
