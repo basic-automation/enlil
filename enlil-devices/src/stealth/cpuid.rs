@@ -136,6 +136,12 @@ impl CpuidStealthTable {
         // Leaf 0x4: Deterministic Cache Parameters (Intel)
         // Leaf 0x5: MONITOR/MWAIT
         // Leaf 0x6: Thermal and Power Management
+        entries.push(CpuidCacheEntry {
+            leaf: 6,
+            subleaf: 0,
+            result: Self::build_leaf_6(config),
+        });
+
         // Leaf 0x7: Structured Extended Feature Flags
         entries.push(CpuidCacheEntry {
             leaf: 7,
@@ -373,6 +379,35 @@ impl CpuidStealthTable {
             ebx,
             ecx,
             edx: config.features_edx,
+        }
+    }
+
+    /// Leaf 0x6 — Thermal and Power Management.
+    ///
+    /// ECX bit 0 advertises the `IA32_APERF`/`IA32_MPERF` MSRs (Intel: "hardware
+    /// coordination feedback"; AMD: "effective frequency interface" — same
+    /// bit, confirmed against Linux `scattered.c`, which sets
+    /// `X86_FEATURE_APERFMPERF` from leaf 6 ECX[0] on both vendors). Our
+    /// timing-stealth shadow *serves* those MSRs, so not advertising them is
+    /// an inconsistency — and an IET detector that politely checks before
+    /// reading would conclude the MSRs shouldn't exist.
+    ///
+    /// EAX bit 1 (Intel Dynamic Acceleration = turbo) must be set on Intel
+    /// because leaf 0x16 advertises a max frequency above base and the PMC
+    /// rate model claims core > ref — both imply turbo. (AMD signals boost
+    /// via leaf 0x80000007 EDX[9] instead.) EAX bit 2 (ARAT, always-running
+    /// APIC timer) is set on both: our virtual APIC timer never stops in
+    /// deep C-states, and every CPU of the advertised generation has it.
+    const fn build_leaf_6(config: &CpuidStealthConfig) -> CpuidResult {
+        let eax = match config.vendor {
+            CpuVendor::Intel => (1 << 1) | (1 << 2), // IDA (turbo) + ARAT
+            CpuVendor::Amd => 1 << 2,                // ARAT
+        };
+        CpuidResult {
+            eax,
+            ebx: 0,
+            ecx: 1, // APERF/MPERF present
+            edx: 0,
         }
     }
 
@@ -639,6 +674,23 @@ mod tests {
         assert_eq!(table.lookup(0xA, 0), CpuidResult::default());
         assert_eq!(table.lookup(0x15, 0), CpuidResult::default());
         assert_eq!(table.lookup(0x16, 0), CpuidResult::default());
+    }
+
+    #[test]
+    fn leaf_6_advertises_the_msrs_the_timing_shadow_serves() {
+        // Intel: APERF/MPERF present (ECX[0]), turbo (EAX[1]) — required by
+        // leaf 0x16's max > base and the PMC core/ref ratio > 1 — and ARAT.
+        let intel = CpuidStealthTable::build(&intel_config()).lookup(6, 0);
+        assert_eq!(intel.ecx & 1, 1, "APERF/MPERF must be advertised");
+        assert_eq!(intel.eax & (1 << 1), 1 << 1, "turbo (IDA)");
+        assert_eq!(intel.eax & (1 << 2), 1 << 2, "ARAT");
+
+        // AMD: effective-frequency interface (same ECX bit) + ARAT, but no
+        // Intel IDA bit (AMD boost lives in leaf 0x80000007 EDX[9]).
+        let amd = CpuidStealthTable::build(&test_config()).lookup(6, 0);
+        assert_eq!(amd.ecx & 1, 1, "effective frequency interface");
+        assert_eq!(amd.eax & (1 << 1), 0, "no Intel IDA bit on AMD");
+        assert_eq!(amd.eax & (1 << 2), 1 << 2, "ARAT");
     }
 
     #[test]
