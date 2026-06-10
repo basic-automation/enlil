@@ -409,6 +409,13 @@ impl CpuidStealthTable {
             // Clear bit 31: hypervisor present
             ecx &= !(1 << 31);
         }
+        // Clear bit 3: MONITOR/MWAIT. We don't virtualize it (MWAIT exits and
+        // leaf 0x5 is unpopulated), and passing the physical bit through while
+        // leaf 0x5 reports zero line sizes is an inconsistency. A CPU without
+        // MONITOR legitimately reports leaf 0x5 as reserved-zero, so hiding
+        // the feature keeps both leaves coherent (KVM does the same by
+        // default). Guests then idle via HLT, which we already handle.
+        ecx &= !(1 << 3);
 
         // EBX[23:16] = max number of addressable logical-processor IDs in the package. Real CPUs
         // advertise this (rounded up to a power of two) only when HTT (EDX bit 28) is set, and it
@@ -910,6 +917,18 @@ mod tests {
         // distinct from the out-of-range mirror.
         let table = CpuidStealthTable::build(&intel_config());
         assert_eq!(table.lookup(0x3, 0), CpuidResult::default());
+    }
+
+    #[test]
+    fn monitor_mwait_is_hidden_consistently() {
+        // test_config's features_ecx has bit 3 (MONITOR) set; the table must
+        // clear it because leaf 0x5 is unpopulated — advertising MONITOR with
+        // zero monitor-line sizes is an inconsistency.
+        let cfg = test_config();
+        assert_eq!(cfg.features_ecx & (1 << 3), 1 << 3, "fixture has MONITOR");
+        let table = CpuidStealthTable::build(&cfg);
+        assert_eq!(table.lookup(1, 0).ecx & (1 << 3), 0, "MONITOR hidden");
+        assert_eq!(table.lookup(5, 0), CpuidResult::default(), "leaf 5 empty");
     }
 
     #[test]
