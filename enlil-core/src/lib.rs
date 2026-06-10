@@ -4,7 +4,6 @@ pub mod cpuid;
 pub mod device_bus;
 pub mod ept;
 pub mod error;
-pub mod exit_handler;
 pub mod kvm_backend;
 pub mod memory;
 pub mod serial;
