@@ -39,25 +39,37 @@ impl VcpuTimingState {
         self.last_exit_tsc.store(exit_tsc, Ordering::Release);
     }
 
-    /// Called before VMRESUME: account for exit time and adjust shadow counters
+    /// Called before VMRESUME: account for exit time and adjust shadow counters.
+    ///
+    /// The VMEXIT must be hidden from *both* APERF and MPERF so neither shadow counter
+    /// advances across the exit, and the decrement must be proportional so the
+    /// APERF/MPERF ratio — the frequency/utilization signal an IET detector inspects —
+    /// is unchanged. `exit_overhead_cycles` is a TSC delta, which is in MPERF units
+    /// (MPERF runs at the nominal/TSC rate); APERF runs at the core frequency, i.e.
+    /// `ratio * MPERF`, so its decrement is scaled by the established ratio.
     pub fn on_vmresume(&self, entry_tsc: u64, guest_rip: u64) {
         let last_tsc = self.last_exit_tsc.load(Ordering::Acquire);
         let exit_overhead_cycles = entry_tsc.saturating_sub(last_tsc);
 
-        // Subtract exit overhead from shadow APERF to hide hypervisor time
         let current_aperf = self.aperf.load(Ordering::Relaxed);
+        let current_mperf = self.mperf.load(Ordering::Relaxed);
+
+        // Preserve APERF/MPERF (default 1.0 before MPERF has advanced).
+        let ratio = if current_mperf > 0 {
+            (current_aperf as f64) / (current_mperf as f64)
+        } else {
+            1.0
+        };
+        let aperf_overhead = (exit_overhead_cycles as f64 * ratio) as u64;
+
         self.aperf.store(
-            current_aperf.saturating_sub(exit_overhead_cycles),
+            current_aperf.saturating_sub(aperf_overhead),
             Ordering::Release,
         );
-
-        // Keep MPERF proportional (APERF/MPERF ratio ~1.0 for high performance)
-        let current_mperf = self.mperf.load(Ordering::Relaxed);
-        if current_mperf > 0 {
-            let ratio = (current_aperf as f64) / (current_mperf as f64);
-            self.mperf
-                .store((current_aperf as f64 / ratio) as u64, Ordering::Release);
-        }
+        self.mperf.store(
+            current_mperf.saturating_sub(exit_overhead_cycles),
+            Ordering::Release,
+        );
 
         self.last_guest_rip.store(guest_rip, Ordering::Release);
     }
@@ -223,6 +235,46 @@ mod tests {
         let state = VcpuTimingState::new();
         state.write_aperf(1000);
         assert_eq!(state.read_aperf(), 1000);
+    }
+
+    #[test]
+    fn vmexit_overhead_hidden_from_both_counters_preserving_ratio() {
+        // Ratio 1.0: both counters must drop by the exit overhead, ratio unchanged.
+        let state = VcpuTimingState::new();
+        state.write_aperf(1000);
+        state.write_mperf(1000);
+        state.on_vmexit(100);
+        state.on_vmresume(150, 0xDEAD); // 50 cycles of exit overhead
+        assert_eq!(state.read_mperf(), 950, "MPERF must hide the exit overhead");
+        assert_eq!(state.read_aperf(), 950, "APERF must hide the exit overhead");
+        // The old code left MPERF at 1000 (ratio 0.95) — a detectable anomaly.
+    }
+
+    #[test]
+    fn vmexit_overhead_scales_aperf_by_ratio() {
+        // Ratio 0.8 (core running below nominal): APERF decrement is ratio-scaled so
+        // the APERF/MPERF ratio is preserved across the hidden exit.
+        let state = VcpuTimingState::new();
+        state.write_aperf(800);
+        state.write_mperf(1000);
+        state.on_vmexit(0);
+        state.on_vmresume(50, 0); // overhead 50
+        assert_eq!(state.read_mperf(), 950); // 1000 - 50
+        assert_eq!(state.read_aperf(), 760); // 800 - (50 * 0.8)
+                                             // Ratio preserved: 760/950 == 0.8 == 800/1000.
+        assert!((state.read_aperf() as f64 / state.read_mperf() as f64 - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn vmexit_counters_saturate_at_zero() {
+        // A large exit overhead must not underflow the shadow counters.
+        let state = VcpuTimingState::new();
+        state.write_aperf(10);
+        state.write_mperf(10);
+        state.on_vmexit(0);
+        state.on_vmresume(1000, 0);
+        assert_eq!(state.read_aperf(), 0);
+        assert_eq!(state.read_mperf(), 0);
     }
 
     #[test]
