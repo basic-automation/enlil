@@ -11,6 +11,8 @@
 //! - Out-of-range leaves: highest basic leaf data (Intel) / zeros (AMD), per the SDM/APM;
 //!   in-range but reserved leaves return 0.
 
+use crate::truncate::u32_of;
+
 /// CPUID register set for a single leaf result
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CpuidResult {
@@ -134,6 +136,16 @@ impl CpuidStealthTable {
             subleaf: 0,
             result: Self::build_leaf_7(config),
         });
+
+        // Leaf 0xA: Architectural Performance Monitoring (Intel only — reserved
+        // on AMD, where the in-range-reserved zero fallback is correct).
+        if config.vendor == CpuVendor::Intel {
+            entries.push(CpuidCacheEntry {
+                leaf: 0xA,
+                subleaf: 0,
+                result: Self::build_leaf_a(),
+            });
+        }
 
         // Leaf 0xB: Extended Topology
         Self::build_topology_leaves(config, entries);
@@ -335,6 +347,33 @@ impl CpuidStealthTable {
         }
     }
 
+    /// Leaf 0xA — Architectural Performance Monitoring (Intel SDM Vol. 2A;
+    /// field layout cross-checked against Linux's `union cpuid10_{eax,ebx,edx}`).
+    ///
+    /// The table used to leave this leaf unpopulated, so the in-range-reserved
+    /// fallback returned all zeros — PMU version 0, "no architectural PMU".
+    /// Every Intel CPU since Core reports version ≥ 1 (cloud vPMU-less VMs are
+    /// the ones that report 0, making it a tell by itself), and it contradicts
+    /// the PMC shadow (`stealth::pmc`) servicing RDPMC. Advertise PMU version 5
+    /// with exactly the counters the shadow implements: [`super::pmc::MAX_GP_PMCS`]
+    /// general-purpose and [`super::pmc::MAX_FIXED_PMCS`] fixed counters
+    /// (including TOPDOWN.SLOTS), 48 bits wide, all seven architectural events
+    /// available (EBX = 0), ECX = supported-fixed-counter bitmask (version-5
+    /// semantics), and EDX.AnyThread-deprecated set (version 5 deprecates it).
+    fn build_leaf_a() -> CpuidResult {
+        use super::pmc::{MAX_FIXED_PMCS, MAX_GP_PMCS};
+        let gp_counters = u32_of(MAX_GP_PMCS);
+        let fixed_counters = u32_of(MAX_FIXED_PMCS);
+        let counter_width = 48;
+        let event_vector_len = 7;
+        CpuidResult {
+            eax: 5 | (gp_counters << 8) | (counter_width << 16) | (event_vector_len << 24),
+            ebx: 0, // all architectural events available
+            ecx: (1 << fixed_counters) - 1,
+            edx: fixed_counters | (counter_width << 5) | (1 << 15),
+        }
+    }
+
     fn build_topology_leaves(config: &CpuidStealthConfig, entries: &mut Vec<CpuidCacheEntry>) {
         // Subleaf 0: SMT level
         let threads_per_core = config.threads_per_core;
@@ -519,6 +558,44 @@ mod tests {
             0,
             "LA57 must be unadvertised"
         );
+    }
+
+    #[test]
+    fn intel_leaf_a_advertises_a_pmu_consistent_with_the_pmc_shadow() {
+        use crate::stealth::pmc::{MAX_FIXED_PMCS, MAX_GP_PMCS};
+        let table = CpuidStealthTable::build(&intel_config());
+        let r = table.lookup(0xA, 0);
+
+        // Version 0 ("no PMU") is itself a tell — only vPMU-less VMs report it —
+        // and contradicts the PMC shadow servicing RDPMC.
+        assert_eq!(r.eax & 0xFF, 5, "PMU version");
+        assert_eq!(
+            (r.eax >> 8) & 0xFF,
+            u32_of(MAX_GP_PMCS),
+            "GP counter count must match the PMC shadow"
+        );
+        assert_eq!((r.eax >> 16) & 0xFF, 48, "GP counter width");
+        assert_eq!((r.eax >> 24) & 0xFF, 7, "event vector length");
+        assert_eq!(r.ebx, 0, "all architectural events available");
+        assert_eq!(
+            r.ecx,
+            (1 << MAX_FIXED_PMCS) - 1,
+            "v5 supported-fixed-counter bitmask"
+        );
+        assert_eq!(
+            r.edx & 0x1F,
+            u32_of(MAX_FIXED_PMCS),
+            "fixed counter count must match the PMC shadow"
+        );
+        assert_eq!((r.edx >> 5) & 0xFF, 48, "fixed counter width");
+        assert_eq!((r.edx >> 15) & 1, 1, "AnyThread deprecated (v5)");
+    }
+
+    #[test]
+    fn amd_leaf_a_stays_reserved_zero() {
+        // Leaf 0xA is Intel-only; on AMD it is reserved and must return zeros.
+        let table = CpuidStealthTable::build(&test_config());
+        assert_eq!(table.lookup(0xA, 0), CpuidResult::default());
     }
 
     #[test]
