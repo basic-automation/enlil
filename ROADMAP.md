@@ -1590,6 +1590,12 @@ Physical USB Devices
 - Some detectors use `RDPMC` to read hardware performance counters
 - Virtualize PMC access to return consistent values that don't reveal VMEXIT overhead
 - Either trap RDPMC and serve shadow values, or use PMC virtualization features (Intel VPMC)
+- **Cross-surface consistency pitfall (2026-06-10):** the fixed counters must advance at
+  *distinct* per-counter rates (IPC ≢ 1.0, core ≢ ref — `stealth::pmc::PmcRateModel`), the
+  RDPMC core/ref ratio must equal the APERF/MPERF shadow's ratio (a detector can cross-check
+  the two), and CPUID leaf 0xA must advertise a PMU matching the shadow's counter counts
+  (all-zeros = "PMU version 0" is itself a cloud-VM tell). The KVM run loop must seed
+  `VcpuTimingState` APERF/MPERF with `PmcRateModel::core_per_kilo_ref` when it wires both.
 
 ### 5.5 Virtual TPM 2.0
 - Required for Windows 11

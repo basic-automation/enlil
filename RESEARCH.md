@@ -1004,3 +1004,32 @@ so the next run sees the authoritative sources without re-deriving them.
   Authoritative command codes: `PCR_Extend=0x0000_0182`, `PCR_Read=0x0000_017E`,
   `GetCapability=0x0000_017A`. `GetRandom` must vary across calls. No new dependency was
   added — SHA-256 is implemented in-tree (no_std-friendly), verified against FIPS vectors.
+
+---
+
+## 2026-06-10 (c) — vPMU as a transparency surface: distinct fixed-counter rates + CPUID leaf 0xA
+
+Web research for the PMC-model increment, plus primary-source layout verification.
+
+- **KVM passthrough vPMU (LWN, "KVM: x86/pmu: Introduce passthrough vPMU",
+  <https://lwn.net/Articles/959653/>).** KVM's two vPMU models: trap-and-emulate (our shadow
+  model — every PMC MSR access exits) vs. passthrough (guest owns the real GP counters and
+  "some of the fixed counters"). Confirms the fixed counters are a first-class guest-visible
+  surface; our trap path must therefore return *plausible* values, not placeholders.
+- **IET divergence detection reads APERF (secret.club, "BattlEye hypervisor detection",
+  <https://secret.club/2020/01/12/battleye-hypervisor-detection.html>); the rdtsc;cpuid;rdtsc
+  timing attack is standard in BattlEye/EAC (VIC, arXiv:2502.12322,
+  <https://arxiv.org/abs/2502.12322>).** Consequence for what we build: a detector can
+  cross-check RDPMC's CPU_CLK_UNHALTED.THREAD/REF_TSC against APERF/MPERF — the two surfaces
+  must encode the *same* core/ref ratio, and IPC ≡ 1.0 / core ≡ ref (all counters advancing
+  by the same delta) is the RDPMC version of the APERF/MPERF-no-op tell. Drove the
+  `PmcRateModel` (ref rate / core = 1.15×ref / instr = 1.31×core / slots = 4×core), with the
+  seeding requirement documented on the type.
+- **CPUID leaf 0xA layout (Intel SDM Vol 2A; cross-checked against Linux
+  `arch/x86/include/asm/perf_event.h` `union cpuid10_{eax,ebx,edx}`).** EAX: version[7:0],
+  GP-counter count[15:8], GP width[23:16], event-vector length[31:24]; EBX: 7
+  event-unavailable bits; ECX (v5): supported-fixed-counter bitmask; EDX: fixed count[4:0],
+  fixed width[12:5], AnyThread-deprecated[15]. **Tell found:** our table left 0xA unpopulated
+  → all-zeros → "PMU version 0", which only vPMU-less VMs report (this runner's own cloud
+  guest CPUID returns exactly that) and which contradicts the PMC shadow servicing RDPMC.
+  Fixed: Intel tables advertise version 5 matching `stealth::pmc`'s counter counts.
