@@ -1033,3 +1033,23 @@ Web research for the PMC-model increment, plus primary-source layout verificatio
   → all-zeros → "PMU version 0", which only vPMU-less VMs report (this runner's own cloud
   guest CPUID returns exactly that) and which contradicts the PMC shadow servicing RDPMC.
   Fixed: Intel tables advertise version 5 matching `stealth::pmc`'s counter counts.
+
+---
+
+## 2026-06-10 (d) — CPUID consistency sweep: the kernel parsers as layout oracles
+
+The session's later CPUID work (leaves 0x2/0x4/0x5/0x6/0xD/0x15/0x16, 0x80000005-7) was
+verified against the Linux kernel's own parsers — useful as free, precise "what does a real
+OS read" oracles when the SDM/APM PDFs are paywalled/blocked from this runner:
+
+- `arch/x86/kernel/cpu/scattered.c`: `X86_FEATURE_APERFMPERF` ← leaf 0x6 **ECX[0]**, both
+  vendors (AMD calls it the effective-frequency interface). If we serve APERF/MPERF, leaf 6
+  must advertise them; turbo (Intel IDA, EAX[1]) must back any max>base frequency claim.
+- `arch/x86/include/asm/perf_event.h` `union cpuid10_*`: leaf 0xA layout (used 2026-06-10 (c)).
+- `arch/x86/kernel/cpu/cacheinfo.c` `union l1_cache/l2_cache/l3_cache` + `assocs[]`: the
+  legacy AMD Fn8000_0005/6 field layouts and the L2/L3 associativity *encoding* table
+  (4→4-way, 6→8-way, 8→16-way, L3 size = size_encoded × 512 KiB).
+- **Pattern worth keeping:** every populated leaf must be cross-checkable against every other
+  surface that encodes the same fact (leaf 4 L2 ↔ 0x80000006 L2; leaf 0x16 turbo ↔ leaf 6 IDA
+  ↔ PMC core/ref ratio; leaf 0xD subleaf 0 size ↔ subleaf 2 offset+size; leaf 1 MONITOR ↔
+  leaf 5). The tests now pin each of these pairs.
