@@ -77,9 +77,10 @@ impl DsdtBuilder {
     /// Build the global interrupt-model flag `PICF` and the `_PIC` control method
     /// the OS calls to announce whether it drives the legacy 8259 PICs (`_PIC(0)`)
     /// or the I/O APIC (`_PIC(1)`). The method stores the argument into `PICF`,
-    /// exactly as real firmware does — a missing `_PIC` is a VM tell. Our `_PRT`
-    /// is currently a static APIC table that ignores `PICF`; wiring a mode-
-    /// selecting `_PRT` onto this flag is the documented follow-up.
+    /// exactly as real firmware does — a missing `_PIC` is a VM tell. `PICF` selects
+    /// the branch of the mode-selecting `_PRT` (APIC GSIs when `PICF==1`, the
+    /// link-device PIC table otherwise), so the routing the OS sees matches the
+    /// interrupt model it announced.
     fn build_pic_method(aml: &mut AmlBuilder) {
         aml.name_integer(b"PICF", 0);
         let m = aml.method_start(b"_PIC", 1, false);
