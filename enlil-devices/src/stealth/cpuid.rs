@@ -303,9 +303,25 @@ impl CpuidStealthTable {
             ecx &= !(1 << 31);
         }
 
+        // EBX[23:16] = max number of addressable logical-processor IDs in the package. Real CPUs
+        // advertise this (rounded up to a power of two) only when HTT (EDX bit 28) is set, and it
+        // tracks the actual topology — a fixed constant that disagrees with the leaf-0xB topology
+        // and the vCPU count is a tell. EBX[15:8] = CLFLUSH line size / 8 (64-byte lines);
+        // EBX[31:24] (initial APIC ID) is filled in per-vCPU at runtime, so it stays 0 here.
+        let htt = (config.features_edx & (1 << 28)) != 0;
+        let mut max_ids = if htt {
+            config.vcpu_count.next_power_of_two()
+        } else {
+            1
+        };
+        if max_ids > 0xFF {
+            max_ids = 0xFF;
+        }
+        let ebx = 0x0000_0800 | (max_ids << 16);
+
         CpuidResult {
             eax: config.family_model_stepping,
-            ebx: 0x0010_0800, // CLFLUSH size=8, max CPUs=1
+            ebx,
             ecx,
             edx: config.features_edx,
         }
@@ -454,6 +470,39 @@ mod tests {
             );
             assert_ne!(hv, CpuidResult::default(), "must not be all-zeros on Intel");
         }
+    }
+
+    #[test]
+    fn leaf_1_ebx_tracks_vcpu_count() {
+        // test_config: 8 vCPUs, HTT set in features_edx → EBX[23:16] = 8 (power of two).
+        let table = CpuidStealthTable::build(&test_config());
+        let ebx = table.lookup(1, 0).ebx;
+        assert_eq!(
+            (ebx >> 16) & 0xFF,
+            8,
+            "max addressable IDs must equal vCPU count"
+        );
+        assert_eq!((ebx >> 8) & 0xFF, 0x08, "CLFLUSH line size byte preserved");
+        assert_eq!(ebx & 0xFF, 0, "brand index byte stays 0");
+
+        // 6 vCPUs rounds up to the next power of two (8).
+        let cfg = CpuidStealthConfig {
+            vcpu_count: 6,
+            ..test_config()
+        };
+        let ebx = CpuidStealthTable::build(&cfg).lookup(1, 0).ebx;
+        assert_eq!((ebx >> 16) & 0xFF, 8);
+    }
+
+    #[test]
+    fn leaf_1_ebx_without_htt_is_one() {
+        // HTT (EDX bit 28) clear → max addressable IDs = 1 regardless of vCPU count.
+        let cfg = CpuidStealthConfig {
+            features_edx: test_config().features_edx & !(1 << 28),
+            ..test_config()
+        };
+        let ebx = CpuidStealthTable::build(&cfg).lookup(1, 0).ebx;
+        assert_eq!((ebx >> 16) & 0xFF, 1);
     }
 
     #[test]
