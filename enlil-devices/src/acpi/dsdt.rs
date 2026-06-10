@@ -222,8 +222,15 @@ impl DsdtBuilder {
             prs.irq_flags(ROUTABLE, false, true, true);
             aml.name_resource_template(b"_PRS", &prs);
 
-            // _STA — present, enabled (0x0B = bits 0,1,3).
+            // _STA — present; report disabled (0x09) when the route-disable bit (PIRx
+            // bit 7) is set, else present-and-enabled (0x0B), so _STA tracks _DIS/_SRS:
+            //   If (And (PIRx, 0x80)) { Return (0x09) }
+            //   Return (0x0B)
             let sta = aml.method_start(b"_STA", 0, false);
+            let if_disabled = aml.if_start();
+            aml.and_op(Operand::Name(pirx), Operand::Int(0x80), Operand::Int(0));
+            aml.return_integer(0x09);
+            aml.if_end(&if_disabled);
             aml.return_integer(0x0B);
             aml.method_end(&sta);
 
@@ -735,6 +742,22 @@ mod tests {
         assert!(
             dsdt.windows(srs.len()).any(|w| w == srs),
             "a link _SRS must Store the chosen IRQ into its PIRQ register"
+        );
+        // _STA tests the disable bit: And(PIRA, 0x80, <null target>) =
+        // AND_OP "PIRA" BYTE_PREFIX 0x80 ZERO.
+        let sta = [
+            opcode::AND_OP,
+            b'P',
+            b'I',
+            b'R',
+            b'A',
+            opcode::BYTE_PREFIX,
+            0x80,
+            opcode::ZERO,
+        ];
+        assert!(
+            dsdt.windows(sta.len()).any(|w| w == sta),
+            "a link _STA must test its PIRQ register's route-disable bit"
         );
         let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         assert_eq!(sum, 0);

@@ -472,7 +472,22 @@ impl AmlBuilder {
         }
     }
 
-    /// Close an `If` block opened with [`Self::if_name_start`].
+    /// Start an `If` block with a caller-built predicate: emit `IfOp` + a reserved
+    /// `PkgLength`, then the caller emits the predicate expression (e.g. an
+    /// [`Self::and_op`] with a null target) followed by the body, and closes with
+    /// [`Self::if_end`]. Unlike [`Self::if_name_start`] the predicate is whatever the
+    /// caller writes next, so a computed test like `If (And (PIRx, 0x80))` is possible.
+    pub fn if_start(&mut self) -> ScopeHandle {
+        self.data.push(opcode::IF_OP);
+        let length_pos = self.data.len();
+        self.data.extend_from_slice(&[0, 0, 0, 0]);
+        ScopeHandle {
+            length_pos,
+            content_start: self.data.len(),
+        }
+    }
+
+    /// Close an `If` block opened with [`Self::if_name_start`] or [`Self::if_start`].
     pub fn if_end(&mut self, handle: &ScopeHandle) {
         self.patch_pkg_length(handle.length_pos, handle.content_start);
     }
