@@ -6,6 +6,93 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-10 (b) — Session: vPMU/CPUID cross-surface consistency arc + TPM/LBR consolidation + CI validator gates
+
+**15 commits, each independently green** (PR #19, branch `claude/awesome-faraday-yud61k`).
+Second session today; picked up the morning hand-off's items 1, 2, 4 and 5 and extended them
+into a coherent arc: *every guest-visible surface that encodes the same fact must agree*.
+Workspace tests **881 → 897** (`cargo test --workspace`: 897 passed, 0 failed, 1 ignored =
+the `/dev/kvm` self-skip). `cargo build --workspace`, `cargo fmt --all -- --check`,
+`cargo clippy --all-targets --workspace -- -D warnings` all green at every commit.
+`/dev/kvm` **still absent** (verified). `iasl` + `dmidecode` installed and used locally.
+
+### Arc 1 — CI + consolidation (morning hand-off items)
+- **`8d0bb5a`** CI installs `acpica-tools` + `dmidecode` → the iasl/dmidecode integration
+  tests are now hard gates (verified green on GitHub's runner); clippy/test aligned to
+  `--workspace`.
+- **`78bba2c`** removed duplicate `LbrSanitizer` (canonical: `enlil_devices::stealth::lbr`).
+- **`5707341`** **one TPM now**: device CRB TPM gained real `NV_Write`/`NV_Read` (writes were
+  silently discarded before — BitLocker sealing read back nothing; undefined index →
+  `TPM_RC_HANDLE`) and a byte-vec `execute_command` front (replaces the old `TpmDispatcher`)
+  sharing PCR/NV state with the MMIO front; duplicate `enlil-core::vtpm` deleted (its
+  zero-filled EK/AIK/SRK stubs were *not* ported — still blocked on real RSA/ECC keygen).
+- **`660c0eb`** `TPM2_GetCapability` returns real `TPM_CAP_PCRS` / `TPM_CAP_TPM_PROPERTIES` /
+  `TPM_CAP_ALGS` data (TCG Part 3 §30.2 framing; property windowing pragmatically ignored).
+- **`b7c4459`** removed the dead `exit_handler` placeholder (superseded by
+  `device_bus::DeviceBus: VmExitHandler`, which already exists and is tested).
+
+### Arc 2 — PMC/APERF cross-surface consistency (hand-off item 4)
+- **`36b81d9`** `PmcRateModel`: fixed counters advance at *distinct* plausible rates
+  (ref = TSC rate; core = 1.15×ref; instr = 1.31 IPC × core; TOPDOWN.SLOTS = 4×core; GP at
+  core rate). Kills the IPC≡1.0 / core≡ref tell.
+- **`e8659fe`** `VcpuTimingState::advance(ref_cycles, &PmcRateModel)`: the APERF/MPERF
+  shadows advance at the same model's rates; test pins MSR surface == RDPMC surface exactly,
+  and exit-hiding preserves the model ratio.
+
+### Arc 3 — CPUID: populate every leaf a real OS parses, consistently (research-driven)
+All layouts verified against Intel SDM / kernel parsers (see RESEARCH.md 2026-06-10 (c),(d));
+runner's own cloud-VM CPUID used as the negative reference (it *shows* the leaf-0xA tell):
+- **`ca0cc1a`** leaf 0xA (Intel): PMU version 5 matching `stealth::pmc` counts exactly
+  (was all-zeros = "no PMU" — only vPMU-less VMs report that).
+- **`6477fcc`** leaves 0x15/0x16 (Intel): TSC enumerated integer-exactly (24 MHz crystal,
+  EAX=24, EBX=base MHz) — new config fields `base/max_frequency_mhz` (2800/3300); turbo
+  headroom covers the PMC core/ref ratio (test-pinned).
+- **`1fc6c02`** leaf 0x6: APERF/MPERF advertised (ECX[0], kernel `scattered.c` oracle),
+  Intel IDA turbo backs max>base, ARAT on both vendors.
+- **`b4ff02e`** leaves 0x2/0x4 (Intel): AL=01H + 0xFF descriptor; full leaf-4 hierarchy
+  (32K L1d/L1i, 256K L2, 16M L3, sharing IDs track topology); dormant
+  `CpuidStealthConfig::cache_info` now overrides as the pass-through path.
+- **`5dad1d8`** 0x80000007 EDX[8] invariant TSC (both vendors); leaf 0xD subleaves 1/2 so
+  the advertised AVX state is locatable (offset 576 + size 256 == subleaf-0 total, pinned).
+- **`4b9a35a`** leaf-1 MONITOR bit cleared (leaf 0x5 is empty; KVM-default behavior).
+- **`e200c29`** 0x80000005/6: Intel L2 == leaf-4 L2 (cross-check pinned); AMD legacy
+  L1/TLB/L2/L3 populated (kernel `cacheinfo.c` unions + associativity-encoding table).
+
+### Test results (exact)
+- `cargo build --workspace` OK · `cargo fmt --all -- --check` OK ·
+  `cargo clippy --all-targets --workspace -- -D warnings` OK ·
+  `cargo test --workspace` → **897 passed, 0 failed, 1 ignored**.
+- GitHub CI ("Check & Lint" incl. the new validator installs): **success** on the first
+  batch; final batch pushed at end of session (check PR #19).
+- `/dev/kvm`: **not run — absent (no nested virt)**, verified. no_std target: N/A.
+
+### Recommended next steps (tomorrow)
+1. **q35 chipset identity pass** — still the top unblocked architectural item (host bridge
+   says i440FX 0x1237 while the platform exposes PCIe ECAM/MCFG + PIIX3 at 00:01.0). Do it
+   as the *first* increment of a fresh session: touches `device_bus`, bridge BDF, host-bridge
+   ID, several tests, reverts the 00:01.0 `_ADR` fix; iasl is available to re-validate.
+2. **Consolidate the two CPUID paths** (flagged, not done): `enlil-core::cpuid::CpuidFilter`
+   (filters host-provided entries, KVM_GET_SUPPORTED_CPUID-style, no users) vs the canonical
+   `enlil_devices::stealth::cpuid::CpuidStealthTable` (synthesizes). The right merge is
+   probably "build a `CpuidStealthConfig` *from host data*, then synthesize" — `cache_info`
+   is already the bridge for leaf 4. Deliberate pass, same as the TPM was.
+3. **CPUID gaps that remain**: AMD profile (max basic leaf should arguably be 0xD/0x10, no
+   0xB enumeration check, 0x8000001D/0x8000001E TOPOEXT path, boost via 0x80000007 EDX[9]);
+   Intel leaf 0x7 is conservative (no LA57 deliberately, but also no BMI2/ADX/SHA — fine
+   until the vCPU actually executes those); leaf 0x16's bus 100 MHz vs leaf 0x15's 24 MHz
+   crystal are both plausible but unverified against one physical reference dump — grab one
+   from a real (non-VM) machine when available.
+4. **KVM run loop** still blocked on `/dev/kvm` (ask for a nested-virt runner). When it
+   lands: build bus via `standard_pc_complete`, `KVM_SET_CPUID2` from `CpuidStealthTable`,
+   drive `PmcState::advance_counters` + `VcpuTimingState::advance` with the SAME
+   `PmcRateModel` and ref-cycle delta per VMENTRY (the consistency contract is documented on
+   both types and roadmap §5.4).
+5. **TPM**: spec-exact command parsing (auth areas, GetCapability windowing) still wants a
+   swtpm/guest oracle; EK/AIK/SRK need real keygen (RSA/ECC — large, separate).
+
+---
+
+
 ## 2026-06-10 — Session: transparency-surface correctness sweep — CPUID, reprogrammable PIRQ links, timing/LBR stealth, and a real TPM (SHA-256)
 
 **20 commits, each independently green.** `acpica-tools` (`iasl` 20230628) + `dmidecode`
