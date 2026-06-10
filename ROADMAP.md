@@ -1531,12 +1531,19 @@ Physical USB Devices
 ### 5.3 CPUID Stealth
 - Intercept all CPUID exits and craft responses:
   - **Leaf 0x1, ECX bit 31:** Clear the hypervisor present bit
-  - **Leaf 0x40000000–0x400000FF:** Return zeros (no hypervisor signature)
+  - **Leaf 0x40000000–0x400000FF:** No hypervisor signature. **NOT** zeros — that is
+    itself a tell (2026-06-10 research): no real Intel CPU returns zeros for an
+    out-of-range leaf, and a detector that compares `CPUID(0x40000000)` to a bogus
+    leaf catches the mismatch. Treat the whole region as out-of-range (see below).
   - **Leaf 0x0:** Report correct vendor string (GenuineIntel / AuthenticAMD)
   - **Leaf 0x1:** Report correct family/model/stepping from physical CPU
   - **Leaf 0x4, 0xB:** Report virtual topology (only assigned cores)
   - **Leaf 0x80000002–0x80000004:** Pass through real CPU brand string
-- Ensure all reserved/undefined leaves return 0 (some detectors check these)
+- **Out-of-range leaves are vendor-specific** (2026-06-10, reference-dump-verified): on
+  **Intel** any leaf above the basic max (incl. the `0x40000000` region) or above the
+  extended max returns the **highest basic leaf's data**; on **AMD** it returns zeros.
+  In-range-but-reserved leaves return zeros on both. (`CpuidStealthTable::lookup` now
+  precomputes the vendor-correct out-of-range result.)
 
 ### 5.4 Timing Stealth (Expanded — from 2024–2025 anti-cheat research)
 

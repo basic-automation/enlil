@@ -940,3 +940,36 @@ and finished against the validating tools.
   touching: leaf `0x1` `EBX` max-addressable-IDs is a fixed constant (doesn't track
   `vcpu_count`), and leaf `0x80000008`'s address-size value vs. its comment look swapped.
   There is no `iasl`/`dmidecode`-style validator for CPUID, so this is a focused future pass.
+
+---
+
+## 2026-06-10 — CPUID out-of-range semantics: the `0x40000000`-zeroing is itself a tell (Phase 0.2 / 5.x stealth)
+
+Verified against a **real CPU reference dump** taken on this runner (`std::arch::x86_64::__cpuid_count`,
+compiled with `rustc -O`) plus the Intel SDM / AMD APM and the Intel-vs-AMD distinguisher folklore.
+
+- **Intel: every out-of-range leaf returns the highest *basic* leaf's data — not zeros.** On the
+  reference Intel CPU (max basic leaf `0xD`, whose result was `eax=0x000000e7 ebx=0x00000a80
+  ecx=0x00000a80 edx=0`), querying leaves `0x20`, `0x100`, `0x1337` (above the basic max, below
+  `0x4000_0000`), and `0x8000_0009`…`0xFFFF_FFFF` (above the extended max) **all returned that same
+  leaf-`0xD` value**. This is the documented Intel rule (Intel SDM Vol 2A, CPUID: "If a value entered
+  for CPUID.EAX is higher than the maximum input value for basic or extended function… the data for
+  the highest basic information leaf is returned"). QEMU implements exactly this
+  (`target-i386: return highest basic leaf if eax out of range`, lists.gnu.org/archive/html/qemu-devel/2012-12).
+- **AMD: out-of-range/undefined leaves return zeros** (AMD APM Vol 3; the standard/extended ranges are
+  the only defined ones). So the correct stealth behaviour is **vendor-specific**, and the difference is
+  itself a known Intel-vs-AMD probe.
+- **The detection vector (websec.net "Ophion: Building a Stealth Intel VT-x Hypervisor"; CPUID
+  Wikipedia).** A detector reads an obviously-bogus leaf (e.g. `0x13371337`) and compares it to
+  `CPUID(0x4000_0000)`. On bare-metal **Intel** both return the highest-basic-leaf data and are equal;
+  most hypervisors answer `0x4000_0000` with a vendor signature (or, like Enlil today, with zeros) while
+  the bogus leaf returns *something else* — the mismatch (or the all-zeros, which no real Intel CPU ever
+  returns for an out-of-range leaf) is the tell.
+- **Changed what we build:** `CpuidStealthTable::lookup` was returning `CpuidResult::default()` (zeros)
+  for the `0x4000_0000-0x4000_00FF` region *and* for every leaf outside the populated ranges. Replace
+  that with **faithful out-of-range emulation**: precompute an `out_of_range` result at build time
+  (Intel → the highest populated basic leaf's data; AMD → zeros) and return it for any leaf above the
+  advertised basic max (including the hypervisor region while hiding) and above the extended max — so the
+  hypervisor leaves are *indistinguishable from bare metal* on Intel and correctly zero on AMD. In-range
+  but unpopulated leaves keep returning zeros (real CPUs do that for reserved leaves). No CPUID validator
+  exists, so this is reference-dump-backed, not tool-validated.
