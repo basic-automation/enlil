@@ -267,14 +267,21 @@ impl CpuidStealthTable {
             },
         });
 
-        // 0x80000001: Extended feature flags
+        // 0x80000001: Extended feature flags. ECX bit 22 (TOPOEXT) is
+        // AMD-only and gates the 0x8000001D/0x8000001E topology leaves the
+        // kernel's cacheinfo/topology code prefers on Zen — advertising the
+        // leaves without the bit (or vice versa) is an inconsistency.
+        let ext_ecx = match config.vendor {
+            CpuVendor::Intel => 0x0000_0121,           // LAHF, LZCNT, PREFETCHW
+            CpuVendor::Amd => 0x0000_0121 | (1 << 22), // + TOPOEXT
+        };
         entries.push(CpuidCacheEntry {
             leaf: 0x8000_0001,
             subleaf: 0,
             result: CpuidResult {
                 eax: config.family_model_stepping,
-                ecx: 0x0000_0121, // LAHF, CmpLegacy, ABM
-                edx: 0x2C10_0800, // NX, Page1GB, RDTSCP, LM
+                ecx: ext_ecx,
+                edx: 0x2C10_0800, // SYSCALL, NX, Page1GB, RDTSCP, LM
                 ..CpuidResult::default()
             },
         });
@@ -310,13 +317,71 @@ impl CpuidStealthTable {
             });
         }
 
-        // 0x80000005/0x80000006: legacy L1/L2/L3 cache + TLB info (field
-        // layouts per AMD APM Fn8000_0005/6, cross-checked against Linux's
-        // cacheinfo.c `union l1_cache`/`l2_cache`/`l3_cache`). Both were
-        // in-range zeros: on Intel that contradicts the leaf-4 hierarchy
-        // ("no L2" vs a 256 KiB L2 — a one-instruction cross-check for a
-        // detector); on AMD these legacy leaves are the *primary* cache
-        // enumeration a guest parses.
+        Self::push_legacy_cache_leaves(config, entries);
+
+        // 0x80000007 EDX[8]: invariant TSC (same bit on Intel and AMD). Every
+        // CPU of the advertised generation sets it; leaving it clear tells the
+        // guest the TSC stops in deep C-states / varies with P-states, so
+        // Linux marks the TSC unstable and falls back to HPET — more traffic
+        // through our slower timer paths AND a tell. Our virtual TSC is
+        // offset-based and never stops, so claiming invariance is truthful.
+        // AMD signals boost via EDX[9] (CPB — the counterpart of Intel's
+        // leaf-6 IDA bit; the PMC rate model's core > ref ratio implies it)
+        // and the read-only APERF/MPERF pair via EDX[10] (EffFreq), which our
+        // timing-stealth MSR shadows actually serve.
+        let pm_edx = match config.vendor {
+            CpuVendor::Intel => 1 << 8,
+            CpuVendor::Amd => (1 << 8) | (1 << 9) | (1 << 10),
+        };
+        entries.push(CpuidCacheEntry {
+            leaf: 0x8000_0007,
+            subleaf: 0,
+            result: CpuidResult {
+                edx: pm_edx,
+                ..CpuidResult::default()
+            },
+        });
+
+        // 0x80000008 EAX: address sizes. EAX[7:0] = physical address bits, EAX[15:8] = linear
+        // (virtual) address bits (Intel SDM / AMD APM). The old value 0x3930 decoded as 57-bit
+        // linear (LA57) + 48-bit physical — both the comment (fields swapped) and the LA57 claim
+        // were wrong: leaf 7 ECX does not advertise LA57, so 57-bit linear is an inconsistency a
+        // guest can catch. Use the common, internally-consistent 48/48 (no LA57): 0x3030.
+        // On AMD, ECX[7:0] (NC) is threads-in-package minus one and
+        // ECX[15:12] (ApicIdSize) the APIC-ID bits per package — the legacy
+        // topology source the kernel cross-checks against leaf 1 EBX and
+        // leaf 0xB. Intel leaves ECX reserved-zero.
+        let sizes_ecx = match config.vendor {
+            CpuVendor::Intel => 0,
+            CpuVendor::Amd => {
+                let apic_id_size = 32 - (config.vcpu_count.max(1) - 1).leading_zeros();
+                (config.vcpu_count - 1) | (apic_id_size << 12)
+            }
+        };
+        entries.push(CpuidCacheEntry {
+            leaf: 0x8000_0008,
+            subleaf: 0,
+            result: CpuidResult {
+                eax: 0x0000_3030, // 48-bit linear, 48-bit physical
+                ecx: sizes_ecx,
+                ..CpuidResult::default()
+            },
+        });
+
+        // AMD topology-extension leaves (gated by the TOPOEXT bit above).
+        if config.vendor == CpuVendor::Amd {
+            Self::push_amd_topology_leaves(config, entries);
+        }
+    }
+
+    /// Push the `0x80000005`/`0x80000006` legacy cache + TLB leaves (field
+    /// layouts per AMD APM `Fn8000_0005`/6, cross-checked against Linux's
+    /// cacheinfo.c `union l1_cache`/`l2_cache`/`l3_cache`). Both were
+    /// in-range zeros: on Intel that contradicts the leaf-4 hierarchy
+    /// ("no L2" vs a 256 KiB L2 — a one-instruction cross-check for a
+    /// detector); on AMD these legacy leaves are the *primary* cache
+    /// enumeration a guest parses.
+    fn push_legacy_cache_leaves(config: &CpuidStealthConfig, entries: &mut Vec<CpuidCacheEntry>) {
         match config.vendor {
             CpuVendor::Intel => {
                 // Intel implements only ECX (L2): 256 KiB, 4-way (encoding 4),
@@ -360,33 +425,67 @@ impl CpuidStealthTable {
                 });
             }
         }
+    }
 
-        // 0x80000007 EDX[8]: invariant TSC (same bit on Intel and AMD). Every
-        // CPU of the advertised generation sets it; leaving it clear tells the
-        // guest the TSC stops in deep C-states / varies with P-states, so
-        // Linux marks the TSC unstable and falls back to HPET — more traffic
-        // through our slower timer paths AND a tell. Our virtual TSC is
-        // offset-based and never stops, so claiming invariance is truthful.
+    /// One `0x8000001D` cache-topology subleaf (AMD APM `Fn8000_001D`; the
+    /// field layout mirrors Intel leaf 4, but EAX[31:26] is reserved — AMD
+    /// has no cores-per-package field there).
+    const fn amd_cache_subleaf(
+        cache_type: u32,
+        level: u32,
+        ways: u32,
+        line_size: u32,
+        sets: u32,
+        shared_by: u32,
+    ) -> CpuidResult {
+        CpuidResult {
+            eax: cache_type | (level << 5) | (1 << 8) | ((shared_by - 1) << 14),
+            ebx: (line_size - 1) | ((ways - 1) << 22), // partitions = 1
+            ecx: sets - 1,
+            edx: 0, // L3 is non-inclusive on Zen; WBINVD scope not asserted
+        }
+    }
+
+    /// Push the AMD `TOPOEXT` leaves: the `0x8000001D` cache hierarchy and
+    /// the `0x8000001E` extended APIC/core/node IDs.
+    ///
+    /// The `0x8000001D` geometry must encode the **same caches** as the
+    /// legacy `0x80000005`/`0x80000006` leaves (32 KiB 8-way L1d/L1i,
+    /// 1 MiB 8-way L2, 32 MiB 16-way L3, 64-byte lines) — the kernel parses
+    /// both and a detector can diff them in four instructions; a test pins
+    /// the pair. Sharing follows the configured topology: L1/L2 per core
+    /// (shared by its SMT threads), L3 package-wide.
+    fn push_amd_topology_leaves(config: &CpuidStealthConfig, entries: &mut Vec<CpuidCacheEntry>) {
+        let smt = config.threads_per_core;
+        let subleaves = [
+            Self::amd_cache_subleaf(1, 1, 8, 64, 64, smt), // 32 KiB L1d
+            Self::amd_cache_subleaf(2, 1, 8, 64, 64, smt), // 32 KiB L1i
+            Self::amd_cache_subleaf(3, 2, 8, 64, 2048, smt), // 1 MiB L2
+            Self::amd_cache_subleaf(3, 3, 16, 64, 32768, config.vcpu_count), // 32 MiB L3
+        ];
+        for (i, result) in subleaves.into_iter().enumerate() {
+            entries.push(CpuidCacheEntry {
+                leaf: 0x8000_001D,
+                subleaf: u32_of(i),
+                result,
+            });
+        }
+        // A null subleaf (type 0) terminates the enumeration; the in-range
+        // zero default already encodes it, as with Intel leaf 4.
+
+        // 0x8000001E: extended APIC ID (EAX), core ID + threads-per-core
+        // (EBX[7:0] / EBX[15:8] = threads minus one), node IDs (ECX). The
+        // per-vCPU fields (APIC ID, core ID) are runtime concerns patched by
+        // the vCPU layer, exactly like leaf 0xB EDX; the table carries the
+        // package-invariant encoding.
         entries.push(CpuidCacheEntry {
-            leaf: 0x8000_0007,
+            leaf: 0x8000_001E,
             subleaf: 0,
             result: CpuidResult {
-                edx: 1 << 8,
-                ..CpuidResult::default()
-            },
-        });
-
-        // 0x80000008 EAX: address sizes. EAX[7:0] = physical address bits, EAX[15:8] = linear
-        // (virtual) address bits (Intel SDM / AMD APM). The old value 0x3930 decoded as 57-bit
-        // linear (LA57) + 48-bit physical — both the comment (fields swapped) and the LA57 claim
-        // were wrong: leaf 7 ECX does not advertise LA57, so 57-bit linear is an inconsistency a
-        // guest can catch. Use the common, internally-consistent 48/48 (no LA57): 0x3030.
-        entries.push(CpuidCacheEntry {
-            leaf: 0x8000_0008,
-            subleaf: 0,
-            result: CpuidResult {
-                eax: 0x0000_3030, // 48-bit linear, 48-bit physical
-                ..CpuidResult::default()
+                eax: 0,              // extended APIC ID (per-vCPU)
+                ebx: (smt - 1) << 8, // core ID 0 (per-vCPU); SMT count
+                ecx: 0,              // node 0 of 1
+                edx: 0,
             },
         });
     }
@@ -395,8 +494,15 @@ impl CpuidStealthTable {
     #[must_use]
     pub fn build(config: &CpuidStealthConfig) -> Self {
         let mut entries = Vec::with_capacity(128);
-        let max_standard_leaf = 0x16; // Processor Frequency
-        let max_extended_leaf = 0x8000_0008; // Virtual/Physical address sizes
+        // The max leaves are a vendor fingerprint of their own: no AMD part
+        // reports basic max 0x16 (Zen reports 0x10; 0x15/0x16 are the Intel
+        // TSC/frequency leaves), and AMD's extended range runs past the
+        // topology leaves to 0x8000001F (the SEV leaf — in-range reserved
+        // zeros here, consistent with not advertising SME/SEV anywhere else).
+        let (max_standard_leaf, max_extended_leaf) = match config.vendor {
+            CpuVendor::Intel => (0x16, 0x8000_0008), // frequency / address sizes
+            CpuVendor::Amd => (0x10, 0x8000_001F),   // PQOS / SEV
+        };
 
         Self::push_standard_leaves(config, max_standard_leaf, &mut entries);
         Self::push_extended_leaves(config, max_extended_leaf, &mut entries);
@@ -785,6 +891,102 @@ mod tests {
         };
         let ebx = CpuidStealthTable::build(&cfg).lookup(1, 0).ebx;
         assert_eq!((ebx >> 16) & 0xFF, 1);
+    }
+
+    /// Decode one leaf-4-style cache subleaf into (type, level, size-bytes,
+    /// ways, line-size, sharing count).
+    fn decode_cache_subleaf(r: CpuidResult) -> (u32, u32, u32, u32, u32, u32) {
+        let ctype = r.eax & 0x1F;
+        let level = (r.eax >> 5) & 0x7;
+        let sharing = ((r.eax >> 14) & 0xFFF) + 1;
+        let line = (r.ebx & 0xFFF) + 1;
+        let ways = ((r.ebx >> 22) & 0x3FF) + 1;
+        let sets = r.ecx + 1;
+        (ctype, level, ways * line * sets, ways, line, sharing)
+    }
+
+    #[test]
+    fn amd_topoext_cache_leaves_match_the_legacy_cache_leaves() {
+        let cfg = test_config(); // AMD
+        let table = CpuidStealthTable::build(&cfg);
+
+        // The TOPOEXT bit gates the leaves; both must be present together.
+        assert_ne!(
+            table.lookup(0x8000_0001, 0).ecx & (1 << 22),
+            0,
+            "TOPOEXT must be advertised when 0x8000001D/1E are populated"
+        );
+
+        // 0x8000001D: L1d, L1i, L2, L3 — then a null terminator.
+        let l1d = decode_cache_subleaf(table.lookup(0x8000_001D, 0));
+        let l1i = decode_cache_subleaf(table.lookup(0x8000_001D, 1));
+        let l2 = decode_cache_subleaf(table.lookup(0x8000_001D, 2));
+        let l3 = decode_cache_subleaf(table.lookup(0x8000_001D, 3));
+        assert_eq!(table.lookup(0x8000_001D, 4).eax & 0x1F, 0, "terminator");
+
+        // Same caches the legacy leaves enumerate (the kernel parses both):
+        // 0x80000005 — L1d/L1i 32 KiB, 8-way, 64-byte lines.
+        let legacy_l1 = table.lookup(0x8000_0005, 0);
+        for (name, (ctype, level, size, ways, line, _)) in [("L1d", l1d), ("L1i", l1i)] {
+            assert_eq!(level, 1, "{name} level");
+            assert!(ctype == 1 || ctype == 2, "{name} type");
+            assert_eq!(size, (legacy_l1.ecx >> 24) * 1024, "{name} size");
+            assert_eq!(ways, (legacy_l1.ecx >> 16) & 0xFF, "{name} ways");
+            assert_eq!(line, legacy_l1.ecx & 0xFF, "{name} line");
+        }
+        // 0x80000006 — L2 1 MiB (8-way: encoding 6), L3 32 MiB (16-way:
+        // encoding 8; size field counts 512 KiB units).
+        let legacy_l23 = table.lookup(0x8000_0006, 0);
+        assert_eq!(l2.1, 2);
+        assert_eq!(l2.2, ((legacy_l23.ecx >> 16) & 0xFFFF) * 1024, "L2 size");
+        assert_eq!(l2.3, 8, "L2 ways (legacy encoding 6)");
+        assert_eq!(l3.1, 3);
+        assert_eq!(l3.2, (legacy_l23.edx >> 18) * 512 * 1024, "L3 size");
+        assert_eq!(l3.3, 16, "L3 ways (legacy encoding 8)");
+
+        // Sharing tracks the topology: L1/L2 per core (SMT threads), L3
+        // package-wide.
+        assert_eq!(l1d.5, cfg.threads_per_core);
+        assert_eq!(l2.5, cfg.threads_per_core);
+        assert_eq!(l3.5, cfg.vcpu_count);
+
+        // 0x8000001E: EBX[15:8] + 1 = threads per core.
+        let ext = table.lookup(0x8000_001E, 0);
+        assert_eq!(((ext.ebx >> 8) & 0xFF) + 1, cfg.threads_per_core);
+    }
+
+    #[test]
+    fn max_leaves_are_vendor_correct() {
+        // AMD: basic max 0x10 (no Intel frequency leaves), extended max
+        // 0x8000001F with the SEV leaf as in-range reserved zeros.
+        let amd = CpuidStealthTable::build(&test_config());
+        assert_eq!(amd.lookup(0, 0).eax, 0x10);
+        assert_eq!(amd.lookup(0x8000_0000, 0).eax, 0x8000_001F);
+        assert_eq!(amd.lookup(0x8000_001F, 0), CpuidResult::default());
+        // Intel: basic max 0x16, extended max 0x80000008, and no TOPOEXT.
+        let intel = CpuidStealthTable::build(&intel_config());
+        assert_eq!(intel.lookup(0, 0).eax, 0x16);
+        assert_eq!(intel.lookup(0x8000_0000, 0).eax, 0x8000_0008);
+        assert_eq!(intel.lookup(0x8000_0001, 0).ecx & (1 << 22), 0);
+    }
+
+    #[test]
+    fn amd_boost_and_legacy_core_count_fields() {
+        let cfg = test_config();
+        let amd = CpuidStealthTable::build(&cfg);
+        // 0x80000007 EDX: invariant TSC + CPB (boost) + EffFreq (APERF/MPERF).
+        let edx = amd.lookup(0x8000_0007, 0).edx;
+        assert_eq!(edx & (1 << 8), 1 << 8, "invariant TSC");
+        assert_eq!(edx & (1 << 9), 1 << 9, "CPB: boost backs core > ref");
+        assert_eq!(edx & (1 << 10), 1 << 10, "EffFreq: the MSR shadows exist");
+        // 0x80000008 ECX: NC = threads-in-package - 1; ApicIdSize covers it.
+        let ecx = amd.lookup(0x8000_0008, 0).ecx;
+        assert_eq!(ecx & 0xFF, cfg.vcpu_count - 1, "NC");
+        assert_eq!((ecx >> 12) & 0xF, 3, "ApicIdSize for 8 threads");
+        // Intel: boost is leaf-6 IDA instead; ECX stays reserved.
+        let intel = CpuidStealthTable::build(&intel_config());
+        assert_eq!(intel.lookup(0x8000_0007, 0).edx, 1 << 8);
+        assert_eq!(intel.lookup(0x8000_0008, 0).ecx, 0);
     }
 
     #[test]
