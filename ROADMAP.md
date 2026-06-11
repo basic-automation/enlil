@@ -471,8 +471,19 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > register file's `INTB#` sink routes through the shared `route_pci_intx`
 > helper — live PIRQ config at assertion time, both controllers, level
 > semantics — so `INTREN`-driven drivers get the interrupt config space
-> promises instead of a timeout; (3) subsystem IDs are zero across all functions — source them from
-> the SMBIOS board vendor (same-fact pair) in one pass; (4) route PIRQ E-H if a
+> promises instead of a timeout; (3) ~~subsystem IDs~~ **done (2026-06-11):** all three onboard
+> functions (MCH, LPC, SMBus) carry `1043:8694` — ASUSTeK's PCI-SIG vendor ID,
+> pinned by test against the SMBIOS default baseboard manufacturer (same-fact
+> pair); note the subsystem registers are still guest-writable (real ones are
+> RO) — a general config-space write-mask pass is a separate item;
+> (3b) **machine-identity coherence gap (flagged 2026-06-11):** the default
+> SMBIOS profile describes an AMD Ryzen 7950X on an ASUS B650E board while the
+> chipset model is Intel Q35 and the CPUID stealth table has both vendor
+> profiles — a guest cross-referencing SMBIOS against PCI IDs/CPUID sees an
+> impossible machine. The identity (CPU vendor profile + chipset + SMBIOS
+> board/CPU strings) should be selected coherently from ONE machine profile;
+> needs either an Intel-flavoured SMBIOS default to match Q35, or profile
+> plumbing that swaps all three surfaces together; (4) route PIRQ E-H if a
 > device ever needs more than four lines.
 
 Enlil must be testable without modifying the user's existing system. This is the single most important usability feature for early adoption.

@@ -23,7 +23,8 @@ use enlil_devices::interrupt::{
 };
 use enlil_devices::pcie::{
     vendors, EcamSpace, PciBdf, PciConfigIo, PciResetControl, PcieRootComplex, SharedRootComplex,
-    ICH9_SMBUS_BDF, PIRQ_ROUTE_CONFIG_BASE, SMBUS_INTERRUPT_PIN,
+    BOARD_SUBSYSTEM_DEVICE_ID, BOARD_SUBSYSTEM_VENDOR_ID, ICH9_SMBUS_BDF, PIRQ_ROUTE_CONFIG_BASE,
+    SMBUS_INTERRUPT_PIN,
 };
 use enlil_devices::ps2::{SharedI8042, PS2_KBD_IRQ, PS2_MOUSE_IRQ};
 use enlil_devices::smbus::{SmbusHost, SMBUS_IO_BASE};
@@ -683,6 +684,10 @@ impl DeviceBus {
                 // is function 3), so function 0's header must say so or the
                 // guest never probes past it.
                 bridge.set_header_type(0x80);
+                // Board firmware stamps the board vendor's subsystem IDs on
+                // every onboard function (the generic ISA-bridge factory can't
+                // assume a board, so it's done at the platform seeding site).
+                bridge.set_subsystem(BOARD_SUBSYSTEM_VENDOR_ID, BOARD_SUBSYSTEM_DEVICE_ID);
                 // Firmware programs the PIRQ routing registers out of their 0x80
                 // reset (disabled) state to the defaults the DSDT advertises — the
                 // same PIRQ_DEFAULT_IRQS the link devices' _CRS reports — so a guest
@@ -1688,7 +1693,9 @@ mod tests {
     fn standard_pc_complete_mounts_the_ich9_smbus_function() {
         use super::{PirqRouter, StandardPc, ICH9_LPC_BDF, PIRQ_DEFAULT_IRQS};
         use crate::serial::{SerialOutput, SerialOutputMode};
-        use enlil_devices::pcie::{cfg, ICH9_SMBUS_BDF};
+        use enlil_devices::pcie::{
+            cfg, PciBdf, BOARD_SUBSYSTEM_DEVICE_ID, BOARD_SUBSYSTEM_VENDOR_ID, ICH9_SMBUS_BDF,
+        };
         use enlil_devices::smbus::{HST_STS, SMBUS_IO_BASE, STS_INUSE};
 
         let pc = DeviceBus::standard_pc_complete(
@@ -1713,6 +1720,15 @@ mod tests {
             let smb = rc.find_device(&ICH9_SMBUS_BDF).unwrap();
             assert_eq!(smb.read_u8(cfg::CLASS_CODE), 0x0C);
             assert_eq!(smb.read_u8(cfg::SUBCLASS), 0x05);
+
+            // Every onboard function carries the board vendor's subsystem IDs.
+            for dev in [lpc, smb, rc.find_device(&PciBdf::new(0, 0, 0)).unwrap()] {
+                assert_eq!(
+                    dev.read_u16(cfg::SUBSYSTEM_VENDOR_ID),
+                    BOARD_SUBSYSTEM_VENDOR_ID
+                );
+                assert_eq!(dev.read_u16(cfg::SUBSYSTEM_ID), BOARD_SUBSYSTEM_DEVICE_ID);
+            }
             assert_eq!(smb.read_u32(cfg::BAR4), u32::from(SMBUS_IO_BASE) | 1);
             assert_eq!(smb.read_u8(cfg::INTERRUPT_PIN), 2);
             let expected = PirqRouter::default_device_isa_irq(31, 2).unwrap();

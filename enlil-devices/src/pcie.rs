@@ -388,6 +388,8 @@ impl PcieRootComplex {
         let mut dev = Self::create_host_bridge(vendors::INTEL, Q35_HOST_BRIDGE_DEVICE_ID);
         // A2-stepping silicon: the revision real 82Q35 parts report.
         dev.write_u8(cfg::REVISION_ID, 0x02);
+        // The board vendor's subsystem IDs, as board firmware programs them.
+        dev.set_subsystem(BOARD_SUBSYSTEM_VENDOR_ID, BOARD_SUBSYSTEM_DEVICE_ID);
         let pciexbar = (ecam_base & PCIEXBAR_ADDR_MASK) | PCIEXBAR_ENABLE;
         dev.write_u32(PCIEXBAR_OFFSET, u32_of(pciexbar & 0xFFFF_FFFF));
         dev.write_u32(PCIEXBAR_OFFSET + 4, u32_of(pciexbar >> 32));
@@ -414,6 +416,7 @@ impl PcieRootComplex {
         let mut dev = PciConfigSpace::new(ICH9_SMBUS_BDF, vendors::INTEL, ICH9_SMBUS_DEVICE_ID);
         dev.set_class(0x0C, 0x05, 0x00, 0x02); // Serial bus: SMBus, A2 stepping
         dev.set_header_type(0x00);
+        dev.set_subsystem(BOARD_SUBSYSTEM_VENDOR_ID, BOARD_SUBSYSTEM_DEVICE_ID);
         // BAR4 = SMB_BASE: a 32-byte I/O BAR (bit 0 = I/O space indicator).
         dev.set_bar(4, u32::from(io_base) | 1, 0xFFFF_FFE0);
         let line = crate::interrupt::PirqRouter::default_device_isa_irq(
@@ -478,6 +481,22 @@ pub const ICH9_LPC_BRIDGE_BDF: PciBdf = PciBdf::new(0, 31, 0);
 
 /// PCI device ID of the ICH9 LPC interface bridge (Intel 82801IB, `D31:F0`).
 pub const ICH9_LPC_DEVICE_ID: u16 = 0x2918;
+
+/// PCI subsystem **vendor** ID stamped on the chipset's onboard functions:
+/// `ASUSTeK` Computer Inc.'s PCI-SIG vendor ID.
+///
+/// A real board's firmware programs the board vendor's ID into the subsystem
+/// vendor register of every onboard function; a guest (or detector) can
+/// cross-check it against the baseboard manufacturer SMBIOS advertises
+/// (`ASUSTeK COMPUTER INC.` in the default profile — a test pins the pair).
+/// All-zero subsystem IDs are what an unconfigured/synthetic platform shows.
+pub const BOARD_SUBSYSTEM_VENDOR_ID: u16 = 0x1043;
+
+/// PCI subsystem **device** ID stamped on the chipset's onboard functions.
+///
+/// A board-specific value the vendor assigns; boards reuse one value across
+/// their onboard chipset functions, which is exactly what we do.
+pub const BOARD_SUBSYSTEM_DEVICE_ID: u16 = 0x8694;
 
 /// The PCI location of the ICH9 `SMBus` host controller: `00:1F.3` (`D31:F3`).
 pub const ICH9_SMBUS_BDF: PciBdf = PciBdf::new(0, 31, 3);
@@ -869,6 +888,31 @@ mod tests {
         // PCIEXBAR: enabled, 256 MiB window (length bits 2:1 = 00), base intact.
         assert_eq!(bridge.read_u32(PCIEXBAR_OFFSET), 0xB000_0001);
         assert_eq!(bridge.read_u32(PCIEXBAR_OFFSET + 4), 0);
+        // The board vendor's subsystem IDs are stamped, not left zero.
+        assert_eq!(
+            bridge.read_u16(cfg::SUBSYSTEM_VENDOR_ID),
+            BOARD_SUBSYSTEM_VENDOR_ID
+        );
+        assert_eq!(
+            bridge.read_u16(cfg::SUBSYSTEM_ID),
+            BOARD_SUBSYSTEM_DEVICE_ID
+        );
+    }
+
+    /// The PCI subsystem vendor and the SMBIOS baseboard manufacturer encode
+    /// the same fact (who made the board); the default profiles must agree.
+    #[test]
+    fn board_subsystem_vendor_matches_the_smbios_baseboard_vendor() {
+        let board = crate::smbios::SmbiosConfig::default().baseboard_manufacturer;
+        assert!(
+            board.starts_with("ASUSTeK"),
+            "SMBIOS default baseboard is ASUSTeK; if this changes, change \
+             BOARD_SUBSYSTEM_VENDOR_ID to the new vendor's PCI-SIG ID too"
+        );
+        assert_eq!(
+            BOARD_SUBSYSTEM_VENDOR_ID, 0x1043,
+            "0x1043 is ASUSTeK's PCI-SIG vendor ID"
+        );
     }
 
     /// The ICH9 LPC bridge resets both PIRQ routing banks — `PIRQ[A-D]_ROUT` at
