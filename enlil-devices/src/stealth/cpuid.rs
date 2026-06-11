@@ -73,6 +73,108 @@ pub struct CpuidStealthConfig {
     pub max_frequency_mhz: u32,
 }
 
+#[cfg(target_arch = "x86_64")]
+impl CpuidStealthConfig {
+    /// Build a stealth config **from the host CPU's own CPUID**, so the
+    /// synthesized table presents the physical machine's identity (vendor,
+    /// family/model/stepping, features, brand string, cache geometry,
+    /// frequencies) with only the virtualization-relevant facts rewritten.
+    ///
+    /// This replaces the old filter-host-entries approach (the deleted
+    /// `enlil-core::cpuid::CpuidFilter`): instead of patching host CPUID
+    /// entries leaf by leaf at lookup time, the host facts are captured once
+    /// into the config and [`CpuidStealthTable::build`] synthesizes every
+    /// leaf with the cross-surface consistency rules applied. The one piece
+    /// of per-leaf rewriting the filter did that survives is the **cache
+    /// sharing topology**: host leaf-4 geometry is captured verbatim, but
+    /// each subleaf's "threads sharing this cache" / "cores per package"
+    /// fields are rewritten to the *guest* topology (L1/L2 shared per core,
+    /// L3 package-wide), since the host's sharing IDs describe a machine the
+    /// guest doesn't have.
+    ///
+    /// `hide_hypervisor` defaults on — when this host is itself a VM (e.g. a
+    /// CI runner) the captured leaf-1 ECX has the hypervisor bit set, and the
+    /// build clears it.
+    #[must_use]
+    pub fn from_host(vcpu_count: u32, threads_per_core: u32) -> Self {
+        use core::arch::x86_64::{__cpuid, __cpuid_count};
+
+        let leaf0 = __cpuid(0);
+        let vendor = match (leaf0.ebx, leaf0.edx, leaf0.ecx) {
+            v if v == CpuVendor::Amd.vendor_regs() => CpuVendor::Amd,
+            // Anything else (including unknown vendors) takes the Intel
+            // profile — the common case, and a coherent identity either way.
+            _ => CpuVendor::Intel,
+        };
+        let leaf1 = __cpuid(1);
+
+        // Brand string from 0x80000002-4 (present on every x86_64 part).
+        let mut brand_string = [0u8; 48];
+        if __cpuid(0x8000_0000).eax >= 0x8000_0004 {
+            for i in 0..3u32 {
+                let r = __cpuid(0x8000_0002 + i);
+                let off = (i as usize) * 16;
+                brand_string[off..off + 4].copy_from_slice(&r.eax.to_le_bytes());
+                brand_string[off + 4..off + 8].copy_from_slice(&r.ebx.to_le_bytes());
+                brand_string[off + 8..off + 12].copy_from_slice(&r.ecx.to_le_bytes());
+                brand_string[off + 12..off + 16].copy_from_slice(&r.edx.to_le_bytes());
+            }
+        }
+
+        // Host leaf-4 cache geometry (Intel only), with the sharing fields
+        // rewritten to the guest topology.
+        let mut cache_info = Vec::new();
+        if vendor == CpuVendor::Intel && leaf0.eax >= 4 {
+            for subleaf in 0..16u32 {
+                let r = __cpuid_count(4, subleaf);
+                if r.eax.trailing_zeros() >= 5 {
+                    break; // null cache type terminates the enumeration
+                }
+                let level = (r.eax >> 5) & 0x7;
+                let shared_by = if level >= 3 {
+                    vcpu_count
+                } else {
+                    threads_per_core
+                };
+                let cores = (vcpu_count / threads_per_core).max(1);
+                cache_info.push(CpuidResult {
+                    eax: (r.eax & 0x0000_3FFF) | ((shared_by - 1) << 14) | ((cores - 1) << 26),
+                    ebx: r.ebx,
+                    ecx: r.ecx,
+                    edx: r.edx,
+                });
+            }
+        }
+
+        // Host frequencies from Intel leaf 0x16, when enumerated; otherwise
+        // the plausible defaults the synthetic profile uses.
+        let (base_frequency_mhz, max_frequency_mhz) = if leaf0.eax >= 0x16 {
+            let f = __cpuid(0x16);
+            if f.eax & 0xFFFF != 0 && f.ebx & 0xFFFF != 0 {
+                (f.eax & 0xFFFF, f.ebx & 0xFFFF)
+            } else {
+                (2800, 3300)
+            }
+        } else {
+            (2800, 3300)
+        };
+
+        Self {
+            vendor,
+            family_model_stepping: leaf1.eax,
+            features_ecx: leaf1.ecx,
+            features_edx: leaf1.edx,
+            brand_string,
+            vcpu_count,
+            threads_per_core,
+            hide_hypervisor: true,
+            cache_info,
+            base_frequency_mhz,
+            max_frequency_mhz,
+        }
+    }
+}
+
 /// CPU vendor
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CpuVendor {
@@ -953,6 +1055,52 @@ mod tests {
         // 0x8000001E: EBX[15:8] + 1 = threads per core.
         let ext = table.lookup(0x8000_001E, 0);
         assert_eq!(((ext.ebx >> 8) & 0xFF) + 1, cfg.threads_per_core);
+    }
+
+    /// `from_host` must capture this machine's identity and clear what a
+    /// guest must not see. (The CI runner is itself a VM with the hypervisor
+    /// bit set — a perfect negative reference for the hide path.)
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn from_host_captures_the_machine_and_hides_the_hypervisor() {
+        use core::arch::x86_64::__cpuid;
+
+        let cfg = CpuidStealthConfig::from_host(8, 2);
+        let table = CpuidStealthTable::build(&cfg);
+
+        // Vendor: the table's leaf 0 matches the host's (when the host is a
+        // recognized vendor; an exotic vendor falls back to the Intel profile).
+        let host0 = __cpuid(0);
+        let host_vendor = (host0.ebx, host0.edx, host0.ecx);
+        if host_vendor == CpuVendor::Amd.vendor_regs()
+            || host_vendor == CpuVendor::Intel.vendor_regs()
+        {
+            let r = table.lookup(0, 0);
+            assert_eq!((r.ebx, r.edx, r.ecx), host_vendor);
+        }
+
+        // Family/model/stepping pass through; the hypervisor bit does not —
+        // even when (especially when) the host sets it.
+        let host1 = __cpuid(1);
+        assert_eq!(table.lookup(1, 0).eax, host1.eax);
+        assert_eq!(table.lookup(1, 0).ecx & (1 << 31), 0);
+
+        // The brand string was captured (never all-zero on a real x86_64).
+        assert!(cfg.brand_string.iter().any(|&b| b != 0));
+
+        // On an Intel host the leaf-4 geometry passes through with the
+        // sharing fields rewritten to the GUEST topology, not the host's.
+        if cfg.vendor == CpuVendor::Intel && !cfg.cache_info.is_empty() {
+            for r in &cfg.cache_info {
+                let level = (r.eax >> 5) & 0x7;
+                let sharing = ((r.eax >> 14) & 0xFFF) + 1;
+                let expected = if level >= 3 { 8 } else { 2 };
+                assert_eq!(sharing, expected, "L{level} sharing tracks the guest");
+                assert_eq!((r.eax >> 26) + 1, 4, "cores per package");
+            }
+            // The built table serves the rewritten host geometry at leaf 4.
+            assert_eq!(table.lookup(4, 0), cfg.cache_info[0]);
+        }
     }
 
     #[test]
