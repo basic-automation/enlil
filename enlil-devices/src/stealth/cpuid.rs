@@ -618,9 +618,11 @@ impl CpuidStealthTable {
     }
 
     fn build_topology_leaves(config: &CpuidStealthConfig, entries: &mut Vec<CpuidCacheEntry>) {
-        // Subleaf 0: SMT level
+        // Subleaf 0: SMT level. EAX is the number of x2APIC-ID bits the SMT field
+        // occupies — ceil(log2(threads_per_core)), so a core with N threads shifts
+        // the ID right by exactly enough bits to reach the core ID.
         let threads_per_core = config.threads_per_core;
-        let smt_shift = u32::from(threads_per_core > 1);
+        let smt_shift = ceil_log2(threads_per_core);
         entries.push(CpuidCacheEntry {
             leaf: 0xB,
             subleaf: 0,
@@ -632,9 +634,13 @@ impl CpuidStealthTable {
             },
         });
 
-        // Subleaf 1: Core level
+        // Subleaf 1: Core level. EAX is the cumulative shift past the SMT *and*
+        // core fields = ceil(log2(threads)) + ceil(log2(cores)); right-shifting an
+        // x2APIC ID by it yields the package ID. The naive `32 - cores.leading_zeros()`
+        // is `floor(log2)+1`, which overshoots power-of-two core counts by a bit
+        // (4 cores → 3 instead of 2), corrupting the package boundary a guest derives.
         let cores = config.vcpu_count / threads_per_core;
-        let core_shift = 32 - cores.leading_zeros(); // ceil(log2(cores))
+        let core_shift = ceil_log2(cores);
         entries.push(CpuidCacheEntry {
             leaf: 0xB,
             subleaf: 1,
@@ -657,6 +663,21 @@ impl CpuidStealthTable {
                 edx: 0,
             },
         });
+    }
+}
+
+/// `ceil(log2(n))` — the number of bits needed to enumerate `n` distinct items,
+/// i.e. the smallest `b` with `2^b >= n`. Returns 0 for `n <= 1`.
+///
+/// This is the correct width for an x2APIC-ID topology field. Note it differs
+/// from `32 - n.leading_zeros()` (which is `floor(log2(n)) + 1`) on exact powers
+/// of two: `ceil_log2(4) == 2`, whereas the latter gives 3. Using `(n - 1)`
+/// before counting leading zeros collapses that off-by-one.
+const fn ceil_log2(n: u32) -> u32 {
+    if n <= 1 {
+        0
+    } else {
+        u32::BITS - (n - 1).leading_zeros()
     }
 }
 
@@ -1078,14 +1099,46 @@ mod tests {
 
     #[test]
     fn topology_leaf_0xb() {
+        // test_config(): 8 logical processors, 2 threads/core => 4 cores.
         let table = CpuidStealthTable::build(&test_config());
-        // Subleaf 0: SMT
+        // Subleaf 0: SMT. 2 threads/core needs 1 ID bit.
         let smt = table.lookup(0xB, 0);
         assert_eq!(smt.ebx, 2); // 2 threads per core
+        assert_eq!(smt.eax, 1, "SMT shift = ceil(log2(2)) = 1");
 
-        // Subleaf 1: Core
+        // Subleaf 1: Core. The package-level shift covers SMT(1) + core(2) bits.
+        // 8 logical processors fit in exactly 3 x2APIC-ID bits, so EAX must be 3 —
+        // not 4, which the old `floor(log2(4))+1` core_shift produced.
         let core = table.lookup(0xB, 1);
         assert_eq!(core.ebx, 8); // 8 total logical processors
+        assert_eq!(core.eax, 3, "package shift = ceil(log2(8 logical)) = 3");
+    }
+
+    #[test]
+    fn ceil_log2_does_not_overshoot_powers_of_two() {
+        assert_eq!(ceil_log2(0), 0);
+        assert_eq!(ceil_log2(1), 0);
+        assert_eq!(ceil_log2(2), 1);
+        assert_eq!(ceil_log2(3), 2);
+        assert_eq!(ceil_log2(4), 2); // the off-by-one case
+        assert_eq!(ceil_log2(5), 3);
+        assert_eq!(ceil_log2(8), 3);
+        assert_eq!(ceil_log2(16), 4);
+    }
+
+    #[test]
+    fn topology_leaf_0xb_single_thread_power_of_two_cores() {
+        // 4 logical processors, no SMT => 4 cores, 0 SMT bits, 2 core bits.
+        let cfg = CpuidStealthConfig {
+            vcpu_count: 4,
+            threads_per_core: 1,
+            ..test_config()
+        };
+        let table = CpuidStealthTable::build(&cfg);
+        let smt = table.lookup(0xB, 0);
+        assert_eq!(smt.eax, 0, "no SMT => 0 shift");
+        let core = table.lookup(0xB, 1);
+        assert_eq!(core.eax, 2, "4 logical processors => 2 ID bits, not 3");
     }
 
     #[test]
