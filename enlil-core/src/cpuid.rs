@@ -50,6 +50,21 @@ impl GuestTopology {
     }
 }
 
+/// `ceil(log2(n))` — the number of x2APIC-ID bits needed to enumerate `n`
+/// distinct items (the smallest `b` with `2^b >= n`). Returns 0 for `n <= 1`.
+///
+/// Differs from `32 - n.leading_zeros()` (which is `floor(log2(n)) + 1`) on exact
+/// powers of two: `ceil_log2(4) == 2`, not 3. Subtracting one before counting
+/// leading zeros removes that off-by-one, which otherwise widens the topology
+/// shift fields by a bit and corrupts the package boundary a guest derives.
+const fn ceil_log2(n: u32) -> u32 {
+    if n <= 1 {
+        0
+    } else {
+        u32::BITS - (n - 1).leading_zeros()
+    }
+}
+
 /// `CPUID` filter that modifies host `CPUID` data for guest consumption.
 pub struct CpuidFilter {
     /// Guest topology description.
@@ -156,8 +171,9 @@ impl CpuidFilter {
             0xB => {
                 match entry.index {
                     0 => {
-                        // `SMT` level: threads per core
-                        let shift = u32::from(self.topology.threads_per_core > 1);
+                        // `SMT` level: threads per core. EAX = bits the SMT field
+                        // occupies = ceil(log2(threads_per_core)).
+                        let shift = ceil_log2(self.topology.threads_per_core);
                         out.eax = (out.eax & 0xFFFF_FFE0) | (shift & 0x1F);
                         out.ebx =
                             (out.ebx & 0xFFFF_0000) | (self.topology.threads_per_core & 0xFFFF);
@@ -165,9 +181,11 @@ impl CpuidFilter {
                         out.ecx = (out.ecx & 0xFFFF_00FF) | (1 << 8);
                     }
                     1 => {
-                        // Core level: logical processors per package
-                        let shift =
-                            32u32.saturating_sub(self.topology.logical_cpus.leading_zeros());
+                        // Core level: cumulative shift past SMT + core fields =
+                        // ceil(log2(logical_cpus)); right-shifting an x2APIC ID by it
+                        // yields the package ID. `32 - leading_zeros` overshoots
+                        // power-of-two CPU counts by a bit, so use `ceil_log2`.
+                        let shift = ceil_log2(self.topology.logical_cpus);
                         out.eax = (out.eax & 0xFFFF_FFE0) | (shift & 0x1F);
                         out.ebx = (out.ebx & 0xFFFF_0000) | (self.topology.logical_cpus & 0xFFFF);
                         // `ECX`[15:8] = level type (2 = Core)
@@ -218,7 +236,7 @@ impl CpuidFilter {
 
         // Leaf 0xB sub-leaves
         // `SMT` level
-        let smt_shift = u32::from(self.topology.threads_per_core > 1);
+        let smt_shift = ceil_log2(self.topology.threads_per_core);
         entries.push(CpuidEntry {
             function: 0xB,
             index: 0,
@@ -228,8 +246,10 @@ impl CpuidFilter {
             edx: apic_id,
         });
 
-        // Core level
-        let core_shift = 32u32.saturating_sub(self.topology.logical_cpus.leading_zeros());
+        // Core level: cumulative shift = ceil(log2(logical_cpus)), so the package
+        // ID falls out of an x2APIC ID right-shifted by it. Using `ceil_log2`
+        // avoids the power-of-two off-by-one of `32 - leading_zeros`.
+        let core_shift = ceil_log2(self.topology.logical_cpus);
         entries.push(CpuidEntry {
             function: 0xB,
             index: 1,
@@ -361,6 +381,19 @@ mod tests {
         let filtered = filter.filter(&entry).unwrap();
         assert_eq!(filtered.ebx & 0xFFFF, 4); // 4 logical CPUs
         assert_eq!((filtered.ecx >> 8) & 0xFF, 2); // level type = Core
+                                                   // 4 logical CPUs fit in exactly 2 x2APIC-ID bits, so the package shift is
+                                                   // 2 — not 3, which the old `32 - leading_zeros` produced for powers of two.
+        assert_eq!(filtered.eax & 0x1F, 2);
+    }
+
+    #[test]
+    fn ceil_log2_does_not_overshoot_powers_of_two() {
+        assert_eq!(ceil_log2(0), 0);
+        assert_eq!(ceil_log2(1), 0);
+        assert_eq!(ceil_log2(2), 1);
+        assert_eq!(ceil_log2(3), 2);
+        assert_eq!(ceil_log2(4), 2); // the off-by-one case
+        assert_eq!(ceil_log2(8), 3);
     }
 
     #[test]
