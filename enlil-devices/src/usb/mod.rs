@@ -33,7 +33,7 @@ pub mod routing;
 pub mod types;
 pub mod xhci;
 
-pub use controller::VirtualXhciController;
+pub use controller::{SharedXhci, VirtualXhciController, XhciMmio};
 pub use device::{UsbClass, UsbDevice, UsbDeviceId, UsbDeviceState, UsbSpeed};
 pub use monitor::{UsbHotplugEvent, UsbMonitor};
 pub use routing::{RoutingRule, RoutingState, RoutingTable};

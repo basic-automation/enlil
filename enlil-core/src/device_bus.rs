@@ -32,6 +32,9 @@ use enlil_devices::timer::{
     AcpiPmTimer, Pit, RtcTime, SharedAcpiPmTimer, SharedHpet, SharedPit, SharedRtc,
     SystemControlPortB, HPET_TICK_NS, RTC_IRQ,
 };
+use enlil_devices::usb::{SharedXhci, VirtualXhciController, XhciMmio};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// The system device bus: a PIO bus and an MMIO bus behind one exit handler.
 #[derive(Default)]
@@ -742,6 +745,32 @@ impl DeviceBus {
         }
         bus.add_pio(Box::new(smbus))?;
 
+        // The discrete xHCI USB 3.0 controller (Phase 4.4): config function at
+        // XHCI_BDF, register file behind its 64 KiB BAR0, INTA# through the
+        // live PIRQ routing. The routing engine attaches each guest's routed
+        // USB devices to this controller's ports.
+        {
+            let mut rc = pcie.borrow_mut();
+            if rc.find_device(&XHCI_BDF).is_none() {
+                rc.add_device(PcieRootComplex::create_xhci_controller(
+                    XHCI_BDF,
+                    XHCI_MMIO_BASE,
+                ));
+            }
+        }
+        let xhci: SharedXhci = Rc::new(RefCell::new(VirtualXhciController::new(XHCI_PORTS)));
+        let mut xhci_mmio =
+            XhciMmio::new(Rc::clone(&xhci), u64::from(XHCI_MMIO_BASE), XHCI_MMIO_SIZE);
+        {
+            let pcie = pcie.clone();
+            let pic = pic.clone();
+            let ioapic = ioapic.clone();
+            xhci_mmio.set_interrupt_line(move |level| {
+                route_pci_intx(&pcie, &pic, &ioapic, XHCI_BDF.device, 1, level);
+            });
+        }
+        bus.add_mmio(Box::new(xhci_mmio))?;
+
         Ok(StandardPc {
             bus,
             pcie,
@@ -755,6 +784,7 @@ impl DeviceBus {
             pm1,
             sysctl_a,
             pci_reset,
+            xhci,
         })
     }
 }
@@ -826,6 +856,10 @@ pub struct StandardPc {
     /// run loop to handle a guest-initiated `reboot=pci` reset (the modern path,
     /// alongside `0x92`).
     pub pci_reset: PciResetControl,
+    /// The virtual xHCI controller — hot-plug routed USB devices through
+    /// [`connect_usb_device`](Self::connect_usb_device), not this handle, so
+    /// the port-status interrupt is delivered too.
+    pub xhci: SharedXhci,
 }
 
 impl StandardPc {
@@ -862,6 +896,28 @@ impl StandardPc {
     /// must have set it level in the ELCR — what PCI interrupts require), and the
     /// **I/O APIC** sees the PIRQ line's fixed GSI (16-19). Whichever path the
     /// guest has unmasked delivers it; deasserting (`level = false`) withdraws it.
+    /// Hot-plug a USB device onto the virtual xHCI's root-hub `port`
+    /// (0-based) at the xHCI speed code (1=FS, 2=LS, 3=HS, 4=SS) — or detach
+    /// with `connected = false`. Flips the port, posts the Port Status Change
+    /// event, and drives the controller's `INTA#` through the live PIRQ
+    /// routing so a guest with the interrupter enabled is notified exactly as
+    /// on hardware.
+    pub fn connect_usb_device(&self, port: usize, speed: u8, connected: bool) -> bool {
+        let (changed, level) = {
+            let mut xhci = self.xhci.borrow_mut();
+            let changed = if connected {
+                xhci.connect_device(port, speed)
+            } else {
+                xhci.disconnect_device(port)
+            };
+            (changed, xhci.intx_level())
+        };
+        if changed {
+            self.assert_pci_intx(XHCI_BDF.device, 1, level);
+        }
+        changed
+    }
+
     pub fn assert_pci_intx(&self, slot: u8, pin: u8, level: bool) {
         route_pci_intx(&self.pcie, &self.pic, &self.ioapic, slot, pin, level);
     }
@@ -978,6 +1034,17 @@ pub const IRQ_COM1: u8 = 4;
 const ICH9_LPC_BDF: PciBdf = enlil_devices::pcie::ICH9_LPC_BRIDGE_BDF;
 /// PCI device ID of the ICH9 LPC interface bridge (Intel 82801IB, `D31:F0`).
 const ICH9_LPC_DEVICE_ID: u16 = enlil_devices::pcie::ICH9_LPC_DEVICE_ID;
+
+/// BDF of the discrete Renesas xHCI USB 3.0 controller seeded by
+/// [`DeviceBus::standard_pc_complete`]: an expansion slot on bus 0.
+const XHCI_BDF: PciBdf = PciBdf::new(0, 4, 0);
+/// Firmware-assigned BAR0 of the xHCI register window, inside the 32-bit PCI
+/// MMIO hole the DSDT's `PCI0._CRS` produces (`0xC000_0000..0xFEC0_0000`).
+const XHCI_MMIO_BASE: u32 = 0xFE90_0000;
+/// Size of the xHCI BAR0 window (64 KiB).
+const XHCI_MMIO_SIZE: u64 = 0x1_0000;
+/// Root-hub port count on the virtual controller.
+const XHCI_PORTS: u8 = 4;
 
 /// Guest-physical base of the `PCIe` ECAM window for the default single-segment
 /// layout. Matches the MCFG table emitted by `enlil_devices::acpi`, so a guest
@@ -1850,6 +1917,68 @@ mod tests {
         // request is withdrawn from the 8259.
         VmExitHandler::io_out(&mut pc.bus, SMBUS_IO_BASE + HST_STS, &[STS_DEV_ERR]);
         assert_eq!(pc.pic.with(|p| p.pending_vector()), None);
+    }
+
+    /// The xHCI function is enumerable, its register file decodes behind the
+    /// BAR config space advertises, and a hot-plug delivers the port-status
+    /// interrupt through the live PIRQ routing — the full path a guest's USB
+    /// stack exercises.
+    #[test]
+    fn xhci_is_enumerable_and_hotplug_interrupts_through_the_pirq_routing() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::pcie::{cfg, PciBdf};
+        use enlil_devices::usb::EventTrb;
+
+        let mut pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            1_780_838_055,
+            1,
+        )
+        .unwrap();
+        pc.ioapic.with(|c| c.lapics[0].write_register(0x0F0, 0x1FF));
+
+        // Enumerable at 00:04.0: Renesas xHCI, USB class with xHCI prog-if,
+        // BAR0 = the mounted MMIO window, INTA#.
+        {
+            let rc = pc.pcie.borrow();
+            let dev = rc.find_device(&PciBdf::new(0, 4, 0)).unwrap();
+            assert_eq!(dev.read_u16(cfg::VENDOR_ID), 0x1912);
+            assert_eq!(dev.read_u8(cfg::CLASS_CODE), 0x0C);
+            assert_eq!(dev.read_u8(cfg::SUBCLASS), 0x03);
+            assert_eq!(dev.read_u8(cfg::PROG_IF), 0x30);
+            assert_eq!(dev.read_u32(cfg::BAR0), 0xFE90_0000);
+            assert_eq!(dev.read_u8(cfg::INTERRUPT_PIN), 1);
+        }
+
+        // The register window decodes behind the BAR: CAPLENGTH/HCIVERSION.
+        let mut data = [0u8; 4];
+        VmExitHandler::mmio_read(&mut pc.bus, 0xFE90_0000, &mut data);
+        let r0 = u32::from_le_bytes(data);
+        assert_eq!(r0 & 0xFF, 0x20);
+        assert_eq!(r0 >> 16, 0x0110);
+
+        // Program PIRQA's GSI (16; slot-4 INTA swizzles to PIRQA): vector
+        // 0x70, then enable interrupter 0 (IMAN.IE at RTSOFF + 0x20) through
+        // the BAR like a driver does.
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0000, &0x30u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0010, &0x70u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0000, &0x31u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0010, &0u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFE90_0000 + 0x1020, &2u32.to_le_bytes());
+
+        // Hot-plug a SuperSpeed device on port 0: the I/O APIC delivers the
+        // PIRQA vector, and the event ring carries the port-status change.
+        assert!(pc.connect_usb_device(0, 4, true));
+        assert_eq!(pc.ioapic.with(|c| c.pending_vector(0)), Some(0x70));
+        match pc.xhci.borrow_mut().pop_event() {
+            Some(EventTrb::PortStatusChange { port_id }) => assert_eq!(port_id, 1),
+            other => panic!("expected a port status change, got {other:?}"),
+        }
+
+        // The guest acknowledges: clearing IMAN.IP through the BAR withdraws
+        // the level line (the MMIO adapter re-syncs the routed INTx).
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFE90_0000 + 0x1020, &3u32.to_le_bytes());
+        assert!(!pc.xhci.borrow().intx_level());
     }
 
     #[test]

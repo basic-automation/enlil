@@ -273,17 +273,23 @@ impl VirtualXhciController {
         })
     }
 
-    /// Post an event through `post` and raise the interrupt surfaces: the
-    /// interrupter's IP bit (when IE is set) and `USBSTS.EINT`.
+    /// Post an event through `post` and raise the interrupt surfaces:
+    /// `USBSTS.EINT` and the interrupter's IP bit (IP latches regardless of
+    /// IE — IE only gates whether the pin asserts, xHCI §5.5.2.1).
     fn post_event_trb(&mut self, post: impl FnOnce(&mut EventRing) -> bool) -> bool {
         let posted = post(&mut self.interrupter.event_ring);
         if posted {
             self.op.usbsts |= USBSTS_EINT;
-            if self.interrupter.interrupt_enabled() {
-                self.interrupter.set_pending(true);
-            }
+            self.interrupter.set_pending(true);
         }
         posted
+    }
+
+    /// The level of the controller's legacy `INTx` pin: asserted while the
+    /// interrupter has a pending event (IP) with interrupts enabled (IE).
+    #[must_use]
+    pub const fn intx_level(&self) -> bool {
+        self.interrupter.interrupt_pending() && self.interrupter.interrupt_enabled()
     }
 
     /// Pop the next pending event from the interrupter's event ring (what the
@@ -302,6 +308,88 @@ impl VirtualXhciController {
         let trb = ring.read_trb(idx).copied()?;
         ring.set_dequeue_index((idx + 1) % ring.capacity());
         Some(trb)
+    }
+}
+
+/// A shared handle to one guest's virtual xHCI controller.
+///
+/// The MMIO adapter below holds one clone for the guest's register accesses;
+/// the platform holds another for hot-plug (`connect_device`) and the run
+/// loop's interrupt sampling. `Rc<RefCell>` matches the single-threaded bus
+/// (like [`SharedRootComplex`](crate::pcie::SharedRootComplex)); a hot-plug
+/// monitor on another thread posts events through a channel the run loop
+/// drains, it does not touch this handle directly.
+pub type SharedXhci = std::rc::Rc<std::cell::RefCell<VirtualXhciController>>;
+
+/// Bus adapter exposing a [`VirtualXhciController`]'s register window as MMIO
+/// at the base address its PCI BAR0 advertises.
+///
+/// xHCI registers are 32-bit (64-bit registers are two dword halves, which
+/// the controller's window already models), so accesses are dispatched as
+/// dwords; a 64-bit access is split into two. After every access — and after
+/// any event the access may have caused — the adapter pushes the controller's
+/// [`intx_level`](VirtualXhciController::intx_level) into the wired interrupt
+/// sink, giving level-triggered `INTx` semantics: asserted while IP&IE,
+/// withdrawn when the guest clears IP through `IMAN`.
+pub struct XhciMmio {
+    controller: SharedXhci,
+    base: u64,
+    size: u64,
+    interrupt_line: Option<Box<dyn Fn(bool)>>,
+}
+
+impl XhciMmio {
+    /// Wrap `controller`, claiming `size` bytes of MMIO at `base` (the BAR0
+    /// window; 64 KiB on the PCI function Enlil mounts).
+    #[must_use]
+    pub const fn new(controller: SharedXhci, base: u64, size: u64) -> Self {
+        Self {
+            controller,
+            base,
+            size,
+            interrupt_line: None,
+        }
+    }
+
+    /// Wire the function's `INTx` sink (the platform routes it through the
+    /// live PIRQ routing, like every PCI interrupt).
+    pub fn set_interrupt_line(&mut self, line: impl Fn(bool) + 'static) {
+        self.interrupt_line = Some(Box::new(line));
+    }
+
+    fn sync_interrupt_line(&self) {
+        if let Some(line) = &self.interrupt_line {
+            line(self.controller.borrow().intx_level());
+        }
+    }
+}
+
+impl crate::bus::MmioDevice for XhciMmio {
+    fn mmio_read(&mut self, offset: u64, size: u8) -> u64 {
+        let reg = u32::try_from(offset & !0x3).unwrap_or(u32::MAX);
+        let ctrl = self.controller.borrow();
+        if size >= 8 {
+            u64::from(ctrl.read_register(reg)) | (u64::from(ctrl.read_register(reg + 4)) << 32)
+        } else {
+            u64::from(ctrl.read_register(reg))
+        }
+    }
+
+    fn mmio_write(&mut self, offset: u64, size: u8, data: u64) {
+        let reg = u32::try_from(offset & !0x3).unwrap_or(u32::MAX);
+        {
+            let mut ctrl = self.controller.borrow_mut();
+            ctrl.write_register(reg, u32_of(data));
+            if size >= 8 {
+                ctrl.write_register(reg + 4, u32_of(data >> 32));
+            }
+        }
+        // The write may have posted events (doorbell) or cleared IP (IMAN).
+        self.sync_interrupt_line();
+    }
+
+    fn mmio_range(&self) -> (u64, u64) {
+        (self.base, self.base + self.size)
     }
 }
 

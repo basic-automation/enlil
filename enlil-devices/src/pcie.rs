@@ -65,6 +65,7 @@ pub mod vendors {
     pub const AMD: u16 = 0x1022;
     pub const NVIDIA: u16 = 0x10DE;
     pub const REALTEK: u16 = 0x10EC;
+    pub const RENESAS: u16 = 0x1912;
 }
 
 /// PCI device class codes
@@ -428,6 +429,31 @@ impl PcieRootComplex {
         dev
     }
 
+    /// Create the discrete **xHCI USB 3.0 host controller** function: a
+    /// Renesas uPD720202 (`1912:0015`), the ubiquitous add-in xHCI chip of
+    /// the era Enlil's chipset models (the Q35 generation predates
+    /// chipset-integrated xHCI, so a discrete controller is the identity a
+    /// real board of that generation would carry). `mmio_base` is the
+    /// firmware-assigned BAR0 (a 64 KiB MMIO window holding the register
+    /// file in [`usb::XhciMmio`](crate::usb::XhciMmio)). The interrupt pin
+    /// is `INTA#`, pre-routed to the default PIRQ resolution for its slot.
+    ///
+    /// # Panics
+    /// Never in practice: `INTA#` is a valid interrupt pin, so the default
+    /// PIRQ routing always resolves it.
+    #[must_use]
+    pub fn create_xhci_controller(bdf: PciBdf, mmio_base: u32) -> PciConfigSpace {
+        let mut dev = PciConfigSpace::new(bdf, vendors::RENESAS, XHCI_DEVICE_ID);
+        dev.set_class(0x0C, 0x03, 0x30, 0x02); // Serial bus: USB, xHCI
+        dev.set_header_type(0x00);
+        // BAR0: 64 KiB non-prefetchable 32-bit memory.
+        dev.set_bar(0, mmio_base, 0xFFFF_0000);
+        let line = crate::interrupt::PirqRouter::default_device_isa_irq(bdf.device, 1)
+            .expect("INTA# always swizzles to a PIRQ line");
+        dev.set_interrupt(line, 1);
+        dev
+    }
+
     /// Create a standard ISA/LPC bridge device.
     ///
     /// For an ICH9-style (or PIIX3-style) bridge this is also the **PCI
@@ -497,6 +523,9 @@ pub const BOARD_SUBSYSTEM_VENDOR_ID: u16 = 0x1043;
 /// A board-specific value the vendor assigns; boards reuse one value across
 /// their onboard chipset functions, which is exactly what we do.
 pub const BOARD_SUBSYSTEM_DEVICE_ID: u16 = 0x8694;
+
+/// PCI device ID of the Renesas uPD720202 xHCI USB 3.0 host controller.
+pub const XHCI_DEVICE_ID: u16 = 0x0015;
 
 /// The PCI location of the ICH9 `SMBus` host controller: `00:1F.3` (`D31:F3`).
 pub const ICH9_SMBUS_BDF: PciBdf = PciBdf::new(0, 31, 3);
