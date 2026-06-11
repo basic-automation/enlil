@@ -6,6 +6,95 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-11 — Session: Q35/ICH9 chipset identity arc + host-machine identity capture + virtual xHCI assembly
+
+**13 increments, each independently green and committed** (PR #21, branch
+`claude/awesome-faraday-aomlqt`). Picked up the morning hand-off's #1 (q35 chipset
+identity) and ran it to completion, then continued into the host-identity-capture
+consolidation (#2 CPUID paths, SMBIOS) and the long-dormant Phase 4 xHCI assembly.
+Workspace tests **897 → 919** (`cargo test --workspace`: 919 passed, 0 failed, 1 ignored =
+the `/dev/kvm` self-skip). `cargo build --workspace`, `cargo fmt --all -- --check`,
+`cargo clippy --all-targets --workspace -- -D warnings` green at every commit. `/dev/kvm`
+**still absent** (verified). `iasl` 20230628 + `dmidecode` 3.5 installed and used.
+
+### Arc 1 — Chipset identity is now coherently Q35/ICH9 (was a mixed-generation impossibility)
+The platform mixed an i440FX host bridge (`8086:1237`, no ECAM) with PCIe ECAM/MCFG and a
+PIIX3 ISA bridge at `00:01.0` — incoherent to anyone cross-checking IDs vs capabilities.
+- **`22b7102`** Host bridge → Q35 MCH (`8086:29C0`, rev 02) with **PCIEXBAR** (config 0x60)
+  seeded from the live `ecam_base`; ISA/LPC bridge → ICH9 LPC at `00:1F.0` (`8086:2918`).
+  ICH9 PIRQ regs share PIIX3 offsets/semantics, so PirqRouter/ELCR/links/`_PRT` carry over
+  unchanged. DSDT `_ADR` derives from the shared BDF; iasl re-validated. Cross-check tests
+  at the pcie and device-bus layers (PCIEXBAR base == decoded ECAM window).
+- **`a05bd09`** ICH9 SMBus host controller at `00:1F.3` (`8086:2930`) — full i801 register
+  model, empty-bus semantics (probes complete DEV_ERR, not open-bus 0xFF); LPC gains the
+  multifunction header bit. New crate module `enlil-devices::smbus`.
+- **`4cb9a92`** SMBus completion interrupt delivers through the live PIRQ routing: factored
+  `assert_pci_intx` into a shared `route_pci_intx` helper; SMBus INTB# level sink routes
+  through it (INTREN-set drivers now get the interrupt, not a timeout).
+- **`ca2204e`** Board subsystem IDs (`1043:8694`, ASUSTeK) on every onboard function;
+  pinned against the SMBIOS default baseboard manufacturer.
+- **`2fcef76`** LPC PMBASE/ACPI_CNTL encode the live ACPI PM block + SCI routing;
+  `chipset::SCI_IRQ` is the single source the FADT's SCI_INT derives from.
+- **`d68fb0d`** MCFG ECAM base pinned against the MCH PCIEXBAR (the ACPI half of the pair).
+
+### Arc 2 — Capture the host machine's real identity (consolidation: one canonical path)
+- **`f8eb7dd`** `CpuidStealthConfig::from_host` replaces the unused `enlil-core::cpuid::
+  CpuidFilter` (deleted) — captures host CPUID (vendor/FMS/features/brand/Intel leaf-4 cache
+  geometry with guest-topology sharing rewrite/leaf-0x16 freqs) and synthesizes every leaf
+  with the consistency rules. Tested on the runner (itself a VM → negative reference for the
+  hide-hypervisor path).
+- **`53525c2`** `SmbiosConfig::from_host` reads `/sys/class/dmi/id` (board/BIOS/system
+  strings, product UUID) + host CPU brand; guest topology for core/thread counts. Tested
+  with a fake DMI dir (tempdir) + fallback.
+- **`61b1ce8`** Leaf 7 captures host EBX/ECX, masked to a virtualizable, leaf-0xD-consistent
+  allowlist (no AVX-512/TSX/SGX/PKU/LA57 — each pairs with absent state or an MSR surface).
+
+### Arc 3 — AMD CPUID topology surface (Phase 5.4 sweep, AMD side)
+- **`82c0959`** Vendor-correct max leaves (AMD 0x10/0x8000001F), TOPOEXT leaves
+  0x8000001D/1E (cache geometry == legacy 0x80000005/6; SMT in 1E), CPB/EffFreq in
+  0x80000007, NC/ApicIdSize in 0x80000008 — every leaf cross-checked against a partner.
+
+### Arc 4 — Virtual xHCI controller assembled and mounted (Phase 4.4, was a placeholder)
+- **`2c75780`** `VirtualXhciController` assembled from its modelled-but-unwired parts:
+  one MMIO window per the capability block, real slot-pool command processing
+  (Enable/Disable/NoSlotsAvailable), port connect → Port Status Change events.
+  `CommandTrb::from_trb` added (missing decode half).
+- **`ed2f781`** Mounted as a discrete Renesas uPD720202 (`1912:0015`) at `00:04.0` with a
+  64 KiB BAR0 MMIO window (`usb::XhciMmio`) and INTA# through the live PIRQ routing;
+  `StandardPc` carries the handle + `connect_usb_device`.
+- **`ec57241`** Root-hub port allocator: `DeviceSpeed::xhci_speed_id` + `attach_device`
+  (lowest free port by speed); `StandardPc::attach_usb_device` is the routing-engine seam.
+
+### Test results (exact)
+- `cargo build --workspace` OK · `cargo fmt --all -- --check` OK ·
+  `cargo clippy --all-targets --workspace -- -D warnings` OK ·
+  `cargo test --workspace` → **919 passed, 0 failed, 1 ignored**.
+- iasl + dmidecode validation tests ran and pass. `/dev/kvm`: not run — absent (verified).
+  no_std custom target: N/A (no crate is `#![no_std]`).
+
+### Recommended next steps (tomorrow)
+1. **Machine-identity profile coherence (flagged, not done):** the *default* SMBIOS profile
+   is an AMD Ryzen/B650E board while the chipset is always Intel Q35 — when the host is AMD
+   the run path should prefer `from_host` SMBIOS+CPUID and accept the Intel-chipset
+   divergence (a real AMD chipset model is a large follow-up). Wire `from_host` into the
+   actual boot/`fw_cfg` delivery path so the run path presents one coherent captured machine.
+2. **xHCI transfer-ring (TD) processing** — the next Phase 4 increment: parse Normal/Setup/
+   Data/Status TRBs off a transfer ring and forward to a real device via libusb (ACRN's
+   model: `devicemodel/hw/pci/xhci.c`). Needs the device-context (DCBAA/input-context)
+   handling that lives in guest memory → partly blocked on the KVM run loop, but the
+   ring-parsing + an in-process loopback device is doable now and testable.
+3. **Routing→controller binding:** a multi-guest controller registry so a `RoutingState`
+   assignment calls `attach_usb_device` on the target guest's controller (the Phase 4.5
+   milestone: two devices, two guests, live reassignment). Single-controller seam is ready.
+4. **q35 fidelity remainder:** SATA at `1F.2` (needs an AHCI model — large); make the
+   guest-writable subsystem/PCIEXBAR registers read-only (general config write-mask pass).
+5. **KVM run loop** still blocked on `/dev/kvm` (ask for a nested-virt runner). When it
+   lands: build the bus via `standard_pc_complete`, `KVM_SET_CPUID2` from a `from_host`
+   `CpuidStealthTable`, deliver `from_host` SMBIOS via fw_cfg, drive the xHCI/SMBus/PM
+   interrupts through the now-wired PIRQ routing.
+
+---
+
 ## 2026-06-10 (b) — Session: vPMU/CPUID cross-surface consistency arc + TPM/LBR consolidation + CI validator gates
 
 **14 code/CI increments + docs/hand-off commits, each independently green** (PR #19, branch `claude/awesome-faraday-yud61k`).
