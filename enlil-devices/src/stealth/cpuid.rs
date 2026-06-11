@@ -580,12 +580,21 @@ impl CpuidStealthTable {
         }
     }
 
+    /// Leaf 0x7 subleaf 0 — Structured Extended Feature Flags (Intel SDM Vol. 2A).
+    ///
+    /// EBX `0x281` = bits 0, 7, 9 = **FSGSBASE, SMEP, ERMS** — a deliberately
+    /// conservative set every Ivy-Bridge-or-later part has, all of which a KVM
+    /// host backs without extra virtualization. (The old comment misnamed these as
+    /// "BMI1, AVX2"; the value never set those bits.) Notably **AVX2 (bit 5) stays
+    /// clear**, consistent with leaf 0xD advertising AVX but not AVX2 — i.e. an
+    /// AVX-but-not-AVX2 (Sandy/Ivy Bridge) feature level. ECX[16] (LA57) stays clear
+    /// so 5-level paging is not implied (cross-checked against leaf 0x80000008's
+    /// 48-bit linear width). EAX = 0: subleaf 0 is the only structured-feature leaf.
     const fn build_leaf_7(_config: &CpuidStealthConfig) -> CpuidResult {
-        // Pass through common structured features, masking dangerous ones
         CpuidResult {
             eax: 0,           // max subleaf
-            ebx: 0x0000_0281, // FSGSBASE, BMI1, AVX2 (conservative)
-            ecx: 0,
+            ebx: 0x0000_0281, // FSGSBASE (b0), SMEP (b7), ERMS (b9)
+            ecx: 0,           // LA57 (b16) clear: no 5-level paging
             edx: 0,
         }
     }
@@ -806,6 +815,32 @@ mod tests {
         };
         let ebx = CpuidStealthTable::build(&cfg).lookup(1, 0).ebx;
         assert_eq!((ebx >> 16) & 0xFF, 1);
+    }
+
+    #[test]
+    fn leaf_7_advertises_fsgsbase_smep_erms_and_no_avx2() {
+        let table = CpuidStealthTable::build(&intel_config());
+        let r = table.lookup(7, 0);
+        assert_eq!(r.eax, 0, "subleaf 0 is the only structured-feature subleaf");
+        // EBX exactly bits 0 (FSGSBASE), 7 (SMEP), 9 (ERMS).
+        assert_eq!(r.ebx & (1 << 0), 1 << 0, "FSGSBASE");
+        assert_eq!(r.ebx & (1 << 7), 1 << 7, "SMEP");
+        assert_eq!(r.ebx & (1 << 9), 1 << 9, "ERMS");
+        assert_eq!(
+            r.ebx,
+            (1 << 0) | (1 << 7) | (1 << 9),
+            "no other EBX feature bits are advertised"
+        );
+        // AVX2 (bit 5) must stay clear: leaf 0xD advertises AVX but not AVX2, so an
+        // AVX2 bit here would be an internally inconsistent feature level.
+        assert_eq!(r.ebx & (1 << 5), 0, "AVX2 must not be advertised");
+        // The XSAVE area (leaf 0xD subleaf 0) carries AVX (XCR0 bit 2) but the size
+        // does not include an AVX2/AVX-512 region — corroborating the level.
+        assert_eq!(
+            table.lookup(0xD, 0).eax & 0b111,
+            0b111,
+            "x87+SSE+AVX in XCR0"
+        );
     }
 
     #[test]
