@@ -2177,9 +2177,9 @@ mod tests {
 
     #[test]
     fn pci_intx_routes_through_the_lpc_bridge_to_both_controllers() {
+        use super::ICH9_LPC_BDF;
         use crate::serial::{SerialOutput, SerialOutputMode};
         use enlil_devices::interrupt::ELCR_SLAVE;
-        use enlil_devices::pcie::PciBdf;
 
         let mut pc = DeviceBus::standard_pc_complete(
             SerialOutput::new("guest", SerialOutputMode::Null),
@@ -2193,7 +2193,7 @@ mod tests {
         // IRQ10 by writing its config register 0x61.
         {
             let mut rc = pc.pcie.borrow_mut();
-            let bridge = rc.find_device_mut(&PciBdf::new(0, 31, 0)).unwrap();
+            let bridge = rc.find_device_mut(&ICH9_LPC_BDF).unwrap();
             bridge.write_u8(0x61, 10);
         }
 

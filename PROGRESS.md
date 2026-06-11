@@ -120,6 +120,105 @@ PIIX3 ISA bridge at `00:01.0` — incoherent to anyone cross-checking IDs vs cap
 
 ---
 
+## 2026-06-11 — Session: Q35/ICH9 chipset identity + leaf-0xB topology shift bug + CPUID surface guards
+
+**4 commits, each independently green** (branch `claude/awesome-faraday-gpjjda`).
+Workspace tests **897 → 902** (`cargo test --workspace`: 902 passed, 0 failed, 1 ignored =
+the `/dev/kvm` self-skip). `cargo build --workspace`, `cargo fmt --all -- --check`, and
+`cargo clippy --all-targets --workspace -- -D warnings` all green at every commit.
+`/dev/kvm` **still absent** (verified — no nested virt). `acpica-tools` (`iasl` 20230628)
+installed and used as a hard validator; `dmidecode` not needed this run.
+
+### Increment 1 — Q35/ICH9 chipset identity (`c5a05aa`, the hand-off's top item)
+The platform exposes an MCFG/ECAM window and a `PNP0A08` PCIe root in the DSDT — a
+PCI-Express-era machine — but the host bridge still reported the legacy **i440FX** ID
+(`8086:1237`) and the south bridge was a **PIIX3** at `00:01.0`, a chipset combo with **no**
+PCIe/ECAM. That contradiction is a one-read VM tell (a guest reads MCFG, then the `00:00.0`
+device ID, and sees a chipset that can't have ECAM).
+- Host bridge now reports the **Q35 MCH** (`8086:29C0`); LPC interrupt-router bridge is the
+  **ICH9 LPC** (`8086:2918`) at its canonical `00:1F.0` (was PIIX3 at `00:01.0`).
+- `PIRQ[A-D]_ROUT` stay at config `0x60`-`0x63` (byte-identical layout on PIIX3 and ICH9,
+  per the ICH9 datasheet §13), so the `PirqRouter` model and the DSDT live `_SRS`/`_CRS`
+  link devices are **unchanged**; only the bridge identity + BDF moved. `ISA_` `_ADR` →
+  `0x001F0000`.
+- New constants `pcie::{Q35_MCH_DEVICE_ID, ICH9_LPC_DEVICE_ID, LPC_BRIDGE_BDF}`; renamed the
+  old `PIIX3_ISA_BRIDGE_BDF`/`PIIX3_ISA_DEVICE_ID`. Whole DSDT **round-trips through `iasl`
+  at 0 errors/warnings** (the `acpi_iasl_validation` integration test was actually run).
+
+### Increment 2 — leaf-0xB topology shift overshoot (`eed6aa6`, a real bug)
+The x2APIC topology shift in CPUID leaf 0xB (subleaf 0 SMT, subleaf 1 Core) was computed as
+`32 - n.leading_zeros()` = `floor(log2(n)) + 1` — one bit too many for **exact powers of
+two** (the common case). 8 logical processors → package shift 4 instead of 3; 4 cores → 3
+instead of 2. A guest right-shifts its x2APIC ID by that field to derive the package ID, so
+the extra bit corrupts the package boundary — a wrong, detectable topology. Fixed all three
+sites (`enlil-core` `CpuidFilter::filter` + `generate_topology_entries`; `enlil-devices`
+`stealth::cpuid::build_topology_leaves`) with a shared `ceil_log2(n)` (counts leading zeros
+of `n-1`). Tests pin the corrected EAX shifts + a `ceil_log2` truth table.
+
+### Increment 3 — cross-surface CPUID consistency guard (`b5e1b5e`)
+Leaf 1 EBX[23:16] (max addressable logical-processor IDs, a power of two via
+`next_power_of_two`) and leaf 0xB subleaf 1 EAX (package shift) both encode the package's
+APIC-ID width; the fix above made them agree. Added a test pinning `max_ids == 2^shift`
+across a vcpu/thread matrix (power-of-two and not) so neither surface can silently desync.
+
+### Increment 4 — leaf-7 feature-comment correction + surface lock (`8ad35b7`)
+`build_leaf_7`'s EBX `0x281` is bits 0/7/9 = **FSGSBASE, SMEP, ERMS**, but the comment
+misnamed them "FSGSBASE, BMI1, AVX2" (the value never set BMI1/AVX2). Corrected the comment,
+documented the leaf, and added a test pinning EBX to exactly those bits, asserting AVX2 stays
+clear, and cross-checking leaf 0xD advertises AVX — a coherent AVX-but-not-AVX2 (Sandy/Ivy
+Bridge) level rather than a mismatched one.
+
+### Research (informed the build) — logged in RESEARCH.md → 2026-06-11
+- **Intel ICH9 datasheet (316972-004) §13 LPC (D31:F0):** `PIRQ[A-D]_ROUT` at `0x60`-`0x63`,
+  bit 7 = IRQEN, bits[3:0] = ISA IRQ — byte-identical to PIIX3 `PIRQRC[A-D]`, so the
+  south-bridge identity swap needed no `PirqRouter` change.
+- **QEMU `pc` (i440FX) vs `q35` taxonomy:** i440FX host bridge `8086:1237` predates PCIe / has
+  no MCFG; Q35 MCH `8086:29C0` is the PCIe generation that ships ECAM + `PNP0A08`. → made the
+  host-bridge ID consistent with the MCFG/PNP0A08 we already emit.
+- **Passthrough-hardening practice (2024-25):** anti-detection setups standardise on `q35`
+  precisely because i440FX is a known emulator fingerprint — corroborates this was a real,
+  cheaply-probed tell, not a theoretical one.
+
+### Test results (exact)
+- `cargo build --workspace` OK · `cargo fmt --all -- --check` OK ·
+  `cargo clippy --all-targets --workspace -- -D warnings` OK (0 warnings) ·
+  `cargo test --workspace` → **902 passed, 0 failed, 1 ignored**.
+- `cargo test -p enlil-devices --test acpi_iasl_validation` → **3 passed** (DSDT/SSDT/all
+  tables round-trip through `iasl` clean *with the new `00:1F.0` `_ADR`*).
+- `/dev/kvm`: **not run — absent (no nested virt)**, verified. no_std custom-target: N/A
+  (no crate is `#![no_std]`).
+
+### Recommended next steps (tomorrow)
+1. **Complete the ICH9 south-bridge identity (multifunction).** Real ICH9 `1F.0` is
+   multifunction with siblings `1F.2` SATA AHCI (`8086:2922`) and `1F.3` SMBus (`8086:2930`).
+   We model only `1F.0`; absent siblings read all-ones (benign), but a complete south bridge
+   would add them with the header-type multifunction bit set. **Caveat:** an AHCI/SMBus
+   *config-only stub* with no working MMIO/IO can be a *worse* tell than absence (a guest
+   driver attaches and fails) — only add a function if its register behaviour is modelled, or
+   add SMBus (simpler) first with a minimal SMB host-controller I/O model.
+2. **Reconcile the SMBIOS board identity with the chipset.** SMBIOS reports `ROG STRIX
+   B650E-E` (an AMD AM5 board) while the chipset is now Intel Q35 and CPUID can be Intel —
+   a cross-surface inconsistency. Decide the canonical machine identity (Intel Q35-class board
+   + matching DMI strings, or keep AMD and revisit the chipset) — this is an owner-facing
+   identity-policy choice, flag in the roadmap before changing.
+3. **AMD CPUID profile gaps (needs a real AMD reference dump to validate):** `0x8000001D`
+   (cache topology) / `0x8000001E` (extended APIC ID / CCX topology) TOPOEXT path, leaf-1
+   max-addressable-IDs vs `0x8000001E` consistency, boost via `0x80000007` EDX[9]. Don't
+   guess these without a hardware oracle — the Intel side is now internally consistent, the
+   AMD side is conservative-but-thin.
+4. **CPUID path consolidation** (flagged in prior hand-offs, still not done): `enlil-core::
+   cpuid::CpuidFilter` (filters host entries; **no production users** — only tests) vs the
+   canonical `enlil_devices::stealth::cpuid::CpuidStealthTable` (synthesises). Both now share
+   the `ceil_log2` topology fix but remain parallel. The right merge is still "build a
+   `CpuidStealthConfig` from host data, then synthesise." A deliberate refactor pass.
+5. **KVM run loop** still blocked on `/dev/kvm` (ask for a nested-virt runner). When it lands:
+   build the bus via `standard_pc_complete`, `KVM_SET_CPUID2` from `CpuidStealthTable`, and
+   drive `PmcState::advance_counters` + `VcpuTimingState::advance` with the same
+   `PmcRateModel` and ref-cycle delta per VMENTRY (consistency contract documented on both
+   types and roadmap §5.4).
+
+---
+
 ## 2026-06-10 (b) — Session: vPMU/CPUID cross-surface consistency arc + TPM/LBR consolidation + CI validator gates
 
 **14 code/CI increments + docs/hand-off commits, each independently green** (PR #19, branch `claude/awesome-faraday-yud61k`).

@@ -496,6 +496,8 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > follow-up); (4) route PIRQ E-H if a
 > device ever needs more than four lines.
 
+### 0.3 USB Live Boot & Non-Destructive Testing (CRITICAL FOR ADOPTION)
+
 Enlil must be testable without modifying the user's existing system. This is the single most important usability feature for early adoption.
 
 **USB Live Boot:**
