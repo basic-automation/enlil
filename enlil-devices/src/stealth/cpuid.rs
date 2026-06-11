@@ -1127,6 +1127,31 @@ mod tests {
     }
 
     #[test]
+    fn leaf_1_max_addressable_ids_agrees_with_leaf_0xb_package_shift() {
+        // Two surfaces encode the package's APIC-ID width: leaf 1 EBX[23:16] is the
+        // number of addressable logical-processor IDs (a power of two), and leaf 0xB
+        // subleaf 1 EAX is the bit count to shift past them. They must satisfy
+        // max_ids == 2^shift, or a guest sees two different package sizes.
+        for &(vcpus, threads) in &[(8u32, 2u32), (4, 1), (4, 2), (2, 1), (1, 1), (6, 2)] {
+            let cfg = CpuidStealthConfig {
+                vcpu_count: vcpus,
+                threads_per_core: threads,
+                // HTT must be set for leaf 1 to advertise a >1 max-ID count.
+                features_edx: test_config().features_edx | (1 << 28),
+                ..test_config()
+            };
+            let table = CpuidStealthTable::build(&cfg);
+            let max_ids = (table.lookup(1, 0).ebx >> 16) & 0xFF;
+            let shift = table.lookup(0xB, 1).eax;
+            assert_eq!(
+                max_ids,
+                1 << shift,
+                "vcpus={vcpus} threads={threads}: leaf1 max_ids {max_ids} != 2^{shift}"
+            );
+        }
+    }
+
+    #[test]
     fn topology_leaf_0xb_single_thread_power_of_two_cores() {
         // 4 logical processors, no SMT => 4 cores, 0 SMT bits, 2 core bits.
         let cfg = CpuidStealthConfig {
