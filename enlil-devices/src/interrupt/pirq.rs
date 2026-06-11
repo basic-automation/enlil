@@ -1,4 +1,9 @@
-//! The PIIX3 PCI interrupt router (the "PIRQ" router).
+//! The PIIX3/ICH9 PCI interrupt router (the "PIRQ" router).
+//!
+//! The four `PIRQ[A-D]_ROUT` routing registers and their bit layout are identical
+//! on the legacy PIIX3 (`8086:7000`, at `00:01.0`) and the PCIe-era ICH9 LPC
+//! bridge (`8086:2918`, at `00:1F.0`); Enlil mounts the ICH9 LPC bridge, so the
+//! register addresses below are config `0x60`..`0x63` on that bridge.
 //!
 //! PCI devices signal interrupts on one of four level-triggered pins —
 //! `INTA#`..`INTD#` (encoded 1..4 in config-space register `0x3D`,
@@ -327,13 +332,15 @@ mod tests {
     }
 
     #[test]
-    fn router_syncs_routing_a_guest_programmed_in_the_piix_bridge_config() {
-        use crate::pcie::{PIRQ_ROUTE_CONFIG_BASE, PciBdf, PcieRootComplex, vendors};
+    fn router_syncs_routing_a_guest_programmed_in_the_lpc_bridge_config() {
+        use crate::pcie::{
+            ICH9_LPC_DEVICE_ID, LPC_BRIDGE_BDF, PIRQ_ROUTE_CONFIG_BASE, PcieRootComplex, vendors,
+        };
 
-        // A guest enumerates the PIIX3 ISA bridge (00:01.0) and programs PIRQB ->
+        // A guest enumerates the ICH9 LPC bridge (00:1F.0) and programs PIRQB ->
         // IRQ10 by writing config offset 0x61, leaving the others at reset (0x80).
         let mut bridge =
-            PcieRootComplex::create_isa_bridge(PciBdf::new(0, 1, 0), vendors::INTEL, 0x7000);
+            PcieRootComplex::create_isa_bridge(LPC_BRIDGE_BDF, vendors::INTEL, ICH9_LPC_DEVICE_ID);
         assert_eq!(
             bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE),
             0x80,

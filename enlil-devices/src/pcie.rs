@@ -375,11 +375,12 @@ impl PcieRootComplex {
 
     /// Create a standard ISA/LPC bridge device.
     ///
-    /// For a PIIX3-style bridge this is also the **PCI interrupt router**: the
-    /// four `PIRQRC[A-D]` routing registers live in this device's config space
-    /// (the four bytes from [`PIRQ_ROUTE_CONFIG_BASE`]), and reset to `0x80`
-    /// (routing disabled), which is what a guest reads before it programs them.
-    /// The [`PirqRouter`](crate::interrupt::PirqRouter) is synced from those bytes
+    /// For an ICH9/PIIX3-style LPC bridge this is also the **PCI interrupt
+    /// router**: the four `PIRQ[A-D]_ROUT` routing registers live in this
+    /// device's config space (the four bytes from [`PIRQ_ROUTE_CONFIG_BASE`]),
+    /// and reset to `0x80` (routing disabled, the IRQEN bit set), which is what a
+    /// guest reads before it programs them. The
+    /// [`PirqRouter`](crate::interrupt::PirqRouter) is synced from those bytes
     /// via [`sync_from_config`](crate::interrupt::PirqRouter::sync_from_config).
     #[must_use]
     pub fn create_isa_bridge(bdf: PciBdf, vendor_id: u16, device_id: u16) -> PciConfigSpace {
@@ -394,20 +395,42 @@ impl PcieRootComplex {
     }
 }
 
-/// The PCI location of the PIIX3 ISA/LPC bridge: `00:01.0`.
+/// The PCI device ID of the Q35 **MCH host bridge** (`8086:29C0`).
 ///
-/// Function 0 of device 1 on bus 0, on the 440FX/PIIX3 chipset Enlil models. This
-/// is the single source of truth for the bridge's address — the device bus mounts
-/// the live bridge here and the DSDT's `ISA_` device object derives its `_ADR`
-/// from it ([`PciBdf::acpi_adr`]), so the ACPI namespace binds to the real bridge
-/// instead of an empty slot.
-pub const PIIX3_ISA_BRIDGE_BDF: PciBdf = PciBdf::new(0, 1, 0);
+/// The DRAM controller / host bridge of Intel's Q35 (82G33/P35-family) chipset —
+/// the host bridge a guest reads at `00:00.0`. Q35 is the PCI Express generation
+/// of Intel's desktop chipsets, so a host bridge that reports this ID is
+/// consistent with the platform Enlil actually exposes: an MCFG/ECAM window and a
+/// `PNP0A08` `PCIe` root in the DSDT. The legacy `i440FX` ID (`8086:1237`) is *not* —
+/// `i440FX` predates `PCIe` and has no ECAM, so advertising it next to an MCFG table
+/// is an internal contradiction a guest can detect.
+pub const Q35_MCH_DEVICE_ID: u16 = 0x29C0;
 
-/// Config-space offset of the first PIIX3 PCI interrupt-routing register.
+/// The PCI device ID of the ICH9 **LPC interrupt controller / ISA bridge**
+/// (`8086:2918`).
 ///
-/// `PIRQRCA`; the four `PIRQRC[A-D]` registers are contiguous at `0x60`..`0x63`.
-/// A guest programs interrupt routing by writing these; the
-/// [`PirqRouter`](crate::interrupt::PirqRouter) reads them back.
+/// Function 0 of device `1F` on the Q35 chipset's companion ICH9 south bridge.
+/// This is the PCIe-era counterpart of the PIIX3 ISA bridge (`8086:7000`); it
+/// carries the same `PIRQ[A-D]_ROUT` routing registers at config `0x60`..`0x63`,
+/// so the [`PirqRouter`](crate::interrupt::PirqRouter) model is unchanged, but its
+/// identity matches a Q35/ICH9 platform rather than the legacy 440FX/PIIX3 one.
+pub const ICH9_LPC_DEVICE_ID: u16 = 0x2918;
+
+/// The PCI location of the ICH9 LPC / ISA bridge: `00:1F.0`.
+///
+/// Function 0 of device `0x1F` on bus 0 — where Intel's ICH-family south bridges
+/// place the LPC interrupt-router bridge (the PIIX3 sat at `00:01.0`; the move to
+/// `1F.0` is part of the Q35/ICH9 identity). This is the single source of truth
+/// for the bridge's address — the device bus mounts the live bridge here and the
+/// DSDT's `ISA_` device object derives its `_ADR` from it ([`PciBdf::acpi_adr`]),
+/// so the ACPI namespace binds to the real bridge instead of an empty slot.
+pub const LPC_BRIDGE_BDF: PciBdf = PciBdf::new(0, 0x1F, 0);
+
+/// Config-space offset of the first PCI interrupt-routing register.
+///
+/// `PIRQA_ROUT`; the four `PIRQ[A-D]_ROUT` registers are contiguous at
+/// `0x60`..`0x63` on both PIIX3 and ICH9. A guest programs interrupt routing by
+/// writing these; the [`PirqRouter`](crate::interrupt::PirqRouter) reads them back.
 pub const PIRQ_ROUTE_CONFIG_BASE: u16 = 0x60;
 
 /// Legacy PCI Configuration Mechanism #1: the `CONFIG_ADDRESS` port (32-bit

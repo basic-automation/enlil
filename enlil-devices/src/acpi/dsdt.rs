@@ -184,8 +184,8 @@ impl DsdtBuilder {
     /// The four PCI interrupt link-device names (`PIRQ[A-D]`), in line order.
     const LINK_NAMES: [[u8; 4]; 4] = [*b"LNKA", *b"LNKB", *b"LNKC", *b"LNKD"];
 
-    /// The four `Field` names overlaying the PIIX3 PIRQRC[A-D] route-control bytes
-    /// (config 0x60-0x63), one per PIRQ line, in line order.
+    /// The four `Field` names overlaying the ICH9 LPC PIRQ[A-D]_ROUT route-control
+    /// bytes (config 0x60-0x63), one per PIRQ line, in line order.
     const PIRQ_FIELDS: [[u8; 4]; 4] = [*b"PIRA", *b"PIRB", *b"PIRC", *b"PIRD"];
 
     /// Build the four PCI interrupt **link devices** (`PNP0C0F`), one per `PIRQ`
@@ -193,8 +193,8 @@ impl DsdtBuilder {
     /// - `_PRS`: the set of ISA IRQs the line *may* be routed to (level, active-low,
     ///   shared — PCI interrupt electrical characteristics);
     /// - `_STA`: present-and-enabled (0x0B);
-    /// - `_CRS`/`_DIS`/`_SRS`: **live** routing — they read and rewrite the PIIX3
-    ///   PIRQRC register (the `PIRA..PIRD` field over this bridge's config space).
+    /// - `_CRS`/`_DIS`/`_SRS`: **live** routing — they read and rewrite the ICH9 LPC
+    ///   `PIRQ_ROUT` register (the `PIRA..PIRD` field over this bridge's config space).
     ///
     /// `_CRS` reports the IRQ the register currently selects (`PIRx & 0x0F`) by
     /// building the IRQ mask `1 << irq` into a resource buffer; `_DIS` sets the
@@ -332,23 +332,20 @@ impl DsdtBuilder {
     fn build_isa_bridge(&self, aml: &mut AmlBuilder) {
         let isa = aml.device_start(b"ISA_");
 
-        // The ISA/LPC bridge's _ADR must point at the PIIX3 bridge the device bus
-        // actually mounts — function 0 of device 1 (00:01.0) on the 440FX/PIIX3
-        // chipset — not the ICH-era 1F.0 location. Deriving it from the shared
-        // PIIX3_ISA_BRIDGE_BDF keeps the ACPI object and the live bridge from
-        // drifting, so the guest's ISA device binds to the real PIRQ-router bridge.
-        aml.name_integer(
-            b"_ADR",
-            u64::from(crate::pcie::PIIX3_ISA_BRIDGE_BDF.acpi_adr()),
-        );
+        // The ISA/LPC bridge's _ADR must point at the LPC bridge the device bus
+        // actually mounts — function 0 of device 0x1F (00:1F.0) on the Q35/ICH9
+        // chipset, the standard ICH-family LPC location. Deriving it from the shared
+        // LPC_BRIDGE_BDF keeps the ACPI object and the live bridge from drifting, so
+        // the guest's ISA device binds to the real PIRQ-router bridge.
+        aml.name_integer(b"_ADR", u64::from(crate::pcie::LPC_BRIDGE_BDF.acpi_adr()));
 
-        // PIRQ route-control registers (PIIX3 config 0x60-0x63) as an OperationRegion
-        // over *this* bridge's PCI config space, with one byte-wide Field per PIRQ
-        // line. The link devices below read and rewrite these to report and reprogram
-        // their routing — so a guest's _SRS actually lands in the same config bytes the
-        // live PirqRouter reads. Declared here (not under PCI0) because a PCI_Config
-        // region resolves to the enclosing device's _ADR (00:01.0), which is where the
-        // PIRQRC registers actually live.
+        // PIRQ route-control registers (ICH9 LPC config 0x60-0x63) as an
+        // OperationRegion over *this* bridge's PCI config space, with one byte-wide
+        // Field per PIRQ line. The link devices below read and rewrite these to report
+        // and reprogram their routing — so a guest's _SRS actually lands in the same
+        // config bytes the live PirqRouter reads. Declared here (not under PCI0)
+        // because a PCI_Config region resolves to the enclosing device's _ADR
+        // (00:1F.0), which is where the PIRQ route registers actually live.
         aml.operation_region(
             b"PIRR",
             crate::acpi::aml::opcode::REGION_SPACE_PCI_CONFIG,
@@ -777,8 +774,8 @@ mod tests {
             adr_count, 1,
             "only the ISA bridge may carry _ADR; the PCI root must use _HID alone"
         );
-        // The ISA bridge's _ADR (00:01.0 -> 0x00010000) is the one that remains.
-        assert_eq!(crate::pcie::PIIX3_ISA_BRIDGE_BDF.acpi_adr(), 0x0001_0000);
+        // The ISA bridge's _ADR (00:1F.0 -> 0x001F0000) is the one that remains.
+        assert_eq!(crate::pcie::LPC_BRIDGE_BDF.acpi_adr(), 0x001F_0000);
         let isa_adr = [
             b'_',
             b'A',
@@ -787,12 +784,12 @@ mod tests {
             opcode::DWORD_PREFIX,
             0x00,
             0x00,
-            0x01,
+            0x1F,
             0x00,
         ];
         assert!(
             dsdt.windows(isa_adr.len()).any(|w| w == isa_adr),
-            "the surviving _ADR must be the ISA bridge at 00:01.0"
+            "the surviving _ADR must be the ISA bridge at 00:1F.0"
         );
         let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         assert_eq!(sum, 0);

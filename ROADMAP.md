@@ -444,6 +444,27 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > now sources `SMI_CMD`/`ACPI_ENABLE`/`ACPI_DISABLE` from the
 > `chipset::{SMI_CMD_PORT,ACPI_ENABLE_VALUE,ACPI_DISABLE_VALUE}` constants the port
 > uses, so the advertised handshake and the decoding hardware can't drift.
+>
+> **Status (2026-06-11):** **chipset identity is now internally consistent (Q35/ICH9).**
+> The platform exposes an MCFG/ECAM window and a `PNP0A08` PCIe root in the DSDT —
+> a PCI-Express-era machine — but the host bridge still reported the legacy i440FX
+> ID (`8086:1237`) and the south bridge was a PIIX3 at `00:01.0`, a chipset combo
+> that has **no** PCIe/ECAM. That contradiction is a one-read VM tell. The host
+> bridge now reports the **Q35 MCH** (`8086:29C0`) and the LPC interrupt-router
+> bridge is the **ICH9 LPC** (`8086:2918`) at its canonical `00:1F.0` (was
+> PIIX3 at `00:01.0`). The `PIRQ[A-D]_ROUT` registers stay at config `0x60`-`0x63`
+> (identical layout on PIIX3 and ICH9), so the `PirqRouter` model and the DSDT's
+> live `_SRS`/`_CRS` link devices are unchanged; only the bridge's identity and BDF
+> moved, with the `ISA_` `_ADR` now `0x001F0000`. New constants
+> `pcie::{Q35_MCH_DEVICE_ID, ICH9_LPC_DEVICE_ID, LPC_BRIDGE_BDF}`; whole DSDT still
+> round-trips through `iasl` at 0 errors/warnings. **Follow-up:** ICH9 1F.0 is a
+> multifunction device on real hardware (1F.2 SATA AHCI `8086:2922`, 1F.3 SMBus
+> `8086:2930`); we model only 1F.0 as single-function. Adding those sibling
+> functions (and setting the header-type multifunction bit) would complete the
+> south-bridge identity, but each absent function currently just reads all-ones,
+> which is benign. The SMBIOS board name (`ROG STRIX B650E`, an AMD AM5 board) is a
+> separate identity surface that should eventually be reconciled with the Q35/Intel
+> chipset story.
 
 ### 0.3 USB Live Boot & Non-Destructive Testing (CRITICAL FOR ADOPTION)
 

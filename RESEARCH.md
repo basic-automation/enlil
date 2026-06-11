@@ -1075,3 +1075,30 @@ ROADMAP.md → Core Model → "Execution modes" + Phase 11 intro. Prior art that
 - **JIT-instrumented DSM (mesh-mode thesis):** a translator observes every load/store, so
   coherence can be word/object-granular with access-stream-driven co-scheduling — translation
   doesn't remove distance, it instruments it. This is the Phase 11 research track.
+
+---
+
+## 2026-06-11 — Chipset identity consistency: i440FX/PIIX3 vs Q35/ICH9 as a VM tell (Phase 0.2 / 5.x stealth)
+
+The transparency question for this increment: does the emulated chipset's *identity* match the
+*features* we expose? Primary sources, since chipset register maps are stable:
+
+- **Intel ICH9 Family Datasheet (316972-004), §13 LPC (D31:F0).** The PIRQ routing registers
+  `PIRQ[A-D]_ROUT` are at config `0x60`-`0x63` and `PIRQ[E-H]_ROUT` at `0x68`-`0x6B`; bit 7 is
+  IRQEN (1 = *not* routed to the 8259), bits[3:0] select the ISA IRQ — **byte-identical** to the
+  PIIX3 `PIRQRC[A-D]` layout we already model. So switching the south-bridge identity from PIIX3
+  (`8086:7000`, `00:01.0`) to ICH9 LPC (`8086:2918`, `00:1F.0`) needs **no** change to the
+  `PirqRouter` or the DSDT link devices — only the device ID and BDF move. → done this run.
+- **QEMU machine-type taxonomy (`pc` i440FX vs `q35`).** i440FX is the pre-PCIe northbridge
+  (host bridge `8086:1237`, no MCFG/ECAM); Q35's MCH (`8086:29C0`) is the PCI-Express generation
+  and is what ships an ECAM window + `PNP0A08` root. Enlil already emits MCFG/ECAM and a
+  `PNP0A08` DSDT root, so the i440FX host-bridge ID was internally contradictory — a guest that
+  reads MCFG then the `00:00.0` device ID sees a chipset that can't have ECAM. → host bridge now
+  reports the Q35 MCH; the MCFG/PNP0A08/host-bridge-ID triple is consistent.
+- **Detection practice (passthrough-hardening guides, 2024-25).** Community anti-detection setups
+  standardise on `q35` precisely because the i440FX identity is a known emulator fingerprint;
+  this corroborates that the host-bridge/chipset ID is a real, cheaply-probed surface, not a
+  theoretical one. → confirms priority of this fix over cosmetic stealth.
+- **Follow-up the datasheet implies:** ICH9 1F.0 is multifunction (1F.2 SATA AHCI `8086:2922`,
+  1F.3 SMBus `8086:2930`). We model only 1F.0; the absent siblings read all-ones (benign), but a
+  complete south bridge would add them with the header-type multifunction bit set.
