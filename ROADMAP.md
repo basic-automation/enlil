@@ -461,10 +461,14 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > seeded to its reset state. **Remaining q35-fidelity follow-ups:** (1) guest
 > writes to `PCIEXBAR` update the register but do **not** relocate the decoded
 > ECAM window (firmware-only register in practice; flag if a guest ever
-> reprograms it); (2) a real ICH9 `D31` is multifunction — SATA at `1F.2` and
-> SMBus at `1F.3` (`8086:2930`) always exist; add at least the SMBus function
-> (and set the LPC's multifunction header bit) so the southbridge SKU is
-> plausible; (3) subsystem IDs are zero across all functions — source them from
+> reprograms it); (2) ~~add the SMBus function + LPC multifunction header bit~~ **done
+> (2026-06-11):** `D31` is now multifunction with the ICH9 SMBus host controller
+> (`8086:2930`) at `1F.3` — full i801 register file behind BAR4 (`0xB100`),
+> empty-bus semantics (probes complete `DEV_ERR`, in-use semaphore, block
+> buffer), INTB#/IRQ11 consistent with the PIRQ defaults; remaining: SATA at
+> `1F.2` (a real ICH9 always has it — needs an AHCI/IDE model, large), and
+> delivering the SMBus completion interrupt through the live PIRQ routing
+> (model stores `INTREN` but nothing asserts INTx yet; `i2c-i801` polls); (3) subsystem IDs are zero across all functions — source them from
 > the SMBIOS board vendor (same-fact pair) in one pass; (4) route PIRQ E-H if a
 > device ever needs more than four lines.
 

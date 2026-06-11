@@ -23,9 +23,10 @@ use enlil_devices::interrupt::{
 };
 use enlil_devices::pcie::{
     vendors, EcamSpace, PciBdf, PciConfigIo, PciResetControl, PcieRootComplex, SharedRootComplex,
-    PIRQ_ROUTE_CONFIG_BASE,
+    ICH9_SMBUS_BDF, PIRQ_ROUTE_CONFIG_BASE,
 };
 use enlil_devices::ps2::{SharedI8042, PS2_KBD_IRQ, PS2_MOUSE_IRQ};
+use enlil_devices::smbus::{SmbusHost, SMBUS_IO_BASE};
 use enlil_devices::timer::{
     AcpiPmTimer, Pit, RtcTime, SharedAcpiPmTimer, SharedHpet, SharedPit, SharedRtc,
     SystemControlPortB, HPET_TICK_NS, RTC_IRQ,
@@ -668,7 +669,8 @@ impl DeviceBus {
             .expect("add_pcie mounts the 0xCF9 reset latch");
 
         // Seed the ICH9 LPC bridge / PCI interrupt router at 00:1F.0 (its config
-        // space holds the PIRQ routing registers a guest programs).
+        // space holds the PIRQ routing registers a guest programs), and its
+        // SMBus sibling at 00:1F.3.
         {
             let mut rc = pcie.borrow_mut();
             if rc.find_device(&ICH9_LPC_BDF).is_none() {
@@ -677,6 +679,10 @@ impl DeviceBus {
                     vendors::INTEL,
                     ICH9_LPC_DEVICE_ID,
                 );
+                // D31 is multifunction on every ICH9 (the SMBus controller below
+                // is function 3), so function 0's header must say so or the
+                // guest never probes past it.
+                bridge.set_header_type(0x80);
                 // Firmware programs the PIRQ routing registers out of their 0x80
                 // reset (disabled) state to the defaults the DSDT advertises — the
                 // same PIRQ_DEFAULT_IRQS the link devices' _CRS reports — so a guest
@@ -687,7 +693,13 @@ impl DeviceBus {
                 }
                 rc.add_device(bridge);
             }
+            if rc.find_device(&ICH9_SMBUS_BDF).is_none() {
+                rc.add_device(PcieRootComplex::create_ich9_smbus(SMBUS_IO_BASE));
+            }
         }
+        // The live SMBus host register file behind the BAR the config function
+        // advertises (an empty bus: probes complete with DEV_ERR, not open bus).
+        bus.add_pio(Box::new(SmbusHost::new()))?;
 
         Ok(StandardPc {
             bus,
@@ -1629,6 +1641,56 @@ mod tests {
         let mut router = PirqRouter::new();
         router.sync_from_config(regs);
         assert_eq!(router.device_isa_irq(0, 1), Some(PIRQ_DEFAULT_IRQS[0]));
+    }
+
+    /// `D31` is multifunction on every ICH9: the LPC's header must say so, the
+    /// SMBus controller must answer at `1F.3` with the BAR the firmware
+    /// assigned, and the live register file must decode behind that BAR — one
+    /// consistent story across config space, the PIRQ defaults, and the bus.
+    #[test]
+    fn standard_pc_complete_mounts_the_ich9_smbus_function() {
+        use super::{PirqRouter, StandardPc, ICH9_LPC_BDF, PIRQ_DEFAULT_IRQS};
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::pcie::{cfg, ICH9_SMBUS_BDF};
+        use enlil_devices::smbus::{HST_STS, SMBUS_IO_BASE, STS_INUSE};
+
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            1_780_838_055,
+            1,
+        )
+        .unwrap();
+        let StandardPc { mut bus, pcie, .. } = pc;
+
+        {
+            let rc = pcie.borrow();
+            // Function 0 declares the device multifunction, or the guest never
+            // probes function 3.
+            let lpc = rc.find_device(&ICH9_LPC_BDF).unwrap();
+            assert_eq!(lpc.read_u8(cfg::HEADER_TYPE) & 0x80, 0x80);
+
+            // The SMBus function: SMBus class, SMB_BASE in BAR4, and an
+            // interrupt line that matches what the default PIRQ routing
+            // resolves INTB# of device 31 to (the same answer the DSDT's
+            // link devices give).
+            let smb = rc.find_device(&ICH9_SMBUS_BDF).unwrap();
+            assert_eq!(smb.read_u8(cfg::CLASS_CODE), 0x0C);
+            assert_eq!(smb.read_u8(cfg::SUBCLASS), 0x05);
+            assert_eq!(smb.read_u32(cfg::BAR4), u32::from(SMBUS_IO_BASE) | 1);
+            assert_eq!(smb.read_u8(cfg::INTERRUPT_PIN), 2);
+            let expected = PirqRouter::default_device_isa_irq(31, 2).unwrap();
+            assert_eq!(smb.read_u8(cfg::INTERRUPT_LINE), expected);
+            assert_eq!(expected, PIRQ_DEFAULT_IRQS[0]); // INTB#@31 -> PIRQA
+        }
+
+        // The register file decodes behind the advertised BAR: an idle
+        // controller (first status read 0, second shows the INUSE semaphore
+        // the first read took) — not open bus.
+        let mut data = [0u8; 1];
+        VmExitHandler::io_in(&mut bus, SMBUS_IO_BASE + HST_STS, &mut data);
+        assert_eq!(data[0], 0);
+        VmExitHandler::io_in(&mut bus, SMBUS_IO_BASE + HST_STS, &mut data);
+        assert_eq!(data[0], STS_INUSE);
     }
 
     #[test]

@@ -394,6 +394,37 @@ impl PcieRootComplex {
         dev
     }
 
+    /// Create the **ICH9 `SMBus` host controller** (`00:1F.3`, `8086:2930`).
+    ///
+    /// Every ICH-generation `D31` carries this function — a southbridge whose
+    /// `1F.3` is absent is a SKU that never shipped, so the chipset identity
+    /// needs it present. `io_base` is the firmware-assigned `SMB_BASE` (BAR4,
+    /// a 32-byte I/O block; the live register file is
+    /// [`smbus::SmbusHost`](crate::smbus::SmbusHost)). The interrupt pin is
+    /// `INTB#` (as the datasheet hardwires), and the interrupt line is
+    /// pre-programmed to the IRQ the default PIRQ routing resolves that pin
+    /// to — so config space, the PIRQ registers, and the DSDT link devices
+    /// tell the guest one consistent story.
+    ///
+    /// # Panics
+    /// Never in practice: `INTB#` is a valid interrupt pin, so the default
+    /// PIRQ routing always resolves it.
+    #[must_use]
+    pub fn create_ich9_smbus(io_base: u16) -> PciConfigSpace {
+        let mut dev = PciConfigSpace::new(ICH9_SMBUS_BDF, vendors::INTEL, ICH9_SMBUS_DEVICE_ID);
+        dev.set_class(0x0C, 0x05, 0x00, 0x02); // Serial bus: SMBus, A2 stepping
+        dev.set_header_type(0x00);
+        // BAR4 = SMB_BASE: a 32-byte I/O BAR (bit 0 = I/O space indicator).
+        dev.set_bar(4, u32::from(io_base) | 1, 0xFFFF_FFE0);
+        let line = crate::interrupt::PirqRouter::default_device_isa_irq(
+            ICH9_SMBUS_BDF.device,
+            SMBUS_INTERRUPT_PIN,
+        )
+        .expect("INTB# always swizzles to a PIRQ line");
+        dev.set_interrupt(line, SMBUS_INTERRUPT_PIN);
+        dev
+    }
+
     /// Create a standard ISA/LPC bridge device.
     ///
     /// For an ICH9-style (or PIIX3-style) bridge this is also the **PCI
@@ -447,6 +478,16 @@ pub const ICH9_LPC_BRIDGE_BDF: PciBdf = PciBdf::new(0, 31, 0);
 
 /// PCI device ID of the ICH9 LPC interface bridge (Intel 82801IB, `D31:F0`).
 pub const ICH9_LPC_DEVICE_ID: u16 = 0x2918;
+
+/// The PCI location of the ICH9 `SMBus` host controller: `00:1F.3` (`D31:F3`).
+pub const ICH9_SMBUS_BDF: PciBdf = PciBdf::new(0, 31, 3);
+
+/// PCI device ID of the ICH9 `SMBus` host controller (Intel 82801IB, `D31:F3`).
+pub const ICH9_SMBUS_DEVICE_ID: u16 = 0x2930;
+
+/// The `SMBus` controller's interrupt pin: `INTB#` (config `0x3D` = 2), per the
+/// ICH9 datasheet's `D31:F3` interrupt-pin register.
+pub const SMBUS_INTERRUPT_PIN: u8 = 2;
 
 /// Config-space offset of the first PCI interrupt-routing register.
 ///
