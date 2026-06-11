@@ -28,6 +28,10 @@ Increments after the initial hand-off draft (this entry was extended in place):
   are now read-only to guest config writes — `PciConfigSpace::guest_write(offset, width,
   value)` is the single masked write path (also fixed a pre-existing byte/word ECAM write
   bypass). Protects all the identity the session programmed.
+- **`9dee7f1`** PCI functions present a consistent capability list: `new()` no longer
+  asserts the STATUS caps bit with a null pointer; `add_power_management_capability` installs
+  a PM cap (ID 0x01) on the session's chipset functions so a guest walking the list finds a
+  real terminating one. (Total now **19 increments, 923 tests**.)
 
 ### Arc 1 — Chipset identity is now coherently Q35/ICH9 (was a mixed-generation impossibility)
 The platform mixed an i440FX host bridge (`8086:1237`, no ECAM) with PCIe ECAM/MCFG and a
@@ -98,8 +102,13 @@ PIIX3 ISA bridge at `00:01.0` — incoherent to anyone cross-checking IDs vs cap
 3. **Routing→controller binding:** a multi-guest controller registry so a `RoutingState`
    assignment calls `attach_usb_device` on the target guest's controller (the Phase 4.5
    milestone: two devices, two guests, live reassignment). Single-controller seam is ready.
-4. **q35 fidelity remainder:** SATA at `1F.2` (needs an AHCI model — large); make the
-   guest-writable subsystem/PCIEXBAR registers read-only (general config write-mask pass).
+4. **q35 fidelity remainder:** SATA at `1F.2` (needs an AHCI model — large). The subsystem
+   IDs are now read-only to guests (`be6cb30`) and the functions carry a PM capability
+   (`9dee7f1`); the next capability-list item is a **PCI Express Capability (ID 0x10)** on
+   each function — without it a device behind the PNP0A08 PCIe root presents only
+   conventional-PCI config space, a PCIe-vs-PCI tell. It's per-device-type (root-complex
+   integrated endpoint `0x9` for the chipset functions, endpoint `0x0` for the xHCI), so do
+   it as its own careful, spec-checked pass.
 5. **KVM run loop** still blocked on `/dev/kvm` (ask for a nested-virt runner). When it
    lands: build the bus via `standard_pc_complete`, `KVM_SET_CPUID2` from a `from_host`
    `CpuidStealthTable`, deliver `from_host` SMBIOS via fw_cfg, drive the xHCI/SMBus/PM
