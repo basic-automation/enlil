@@ -1075,3 +1075,37 @@ ROADMAP.md → Core Model → "Execution modes" + Phase 11 intro. Prior art that
 - **JIT-instrumented DSM (mesh-mode thesis):** a translator observes every load/store, so
   coherence can be word/object-granular with access-stream-driven co-scheduling — translation
   doesn't remove distance, it instruments it. This is the Phase 11 research track.
+
+---
+
+## 2026-06-11 — q35/ICH9 chipset identity: primary-source register map for the conversion (Phase 0.2 / 5.x stealth)
+
+The platform's surfaces currently mix generations: PCIe ECAM/MCFG + an i440FX host bridge
+(`8086:1237`, a 1996 chipset with **no** ECAM) + the PIIX3 ISA bridge at `00:01.0`. Any guest
+(or detector) that cross-references the host bridge ID against the MCFG table sees an
+impossible machine. Primary sources for the q35 conversion:
+
+- **Intel 3 Series Express Chipset Family datasheet (Q35 MCH)** — host bridge `D0:F0` is
+  `8086:29C0`; **PCIEXBAR** lives at MCH config `0x60-0x67` (bit 0 = enable, bits 2:1 = window
+  size 00b=256 MiB, base bits 38:28). The MCH's own PCIEXBAR must agree with the MCFG table —
+  one more "same fact, two surfaces" pair to pin. OVMF programs PCIEXBAR=`0xB0000000` on q35
+  (edk2 `OvmfPkg/PlatformPei` MMCONFIG patch), which is exactly our `DEFAULT_ECAM_BASE`.
+- **Intel ICH9 Family datasheet (316972)** — LPC interface bridge is `D31:F0` (`00:1F.0`),
+  `8086:2918`, class `06 01`; **PIRQ[A-D]_ROUT at config `0x60-0x63` with byte semantics
+  identical to PIIX3** (bit 7 = routing disable, reset `0x80`, bits 3:0 = ISA IRQ, IRQ
+  0/1/2/8/13 reserved), plus **PIRQ[E-H]_ROUT at `0x68-0x6B`** (new vs PIIX3); PIRQA-H wire to
+  I/O APIC inputs 16-23 in APIC mode. ELCR stays at `0x4D0/0x4D1`, RST_CNT at `0xCF9`.
+- **QEMU `hw/pci-host/q35.c` / `hw/isa/lpc_ich9.c`** — confirms a production VMM models q35
+  exactly this way (MCH `29C0` + ICH9 LPC `2918` at 1F.0, PIRQ regs 0x60/0x68); QEMU's tell is
+  its `1af4:1100` *subsystem* IDs, which we leave unset for now (follow-up: source subsystem
+  IDs from the SMBIOS board vendor across all functions — same-fact pair).
+
+**How it changes what we build:** the existing `PirqRouter` (registers, semantics, swizzle,
+GSI 16-19) carries over to ICH9 unchanged for A-D — the conversion is an identity/BDF pass
+(host bridge ID, LPC at `00:1F.0`, DSDT `_ADR`, PCIEXBAR seeding), not an interrupt-model
+rewrite. PIRQ E-H and the multifunction `00:1F.x` siblings a real ICH9 always has (SATA
+`1F.2`, SMBus `1F.3` = `8086:2930`) are follow-up fidelity items, flagged in the roadmap.
+
+Sources: https://www.intel.com/content/dam/doc/datasheet/io-controller-hub-9-datasheet.pdf ·
+Intel 3-Series (Q35) chipset datasheet · https://github.com/qemu/qemu/blob/master/hw/pci-host/q35.c ·
+https://mail-archive.com/edk2-devel@lists.01.org/msg08739.html

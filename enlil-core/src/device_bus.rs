@@ -146,10 +146,13 @@ impl DeviceBus {
     /// sharing one [`PcieRootComplex`] so a register programmed through either
     /// mechanism is visible through the other.
     ///
-    /// If `root` does not already contain a device at BDF 0:0.0, a default Intel
-    /// 440FX-style **host bridge** is seeded there so a guest enumerating the bus
+    /// If `root` does not already contain a device at BDF 0:0.0, the **Q35 MCH
+    /// host bridge** (`8086:29C0`) is seeded there so a guest enumerating the bus
     /// at boot finds at least the root device (matching real hardware, where the
-    /// host bridge always answers).
+    /// host bridge always answers). Its `PCIEXBAR` register is seeded from
+    /// `root.ecam_base`, so the base the MCH advertises through config space and
+    /// the ECAM window the platform decodes (and the MCFG table describes) are
+    /// the same address by construction.
     ///
     /// Returns the [`SharedRootComplex`] handle so the caller can add further
     /// devices after both front-ends are mounted (the change is seen by both).
@@ -168,7 +171,8 @@ impl DeviceBus {
         {
             let mut rc = shared.borrow_mut();
             if rc.find_device(&PciBdf::new(0, 0, 0)).is_none() {
-                rc.add_device(PcieRootComplex::create_host_bridge(vendors::INTEL, 0x1237));
+                let ecam_base = rc.ecam_base;
+                rc.add_device(PcieRootComplex::create_q35_host_bridge(ecam_base));
             }
         }
         self.add_pci_config_io(cam)?;
@@ -663,20 +667,20 @@ impl DeviceBus {
             .pci_reset_handle()
             .expect("add_pcie mounts the 0xCF9 reset latch");
 
-        // Seed the PIIX3 ISA bridge / PCI interrupt router at 00:01.0 (its config
+        // Seed the ICH9 LPC bridge / PCI interrupt router at 00:1F.0 (its config
         // space holds the PIRQ routing registers a guest programs).
         {
             let mut rc = pcie.borrow_mut();
-            if rc.find_device(&PIIX_ISA_BRIDGE_BDF).is_none() {
+            if rc.find_device(&ICH9_LPC_BDF).is_none() {
                 let mut bridge = PcieRootComplex::create_isa_bridge(
-                    PIIX_ISA_BRIDGE_BDF,
+                    ICH9_LPC_BDF,
                     vendors::INTEL,
-                    PIIX3_ISA_DEVICE_ID,
+                    ICH9_LPC_DEVICE_ID,
                 );
                 // Firmware programs the PIRQ routing registers out of their 0x80
                 // reset (disabled) state to the defaults the DSDT advertises — the
                 // same PIRQ_DEFAULT_IRQS the link devices' _CRS reports — so a guest
-                // reading PIRQRC[A-D], the PirqRouter that syncs from it, and the
+                // reading PIRQ[A-D]_ROUT, the PirqRouter that syncs from it, and the
                 // ACPI namespace all agree on PCI-mode routing.
                 for (line, &irq) in PIRQ_DEFAULT_IRQS.iter().enumerate() {
                     bridge.write_u8(PIRQ_ROUTE_CONFIG_BASE + line as u16, irq);
@@ -798,18 +802,18 @@ impl StandardPc {
     /// `pin` its interrupt pin (`1`=INTA..`4`=INTD, from config `0x3D`), and
     /// `level` the asserted state.
     ///
-    /// The routing is read **live** from the PIIX3 bridge's config space (the
-    /// `PIRQRC[A-D]` registers a guest programmed), so it always reflects what the
+    /// The routing is read **live** from the ICH9 LPC bridge's config space (the
+    /// `PIRQ[A-D]_ROUT` registers a guest programmed), so it always reflects what the
     /// guest configured. The line is driven into *both* controllers, matching the
     /// hardware: the **8259** sees the routed ISA IRQ as a *level* line (the guest
     /// must have set it level in the ELCR — what PCI interrupts require), and the
     /// **I/O APIC** sees the PIRQ line's fixed GSI (16-19). Whichever path the
     /// guest has unmasked delivers it; deasserting (`level = false`) withdraws it.
     pub fn assert_pci_intx(&self, slot: u8, pin: u8, level: bool) {
-        // Read the four PIRQRC bytes the guest programmed in the bridge config.
+        // Read the four PIRQ routing bytes the guest programmed in the bridge config.
         let regs = {
             let rc = self.pcie.borrow();
-            match rc.find_device(&PIIX_ISA_BRIDGE_BDF) {
+            match rc.find_device(&ICH9_LPC_BDF) {
                 Some(bridge) => [
                     bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE),
                     bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE + 1),
@@ -895,14 +899,14 @@ pub const IRQ_PIT: u8 = 0;
 /// Legacy ISA IRQ line for the COM1 16550 UART.
 pub const IRQ_COM1: u8 = 4;
 
-/// BDF of the PIIX3 ISA bridge / PCI interrupt router (`00:01.0`) seeded by
-/// [`DeviceBus::standard_pc_complete`]; its config space holds the `PIRQRC[A-D]`
-/// routing registers. Sourced from the shared
-/// [`enlil_devices::pcie::PIIX3_ISA_BRIDGE_BDF`] so the live bridge and the DSDT's
+/// BDF of the ICH9 LPC bridge / PCI interrupt router (`00:1F.0`) seeded by
+/// [`DeviceBus::standard_pc_complete`]; its config space holds the
+/// `PIRQ[A-D]_ROUT` routing registers. Sourced from the shared
+/// [`enlil_devices::pcie::ICH9_LPC_BRIDGE_BDF`] so the live bridge and the DSDT's
 /// `ISA_` `_ADR` cannot drift to different PCI locations.
-const PIIX_ISA_BRIDGE_BDF: PciBdf = enlil_devices::pcie::PIIX3_ISA_BRIDGE_BDF;
-/// PCI device ID of the PIIX3 ISA bridge (Intel 82371SB, function 0).
-const PIIX3_ISA_DEVICE_ID: u16 = 0x7000;
+const ICH9_LPC_BDF: PciBdf = enlil_devices::pcie::ICH9_LPC_BRIDGE_BDF;
+/// PCI device ID of the ICH9 LPC interface bridge (Intel 82801IB, `D31:F0`).
+const ICH9_LPC_DEVICE_ID: u16 = enlil_devices::pcie::ICH9_LPC_DEVICE_ID;
 
 /// Guest-physical base of the `PCIe` ECAM window for the default single-segment
 /// layout. Matches the MCFG table emitted by `enlil_devices::acpi`, so a guest
@@ -1125,12 +1129,12 @@ mod tests {
         VmExitHandler::io_out(&mut bus, 0xCF8, &addr.to_le_bytes());
         let mut data = [0u8; 4];
         VmExitHandler::io_in(&mut bus, 0xCFC, &mut data);
-        // Intel 440FX host bridge: device_id:vendor_id = 0x1237_8086.
-        assert_eq!(u32::from_le_bytes(data), 0x1237_8086);
+        // Intel Q35 MCH host bridge: device_id:vendor_id = 0x29C0_8086.
+        assert_eq!(u32::from_le_bytes(data), 0x29C0_8086);
 
         // ...and the same device through the ECAM MMIO window at base + 0.
         VmExitHandler::mmio_read(&mut bus, 0xB000_0000, &mut data);
-        assert_eq!(u32::from_le_bytes(data), 0x1237_8086);
+        assert_eq!(u32::from_le_bytes(data), 0x29C0_8086);
 
         // A device added through the shared handle *after* both front-ends are
         // mounted is visible through ECAM (proving the shared device set).
@@ -1140,6 +1144,32 @@ mod tests {
         let dev_addr = 0xB000_0000 + (u64::from(2u32) << 15); // BDF 0:2.0 ecam offset
         VmExitHandler::mmio_read(&mut bus, dev_addr, &mut data);
         assert_eq!(u32::from_le_bytes(data), 0x8168_10EC);
+    }
+
+    /// The MCH's `PCIEXBAR` (config `0x60`) is where a real guest can learn the
+    /// ECAM base from the hardware itself; it must advertise exactly the window
+    /// the bus decodes (and the MCFG table describes) — same fact, two surfaces.
+    #[test]
+    fn q35_pciexbar_advertises_the_live_ecam_window() {
+        use super::DEFAULT_ECAM_BASE;
+        use enlil_devices::pcie::{PcieRootComplex, PCIEXBAR_ENABLE, PCIEXBAR_OFFSET};
+
+        let mut bus = DeviceBus::new();
+        bus.add_pcie(PcieRootComplex::new(DEFAULT_ECAM_BASE))
+            .unwrap();
+
+        // Read PCIEXBAR through the legacy CAM: enable | 0:0.0 | reg 0x60.
+        let addr: u32 = 0x8000_0000 | u32::from(PCIEXBAR_OFFSET);
+        VmExitHandler::io_out(&mut bus, 0xCF8, &addr.to_le_bytes());
+        let mut data = [0u8; 4];
+        VmExitHandler::io_in(&mut bus, 0xCFC, &mut data);
+        let pciexbar = u64::from(u32::from_le_bytes(data));
+
+        // Enabled, and the base is the window the MMIO bus actually decodes.
+        assert_eq!(pciexbar & PCIEXBAR_ENABLE, PCIEXBAR_ENABLE);
+        let base = pciexbar & !0xFu64;
+        assert_eq!(base, DEFAULT_ECAM_BASE);
+        assert!(bus.mmio.is_mapped(base));
     }
 
     #[test]
@@ -1169,9 +1199,9 @@ mod tests {
         VmExitHandler::io_out(&mut bus, 0xCF8, &addr.to_le_bytes());
         let mut data = [0u8; 4];
         VmExitHandler::io_in(&mut bus, 0xCFC, &mut data);
-        assert_eq!(u32::from_le_bytes(data), 0x1237_8086);
+        assert_eq!(u32::from_le_bytes(data), 0x29C0_8086);
         VmExitHandler::mmio_read(&mut bus, DEFAULT_ECAM_BASE, &mut data);
-        assert_eq!(u32::from_le_bytes(data), 0x1237_8086);
+        assert_eq!(u32::from_le_bytes(data), 0x29C0_8086);
 
         // Guest serial output reaches the shared sink (byte-at-a-time, as a
         // guest drives a byte-wide register).
@@ -1566,7 +1596,7 @@ mod tests {
     #[test]
     fn standard_pc_complete_programs_the_default_pirq_routing() {
         use super::{
-            PirqRouter, StandardPc, PIIX_ISA_BRIDGE_BDF, PIRQ_DEFAULT_IRQS, PIRQ_ROUTE_CONFIG_BASE,
+            PirqRouter, StandardPc, ICH9_LPC_BDF, PIRQ_DEFAULT_IRQS, PIRQ_ROUTE_CONFIG_BASE,
         };
         use crate::serial::{SerialOutput, SerialOutputMode};
 
@@ -1578,20 +1608,20 @@ mod tests {
         .unwrap();
         let StandardPc { pcie, .. } = pc;
 
-        // The firmware programmed the PIIX3 bridge's PIRQRC[A-D] out of their 0x80
+        // The firmware programmed the LPC bridge's PIRQ[A-D]_ROUT out of their 0x80
         // reset state to the advertised defaults, so the live router agrees with the
         // DSDT link devices.
         let rc = pcie.borrow();
         let bridge = rc
-            .find_device(&PIIX_ISA_BRIDGE_BDF)
-            .expect("PIIX3 ISA bridge is mounted");
+            .find_device(&ICH9_LPC_BDF)
+            .expect("ICH9 LPC bridge is mounted");
         let mut regs = [0u8; 4];
         for (line, slot) in regs.iter_mut().enumerate() {
             *slot = bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE + line as u16);
         }
         assert_eq!(
             regs, PIRQ_DEFAULT_IRQS,
-            "PIRQRC[A-D] must hold the firmware-default routing"
+            "PIRQ[A-D]_ROUT must hold the firmware-default routing"
         );
 
         // A router synced from those bytes resolves a slot-0 INTA device (PIRQA) to
@@ -1771,7 +1801,7 @@ mod tests {
     }
 
     #[test]
-    fn pci_intx_routes_through_the_piix_bridge_to_both_controllers() {
+    fn pci_intx_routes_through_the_lpc_bridge_to_both_controllers() {
         use crate::serial::{SerialOutput, SerialOutputMode};
         use enlil_devices::interrupt::ELCR_SLAVE;
         use enlil_devices::pcie::PciBdf;
@@ -1784,11 +1814,11 @@ mod tests {
         .unwrap();
         pc.ioapic.with(|c| c.lapics[0].write_register(0x0F0, 0x1FF));
 
-        // The guest enumerates the PIIX3 bridge (00:01.0) and routes PIRQB ->
+        // The guest enumerates the ICH9 LPC bridge (00:1F.0) and routes PIRQB ->
         // IRQ10 by writing its config register 0x61.
         {
             let mut rc = pc.pcie.borrow_mut();
-            let bridge = rc.find_device_mut(&PciBdf::new(0, 1, 0)).unwrap();
+            let bridge = rc.find_device_mut(&PciBdf::new(0, 31, 0)).unwrap();
             bridge.write_u8(0x61, 10);
         }
 

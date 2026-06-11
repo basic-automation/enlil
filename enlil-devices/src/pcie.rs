@@ -373,42 +373,93 @@ impl PcieRootComplex {
         dev
     }
 
+    /// Create the **Q35 MCH** host bridge (`00:00.0`, `8086:29C0`) with its
+    /// `PCIEXBAR` register seeded to advertise the live ECAM window.
+    ///
+    /// On a real Q35 the MCH's `PCIEXBAR` (config `0x60`, 64-bit) is where the
+    /// ECAM base physically comes from — firmware programs it and *then* writes
+    /// the same address into the MCFG ACPI table. A guest (or a detector) can
+    /// read it back through config space and cross-check it against MCFG, so the
+    /// register must encode the same base the platform actually decodes:
+    /// bit 0 = enable, bits 2:1 = window size (`00` = 256 MiB, the full
+    /// single-segment window), bits 38:28 = the base address.
+    #[must_use]
+    pub fn create_q35_host_bridge(ecam_base: u64) -> PciConfigSpace {
+        let mut dev = Self::create_host_bridge(vendors::INTEL, Q35_HOST_BRIDGE_DEVICE_ID);
+        // A2-stepping silicon: the revision real 82Q35 parts report.
+        dev.write_u8(cfg::REVISION_ID, 0x02);
+        let pciexbar = (ecam_base & PCIEXBAR_ADDR_MASK) | PCIEXBAR_ENABLE;
+        dev.write_u32(PCIEXBAR_OFFSET, u32_of(pciexbar & 0xFFFF_FFFF));
+        dev.write_u32(PCIEXBAR_OFFSET + 4, u32_of(pciexbar >> 32));
+        dev
+    }
+
     /// Create a standard ISA/LPC bridge device.
     ///
-    /// For a PIIX3-style bridge this is also the **PCI interrupt router**: the
-    /// four `PIRQRC[A-D]` routing registers live in this device's config space
-    /// (the four bytes from [`PIRQ_ROUTE_CONFIG_BASE`]), and reset to `0x80`
-    /// (routing disabled), which is what a guest reads before it programs them.
-    /// The [`PirqRouter`](crate::interrupt::PirqRouter) is synced from those bytes
+    /// For an ICH9-style (or PIIX3-style) bridge this is also the **PCI
+    /// interrupt router**: the four `PIRQ[A-D]_ROUT` routing registers live in
+    /// this device's config space (the four bytes from
+    /// [`PIRQ_ROUTE_CONFIG_BASE`]), and reset to `0x80` (routing disabled),
+    /// which is what a guest reads before it programs them. The
+    /// [`PirqRouter`](crate::interrupt::PirqRouter) is synced from those bytes
     /// via [`sync_from_config`](crate::interrupt::PirqRouter::sync_from_config).
+    /// The ICH9's second bank, `PIRQ[E-H]_ROUT` at `0x68`..`0x6B`, is also
+    /// seeded to its reset state; nothing in-tree routes through E-H yet.
     #[must_use]
     pub fn create_isa_bridge(bdf: PciBdf, vendor_id: u16, device_id: u16) -> PciConfigSpace {
         let mut dev = PciConfigSpace::new(bdf, vendor_id, device_id);
         dev.set_class(0x06, 0x01, 0x00, 0x00); // ISA bridge
         dev.set_header_type(0x00);
-        // PIIX3 PCI interrupt-router registers reset to "disabled" (bit 7 set).
+        // PIRQ routing registers reset to "disabled" (bit 7 set): A-D and the
+        // ICH9-only E-H bank.
         for i in 0..4 {
             dev.write_u8(PIRQ_ROUTE_CONFIG_BASE + i, 0x80);
+            dev.write_u8(PIRQ_EH_ROUTE_CONFIG_BASE + i, 0x80);
         }
         dev
     }
 }
 
-/// The PCI location of the PIIX3 ISA/LPC bridge: `00:01.0`.
+/// PCI device ID of the Q35 MCH host bridge (Intel 82Q35 Express DRAM
+/// Controller, `D0:F0`).
 ///
-/// Function 0 of device 1 on bus 0, on the 440FX/PIIX3 chipset Enlil models. This
-/// is the single source of truth for the bridge's address — the device bus mounts
-/// the live bridge here and the DSDT's `ISA_` device object derives its `_ADR`
-/// from it ([`PciBdf::acpi_adr`]), so the ACPI namespace binds to the real bridge
-/// instead of an empty slot.
-pub const PIIX3_ISA_BRIDGE_BDF: PciBdf = PciBdf::new(0, 1, 0);
+/// The chipset generation Enlil models: unlike the i440FX it actually *has*
+/// ECAM (`PCIEXBAR`), so the MCFG table the platform emits describes a register
+/// the host bridge really carries.
+pub const Q35_HOST_BRIDGE_DEVICE_ID: u16 = 0x29C0;
 
-/// Config-space offset of the first PIIX3 PCI interrupt-routing register.
+/// MCH config-space offset of `PCIEXBAR` (the PCI Express register-range base
+/// address; 64 bits at `0x60`-`0x67`). Intel 3 Series chipset datasheet §5.1.9.
+pub const PCIEXBAR_OFFSET: u16 = 0x60;
+/// `PCIEXBAR` bit 0: the ECAM window decode enable.
+pub const PCIEXBAR_ENABLE: u64 = 1;
+/// `PCIEXBAR` base-address field: bits 38:28 (a 256 MiB-aligned base; with the
+/// length field left at `00` the window is the full 256 MiB segment).
+pub const PCIEXBAR_ADDR_MASK: u64 = 0x7F_F000_0000;
+
+/// The PCI location of the ICH9 LPC interface bridge: `00:1F.0` (`D31:F0`).
 ///
-/// `PIRQRCA`; the four `PIRQRC[A-D]` registers are contiguous at `0x60`..`0x63`.
-/// A guest programs interrupt routing by writing these; the
-/// [`PirqRouter`](crate::interrupt::PirqRouter) reads them back.
+/// This is the single source of truth for the bridge's address — the device bus
+/// mounts the live bridge here and the DSDT's `ISA_` device object derives its
+/// `_ADR` from it ([`PciBdf::acpi_adr`]), so the ACPI namespace binds to the
+/// real bridge instead of an empty slot.
+pub const ICH9_LPC_BRIDGE_BDF: PciBdf = PciBdf::new(0, 31, 0);
+
+/// PCI device ID of the ICH9 LPC interface bridge (Intel 82801IB, `D31:F0`).
+pub const ICH9_LPC_DEVICE_ID: u16 = 0x2918;
+
+/// Config-space offset of the first PCI interrupt-routing register.
+///
+/// `PIRQA_ROUT`; the four `PIRQ[A-D]_ROUT` registers are contiguous at
+/// `0x60`..`0x63` — the same offsets and byte semantics on the ICH9 LPC bridge
+/// as on the PIIX3 it replaced. A guest programs interrupt routing by writing
+/// these; the [`PirqRouter`](crate::interrupt::PirqRouter) reads them back.
 pub const PIRQ_ROUTE_CONFIG_BASE: u16 = 0x60;
+
+/// Config-space offset of the ICH9's second routing bank, `PIRQ[E-H]_ROUT`
+/// (`0x68`..`0x6B`). Modeled only as reset-state config bytes for now — no
+/// in-tree device routes through PIRQ E-H.
+pub const PIRQ_EH_ROUTE_CONFIG_BASE: u16 = 0x68;
 
 /// Legacy PCI Configuration Mechanism #1: the `CONFIG_ADDRESS` port (32-bit
 /// register at `0xCF8`).
@@ -759,6 +810,43 @@ mod tests {
         let cs = PciConfigSpace::empty(PciBdf::new(0, 1, 0));
         assert_eq!(cs.vendor_id(), 0xFFFF);
         assert!(!cs.is_present());
+    }
+
+    /// The Q35 MCH's identity and its `PCIEXBAR` must encode the same chipset
+    /// generation and the same ECAM base the platform actually decodes — a guest
+    /// can cross-check the host bridge ID against the existence of ECAM, and
+    /// `PCIEXBAR` against the MCFG table, so the surfaces must agree.
+    #[test]
+    fn q35_host_bridge_identity_and_pciexbar() {
+        let bridge = PcieRootComplex::create_q35_host_bridge(0xB000_0000);
+        assert_eq!(bridge.vendor_id(), vendors::INTEL);
+        assert_eq!(bridge.device_id(), Q35_HOST_BRIDGE_DEVICE_ID);
+        // Host bridge class, A2-stepping revision.
+        assert_eq!(bridge.read_u8(cfg::CLASS_CODE), 0x06);
+        assert_eq!(bridge.read_u8(cfg::SUBCLASS), 0x00);
+        assert_eq!(bridge.read_u8(cfg::REVISION_ID), 0x02);
+        // PCIEXBAR: enabled, 256 MiB window (length bits 2:1 = 00), base intact.
+        assert_eq!(bridge.read_u32(PCIEXBAR_OFFSET), 0xB000_0001);
+        assert_eq!(bridge.read_u32(PCIEXBAR_OFFSET + 4), 0);
+    }
+
+    /// The ICH9 LPC bridge resets both PIRQ routing banks — `PIRQ[A-D]_ROUT` at
+    /// `0x60` and the ICH9-only `PIRQ[E-H]_ROUT` at `0x68` — to `0x80` (routing
+    /// disabled), so a guest probing either bank before firmware programs it
+    /// reads the documented reset state, not open bus.
+    #[test]
+    fn ich9_lpc_bridge_resets_both_pirq_banks() {
+        let bridge = PcieRootComplex::create_isa_bridge(
+            ICH9_LPC_BRIDGE_BDF,
+            vendors::INTEL,
+            ICH9_LPC_DEVICE_ID,
+        );
+        assert_eq!(ICH9_LPC_BRIDGE_BDF.acpi_adr(), 0x001F_0000);
+        assert_eq!(bridge.read_u8(cfg::SUBCLASS), 0x01); // ISA bridge
+        for i in 0..4 {
+            assert_eq!(bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE + i), 0x80);
+            assert_eq!(bridge.read_u8(PIRQ_EH_ROUTE_CONFIG_BASE + i), 0x80);
+        }
     }
 
     #[test]

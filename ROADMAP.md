@@ -444,8 +444,29 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > now sources `SMI_CMD`/`ACPI_ENABLE`/`ACPI_DISABLE` from the
 > `chipset::{SMI_CMD_PORT,ACPI_ENABLE_VALUE,ACPI_DISABLE_VALUE}` constants the port
 > uses, so the advertised handshake and the decoding hardware can't drift.
-
-### 0.3 USB Live Boot & Non-Destructive Testing (CRITICAL FOR ADOPTION)
+>
+> **Status (2026-06-11):** the **chipset identity is now coherently Q35/ICH9**
+> (it previously mixed generations: an i440FX host bridge — a 1996 part with no
+> ECAM — alongside PCIe ECAM/MCFG, an impossible machine to anyone cross-checking
+> IDs against capabilities). The host bridge is the Q35 MCH (`8086:29C0`, rev 02)
+> with its **`PCIEXBAR`** (config `0x60`) seeded from the live root complex's
+> `ecam_base` — so the base the MCH advertises, the window the bus decodes, and
+> the MCFG table agree by construction (cross-check tests at both the pcie and
+> device-bus layers). The ISA/LPC bridge moved from PIIX3 `00:01.0` to the **ICH9
+> LPC interface at `00:1F.0`** (`8086:2918`); the ICH9's PIRQ registers have the
+> same offsets (`0x60-0x63`) and byte semantics as the PIIX3's, so the
+> `PirqRouter`, ELCR, link devices, and `_PRT` all carry over unchanged — the
+> DSDT `_ADR` derives from the shared `ICH9_LPC_BRIDGE_BDF` constant and was
+> re-validated with `iasl`. The ICH9-only `PIRQ[E-H]_ROUT` bank (`0x68-0x6B`) is
+> seeded to its reset state. **Remaining q35-fidelity follow-ups:** (1) guest
+> writes to `PCIEXBAR` update the register but do **not** relocate the decoded
+> ECAM window (firmware-only register in practice; flag if a guest ever
+> reprograms it); (2) a real ICH9 `D31` is multifunction — SATA at `1F.2` and
+> SMBus at `1F.3` (`8086:2930`) always exist; add at least the SMBus function
+> (and set the LPC's multifunction header bit) so the southbridge SKU is
+> plausible; (3) subsystem IDs are zero across all functions — source them from
+> the SMBIOS board vendor (same-fact pair) in one pass; (4) route PIRQ E-H if a
+> device ever needs more than four lines.
 
 Enlil must be testable without modifying the user's existing system. This is the single most important usability feature for early adoption.
 
