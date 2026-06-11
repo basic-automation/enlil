@@ -27,6 +27,7 @@
 //! models the guest's enqueue, and events are drained with
 //! [`pop_event`](VirtualXhciController::pop_event).
 
+use super::types::DeviceSpeed as UsbSpeed;
 use super::xhci::{
     CapabilityRegisters, CommandRing, CommandTrb, DoorbellArray, DoorbellTarget, EventRing,
     EventTrb, InterrupterRegisterSet, OperationalRegisters, RuntimeRegisters, Trb,
@@ -241,6 +242,20 @@ impl VirtualXhciController {
             .get(usize::from(slot_id.wrapping_sub(1)))
             .copied()
             .unwrap_or(false)
+    }
+
+    /// Attach a device of the given [`UsbSpeed`] to the **lowest free**
+    /// root-hub port, returning the 0-based port index it landed on (or
+    /// `None` if every port is occupied). This is the routing engine's entry
+    /// point: it routes a device to this guest's controller without choosing
+    /// a port itself.
+    pub fn attach_device(&mut self, speed: UsbSpeed) -> Option<usize> {
+        let port = self.op.ports.iter().position(|p| !p.is_connected())?;
+        if self.connect_device(port, speed.xhci_speed_id()) {
+            Some(port)
+        } else {
+            None
+        }
     }
 
     /// Connect a device to `port` (0-based) at the xHCI speed code
@@ -522,6 +537,38 @@ mod tests {
             Some(EventTrb::PortStatusChange { port_id }) => assert_eq!(port_id, 3),
             other => panic!("expected a port status change, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn attach_fills_the_lowest_free_port_and_maps_speed() {
+        let mut c = running_controller(); // 4 ports
+        c.write_register(c.caps.rtsoff + 0x20, 2); // IE
+
+        // A keyboard (low speed) takes port 0 with PORTSC speed id 2.
+        assert_eq!(c.attach_device(UsbSpeed::Low), Some(0));
+        let portsc0 = c.read_register(0x20 + 0x400);
+        assert_eq!(
+            (portsc0 >> 10) & 0xF,
+            u32::from(UsbSpeed::Low.xhci_speed_id())
+        );
+        let _ = c.pop_event();
+
+        // A SuperSpeed drive takes the next free port (1) at speed id 4.
+        assert_eq!(c.attach_device(UsbSpeed::Super), Some(1));
+        let portsc1 = c.read_register(0x20 + 0x400 + 16);
+        assert_eq!(
+            (portsc1 >> 10) & 0xF,
+            u32::from(UsbSpeed::Super.xhci_speed_id())
+        );
+
+        // Fill the remaining two, then the fifth attach finds no free port.
+        assert_eq!(c.attach_device(UsbSpeed::High), Some(2));
+        assert_eq!(c.attach_device(UsbSpeed::Full), Some(3));
+        assert_eq!(c.attach_device(UsbSpeed::High), None);
+
+        // Detaching frees the port for reuse (lowest-free again).
+        assert!(c.disconnect_device(1));
+        assert_eq!(c.attach_device(UsbSpeed::High), Some(1));
     }
 
     #[test]

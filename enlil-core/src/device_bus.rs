@@ -32,7 +32,7 @@ use enlil_devices::timer::{
     AcpiPmTimer, Pit, RtcTime, SharedAcpiPmTimer, SharedHpet, SharedPit, SharedRtc,
     SystemControlPortB, HPET_TICK_NS, RTC_IRQ,
 };
-use enlil_devices::usb::{SharedXhci, VirtualXhciController, XhciMmio};
+use enlil_devices::usb::{SharedXhci, UsbSpeed, VirtualXhciController, XhciMmio};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -916,6 +916,25 @@ impl StandardPc {
             self.assert_pci_intx(XHCI_BDF.device, 1, level);
         }
         changed
+    }
+
+    /// Attach a routed USB device of the given [`UsbSpeed`] to the lowest free
+    /// root-hub port, delivering the port-status interrupt through the live
+    /// PIRQ routing. Returns the 0-based port it landed on (the handle the
+    /// routing engine records for a later detach), or `None` if the
+    /// controller's ports are all occupied. This is the seam the
+    /// [routing engine](enlil_devices::usb::RoutingState) drives: it decides
+    /// *which guest* a device goes to; this attaches it to that guest's
+    /// controller without picking a port itself.
+    pub fn attach_usb_device(&self, speed: UsbSpeed) -> Option<usize> {
+        let (port, level) = {
+            let mut xhci = self.xhci.borrow_mut();
+            (xhci.attach_device(speed), xhci.intx_level())
+        };
+        if port.is_some() {
+            self.assert_pci_intx(XHCI_BDF.device, 1, level);
+        }
+        port
     }
 
     pub fn assert_pci_intx(&self, slot: u8, pin: u8, level: bool) {
@@ -1927,7 +1946,7 @@ mod tests {
     fn xhci_is_enumerable_and_hotplug_interrupts_through_the_pirq_routing() {
         use crate::serial::{SerialOutput, SerialOutputMode};
         use enlil_devices::pcie::{cfg, PciBdf};
-        use enlil_devices::usb::EventTrb;
+        use enlil_devices::usb::{EventTrb, UsbSpeed};
 
         let mut pc = DeviceBus::standard_pc_complete(
             SerialOutput::new("guest", SerialOutputMode::Null),
@@ -1979,6 +1998,12 @@ mod tests {
         // the level line (the MMIO adapter re-syncs the routed INTx).
         VmExitHandler::mmio_write(&mut pc.bus, 0xFE90_0000 + 0x1020, &3u32.to_le_bytes());
         assert!(!pc.xhci.borrow().intx_level());
+
+        // The routing-engine seam: attach_usb_device picks the lowest free
+        // port by speed (port 0 already taken above, so this lands on 1) and
+        // delivers the interrupt the same way.
+        assert_eq!(pc.attach_usb_device(UsbSpeed::Low), Some(1));
+        assert_eq!(pc.ioapic.with(|c| c.pending_vector(0)), Some(0x70));
     }
 
     #[test]

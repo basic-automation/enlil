@@ -1542,6 +1542,24 @@ Physical USB Devices
 - Support live re-routing via management console (move a device between guests at runtime)
 - Hot-plug events: when a new device is plugged in, apply routing rules and attach to correct guest
 
+> **Status (2026-06-11):** the **virtual xHCI controller is assembled, bus-mounted,
+> and routing-attachable** (pure userspace, no KVM). The previously-modelled-but-
+> unassembled xHCI parts (register files, port sets, doorbell array, command/event
+> rings, TRB codecs) are now one `VirtualXhciController` behind a single MMIO window
+> laid out as the capability block advertises; command processing does real slot-pool
+> allocation (Enable/Disable Slot, NoSlotsAvailable on exhaustion) and posts Command
+> Completion events; `connect_device`/`attach_device` flip `PORTSC` and post Port Status
+> Change events. It is mounted as a discrete Renesas uPD720202 PCI function (`1912:0015`)
+> at `00:04.0` with a 64 KiB BAR0 MMIO register window (`usb::XhciMmio`) and `INTA#`
+> delivered through the live PIRQ routing (level INTx, IP&IE-gated, withdrawn on
+> `IMAN.IP` clear). `StandardPc::attach_usb_device(speed)` is the seam the routing
+> engine drives: it picks the lowest free root-hub port and delivers the interrupt,
+> leaving *which guest* to the routing decision. **Still to do:** transfer-ring (TD)
+> processing — Normal/Setup/Data/Status TRBs forwarded to a real device via libusb
+> (ACRN's model); device-context (DCBAA/input-context) handling in guest memory (waits
+> on the KVM run loop); and the routing→controller binding that calls `attach_usb_device`
+> from a `RoutingState` assignment (needs the multi-guest controller registry).
+
 ### 4.4 Virtual xHCI Controller
 - Present each guest with an emulated xHCI (USB 3.x) host controller
 - **Primary approach: Software-emulated xHCI with TRB-level interception (recommended)**

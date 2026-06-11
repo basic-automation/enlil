@@ -24,6 +24,23 @@ pub enum DeviceSpeed {
     SuperPlus,
 }
 
+impl DeviceSpeed {
+    /// The xHCI Port Speed ID this device negotiates (the value that lands in
+    /// `PORTSC` bits 13:10 and the slot context's Speed field). Per the xHCI
+    /// default speed-ID assignment (§7.2.2.1.1): FS=1, LS=2, HS=3, SS=4,
+    /// SSP=5.
+    #[must_use]
+    pub const fn xhci_speed_id(self) -> u8 {
+        match self {
+            Self::Full => 1,
+            Self::Low => 2,
+            Self::High => 3,
+            Self::Super => 4,
+            Self::SuperPlus => 5,
+        }
+    }
+}
+
 impl fmt::Display for DeviceSpeed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
