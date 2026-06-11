@@ -104,11 +104,15 @@ PIIX3 ISA bridge at `00:01.0` — incoherent to anyone cross-checking IDs vs cap
    milestone: two devices, two guests, live reassignment). Single-controller seam is ready.
 4. **q35 fidelity remainder:** SATA at `1F.2` (needs an AHCI model — large). The subsystem
    IDs are now read-only to guests (`be6cb30`) and the functions carry a PM capability
-   (`9dee7f1`); the next capability-list item is a **PCI Express Capability (ID 0x10)** on
-   each function — without it a device behind the PNP0A08 PCIe root presents only
-   conventional-PCI config space, a PCIe-vs-PCI tell. It's per-device-type (root-complex
-   integrated endpoint `0x9` for the chipset functions, endpoint `0x0` for the xHCI), so do
-   it as its own careful, spec-checked pass.
+   (`9dee7f1`). **Note on PCIe capabilities (corrected mid-session):** the chipset
+   southbridge/host-bridge functions (MCH `00:00.0`, LPC `1F.0`, SMBus `1F.3`) are
+   legitimately *conventional* PCI on a real Q35 — they correctly have NO PCI Express
+   Capability, so the PM-cap-only treatment is right; do **not** add a PCIe cap to them. The
+   real gap is **topology**: a discrete xHCI is a PCIe *endpoint behind a root port*, but our
+   flat bus-0 model puts it directly on bus 0 with no root port. The proper fix is to model a
+   PCIe root port (a Type 1 bridge with a PCI Express Capability, port-type `0x4`) and put
+   the xHCI on its secondary bus with its own PCI Express Capability (endpoint, port-type
+   `0x0`) — a larger topology pass, not a per-function cap add.
 5. **KVM run loop** still blocked on `/dev/kvm` (ask for a nested-virt runner). When it
    lands: build the bus via `standard_pc_complete`, `KVM_SET_CPUID2` from a `from_host`
    `CpuidStealthTable`, deliver `from_host` SMBIOS via fw_cfg, drive the xHCI/SMBus/PM
