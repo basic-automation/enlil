@@ -466,9 +466,12 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > (`8086:2930`) at `1F.3` — full i801 register file behind BAR4 (`0xB100`),
 > empty-bus semantics (probes complete `DEV_ERR`, in-use semaphore, block
 > buffer), INTB#/IRQ11 consistent with the PIRQ defaults; remaining: SATA at
-> `1F.2` (a real ICH9 always has it — needs an AHCI/IDE model, large), and
-> delivering the SMBus completion interrupt through the live PIRQ routing
-> (model stores `INTREN` but nothing asserts INTx yet; `i2c-i801` polls); (3) subsystem IDs are zero across all functions — source them from
+> `1F.2` (a real ICH9 always has it — needs an AHCI/IDE model, large); the
+> SMBus completion interrupt **is** delivered (2026-06-11, same day): the
+> register file's `INTB#` sink routes through the shared `route_pci_intx`
+> helper — live PIRQ config at assertion time, both controllers, level
+> semantics — so `INTREN`-driven drivers get the interrupt config space
+> promises instead of a timeout; (3) subsystem IDs are zero across all functions — source them from
 > the SMBIOS board vendor (same-fact pair) in one pass; (4) route PIRQ E-H if a
 > device ever needs more than four lines.
 

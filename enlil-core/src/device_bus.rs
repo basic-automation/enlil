@@ -23,7 +23,7 @@ use enlil_devices::interrupt::{
 };
 use enlil_devices::pcie::{
     vendors, EcamSpace, PciBdf, PciConfigIo, PciResetControl, PcieRootComplex, SharedRootComplex,
-    ICH9_SMBUS_BDF, PIRQ_ROUTE_CONFIG_BASE,
+    ICH9_SMBUS_BDF, PIRQ_ROUTE_CONFIG_BASE, SMBUS_INTERRUPT_PIN,
 };
 use enlil_devices::ps2::{SharedI8042, PS2_KBD_IRQ, PS2_MOUSE_IRQ};
 use enlil_devices::smbus::{SmbusHost, SMBUS_IO_BASE};
@@ -699,7 +699,26 @@ impl DeviceBus {
         }
         // The live SMBus host register file behind the BAR the config function
         // advertises (an empty bus: probes complete with DEV_ERR, not open bus).
-        bus.add_pio(Box::new(SmbusHost::new()))?;
+        // Its completion interrupt (INTB# of device 31) is delivered through the
+        // live PIRQ routing into both controllers, so a guest driving the
+        // controller with INTREN set gets the interrupt config space promised.
+        let mut smbus = SmbusHost::new();
+        {
+            let pcie = pcie.clone();
+            let pic = pic.clone();
+            let ioapic = ioapic.clone();
+            smbus.set_interrupt_line(move |level| {
+                route_pci_intx(
+                    &pcie,
+                    &pic,
+                    &ioapic,
+                    ICH9_SMBUS_BDF.device,
+                    SMBUS_INTERRUPT_PIN,
+                    level,
+                );
+            });
+        }
+        bus.add_pio(Box::new(smbus))?;
 
         Ok(StandardPc {
             bus,
@@ -822,31 +841,7 @@ impl StandardPc {
     /// **I/O APIC** sees the PIRQ line's fixed GSI (16-19). Whichever path the
     /// guest has unmasked delivers it; deasserting (`level = false`) withdraws it.
     pub fn assert_pci_intx(&self, slot: u8, pin: u8, level: bool) {
-        // Read the four PIRQ routing bytes the guest programmed in the bridge config.
-        let regs = {
-            let rc = self.pcie.borrow();
-            match rc.find_device(&ICH9_LPC_BDF) {
-                Some(bridge) => [
-                    bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE),
-                    bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE + 1),
-                    bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE + 2),
-                    bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE + 3),
-                ],
-                None => return,
-            }
-        };
-        let mut router = PirqRouter::new();
-        router.sync_from_config(regs);
-
-        // 8259 path: the routed ISA IRQ as a level line (PCI INTx is level).
-        if let Some(irq) = router.device_isa_irq(slot, pin) {
-            self.pic.with(|p| p.set_irq_level(irq, level));
-        }
-        // I/O APIC path: the PIRQ line's fixed GSI 16-19.
-        if let Some(gsi) = PirqRouter::device_gsi(slot, pin) {
-            let line = self.ioapic.line(gsi);
-            line(level);
-        }
+        route_pci_intx(&self.pcie, &self.pic, &self.ioapic, slot, pin, level);
     }
 
     /// Advance every free-running platform clock by one elapsed-time delta of `ns`
@@ -903,6 +898,48 @@ impl StandardPc {
             }
         }
         fired
+    }
+}
+
+/// Drive a PCI device's level-triggered `INTx` line into the interrupt fabric
+/// through the **live** PIRQ routing: the `PIRQ[A-D]_ROUT` bytes are read from
+/// the ICH9 LPC bridge's config space at assertion time, so the route always
+/// reflects what the guest last programmed. Shared by
+/// [`StandardPc::assert_pci_intx`] (the run loop's path) and the interrupt
+/// sinks of bus-internal PCI functions (e.g. the SMBus controller), which
+/// capture clones of these shared handles.
+fn route_pci_intx(
+    pcie: &SharedRootComplex,
+    pic: &SharedPic,
+    ioapic: &SharedInterruptController,
+    slot: u8,
+    pin: u8,
+    level: bool,
+) {
+    // Read the four PIRQ routing bytes the guest programmed in the bridge config.
+    let regs = {
+        let rc = pcie.borrow();
+        match rc.find_device(&ICH9_LPC_BDF) {
+            Some(bridge) => [
+                bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE),
+                bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE + 1),
+                bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE + 2),
+                bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE + 3),
+            ],
+            None => return,
+        }
+    };
+    let mut router = PirqRouter::new();
+    router.sync_from_config(regs);
+
+    // 8259 path: the routed ISA IRQ as a level line (PCI INTx is level).
+    if let Some(irq) = router.device_isa_irq(slot, pin) {
+        pic.with(|p| p.set_irq_level(irq, level));
+    }
+    // I/O APIC path: the PIRQ line's fixed GSI 16-19.
+    if let Some(gsi) = PirqRouter::device_gsi(slot, pin) {
+        let line = ioapic.line(gsi);
+        line(level);
     }
 }
 
@@ -1691,6 +1728,75 @@ mod tests {
         assert_eq!(data[0], 0);
         VmExitHandler::io_in(&mut bus, SMBUS_IO_BASE + HST_STS, &mut data);
         assert_eq!(data[0], STS_INUSE);
+    }
+
+    /// The SMBus completion interrupt travels the whole path a real one does:
+    /// the guest starts a transaction with `INTREN` set, the (empty-bus)
+    /// `DEV_ERR` completion asserts `INTB#`, the live PIRQ routing resolves it
+    /// (device 31 INTB# -> PIRQA -> GSI 16), and the I/O APIC delivers the
+    /// programmed vector — until the driver clears the status and the
+    /// level-triggered line drops.
+    #[test]
+    fn smbus_completion_interrupt_routes_through_the_live_pirq_routing() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::smbus::{
+            CNT_INTREN, CNT_START, HST_CNT, HST_STS, SMBUS_IO_BASE, STS_DEV_ERR, XMIT_SLVA,
+        };
+
+        use enlil_devices::interrupt::ELCR_SLAVE;
+
+        let mut pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            1_780_838_055,
+            1,
+        )
+        .unwrap();
+        pc.ioapic.with(|c| c.lapics[0].write_register(0x0F0, 0x1FF));
+
+        // Program the 8259 (PC/AT layout) and mark IRQ11 — PIRQA's default
+        // route — level in the ELCR (slave line 3), as a PCI interrupt must be.
+        pc.pic.with(|p| {
+            for (port, val) in [
+                (0x20u16, 0x11u8),
+                (0x21, 0x20),
+                (0x21, 0x04),
+                (0x21, 0x01),
+                (0xA0, 0x11),
+                (0xA1, 0x28),
+                (0xA1, 0x02),
+                (0xA1, 0x01),
+                (0x21, 0x00),
+                (0xA1, 0x00),
+            ] {
+                p.write_port(port, val);
+            }
+            p.write_elcr(ELCR_SLAVE, 1 << 3);
+        });
+
+        // Program PIRQA's I/O APIC GSI (16): vector 0x60 -> LAPIC 0.
+        // REDTBL base 0x10 + 16*2 = 0x30 (low), 0x31 (high).
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0000, &0x30u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0010, &0x60u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0000, &0x31u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0010, &0u32.to_le_bytes());
+
+        // The guest probes slave 0x50 with the interrupt enabled.
+        VmExitHandler::io_out(&mut pc.bus, SMBUS_IO_BASE + XMIT_SLVA, &[(0x50 << 1) | 1]);
+        VmExitHandler::io_out(
+            &mut pc.bus,
+            SMBUS_IO_BASE + HST_CNT,
+            &[CNT_START | CNT_INTREN],
+        );
+
+        // The DEV_ERR completion asserted INTB#: the 8259 presents IRQ11's
+        // vector (slave base 0x28 + 3 = 0x2B), the I/O APIC delivered GSI 16's.
+        assert_eq!(pc.pic.with(|p| p.pending_vector()), Some(0x2B));
+        assert_eq!(pc.ioapic.with(|c| c.pending_vector(0)), Some(0x60));
+
+        // The driver clears the status; the level line deasserts and the
+        // request is withdrawn from the 8259.
+        VmExitHandler::io_out(&mut pc.bus, SMBUS_IO_BASE + HST_STS, &[STS_DEV_ERR]);
+        assert_eq!(pc.pic.with(|p| p.pending_vector()), None);
     }
 
     #[test]

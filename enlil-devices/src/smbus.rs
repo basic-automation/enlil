@@ -80,6 +80,11 @@ pub const CNT_KILL: u8 = 1 << 1;
 /// `HST_CNT` bit 6: start the transaction described by bits 4:2.
 pub const CNT_START: u8 = 1 << 6;
 
+/// The `HST_STS` bits that assert the host interrupt while `INTREN` is set
+/// (ICH9 datasheet §19.1: completion, the three error sources, and the
+/// block-transfer byte-done status).
+const STS_INTERRUPT_SOURCES: u8 = STS_INTR | STS_DEV_ERR | STS_BUS_ERR | STS_FAILED | STS_BYTE_DONE;
+
 /// Size of the host block-data buffer behind [`HOST_BLOCK_DB`].
 const BLOCK_BUF_LEN: usize = 32;
 
@@ -112,6 +117,10 @@ pub struct SmbusHost {
     /// The shared internal byte pointer into [`Self::block_buf`]; reading
     /// `HST_CNT` resets it.
     block_index: usize,
+    /// The level sink the platform wires to this function's `INTB#`: called
+    /// with the interrupt level (`INTREN` and an unserviced status bit) after
+    /// every register write, like a real level-triggered `INTx` line.
+    interrupt_line: Option<Box<dyn Fn(bool)>>,
 }
 
 impl Default for SmbusHost {
@@ -136,6 +145,27 @@ impl SmbusHost {
             aux_control: 0,
             block_buf: [0; BLOCK_BUF_LEN],
             block_index: 0,
+            interrupt_line: None,
+        }
+    }
+
+    /// Wire the function's `INTB#` line: `line` is called with the computed
+    /// interrupt level after every register write (assert on completion or
+    /// error while `INTREN` is set, deassert once the driver clears the
+    /// status), so the platform can route it through the live PIRQ routing.
+    pub fn set_interrupt_line(&mut self, line: impl Fn(bool) + 'static) {
+        self.interrupt_line = Some(Box::new(line));
+    }
+
+    /// The current `INTx` level: a pending interrupt source with `INTREN` set.
+    const fn interrupt_level(&self) -> bool {
+        self.control & CNT_INTREN != 0 && self.status & STS_INTERRUPT_SOURCES != 0
+    }
+
+    /// Push the current interrupt level into the wired sink (if any).
+    fn sync_interrupt_line(&self) {
+        if let Some(line) = &self.interrupt_line {
+            line(self.interrupt_level());
         }
     }
 
@@ -219,6 +249,9 @@ impl PioDevice for SmbusHost {
 
     fn pio_write(&mut self, port: u16, _size: u8, data: u32) {
         self.write_register(port.wrapping_sub(SMBUS_IO_BASE), u8_of(data));
+        // A write may have started/killed a transaction (raising a status bit)
+        // or cleared one — recompute the level-triggered INTx state either way.
+        self.sync_interrupt_line();
     }
 
     fn port_range(&self) -> (u16, u16) {
@@ -293,6 +326,33 @@ mod tests {
         assert_eq!(read(&mut smb, HOST_BLOCK_DB), 0xAA);
         assert_eq!(read(&mut smb, HOST_BLOCK_DB), 0xBB);
         assert_eq!(read(&mut smb, HOST_BLOCK_DB), 0xCC);
+    }
+
+    #[test]
+    fn the_intx_line_follows_intren_and_the_status_bits() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let level = Rc::new(Cell::new(false));
+        let mut smb = SmbusHost::new();
+        {
+            let level = Rc::clone(&level);
+            smb.set_interrupt_line(move |l| level.set(l));
+        }
+
+        // A failed transaction with INTREN clear raises no interrupt.
+        write(&mut smb, HST_CNT, CNT_START);
+        assert!(!level.get());
+        write(&mut smb, HST_STS, STS_DEV_ERR);
+
+        // With INTREN set the DEV_ERR completion asserts the line (level)...
+        write(&mut smb, HST_CNT, CNT_START | CNT_INTREN);
+        assert!(level.get());
+        // ...and stays asserted until the driver clears the status.
+        write(&mut smb, HST_CMD, 0x00);
+        assert!(level.get());
+        write(&mut smb, HST_STS, STS_DEV_ERR);
+        assert!(!level.get());
     }
 
     #[test]
