@@ -26,6 +26,13 @@ pub const PCIE_CONFIG_SPACE_SIZE: usize = 4096;
 /// ECAM size per bus (256 devices * 8 functions * 4096 bytes)
 pub const ECAM_BUS_SIZE: usize = 256 * 8 * 4096;
 
+/// Config-space offset where [`PciConfigSpace::add_power_management_capability`]
+/// places the PCI Power Management Capability (the device-specific region,
+/// past the standard header).
+pub const PM_CAP_OFFSET: u16 = 0x50;
+/// [`PM_CAP_OFFSET`] as the byte the capability pointer stores.
+const PM_CAP_OFFSET_BYTE: u8 = 0x50;
+
 /// PCI configuration space header offsets
 pub mod cfg {
     pub const VENDOR_ID: u16 = 0x00;
@@ -158,8 +165,9 @@ impl PciConfigSpace {
         };
         cs.write_u16(cfg::VENDOR_ID, vendor_id);
         cs.write_u16(cfg::DEVICE_ID, device_id);
-        // Status: capabilities list present
-        cs.write_u16(cfg::STATUS, 0x0010);
+        // No capabilities list yet: the STATUS "capabilities list" bit stays
+        // clear until one is added (add_power_management_capability), so the
+        // bit and the null capability pointer can't disagree.
         cs
     }
 
@@ -254,6 +262,30 @@ impl PciConfigSpace {
     pub fn set_interrupt(&mut self, line: u8, pin: u8) {
         self.write_u8(cfg::INTERRUPT_LINE, line);
         self.write_u8(cfg::INTERRUPT_PIN, pin);
+    }
+
+    /// Install a **PCI Power Management Capability** (cap ID 0x01) — the
+    /// simplest standard capability, present on essentially every real PCI/
+    /// `PCIe` function — and point the capabilities list at it. This makes the
+    /// STATUS "capabilities list present" bit truthful: a guest that sees the
+    /// bit set and walks from the capability pointer finds a real, terminating
+    /// list instead of a null one (an asserted-but-empty list is a tell).
+    ///
+    /// The capability sits at [`PM_CAP_OFFSET`] in the device-specific config
+    /// region; its PMCSR power-state field stays guest-writable (D0..D3 is a
+    /// legitimate guest operation), the PMC fields are read-only descriptors.
+    pub fn add_power_management_capability(&mut self) {
+        // Capability ID 0x01 (PM), next-capability pointer 0 (end of list).
+        self.write_u8(PM_CAP_OFFSET, 0x01);
+        self.write_u8(PM_CAP_OFFSET + 1, 0x00);
+        // PMC (Power Management Capabilities): version 3 (PCI PM 1.2), no PME.
+        self.write_u16(PM_CAP_OFFSET + 2, 0x0003);
+        // PMCSR: power state D0 (0).
+        self.write_u16(PM_CAP_OFFSET + 4, 0x0000);
+        // Point the capabilities list here and assert the STATUS caps bit.
+        self.write_u8(cfg::CAPABILITY_PTR, PM_CAP_OFFSET_BYTE);
+        let status = self.read_u16(cfg::STATUS) | 0x0010;
+        self.write_u16(cfg::STATUS, status);
     }
 
     /// Handle a guest config-space write of `width` (1/2/4) bytes at `offset`,
@@ -426,6 +458,7 @@ impl PcieRootComplex {
         let pciexbar = (ecam_base & PCIEXBAR_ADDR_MASK) | PCIEXBAR_ENABLE;
         dev.write_u32(PCIEXBAR_OFFSET, u32_of(pciexbar & 0xFFFF_FFFF));
         dev.write_u32(PCIEXBAR_OFFSET + 4, u32_of(pciexbar >> 32));
+        dev.add_power_management_capability();
         dev
     }
 
@@ -458,6 +491,7 @@ impl PcieRootComplex {
         )
         .expect("INTB# always swizzles to a PIRQ line");
         dev.set_interrupt(line, SMBUS_INTERRUPT_PIN);
+        dev.add_power_management_capability();
         dev
     }
 
@@ -483,6 +517,7 @@ impl PcieRootComplex {
         let line = crate::interrupt::PirqRouter::default_device_isa_irq(bdf.device, 1)
             .expect("INTA# always swizzles to a PIRQ line");
         dev.set_interrupt(line, 1);
+        dev.add_power_management_capability();
         dev
     }
 
@@ -508,6 +543,7 @@ impl PcieRootComplex {
             dev.write_u8(PIRQ_ROUTE_CONFIG_BASE + i, 0x80);
             dev.write_u8(PIRQ_EH_ROUTE_CONFIG_BASE + i, 0x80);
         }
+        dev.add_power_management_capability();
         dev
     }
 }
@@ -1069,6 +1105,30 @@ mod tests {
         let readback = cs.read_u32(cfg::BAR0);
         // Should have mask applied
         assert_eq!(readback & 0xFFFF_F000, 0xFFFF_F000);
+    }
+
+    /// A function with a Power Management capability presents a consistent,
+    /// walkable capability list: STATUS asserts "capabilities present", the
+    /// pointer leads to a PM cap (ID 0x01), and the cap terminates the list.
+    /// A bare device asserts no list and has a null pointer (no asserted-but-
+    /// empty list).
+    #[test]
+    fn power_management_capability_makes_a_walkable_list() {
+        // Bare device: no caps bit, null pointer.
+        let bare = PciConfigSpace::new(PciBdf::new(0, 5, 0), 0x1234, 0x5678);
+        assert_eq!(bare.read_u16(cfg::STATUS) & 0x0010, 0, "no caps advertised");
+        assert_eq!(bare.read_u8(cfg::CAPABILITY_PTR), 0);
+
+        // The Q35 MCH (and the other session functions) carry the PM cap.
+        let mch = PcieRootComplex::create_q35_host_bridge(0xB000_0000);
+        assert_ne!(mch.read_u16(cfg::STATUS) & 0x0010, 0, "caps present");
+        let ptr = mch.read_u8(cfg::CAPABILITY_PTR);
+        assert_eq!(u16::from(ptr), PM_CAP_OFFSET);
+        // Walk it: cap ID 0x01 (PM), next pointer 0 (end).
+        assert_eq!(mch.read_u8(PM_CAP_OFFSET), 0x01);
+        assert_eq!(mch.read_u8(PM_CAP_OFFSET + 1), 0x00);
+        // PMCSR power state defaults to D0.
+        assert_eq!(mch.read_u16(PM_CAP_OFFSET + 4) & 0x3, 0);
     }
 
     /// The device-identity registers are read-only to a guest: a guest write
