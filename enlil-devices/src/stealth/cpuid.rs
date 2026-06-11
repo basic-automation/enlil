@@ -65,6 +65,14 @@ pub struct CpuidStealthConfig {
     pub hide_hypervisor: bool,
     /// Physical cache info to pass through
     pub cache_info: Vec<CpuidResult>,
+    /// Leaf 7 subleaf 0 EBX/ECX structured-extended-feature candidates.
+    /// [`CpuidStealthTable::build`] masks these to the **virtualizable,
+    /// leaf-0xD-consistent allowlist** ([`LEAF7_EBX_PASSTHROUGH`] /
+    /// [`LEAF7_ECX_PASSTHROUGH`]) regardless of what's set here, so a config
+    /// captured from a host with AVX-512/TSX/SGX cannot advertise state the
+    /// virtual platform doesn't carry.
+    pub features_7_ebx: u32,
+    pub features_7_ecx: u32,
     /// Processor base frequency in MHz (leaf 0x16 EAX; also fixes the TSC
     /// rate enumerated by leaf 0x15 — modern Intel clocks the TSC at the
     /// base frequency)
@@ -72,6 +80,42 @@ pub struct CpuidStealthConfig {
     /// Maximum turbo frequency in MHz (leaf 0x16 EBX)
     pub max_frequency_mhz: u32,
 }
+
+/// Leaf 7 EBX bits safe to pass through from a host capture.
+///
+/// Pure instruction-set extensions (and the SMEP/SMAP CR4 bits every
+/// hypervisor backend supports) whose state lives in the x87/SSE/AVX XSAVE
+/// area leaf 0xD already enumerates. Deliberately **excluded**: AVX-512
+/// (bits 16/17/21/26/27/28/30/31 — leaf 0xD advertises no AVX-512 state
+/// components, and the pair must agree), TSX HLE/RTM (4/11 — abort behaviour
+/// we don't model), SGX (2), MPX (14), PQM/PQE (12/15 — need leaves
+/// 0xF/0x10), and Processor Trace (25 — needs its MSR surface).
+pub const LEAF7_EBX_PASSTHROUGH: u32 = (1 << 0)  // FSGSBASE
+    | (1 << 3)  // BMI1
+    | (1 << 5)  // AVX2
+    | (1 << 7)  // SMEP
+    | (1 << 8)  // BMI2
+    | (1 << 9)  // ERMS
+    | (1 << 18) // RDSEED
+    | (1 << 19) // ADX
+    | (1 << 20) // SMAP
+    | (1 << 23) // CLFLUSHOPT
+    | (1 << 24) // CLWB
+    | (1 << 29); // SHA
+
+/// Leaf 7 ECX bits safe to pass through.
+///
+/// Instruction-set extensions over existing XSAVE state plus UMIP (a CR4
+/// bit) and RDPID (`TSC_AUX` already exists — RDTSCP is advertised).
+/// Deliberately **excluded**: the AVX-512 extensions (1/6/11/12/14),
+/// PKU/OSPKE (3/4 — XSAVE PKRU component not enumerated in leaf 0xD),
+/// WAITPKG (5 — UMWAIT MSR), CET (7), **LA57 (16 — leaf 0x80000008
+/// advertises 48-bit linear; the pair is test-pinned)**, and KL (23).
+pub const LEAF7_ECX_PASSTHROUGH: u32 = (1 << 2)  // UMIP
+    | (1 << 8)  // GFNI
+    | (1 << 9)  // VAES
+    | (1 << 10) // VPCLMULQDQ
+    | (1 << 22); // RDPID
 
 #[cfg(target_arch = "x86_64")]
 impl CpuidStealthConfig {
@@ -107,6 +151,12 @@ impl CpuidStealthConfig {
             _ => CpuVendor::Intel,
         };
         let leaf1 = __cpuid(1);
+        let leaf7_candidates = if leaf0.eax >= 7 {
+            let r = __cpuid_count(7, 0);
+            (r.ebx, r.ecx)
+        } else {
+            (0, 0)
+        };
 
         // Brand string from 0x80000002-4 (present on every x86_64 part).
         let mut brand_string = [0u8; 48];
@@ -164,6 +214,8 @@ impl CpuidStealthConfig {
             family_model_stepping: leaf1.eax,
             features_ecx: leaf1.ecx,
             features_edx: leaf1.edx,
+            features_7_ebx: leaf7_candidates.0,
+            features_7_ecx: leaf7_candidates.1,
             brand_string,
             vcpu_count,
             threads_per_core,
@@ -788,12 +840,17 @@ impl CpuidStealthTable {
         }
     }
 
-    const fn build_leaf_7(_config: &CpuidStealthConfig) -> CpuidResult {
-        // Pass through common structured features, masking dangerous ones
+    /// Leaf 7 subleaf 0: the config's captured candidates masked to the
+    /// virtualizable allowlist. EDX (the speculation-control enumeration —
+    /// IBRS/STIBP/SSBD/`ARCH_CAPABILITIES`) stays zero: each bit advertises an
+    /// MSR surface we don't emulate yet, and an all-clear EDX just reads as
+    /// pre-mitigation microcode (the guest applies retpolines — slower but
+    /// coherent), not as a virtual machine.
+    const fn build_leaf_7(config: &CpuidStealthConfig) -> CpuidResult {
         CpuidResult {
-            eax: 0,           // max subleaf
-            ebx: 0x0000_0281, // FSGSBASE, BMI1, AVX2 (conservative)
-            ecx: 0,
+            eax: 0, // max subleaf
+            ebx: config.features_7_ebx & LEAF7_EBX_PASSTHROUGH,
+            ecx: config.features_7_ecx & LEAF7_ECX_PASSTHROUGH,
             edx: 0,
         }
     }
@@ -888,6 +945,8 @@ mod tests {
             family_model_stepping: 0x00A6_0F12,
             features_ecx: 0x7ED8_320B,
             features_edx: 0x178B_FBFF,
+            features_7_ebx: 0x0000_0281, // FSGSBASE, BMI1, AVX2
+            features_7_ecx: 0,
             brand_string: brand_string_from_str("AMD Ryzen 9 7950X 16-Core Processor"),
             vcpu_count: 8,
             threads_per_core: 2,
@@ -1101,6 +1160,47 @@ mod tests {
             // The built table serves the rewritten host geometry at leaf 4.
             assert_eq!(table.lookup(4, 0), cfg.cache_info[0]);
         }
+    }
+
+    /// Whatever a host capture claims, leaf 7 must only advertise the
+    /// allowlist — every excluded bit pairs with state or an MSR surface the
+    /// virtual platform doesn't carry, and the cross-surface partner pins it.
+    #[test]
+    fn leaf_7_masks_a_hostile_capture_to_the_virtualizable_set() {
+        let cfg = CpuidStealthConfig {
+            features_7_ebx: u32::MAX, // a host with everything (AVX-512, TSX, SGX…)
+            features_7_ecx: u32::MAX,
+            ..test_config()
+        };
+        let table = CpuidStealthTable::build(&cfg);
+        let r = table.lookup(7, 0);
+        assert_eq!(r.ebx, LEAF7_EBX_PASSTHROUGH);
+        assert_eq!(r.ecx, LEAF7_ECX_PASSTHROUGH);
+        assert_eq!(r.edx, 0, "speculation-control MSR surfaces unadvertised");
+        // The pinned cross-surface pairs: no AVX-512 without leaf-0xD state
+        // components; no LA57 against 0x80000008's 48-bit linear.
+        for bit in [16u32, 17, 21, 26, 27, 28, 30, 31] {
+            assert_eq!(r.ebx & (1 << bit), 0, "AVX-512 EBX bit {bit}");
+        }
+        assert_eq!(r.ecx & (1 << 16), 0, "LA57");
+        // TSX / SGX / MPX / PT stay hidden.
+        for bit in [2u32, 4, 11, 14, 25] {
+            assert_eq!(r.ebx & (1 << bit), 0, "EBX bit {bit}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn from_host_captures_leaf_7_candidates() {
+        use core::arch::x86_64::__cpuid_count;
+        let cfg = CpuidStealthConfig::from_host(8, 2);
+        let host7 = __cpuid_count(7, 0);
+        assert_eq!(cfg.features_7_ebx, host7.ebx);
+        assert_eq!(cfg.features_7_ecx, host7.ecx);
+        // And the built table serves the masked intersection.
+        let r = CpuidStealthTable::build(&cfg).lookup(7, 0);
+        assert_eq!(r.ebx, host7.ebx & LEAF7_EBX_PASSTHROUGH);
+        assert_eq!(r.ecx, host7.ecx & LEAF7_ECX_PASSTHROUGH);
     }
 
     #[test]
