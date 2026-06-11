@@ -9,6 +9,20 @@
 use crate::truncate::u32_of;
 use std::fmt;
 
+/// Byte offset of the xHCI Extended Capabilities region.
+///
+/// Within the controller's MMIO window; `HCCPARAMS1`'s xECP points here (in
+/// dwords). Placed past the doorbell array (`DBOFF` 0x2000) so it overlaps
+/// nothing.
+pub const XECP_OFFSET: u32 = 0x3000;
+/// Extended Capability ID 2: Supported Protocol Capability (xHCI §7.2).
+const SUPPORTED_PROTOCOL_CAP_ID: u32 = 0x02;
+/// The Name String dword of a Supported Protocol cap: ASCII `"USB "`
+/// (little-endian `U`,`S`,`B`,space).
+const SUPPORTED_PROTOCOL_NAME: u32 = u32::from_le_bytes(*b"USB ");
+/// Protocol Slot Type 0 (the default slot type) in a cap's fourth dword.
+const DEFAULT_SLOT_TYPE: u32 = 0;
+
 // ---------------------------------------------------------------------------
 // Capability Registers (xHCI 5.3) — Read-Only
 // ---------------------------------------------------------------------------
@@ -60,8 +74,13 @@ impl CapabilityRegisters {
         // HCSPARAMS3: U1 device exit latency = 10µs, U2 = 2047µs
         let hcsparams3 = 0x0A | (0x7FF << 16);
 
-        // HCCPARAMS1: AC64=1 (64-bit addressing), CSZ=1 (64-byte context)
-        let caps1 = 0x1 | (1 << 2);
+        // HCCPARAMS1: AC64=1 (64-bit addressing), CSZ=1 (64-byte context),
+        // and the xHCI Extended Capabilities Pointer (xECP, bits 31:16, in
+        // dwords) pointing at the Supported Protocol capability list. Every
+        // real xHCI has a non-zero xECP — an all-zero one ("no extended
+        // capabilities") is a controller no vendor ships, so a guest that
+        // walks the list from HCCPARAMS1 must find one.
+        let caps1 = 0x1 | (1 << 2) | ((XECP_OFFSET / 4) << 16);
 
         Self {
             caplength: 0x20,
@@ -73,6 +92,44 @@ impl CapabilityRegisters {
             dboff: 0x2000,
             rtsoff: 0x1000,
             hccparams2: 0,
+        }
+    }
+
+    /// Number of root-hub ports declared as **USB 2.0** by the Supported
+    /// Protocol capabilities: the lower-numbered half (rounded up). The rest
+    /// are USB 3.0. USB 2.0 ports carry LS/FS/HS devices, USB 3.0 ports carry
+    /// SS/SSP — the port split a real USB 3 controller exposes.
+    #[must_use]
+    pub const fn usb2_port_count(&self) -> u8 {
+        let n = self.max_ports();
+        n.div_ceil(2)
+    }
+
+    /// Read a dword from the Extended Capabilities region (offsets relative to
+    /// the MMIO window base, i.e. the same space `read` decodes for the
+    /// standard capability registers). Serves the two Supported Protocol
+    /// capabilities — USB 2.0 then USB 3.0 — that `HCCPARAMS1`'s xECP points
+    /// at. Anything outside the list reads as zero.
+    #[must_use]
+    pub fn read_extended(&self, offset: u32) -> u32 {
+        let usb2 = self.usb2_port_count();
+        let usb3 = self.max_ports() - usb2;
+        match offset.checked_sub(XECP_OFFSET) {
+            // USB 2.0 Supported Protocol cap (4 dwords). Next-cap pointer = 4
+            // dwords (bits 15:8) → the USB 3.0 cap immediately follows.
+            // ID | Next(4 dwords) | MinorRev 0 | MajorRev 2.
+            Some(0x0) => SUPPORTED_PROTOCOL_CAP_ID | (4 << 8) | (2 << 24),
+            // Both caps' Name String dword is "USB ".
+            Some(0x4 | 0x14) => SUPPORTED_PROTOCOL_NAME,
+            Some(0x8) => 1u32 | (u32::from(usb2) << 8),
+            // Both caps' Protocol Slot Type dword is the default (0).
+            Some(0xC | 0x1C) => DEFAULT_SLOT_TYPE,
+            // USB 3.0 Supported Protocol cap (4 dwords). Next-cap pointer = 0
+            // (end of list).
+            // ID | Next 0 (end) | MinorRev 0 | MajorRev 3.
+            Some(0x10) => SUPPORTED_PROTOCOL_CAP_ID | (3 << 24),
+            Some(0x18) => u32::from(usb2 + 1) | (u32::from(usb3) << 8),
+            _ => 0,
         }
     }
 

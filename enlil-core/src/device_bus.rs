@@ -23,13 +23,18 @@ use enlil_devices::interrupt::{
 };
 use enlil_devices::pcie::{
     vendors, EcamSpace, PciBdf, PciConfigIo, PciResetControl, PcieRootComplex, SharedRootComplex,
-    PIRQ_ROUTE_CONFIG_BASE,
+    BOARD_SUBSYSTEM_DEVICE_ID, BOARD_SUBSYSTEM_VENDOR_ID, ICH9_SMBUS_BDF, PIRQ_ROUTE_CONFIG_BASE,
+    SMBUS_INTERRUPT_PIN,
 };
 use enlil_devices::ps2::{SharedI8042, PS2_KBD_IRQ, PS2_MOUSE_IRQ};
+use enlil_devices::smbus::{SmbusHost, SMBUS_IO_BASE};
 use enlil_devices::timer::{
     AcpiPmTimer, Pit, RtcTime, SharedAcpiPmTimer, SharedHpet, SharedPit, SharedRtc,
     SystemControlPortB, HPET_TICK_NS, RTC_IRQ,
 };
+use enlil_devices::usb::{SharedXhci, UsbSpeed, VirtualXhciController, XhciMmio};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// The system device bus: a PIO bus and an MMIO bus behind one exit handler.
 #[derive(Default)]
@@ -146,11 +151,13 @@ impl DeviceBus {
     /// sharing one [`PcieRootComplex`] so a register programmed through either
     /// mechanism is visible through the other.
     ///
-    /// If `root` does not already contain a device at BDF 0:0.0, a default Intel
-    /// Q35 MCH **host bridge** is seeded there so a guest enumerating the bus
+    /// If `root` does not already contain a device at BDF 0:0.0, the **Q35 MCH
+    /// host bridge** (`8086:29C0`) is seeded there so a guest enumerating the bus
     /// at boot finds at least the root device (matching real hardware, where the
-    /// host bridge always answers). Q35 is the PCIe-generation chipset, consistent
-    /// with the ECAM/MCFG window this front-end also mounts.
+    /// host bridge always answers). Its `PCIEXBAR` register is seeded from
+    /// `root.ecam_base`, so the base the MCH advertises through config space and
+    /// the ECAM window the platform decodes (and the MCFG table describes) are
+    /// the same address by construction.
     ///
     /// Returns the [`SharedRootComplex`] handle so the caller can add further
     /// devices after both front-ends are mounted (the change is seen by both).
@@ -169,10 +176,8 @@ impl DeviceBus {
         {
             let mut rc = shared.borrow_mut();
             if rc.find_device(&PciBdf::new(0, 0, 0)).is_none() {
-                rc.add_device(PcieRootComplex::create_host_bridge(
-                    vendors::INTEL,
-                    enlil_devices::pcie::Q35_MCH_DEVICE_ID,
-                ));
+                let ecam_base = rc.ecam_base;
+                rc.add_device(PcieRootComplex::create_q35_host_bridge(ecam_base));
             }
         }
         self.add_pci_config_io(cam)?;
@@ -668,26 +673,103 @@ impl DeviceBus {
             .expect("add_pcie mounts the 0xCF9 reset latch");
 
         // Seed the ICH9 LPC bridge / PCI interrupt router at 00:1F.0 (its config
-        // space holds the PIRQ routing registers a guest programs).
+        // space holds the PIRQ routing registers a guest programs), and its
+        // SMBus sibling at 00:1F.3.
         {
             let mut rc = pcie.borrow_mut();
-            if rc.find_device(&LPC_BRIDGE_BDF).is_none() {
+            if rc.find_device(&ICH9_LPC_BDF).is_none() {
                 let mut bridge = PcieRootComplex::create_isa_bridge(
-                    LPC_BRIDGE_BDF,
+                    ICH9_LPC_BDF,
                     vendors::INTEL,
                     ICH9_LPC_DEVICE_ID,
+                );
+                // D31 is multifunction on every ICH9 (the SMBus controller below
+                // is function 3), so function 0's header must say so or the
+                // guest never probes past it.
+                bridge.set_header_type(0x80);
+                // Board firmware stamps the board vendor's subsystem IDs on
+                // every onboard function (the generic ISA-bridge factory can't
+                // assume a board, so it's done at the platform seeding site).
+                bridge.set_subsystem(BOARD_SUBSYSTEM_VENDOR_ID, BOARD_SUBSYSTEM_DEVICE_ID);
+                // PMBASE/ACPI_CNTL: on an ICH the ACPI PM I/O block's location
+                // physically comes from these LPC registers — firmware programs
+                // them and then writes the same ports into the FADT. The PM
+                // models already sit at the ICH9 fixed offsets from 0x600
+                // (PM1 +0/+4, PM_TMR +8, GPE0 +0x20), so encode that base,
+                // enabled, with the SCI on the FADT's IRQ.
+                bridge.write_u32(
+                    enlil_devices::pcie::LPC_PMBASE_OFFSET,
+                    u32::from(enlil_devices::chipset::PM1_EVT_PORT) | 1,
+                );
+                bridge.write_u8(
+                    enlil_devices::pcie::LPC_ACPI_CNTL_OFFSET,
+                    enlil_devices::pcie::ACPI_CNTL_ACPI_EN
+                        | enlil_devices::pcie::acpi_cntl_sci_select(
+                            enlil_devices::chipset::SCI_IRQ,
+                        ),
                 );
                 // Firmware programs the PIRQ routing registers out of their 0x80
                 // reset (disabled) state to the defaults the DSDT advertises — the
                 // same PIRQ_DEFAULT_IRQS the link devices' _CRS reports — so a guest
-                // reading PIRQRC[A-D], the PirqRouter that syncs from it, and the
+                // reading PIRQ[A-D]_ROUT, the PirqRouter that syncs from it, and the
                 // ACPI namespace all agree on PCI-mode routing.
                 for (line, &irq) in PIRQ_DEFAULT_IRQS.iter().enumerate() {
                     bridge.write_u8(PIRQ_ROUTE_CONFIG_BASE + line as u16, irq);
                 }
                 rc.add_device(bridge);
             }
+            if rc.find_device(&ICH9_SMBUS_BDF).is_none() {
+                rc.add_device(PcieRootComplex::create_ich9_smbus(SMBUS_IO_BASE));
+            }
         }
+        // The live SMBus host register file behind the BAR the config function
+        // advertises (an empty bus: probes complete with DEV_ERR, not open bus).
+        // Its completion interrupt (INTB# of device 31) is delivered through the
+        // live PIRQ routing into both controllers, so a guest driving the
+        // controller with INTREN set gets the interrupt config space promised.
+        let mut smbus = SmbusHost::new();
+        {
+            let pcie = pcie.clone();
+            let pic = pic.clone();
+            let ioapic = ioapic.clone();
+            smbus.set_interrupt_line(move |level| {
+                route_pci_intx(
+                    &pcie,
+                    &pic,
+                    &ioapic,
+                    ICH9_SMBUS_BDF.device,
+                    SMBUS_INTERRUPT_PIN,
+                    level,
+                );
+            });
+        }
+        bus.add_pio(Box::new(smbus))?;
+
+        // The discrete xHCI USB 3.0 controller (Phase 4.4): config function at
+        // XHCI_BDF, register file behind its 64 KiB BAR0, INTA# through the
+        // live PIRQ routing. The routing engine attaches each guest's routed
+        // USB devices to this controller's ports.
+        {
+            let mut rc = pcie.borrow_mut();
+            if rc.find_device(&XHCI_BDF).is_none() {
+                rc.add_device(PcieRootComplex::create_xhci_controller(
+                    XHCI_BDF,
+                    XHCI_MMIO_BASE,
+                ));
+            }
+        }
+        let xhci: SharedXhci = Rc::new(RefCell::new(VirtualXhciController::new(XHCI_PORTS)));
+        let mut xhci_mmio =
+            XhciMmio::new(Rc::clone(&xhci), u64::from(XHCI_MMIO_BASE), XHCI_MMIO_SIZE);
+        {
+            let pcie = pcie.clone();
+            let pic = pic.clone();
+            let ioapic = ioapic.clone();
+            xhci_mmio.set_interrupt_line(move |level| {
+                route_pci_intx(&pcie, &pic, &ioapic, XHCI_BDF.device, 1, level);
+            });
+        }
+        bus.add_mmio(Box::new(xhci_mmio))?;
 
         Ok(StandardPc {
             bus,
@@ -702,6 +784,7 @@ impl DeviceBus {
             pm1,
             sysctl_a,
             pci_reset,
+            xhci,
         })
     }
 }
@@ -773,6 +856,10 @@ pub struct StandardPc {
     /// run loop to handle a guest-initiated `reboot=pci` reset (the modern path,
     /// alongside `0x92`).
     pub pci_reset: PciResetControl,
+    /// The virtual xHCI controller — hot-plug routed USB devices through
+    /// [`connect_usb_device`](Self::connect_usb_device), not this handle, so
+    /// the port-status interrupt is delivered too.
+    pub xhci: SharedXhci,
 }
 
 impl StandardPc {
@@ -809,32 +896,49 @@ impl StandardPc {
     /// must have set it level in the ELCR — what PCI interrupts require), and the
     /// **I/O APIC** sees the PIRQ line's fixed GSI (16-19). Whichever path the
     /// guest has unmasked delivers it; deasserting (`level = false`) withdraws it.
-    pub fn assert_pci_intx(&self, slot: u8, pin: u8, level: bool) {
-        // Read the four PIRQ route bytes the guest programmed in the bridge config.
-        let regs = {
-            let rc = self.pcie.borrow();
-            match rc.find_device(&LPC_BRIDGE_BDF) {
-                Some(bridge) => [
-                    bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE),
-                    bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE + 1),
-                    bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE + 2),
-                    bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE + 3),
-                ],
-                None => return,
-            }
+    /// Hot-plug a USB device onto the virtual xHCI's root-hub `port`
+    /// (0-based) at the xHCI speed code (1=FS, 2=LS, 3=HS, 4=SS) — or detach
+    /// with `connected = false`. Flips the port, posts the Port Status Change
+    /// event, and drives the controller's `INTA#` through the live PIRQ
+    /// routing so a guest with the interrupter enabled is notified exactly as
+    /// on hardware.
+    pub fn connect_usb_device(&self, port: usize, speed: u8, connected: bool) -> bool {
+        let (changed, level) = {
+            let mut xhci = self.xhci.borrow_mut();
+            let changed = if connected {
+                xhci.connect_device(port, speed)
+            } else {
+                xhci.disconnect_device(port)
+            };
+            (changed, xhci.intx_level())
         };
-        let mut router = PirqRouter::new();
-        router.sync_from_config(regs);
+        if changed {
+            self.assert_pci_intx(XHCI_BDF.device, 1, level);
+        }
+        changed
+    }
 
-        // 8259 path: the routed ISA IRQ as a level line (PCI INTx is level).
-        if let Some(irq) = router.device_isa_irq(slot, pin) {
-            self.pic.with(|p| p.set_irq_level(irq, level));
+    /// Attach a routed USB device of the given [`UsbSpeed`] to the lowest free
+    /// root-hub port, delivering the port-status interrupt through the live
+    /// PIRQ routing. Returns the 0-based port it landed on (the handle the
+    /// routing engine records for a later detach), or `None` if the
+    /// controller's ports are all occupied. This is the seam the
+    /// [routing engine](enlil_devices::usb::RoutingState) drives: it decides
+    /// *which guest* a device goes to; this attaches it to that guest's
+    /// controller without picking a port itself.
+    pub fn attach_usb_device(&self, speed: UsbSpeed) -> Option<usize> {
+        let (port, level) = {
+            let mut xhci = self.xhci.borrow_mut();
+            (xhci.attach_device(speed), xhci.intx_level())
+        };
+        if port.is_some() {
+            self.assert_pci_intx(XHCI_BDF.device, 1, level);
         }
-        // I/O APIC path: the PIRQ line's fixed GSI 16-19.
-        if let Some(gsi) = PirqRouter::device_gsi(slot, pin) {
-            let line = self.ioapic.line(gsi);
-            line(level);
-        }
+        port
+    }
+
+    pub fn assert_pci_intx(&self, slot: u8, pin: u8, level: bool) {
+        route_pci_intx(&self.pcie, &self.pic, &self.ioapic, slot, pin, level);
     }
 
     /// Advance every free-running platform clock by one elapsed-time delta of `ns`
@@ -894,6 +998,48 @@ impl StandardPc {
     }
 }
 
+/// Drive a PCI device's level-triggered `INTx` line into the interrupt fabric
+/// through the **live** PIRQ routing: the `PIRQ[A-D]_ROUT` bytes are read from
+/// the ICH9 LPC bridge's config space at assertion time, so the route always
+/// reflects what the guest last programmed. Shared by
+/// [`StandardPc::assert_pci_intx`] (the run loop's path) and the interrupt
+/// sinks of bus-internal PCI functions (e.g. the SMBus controller), which
+/// capture clones of these shared handles.
+fn route_pci_intx(
+    pcie: &SharedRootComplex,
+    pic: &SharedPic,
+    ioapic: &SharedInterruptController,
+    slot: u8,
+    pin: u8,
+    level: bool,
+) {
+    // Read the four PIRQ routing bytes the guest programmed in the bridge config.
+    let regs = {
+        let rc = pcie.borrow();
+        match rc.find_device(&ICH9_LPC_BDF) {
+            Some(bridge) => [
+                bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE),
+                bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE + 1),
+                bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE + 2),
+                bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE + 3),
+            ],
+            None => return,
+        }
+    };
+    let mut router = PirqRouter::new();
+    router.sync_from_config(regs);
+
+    // 8259 path: the routed ISA IRQ as a level line (PCI INTx is level).
+    if let Some(irq) = router.device_isa_irq(slot, pin) {
+        pic.with(|p| p.set_irq_level(irq, level));
+    }
+    // I/O APIC path: the PIRQ line's fixed GSI 16-19.
+    if let Some(gsi) = PirqRouter::device_gsi(slot, pin) {
+        let line = ioapic.line(gsi);
+        line(level);
+    }
+}
+
 /// Legacy ISA IRQ line for the 8254 PIT channel-0 (system timer).
 pub const IRQ_PIT: u8 = 0;
 /// Legacy ISA IRQ line for the COM1 16550 UART.
@@ -902,11 +1048,22 @@ pub const IRQ_COM1: u8 = 4;
 /// BDF of the ICH9 LPC bridge / PCI interrupt router (`00:1F.0`) seeded by
 /// [`DeviceBus::standard_pc_complete`]; its config space holds the
 /// `PIRQ[A-D]_ROUT` routing registers. Sourced from the shared
-/// [`enlil_devices::pcie::LPC_BRIDGE_BDF`] so the live bridge and the DSDT's
+/// [`enlil_devices::pcie::ICH9_LPC_BRIDGE_BDF`] so the live bridge and the DSDT's
 /// `ISA_` `_ADR` cannot drift to different PCI locations.
-const LPC_BRIDGE_BDF: PciBdf = enlil_devices::pcie::LPC_BRIDGE_BDF;
-/// PCI device ID of the ICH9 LPC bridge (Intel `8086:2918`, function 0).
+const ICH9_LPC_BDF: PciBdf = enlil_devices::pcie::ICH9_LPC_BRIDGE_BDF;
+/// PCI device ID of the ICH9 LPC interface bridge (Intel 82801IB, `D31:F0`).
 const ICH9_LPC_DEVICE_ID: u16 = enlil_devices::pcie::ICH9_LPC_DEVICE_ID;
+
+/// BDF of the discrete Renesas xHCI USB 3.0 controller seeded by
+/// [`DeviceBus::standard_pc_complete`]: an expansion slot on bus 0.
+const XHCI_BDF: PciBdf = PciBdf::new(0, 4, 0);
+/// Firmware-assigned BAR0 of the xHCI register window, inside the 32-bit PCI
+/// MMIO hole the DSDT's `PCI0._CRS` produces (`0xC000_0000..0xFEC0_0000`).
+const XHCI_MMIO_BASE: u32 = 0xFE90_0000;
+/// Size of the xHCI BAR0 window (64 KiB).
+const XHCI_MMIO_SIZE: u64 = 0x1_0000;
+/// Root-hub port count on the virtual controller.
+const XHCI_PORTS: u8 = 4;
 
 /// Guest-physical base of the `PCIe` ECAM window for the default single-segment
 /// layout. Matches the MCFG table emitted by `enlil_devices::acpi`, so a guest
@@ -1144,6 +1301,32 @@ mod tests {
         let dev_addr = 0xB000_0000 + (u64::from(2u32) << 15); // BDF 0:2.0 ecam offset
         VmExitHandler::mmio_read(&mut bus, dev_addr, &mut data);
         assert_eq!(u32::from_le_bytes(data), 0x8168_10EC);
+    }
+
+    /// The MCH's `PCIEXBAR` (config `0x60`) is where a real guest can learn the
+    /// ECAM base from the hardware itself; it must advertise exactly the window
+    /// the bus decodes (and the MCFG table describes) — same fact, two surfaces.
+    #[test]
+    fn q35_pciexbar_advertises_the_live_ecam_window() {
+        use super::DEFAULT_ECAM_BASE;
+        use enlil_devices::pcie::{PcieRootComplex, PCIEXBAR_ENABLE, PCIEXBAR_OFFSET};
+
+        let mut bus = DeviceBus::new();
+        bus.add_pcie(PcieRootComplex::new(DEFAULT_ECAM_BASE))
+            .unwrap();
+
+        // Read PCIEXBAR through the legacy CAM: enable | 0:0.0 | reg 0x60.
+        let addr: u32 = 0x8000_0000 | u32::from(PCIEXBAR_OFFSET);
+        VmExitHandler::io_out(&mut bus, 0xCF8, &addr.to_le_bytes());
+        let mut data = [0u8; 4];
+        VmExitHandler::io_in(&mut bus, 0xCFC, &mut data);
+        let pciexbar = u64::from(u32::from_le_bytes(data));
+
+        // Enabled, and the base is the window the MMIO bus actually decodes.
+        assert_eq!(pciexbar & PCIEXBAR_ENABLE, PCIEXBAR_ENABLE);
+        let base = pciexbar & !0xFu64;
+        assert_eq!(base, DEFAULT_ECAM_BASE);
+        assert!(bus.mmio.is_mapped(base));
     }
 
     #[test]
@@ -1570,7 +1753,7 @@ mod tests {
     #[test]
     fn standard_pc_complete_programs_the_default_pirq_routing() {
         use super::{
-            PirqRouter, StandardPc, LPC_BRIDGE_BDF, PIRQ_DEFAULT_IRQS, PIRQ_ROUTE_CONFIG_BASE,
+            PirqRouter, StandardPc, ICH9_LPC_BDF, PIRQ_DEFAULT_IRQS, PIRQ_ROUTE_CONFIG_BASE,
         };
         use crate::serial::{SerialOutput, SerialOutputMode};
 
@@ -1582,12 +1765,12 @@ mod tests {
         .unwrap();
         let StandardPc { pcie, .. } = pc;
 
-        // The firmware programmed the ICH9 LPC bridge's PIRQ[A-D]_ROUT out of their
-        // 0x80 reset state to the advertised defaults, so the live router agrees with
-        // the DSDT link devices.
+        // The firmware programmed the LPC bridge's PIRQ[A-D]_ROUT out of their 0x80
+        // reset state to the advertised defaults, so the live router agrees with the
+        // DSDT link devices.
         let rc = pcie.borrow();
         let bridge = rc
-            .find_device(&LPC_BRIDGE_BDF)
+            .find_device(&ICH9_LPC_BDF)
             .expect("ICH9 LPC bridge is mounted");
         let mut regs = [0u8; 4];
         for (line, slot) in regs.iter_mut().enumerate() {
@@ -1595,7 +1778,7 @@ mod tests {
         }
         assert_eq!(
             regs, PIRQ_DEFAULT_IRQS,
-            "PIRQRC[A-D] must hold the firmware-default routing"
+            "PIRQ[A-D]_ROUT must hold the firmware-default routing"
         );
 
         // A router synced from those bytes resolves a slot-0 INTA device (PIRQA) to
@@ -1603,6 +1786,224 @@ mod tests {
         let mut router = PirqRouter::new();
         router.sync_from_config(regs);
         assert_eq!(router.device_isa_irq(0, 1), Some(PIRQ_DEFAULT_IRQS[0]));
+    }
+
+    /// `D31` is multifunction on every ICH9: the LPC's header must say so, the
+    /// SMBus controller must answer at `1F.3` with the BAR the firmware
+    /// assigned, and the live register file must decode behind that BAR — one
+    /// consistent story across config space, the PIRQ defaults, and the bus.
+    #[test]
+    fn standard_pc_complete_mounts_the_ich9_smbus_function() {
+        use super::{PirqRouter, StandardPc, ICH9_LPC_BDF, PIRQ_DEFAULT_IRQS};
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::pcie::{
+            cfg, PciBdf, BOARD_SUBSYSTEM_DEVICE_ID, BOARD_SUBSYSTEM_VENDOR_ID, ICH9_SMBUS_BDF,
+        };
+        use enlil_devices::smbus::{HST_STS, SMBUS_IO_BASE, STS_INUSE};
+
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            1_780_838_055,
+            1,
+        )
+        .unwrap();
+        let StandardPc { mut bus, pcie, .. } = pc;
+
+        {
+            let rc = pcie.borrow();
+            // Function 0 declares the device multifunction, or the guest never
+            // probes function 3.
+            let lpc = rc.find_device(&ICH9_LPC_BDF).unwrap();
+            assert_eq!(lpc.read_u8(cfg::HEADER_TYPE) & 0x80, 0x80);
+
+            // The SMBus function: SMBus class, SMB_BASE in BAR4, and an
+            // interrupt line that matches what the default PIRQ routing
+            // resolves INTB# of device 31 to (the same answer the DSDT's
+            // link devices give).
+            let smb = rc.find_device(&ICH9_SMBUS_BDF).unwrap();
+            assert_eq!(smb.read_u8(cfg::CLASS_CODE), 0x0C);
+            assert_eq!(smb.read_u8(cfg::SUBCLASS), 0x05);
+
+            // Every onboard function carries the board vendor's subsystem IDs.
+            for dev in [lpc, smb, rc.find_device(&PciBdf::new(0, 0, 0)).unwrap()] {
+                assert_eq!(
+                    dev.read_u16(cfg::SUBSYSTEM_VENDOR_ID),
+                    BOARD_SUBSYSTEM_VENDOR_ID
+                );
+                assert_eq!(dev.read_u16(cfg::SUBSYSTEM_ID), BOARD_SUBSYSTEM_DEVICE_ID);
+            }
+
+            // PMBASE/ACPI_CNTL: the LPC registers the ACPI PM I/O block
+            // physically hangs off must encode the ports the FADT advertises
+            // and the bus decodes (PM1 +0/+4, PM_TMR +8, GPE0 +0x20), with
+            // the decode enabled and the SCI on the FADT's IRQ.
+            use enlil_devices::chipset::{GPE0_PORT, PM1_CNT_PORT, PM1_EVT_PORT, SCI_IRQ};
+            use enlil_devices::pcie::{
+                acpi_cntl_sci_irq, ACPI_CNTL_ACPI_EN, LPC_ACPI_CNTL_OFFSET, LPC_PMBASE_OFFSET,
+            };
+            use enlil_devices::timer::PM_TIMER_PORT;
+            let pmbase = lpc.read_u32(LPC_PMBASE_OFFSET);
+            assert_eq!(pmbase & 1, 1, "PMBASE bit 0 is hardwired (I/O space)");
+            let base = u16::try_from(pmbase & 0xFF80).unwrap();
+            assert_eq!(base, PM1_EVT_PORT);
+            assert_eq!(base + 4, PM1_CNT_PORT);
+            assert_eq!(base + 8, PM_TIMER_PORT);
+            assert_eq!(base + 0x20, GPE0_PORT);
+            let cntl = lpc.read_u8(LPC_ACPI_CNTL_OFFSET);
+            assert_eq!(cntl & ACPI_CNTL_ACPI_EN, ACPI_CNTL_ACPI_EN);
+            assert_eq!(acpi_cntl_sci_irq(cntl), SCI_IRQ);
+            assert_eq!(smb.read_u32(cfg::BAR4), u32::from(SMBUS_IO_BASE) | 1);
+            assert_eq!(smb.read_u8(cfg::INTERRUPT_PIN), 2);
+            let expected = PirqRouter::default_device_isa_irq(31, 2).unwrap();
+            assert_eq!(smb.read_u8(cfg::INTERRUPT_LINE), expected);
+            assert_eq!(expected, PIRQ_DEFAULT_IRQS[0]); // INTB#@31 -> PIRQA
+        }
+
+        // The register file decodes behind the advertised BAR: an idle
+        // controller (first status read 0, second shows the INUSE semaphore
+        // the first read took) — not open bus.
+        let mut data = [0u8; 1];
+        VmExitHandler::io_in(&mut bus, SMBUS_IO_BASE + HST_STS, &mut data);
+        assert_eq!(data[0], 0);
+        VmExitHandler::io_in(&mut bus, SMBUS_IO_BASE + HST_STS, &mut data);
+        assert_eq!(data[0], STS_INUSE);
+    }
+
+    /// The SMBus completion interrupt travels the whole path a real one does:
+    /// the guest starts a transaction with `INTREN` set, the (empty-bus)
+    /// `DEV_ERR` completion asserts `INTB#`, the live PIRQ routing resolves it
+    /// (device 31 INTB# -> PIRQA -> GSI 16), and the I/O APIC delivers the
+    /// programmed vector — until the driver clears the status and the
+    /// level-triggered line drops.
+    #[test]
+    fn smbus_completion_interrupt_routes_through_the_live_pirq_routing() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::smbus::{
+            CNT_INTREN, CNT_START, HST_CNT, HST_STS, SMBUS_IO_BASE, STS_DEV_ERR, XMIT_SLVA,
+        };
+
+        use enlil_devices::interrupt::ELCR_SLAVE;
+
+        let mut pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            1_780_838_055,
+            1,
+        )
+        .unwrap();
+        pc.ioapic.with(|c| c.lapics[0].write_register(0x0F0, 0x1FF));
+
+        // Program the 8259 (PC/AT layout) and mark IRQ11 — PIRQA's default
+        // route — level in the ELCR (slave line 3), as a PCI interrupt must be.
+        pc.pic.with(|p| {
+            for (port, val) in [
+                (0x20u16, 0x11u8),
+                (0x21, 0x20),
+                (0x21, 0x04),
+                (0x21, 0x01),
+                (0xA0, 0x11),
+                (0xA1, 0x28),
+                (0xA1, 0x02),
+                (0xA1, 0x01),
+                (0x21, 0x00),
+                (0xA1, 0x00),
+            ] {
+                p.write_port(port, val);
+            }
+            p.write_elcr(ELCR_SLAVE, 1 << 3);
+        });
+
+        // Program PIRQA's I/O APIC GSI (16): vector 0x60 -> LAPIC 0.
+        // REDTBL base 0x10 + 16*2 = 0x30 (low), 0x31 (high).
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0000, &0x30u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0010, &0x60u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0000, &0x31u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0010, &0u32.to_le_bytes());
+
+        // The guest probes slave 0x50 with the interrupt enabled.
+        VmExitHandler::io_out(&mut pc.bus, SMBUS_IO_BASE + XMIT_SLVA, &[(0x50 << 1) | 1]);
+        VmExitHandler::io_out(
+            &mut pc.bus,
+            SMBUS_IO_BASE + HST_CNT,
+            &[CNT_START | CNT_INTREN],
+        );
+
+        // The DEV_ERR completion asserted INTB#: the 8259 presents IRQ11's
+        // vector (slave base 0x28 + 3 = 0x2B), the I/O APIC delivered GSI 16's.
+        assert_eq!(pc.pic.with(|p| p.pending_vector()), Some(0x2B));
+        assert_eq!(pc.ioapic.with(|c| c.pending_vector(0)), Some(0x60));
+
+        // The driver clears the status; the level line deasserts and the
+        // request is withdrawn from the 8259.
+        VmExitHandler::io_out(&mut pc.bus, SMBUS_IO_BASE + HST_STS, &[STS_DEV_ERR]);
+        assert_eq!(pc.pic.with(|p| p.pending_vector()), None);
+    }
+
+    /// The xHCI function is enumerable, its register file decodes behind the
+    /// BAR config space advertises, and a hot-plug delivers the port-status
+    /// interrupt through the live PIRQ routing — the full path a guest's USB
+    /// stack exercises.
+    #[test]
+    fn xhci_is_enumerable_and_hotplug_interrupts_through_the_pirq_routing() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::pcie::{cfg, PciBdf};
+        use enlil_devices::usb::{EventTrb, UsbSpeed};
+
+        let mut pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            1_780_838_055,
+            1,
+        )
+        .unwrap();
+        pc.ioapic.with(|c| c.lapics[0].write_register(0x0F0, 0x1FF));
+
+        // Enumerable at 00:04.0: Renesas xHCI, USB class with xHCI prog-if,
+        // BAR0 = the mounted MMIO window, INTA#.
+        {
+            let rc = pc.pcie.borrow();
+            let dev = rc.find_device(&PciBdf::new(0, 4, 0)).unwrap();
+            assert_eq!(dev.read_u16(cfg::VENDOR_ID), 0x1912);
+            assert_eq!(dev.read_u8(cfg::CLASS_CODE), 0x0C);
+            assert_eq!(dev.read_u8(cfg::SUBCLASS), 0x03);
+            assert_eq!(dev.read_u8(cfg::PROG_IF), 0x30);
+            assert_eq!(dev.read_u32(cfg::BAR0), 0xFE90_0000);
+            assert_eq!(dev.read_u8(cfg::INTERRUPT_PIN), 1);
+        }
+
+        // The register window decodes behind the BAR: CAPLENGTH/HCIVERSION.
+        let mut data = [0u8; 4];
+        VmExitHandler::mmio_read(&mut pc.bus, 0xFE90_0000, &mut data);
+        let r0 = u32::from_le_bytes(data);
+        assert_eq!(r0 & 0xFF, 0x20);
+        assert_eq!(r0 >> 16, 0x0110);
+
+        // Program PIRQA's GSI (16; slot-4 INTA swizzles to PIRQA): vector
+        // 0x70, then enable interrupter 0 (IMAN.IE at RTSOFF + 0x20) through
+        // the BAR like a driver does.
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0000, &0x30u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0010, &0x70u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0000, &0x31u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFEC0_0010, &0u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFE90_0000 + 0x1020, &2u32.to_le_bytes());
+
+        // Hot-plug a SuperSpeed device on port 0: the I/O APIC delivers the
+        // PIRQA vector, and the event ring carries the port-status change.
+        assert!(pc.connect_usb_device(0, 4, true));
+        assert_eq!(pc.ioapic.with(|c| c.pending_vector(0)), Some(0x70));
+        match pc.xhci.borrow_mut().pop_event() {
+            Some(EventTrb::PortStatusChange { port_id }) => assert_eq!(port_id, 1),
+            other => panic!("expected a port status change, got {other:?}"),
+        }
+
+        // The guest acknowledges: clearing IMAN.IP through the BAR withdraws
+        // the level line (the MMIO adapter re-syncs the routed INTx).
+        VmExitHandler::mmio_write(&mut pc.bus, 0xFE90_0000 + 0x1020, &3u32.to_le_bytes());
+        assert!(!pc.xhci.borrow().intx_level());
+
+        // The routing-engine seam: attach_usb_device picks the lowest free
+        // port by speed (port 0 already taken above, so this lands on 1) and
+        // delivers the interrupt the same way.
+        assert_eq!(pc.attach_usb_device(UsbSpeed::Low), Some(1));
+        assert_eq!(pc.ioapic.with(|c| c.pending_vector(0)), Some(0x70));
     }
 
     #[test]
@@ -1776,9 +2177,9 @@ mod tests {
 
     #[test]
     fn pci_intx_routes_through_the_lpc_bridge_to_both_controllers() {
+        use super::ICH9_LPC_BDF;
         use crate::serial::{SerialOutput, SerialOutputMode};
         use enlil_devices::interrupt::ELCR_SLAVE;
-        use enlil_devices::pcie::LPC_BRIDGE_BDF;
 
         let mut pc = DeviceBus::standard_pc_complete(
             SerialOutput::new("guest", SerialOutputMode::Null),
@@ -1792,7 +2193,7 @@ mod tests {
         // IRQ10 by writing its config register 0x61.
         {
             let mut rc = pc.pcie.borrow_mut();
-            let bridge = rc.find_device_mut(&LPC_BRIDGE_BDF).unwrap();
+            let bridge = rc.find_device_mut(&ICH9_LPC_BDF).unwrap();
             bridge.write_u8(0x61, 10);
         }
 

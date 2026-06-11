@@ -1078,6 +1078,65 @@ ROADMAP.md → Core Model → "Execution modes" + Phase 11 intro. Prior art that
 
 ---
 
+## 2026-06-11 — q35/ICH9 chipset identity: primary-source register map for the conversion (Phase 0.2 / 5.x stealth)
+
+The platform's surfaces currently mix generations: PCIe ECAM/MCFG + an i440FX host bridge
+(`8086:1237`, a 1996 chipset with **no** ECAM) + the PIIX3 ISA bridge at `00:01.0`. Any guest
+(or detector) that cross-references the host bridge ID against the MCFG table sees an
+impossible machine. Primary sources for the q35 conversion:
+
+- **Intel 3 Series Express Chipset Family datasheet (Q35 MCH)** — host bridge `D0:F0` is
+  `8086:29C0`; **PCIEXBAR** lives at MCH config `0x60-0x67` (bit 0 = enable, bits 2:1 = window
+  size 00b=256 MiB, base bits 38:28). The MCH's own PCIEXBAR must agree with the MCFG table —
+  one more "same fact, two surfaces" pair to pin. OVMF programs PCIEXBAR=`0xB0000000` on q35
+  (edk2 `OvmfPkg/PlatformPei` MMCONFIG patch), which is exactly our `DEFAULT_ECAM_BASE`.
+- **Intel ICH9 Family datasheet (316972)** — LPC interface bridge is `D31:F0` (`00:1F.0`),
+  `8086:2918`, class `06 01`; **PIRQ[A-D]_ROUT at config `0x60-0x63` with byte semantics
+  identical to PIIX3** (bit 7 = routing disable, reset `0x80`, bits 3:0 = ISA IRQ, IRQ
+  0/1/2/8/13 reserved), plus **PIRQ[E-H]_ROUT at `0x68-0x6B`** (new vs PIIX3); PIRQA-H wire to
+  I/O APIC inputs 16-23 in APIC mode. ELCR stays at `0x4D0/0x4D1`, RST_CNT at `0xCF9`.
+- **QEMU `hw/pci-host/q35.c` / `hw/isa/lpc_ich9.c`** — confirms a production VMM models q35
+  exactly this way (MCH `29C0` + ICH9 LPC `2918` at 1F.0, PIRQ regs 0x60/0x68); QEMU's tell is
+  its `1af4:1100` *subsystem* IDs, which we leave unset for now (follow-up: source subsystem
+  IDs from the SMBIOS board vendor across all functions — same-fact pair).
+
+**How it changes what we build:** the existing `PirqRouter` (registers, semantics, swizzle,
+GSI 16-19) carries over to ICH9 unchanged for A-D — the conversion is an identity/BDF pass
+(host bridge ID, LPC at `00:1F.0`, DSDT `_ADR`, PCIEXBAR seeding), not an interrupt-model
+rewrite. PIRQ E-H and the multifunction `00:1F.x` siblings a real ICH9 always has (SATA
+`1F.2`, SMBus `1F.3` = `8086:2930`) are follow-up fidelity items, flagged in the roadmap.
+
+Sources: https://www.intel.com/content/dam/doc/datasheet/io-controller-hub-9-datasheet.pdf ·
+Intel 3-Series (Q35) chipset datasheet · https://github.com/qemu/qemu/blob/master/hw/pci-host/q35.c ·
+https://mail-archive.com/edk2-devel@lists.01.org/msg08739.html
+
+---
+
+## 2026-06-11 (b) — AMD topology surface: TOPOEXT leaves, vendor-correct max leaves (Phase 5.4)
+
+Continuation of the 2026-06-10 (d) "kernel parsers as layout oracles" sweep, AMD side:
+
+- **AMD APM Vol 3 `Fn8000_001D`/`Fn8000_001E`** — the TOPOEXT cache-topology and extended
+  APIC/core/node leaves. `Fn8000_001D` mirrors Intel leaf 4's field layout *except* EAX[31:26]
+  (cores-per-package) which is reserved on AMD. Gated by `Fn8000_0001` ECX[22] (TOPOEXT) —
+  Linux `cpu/cacheinfo.c` only parses 0x8000001D when the bit is set, and `cpu/topology_amd.c`
+  parses 0x8000001E EBX[15:8]+1 as threads-per-core.
+- **Max-leaf values are themselves a vendor fingerprint:** no AMD part reports basic max 0x16
+  (that's Intel's frequency leaf; Zen reports 0x10) and AMD extended max runs to 0x8000001F+
+  (SEV leaf). We now emit per-vendor maxes; 0x8000001F is deliberate in-range zeros (no
+  SME/SEV claimed anywhere — internally consistent, though a real 7950X does advertise SME;
+  noted as acceptable divergence until SEV is a feature we can virtualize).
+- **`Fn8000_0007` EDX[9] CPB + EDX[10] EffFreq** — AMD's boost + read-only APERF/MPERF bits;
+  pairs with the PMC rate model's core>ref ratio (Intel signals the same facts via leaf 6 IDA
+  + leaf 6 ECX[0]). **`Fn8000_0008` ECX[7:0] NC / ECX[15:12] ApicIdSize** — the legacy
+  topology source `kernel/cpu/topology.c` cross-checks against leaf 1 EBX and leaf 0xB.
+
+**How it changes what we build:** every populated AMD leaf is now cross-checkable against the
+surface that encodes the same fact (1D geometry ↔ legacy 5/6; 1E SMT ↔ leaf-1 HTT/0xB; NC ↔
+vcpu count; CPB ↔ PMC ratios) — tests pin each pair, same discipline as the Intel sweep.
+
+---
+
 ## 2026-06-11 — Chipset identity consistency: i440FX/PIIX3 vs Q35/ICH9 as a VM tell (Phase 0.2 / 5.x stealth)
 
 The transparency question for this increment: does the emulated chipset's *identity* match the

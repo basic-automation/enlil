@@ -13,6 +13,10 @@ use crate::bus::PioDevice;
 use crate::truncate::{u8_of, u16_of};
 use std::sync::{Arc, Mutex};
 
+/// The ACPI SCI's ISA IRQ — the value the FADT advertises (`SCI_INT`), the
+/// LPC bridge's `ACPI_CNTL` register encodes, and the PIRQ defaults avoid.
+pub const SCI_IRQ: u8 = 9;
+
 /// The port [`SystemControlPortA`] claims.
 pub const PORT_A: u16 = 0x92;
 

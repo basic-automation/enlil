@@ -50,6 +50,7 @@ pub mod net;
 pub mod pcie;
 pub mod ps2;
 pub mod smbios;
+pub mod smbus;
 pub mod stealth;
 pub mod storage;
 pub mod timer;

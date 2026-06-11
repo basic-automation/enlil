@@ -1,9 +1,4 @@
-//! The PIIX3/ICH9 PCI interrupt router (the "PIRQ" router).
-//!
-//! The four `PIRQ[A-D]_ROUT` routing registers and their bit layout are identical
-//! on the legacy PIIX3 (`8086:7000`, at `00:01.0`) and the PCIe-era ICH9 LPC
-//! bridge (`8086:2918`, at `00:1F.0`); Enlil mounts the ICH9 LPC bridge, so the
-//! register addresses below are config `0x60`..`0x63` on that bridge.
+//! The chipset PCI interrupt router (the "PIRQ" router).
 //!
 //! PCI devices signal interrupts on one of four level-triggered pins —
 //! `INTA#`..`INTD#` (encoded 1..4 in config-space register `0x3D`,
@@ -12,8 +7,10 @@
 //! mode the OS has chosen:
 //!
 //! - **PIC mode:** each device's pin is *swizzled* by slot number onto one of
-//!   four router lines `PIRQ[A..D]`, and four chipset registers (PIIX3 config
-//!   offsets `0x60`..`0x63`) program which ISA IRQ each `PIRQ` line drives. PCI
+//!   four router lines `PIRQ[A..D]`, and four chipset registers (LPC-bridge
+//!   config offsets `0x60`..`0x63` — the same bytes, with the same semantics, on
+//!   the ICH9 LPC bridge Enlil mounts at `00:1F.0` as on the PIIX3 that
+//!   preceded it) program which ISA IRQ each `PIRQ` line drives. PCI
 //!   interrupts are **level-triggered**, so the target IRQ must be set to level
 //!   in the [ELCR](crate::interrupt::pic) — which is exactly what
 //!   [`Pic8259::set_line`](crate::interrupt::pic::Pic8259::set_line)'s
@@ -31,8 +28,9 @@
 /// Number of PCI interrupt-router lines: `PIRQA`, `PIRQB`, `PIRQC`, `PIRQD`.
 pub const PIRQ_LINES: usize = 4;
 
-/// First PIIX3 config-space offset of the routing registers (`PIRQRCA`); the
-/// four registers are contiguous at `0x60`..=`0x63`.
+/// First LPC-bridge config-space offset of the routing registers
+/// (`PIRQA_ROUT`); the four registers are contiguous at `0x60`..=`0x63` on both
+/// the ICH9 and the PIIX3.
 pub const PIRQ_ROUTE_BASE: u16 = 0x60;
 
 /// First I/O APIC GSI the four PIRQ lines wire to in APIC mode (`PIRQA`→16).
@@ -53,13 +51,14 @@ pub const PIRQ_GSI_BASE: u8 = 16;
 pub const PIRQ_DEFAULT_IRQS: [u8; PIRQ_LINES] = [11, 10, 5, 6];
 
 /// A set routing register's bit 7 means the line is **not routed** to any IRQ
-/// (the PIIX3 reset state — firmware must program a valid IRQ to enable it).
+/// (the ICH9/PIIX3 reset state — firmware must program a valid IRQ to enable it).
 const ROUTE_DISABLED: u8 = 0x80;
 
 /// Bits 3:0 of a routing register select the ISA IRQ.
 const ROUTE_IRQ_MASK: u8 = 0x0F;
 
-/// The PIIX3 PCI interrupt router.
+/// The chipset PCI interrupt router (ICH9 `PIRQ[A-D]_ROUT`; identical to the
+/// PIIX3's `PIRQRC[A-D]`).
 #[derive(Debug, Clone)]
 pub struct PirqRouter {
     /// `PIRQRC[A..D]` (config `0x60`..`0x63`): bit 7 = disabled, bits 3:0 = the
@@ -74,7 +73,7 @@ impl Default for PirqRouter {
 }
 
 impl PirqRouter {
-    /// A router in its PIIX3 reset state: every PIRQ line disabled (`0x80`).
+    /// A router in its chipset reset state: every PIRQ line disabled (`0x80`).
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -99,7 +98,7 @@ impl PirqRouter {
     }
 
     /// Program one routing register (`pirq` `0`=A..`3`=D) — the effect of a guest
-    /// writing PIIX3 config offset `0x60 + pirq`.
+    /// writing LPC-bridge config offset `0x60 + pirq`.
     pub const fn set_route(&mut self, pirq: usize, value: u8) {
         self.routes[pirq % PIRQ_LINES] = value;
     }
@@ -110,8 +109,8 @@ impl PirqRouter {
         self.routes[pirq % PIRQ_LINES]
     }
 
-    /// Load all four routing registers at once from the `PIRQRC[A-D]` bytes a
-    /// guest has programmed in the PIIX3 bridge's config space (offsets
+    /// Load all four routing registers at once from the `PIRQ[A-D]_ROUT` bytes a
+    /// guest has programmed in the LPC bridge's config space (offsets
     /// `0x60`..`0x63`, [`PIRQ_ROUTE_CONFIG_BASE`](crate::pcie::PIRQ_ROUTE_CONFIG_BASE)).
     /// This is how the router picks up routing the guest configured through PCI
     /// config writes, keeping a single source of truth in config space.
@@ -121,7 +120,7 @@ impl PirqRouter {
 
     /// The ISA IRQ a PIRQ line currently drives in **PIC mode**, or `None` if the
     /// register is disabled (bit 7) or programmed to an IRQ that cannot carry a
-    /// PCI interrupt. The PIIX3 hardwires IRQ 0/1/2/8/13 (and the always-edge
+    /// PCI interrupt. The chipset hardwires IRQ 0/1/2/8/13 (and the always-edge
     /// timer/keyboard/cascade/RTC/FPU lines) so they are never valid PCI targets;
     /// the routable set is 3-7, 9-12, 14, 15.
     #[must_use]
@@ -189,7 +188,8 @@ impl PirqRouter {
     }
 }
 
-/// Whether `irq` is an ISA IRQ a PIIX3 PIRQ line may be routed to. The hardwired
+/// Whether `irq` is an ISA IRQ a PIRQ line may be routed to (the reserved set is
+/// the same on the ICH9 and the PIIX3). The hardwired
 /// legacy functions — IRQ0 timer, IRQ1 keyboard, IRQ2 cascade, IRQ8 RTC, IRQ13
 /// FPU — are never valid PCI targets; everything else in 3-15 is.
 const fn is_pci_routable_irq(irq: u8) -> bool {
@@ -334,13 +334,17 @@ mod tests {
     #[test]
     fn router_syncs_routing_a_guest_programmed_in_the_lpc_bridge_config() {
         use crate::pcie::{
-            ICH9_LPC_DEVICE_ID, LPC_BRIDGE_BDF, PIRQ_ROUTE_CONFIG_BASE, PcieRootComplex, vendors,
+            ICH9_LPC_BRIDGE_BDF, ICH9_LPC_DEVICE_ID, PIRQ_ROUTE_CONFIG_BASE, PcieRootComplex,
+            vendors,
         };
 
         // A guest enumerates the ICH9 LPC bridge (00:1F.0) and programs PIRQB ->
         // IRQ10 by writing config offset 0x61, leaving the others at reset (0x80).
-        let mut bridge =
-            PcieRootComplex::create_isa_bridge(LPC_BRIDGE_BDF, vendors::INTEL, ICH9_LPC_DEVICE_ID);
+        let mut bridge = PcieRootComplex::create_isa_bridge(
+            ICH9_LPC_BRIDGE_BDF,
+            vendors::INTEL,
+            ICH9_LPC_DEVICE_ID,
+        );
         assert_eq!(
             bridge.read_u8(PIRQ_ROUTE_CONFIG_BASE),
             0x80,

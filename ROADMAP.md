@@ -445,26 +445,56 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > `chipset::{SMI_CMD_PORT,ACPI_ENABLE_VALUE,ACPI_DISABLE_VALUE}` constants the port
 > uses, so the advertised handshake and the decoding hardware can't drift.
 >
-> **Status (2026-06-11):** **chipset identity is now internally consistent (Q35/ICH9).**
-> The platform exposes an MCFG/ECAM window and a `PNP0A08` PCIe root in the DSDT —
-> a PCI-Express-era machine — but the host bridge still reported the legacy i440FX
-> ID (`8086:1237`) and the south bridge was a PIIX3 at `00:01.0`, a chipset combo
-> that has **no** PCIe/ECAM. That contradiction is a one-read VM tell. The host
-> bridge now reports the **Q35 MCH** (`8086:29C0`) and the LPC interrupt-router
-> bridge is the **ICH9 LPC** (`8086:2918`) at its canonical `00:1F.0` (was
-> PIIX3 at `00:01.0`). The `PIRQ[A-D]_ROUT` registers stay at config `0x60`-`0x63`
-> (identical layout on PIIX3 and ICH9), so the `PirqRouter` model and the DSDT's
-> live `_SRS`/`_CRS` link devices are unchanged; only the bridge's identity and BDF
-> moved, with the `ISA_` `_ADR` now `0x001F0000`. New constants
-> `pcie::{Q35_MCH_DEVICE_ID, ICH9_LPC_DEVICE_ID, LPC_BRIDGE_BDF}`; whole DSDT still
-> round-trips through `iasl` at 0 errors/warnings. **Follow-up:** ICH9 1F.0 is a
-> multifunction device on real hardware (1F.2 SATA AHCI `8086:2922`, 1F.3 SMBus
-> `8086:2930`); we model only 1F.0 as single-function. Adding those sibling
-> functions (and setting the header-type multifunction bit) would complete the
-> south-bridge identity, but each absent function currently just reads all-ones,
-> which is benign. The SMBIOS board name (`ROG STRIX B650E`, an AMD AM5 board) is a
-> separate identity surface that should eventually be reconciled with the Q35/Intel
-> chipset story.
+> **Status (2026-06-11):** the **chipset identity is now coherently Q35/ICH9**
+> (it previously mixed generations: an i440FX host bridge — a 1996 part with no
+> ECAM — alongside PCIe ECAM/MCFG, an impossible machine to anyone cross-checking
+> IDs against capabilities). The host bridge is the Q35 MCH (`8086:29C0`, rev 02)
+> with its **`PCIEXBAR`** (config `0x60`) seeded from the live root complex's
+> `ecam_base` — so the base the MCH advertises, the window the bus decodes, and
+> the MCFG table agree by construction (cross-check tests at both the pcie and
+> device-bus layers). The ISA/LPC bridge moved from PIIX3 `00:01.0` to the **ICH9
+> LPC interface at `00:1F.0`** (`8086:2918`); the ICH9's PIRQ registers have the
+> same offsets (`0x60-0x63`) and byte semantics as the PIIX3's, so the
+> `PirqRouter`, ELCR, link devices, and `_PRT` all carry over unchanged — the
+> DSDT `_ADR` derives from the shared `ICH9_LPC_BRIDGE_BDF` constant and was
+> re-validated with `iasl`. The ICH9-only `PIRQ[E-H]_ROUT` bank (`0x68-0x6B`) is
+> seeded to its reset state. **Remaining q35-fidelity follow-ups:** (1) guest
+> writes to `PCIEXBAR` update the register but do **not** relocate the decoded
+> ECAM window (firmware-only register in practice; flag if a guest ever
+> reprograms it); (2) ~~add the SMBus function + LPC multifunction header bit~~ **done
+> (2026-06-11):** `D31` is now multifunction with the ICH9 SMBus host controller
+> (`8086:2930`) at `1F.3` — full i801 register file behind BAR4 (`0xB100`),
+> empty-bus semantics (probes complete `DEV_ERR`, in-use semaphore, block
+> buffer), INTB#/IRQ11 consistent with the PIRQ defaults; remaining: SATA at
+> `1F.2` (a real ICH9 always has it — needs an AHCI/IDE model, large); the
+> SMBus completion interrupt **is** delivered (2026-06-11, same day): the
+> register file's `INTB#` sink routes through the shared `route_pci_intx`
+> helper — live PIRQ config at assertion time, both controllers, level
+> semantics — so `INTREN`-driven drivers get the interrupt config space
+> promises instead of a timeout; (3) ~~subsystem IDs~~ **done (2026-06-11):** all three onboard
+> functions (MCH, LPC, SMBus) carry `1043:8694` — ASUSTeK's PCI-SIG vendor ID,
+> pinned by test against the SMBIOS default baseboard manufacturer (same-fact
+> pair); note the subsystem registers are still guest-writable (real ones are
+> RO) — a general config-space write-mask pass is a separate item;
+> (3b) **machine-identity coherence gap (flagged 2026-06-11):** the default
+> SMBIOS profile describes an AMD Ryzen 7950X on an ASUS B650E board while the
+> chipset model is Intel Q35 and the CPUID stealth table has both vendor
+> profiles — a guest cross-referencing SMBIOS against PCI IDs/CPUID sees an
+> impossible machine. The identity (CPU vendor profile + chipset + SMBIOS
+> board/CPU strings) should be selected coherently from ONE machine profile;
+> needs either an Intel-flavoured SMBIOS default to match Q35, or profile
+> plumbing that swaps all three surfaces together. **Partially addressed
+> (2026-06-11):** both canonical configs can now capture the HOST machine —
+> `CpuidStealthConfig::from_host` (host CPUID: vendor/FMS/features/brand/
+> cache geometry with guest-topology sharing rewrite) and
+> `SmbiosConfig::from_host` (DMI sysfs board/BIOS/system strings + host CPU
+> brand) — so the run path can present one real, coherent machine identity;
+> the *defaults* still mix profiles (synthetic-only path) and the chipset is
+> always Intel Q35, so when the host is AMD the run path should prefer
+> from_host SMBIOS/CPUID and accept the Intel-chipset divergence (real AMD
+> boards obviously don't carry a Q35 — an AMD chipset model is a large
+> follow-up); (4) route PIRQ E-H if a
+> device ever needs more than four lines.
 
 ### 0.3 USB Live Boot & Non-Destructive Testing (CRITICAL FOR ADOPTION)
 
@@ -1513,6 +1543,24 @@ Physical USB Devices
   ```
 - Support live re-routing via management console (move a device between guests at runtime)
 - Hot-plug events: when a new device is plugged in, apply routing rules and attach to correct guest
+
+> **Status (2026-06-11):** the **virtual xHCI controller is assembled, bus-mounted,
+> and routing-attachable** (pure userspace, no KVM). The previously-modelled-but-
+> unassembled xHCI parts (register files, port sets, doorbell array, command/event
+> rings, TRB codecs) are now one `VirtualXhciController` behind a single MMIO window
+> laid out as the capability block advertises; command processing does real slot-pool
+> allocation (Enable/Disable Slot, NoSlotsAvailable on exhaustion) and posts Command
+> Completion events; `connect_device`/`attach_device` flip `PORTSC` and post Port Status
+> Change events. It is mounted as a discrete Renesas uPD720202 PCI function (`1912:0015`)
+> at `00:04.0` with a 64 KiB BAR0 MMIO register window (`usb::XhciMmio`) and `INTA#`
+> delivered through the live PIRQ routing (level INTx, IP&IE-gated, withdrawn on
+> `IMAN.IP` clear). `StandardPc::attach_usb_device(speed)` is the seam the routing
+> engine drives: it picks the lowest free root-hub port and delivers the interrupt,
+> leaving *which guest* to the routing decision. **Still to do:** transfer-ring (TD)
+> processing — Normal/Setup/Data/Status TRBs forwarded to a real device via libusb
+> (ACRN's model); device-context (DCBAA/input-context) handling in guest memory (waits
+> on the KVM run loop); and the routing→controller binding that calls `attach_usb_device`
+> from a `RoutingState` assignment (needs the multi-guest controller registry).
 
 ### 4.4 Virtual xHCI Controller
 - Present each guest with an emulated xHCI (USB 3.x) host controller

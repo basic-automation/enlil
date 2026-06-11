@@ -129,4 +129,28 @@ mod tests {
         assert_eq!(mcfg[54], 0); // start bus
         assert_eq!(mcfg[55], 255); // end bus
     }
+
+    /// The ECAM base is encoded by two independent surfaces a guest can
+    /// cross-reference: the MCFG table (here) and the Q35 MCH's PCIEXBAR
+    /// register (config 0x60). Built from the same base, they must agree —
+    /// otherwise the firmware-described config aperture and the hardware
+    /// decode disagree, an impossible machine.
+    #[test]
+    fn mcfg_base_matches_the_mch_pciexbar() {
+        use crate::pcie::{PCIEXBAR_ENABLE, PCIEXBAR_OFFSET, PcieRootComplex};
+
+        let ecam_base = 0xB000_0000u64;
+        let mcfg = McfgBuilder::standard(ecam_base).build();
+        let mcfg_base = u64::from_le_bytes(mcfg[44..52].try_into().unwrap());
+
+        let mch = PcieRootComplex::create_q35_host_bridge(ecam_base);
+        let pciexbar = u64::from(mch.read_u32(PCIEXBAR_OFFSET))
+            | (u64::from(mch.read_u32(PCIEXBAR_OFFSET + 4)) << 32);
+        assert_eq!(
+            pciexbar & PCIEXBAR_ENABLE,
+            PCIEXBAR_ENABLE,
+            "PCIEXBAR enabled"
+        );
+        assert_eq!(pciexbar & !0xFu64, mcfg_base, "PCIEXBAR base == MCFG base");
+    }
 }

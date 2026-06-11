@@ -493,7 +493,7 @@ impl AmlBuilder {
     }
 
     /// `OperationRegion(name, space, offset, length)` — declare a region the
-    /// `Field` below names into. Used to expose the PIIX3 PCI-config PIRQ
+    /// `Field` below names into. Used to expose the LPC bridge's PCI-config PIRQ
     /// route-control bytes so the link devices can read/write live routing.
     /// `DefOpRegion := ExtOpPrefix OpRegionOp NameString RegionSpace
     /// RegionOffset RegionLen` — no `PkgLength` (ACPI 6.x §20.2.5.2).
