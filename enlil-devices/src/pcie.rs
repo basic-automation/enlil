@@ -256,21 +256,53 @@ impl PciConfigSpace {
         self.write_u8(cfg::INTERRUPT_PIN, pin);
     }
 
-    /// Handle a guest config space write (respecting BAR masks)
-    pub fn guest_write_u32(&mut self, offset: u16, value: u32) {
-        // BAR writes need special handling for size detection
-        if (cfg::BAR0..=cfg::BAR5).contains(&offset) {
+    /// Handle a guest config-space write of `width` (1/2/4) bytes at `offset`,
+    /// respecting both BAR size-detection masks and the **read-only header
+    /// registers** a guest must not be able to change (Vendor/Device ID, Class
+    /// Code, Header Type, Subsystem IDs — the device identity). Real hardware
+    /// ignores writes to those registers; a guest that tries (some drivers
+    /// probe-write to size a register) used to scribble over the identity the
+    /// platform programmed. Firmware/platform seeding uses the unmasked
+    /// `write_u*` methods, so this only constrains *guest* writes.
+    pub fn guest_write(&mut self, offset: u16, width: u8, value: u32) {
+        // BARs: the writable bits are the size-detection mask; the rest hold.
+        if (cfg::BAR0..=cfg::BAR5).contains(&offset) && width == 4 {
             let bar_idx = ((offset - cfg::BAR0) / 4) as usize;
             if bar_idx < 6 {
                 let mask = self.bar_masks[bar_idx];
                 let current = self.read_u32(offset);
-                // Guest writes all-ones to detect size, then writes the address
-                let new_val = (value & mask) | (current & !mask);
-                self.write_u32(offset, new_val);
+                self.write_u32(offset, (value & mask) | (current & !mask));
                 return;
             }
         }
-        self.write_u32(offset, value);
+        // Everything else: write byte by byte, skipping read-only bytes.
+        let bytes = value.to_le_bytes();
+        for (i, &b) in bytes.iter().enumerate().take(usize::from(width)) {
+            let off = offset + u16::try_from(i).unwrap_or(0);
+            if !Self::byte_is_read_only(off) {
+                self.write_u8(off, b);
+            }
+        }
+    }
+
+    /// Handle a guest 32-bit config write (BAR-mask + read-only aware).
+    pub fn guest_write_u32(&mut self, offset: u16, value: u32) {
+        self.guest_write(offset, 4, value);
+    }
+
+    /// Whether the config byte at `offset` is a read-only Type 0 header
+    /// register a guest write must not change: the device identity (Vendor ID
+    /// `0x00-01`, Device ID `0x02-03`, Revision ID `0x08`, Class/Subclass/
+    /// `ProgIF` `0x09-0x0B`, Header Type `0x0E`) and the Subsystem IDs
+    /// (`0x2C-0x2F`). Command/Status, the cache-line/latency bytes, BARs, and
+    /// the interrupt line stay guest-writable.
+    #[must_use]
+    const fn byte_is_read_only(offset: u16) -> bool {
+        matches!(offset,
+            cfg::VENDOR_ID..=0x03                  // Vendor + Device ID
+            | cfg::REVISION_ID..=cfg::CLASS_CODE   // Revision, ProgIF, Subclass, Class
+            | cfg::HEADER_TYPE
+            | cfg::SUBSYSTEM_VENDOR_ID..=0x2F) // Subsystem Vendor + Device ID
     }
 
     /// Get vendor ID
@@ -356,11 +388,11 @@ impl PcieRootComplex {
         let reg_offset = (offset & 0xFFF) as u16;
 
         if let Some(dev) = self.find_device_mut(&bdf) {
-            match size {
-                1 => dev.write_u8(reg_offset, u8_of(value)),
-                2 => dev.write_u16(reg_offset, u16_of(value)),
-                4 => dev.guest_write_u32(reg_offset, value),
-                _ => {}
+            // Every width is a guest write: BAR size-detection masks and the
+            // read-only header registers (device identity) are honored, so a
+            // guest can't reprogram Vendor/Device/Subsystem/Class IDs.
+            if matches!(size, 1 | 2 | 4) {
+                dev.guest_write(reg_offset, size, value);
             }
         }
     }
@@ -1037,6 +1069,46 @@ mod tests {
         let readback = cs.read_u32(cfg::BAR0);
         // Should have mask applied
         assert_eq!(readback & 0xFFFF_F000, 0xFFFF_F000);
+    }
+
+    /// The device-identity registers are read-only to a guest: a guest write
+    /// (any width) leaves Vendor/Device/Subsystem/Class IDs and the header
+    /// type unchanged, while writable registers (Command, BARs, interrupt
+    /// line) still take. This protects the chipset identity the platform
+    /// programs from a guest's probe-writes.
+    #[test]
+    fn guest_writes_cannot_change_the_device_identity() {
+        let mut cs = PciConfigSpace::new(PciBdf::new(0, 4, 0), vendors::RENESAS, XHCI_DEVICE_ID);
+        cs.set_class(0x0C, 0x03, 0x30, 0x02);
+        cs.set_subsystem(BOARD_SUBSYSTEM_VENDOR_ID, BOARD_SUBSYSTEM_DEVICE_ID);
+        cs.set_bar(0, 0xFE90_0000, 0xFFFF_0000);
+
+        // A guest tries to overwrite the whole identity block — ignored.
+        cs.guest_write(cfg::VENDOR_ID, 4, 0xDEAD_BEEF); // vendor+device
+        cs.guest_write(cfg::CLASS_CODE, 1, 0xFF); // class byte
+        cs.guest_write(cfg::SUBSYSTEM_VENDOR_ID, 4, 0x1234_5678);
+        cs.guest_write(cfg::REVISION_ID, 1, 0xAB);
+        cs.guest_write(cfg::HEADER_TYPE, 1, 0xFF);
+        assert_eq!(cs.vendor_id(), vendors::RENESAS);
+        assert_eq!(cs.device_id(), XHCI_DEVICE_ID);
+        assert_eq!(cs.read_u8(cfg::CLASS_CODE), 0x0C);
+        assert_eq!(cs.read_u8(cfg::REVISION_ID), 0x02);
+        assert_eq!(
+            cs.read_u16(cfg::SUBSYSTEM_VENDOR_ID),
+            BOARD_SUBSYSTEM_VENDOR_ID
+        );
+        assert_eq!(cs.read_u16(cfg::SUBSYSTEM_ID), BOARD_SUBSYSTEM_DEVICE_ID);
+
+        // Writable registers still take: Command (enable bus master/MMIO) and
+        // the interrupt line.
+        cs.guest_write(cfg::COMMAND, 2, 0x0006);
+        assert_eq!(cs.read_u16(cfg::COMMAND), 0x0006);
+        cs.guest_write(cfg::INTERRUPT_LINE, 1, 0x0B);
+        assert_eq!(cs.read_u8(cfg::INTERRUPT_LINE), 0x0B);
+
+        // BAR sizing still works (the writable bits are the size mask).
+        cs.guest_write(cfg::BAR0, 4, 0xFFFF_FFFF);
+        assert_eq!(cs.read_u32(cfg::BAR0) & 0xFFFF_0000, 0xFFFF_0000);
     }
 
     #[test]
