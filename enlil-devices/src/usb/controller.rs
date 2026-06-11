@@ -28,6 +28,7 @@
 //! [`pop_event`](VirtualXhciController::pop_event).
 
 use super::types::DeviceSpeed as UsbSpeed;
+use super::xhci::registers::XECP_OFFSET;
 use super::xhci::{
     CapabilityRegisters, CommandRing, CommandTrb, DoorbellArray, DoorbellTarget, EventRing,
     EventTrb, InterrupterRegisterSet, OperationalRegisters, RuntimeRegisters, Trb,
@@ -87,6 +88,9 @@ impl VirtualXhciController {
             o if o < op_base => self.caps.read(o),
             o if o < self.caps.rtsoff => self.op.read(o - op_base),
             o if o < self.caps.dboff => self.read_runtime(o - self.caps.rtsoff),
+            // The Extended Capabilities region (Supported Protocol caps) that
+            // HCCPARAMS1's xECP points at.
+            o if o >= XECP_OFFSET => self.caps.read_extended(o),
             // Doorbells are write-only; reads return zero (xHCI §5.6).
             _ => 0,
         }
@@ -244,13 +248,27 @@ impl VirtualXhciController {
             .unwrap_or(false)
     }
 
-    /// Attach a device of the given [`UsbSpeed`] to the **lowest free**
-    /// root-hub port, returning the 0-based port index it landed on (or
-    /// `None` if every port is occupied). This is the routing engine's entry
-    /// point: it routes a device to this guest's controller without choosing
-    /// a port itself.
+    /// Attach a device of the given [`UsbSpeed`] to the **lowest free port of
+    /// the matching protocol**, returning the 0-based port index it landed on
+    /// (or `None` if every compatible port is occupied). This is the routing
+    /// engine's entry point: it routes a device to this guest's controller
+    /// without choosing a port itself.
+    ///
+    /// The root-hub ports are split by the Supported Protocol capabilities
+    /// into a USB 2.0 group (the lower-numbered half — LS/FS/HS devices) and
+    /// a USB 3.0 group (SS/SSP devices), exactly as the capabilities advertise
+    /// them; a `SuperSpeed` drive will not land on a USB 2.0 port, matching real
+    /// hardware.
     pub fn attach_device(&mut self, speed: UsbSpeed) -> Option<usize> {
-        let port = self.op.ports.iter().position(|p| !p.is_connected())?;
+        let usb2 = usize::from(self.caps.usb2_port_count());
+        let range = if speed.is_superspeed() {
+            usb2..self.op.ports.len()
+        } else {
+            0..usb2
+        };
+        let port = range
+            .into_iter()
+            .find(|&i| !self.op.ports[i].is_connected())?;
         if self.connect_device(port, speed.xhci_speed_id()) {
             Some(port)
         } else {
@@ -540,11 +558,11 @@ mod tests {
     }
 
     #[test]
-    fn attach_fills_the_lowest_free_port_and_maps_speed() {
-        let mut c = running_controller(); // 4 ports
+    fn attach_fills_the_matching_protocol_port_and_maps_speed() {
+        let mut c = running_controller(); // 4 ports: 0-1 USB2, 2-3 USB3
         c.write_register(c.caps.rtsoff + 0x20, 2); // IE
 
-        // A keyboard (low speed) takes port 0 with PORTSC speed id 2.
+        // A keyboard (low speed) takes the lowest USB 2.0 port (0), speed id 2.
         assert_eq!(c.attach_device(UsbSpeed::Low), Some(0));
         let portsc0 = c.read_register(0x20 + 0x400);
         assert_eq!(
@@ -553,22 +571,58 @@ mod tests {
         );
         let _ = c.pop_event();
 
-        // A SuperSpeed drive takes the next free port (1) at speed id 4.
-        assert_eq!(c.attach_device(UsbSpeed::Super), Some(1));
-        let portsc1 = c.read_register(0x20 + 0x400 + 16);
+        // A SuperSpeed drive skips the USB 2.0 ports and lands on the lowest
+        // USB 3.0 port (2), speed id 4 — it cannot land on a USB 2.0 port.
+        assert_eq!(c.attach_device(UsbSpeed::Super), Some(2));
+        let portsc2 = c.read_register(0x20 + 0x400 + 32);
         assert_eq!(
-            (portsc1 >> 10) & 0xF,
+            (portsc2 >> 10) & 0xF,
             u32::from(UsbSpeed::Super.xhci_speed_id())
         );
 
-        // Fill the remaining two, then the fifth attach finds no free port.
-        assert_eq!(c.attach_device(UsbSpeed::High), Some(2));
-        assert_eq!(c.attach_device(UsbSpeed::Full), Some(3));
-        assert_eq!(c.attach_device(UsbSpeed::High), None);
+        // Fill each protocol group; a third device of that protocol has no port.
+        assert_eq!(c.attach_device(UsbSpeed::High), Some(1)); // last USB2
+        assert_eq!(c.attach_device(UsbSpeed::Full), None); // USB2 full
+        assert_eq!(c.attach_device(UsbSpeed::SuperPlus), Some(3)); // last USB3
+        assert_eq!(c.attach_device(UsbSpeed::Super), None); // USB3 full
 
-        // Detaching frees the port for reuse (lowest-free again).
-        assert!(c.disconnect_device(1));
-        assert_eq!(c.attach_device(UsbSpeed::High), Some(1));
+        // Detaching a USB2 port frees it for the next LS/FS/HS device.
+        assert!(c.disconnect_device(0));
+        assert_eq!(c.attach_device(UsbSpeed::Full), Some(0));
+    }
+
+    #[test]
+    fn hccparams1_advertises_parseable_supported_protocol_caps() {
+        use super::super::xhci::registers::XECP_OFFSET;
+        let c = VirtualXhciController::new(4);
+
+        // HCCPARAMS1 xECP (bits 31:16, in dwords) points at the cap list.
+        let hccparams1 = c.read_register(0x10);
+        let xecp_dwords = hccparams1 >> 16;
+        assert_ne!(xecp_dwords, 0, "a real xHCI never has xECP == 0");
+        assert_eq!(xecp_dwords * 4, XECP_OFFSET);
+
+        // Walk the list: USB 2.0 cap, then (via the next pointer) USB 3.0.
+        let cap0 = c.read_register(XECP_OFFSET);
+        assert_eq!(cap0 & 0xFF, 0x02, "Supported Protocol cap ID");
+        assert_eq!(cap0 >> 24, 2, "major revision 2 (USB 2.0)");
+        assert_eq!(
+            c.read_register(XECP_OFFSET + 4),
+            u32::from_le_bytes(*b"USB ")
+        );
+        let ports0 = c.read_register(XECP_OFFSET + 8);
+        assert_eq!(ports0 & 0xFF, 1, "USB2 compatible port offset");
+        assert_eq!((ports0 >> 8) & 0xFF, 2, "USB2 covers ports 1-2");
+
+        let next = (cap0 >> 8) & 0xFF; // next-cap pointer in dwords
+        assert_eq!(next, 4);
+        let cap1 = c.read_register(XECP_OFFSET + next * 4);
+        assert_eq!(cap1 & 0xFF, 0x02);
+        assert_eq!(cap1 >> 24, 3, "major revision 3 (USB 3.0)");
+        assert_eq!((cap1 >> 8) & 0xFF, 0, "USB 3.0 cap ends the list");
+        let ports1 = c.read_register(XECP_OFFSET + next * 4 + 8);
+        assert_eq!(ports1 & 0xFF, 3, "USB3 ports start after the USB2 group");
+        assert_eq!((ports1 >> 8) & 0xFF, 2, "USB3 covers ports 3-4");
     }
 
     #[test]

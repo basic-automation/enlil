@@ -39,6 +39,14 @@ impl DeviceSpeed {
             Self::SuperPlus => 5,
         }
     }
+
+    /// Whether this speed operates over the USB 3.0 (`SuperSpeed`) protocol —
+    /// the speeds that attach to a controller's USB 3.0 ports, as opposed to
+    /// the LS/FS/HS speeds that attach to its USB 2.0 ports.
+    #[must_use]
+    pub const fn is_superspeed(self) -> bool {
+        matches!(self, Self::Super | Self::SuperPlus)
+    }
 }
 
 impl fmt::Display for DeviceSpeed {
