@@ -483,7 +483,17 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > impossible machine. The identity (CPU vendor profile + chipset + SMBIOS
 > board/CPU strings) should be selected coherently from ONE machine profile;
 > needs either an Intel-flavoured SMBIOS default to match Q35, or profile
-> plumbing that swaps all three surfaces together; (4) route PIRQ E-H if a
+> plumbing that swaps all three surfaces together. **Partially addressed
+> (2026-06-11):** both canonical configs can now capture the HOST machine —
+> `CpuidStealthConfig::from_host` (host CPUID: vendor/FMS/features/brand/
+> cache geometry with guest-topology sharing rewrite) and
+> `SmbiosConfig::from_host` (DMI sysfs board/BIOS/system strings + host CPU
+> brand) — so the run path can present one real, coherent machine identity;
+> the *defaults* still mix profiles (synthetic-only path) and the chipset is
+> always Intel Q35, so when the host is AMD the run path should prefer
+> from_host SMBIOS/CPUID and accept the Intel-chipset divergence (real AMD
+> boards obviously don't carry a Q35 — an AMD chipset model is a large
+> follow-up); (4) route PIRQ E-H if a
 > device ever needs more than four lines.
 
 Enlil must be testable without modifying the user's existing system. This is the single most important usability feature for early adoption.

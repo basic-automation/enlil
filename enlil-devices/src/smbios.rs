@@ -124,6 +124,106 @@ impl Default for SmbiosConfig {
     }
 }
 
+impl SmbiosConfig {
+    /// Build an SMBIOS config **from this host machine's own identity**: the
+    /// DMI strings the firmware wrote (read from `/sys/class/dmi/id`) and the
+    /// CPU brand string from the host's CPUID — so the guest sees the
+    /// physical machine's vendor/board/BIOS identity, which is what Windows
+    /// activation checks and what transparency requires (ROADMAP §5.2).
+    ///
+    /// `cpu_cores`/`cpu_threads` describe the **guest** topology (they must
+    /// agree with what CPUID leaf 1/0xB advertises to the guest, not with the
+    /// host's full core count). Every field the host doesn't expose — DMI
+    /// sysfs absent (containers), root-only serial/UUID files — falls back to
+    /// the default profile's value, field by field.
+    #[must_use]
+    pub fn from_host(cpu_cores: u8, cpu_threads: u8) -> Self {
+        let mut config = Self::from_dmi_dir(std::path::Path::new("/sys/class/dmi/id"));
+        config.cpu_cores = cpu_cores;
+        config.cpu_threads = cpu_threads;
+        #[cfg(target_arch = "x86_64")]
+        if let Some(brand) = host_cpu_brand() {
+            config.cpu_brand = brand;
+        }
+        config
+    }
+
+    /// Read the DMI identity strings from `dir` (the layout of Linux's
+    /// `/sys/class/dmi/id`), falling back to the default profile per missing
+    /// or unreadable file.
+    fn from_dmi_dir(dir: &std::path::Path) -> Self {
+        let mut config = Self::default();
+        let read = |name: &str| -> Option<String> {
+            let s = std::fs::read_to_string(dir.join(name)).ok()?;
+            let s = s.trim();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.to_string())
+            }
+        };
+        for (field, file) in [
+            (&mut config.bios_vendor, "bios_vendor"),
+            (&mut config.bios_version, "bios_version"),
+            (&mut config.bios_date, "bios_date"),
+            (&mut config.system_manufacturer, "sys_vendor"),
+            (&mut config.system_product, "product_name"),
+            (&mut config.system_version, "product_version"),
+            (&mut config.system_serial, "product_serial"),
+            (&mut config.system_sku, "product_sku"),
+            (&mut config.system_family, "product_family"),
+            (&mut config.baseboard_manufacturer, "board_vendor"),
+            (&mut config.baseboard_product, "board_name"),
+            (&mut config.baseboard_serial, "board_serial"),
+        ] {
+            if let Some(value) = read(file) {
+                *field = value;
+            }
+        }
+        // product_uuid ("8-4-4-4-12" hex): root-only on most systems, so this
+        // usually falls back to the default.
+        if let Some(uuid) = read("product_uuid").and_then(|u| parse_dmi_uuid(&u)) {
+            config.system_uuid = uuid;
+        }
+        config
+    }
+}
+
+/// Parse a DMI UUID string (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`) into its
+/// 16 raw bytes (in string order, as the sysfs file presents it).
+fn parse_dmi_uuid(s: &str) -> Option<[u8; 16]> {
+    let hex: String = s.chars().filter(char::is_ascii_alphanumeric).collect();
+    if hex.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// The host CPU's brand string from CPUID `0x80000002-4`, trimmed of the
+/// leading-space padding real parts carry. `None` if unenumerated (no
+/// `x86_64` part ships without it) or empty.
+#[cfg(target_arch = "x86_64")]
+fn host_cpu_brand() -> Option<String> {
+    use core::arch::x86_64::__cpuid;
+    if __cpuid(0x8000_0000).eax < 0x8000_0004 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(48);
+    for i in 0..3u32 {
+        let r = __cpuid(0x8000_0002 + i);
+        for reg in [r.eax, r.ebx, r.ecx, r.edx] {
+            bytes.extend_from_slice(&reg.to_le_bytes());
+        }
+    }
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    let brand = String::from_utf8_lossy(&bytes[..end]).trim().to_string();
+    if brand.is_empty() { None } else { Some(brand) }
+}
+
 /// SMBIOS table builder
 pub struct SmbiosBuilder {
     config: SmbiosConfig,
@@ -787,6 +887,70 @@ mod tests {
             t4.2.get(1).map(String::as_str),
             Some("Advanced Micro Devices, Inc."),
             "Type 4 string table must not be shifted by a short formatted area"
+        );
+    }
+
+    #[test]
+    fn from_dmi_dir_captures_present_fields_and_defaults_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("board_vendor"),
+            "Micro-Star INT'L CO.,LTD\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("bios_version"), "  1.80  \n").unwrap();
+        std::fs::write(
+            dir.path().join("product_uuid"),
+            "00112233-4455-6677-8899-aabbccddeeff\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("product_serial"), "\n").unwrap(); // empty → default
+
+        let cfg = SmbiosConfig::from_dmi_dir(dir.path());
+        let default = SmbiosConfig::default();
+        // Present files are captured, trimmed of sysfs whitespace.
+        assert_eq!(cfg.baseboard_manufacturer, "Micro-Star INT'L CO.,LTD");
+        assert_eq!(cfg.bios_version, "1.80");
+        assert_eq!(
+            cfg.system_uuid,
+            [
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+                0xEE, 0xFF
+            ]
+        );
+        // Absent or empty files keep the default profile's values.
+        assert_eq!(cfg.system_manufacturer, default.system_manufacturer);
+        assert_eq!(cfg.system_serial, default.system_serial);
+    }
+
+    #[test]
+    fn from_dmi_dir_without_dmi_is_the_default_profile() {
+        let cfg = SmbiosConfig::from_dmi_dir(std::path::Path::new("/nonexistent/dmi"));
+        let default = SmbiosConfig::default();
+        assert_eq!(cfg.baseboard_manufacturer, default.baseboard_manufacturer);
+        assert_eq!(cfg.bios_vendor, default.bios_vendor);
+        assert_eq!(cfg.system_uuid, default.system_uuid);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn from_host_takes_the_guest_topology_and_the_host_cpu_brand() {
+        let cfg = SmbiosConfig::from_host(8, 16);
+        assert_eq!(cfg.cpu_cores, 8);
+        assert_eq!(cfg.cpu_threads, 16);
+        // Every x86_64 part enumerates a brand string; the tables it feeds
+        // must never carry an empty CPU name.
+        assert!(!cfg.cpu_brand.is_empty());
+    }
+
+    #[test]
+    fn dmi_uuid_parser_rejects_malformed_input() {
+        assert!(parse_dmi_uuid("not-a-uuid").is_none());
+        assert!(parse_dmi_uuid("").is_none());
+        assert!(parse_dmi_uuid("00112233-4455-6677-8899-aabbccddee").is_none()); // short
+        assert_eq!(
+            parse_dmi_uuid("00000000-0000-0000-0000-000000000001"),
+            Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
         );
     }
 }
