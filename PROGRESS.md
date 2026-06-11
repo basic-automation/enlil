@@ -8,14 +8,26 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ## 2026-06-11 — Session: Q35/ICH9 chipset identity arc + host-machine identity capture + virtual xHCI assembly
 
-**13 increments, each independently green and committed** (PR #21, branch
+**17 increments, each independently green and committed** (PR #21, branch
 `claude/awesome-faraday-aomlqt`). Picked up the morning hand-off's #1 (q35 chipset
 identity) and ran it to completion, then continued into the host-identity-capture
 consolidation (#2 CPUID paths, SMBIOS) and the long-dormant Phase 4 xHCI assembly.
-Workspace tests **897 → 919** (`cargo test --workspace`: 919 passed, 0 failed, 1 ignored =
+Workspace tests **897 → 922** (`cargo test --workspace`: 922 passed, 0 failed, 1 ignored =
 the `/dev/kvm` self-skip). `cargo build --workspace`, `cargo fmt --all -- --check`,
 `cargo clippy --all-targets --workspace -- -D warnings` green at every commit. `/dev/kvm`
 **still absent** (verified). `iasl` 20230628 + `dmidecode` 3.5 installed and used.
+
+Increments after the initial hand-off draft (this entry was extended in place):
+- **`d68fb0d`** Pinned the MCFG ECAM base against the MCH PCIEXBAR (the ACPI half of
+  the q35 ECAM cross-surface pair; device-bus half was in the identity commit).
+- **`1b04abe`** xHCI now advertises Supported Protocol extended capabilities (`HCCPARAMS1`
+  xECP was 0 — a controller no vendor ships): a USB 2.0 + USB 3.0 cap pair with the
+  root-hub ports split by protocol; `attach_device` is protocol-aware (SS→USB3 ports,
+  LS/FS/HS→USB2 ports).
+- **`be6cb30`** PCI identity registers (Vendor/Device/Subsystem/Class IDs, Header Type)
+  are now read-only to guest config writes — `PciConfigSpace::guest_write(offset, width,
+  value)` is the single masked write path (also fixed a pre-existing byte/word ECAM write
+  bypass). Protects all the identity the session programmed.
 
 ### Arc 1 — Chipset identity is now coherently Q35/ICH9 (was a mixed-generation impossibility)
 The platform mixed an i440FX host bridge (`8086:1237`, no ECAM) with PCIe ECAM/MCFG and a
