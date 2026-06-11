@@ -139,7 +139,7 @@ impl FadtBuilder {
             oem: OemInfo::default(),
             dsdt_address,
             facs_address: 0,
-            sci_interrupt: 9,
+            sci_interrupt: u16::from(crate::chipset::SCI_IRQ),
             // SMI command port + enable/disable values are owned by the
             // SMI-command device model, so the table and the port that actually
             // toggles SCI_EN can't drift (the OS's ACPI-enable handshake targets

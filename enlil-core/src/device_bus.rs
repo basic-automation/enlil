@@ -688,6 +688,23 @@ impl DeviceBus {
                 // every onboard function (the generic ISA-bridge factory can't
                 // assume a board, so it's done at the platform seeding site).
                 bridge.set_subsystem(BOARD_SUBSYSTEM_VENDOR_ID, BOARD_SUBSYSTEM_DEVICE_ID);
+                // PMBASE/ACPI_CNTL: on an ICH the ACPI PM I/O block's location
+                // physically comes from these LPC registers — firmware programs
+                // them and then writes the same ports into the FADT. The PM
+                // models already sit at the ICH9 fixed offsets from 0x600
+                // (PM1 +0/+4, PM_TMR +8, GPE0 +0x20), so encode that base,
+                // enabled, with the SCI on the FADT's IRQ.
+                bridge.write_u32(
+                    enlil_devices::pcie::LPC_PMBASE_OFFSET,
+                    u32::from(enlil_devices::chipset::PM1_EVT_PORT) | 1,
+                );
+                bridge.write_u8(
+                    enlil_devices::pcie::LPC_ACPI_CNTL_OFFSET,
+                    enlil_devices::pcie::ACPI_CNTL_ACPI_EN
+                        | enlil_devices::pcie::acpi_cntl_sci_select(
+                            enlil_devices::chipset::SCI_IRQ,
+                        ),
+                );
                 // Firmware programs the PIRQ routing registers out of their 0x80
                 // reset (disabled) state to the defaults the DSDT advertises — the
                 // same PIRQ_DEFAULT_IRQS the link devices' _CRS reports — so a guest
@@ -1729,6 +1746,26 @@ mod tests {
                 );
                 assert_eq!(dev.read_u16(cfg::SUBSYSTEM_ID), BOARD_SUBSYSTEM_DEVICE_ID);
             }
+
+            // PMBASE/ACPI_CNTL: the LPC registers the ACPI PM I/O block
+            // physically hangs off must encode the ports the FADT advertises
+            // and the bus decodes (PM1 +0/+4, PM_TMR +8, GPE0 +0x20), with
+            // the decode enabled and the SCI on the FADT's IRQ.
+            use enlil_devices::chipset::{GPE0_PORT, PM1_CNT_PORT, PM1_EVT_PORT, SCI_IRQ};
+            use enlil_devices::pcie::{
+                acpi_cntl_sci_irq, ACPI_CNTL_ACPI_EN, LPC_ACPI_CNTL_OFFSET, LPC_PMBASE_OFFSET,
+            };
+            use enlil_devices::timer::PM_TIMER_PORT;
+            let pmbase = lpc.read_u32(LPC_PMBASE_OFFSET);
+            assert_eq!(pmbase & 1, 1, "PMBASE bit 0 is hardwired (I/O space)");
+            let base = u16::try_from(pmbase & 0xFF80).unwrap();
+            assert_eq!(base, PM1_EVT_PORT);
+            assert_eq!(base + 4, PM1_CNT_PORT);
+            assert_eq!(base + 8, PM_TIMER_PORT);
+            assert_eq!(base + 0x20, GPE0_PORT);
+            let cntl = lpc.read_u8(LPC_ACPI_CNTL_OFFSET);
+            assert_eq!(cntl & ACPI_CNTL_ACPI_EN, ACPI_CNTL_ACPI_EN);
+            assert_eq!(acpi_cntl_sci_irq(cntl), SCI_IRQ);
             assert_eq!(smb.read_u32(cfg::BAR4), u32::from(SMBUS_IO_BASE) | 1);
             assert_eq!(smb.read_u8(cfg::INTERRUPT_PIN), 2);
             let expected = PirqRouter::default_device_isa_irq(31, 2).unwrap();

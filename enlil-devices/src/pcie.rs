@@ -508,6 +508,51 @@ pub const ICH9_SMBUS_DEVICE_ID: u16 = 0x2930;
 /// ICH9 datasheet's `D31:F3` interrupt-pin register.
 pub const SMBUS_INTERRUPT_PIN: u8 = 2;
 
+/// LPC config offset of `PMBASE` (ICH9 `D31:F0`, 32-bit).
+///
+/// Bits 15:7 are the ACPI PM I/O block's base, bit 0 is hardwired 1 (I/O
+/// space). The fixed PM register offsets hang off it — `PM1_STS/EN` at +0,
+/// `PM1_CNT` at +4, `PM1_TMR` at +8, `GPE0` at +0x20 — so the base this
+/// register encodes, the blocks the FADT advertises, and the ports the bus
+/// decodes must all agree.
+pub const LPC_PMBASE_OFFSET: u16 = 0x40;
+
+/// LPC config offset of `ACPI_CNTL` (ICH9 D31:F0): bit 7 (`ACPI_EN`) enables
+/// the PMBASE decode, bits 2:0 select the SCI's ISA IRQ.
+pub const LPC_ACPI_CNTL_OFFSET: u16 = 0x44;
+
+/// `ACPI_CNTL` bit 7: the ACPI I/O decode enable.
+pub const ACPI_CNTL_ACPI_EN: u8 = 0x80;
+
+/// Encode an SCI IRQ into `ACPI_CNTL` bits 2:0 (ICH9 datasheet: 0-2 select
+/// IRQ 9-11, 4-7 select IRQ 20-23; other IRQs are not selectable).
+#[must_use]
+pub const fn acpi_cntl_sci_select(irq: u8) -> u8 {
+    match irq {
+        10 => 1,
+        11 => 2,
+        20 => 4,
+        21 => 5,
+        22 => 6,
+        23 => 7,
+        _ => 0, // IRQ9, the power-on default
+    }
+}
+
+/// Decode `ACPI_CNTL` bits 2:0 back to the SCI's ISA IRQ.
+#[must_use]
+pub const fn acpi_cntl_sci_irq(cntl: u8) -> u8 {
+    match cntl & 0x7 {
+        1 => 10,
+        2 => 11,
+        4 => 20,
+        5 => 21,
+        6 => 22,
+        7 => 23,
+        _ => 9,
+    }
+}
+
 /// Config-space offset of the first PCI interrupt-routing register.
 ///
 /// `PIRQA_ROUT`; the four `PIRQ[A-D]_ROUT` registers are contiguous at
