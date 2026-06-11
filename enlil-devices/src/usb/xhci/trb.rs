@@ -425,6 +425,38 @@ impl CommandTrb {
     }
 }
 
+impl CommandTrb {
+    /// Attempt to decode a command TRB from a raw TRB fetched off the
+    /// command ring (the inverse of [`to_trb`](Self::to_trb)).
+    #[must_use]
+    pub const fn from_trb(trb: &Trb) -> Option<Self> {
+        let slot_id = (trb.control >> 24) as u8;
+        let endpoint_id = ((trb.control >> 16) & 0x1F) as u8;
+        match trb.decoded_type() {
+            TrbType::EnableSlotCommand => Some(Self::EnableSlot),
+            TrbType::DisableSlotCommand => Some(Self::DisableSlot { slot_id }),
+            TrbType::AddressDeviceCommand => Some(Self::AddressDevice {
+                slot_id,
+                input_context_ptr: trb.parameter,
+            }),
+            TrbType::ConfigureEndpointCommand => Some(Self::ConfigureEndpoint {
+                slot_id,
+                input_context_ptr: trb.parameter,
+            }),
+            TrbType::ResetEndpointCommand => Some(Self::ResetEndpoint {
+                slot_id,
+                endpoint_id,
+            }),
+            TrbType::StopEndpointCommand => Some(Self::StopEndpoint {
+                slot_id,
+                endpoint_id,
+            }),
+            TrbType::NoOpCommand => Some(Self::NoOp),
+            _ => None,
+        }
+    }
+}
+
 /// An event TRB produced by the controller on the event ring.
 #[derive(Debug, Clone, Copy)]
 pub enum EventTrb {
