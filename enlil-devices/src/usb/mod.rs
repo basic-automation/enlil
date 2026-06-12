@@ -29,6 +29,7 @@
 pub mod controller;
 pub mod device;
 pub mod emulated;
+pub mod hotplug;
 pub mod monitor;
 pub mod registry;
 pub mod routing;
@@ -38,6 +39,7 @@ pub mod xhci;
 pub use controller::{SharedXhci, VirtualXhciController, XhciMmio};
 pub use device::{UsbClass, UsbDevice, UsbDeviceId, UsbDeviceState, UsbSpeed};
 pub use emulated::{LoopbackDevice, UsbDeviceModel, UsbTransferResult};
+pub use hotplug::{HotplugDispatcher, HotplugOutcome};
 pub use monitor::{UsbHotplugEvent, UsbMonitor};
 pub use registry::{AttachOutcome, DevicePlacement, RegistryError, XhciRegistry};
 pub use routing::{RoutingRule, RoutingState, RoutingTable};
