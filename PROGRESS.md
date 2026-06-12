@@ -6,6 +6,95 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-12 — Session: Phase 4 USB routing — TD processing, device models, routing→controller binding, hot-plug bridge
+
+**6 increments, each independently green and committed.** Increments 1–3 went out as
+**PR #22 (merged)**; increments 4–6 are on `claude/awesome-faraday-u1tb3x` → **PR #23**.
+Workspace tests **923 → 975** (`cargo test --workspace`: 975 passed, 0 failed, 1 ignored =
+the `/dev/kvm` self-skip). `cargo build --workspace`, `cargo fmt --all -- --check`,
+`cargo clippy --all-targets --workspace -- -D warnings` green at every commit. `/dev/kvm`
+**still absent** (verified — no nested virt).
+
+### Increments (all in the morning hand-off's top-2 lane: Phase 4 xHCI/routing)
+1. **`941f909` (phase-4.4) Transfer-ring (TD) processing.** `usb::xhci::transfer` (Setup/
+   Data/Status/Normal TRB codecs, SETUP as IDT immediate data, DCI helpers, the
+   **`DmaMemory` guest-memory seam** + Vec-backed test double); `usb::emulated` with the
+   **`UsbDeviceModel` trait** (the future libusb boundary, ACRN's three transfer shapes) and
+   a `LoopbackDevice`; controller grows per-(slot, DCI) transfer rings, an EP0
+   Setup→Data→Status stage machine, scatter/gather, Transfer Events with the spec's 24-bit
+   residual (`requested − transferred`, Short Packet on short TDs), STALL→halt with **Reset
+   Endpoint actually recovering the ring**, Disable Slot dropping the slot machinery.
+   Device-slot doorbells latch at register-write time; `service_doorbells(mem)` drains them.
+2. **`fd0284c` (phase-4.5) Routing→controller binding.** `usb::registry::XhciRegistry`:
+   guest→`SharedXhci` map; `attach` consults `RoutingState` and lands the device on the
+   decided guest's lowest free protocol-matching port (rollback on unknown guest / full
+   controller); `detach`; live `reassign` = virtual unplug/replug with real hot-plug events
+   on both guests, failed moves replug on the original guest. Tests run the Phase 4.5
+   milestone in miniature (two mice + two keyboards → two guests, live reassignment).
+3. **`9c3bab0` (phase-4.3) Hot-plug bridge.** `usb::hotplug::HotplugDispatcher`: monitor
+   callbacks (any thread) → mpsc channel → `service(&mut registry)` on the run-loop thread
+   (the single thread owning the `Rc<RefCell>` controller handles); port-path→bus-address
+   map so disconnects (which only name the port) find their placement; outcomes enum for
+   the console's notification feed.
+4. **`3b2aa35` (phase-4.5) Management-protocol USB controls + protocol-module revival.**
+   `UsbDeviceEntry`, `ServerMessage::{UsbDeviceList, UsbHotplugNotice}`,
+   `ClientMessage::{RequestUsbDevices, UsbCommand}` with `UsbAction::{Reassign, Detach}`.
+   **Found:** `enlil-mgmt/src/protocol.rs` was never declared as a module — never compiled
+   (missing `thiserror` dep, lossy cast, missing docs all latent); it is now the root of a
+   real lib target. **Also found and removed:** `enlil-mgmt/src/tui/mod.rs` contained only
+   an 80-byte tool-placeholder string (`[content omitted from context — 12779 bytes …]`) —
+   same corruption pattern as the 2026-06-02 `kvm_backend.rs` incident; the real TUI was
+   never committed.
+5. **`05286a5` (phase-4.5) Emulated HID boot keyboard.** `EmulatedKeyboard`: canonical
+   63-byte E.6 report descriptor, coherent device/config/HID/endpoint descriptor block
+   (the shape stock Windows/Linux HID drivers class-match), `SET_IDLE`/`SET_PROTOCOL`,
+   LED `SET_REPORT`, 6-key-rollover boot reports on the interrupt IN endpoint; end-to-end
+   test delivers a key report into guest memory through the TD path.
+6. **`fbbb6fa` (phase-4.4) Address Device parses the input context.** Doorbell 0 now
+   latches like the rest (commands process in `service_doorbells`, with guest memory);
+   `address_device` validates A0|A1 add flags (else the new `ParameterError`, xHCI code
+   17) and reads the slot context's root-hub port number, **binding the model parked at
+   that port to the slot** — the real enumeration flow. `attach_device_with_model` parks
+   models at routing time; Disable Slot re-parks (guest can re-enumerate); registry
+   threads models through attach/reassign.
+
+### Research (informed the build) — logged in RESEARCH.md → 2026-06-12
+- ACRN `xhci.c` TD assembly (chain bit, `USB_DATA_PART`/`USB_DATA_FULL`; control stages
+  are separate TDs → per-EP0 state machine).
+- Linux fix "xhci: Fix TRB transfer length macro used for Event TRB": event TRBs carry a
+  **24-bit residual**, not the 17-bit requested length — drivers compute
+  `transferred = requested − residual`; wrong residuals silently corrupt length accounting.
+- xHCI §6.4.1.2.1 (SETUP is IDT immediate data; TRT field), §4.5.1 (DCI = ep×2+dir),
+  §6.2.5.1 (input control context A0|A1 for Address Device), §6.2.2 (slot context dword 1
+  bits 23:16 = root-hub port number).
+
+### Test results (exact)
+- `cargo build --workspace` OK · `cargo fmt --all -- --check` OK ·
+  `cargo clippy --all-targets --workspace -- -D warnings` OK ·
+  `cargo test --workspace` → **975 passed, 0 failed, 1 ignored**.
+- `/dev/kvm`: **not run — absent (no nested virt)**, verified. no_std custom target: N/A
+  (no crate is `#![no_std]`).
+
+### Recommended next steps (tomorrow)
+1. **libusb-backed `UsbDeviceModel`** (Phase 4 host side): a `rusb`-based forwarder
+   implementing the three transfer shapes against a real device, feature-gated +
+   self-skipping when no device/permission (like the KVM test). The seam is ready and
+   tested; this is the last piece between the routing stack and physical hardware.
+2. **Configure Endpoint context handling**: parse endpoint contexts (add flags A2+) out of
+   the input context the same way Address Device now does — gives transfer rings their
+   real EP types/max-packet instead of get-or-create.
+3. **TUI USB tab** (Phase 4.5 milestone UI): ratatui table over
+   `UsbDeviceList`/`UsbHotplugNotice` + `UsbCommand{Reassign,Detach}`; the protocol seam
+   landed this session. Note the old `tui/mod.rs` was a corrupt placeholder (removed) —
+   build fresh; also the core-side daemon that answers `RequestUsbDevices` from
+   `XhciRegistry::placements()` + `UsbMonitor::devices()` does not exist yet.
+4. **Guest-memory-resident rings** (CRCR/DCBAAP/ERSTBA dereferencing through `DmaMemory`)
+   — the seam is in place; the doorbell/service split already matches the KVM exit shape.
+5. Machine-identity profile coherence (hand-off item from 2026-06-11 #1) remains open:
+   wire `from_host` CPUID/SMBIOS into the boot/fw_cfg delivery path.
+
+---
+
 ## 2026-06-11 — Session: Q35/ICH9 chipset identity arc + host-machine identity capture + virtual xHCI assembly
 
 **17 increments, each independently green and committed** (PR #21, branch

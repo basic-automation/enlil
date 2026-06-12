@@ -76,6 +76,12 @@ pub struct VirtualXhciController {
     /// EP0 control-transfer stage tracking per slot (Setup/Data/Status
     /// arrive as separate TDs, xHCI §4.11.2.2).
     control_state: BTreeMap<u8, ControlStage>,
+    /// Device models parked at root-hub ports (index = 0-based port) until
+    /// Address Device binds them to a slot.
+    port_models: Vec<Option<Box<dyn UsbDeviceModel>>>,
+    /// The port each slot's model was bound from (the model parks there
+    /// again on Disable Slot, so the guest can re-enumerate it).
+    slot_ports: BTreeMap<u8, usize>,
 }
 
 /// Where slot's EP0 is within the Setup → Data → Status sequence.
@@ -115,6 +121,8 @@ impl VirtualXhciController {
             transfer_rings: BTreeMap::new(),
             device_models: BTreeMap::new(),
             control_state: BTreeMap::new(),
+            port_models: (0..num_ports).map(|_| None).collect(),
+            slot_ports: BTreeMap::new(),
         }
     }
 
@@ -135,7 +143,8 @@ impl VirtualXhciController {
     }
 
     /// Write a 32-bit register at `offset` within the controller's MMIO
-    /// window. A doorbell-0 write kicks command-ring processing.
+    /// window. Doorbell writes latch pending until
+    /// [`service_doorbells`](Self::service_doorbells).
     pub fn write_register(&mut self, offset: u32, value: u32) {
         let op_base = u32::from(self.caps.caplength);
         match offset {
@@ -145,15 +154,12 @@ impl VirtualXhciController {
             o if o < self.caps.dboff => self.write_runtime(o - self.caps.rtsoff, value),
             o => {
                 let index = u8::try_from((o - self.caps.dboff) / 4).unwrap_or(u8::MAX);
-                // Doorbell 0 (command ring) is processed inline — commands
-                // never touch guest memory here. Device-slot doorbells latch
-                // pending and are drained by `service_doorbells`, which is
-                // where guest memory is in hand (matching the run loop's
-                // doorbell-write-exit → service shape).
-                if self.doorbells.write(index, value) == Some(DoorbellTarget::HostCommand) {
-                    self.process_command_ring();
-                    self.doorbells.clear_pending(index);
-                }
+                // Every doorbell latches pending — including doorbell 0:
+                // command processing happens in `service_doorbells`, where
+                // guest memory (for Address Device's input context) is in
+                // hand, matching the run loop's doorbell-write-exit →
+                // service shape.
+                let _ = self.doorbells.write(index, value);
             }
         }
     }
@@ -216,15 +222,16 @@ impl VirtualXhciController {
     /// Model the guest enqueueing a command on the command ring (until rings
     /// live in guest memory, this stands in for the guest's TRB write). Ring
     /// doorbell 0 — via [`write_register`](Self::write_register) at the
-    /// `DBOFF` window — to have it processed.
+    /// `DBOFF` window — and call
+    /// [`service_doorbells`](Self::service_doorbells) to have it processed.
     pub fn submit_command(&mut self, command: &CommandTrb) -> bool {
         self.command_ring.submit(command.to_trb(true))
     }
 
     /// Drain the command ring (doorbell 0, xHCI §4.6): execute each command
-    /// and post its Command Completion event. A halted controller leaves the
-    /// ring untouched, as real hardware does.
-    fn process_command_ring(&mut self) {
+    /// against guest memory and post its Command Completion event. A halted
+    /// controller leaves the ring untouched, as real hardware does.
+    fn process_command_ring(&mut self, mem: &dyn DmaMemory) {
         if !self.op.is_running() {
             return;
         }
@@ -233,12 +240,20 @@ impl VirtualXhciController {
                 Some(CommandTrb::NoOp) => (TrbCompletionCode::Success, 0),
                 Some(CommandTrb::EnableSlot) => self.enable_slot(),
                 Some(CommandTrb::DisableSlot { slot_id }) => (self.disable_slot(slot_id), slot_id),
-                // Address/configure/stop need the device-context memory
-                // the KVM run loop will provide; succeed on an enabled slot so
-                // a driver's bring-up sequence can proceed, error otherwise.
+                // Address Device reads the input context out of guest memory
+                // and binds the named port's parked device model to the slot.
+                Some(CommandTrb::AddressDevice {
+                    slot_id,
+                    input_context_ptr,
+                }) => (
+                    self.address_device(slot_id, input_context_ptr, mem),
+                    slot_id,
+                ),
+                // Configure/stop endpoint contexts wait on richer
+                // device-context handling; succeed on an enabled slot so a
+                // driver's bring-up sequence can proceed, error otherwise.
                 Some(
-                    CommandTrb::AddressDevice { slot_id, .. }
-                    | CommandTrb::ConfigureEndpoint { slot_id, .. }
+                    CommandTrb::ConfigureEndpoint { slot_id, .. }
                     | CommandTrb::StopEndpoint { slot_id, .. },
                 ) => (self.slot_dependent_success(slot_id), slot_id),
                 // Reset Endpoint recovers a halted endpoint (xHCI §4.6.8):
@@ -278,18 +293,69 @@ impl VirtualXhciController {
     }
 
     /// Free a slot; disabling a never-enabled slot is a TRB error. A freed
-    /// slot's transfer rings, device model, and control state go with it.
+    /// slot's transfer rings and control state go with it; a model the slot
+    /// bound from a port parks there again (the device is still physically
+    /// connected, so the guest can re-enumerate it), while an explicitly
+    /// bound model is dropped.
     fn disable_slot(&mut self, slot_id: u8) -> TrbCompletionCode {
         match self.slots.get_mut(usize::from(slot_id.wrapping_sub(1))) {
             Some(used) if *used => {
                 *used = false;
                 self.transfer_rings.retain(|(slot, _), _| *slot != slot_id);
-                self.device_models.remove(&slot_id);
+                let model = self.device_models.remove(&slot_id);
+                if let Some(port) = self.slot_ports.remove(&slot_id)
+                    && let Some(parked) = self.port_models.get_mut(port)
+                {
+                    *parked = model;
+                }
                 self.control_state.remove(&slot_id);
                 TrbCompletionCode::Success
             }
             _ => TrbCompletionCode::TrbError,
         }
+    }
+
+    /// Address Device (xHCI §4.6.5): validate the input context in guest
+    /// memory and bind the device model parked at the slot context's
+    /// root-hub port to the slot. A port with no parked model (pure
+    /// port-status modelling) still addresses successfully.
+    fn address_device(
+        &mut self,
+        slot_id: u8,
+        input_context_ptr: u64,
+        mem: &dyn DmaMemory,
+    ) -> TrbCompletionCode {
+        if self.slot_dependent_success(slot_id) != TrbCompletionCode::Success {
+            return TrbCompletionCode::TrbError;
+        }
+        // Input control context (xHCI §6.2.5.1): dword 0 = drop flags,
+        // dword 1 = add flags. Address Device must add exactly the slot
+        // and EP0 contexts (A0 | A1).
+        let mut control = [0_u8; 8];
+        if !mem.read(input_context_ptr, &mut control) {
+            return TrbCompletionCode::TrbError;
+        }
+        let add_flags = u32::from_le_bytes([control[4], control[5], control[6], control[7]]);
+        if add_flags & 0x3 != 0x3 {
+            return TrbCompletionCode::ParameterError;
+        }
+        // Slot context dword 1 (32-byte contexts: input context + 0x24),
+        // bits 23:16 = root-hub port number, 1-based (xHCI §6.2.2).
+        let mut dword1 = [0_u8; 4];
+        if !mem.read(input_context_ptr + 0x24, &mut dword1) {
+            return TrbCompletionCode::TrbError;
+        }
+        let Some(port) = usize::from(dword1[2]).checked_sub(1) else {
+            return TrbCompletionCode::ParameterError;
+        };
+        if port >= self.port_models.len() {
+            return TrbCompletionCode::ParameterError;
+        }
+        if let Some(model) = self.port_models[port].take() {
+            self.device_models.insert(slot_id, model);
+            self.slot_ports.insert(slot_id, port);
+        }
+        TrbCompletionCode::Success
     }
 
     fn slot_dependent_success(&self, slot_id: u8) -> TrbCompletionCode {
@@ -352,7 +418,7 @@ impl VirtualXhciController {
         }
         for target in self.doorbells.drain_pending() {
             match target {
-                DoorbellTarget::HostCommand => self.process_command_ring(),
+                DoorbellTarget::HostCommand => self.process_command_ring(&*mem),
                 DoorbellTarget::ControlEndpoint { slot_id } => {
                     self.process_transfer_ring(slot_id, CONTROL_DCI, mem);
                 }
@@ -856,6 +922,29 @@ impl VirtualXhciController {
         }
     }
 
+    /// [`attach_device`](Self::attach_device), additionally parking `model`
+    /// at the chosen port: when the guest's driver issues Address Device
+    /// naming that port, the model binds to the slot and its transfer rings
+    /// terminate against it. This is the routing path for devices with a
+    /// backing model (emulated today, libusb-forwarded later).
+    pub fn attach_device_with_model(
+        &mut self,
+        speed: UsbSpeed,
+        model: Box<dyn UsbDeviceModel>,
+    ) -> Option<usize> {
+        let port = self.attach_device(speed)?;
+        if let Some(parked) = self.port_models.get_mut(port) {
+            *parked = Some(model);
+        }
+        Some(port)
+    }
+
+    /// Take the device model parked at `port` (0-based), if any — the
+    /// registry uses this to carry a model along a live reassignment.
+    pub fn take_port_model(&mut self, port: usize) -> Option<Box<dyn UsbDeviceModel>> {
+        self.port_models.get_mut(port).and_then(Option::take)
+    }
+
     /// Connect a device to `port` (0-based) at the xHCI speed code
     /// (1=FS, 2=LS, 3=HS, 4=SS): flips the port's `PORTSC` (CCS + CSC), sets
     /// `USBSTS.PCD`, and posts the Port Status Change event (port IDs are
@@ -869,12 +958,20 @@ impl VirtualXhciController {
     }
 
     /// Disconnect the device on `port` (0-based), with the same status-change
-    /// signalling as a connect.
+    /// signalling as a connect. Any model parked at the port — or bound to a
+    /// slot from it — goes with the device.
     pub fn disconnect_device(&mut self, port: usize) -> bool {
         let Some(p) = self.op.ports.get_mut(port) else {
             return false;
         };
         p.disconnect_device();
+        if let Some(parked) = self.port_models.get_mut(port) {
+            *parked = None;
+        }
+        if let Some((&slot_id, _)) = self.slot_ports.iter().find(|&(_, &p)| p == port) {
+            self.slot_ports.remove(&slot_id);
+            self.device_models.remove(&slot_id);
+        }
         self.signal_port_change(port)
     }
 
@@ -1010,6 +1107,14 @@ impl crate::bus::MmioDevice for XhciMmio {
 mod tests {
     use super::*;
 
+    /// Ring doorbell 0 through the register window and service it (command
+    /// processing happens at service time, when guest memory is in hand).
+    fn kick_commands(c: &mut VirtualXhciController) {
+        let mut mem = super::super::xhci::VecDmaMemory::new(0, 0);
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+    }
+
     /// A controller brought to the running state with 8 slots enabled, the
     /// way a driver does it (CONFIG, then USBCMD.R/S through the register
     /// window).
@@ -1042,11 +1147,11 @@ mod tests {
         c.write_register(u32::from(c.caps.caplength) + 0x38, 8);
         assert!(c.submit_command(&CommandTrb::NoOp));
         // Halted: the doorbell does nothing.
-        c.write_register(c.caps.dboff, 0);
+        kick_commands(&mut c);
         assert!(c.pop_event().is_none());
         // Running: the same doorbell drains the ring.
         c.write_register(u32::from(c.caps.caplength), 1);
-        c.write_register(c.caps.dboff, 0);
+        kick_commands(&mut c);
         match c.pop_event() {
             Some(EventTrb::CommandCompletion {
                 completion_code, ..
@@ -1059,7 +1164,7 @@ mod tests {
     fn enable_slot_allocates_and_disable_frees() {
         let mut c = running_controller();
         c.submit_command(&CommandTrb::EnableSlot);
-        c.write_register(c.caps.dboff, 0);
+        kick_commands(&mut c);
         let slot = match c.pop_event() {
             Some(EventTrb::CommandCompletion {
                 completion_code,
@@ -1075,13 +1180,13 @@ mod tests {
         assert!(c.slot_enabled(1));
 
         c.submit_command(&CommandTrb::DisableSlot { slot_id: slot });
-        c.write_register(c.caps.dboff, 0);
+        kick_commands(&mut c);
         let _ = c.pop_event();
         assert!(!c.slot_enabled(1));
 
         // Disabling it again is a TRB error.
         c.submit_command(&CommandTrb::DisableSlot { slot_id: slot });
-        c.write_register(c.caps.dboff, 0);
+        kick_commands(&mut c);
         match c.pop_event() {
             Some(EventTrb::CommandCompletion {
                 completion_code, ..
@@ -1097,7 +1202,7 @@ mod tests {
             c.submit_command(&CommandTrb::EnableSlot);
         }
         c.submit_command(&CommandTrb::EnableSlot); // the ninth
-        c.write_register(c.caps.dboff, 0);
+        kick_commands(&mut c);
         let mut codes = Vec::new();
         while let Some(EventTrb::CommandCompletion {
             completion_code, ..
@@ -1211,7 +1316,7 @@ mod tests {
         use super::super::emulated::LoopbackDevice;
         let mut c = running_controller();
         c.submit_command(&CommandTrb::EnableSlot);
-        c.write_register(c.caps.dboff, 0);
+        kick_commands(&mut c);
         let _ = c.pop_event();
         assert!(c.bind_device_model(1, Box::new(LoopbackDevice::new(0x1234, 0x5678))));
         (c, super::super::xhci::VecDmaMemory::new(0x1000, 4096))
@@ -1417,7 +1522,7 @@ mod tests {
             slot_id: 1,
             endpoint_id: CONTROL_DCI,
         });
-        c.write_register(c.caps.dboff, 0);
+        kick_commands(&mut c);
         let _ = c.pop_event();
         assert!(!c.endpoint_halted(1, CONTROL_DCI));
         assert!(c.submit_transfer(1, CONTROL_DCI, &TransferTrb::NoOp { ioc: true }));
@@ -1479,7 +1584,7 @@ mod tests {
         assert!(c.submit_transfer(1, 3, &TransferTrb::NoOp { ioc: true }));
 
         c.submit_command(&CommandTrb::DisableSlot { slot_id: 1 });
-        c.write_register(c.caps.dboff, 0);
+        kick_commands(&mut c);
         let _ = c.pop_event();
 
         // The slot's transfer machinery went with it.
@@ -1491,34 +1596,166 @@ mod tests {
         ));
     }
 
+    /// Write a minimal Address Device input context at `ptr`: input control
+    /// context adding A0|A1, slot context naming `port_number` (1-based).
+    fn write_input_context(mem: &mut super::super::xhci::VecDmaMemory, ptr: u64, port_number: u8) {
+        use super::super::xhci::transfer::DmaMemory;
+        assert!(mem.write(ptr + 4, &0x3_u32.to_le_bytes())); // add flags A0|A1
+        let dword1 = u32::from(port_number) << 16; // root-hub port number
+        assert!(mem.write(ptr + 0x24, &dword1.to_le_bytes()));
+    }
+
+    /// Pop the next event and return its command-completion code.
+    fn completion_code(c: &mut VirtualXhciController) -> u8 {
+        match c.pop_event() {
+            Some(EventTrb::CommandCompletion {
+                completion_code, ..
+            }) => completion_code as u8,
+            other => panic!("expected a command completion, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn address_device_requires_an_enabled_slot() {
+    fn address_device_validates_slot_and_input_context() {
         let mut c = running_controller();
-        // On a never-enabled slot: TRB error.
+        let mut mem = super::super::xhci::VecDmaMemory::new(0x1000, 0x100);
+        write_input_context(&mut mem, 0x1000, 1);
+
+        // On a never-enabled slot: TRB error, even with a valid context.
         c.submit_command(&CommandTrb::AddressDevice {
             slot_id: 5,
             input_context_ptr: 0x1000,
         });
         c.write_register(c.caps.dboff, 0);
-        match c.pop_event() {
-            Some(EventTrb::CommandCompletion {
-                completion_code, ..
-            }) => assert_eq!(completion_code as u8, TrbCompletionCode::TrbError as u8),
-            other => panic!("expected a command completion, got {other:?}"),
-        }
-        // After Enable Slot: success (context handling waits on guest memory).
+        c.service_doorbells(&mut mem);
+        assert_eq!(completion_code(&mut c), TrbCompletionCode::TrbError as u8);
+
+        // After Enable Slot, a valid input context addresses successfully.
         c.submit_command(&CommandTrb::EnableSlot);
         c.submit_command(&CommandTrb::AddressDevice {
             slot_id: 1,
             input_context_ptr: 0x1000,
         });
         c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
         let _ = c.pop_event(); // the Enable Slot completion
+        assert_eq!(completion_code(&mut c), TrbCompletionCode::Success as u8);
+
+        // Add flags missing A0|A1: parameter error. Out-of-range port too.
+        let mut bad_flags = super::super::xhci::VecDmaMemory::new(0x1000, 0x100);
+        write_input_context(&mut bad_flags, 0x1000, 1);
+        {
+            use super::super::xhci::transfer::DmaMemory;
+            assert!(bad_flags.write(0x1004, &1_u32.to_le_bytes())); // only A0
+        }
+        c.submit_command(&CommandTrb::AddressDevice {
+            slot_id: 1,
+            input_context_ptr: 0x1000,
+        });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut bad_flags);
+        assert_eq!(
+            completion_code(&mut c),
+            TrbCompletionCode::ParameterError as u8
+        );
+
+        let mut bad_port = super::super::xhci::VecDmaMemory::new(0x1000, 0x100);
+        write_input_context(&mut bad_port, 0x1000, 99);
+        c.submit_command(&CommandTrb::AddressDevice {
+            slot_id: 1,
+            input_context_ptr: 0x1000,
+        });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut bad_port);
+        assert_eq!(
+            completion_code(&mut c),
+            TrbCompletionCode::ParameterError as u8
+        );
+
+        // An unreadable context pointer is a TRB error.
+        c.submit_command(&CommandTrb::AddressDevice {
+            slot_id: 1,
+            input_context_ptr: 0xDEAD_0000,
+        });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        assert_eq!(completion_code(&mut c), TrbCompletionCode::TrbError as u8);
+    }
+
+    #[test]
+    fn address_device_binds_the_parked_port_model_and_disable_reparks_it() {
+        use super::super::emulated::LoopbackDevice;
+        use super::super::xhci::transfer::{DmaMemory, TransferTrb};
+        let mut c = running_controller();
+        let mut mem = super::super::xhci::VecDmaMemory::new(0x1000, 0x100);
+
+        // Routing parks a model at the port; the guest's driver enables a
+        // slot and addresses the device at that port.
+        let port = c
+            .attach_device_with_model(UsbSpeed::High, Box::new(LoopbackDevice::new(1, 2)))
+            .unwrap();
+        let _ = c.pop_event(); // port status change
+        write_input_context(&mut mem, 0x1000, u8::try_from(port + 1).unwrap());
+        c.submit_command(&CommandTrb::EnableSlot);
+        c.submit_command(&CommandTrb::AddressDevice {
+            slot_id: 1,
+            input_context_ptr: 0x1000,
+        });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        let _ = c.pop_event();
+        assert_eq!(completion_code(&mut c), TrbCompletionCode::Success as u8);
+
+        // The slot's transfer rings now terminate against the model: a bulk
+        // OUT TD on EP1 OUT (DCI 2) is acked by the loopback.
+        assert!(mem.write(0x1080, b"ping"));
+        assert!(c.submit_transfer(
+            1,
+            2,
+            &TransferTrb::Normal {
+                buffer: 0x1080,
+                length: 4,
+                chain: false,
+                ioc: true,
+                isp: false,
+            },
+        ));
+        c.write_register(c.caps.dboff + 4, 2);
+        c.service_doorbells(&mut mem);
         match c.pop_event() {
-            Some(EventTrb::CommandCompletion {
+            Some(EventTrb::TransferEvent {
                 completion_code, ..
             }) => assert_eq!(completion_code as u8, TrbCompletionCode::Success as u8),
-            other => panic!("expected a command completion, got {other:?}"),
+            other => panic!("expected a transfer event, got {other:?}"),
         }
+
+        // Disable Slot parks the model back at the port: re-enabling and
+        // re-addressing finds it again (the guest re-enumerates).
+        c.submit_command(&CommandTrb::DisableSlot { slot_id: 1 });
+        c.submit_command(&CommandTrb::EnableSlot);
+        c.submit_command(&CommandTrb::AddressDevice {
+            slot_id: 1,
+            input_context_ptr: 0x1000,
+        });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        let _ = c.pop_event(); // disable completion
+        let _ = c.pop_event(); // enable completion
+        assert_eq!(completion_code(&mut c), TrbCompletionCode::Success as u8);
+        assert!(c.submit_transfer(1, 2, &TransferTrb::NoOp { ioc: true }));
+        c.write_register(c.caps.dboff + 4, 2);
+        c.service_doorbells(&mut mem);
+        assert!(matches!(
+            c.pop_event(),
+            Some(EventTrb::TransferEvent { .. })
+        ));
+
+        // Disconnecting the port drops the parked model for good.
+        c.submit_command(&CommandTrb::DisableSlot { slot_id: 1 });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        let _ = c.pop_event();
+        assert!(c.disconnect_device(port));
+        assert!(c.take_port_model(port).is_none());
     }
 }

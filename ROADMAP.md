@@ -1562,6 +1562,31 @@ Physical USB Devices
 > on the KVM run loop); and the routing→controller binding that calls `attach_usb_device`
 > from a `RoutingState` assignment (needs the multi-guest controller registry).
 
+> **Status (2026-06-12):** the previous note's three gaps are closed in pure userspace.
+> **TD processing is real** (`usb::xhci::transfer` + controller): doorbells latch at the
+> register write and `service_doorbells(&mut dyn DmaMemory)` drains them with guest
+> memory in hand (the KVM doorbell-exit shape); TDs are gathered by chain bit (ACRN's
+> model), EP0 runs a Setup→Data→Status stage machine, Transfer Events carry the spec's
+> 24-bit residual, STALL halts the endpoint and Reset Endpoint recovers it. TDs terminate
+> against the **`UsbDeviceModel` seam** (`usb::emulated`) — the future libusb-forwarding
+> boundary — with an in-process `LoopbackDevice` and a full HID **boot keyboard**
+> (`EmulatedKeyboard`: canonical E.6 report descriptor, coherent config block, LED
+> `SET_REPORT`, 6-key rollover reports). **Address Device is no longer a stub**: it
+> parses the input context (A0|A1 add flags, slot-context root-hub port number) out of
+> guest memory and binds the model parked at that port to the slot — the real driver
+> enumeration flow. The **routing→controller binding exists** (`usb::registry::
+> XhciRegistry`): per-guest controller handles, policy-driven attach with rollback,
+> detach, and live `reassign` that virtually unplugs/replugs (carrying a still-parked
+> model) with real hot-plug events on both guests; `usb::hotplug::HotplugDispatcher`
+> bridges monitor callbacks (any thread) to the run loop via a channel. The management
+> protocol (`enlil-mgmt::protocol`) carries the USB tab's wire surface
+> (`UsbDeviceList`/`UsbHotplugNotice`/`UsbCommand{Reassign,Detach}`). **Remaining for
+> Phase 4:** the libusb-backed `UsbDeviceModel` forwarder for physical devices (host
+> side); rings/contexts actually resident in guest memory (CRCR/DCBAAP dereferencing —
+> the `DmaMemory` seam is ready, waits on the KVM run loop); Configure Endpoint context
+> handling; the TUI USB tab (the protocol seam is ready; note the prior `tui/mod.rs` was
+> a corrupt placeholder and was removed).
+
 ### 4.4 Virtual xHCI Controller
 - Present each guest with an emulated xHCI (USB 3.x) host controller
 - **Primary approach: Software-emulated xHCI with TRB-level interception (recommended)**

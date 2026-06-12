@@ -1,5 +1,3 @@
-#![deny(clippy::all, clippy::pedantic, clippy::nursery)]
-
 //! Communication protocol between enlil-core and enlil-mgmt.
 //!
 //! Messages are length-prefixed JSON: `[4-byte LE length][JSON payload]`.
@@ -29,9 +27,9 @@ pub enum GuestState {
 impl std::fmt::Display for GuestState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            GuestState::Running => write!(f, "Running"),
-            GuestState::Stopped => write!(f, "Stopped"),
-            GuestState::Paused => write!(f, "Paused"),
+            Self::Running => write!(f, "Running"),
+            Self::Stopped => write!(f, "Stopped"),
+            Self::Paused => write!(f, "Paused"),
         }
     }
 }
@@ -52,6 +50,40 @@ pub struct GuestStatus {
     pub uptime_secs: u64,
 }
 
+/// One physical USB device as the console's USB tab shows it: identity from
+/// the host monitor, plus where the routing engine currently places it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsbDeviceEntry {
+    /// Host bus address (the routing engine's device key).
+    pub bus_addr: u8,
+    pub vendor_id: u16,
+    pub product_id: u16,
+    pub product: Option<String>,
+    pub manufacturer: Option<String>,
+    pub serial: Option<String>,
+    /// Physical port path (e.g. "1-1", "2-3.1").
+    pub port_path: Option<String>,
+    /// Negotiated speed, display form ("Low", "High", "Super", ...).
+    pub speed: String,
+    /// Guest currently holding the device (`None` = with the hypervisor).
+    pub assigned_guest: Option<GuestId>,
+    /// Root-hub port index on that guest's virtual controller.
+    pub guest_port: Option<usize>,
+}
+
+impl std::fmt::Display for UsbDeviceEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:04x}:{:04x} {} [{}]",
+            self.vendor_id,
+            self.product_id,
+            self.product.as_deref().unwrap_or("Unknown Device"),
+            self.assigned_guest.as_deref().unwrap_or("unassigned"),
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Wire messages
 // ---------------------------------------------------------------------------
@@ -64,7 +96,20 @@ pub enum ServerMessage {
     /// Serial output from a guest.
     SerialData { guest_id: GuestId, data: Vec<u8> },
     /// Response to a command.
-    CommandResponse { id: u64, success: bool, message: String },
+    CommandResponse {
+        id: u64,
+        success: bool,
+        message: String,
+    },
+    /// Full USB inventory with current routing assignments (answer to
+    /// [`ClientMessage::RequestUsbDevices`], and pushed after changes).
+    UsbDeviceList(Vec<UsbDeviceEntry>),
+    /// A USB hot-plug or routing change the console surfaces as a
+    /// notification. `device` is `None` for a disconnect.
+    UsbHotplugNotice {
+        message: String,
+        device: Option<UsbDeviceEntry>,
+    },
 }
 
 /// Messages sent from enlil-mgmt → enlil-core.
@@ -75,7 +120,37 @@ pub enum ClientMessage {
     /// Send serial input to a guest.
     SerialInput { guest_id: GuestId, data: Vec<u8> },
     /// Guest lifecycle command.
-    GuestCommand { id: u64, guest_id: GuestId, action: GuestAction },
+    GuestCommand {
+        id: u64,
+        guest_id: GuestId,
+        action: GuestAction,
+    },
+    /// Request the USB inventory.
+    RequestUsbDevices,
+    /// USB routing command (answered by a `CommandResponse` with the same
+    /// `id`, followed by a fresh `UsbDeviceList`).
+    UsbCommand { id: u64, action: UsbAction },
+}
+
+/// A USB routing action from the console's USB tab.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UsbAction {
+    /// Live-move a device to another guest (virtual unplug + replug).
+    Reassign { bus_addr: u8, target_guest: GuestId },
+    /// Detach a device from its guest (back to the hypervisor).
+    Detach { bus_addr: u8 },
+}
+
+impl std::fmt::Display for UsbAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reassign {
+                bus_addr,
+                target_guest,
+            } => write!(f, "Reassign device {bus_addr} -> {target_guest}"),
+            Self::Detach { bus_addr } => write!(f, "Detach device {bus_addr}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,9 +163,9 @@ pub enum GuestAction {
 impl std::fmt::Display for GuestAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            GuestAction::Start => write!(f, "Start"),
-            GuestAction::Stop => write!(f, "Stop"),
-            GuestAction::Reboot => write!(f, "Reboot"),
+            Self::Start => write!(f, "Start"),
+            Self::Stop => write!(f, "Stop"),
+            Self::Reboot => write!(f, "Reboot"),
         }
     }
 }
@@ -100,9 +175,17 @@ impl std::fmt::Display for GuestAction {
 // ---------------------------------------------------------------------------
 
 /// Encode a message to bytes: `[4-byte LE length][JSON]`.
+///
+/// # Errors
+///
+/// Returns [`ProtocolError::Json`] if the message cannot be serialized, or
+/// [`ProtocolError::FrameTooLarge`] if it exceeds the 4-byte length prefix's
+/// frame limit.
 pub fn encode<T: Serialize>(msg: &T) -> Result<Vec<u8>, ProtocolError> {
     let json = serde_json::to_vec(msg)?;
-    let len = (json.len() as u32).to_le_bytes();
+    let len = u32::try_from(json.len())
+        .map_err(|_| ProtocolError::FrameTooLarge(json.len()))?
+        .to_le_bytes();
     let mut buf = Vec::with_capacity(4 + json.len());
     buf.extend_from_slice(&len);
     buf.extend_from_slice(&json);
@@ -116,8 +199,12 @@ pub struct FrameDecoder {
 }
 
 impl FrameDecoder {
-    pub fn new() -> Self {
-        Self { buf: VecDeque::new() }
+    /// An empty decoder.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            buf: VecDeque::new(),
+        }
     }
 
     /// Push raw bytes into the decoder.
@@ -127,6 +214,12 @@ impl FrameDecoder {
 
     /// Try to decode the next complete message. Returns `None` if not enough
     /// data is available yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::FrameTooLarge`] if the frame header claims
+    /// more than the 16 MiB limit, or [`ProtocolError::Json`] if the payload
+    /// is not valid JSON for `T`.
     pub fn decode<T: for<'de> Deserialize<'de>>(&mut self) -> Result<Option<T>, ProtocolError> {
         if self.buf.len() < 4 {
             return Ok(None);
@@ -163,6 +256,10 @@ pub struct Connection {
 
 impl Connection {
     /// Connect via TCP (works on all platforms).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::Io`] if the connection cannot be established.
     pub async fn connect_tcp(addr: &str) -> Result<Self, ProtocolError> {
         let stream = TcpStream::connect(addr).await?;
         Ok(Self {
@@ -173,6 +270,11 @@ impl Connection {
     }
 
     /// Send a client message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::Json`] if the message cannot be serialized,
+    /// or [`ProtocolError::Io`] if the write fails.
     pub async fn send(&mut self, msg: &ClientMessage) -> Result<(), ProtocolError> {
         let bytes = encode(msg)?;
         self.stream.write_all(&bytes).await?;
@@ -180,6 +282,11 @@ impl Connection {
     }
 
     /// Receive the next server message (blocks until one is available).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::Disconnected`] when the peer closes the
+    /// stream, or any decode/IO error from the incoming frame.
     pub async fn recv(&mut self) -> Result<ServerMessage, ProtocolError> {
         loop {
             if let Some(msg) = self.decoder.decode()? {
@@ -244,9 +351,9 @@ mod tests {
         let encoded = encode(&msg).unwrap();
         let mut decoder = FrameDecoder::new();
         decoder.push(&encoded);
-        let decoded: ServerMessage = decoder.decode().unwrap().unwrap();
+        let got: ServerMessage = decoder.decode().unwrap().unwrap();
 
-        match decoded {
+        match got {
             ServerMessage::StatusUpdate(guests) => {
                 assert_eq!(guests.len(), 2);
                 assert_eq!(guests[0].id, "vm-1");
@@ -267,10 +374,14 @@ mod tests {
         let encoded = encode(&msg).unwrap();
         let mut decoder = FrameDecoder::new();
         decoder.push(&encoded);
-        let decoded: ClientMessage = decoder.decode().unwrap().unwrap();
+        let got: ClientMessage = decoder.decode().unwrap().unwrap();
 
-        match decoded {
-            ClientMessage::GuestCommand { id, guest_id, action } => {
+        match got {
+            ClientMessage::GuestCommand {
+                id,
+                guest_id,
+                action,
+            } => {
                 assert_eq!(id, 42);
                 assert_eq!(guest_id, "vm-1");
                 assert_eq!(action, GuestAction::Reboot);
@@ -299,9 +410,13 @@ mod tests {
             }
         }
 
-        let decoded: ServerMessage = decoder.decode().unwrap().unwrap();
-        match decoded {
-            ServerMessage::CommandResponse { id, success, message } => {
+        let got: ServerMessage = decoder.decode().unwrap().unwrap();
+        match got {
+            ServerMessage::CommandResponse {
+                id,
+                success,
+                message,
+            } => {
                 assert_eq!(id, 1);
                 assert!(success);
                 assert_eq!(message, "ok");
@@ -363,8 +478,8 @@ mod tests {
         let encoded = encode(&msg).unwrap();
         let mut decoder = FrameDecoder::new();
         decoder.push(&encoded);
-        let decoded: ServerMessage = decoder.decode().unwrap().unwrap();
-        match decoded {
+        let got: ServerMessage = decoder.decode().unwrap().unwrap();
+        match got {
             ServerMessage::SerialData { guest_id, data } => {
                 assert_eq!(guest_id, "vm-3");
                 assert_eq!(data, vec![0x1b, 0x5b, 0x31, 0x6d]);
@@ -385,5 +500,125 @@ mod tests {
         assert_eq!(GuestAction::Start.to_string(), "Start");
         assert_eq!(GuestAction::Stop.to_string(), "Stop");
         assert_eq!(GuestAction::Reboot.to_string(), "Reboot");
+    }
+
+    fn mouse_entry() -> UsbDeviceEntry {
+        UsbDeviceEntry {
+            bus_addr: 3,
+            vendor_id: 0x046d,
+            product_id: 0xc077,
+            product: Some("M105 Mouse".into()),
+            manufacturer: Some("Logitech".into()),
+            serial: None,
+            port_path: Some("1-1".into()),
+            speed: "Low".into(),
+            assigned_guest: Some("linux1".into()),
+            guest_port: Some(0),
+        }
+    }
+
+    #[test]
+    fn roundtrip_usb_device_list() {
+        let msg = ServerMessage::UsbDeviceList(vec![
+            mouse_entry(),
+            UsbDeviceEntry {
+                bus_addr: 4,
+                assigned_guest: None,
+                guest_port: None,
+                ..mouse_entry()
+            },
+        ]);
+        let encoded = encode(&msg).unwrap();
+        let mut decoder = FrameDecoder::new();
+        decoder.push(&encoded);
+        let got: ServerMessage = decoder.decode().unwrap().unwrap();
+        match got {
+            ServerMessage::UsbDeviceList(entries) => {
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0], mouse_entry());
+                assert_eq!(entries[1].assigned_guest, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_usb_command() {
+        let msg = ClientMessage::UsbCommand {
+            id: 7,
+            action: UsbAction::Reassign {
+                bus_addr: 3,
+                target_guest: "linux2".into(),
+            },
+        };
+        let encoded = encode(&msg).unwrap();
+        let mut decoder = FrameDecoder::new();
+        decoder.push(&encoded);
+        let got: ClientMessage = decoder.decode().unwrap().unwrap();
+        match got {
+            ClientMessage::UsbCommand { id, action } => {
+                assert_eq!(id, 7);
+                assert_eq!(
+                    action,
+                    UsbAction::Reassign {
+                        bus_addr: 3,
+                        target_guest: "linux2".into()
+                    }
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // RequestUsbDevices is a bare variant like RequestStatus.
+        let encoded = encode(&ClientMessage::RequestUsbDevices).unwrap();
+        let mut decoder = FrameDecoder::new();
+        decoder.push(&encoded);
+        let got: ClientMessage = decoder.decode().unwrap().unwrap();
+        assert!(matches!(got, ClientMessage::RequestUsbDevices));
+    }
+
+    #[test]
+    fn roundtrip_usb_hotplug_notice() {
+        let msg = ServerMessage::UsbHotplugNotice {
+            message: "046d:c077 attached to linux1 port 0".into(),
+            device: Some(mouse_entry()),
+        };
+        let encoded = encode(&msg).unwrap();
+        let mut decoder = FrameDecoder::new();
+        decoder.push(&encoded);
+        let got: ServerMessage = decoder.decode().unwrap().unwrap();
+        match got {
+            ServerMessage::UsbHotplugNotice { message, device } => {
+                assert!(message.contains("attached"));
+                assert_eq!(device, Some(mouse_entry()));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn usb_display_forms() {
+        assert_eq!(mouse_entry().to_string(), "046d:c077 M105 Mouse [linux1]");
+        let unassigned = UsbDeviceEntry {
+            assigned_guest: None,
+            product: None,
+            ..mouse_entry()
+        };
+        assert_eq!(
+            unassigned.to_string(),
+            "046d:c077 Unknown Device [unassigned]"
+        );
+        assert_eq!(
+            UsbAction::Reassign {
+                bus_addr: 3,
+                target_guest: "linux2".into()
+            }
+            .to_string(),
+            "Reassign device 3 -> linux2"
+        );
+        assert_eq!(
+            UsbAction::Detach { bus_addr: 3 }.to_string(),
+            "Detach device 3"
+        );
     }
 }
