@@ -35,6 +35,7 @@ use super::xhci::context::{
     EndpointContext, InputControlContext, MAX_DCI, input_context_entry_offset, read_context_entry,
 };
 use super::xhci::registers::XECP_OFFSET;
+use super::xhci::ring::GuestRingCursor;
 use super::xhci::transfer::{
     CONTROL_DCI, DmaMemory, SetupPacket, TransferTrb, dci_endpoint_number, dci_is_in,
 };
@@ -49,6 +50,9 @@ use crate::truncate::{Widen, u32_of};
 const USBSTS_EINT: u32 = 1 << 3;
 /// `USBSTS` bit 4: Port Change Detect (PCD).
 const USBSTS_PCD: u32 = 1 << 4;
+/// Commands executed per doorbell-0 service at most, bounding a guest that
+/// authors a self-linking command ring of forever-valid TRBs.
+const COMMAND_BURST_LIMIT: usize = 256;
 
 /// The per-guest virtual xHCI controller.
 ///
@@ -68,6 +72,10 @@ pub struct VirtualXhciController {
     pub doorbells: DoorbellArray,
     /// The command ring doorbell 0 drains.
     pub command_ring: CommandRing,
+    /// Consumer cursor for a guest-memory command ring — established from
+    /// `CRCR` on the first doorbell 0 after the driver programs it, and
+    /// re-established whenever the driver rewrites `CRCR`.
+    guest_command_ring: Option<GuestRingCursor>,
     /// Device-slot allocation state; index = slot ID - 1.
     slots: Vec<bool>,
     /// Per-(slot ID, DCI) transfer rings. Created on first
@@ -123,6 +131,7 @@ impl VirtualXhciController {
             interrupter: InterrupterRegisterSet::new(),
             doorbells: DoorbellArray::new(caps.max_slots()),
             command_ring: CommandRing::with_default_size(),
+            guest_command_ring: None,
             slots,
             caps,
             transfer_rings: BTreeMap::new(),
@@ -177,8 +186,16 @@ impl VirtualXhciController {
             0x00 => self.op.write_usbcmd(value),
             0x04 => self.op.write_usbsts(value),
             0x14 => self.op.dnctrl = value,
-            0x18 => self.op.crcr = (self.op.crcr & !0xFFFF_FFFF) | u64::from(value),
-            0x1C => self.op.crcr = (self.op.crcr & 0xFFFF_FFFF) | (u64::from(value) << 32),
+            // Rewriting CRCR re-establishes the guest ring's consumer
+            // cursor at the new pointer/RCS on the next doorbell 0.
+            0x18 => {
+                self.op.crcr = (self.op.crcr & !0xFFFF_FFFF) | u64::from(value);
+                self.guest_command_ring = None;
+            }
+            0x1C => {
+                self.op.crcr = (self.op.crcr & 0xFFFF_FFFF) | (u64::from(value) << 32);
+                self.guest_command_ring = None;
+            }
             0x30 => self.op.dcbaap = (self.op.dcbaap & !0xFFFF_FFFF) | u64::from(value),
             0x34 => self.op.dcbaap = (self.op.dcbaap & 0xFFFF_FFFF) | (u64::from(value) << 32),
             0x38 => self.op.config = value,
@@ -239,58 +256,86 @@ impl VirtualXhciController {
     /// Drain the command ring (doorbell 0, xHCI §4.6): execute each command
     /// against guest memory and post its Command Completion event. A halted
     /// controller leaves the ring untouched, as real hardware does.
+    /// A driver-programmed `CRCR` means the ring lives in guest memory and
+    /// commands are fetched there (cycle-bit delimited, Link TRBs followed);
+    /// the internal ring remains the modelling path while `CRCR` is zero.
     fn process_command_ring(&mut self, mem: &dyn DmaMemory) {
         if !self.op.is_running() {
             return;
         }
-        while let Some(trb) = self.command_ring.fetch() {
-            let (code, slot_id) = match CommandTrb::from_trb(&trb) {
-                Some(CommandTrb::NoOp) => (TrbCompletionCode::Success, 0),
-                Some(CommandTrb::EnableSlot) => self.enable_slot(),
-                Some(CommandTrb::DisableSlot { slot_id }) => (self.disable_slot(slot_id), slot_id),
-                // Address Device reads the input context out of guest memory
-                // and binds the named port's parked device model to the slot.
-                Some(CommandTrb::AddressDevice {
-                    slot_id,
-                    input_context_ptr,
-                }) => (
-                    self.address_device(slot_id, input_context_ptr, mem),
-                    slot_id,
-                ),
-                // Configure Endpoint parses the input context's endpoint
-                // contexts and installs (or drops) the slot's transfer rings.
-                Some(CommandTrb::ConfigureEndpoint {
-                    slot_id,
-                    input_context_ptr,
-                    deconfigure,
-                }) => (
-                    self.configure_endpoint(slot_id, input_context_ptr, deconfigure, mem),
-                    slot_id,
-                ),
-                // Stop Endpoint waits on in-flight TD bookkeeping; succeed on
-                // an enabled slot so a driver's bring-up sequence proceeds.
-                Some(CommandTrb::StopEndpoint { slot_id, .. }) => {
-                    (self.slot_dependent_success(slot_id), slot_id)
-                }
-                // Reset Endpoint recovers a halted endpoint (xHCI §4.6.8):
-                // clear the halt so the ring processes TDs again.
-                Some(CommandTrb::ResetEndpoint {
-                    slot_id,
-                    endpoint_id,
-                }) => {
-                    let code = self.slot_dependent_success(slot_id);
-                    if code == TrbCompletionCode::Success
-                        && let Some(ring) = self.transfer_rings.get_mut(&(slot_id, endpoint_id))
-                    {
-                        ring.clear_halt();
-                    }
-                    (code, slot_id)
-                }
-                // An undecodable TRB on the command ring is a TRB error.
-                None => (TrbCompletionCode::TrbError, 0),
-            };
-            self.post_event_trb(|ring| ring.post_command_completion(trb.parameter, code, slot_id));
+        let pointer = self.op.crcr & !0x3F;
+        if pointer == 0 {
+            while let Some(trb) = self.command_ring.fetch() {
+                self.execute_command(&trb, trb.parameter, mem);
+            }
+            return;
         }
+        let mut cursor = self
+            .guest_command_ring
+            .take()
+            .unwrap_or_else(|| GuestRingCursor::new(pointer, self.op.crcr & 1 != 0));
+        // Bounded per doorbell so a guest authoring a self-linking ring of
+        // forever-valid TRBs cannot wedge the controller.
+        for _ in 0..COMMAND_BURST_LIMIT {
+            let Some((address, trb)) = cursor.fetch(mem) else {
+                break;
+            };
+            self.execute_command(&trb, address, mem);
+        }
+        self.guest_command_ring = Some(cursor);
+    }
+
+    /// Decode and execute one command TRB, posting its Command Completion
+    /// event reporting `trb_pointer` as the command-TRB address (the guest
+    /// ring's real fetch address; the parameter field on the internal
+    /// modelling path).
+    fn execute_command(&mut self, trb: &Trb, trb_pointer: u64, mem: &dyn DmaMemory) {
+        let (code, slot_id) = match CommandTrb::from_trb(trb) {
+            Some(CommandTrb::NoOp) => (TrbCompletionCode::Success, 0),
+            Some(CommandTrb::EnableSlot) => self.enable_slot(),
+            Some(CommandTrb::DisableSlot { slot_id }) => (self.disable_slot(slot_id), slot_id),
+            // Address Device reads the input context out of guest memory
+            // and binds the named port's parked device model to the slot.
+            Some(CommandTrb::AddressDevice {
+                slot_id,
+                input_context_ptr,
+            }) => (
+                self.address_device(slot_id, input_context_ptr, mem),
+                slot_id,
+            ),
+            // Configure Endpoint parses the input context's endpoint
+            // contexts and installs (or drops) the slot's transfer rings.
+            Some(CommandTrb::ConfigureEndpoint {
+                slot_id,
+                input_context_ptr,
+                deconfigure,
+            }) => (
+                self.configure_endpoint(slot_id, input_context_ptr, deconfigure, mem),
+                slot_id,
+            ),
+            // Stop Endpoint waits on in-flight TD bookkeeping; succeed on
+            // an enabled slot so a driver's bring-up sequence proceeds.
+            Some(CommandTrb::StopEndpoint { slot_id, .. }) => {
+                (self.slot_dependent_success(slot_id), slot_id)
+            }
+            // Reset Endpoint recovers a halted endpoint (xHCI §4.6.8):
+            // clear the halt so the ring processes TDs again.
+            Some(CommandTrb::ResetEndpoint {
+                slot_id,
+                endpoint_id,
+            }) => {
+                let code = self.slot_dependent_success(slot_id);
+                if code == TrbCompletionCode::Success
+                    && let Some(ring) = self.transfer_rings.get_mut(&(slot_id, endpoint_id))
+                {
+                    ring.clear_halt();
+                }
+                (code, slot_id)
+            }
+            // An undecodable TRB on the command ring is a TRB error.
+            None => (TrbCompletionCode::TrbError, 0),
+        };
+        self.post_event_trb(|ring| ring.post_command_completion(trb_pointer, code, slot_id));
     }
 
     /// Allocate the lowest free device slot.
@@ -2115,6 +2160,93 @@ mod tests {
             Trb::from_bytes(&bytes).decoded_type(),
             TrbType::PortStatusChangeEvent
         );
+    }
+
+    /// Write a raw TRB into guest memory at `addr`.
+    fn write_trb(mem: &mut super::super::xhci::VecDmaMemory, addr: u64, trb: &Trb) {
+        use super::super::xhci::transfer::DmaMemory;
+        assert!(mem.write(addr, &trb.to_bytes()));
+    }
+
+    /// Pop the next event, asserting it is a command completion, and
+    /// return (command TRB pointer, completion code, slot ID).
+    fn completion(c: &mut VirtualXhciController) -> (u64, u8, u8) {
+        match c.pop_event() {
+            Some(EventTrb::CommandCompletion {
+                command_trb_pointer,
+                completion_code,
+                slot_id,
+            }) => (command_trb_pointer, completion_code as u8, slot_id),
+            other => panic!("expected a command completion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commands_fetch_from_the_guest_ring_once_crcr_is_programmed() {
+        let mut c = running_controller();
+        let mut mem = super::super::xhci::VecDmaMemory::new(0x1000, 0x400);
+        let op = u32::from(c.caps.caplength);
+
+        // The driver writes Enable Slot + No Op at 0x1200 (cycle 1; the
+        // zeroed TRBs beyond have cycle 0 = end of ring) and points CRCR
+        // there with RCS = 1.
+        write_trb(&mut mem, 0x1200, &CommandTrb::EnableSlot.to_trb(true));
+        write_trb(&mut mem, 0x1210, &CommandTrb::NoOp.to_trb(true));
+        c.write_register(op + 0x18, 0x1201); // CRCR lo: pointer | RCS
+        c.write_register(op + 0x1C, 0);
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+
+        // Completions report the real guest addresses the TRBs were
+        // fetched from, in ring order.
+        let (pointer, code, slot_id) = completion(&mut c);
+        assert_eq!(
+            (pointer, code, slot_id),
+            (0x1200, TrbCompletionCode::Success as u8, 1)
+        );
+        assert!(c.slot_enabled(1));
+        assert_eq!(completion(&mut c).0, 0x1210);
+        assert!(c.pop_event().is_none(), "cycle bit delimits the ring");
+
+        // The cursor persists across doorbells: the driver enqueues one
+        // more and rings again.
+        write_trb(&mut mem, 0x1220, &CommandTrb::NoOp.to_trb(true));
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        assert_eq!(completion(&mut c).0, 0x1220);
+    }
+
+    #[test]
+    fn guest_command_ring_follows_link_trbs_and_toggle_cycle() {
+        use super::super::xhci::TrbType;
+        let mut c = running_controller();
+        let mut mem = super::super::xhci::VecDmaMemory::new(0x1000, 0x400);
+        let op = u32::from(c.caps.caplength);
+
+        // A two-TRB segment: No Op, then a Link back to the segment base
+        // with Toggle Cycle set (the standard single-segment ring shape).
+        write_trb(&mut mem, 0x1200, &CommandTrb::NoOp.to_trb(true));
+        let mut link = Trb::zeroed();
+        link.set_trb_type(TrbType::Link);
+        link.parameter = 0x1200;
+        link.control |= 0x2; // Toggle Cycle
+        link.set_cycle_bit(true);
+        write_trb(&mut mem, 0x1210, &link);
+        c.write_register(op + 0x18, 0x1201);
+        c.write_register(op + 0x1C, 0);
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+
+        // One command this lap; the link flipped CCS to 0, so the lap-1
+        // No Op at the base (cycle 1) is not consumed again.
+        assert_eq!(completion(&mut c).0, 0x1200);
+        assert!(c.pop_event().is_none());
+
+        // Lap 2: the driver writes with cycle 0 now.
+        write_trb(&mut mem, 0x1200, &CommandTrb::NoOp.to_trb(false));
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        assert_eq!(completion(&mut c).0, 0x1200);
     }
 
     #[test]
