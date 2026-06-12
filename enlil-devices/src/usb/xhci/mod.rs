@@ -30,6 +30,7 @@ pub mod doorbell;
 pub mod event;
 pub mod registers;
 pub mod ring;
+pub mod transfer;
 pub mod trb;
 
 pub use doorbell::{DoorbellArray, DoorbellTarget};
@@ -38,4 +39,5 @@ pub use registers::{
     CapabilityRegisters, OperationalRegisters, PortRegisterSet, PortState, RuntimeRegisters,
 };
 pub use ring::{CommandRing, TransferRing, TrbRing};
+pub use transfer::{CONTROL_DCI, DmaMemory, SetupPacket, TransferTrb, TransferType, VecDmaMemory};
 pub use trb::{CommandTrb, EventTrb, NormalTrb, Trb, TrbCompletionCode, TrbType};

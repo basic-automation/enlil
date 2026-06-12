@@ -1161,3 +1161,40 @@ The transparency question for this increment: does the emulated chipset's *ident
 - **Follow-up the datasheet implies:** ICH9 1F.0 is multifunction (1F.2 SATA AHCI `8086:2922`,
   1F.3 SMBus `8086:2930`). We model only 1F.0; the absent siblings read all-ones (benign), but a
   complete south bridge would add them with the header-type multifunction bit set.
+
+---
+
+## 2026-06-12 — xHCI transfer-ring (TD) processing: ACRN's TD assembly + the spec's event-length semantics (Phase 4.4)
+
+Targeted check before building the TD-processing increment (the broad ACRN-architecture
+case was already logged under "USB Passthrough — ACRN's Architecture as Reference"):
+
+- **ACRN `devicemodel/hw/pci/xhci.c` TD assembly** (https://github.com/projectacrn/acrn-hypervisor/blob/master/devicemodel/hw/pci/xhci.c):
+  a TD is gathered TRB-by-TRB using the control-field **chain bit** — chained TRBs are
+  appended as `USB_DATA_PART`, the first chain-clear TRB closes the TD (`USB_DATA_FULL`)
+  and the whole buffer is handed to the USB core. Control transfers arrive as **three
+  separate TDs** (Setup / Data / Status stages), so the device model keeps per-endpoint
+  control state across TDs rather than expecting one chained mega-TD. → our
+  `process_transfer_ring` mirrors this: chain-bit TD gathering + a per-EP0 control-stage
+  state machine.
+- **Transfer Event length field is 24-bit residual, not 17-bit TRB length** (Linux fix
+  `usb: xhci: Fix TRB transfer length macro used for Event TRB`,
+  https://lkml.iu.edu/hypermail/linux/kernel/1303.2/02331.html): event TRBs carry
+  *untransferred* bytes in status[23:0] (`EVENT_TRB_LEN`), while transfer TRBs carry the
+  *requested* length in status[16:0] (`TRB_LEN`) — drivers compute
+  `transferred = requested - residual`. Posting a wrong residual silently corrupts every
+  guest driver's length accounting. → our events post `requested - transferred` and the
+  tests pin it.
+- **Setup Stage carries the 8-byte packet as immediate data** (xHCI 1.2 §6.4.1.2.1): IDT
+  set, parameter field = the raw `bmRequestType/bRequest/wValue/wIndex/wLength` packet,
+  TRT in control[17:16] (0 = no data, 2 = OUT data, 3 = IN data). No guest-memory read is
+  needed for the setup packet itself — only Data/Normal TRBs dereference guest buffers.
+- **Endpoint addressing is by DCI** (xHCI §4.5.1): DCI = `ep_num * 2 + direction`
+  (IN = 1), EP0 = DCI 1 — the doorbell's target field and the Transfer Event's
+  endpoint_id are both DCIs. Direction is therefore derivable from DCI parity for
+  bulk/interrupt rings (odd = IN), which the dispatcher uses.
+- **Doorbell-deferred servicing matches the eventual KVM shape:** in ACRN/QEMU the
+  device-slot doorbell write is the VM exit and ring processing happens with guest memory
+  in hand. → device-slot doorbells latch pending in the `DoorbellArray` and a
+  `service_doorbells(&mut dyn DmaMemory)` entry point drains them — exactly the call the
+  KVM run loop will make; tests drive it with a Vec-backed memory.
