@@ -27,14 +27,20 @@
 //! models the guest's enqueue, and events are drained with
 //! [`pop_event`](VirtualXhciController::pop_event).
 
+use std::collections::BTreeMap;
+
+use super::emulated::{UsbDeviceModel, UsbTransferResult};
 use super::types::DeviceSpeed as UsbSpeed;
 use super::xhci::registers::XECP_OFFSET;
+use super::xhci::transfer::{
+    CONTROL_DCI, DmaMemory, SetupPacket, TransferTrb, dci_endpoint_number, dci_is_in,
+};
 use super::xhci::{
     CapabilityRegisters, CommandRing, CommandTrb, DoorbellArray, DoorbellTarget, EventRing,
-    EventTrb, InterrupterRegisterSet, OperationalRegisters, RuntimeRegisters, Trb,
+    EventTrb, InterrupterRegisterSet, OperationalRegisters, RuntimeRegisters, TransferRing, Trb,
     TrbCompletionCode,
 };
-use crate::truncate::u32_of;
+use crate::truncate::{Widen, u32_of};
 
 /// `USBSTS` bit 3: Event Interrupt (EINT) — set when an event is posted.
 const USBSTS_EINT: u32 = 1 << 3;
@@ -61,6 +67,35 @@ pub struct VirtualXhciController {
     pub command_ring: CommandRing,
     /// Device-slot allocation state; index = slot ID - 1.
     slots: Vec<bool>,
+    /// Per-(slot ID, DCI) transfer rings. Created on first
+    /// [`submit_transfer`](Self::submit_transfer) — input-context-driven ring
+    /// setup waits on guest-memory device contexts.
+    transfer_rings: BTreeMap<(u8, u8), TransferRing>,
+    /// The device model bound to each slot — where TDs terminate.
+    device_models: BTreeMap<u8, Box<dyn UsbDeviceModel>>,
+    /// EP0 control-transfer stage tracking per slot (Setup/Data/Status
+    /// arrive as separate TDs, xHCI §4.11.2.2).
+    control_state: BTreeMap<u8, ControlStage>,
+}
+
+/// Where slot's EP0 is within the Setup → Data → Status sequence.
+#[derive(Debug)]
+enum ControlStage {
+    /// A Setup Stage TD has been processed; its packet is pending.
+    SetupDone {
+        /// The SETUP packet awaiting its data/status stages.
+        setup: SetupPacket,
+    },
+    /// The Data Stage TD has been processed.
+    DataDone {
+        /// The SETUP packet that opened the transfer.
+        setup: SetupPacket,
+        /// OUT-data gathered from the guest (empty for IN transfers).
+        out_data: Vec<u8>,
+        /// Whether the device model already executed the request (IN
+        /// transfers respond at the data stage; OUT waits for status).
+        responded: bool,
+    },
 }
 
 impl VirtualXhciController {
@@ -77,6 +112,9 @@ impl VirtualXhciController {
             command_ring: CommandRing::with_default_size(),
             slots,
             caps,
+            transfer_rings: BTreeMap::new(),
+            device_models: BTreeMap::new(),
+            control_state: BTreeMap::new(),
         }
     }
 
@@ -107,6 +145,11 @@ impl VirtualXhciController {
             o if o < self.caps.dboff => self.write_runtime(o - self.caps.rtsoff, value),
             o => {
                 let index = u8::try_from((o - self.caps.dboff) / 4).unwrap_or(u8::MAX);
+                // Doorbell 0 (command ring) is processed inline — commands
+                // never touch guest memory here. Device-slot doorbells latch
+                // pending and are drained by `service_doorbells`, which is
+                // where guest memory is in hand (matching the run loop's
+                // doorbell-write-exit → service shape).
                 if self.doorbells.write(index, value) == Some(DoorbellTarget::HostCommand) {
                     self.process_command_ring();
                     self.doorbells.clear_pending(index);
@@ -190,15 +233,28 @@ impl VirtualXhciController {
                 Some(CommandTrb::NoOp) => (TrbCompletionCode::Success, 0),
                 Some(CommandTrb::EnableSlot) => self.enable_slot(),
                 Some(CommandTrb::DisableSlot { slot_id }) => (self.disable_slot(slot_id), slot_id),
-                // Address/configure/reset/stop need the device-context memory
+                // Address/configure/stop need the device-context memory
                 // the KVM run loop will provide; succeed on an enabled slot so
                 // a driver's bring-up sequence can proceed, error otherwise.
                 Some(
                     CommandTrb::AddressDevice { slot_id, .. }
                     | CommandTrb::ConfigureEndpoint { slot_id, .. }
-                    | CommandTrb::ResetEndpoint { slot_id, .. }
                     | CommandTrb::StopEndpoint { slot_id, .. },
                 ) => (self.slot_dependent_success(slot_id), slot_id),
+                // Reset Endpoint recovers a halted endpoint (xHCI §4.6.8):
+                // clear the halt so the ring processes TDs again.
+                Some(CommandTrb::ResetEndpoint {
+                    slot_id,
+                    endpoint_id,
+                }) => {
+                    let code = self.slot_dependent_success(slot_id);
+                    if code == TrbCompletionCode::Success
+                        && let Some(ring) = self.transfer_rings.get_mut(&(slot_id, endpoint_id))
+                    {
+                        ring.clear_halt();
+                    }
+                    (code, slot_id)
+                }
                 // An undecodable TRB on the command ring is a TRB error.
                 None => (TrbCompletionCode::TrbError, 0),
             };
@@ -221,11 +277,15 @@ impl VirtualXhciController {
         (TrbCompletionCode::NoSlotsAvailableError, 0)
     }
 
-    /// Free a slot; disabling a never-enabled slot is a TRB error.
+    /// Free a slot; disabling a never-enabled slot is a TRB error. A freed
+    /// slot's transfer rings, device model, and control state go with it.
     fn disable_slot(&mut self, slot_id: u8) -> TrbCompletionCode {
         match self.slots.get_mut(usize::from(slot_id.wrapping_sub(1))) {
             Some(used) if *used => {
                 *used = false;
+                self.transfer_rings.retain(|(slot, _), _| *slot != slot_id);
+                self.device_models.remove(&slot_id);
+                self.control_state.remove(&slot_id);
                 TrbCompletionCode::Success
             }
             _ => TrbCompletionCode::TrbError,
@@ -246,6 +306,526 @@ impl VirtualXhciController {
             .get(usize::from(slot_id.wrapping_sub(1)))
             .copied()
             .unwrap_or(false)
+    }
+
+    // -----------------------------------------------------------------------
+    // Transfer-ring (TD) processing
+    // -----------------------------------------------------------------------
+
+    /// Bind the device model that `slot_id`'s transfer rings terminate
+    /// against (an emulated device today, a libusb forwarder for routed
+    /// physical devices later). Until Address Device parses input contexts
+    /// out of guest memory, the platform binds the model explicitly after
+    /// Enable Slot. Fails on a disabled slot.
+    pub fn bind_device_model(&mut self, slot_id: u8, model: Box<dyn UsbDeviceModel>) -> bool {
+        if !self.slot_enabled(slot_id) {
+            return false;
+        }
+        self.device_models.insert(slot_id, model);
+        true
+    }
+
+    /// Model the guest enqueueing a transfer TRB on the (slot, DCI) ring
+    /// (stands in for the guest's TRB write until rings live in guest
+    /// memory). Ring the slot's doorbell and call
+    /// [`service_doorbells`](Self::service_doorbells) to have it processed.
+    /// Fails on a disabled slot, DCI 0, a full ring, or a halted endpoint.
+    pub fn submit_transfer(&mut self, slot_id: u8, dci: u8, trb: &TransferTrb) -> bool {
+        if !self.slot_enabled(slot_id) || dci == 0 {
+            return false;
+        }
+        let ring = self
+            .transfer_rings
+            .entry((slot_id, dci))
+            .or_insert_with(|| TransferRing::with_default_size(slot_id, dci));
+        ring.enqueue(trb.to_trb(true))
+    }
+
+    /// Drain every pending doorbell, processing the rung transfer rings
+    /// against guest memory. This is the run loop's entry point after a
+    /// doorbell-write exit — device-slot doorbells latch in
+    /// [`write_register`](Self::write_register) and are serviced here, where
+    /// guest memory is in hand. A halted controller leaves them latched.
+    pub fn service_doorbells(&mut self, mem: &mut dyn DmaMemory) {
+        if !self.op.is_running() {
+            return;
+        }
+        for target in self.doorbells.drain_pending() {
+            match target {
+                DoorbellTarget::HostCommand => self.process_command_ring(),
+                DoorbellTarget::ControlEndpoint { slot_id } => {
+                    self.process_transfer_ring(slot_id, CONTROL_DCI, mem);
+                }
+                DoorbellTarget::Endpoint {
+                    slot_id,
+                    endpoint_id,
+                }
+                | DoorbellTarget::Stream {
+                    slot_id,
+                    endpoint_id,
+                    ..
+                } => self.process_transfer_ring(slot_id, endpoint_id, mem),
+            }
+        }
+    }
+
+    /// Whether an endpoint is halted (after a STALL, until Reset Endpoint).
+    #[must_use]
+    pub fn endpoint_halted(&self, slot_id: u8, dci: u8) -> bool {
+        self.transfer_rings
+            .get(&(slot_id, dci))
+            .is_some_and(TransferRing::is_halted)
+    }
+
+    /// Drain one rung transfer ring TD by TD (xHCI §4.9.2): gather each TD
+    /// by the chain bit, execute it against the slot's device model, and
+    /// post its Transfer Event. Stops at a halt (STALL) or an empty ring.
+    fn process_transfer_ring(&mut self, slot_id: u8, dci: u8, mem: &mut dyn DmaMemory) {
+        if !self.slot_enabled(slot_id) {
+            return;
+        }
+        loop {
+            let Some(ring) = self.transfer_rings.get_mut(&(slot_id, dci)) else {
+                return;
+            };
+            if ring.is_halted() || ring.ring().is_empty() {
+                return;
+            }
+            match Self::gather_td(ring) {
+                // An undecodable TRB on the ring is a TRB error.
+                Err(trb_pointer) => {
+                    self.post_transfer_event(
+                        trb_pointer,
+                        0,
+                        TrbCompletionCode::TrbError,
+                        slot_id,
+                        dci,
+                    );
+                }
+                Ok(td) if td.is_empty() => return,
+                Ok(td) => {
+                    if dci == CONTROL_DCI {
+                        self.execute_control_td(slot_id, &td, mem);
+                    } else {
+                        self.execute_normal_td(slot_id, dci, &td, mem);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Gather one TD off the ring: TRBs chain while the chain bit is set,
+    /// the first chain-clear TRB closes the TD (ACRN's `USB_DATA_PART` /
+    /// `USB_DATA_FULL` assembly). Each TRB is paired with the ring address a
+    /// Transfer Event reports for it (`base + index * 16`). An undecodable
+    /// TRB aborts the TD with its address as the error.
+    fn gather_td(ring: &mut TransferRing) -> Result<Vec<(u64, TransferTrb)>, u64> {
+        let mut td = Vec::new();
+        loop {
+            let index = ring.ring().dequeue_index();
+            let base = ring.ring().base_addr();
+            let Some(raw) = ring.dequeue() else { break };
+            let trb_pointer = base + index.to_u64() * 16;
+            match TransferTrb::from_trb(&raw) {
+                Some(trb) => {
+                    let chains = trb.chains();
+                    td.push((trb_pointer, trb));
+                    if !chains {
+                        break;
+                    }
+                }
+                None => return Err(trb_pointer),
+            }
+        }
+        Ok(td)
+    }
+
+    /// Execute one TD on the control endpoint. The Setup/Data/Status stages
+    /// arrive as separate TDs (xHCI §4.11.2.2), so this advances the slot's
+    /// [`ControlStage`] machine: Setup stashes the packet, an IN data stage
+    /// runs the request and fills the guest buffer, an OUT data stage
+    /// gathers the guest's bytes, and Status runs any not-yet-run request
+    /// and completes the transfer.
+    fn execute_control_td(
+        &mut self,
+        slot_id: u8,
+        td: &[(u64, TransferTrb)],
+        mem: &mut dyn DmaMemory,
+    ) {
+        let last_pointer = td[td.len() - 1].0;
+        match td[0].1 {
+            TransferTrb::Setup { packet, ioc, .. } => {
+                self.control_state
+                    .insert(slot_id, ControlStage::SetupDone { setup: packet });
+                if ioc {
+                    self.post_transfer_event(
+                        td[0].0,
+                        0,
+                        TrbCompletionCode::Success,
+                        slot_id,
+                        CONTROL_DCI,
+                    );
+                }
+            }
+            TransferTrb::Data { dir_in, .. } => {
+                self.execute_control_data(slot_id, td, dir_in, mem);
+            }
+            TransferTrb::Status { ioc, .. } => {
+                self.execute_control_status(slot_id, last_pointer, ioc);
+            }
+            TransferTrb::NoOp { ioc } => {
+                if ioc {
+                    self.post_transfer_event(
+                        last_pointer,
+                        0,
+                        TrbCompletionCode::Success,
+                        slot_id,
+                        CONTROL_DCI,
+                    );
+                }
+            }
+            // A TD headed by a Normal TRB on EP0 is malformed.
+            TransferTrb::Normal { .. } => {
+                self.post_transfer_event(
+                    last_pointer,
+                    0,
+                    TrbCompletionCode::TrbError,
+                    slot_id,
+                    CONTROL_DCI,
+                );
+            }
+        }
+    }
+
+    /// The Data Stage TD of a control transfer (a Data Stage TRB optionally
+    /// chained with Normal TRBs). IN runs the request now and scatters the
+    /// response into the guest buffers; OUT gathers the guest's bytes and
+    /// defers the request to the Status stage.
+    fn execute_control_data(
+        &mut self,
+        slot_id: u8,
+        td: &[(u64, TransferTrb)],
+        dir_in: bool,
+        mem: &mut dyn DmaMemory,
+    ) {
+        let last_pointer = td[td.len() - 1].0;
+        let ioc = td.iter().any(|(_, t)| t.interrupt_on_completion());
+        let Some(buffers) = Self::td_buffers(td) else {
+            self.post_transfer_event(
+                last_pointer,
+                0,
+                TrbCompletionCode::TrbError,
+                slot_id,
+                CONTROL_DCI,
+            );
+            return;
+        };
+        let requested: u32 = buffers.iter().map(|(_, len)| *len).sum();
+        // The data stage must follow a setup stage of the same direction.
+        let setup = match self.control_state.remove(&slot_id) {
+            Some(ControlStage::SetupDone { setup }) if setup.is_device_to_host() == dir_in => setup,
+            _ => {
+                self.post_transfer_event(
+                    last_pointer,
+                    0,
+                    TrbCompletionCode::TrbError,
+                    slot_id,
+                    CONTROL_DCI,
+                );
+                return;
+            }
+        };
+        if dir_in {
+            let result = self
+                .device_models
+                .get_mut(&slot_id)
+                .map_or(UsbTransferResult::Error, |model| model.control(&setup, &[]));
+            match result {
+                UsbTransferResult::Data(bytes) => {
+                    let Some(written) = Self::scatter(mem, &buffers, &bytes) else {
+                        self.post_transfer_event(
+                            last_pointer,
+                            requested,
+                            TrbCompletionCode::UsbTransactionError,
+                            slot_id,
+                            CONTROL_DCI,
+                        );
+                        return;
+                    };
+                    self.control_state.insert(
+                        slot_id,
+                        ControlStage::DataDone {
+                            setup,
+                            out_data: Vec::new(),
+                            responded: true,
+                        },
+                    );
+                    self.complete_td(last_pointer, requested, written, ioc, slot_id, CONTROL_DCI);
+                }
+                UsbTransferResult::Stall => {
+                    self.stall_endpoint(slot_id, CONTROL_DCI, last_pointer, requested);
+                }
+                UsbTransferResult::Ack(_) | UsbTransferResult::Error => {
+                    self.post_transfer_event(
+                        last_pointer,
+                        requested,
+                        TrbCompletionCode::UsbTransactionError,
+                        slot_id,
+                        CONTROL_DCI,
+                    );
+                }
+            }
+        } else {
+            let Some(data) = Self::gather_buffers(mem, &buffers) else {
+                self.post_transfer_event(
+                    last_pointer,
+                    requested,
+                    TrbCompletionCode::UsbTransactionError,
+                    slot_id,
+                    CONTROL_DCI,
+                );
+                return;
+            };
+            self.control_state.insert(
+                slot_id,
+                ControlStage::DataDone {
+                    setup,
+                    out_data: data,
+                    responded: false,
+                },
+            );
+            if ioc {
+                self.post_transfer_event(
+                    last_pointer,
+                    0,
+                    TrbCompletionCode::Success,
+                    slot_id,
+                    CONTROL_DCI,
+                );
+            }
+        }
+    }
+
+    /// The Status Stage TD: run the request if the data stage did not
+    /// already (OUT and no-data transfers), then complete the control
+    /// transfer. Errors always post an event; success posts on IOC.
+    fn execute_control_status(&mut self, slot_id: u8, trb_pointer: u64, ioc: bool) {
+        let code = match self.control_state.remove(&slot_id) {
+            Some(ControlStage::DataDone {
+                responded: true, ..
+            }) => TrbCompletionCode::Success,
+            Some(ControlStage::DataDone {
+                setup,
+                out_data,
+                responded: false,
+            }) => self.run_control_request(slot_id, setup, &out_data),
+            Some(ControlStage::SetupDone { setup }) => {
+                self.run_control_request(slot_id, setup, &[])
+            }
+            // A status stage with no transfer in flight is a TRB error.
+            None => TrbCompletionCode::TrbError,
+        };
+        if code == TrbCompletionCode::StallError {
+            self.stall_endpoint(slot_id, CONTROL_DCI, trb_pointer, 0);
+            return;
+        }
+        if ioc || code != TrbCompletionCode::Success {
+            self.post_transfer_event(trb_pointer, 0, code, slot_id, CONTROL_DCI);
+        }
+    }
+
+    /// Run a control request against the slot's device model, mapping the
+    /// outcome to a completion code (no bound model = transaction error, as
+    /// for a device that fell off the bus).
+    fn run_control_request(
+        &mut self,
+        slot_id: u8,
+        setup: SetupPacket,
+        out_data: &[u8],
+    ) -> TrbCompletionCode {
+        let result = self
+            .device_models
+            .get_mut(&slot_id)
+            .map_or(UsbTransferResult::Error, |model| {
+                model.control(&setup, out_data)
+            });
+        match result {
+            UsbTransferResult::Ack(_) | UsbTransferResult::Data(_) => TrbCompletionCode::Success,
+            UsbTransferResult::Stall => TrbCompletionCode::StallError,
+            UsbTransferResult::Error => TrbCompletionCode::UsbTransactionError,
+        }
+    }
+
+    /// Execute one bulk/interrupt TD: OUT gathers the guest buffers and
+    /// sends them to the device, IN asks the device for up to the TD's
+    /// capacity and scatters the response back.
+    fn execute_normal_td(
+        &mut self,
+        slot_id: u8,
+        dci: u8,
+        td: &[(u64, TransferTrb)],
+        mem: &mut dyn DmaMemory,
+    ) {
+        let last_pointer = td[td.len() - 1].0;
+        let ioc = td.iter().any(|(_, t)| t.interrupt_on_completion());
+        if let TransferTrb::NoOp { ioc } = td[0].1 {
+            if ioc {
+                self.post_transfer_event(last_pointer, 0, TrbCompletionCode::Success, slot_id, dci);
+            }
+            return;
+        }
+        let Some(buffers) = Self::td_buffers(td) else {
+            self.post_transfer_event(last_pointer, 0, TrbCompletionCode::TrbError, slot_id, dci);
+            return;
+        };
+        let requested: u32 = buffers.iter().map(|(_, len)| *len).sum();
+        let endpoint = dci_endpoint_number(dci);
+        let result = if dci_is_in(dci) {
+            self.device_models
+                .get_mut(&slot_id)
+                .map_or(UsbTransferResult::Error, |model| {
+                    model.transfer_in(endpoint, crate::truncate::usize_of(requested))
+                })
+        } else {
+            match Self::gather_buffers(mem, &buffers) {
+                Some(data) => self
+                    .device_models
+                    .get_mut(&slot_id)
+                    .map_or(UsbTransferResult::Error, |model| {
+                        model.transfer_out(endpoint, &data)
+                    }),
+                None => UsbTransferResult::Error,
+            }
+        };
+        match result {
+            UsbTransferResult::Data(bytes) => {
+                let Some(written) = Self::scatter(mem, &buffers, &bytes) else {
+                    self.post_transfer_event(
+                        last_pointer,
+                        requested,
+                        TrbCompletionCode::UsbTransactionError,
+                        slot_id,
+                        dci,
+                    );
+                    return;
+                };
+                self.complete_td(last_pointer, requested, written, ioc, slot_id, dci);
+            }
+            UsbTransferResult::Ack(accepted) => {
+                self.complete_td(last_pointer, requested, accepted, ioc, slot_id, dci);
+            }
+            UsbTransferResult::Stall => {
+                self.stall_endpoint(slot_id, dci, last_pointer, requested);
+            }
+            UsbTransferResult::Error => {
+                self.post_transfer_event(
+                    last_pointer,
+                    requested,
+                    TrbCompletionCode::UsbTransactionError,
+                    slot_id,
+                    dci,
+                );
+            }
+        }
+    }
+
+    /// Post a TD's completion: the Transfer Event carries the **residual**
+    /// (requested-but-untransferred bytes, the spec's 24-bit `EVENT_TRB_LEN`
+    /// — drivers compute `transferred = requested - residual`). Success
+    /// posts on IOC; a short transfer always posts, as Short Packet.
+    fn complete_td(
+        &mut self,
+        trb_pointer: u64,
+        requested: u32,
+        transferred: usize,
+        ioc: bool,
+        slot_id: u8,
+        dci: u8,
+    ) {
+        let residual = requested.saturating_sub(u32_of(transferred));
+        let code = if residual > 0 {
+            TrbCompletionCode::ShortPacket
+        } else {
+            TrbCompletionCode::Success
+        };
+        if ioc || residual > 0 {
+            self.post_transfer_event(trb_pointer, residual, code, slot_id, dci);
+        }
+    }
+
+    /// STALL: halt the endpoint (TDs stop processing until Reset Endpoint)
+    /// and post the Stall Error event.
+    fn stall_endpoint(&mut self, slot_id: u8, dci: u8, trb_pointer: u64, residual: u32) {
+        if let Some(ring) = self.transfer_rings.get_mut(&(slot_id, dci)) {
+            ring.halt();
+        }
+        if dci == CONTROL_DCI {
+            self.control_state.remove(&slot_id);
+        }
+        self.post_transfer_event(
+            trb_pointer,
+            residual,
+            TrbCompletionCode::StallError,
+            slot_id,
+            dci,
+        );
+    }
+
+    /// The (buffer, length) list of a data-carrying TD (a Data/Normal head
+    /// chained with Normal TRBs). `None` if a non-data TRB is mixed in.
+    fn td_buffers(td: &[(u64, TransferTrb)]) -> Option<Vec<(u64, u32)>> {
+        td.iter()
+            .map(|(_, trb)| match trb {
+                TransferTrb::Data { buffer, length, .. }
+                | TransferTrb::Normal { buffer, length, .. } => Some((*buffer, *length)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Read and concatenate a TD's guest buffers (`None` on an unbacked
+    /// address — a transaction error on the USB side).
+    fn gather_buffers(mem: &dyn DmaMemory, buffers: &[(u64, u32)]) -> Option<Vec<u8>> {
+        let mut data = Vec::new();
+        for (address, length) in buffers {
+            let mut chunk = vec![0_u8; crate::truncate::usize_of(*length)];
+            if !mem.read(*address, &mut chunk) {
+                return None;
+            }
+            data.append(&mut chunk);
+        }
+        Some(data)
+    }
+
+    /// Scatter `bytes` across a TD's guest buffers in order, returning how
+    /// many were written (`None` on an unbacked address).
+    fn scatter(mem: &mut dyn DmaMemory, buffers: &[(u64, u32)], bytes: &[u8]) -> Option<usize> {
+        let mut offset = 0;
+        for (address, length) in buffers {
+            if offset >= bytes.len() {
+                break;
+            }
+            let take = crate::truncate::usize_of(*length).min(bytes.len() - offset);
+            if !mem.write(*address, &bytes[offset..offset + take]) {
+                return None;
+            }
+            offset += take;
+        }
+        Some(offset)
+    }
+
+    /// Post a Transfer Event through the interrupt surfaces.
+    fn post_transfer_event(
+        &mut self,
+        trb_pointer: u64,
+        residual: u32,
+        code: TrbCompletionCode,
+        slot_id: u8,
+        dci: u8,
+    ) {
+        self.post_event_trb(|ring| {
+            ring.post_transfer_event(trb_pointer, residual, code, slot_id, dci)
+        });
     }
 
     /// Attach a device of the given [`UsbSpeed`] to the **lowest free port of
@@ -623,6 +1203,292 @@ mod tests {
         let ports1 = c.read_register(XECP_OFFSET + next * 4 + 8);
         assert_eq!(ports1 & 0xFF, 3, "USB3 ports start after the USB2 group");
         assert_eq!((ports1 >> 8) & 0xFF, 2, "USB3 covers ports 3-4");
+    }
+
+    /// A running controller with slot 1 enabled and a loopback device
+    /// (VID:PID 1234:5678) bound to it, plus 4 KiB of "guest RAM" at 0x1000.
+    fn controller_with_loopback() -> (VirtualXhciController, super::super::xhci::VecDmaMemory) {
+        use super::super::emulated::LoopbackDevice;
+        let mut c = running_controller();
+        c.submit_command(&CommandTrb::EnableSlot);
+        c.write_register(c.caps.dboff, 0);
+        let _ = c.pop_event();
+        assert!(c.bind_device_model(1, Box::new(LoopbackDevice::new(0x1234, 0x5678))));
+        (c, super::super::xhci::VecDmaMemory::new(0x1000, 4096))
+    }
+
+    /// Ring the doorbell for slot 1 / `dci` through the register window and
+    /// service it against `mem` (the run loop's doorbell-exit shape).
+    fn ring_and_service(
+        c: &mut VirtualXhciController,
+        dci: u8,
+        mem: &mut super::super::xhci::VecDmaMemory,
+    ) {
+        c.write_register(c.caps.dboff + 4, u32::from(dci));
+        c.service_doorbells(mem);
+    }
+
+    #[test]
+    fn control_get_descriptor_fills_the_guest_buffer() {
+        use super::super::xhci::transfer::{SetupPacket, TransferTrb, TransferType};
+        let (mut c, mut mem) = controller_with_loopback();
+
+        // The driver's GET_DESCRIPTOR(Device) sequence: Setup, Data IN at
+        // guest 0x1100, Status OUT with IOC.
+        let setup = SetupPacket {
+            request_type: 0x80,
+            request: 6,
+            value: 0x0100,
+            index: 0,
+            length: 18,
+        };
+        assert!(c.submit_transfer(
+            1,
+            CONTROL_DCI,
+            &TransferTrb::Setup {
+                packet: setup,
+                transfer_type: TransferType::InData,
+                ioc: false,
+            },
+        ));
+        assert!(c.submit_transfer(
+            1,
+            CONTROL_DCI,
+            &TransferTrb::Data {
+                buffer: 0x1100,
+                length: 18,
+                dir_in: true,
+                chain: false,
+                ioc: false,
+            },
+        ));
+        assert!(c.submit_transfer(
+            1,
+            CONTROL_DCI,
+            &TransferTrb::Status {
+                dir_in: false,
+                ioc: true,
+            },
+        ));
+        ring_and_service(&mut c, CONTROL_DCI, &mut mem);
+
+        // The 18-byte device descriptor landed at guest 0x1100 (offset 0x100).
+        let bytes = mem.bytes();
+        assert_eq!(bytes[0x100], 18, "bLength");
+        assert_eq!(bytes[0x101], 1, "bDescriptorType DEVICE");
+        assert_eq!(&bytes[0x108..0x10C], &[0x34, 0x12, 0x78, 0x56], "VID/PID");
+
+        // One transfer event: the IOC'd status stage, Success, on EP0's DCI.
+        match c.pop_event() {
+            Some(EventTrb::TransferEvent {
+                completion_code,
+                slot_id,
+                endpoint_id,
+                ..
+            }) => {
+                assert_eq!(completion_code as u8, TrbCompletionCode::Success as u8);
+                assert_eq!(slot_id, 1);
+                assert_eq!(endpoint_id, CONTROL_DCI);
+            }
+            other => panic!("expected a transfer event, got {other:?}"),
+        }
+        assert!(c.pop_event().is_none(), "no event without IOC");
+    }
+
+    #[test]
+    fn bulk_loopback_round_trips_through_chained_trbs() {
+        use super::super::xhci::transfer::TransferTrb;
+        let (mut c, mut mem) = controller_with_loopback();
+
+        // Guest data at 0x1000: two chained OUT TRBs form one 8-byte TD on
+        // EP1 OUT (DCI 2).
+        assert!(mem.write(0x1000, b"abcdEFGH"));
+        for (buffer, chain) in [(0x1000_u64, true), (0x1004, false)] {
+            assert!(c.submit_transfer(
+                1,
+                2,
+                &TransferTrb::Normal {
+                    buffer,
+                    length: 4,
+                    chain,
+                    ioc: !chain,
+                    isp: false,
+                },
+            ));
+        }
+        ring_and_service(&mut c, 2, &mut mem);
+        match c.pop_event() {
+            Some(EventTrb::TransferEvent {
+                completion_code,
+                transfer_length,
+                endpoint_id,
+                ..
+            }) => {
+                assert_eq!(completion_code as u8, TrbCompletionCode::Success as u8);
+                assert_eq!(transfer_length, 0, "residual is 0 — all 8 went out");
+                assert_eq!(endpoint_id, 2);
+            }
+            other => panic!("expected a transfer event, got {other:?}"),
+        }
+
+        // EP1 IN (DCI 3) asks for 16 into 0x1200 — only 8 are queued, so the
+        // event is a Short Packet with residual 8 and the bytes match.
+        assert!(c.submit_transfer(
+            1,
+            3,
+            &TransferTrb::Normal {
+                buffer: 0x1200,
+                length: 16,
+                chain: false,
+                ioc: true,
+                isp: true,
+            },
+        ));
+        ring_and_service(&mut c, 3, &mut mem);
+        match c.pop_event() {
+            Some(EventTrb::TransferEvent {
+                completion_code,
+                transfer_length,
+                ..
+            }) => {
+                assert_eq!(
+                    completion_code as u8,
+                    TrbCompletionCode::ShortPacket as u8,
+                    "16 asked, 8 delivered"
+                );
+                assert_eq!(transfer_length, 8, "residual = requested - transferred");
+            }
+            other => panic!("expected a transfer event, got {other:?}"),
+        }
+        assert_eq!(&mem.bytes()[0x200..0x208], b"abcdEFGH");
+    }
+
+    #[test]
+    fn stall_halts_the_endpoint_until_reset_endpoint() {
+        use super::super::xhci::transfer::{SetupPacket, TransferTrb, TransferType};
+        let (mut c, mut mem) = controller_with_loopback();
+
+        // An unsupported vendor request STALLs at the status stage.
+        let weird = SetupPacket {
+            request_type: 0x40,
+            request: 0x42,
+            value: 0,
+            index: 0,
+            length: 0,
+        };
+        assert!(c.submit_transfer(
+            1,
+            CONTROL_DCI,
+            &TransferTrb::Setup {
+                packet: weird,
+                transfer_type: TransferType::NoData,
+                ioc: false,
+            },
+        ));
+        assert!(c.submit_transfer(
+            1,
+            CONTROL_DCI,
+            &TransferTrb::Status {
+                dir_in: true,
+                ioc: true,
+            },
+        ));
+        ring_and_service(&mut c, CONTROL_DCI, &mut mem);
+        match c.pop_event() {
+            Some(EventTrb::TransferEvent {
+                completion_code, ..
+            }) => assert_eq!(completion_code as u8, TrbCompletionCode::StallError as u8),
+            other => panic!("expected a stall event, got {other:?}"),
+        }
+        assert!(c.endpoint_halted(1, CONTROL_DCI));
+
+        // Halted: the ring accepts nothing and processes nothing.
+        assert!(!c.submit_transfer(
+            1,
+            CONTROL_DCI,
+            &TransferTrb::Status {
+                dir_in: true,
+                ioc: true,
+            },
+        ));
+
+        // Reset Endpoint recovers it, exactly as the driver would.
+        c.submit_command(&CommandTrb::ResetEndpoint {
+            slot_id: 1,
+            endpoint_id: CONTROL_DCI,
+        });
+        c.write_register(c.caps.dboff, 0);
+        let _ = c.pop_event();
+        assert!(!c.endpoint_halted(1, CONTROL_DCI));
+        assert!(c.submit_transfer(1, CONTROL_DCI, &TransferTrb::NoOp { ioc: true }));
+    }
+
+    #[test]
+    fn device_slot_doorbells_defer_until_serviced_with_memory() {
+        use super::super::xhci::transfer::TransferTrb;
+        let (mut c, mut mem) = controller_with_loopback();
+        assert!(c.submit_transfer(1, 3, &TransferTrb::NoOp { ioc: true }));
+
+        // The doorbell write alone latches but does not process (no guest
+        // memory is in hand at register-write time).
+        c.write_register(c.caps.dboff + 4, 3);
+        assert!(c.pop_event().is_none());
+        assert!(c.doorbells.is_pending(1));
+
+        c.service_doorbells(&mut mem);
+        assert!(matches!(
+            c.pop_event(),
+            Some(EventTrb::TransferEvent { .. })
+        ));
+        assert!(!c.doorbells.is_pending(1));
+    }
+
+    #[test]
+    fn transfer_to_unbacked_memory_is_a_transaction_error() {
+        use super::super::xhci::transfer::TransferTrb;
+        let (mut c, mut mem) = controller_with_loopback();
+
+        // OUT TD pointing far outside the backed range.
+        assert!(c.submit_transfer(
+            1,
+            2,
+            &TransferTrb::Normal {
+                buffer: 0xDEAD_0000,
+                length: 4,
+                chain: false,
+                ioc: true,
+                isp: false,
+            },
+        ));
+        ring_and_service(&mut c, 2, &mut mem);
+        match c.pop_event() {
+            Some(EventTrb::TransferEvent {
+                completion_code, ..
+            }) => assert_eq!(
+                completion_code as u8,
+                TrbCompletionCode::UsbTransactionError as u8
+            ),
+            other => panic!("expected a transaction error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn disable_slot_drops_rings_models_and_control_state() {
+        use super::super::xhci::transfer::TransferTrb;
+        let (mut c, _mem) = controller_with_loopback();
+        assert!(c.submit_transfer(1, 3, &TransferTrb::NoOp { ioc: true }));
+
+        c.submit_command(&CommandTrb::DisableSlot { slot_id: 1 });
+        c.write_register(c.caps.dboff, 0);
+        let _ = c.pop_event();
+
+        // The slot's transfer machinery went with it.
+        assert!(!c.endpoint_halted(1, 3));
+        assert!(!c.submit_transfer(1, 3, &TransferTrb::NoOp { ioc: true }));
+        assert!(!c.bind_device_model(
+            1,
+            Box::new(super::super::emulated::LoopbackDevice::new(0, 0))
+        ));
     }
 
     #[test]
