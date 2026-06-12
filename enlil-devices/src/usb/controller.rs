@@ -535,6 +535,18 @@ impl VirtualXhciController {
                 } => self.process_transfer_ring(slot_id, endpoint_id, mem),
             }
         }
+        // Deliver what the servicing produced into the guest's event ring
+        // (a no-op until the driver programs ERSTBA).
+        let _ = self.interrupter.flush_to_guest(mem);
+    }
+
+    /// Deliver internally queued events into the guest-memory event ring
+    /// (xHCI §4.9.4), returning how many were written. The run loop calls
+    /// this after posting events outside doorbell servicing — hot-plug's
+    /// Port Status Change above all; [`service_doorbells`](Self::service_doorbells)
+    /// flushes on its own. A no-op until the driver programs `ERSTBA`.
+    pub fn flush_events(&mut self, mem: &mut dyn DmaMemory) -> usize {
+        self.interrupter.flush_to_guest(mem)
     }
 
     /// Whether an endpoint is halted (after a STALL, until Reset Endpoint).
@@ -2059,6 +2071,49 @@ mod tests {
         assert!(
             c.transfer_rings.contains_key(&(1, CONTROL_DCI)),
             "EP0 survives"
+        );
+    }
+
+    #[test]
+    fn events_land_in_the_guest_event_ring_once_erstba_is_programmed() {
+        use super::super::xhci::transfer::DmaMemory;
+        use super::super::xhci::trb::TrbType;
+        let (mut c, mut mem) = controller_with_slot();
+        let _drained = c.pop_event(); // keep the internal queue empty? (none pending)
+
+        // The driver programs a one-segment event ring: ERST at 0x1000
+        // describing 16 TRBs at 0x1100, ERDP parked at the first slot.
+        assert!(mem.write(0x1000, &0x1100_u64.to_le_bytes()));
+        assert!(mem.write(0x1008, &16_u16.to_le_bytes()));
+        c.write_register(c.caps.rtsoff + 0x28, 1); // ERSTSZ
+        c.write_register(c.caps.rtsoff + 0x30, 0x1000); // ERSTBA lo
+        c.write_register(c.caps.rtsoff + 0x34, 0); // ERSTBA hi
+        c.write_register(c.caps.rtsoff + 0x38, 0x1100); // ERDP lo
+        c.write_register(c.caps.rtsoff + 0x3C, 0); // ERDP hi
+
+        // A serviced command's completion event is written to guest memory.
+        c.submit_command(&CommandTrb::NoOp);
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        let mut bytes = [0_u8; 16];
+        assert!(mem.read(0x1100, &mut bytes));
+        let trb = Trb::from_bytes(&bytes);
+        assert_eq!(trb.decoded_type(), TrbType::CommandCompletionEvent);
+        assert_eq!(trb.control & 1, 1, "PCS 1 on the first lap");
+        assert_eq!((trb.status >> 24) & 0xFF, TrbCompletionCode::Success as u32);
+        assert!(
+            c.pop_event().is_none(),
+            "delivered events leave the internal queue"
+        );
+
+        // Hot-plug events post outside doorbell servicing; the run loop's
+        // explicit flush writes them to the next slot.
+        assert!(c.connect_device(0, 3));
+        assert_eq!(c.flush_events(&mut mem), 1);
+        assert!(mem.read(0x1110, &mut bytes));
+        assert_eq!(
+            Trb::from_bytes(&bytes).decoded_type(),
+            TrbType::PortStatusChangeEvent
         );
     }
 

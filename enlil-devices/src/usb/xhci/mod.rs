@@ -36,7 +36,7 @@ pub mod trb;
 
 pub use context::{EndpointContext, EndpointType, InputControlContext};
 pub use doorbell::{DoorbellArray, DoorbellTarget};
-pub use event::{EventRing, InterrupterRegisterSet};
+pub use event::{EventRing, EventRingSegment, GuestEventRing, InterrupterRegisterSet};
 pub use registers::{
     CapabilityRegisters, OperationalRegisters, PortRegisterSet, PortState, RuntimeRegisters,
 };
