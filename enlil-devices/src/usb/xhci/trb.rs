@@ -365,7 +365,13 @@ pub enum CommandTrb {
     /// Address a device (assign USB address).
     AddressDevice { slot_id: u8, input_context_ptr: u64 },
     /// Configure endpoints.
-    ConfigureEndpoint { slot_id: u8, input_context_ptr: u64 },
+    ConfigureEndpoint {
+        slot_id: u8,
+        input_context_ptr: u64,
+        /// Deconfigure (DC, control bit 9): drop every endpoint but EP0;
+        /// the input context pointer is not referenced (xHCI §6.4.3.5).
+        deconfigure: bool,
+    },
     /// Reset an endpoint.
     ResetEndpoint { slot_id: u8, endpoint_id: u8 },
     /// Stop an endpoint.
@@ -399,10 +405,14 @@ impl CommandTrb {
             Self::ConfigureEndpoint {
                 slot_id,
                 input_context_ptr,
+                deconfigure,
             } => {
                 trb.set_trb_type(TrbType::ConfigureEndpointCommand);
                 trb.parameter = *input_context_ptr;
                 trb.control |= u32::from(*slot_id) << 24;
+                if *deconfigure {
+                    trb.control |= 1 << 9;
+                }
             }
             Self::ResetEndpoint {
                 slot_id,
@@ -445,6 +455,7 @@ impl CommandTrb {
             TrbType::ConfigureEndpointCommand => Some(Self::ConfigureEndpoint {
                 slot_id,
                 input_context_ptr: trb.parameter,
+                deconfigure: trb.control & (1 << 9) != 0,
             }),
             TrbType::ResetEndpointCommand => Some(Self::ResetEndpoint {
                 slot_id,

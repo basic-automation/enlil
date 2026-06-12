@@ -8,6 +8,7 @@
 //! Each interrupter has its own Event Ring Segment Table (ERST) that
 //! maps the ring segments in guest physical memory.
 
+use super::transfer::DmaMemory;
 use super::trb::{Trb, TrbCompletionCode, TrbType};
 use crate::truncate::u16_of;
 use std::fmt;
@@ -238,6 +239,128 @@ impl EventRing {
 }
 
 // ---------------------------------------------------------------------------
+// Guest-memory event ring writer
+// ---------------------------------------------------------------------------
+
+/// One ERST entry is 16 bytes: segment base (64-byte aligned), segment size
+/// in TRBs, reserved (xHCI §6.5).
+const ERST_ENTRY_SIZE: u64 = 16;
+
+/// The controller-side writer for an event ring resident in guest memory.
+///
+/// Built from the Event Ring Segment Table the guest's driver programmed
+/// through `ERSTBA`/`ERSTSZ` (xHCI §6.5): events are written segment by
+/// segment at the enqueue position, the Producer Cycle State starts at 1
+/// and toggles each time the write position wraps off the last segment
+/// back to the first (§4.9.4), and the ring is full when advancing would
+/// reach the TRB `ERDP` says the driver has not consumed yet.
+#[derive(Debug)]
+pub struct GuestEventRing {
+    /// The `ERSTBA` this table was read from (for change detection).
+    erstba: u64,
+    /// The `ERSTSZ` in force when the table was read.
+    erstsz: u32,
+    /// The decoded segment table.
+    segments: Vec<EventRingSegment>,
+    /// Segment the enqueue position is in.
+    segment_index: usize,
+    /// TRB index within that segment.
+    trb_index: usize,
+    /// Producer Cycle State.
+    cycle: bool,
+}
+
+impl GuestEventRing {
+    /// Decode the ERST at `erstba` with `erstsz` entries out of guest
+    /// memory. `None` for an empty/unreadable table or a segment size
+    /// outside the spec's 16–4096 TRBs — the driver misprogrammed the
+    /// ring, so events stay queued internally.
+    #[must_use]
+    pub fn load(mem: &dyn DmaMemory, erstba: u64, erstsz: u32) -> Option<Self> {
+        if erstsz == 0 {
+            return None;
+        }
+        let mut segments = Vec::new();
+        for i in 0..u64::from(erstsz) {
+            let mut entry = [0_u8; 16];
+            if !mem.read(erstba + i * ERST_ENTRY_SIZE, &mut entry) {
+                return None;
+            }
+            let base = u64::from_le_bytes(entry[0..8].try_into().ok()?) & !0x3F;
+            let size = u16::from_le_bytes([entry[8], entry[9]]);
+            if !(16..=4096).contains(&size) {
+                return None;
+            }
+            segments.push(EventRingSegment::new(base, size));
+        }
+        Some(Self {
+            erstba,
+            erstsz,
+            segments,
+            segment_index: 0,
+            trb_index: 0,
+            cycle: true,
+        })
+    }
+
+    /// Whether this table was built from the given `ERSTBA`/`ERSTSZ` (if
+    /// not, the driver reprogrammed the ring and the table must be
+    /// reloaded).
+    #[must_use]
+    pub const fn matches(&self, erstba: u64, erstsz: u32) -> bool {
+        self.erstba == erstba && self.erstsz == erstsz
+    }
+
+    /// Guest physical address of the slot at (`segment`, `index`).
+    fn address_of(&self, segment: usize, index: usize) -> u64 {
+        use crate::truncate::Widen;
+        self.segments[segment].base_address + index.to_u64() * 16
+    }
+
+    /// The position after (`segment`, `index`), wrapping off the last
+    /// segment to the first.
+    fn position_after(&self, segment: usize, index: usize) -> (usize, usize) {
+        if index + 1 < usize::from(self.segments[segment].size) {
+            (segment, index + 1)
+        } else if segment + 1 < self.segments.len() {
+            (segment + 1, 0)
+        } else {
+            (0, 0)
+        }
+    }
+
+    /// Write one event TRB at the enqueue position with the Producer Cycle
+    /// State, then advance. `false` — and no write — if the ring is full
+    /// (the next position is the TRB `erdp` points at) or the segment is
+    /// unbacked; the event stays queued for a later flush.
+    pub fn write_event(&mut self, mem: &mut dyn DmaMemory, mut trb: Trb, erdp: u64) -> bool {
+        let (next_segment, next_index) = self.position_after(self.segment_index, self.trb_index);
+        if self.address_of(next_segment, next_index) == erdp & !0xF {
+            return false;
+        }
+        trb.set_cycle_bit(self.cycle);
+        if !mem.write(
+            self.address_of(self.segment_index, self.trb_index),
+            &trb.to_bytes(),
+        ) {
+            return false;
+        }
+        if (next_segment, next_index) == (0, 0) {
+            self.cycle = !self.cycle;
+        }
+        self.segment_index = next_segment;
+        self.trb_index = next_index;
+        true
+    }
+
+    /// Current Producer Cycle State.
+    #[must_use]
+    pub const fn cycle_state(&self) -> bool {
+        self.cycle
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Interrupter Register Set (xHCI 5.5.2)
 // ---------------------------------------------------------------------------
 
@@ -259,6 +382,9 @@ pub struct InterrupterRegisterSet {
     pub erdp: u64,
     /// The event ring managed by this interrupter.
     pub event_ring: EventRing,
+    /// The guest-memory writer built from the driver's ERST (`None` until
+    /// the first flush after `ERSTBA`/`ERSTSZ` are programmed).
+    guest_ring: Option<GuestEventRing>,
 }
 
 impl InterrupterRegisterSet {
@@ -272,7 +398,44 @@ impl InterrupterRegisterSet {
             erstba: 0,
             erdp: 0,
             event_ring: EventRing::new(256),
+            guest_ring: None,
         }
+    }
+
+    /// Drain internally queued events into the guest-memory event ring the
+    /// driver described through `ERSTBA`/`ERSTSZ`, returning how many were
+    /// delivered. A no-op until the segment table is programmed (events
+    /// then stay on the internal queue, where tests pop them directly);
+    /// delivery stops at a full guest ring — the rest stay queued for the
+    /// next flush.
+    pub fn flush_to_guest(&mut self, mem: &mut dyn DmaMemory) -> usize {
+        if self.erstba == 0 {
+            return 0;
+        }
+        if !self
+            .guest_ring
+            .as_ref()
+            .is_some_and(|ring| ring.matches(self.erstba, self.erstsz))
+        {
+            self.guest_ring = GuestEventRing::load(mem, self.erstba, self.erstsz);
+        }
+        let Some(ring) = &mut self.guest_ring else {
+            return 0;
+        };
+        let mut delivered = 0;
+        while !self.event_ring.is_empty() {
+            let index = self.event_ring.dequeue_index();
+            let Some(trb) = self.event_ring.read_trb(index).copied() else {
+                break;
+            };
+            if !ring.write_event(mem, trb, self.erdp) {
+                break;
+            }
+            self.event_ring
+                .set_dequeue_index((index + 1) % self.event_ring.capacity());
+            delivered += 1;
+        }
+        delivered
     }
 
     /// Check if interrupts are pending.
@@ -329,6 +492,7 @@ impl InterrupterRegisterSet {
         self.erstba = 0;
         self.erdp = 0;
         self.event_ring.reset();
+        self.guest_ring = None;
     }
 }
 
@@ -451,5 +615,114 @@ mod tests {
         let s = ir.to_string();
         assert!(s.contains("Interrupter"));
         assert!(s.contains("pending=0"));
+    }
+
+    use super::super::transfer::VecDmaMemory;
+
+    /// Write an ERST at `erstba` describing the given (base, size) segments.
+    fn write_erst(mem: &mut VecDmaMemory, erstba: u64, segments: &[(u64, u16)]) {
+        use crate::truncate::Widen;
+        for (i, (base, size)) in segments.iter().enumerate() {
+            let offset = erstba + i.to_u64() * ERST_ENTRY_SIZE;
+            assert!(mem.write(offset, &base.to_le_bytes()));
+            assert!(mem.write(offset + 8, &size.to_le_bytes()));
+        }
+    }
+
+    /// The raw TRB written at guest `addr`.
+    fn trb_at(mem: &VecDmaMemory, addr: u64) -> Trb {
+        let mut bytes = [0_u8; 16];
+        assert!(mem.read(addr, &mut bytes));
+        Trb::from_bytes(&bytes)
+    }
+
+    #[test]
+    fn guest_ring_load_validates_the_segment_table() {
+        let mut mem = VecDmaMemory::new(0x1000, 0x1000);
+        write_erst(&mut mem, 0x1000, &[(0x1100, 16), (0x1300, 16)]);
+        let ring = GuestEventRing::load(&mem, 0x1000, 2).unwrap();
+        assert!(ring.matches(0x1000, 2));
+        assert!(!ring.matches(0x1000, 1));
+
+        // Zero entries, an unbacked table, or an out-of-spec segment size
+        // all refuse to load.
+        assert!(GuestEventRing::load(&mem, 0x1000, 0).is_none());
+        assert!(GuestEventRing::load(&mem, 0xDEAD_0000, 1).is_none());
+        write_erst(&mut mem, 0x1800, &[(0x1100, 8)]); // < 16 TRBs
+        assert!(GuestEventRing::load(&mem, 0x1800, 1).is_none());
+    }
+
+    #[test]
+    fn guest_ring_writes_wrap_segments_and_toggle_cycle() {
+        let mut mem = VecDmaMemory::new(0x1000, 0x1000);
+        write_erst(&mut mem, 0x1000, &[(0x1100, 16), (0x1300, 16)]);
+        let mut ring = GuestEventRing::load(&mem, 0x1000, 2).unwrap();
+        let erdp = 0x1100; // driver parked at the first slot
+
+        // 31 writes fill both segments except the slot before ERDP.
+        let mut event = Trb::zeroed();
+        event.control = (TrbType::PortStatusChangeEvent as u32) << 10;
+        for _ in 0..31 {
+            assert!(ring.write_event(&mut mem, event, erdp));
+        }
+        assert!(
+            !ring.write_event(&mut mem, event, erdp),
+            "the slot ERDP points at is never overwritten"
+        );
+
+        // First slot of each segment carries the event with PCS = 1.
+        for addr in [0x1100_u64, 0x1300] {
+            let trb = trb_at(&mem, addr);
+            assert_eq!(trb.decoded_type(), TrbType::PortStatusChangeEvent);
+            assert_eq!(trb.control & 1, 1, "PCS 1 on the first lap");
+        }
+
+        // The driver consumes everything (ERDP = the one unwritten slot):
+        // the next write fills the last slot — still PCS 1 — and wraps the
+        // position to segment 0 slot 0, toggling PCS; the write after that
+        // lands there with PCS 0.
+        let erdp = 0x1300 + 15 * 16;
+        assert!(ring.write_event(&mut mem, event, erdp));
+        assert_eq!(trb_at(&mem, erdp).control & 1, 1, "last slot of lap one");
+        assert!(!ring.cycle_state());
+        assert!(ring.write_event(&mut mem, event, erdp));
+        let wrapped = trb_at(&mem, 0x1100);
+        assert_eq!(wrapped.control & 1, 0, "PCS 0 on the second lap");
+    }
+
+    #[test]
+    fn flush_to_guest_delivers_queued_events_and_reloads_on_reprogram() {
+        let mut mem = VecDmaMemory::new(0x1000, 0x1000);
+        write_erst(&mut mem, 0x1000, &[(0x1100, 16)]);
+        let mut ir = InterrupterRegisterSet::new();
+
+        // Events queue internally while ERSTBA is unprogrammed.
+        assert!(
+            ir.event_ring
+                .post_port_status_change(1, TrbCompletionCode::Success)
+        );
+        assert_eq!(ir.flush_to_guest(&mut mem), 0);
+
+        ir.erstsz = 1;
+        ir.erstba = 0x1000;
+        ir.erdp = 0x1100;
+        assert_eq!(ir.flush_to_guest(&mut mem), 1);
+        assert!(ir.event_ring.is_empty(), "the internal queue drained");
+        let trb = trb_at(&mem, 0x1100);
+        assert_eq!(trb.decoded_type(), TrbType::PortStatusChangeEvent);
+
+        // Reprogramming the table rebuilds the writer from the new ERST.
+        write_erst(&mut mem, 0x1800, &[(0x1500, 16)]);
+        ir.erstba = 0x1800;
+        ir.erdp = 0x1500;
+        assert!(
+            ir.event_ring
+                .post_command_completion(0, TrbCompletionCode::Success, 1)
+        );
+        assert_eq!(ir.flush_to_guest(&mut mem), 1);
+        assert_eq!(
+            trb_at(&mem, 0x1500).decoded_type(),
+            TrbType::CommandCompletionEvent
+        );
     }
 }

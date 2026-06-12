@@ -25,3 +25,6 @@ vm-device = "0.1"
 vm-superio = "0.8"
 vmm-sys-util = "0.12"
 libc = "0.2"
+# `vendored` builds libusb from source so runners without the system
+# library (and CI) still compile the physical-device forwarder.
+rusb = { version = "0.9", features = ["vendored"] }

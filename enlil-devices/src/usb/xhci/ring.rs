@@ -10,7 +10,8 @@
 //! ownership. When the producer toggles the cycle bit in a TRB, the consumer
 //! knows a new entry is available.
 
-use super::trb::Trb;
+use super::transfer::DmaMemory;
+use super::trb::{Trb, TrbType};
 
 // ---------------------------------------------------------------------------
 // Ring configuration
@@ -18,6 +19,79 @@ use super::trb::Trb;
 
 /// Default number of TRB entries per ring segment.
 const DEFAULT_RING_SIZE: usize = 256;
+
+// ---------------------------------------------------------------------------
+// Guest-memory ring cursor (consumer side)
+// ---------------------------------------------------------------------------
+
+/// How many Link TRBs one fetch will follow before giving up — a guard
+/// against a cyclic link chain wedging the controller.
+const LINK_HOP_LIMIT: usize = 8;
+
+/// The consumer side of a TRB ring resident in guest memory (xHCI §4.9):
+/// a dequeue pointer plus the Consumer Cycle State.
+///
+/// A TRB belongs to the consumer while its cycle bit matches CCS; the first
+/// mismatch is the end of the ring's valid TRBs. Link TRBs (type 6) chain
+/// segments: the cursor follows the link's Ring Segment Pointer and toggles
+/// CCS when the link's Toggle Cycle bit is set. The command ring consumes
+/// through this cursor today; transfer rings move onto it when their guest
+/// addresses come from the endpoint contexts.
+#[derive(Debug, Clone, Copy)]
+pub struct GuestRingCursor {
+    /// Guest physical address of the next TRB to consume.
+    dequeue: u64,
+    /// Consumer Cycle State.
+    cycle: bool,
+}
+
+impl GuestRingCursor {
+    /// A cursor at `pointer` with the given initial Consumer Cycle State
+    /// (for the command ring: `CRCR` bits 63:6 and RCS, xHCI §5.4.5).
+    #[must_use]
+    pub const fn new(pointer: u64, cycle: bool) -> Self {
+        Self {
+            dequeue: pointer,
+            cycle,
+        }
+    }
+
+    /// Guest physical address of the next TRB to consume.
+    #[must_use]
+    pub const fn dequeue_pointer(&self) -> u64 {
+        self.dequeue
+    }
+
+    /// Fetch the TRB at the dequeue pointer, following Link TRBs. Returns
+    /// the TRB and the guest address it was fetched from (what its
+    /// completion event reports), or `None` when the next TRB's cycle bit
+    /// says the ring is exhausted (or its memory is unbacked).
+    pub fn fetch(&mut self, mem: &dyn DmaMemory) -> Option<(u64, Trb)> {
+        for _ in 0..LINK_HOP_LIMIT {
+            let mut bytes = [0_u8; 16];
+            if !mem.read(self.dequeue, &mut bytes) {
+                return None;
+            }
+            let trb = Trb::from_bytes(&bytes);
+            if trb.cycle_bit() != self.cycle {
+                return None;
+            }
+            if trb.decoded_type() == TrbType::Link {
+                // Toggle Cycle (control bit 1) flips CCS for the next
+                // segment lap (xHCI §6.4.4.1).
+                if trb.control & 0x2 != 0 {
+                    self.cycle = !self.cycle;
+                }
+                self.dequeue = trb.parameter & !0xF;
+                continue;
+            }
+            let address = self.dequeue;
+            self.dequeue += 16;
+            return Some((address, trb));
+        }
+        None
+    }
+}
 
 // ---------------------------------------------------------------------------
 // TRB Ring (generic base)
