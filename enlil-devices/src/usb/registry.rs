@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 
 use super::controller::SharedXhci;
+use super::emulated::UsbDeviceModel;
 use super::routing::{RoutingDecision, RoutingState};
 use super::types::{GuestId, UsbDeviceId};
 
@@ -95,11 +96,27 @@ impl XhciRegistry {
         bus_addr: u8,
         device: &UsbDeviceId,
     ) -> Result<AttachOutcome, RegistryError> {
+        self.attach_with_model(bus_addr, device, None)
+    }
+
+    /// [`attach`](Self::attach), additionally parking a device model at the
+    /// chosen port so Address Device binds it to the guest's slot — the
+    /// path for devices with a backing (emulated today, libusb later).
+    ///
+    /// # Errors
+    ///
+    /// As for [`attach`](Self::attach).
+    pub fn attach_with_model(
+        &mut self,
+        bus_addr: u8,
+        device: &UsbDeviceId,
+        model: Option<Box<dyn UsbDeviceModel>>,
+    ) -> Result<AttachOutcome, RegistryError> {
         let RoutingDecision::RouteToGuest(guest) = self.routing.assign_device(bus_addr, device)
         else {
             return Ok(AttachOutcome::Unassigned);
         };
-        match self.connect_to_guest(&guest, device) {
+        match self.connect_to_guest(&guest, device, model) {
             Ok(port) => {
                 let placement = DevicePlacement { guest, port };
                 self.placements.insert(bus_addr, placement.clone());
@@ -123,7 +140,7 @@ impl XhciRegistry {
             .placements
             .remove(&bus_addr)
             .ok_or(RegistryError::NotAttached(bus_addr))?;
-        self.disconnect_port(&placement);
+        let _ = self.disconnect_port(&placement);
         let _ = self.routing.unassign_device(bus_addr);
         Ok(placement)
     }
@@ -151,8 +168,10 @@ impl XhciRegistry {
             .get(&bus_addr)
             .cloned()
             .ok_or(RegistryError::NotAttached(bus_addr))?;
-        self.disconnect_port(&old);
-        match self.connect_to_guest(&new_guest, device) {
+        // A model still parked at the old port (i.e. the guest had not
+        // addressed it into a slot) moves with the device.
+        let model = self.disconnect_port(&old);
+        match self.connect_to_guest(&new_guest, device, model) {
             Ok(port) => {
                 let placement = DevicePlacement {
                     guest: new_guest.clone(),
@@ -164,8 +183,12 @@ impl XhciRegistry {
             }
             Err(err) => {
                 // Roll back: replug on the original guest (its compatible
-                // port is free again, so this cannot fail).
-                if let Ok(port) = self.connect_to_guest(&old.guest, device) {
+                // port is free again, so this cannot fail). The model was
+                // consumed by the failed attempt only if a port was found,
+                // which it was not — but it cannot be recovered through the
+                // error path, so the replug is modelless; the caller can
+                // re-park one via attach_with_model after a detach.
+                if let Ok(port) = self.connect_to_guest(&old.guest, device, None) {
                     self.placements.insert(
                         bus_addr,
                         DevicePlacement {
@@ -198,28 +221,35 @@ impl XhciRegistry {
     }
 
     /// Attach `device` to `guest`'s controller at the lowest free
-    /// protocol-compatible port.
+    /// protocol-compatible port, parking `model` there if one is given.
     fn connect_to_guest(
         &self,
         guest: &GuestId,
         device: &UsbDeviceId,
+        model: Option<Box<dyn UsbDeviceModel>>,
     ) -> Result<usize, RegistryError> {
         let controller = self
             .controllers
             .get(guest)
             .ok_or_else(|| RegistryError::NoController(guest.clone()))?;
-        controller
-            .borrow_mut()
-            .attach_device(device.speed)
-            .ok_or_else(|| RegistryError::NoFreePort(guest.clone()))
+        let mut controller = controller.borrow_mut();
+        match model {
+            Some(model) => controller.attach_device_with_model(device.speed, model),
+            None => controller.attach_device(device.speed),
+        }
+        .ok_or_else(|| RegistryError::NoFreePort(guest.clone()))
     }
 
     /// Disconnect the placement's port (a no-op if the guest's controller
-    /// was unregistered in the meantime).
-    fn disconnect_port(&self, placement: &DevicePlacement) {
-        if let Some(controller) = self.controllers.get(&placement.guest) {
-            controller.borrow_mut().disconnect_device(placement.port);
-        }
+    /// was unregistered in the meantime), returning any model still parked
+    /// there so a reassignment can carry it along.
+    fn disconnect_port(&self, placement: &DevicePlacement) -> Option<Box<dyn UsbDeviceModel>> {
+        self.controllers.get(&placement.guest).and_then(|handle| {
+            let mut controller = handle.borrow_mut();
+            let model = controller.take_port_model(placement.port);
+            controller.disconnect_device(placement.port);
+            model
+        })
     }
 }
 
@@ -424,6 +454,41 @@ mod tests {
         let err = registry.reassign(1, "windows-ghost", &mouse).unwrap_err();
         assert!(matches!(err, RegistryError::NoController(_)));
         assert_eq!(registry.placement(1).unwrap().guest, "linux1");
+    }
+
+    #[test]
+    fn reassignment_carries_the_parked_device_model() {
+        use super::super::emulated::LoopbackDevice;
+        let mut registry = milestone_registry();
+        let mouse = device(0x046D, 0xC077, DeviceSpeed::Low, UsbDeviceClass::Hid);
+        let outcome = registry
+            .attach_with_model(
+                1,
+                &mouse,
+                Some(Box::new(LoopbackDevice::new(0x046D, 0xC077))),
+            )
+            .unwrap();
+        let AttachOutcome::Attached(placement) = outcome else {
+            panic!("expected attach");
+        };
+
+        // The model rides the live reassignment to linux2's controller and
+        // is parked at the new port for the guest's Address Device.
+        let moved = registry.reassign(1, "linux2", &mouse).unwrap();
+        assert_eq!(moved.guest, "linux2");
+        let linux1 = registry.controller("linux1").unwrap();
+        assert!(
+            linux1
+                .borrow_mut()
+                .take_port_model(placement.port)
+                .is_none(),
+            "old port no longer holds the model"
+        );
+        let linux2 = registry.controller("linux2").unwrap();
+        assert!(
+            linux2.borrow_mut().take_port_model(moved.port).is_some(),
+            "model parked at the new guest's port"
+        );
     }
 
     #[test]

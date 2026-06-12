@@ -261,6 +261,8 @@ pub enum TrbCompletionCode {
     RingUnderrun = 14,
     /// Ring overrun.
     RingOverrun = 15,
+    /// Parameter error (malformed context or command parameter).
+    ParameterError = 17,
     /// Command ring stopped.
     CommandRingStopped = 24,
     /// Command aborted.
@@ -288,6 +290,7 @@ impl TrbCompletionCode {
             13 => Self::ShortPacket,
             14 => Self::RingUnderrun,
             15 => Self::RingOverrun,
+            17 => Self::ParameterError,
             24 => Self::CommandRingStopped,
             25 => Self::CommandAborted,
             26 => Self::Stopped,

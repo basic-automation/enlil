@@ -617,25 +617,44 @@ mod tests {
         use crate::usb::xhci::transfer::TransferTrb;
         use crate::usb::xhci::{EventTrb, TrbCompletionCode, VecDmaMemory};
 
+        use crate::usb::UsbSpeed;
+        use crate::usb::xhci::transfer::DmaMemory;
+
         let mut c = VirtualXhciController::new(4);
         let op = u32::from(c.caps.caplength);
         c.write_register(op + 0x38, 8); // CONFIG
         c.write_register(op, 1); // run
-        c.submit_command(&CommandTrb::EnableSlot);
-        c.write_register(c.caps.dboff, 0);
-        let _ = c.pop_event();
+        let mut mem = VecDmaMemory::new(0x1000, 0x100);
 
+        // Routing parks the keyboard at a root-hub port ...
         let mut kbd = EmulatedKeyboard::new(0x046D, 0xC534);
         kbd.press_key(0x04);
-        assert!(c.bind_device_model(1, Box::new(kbd)));
+        let port = c
+            .attach_device_with_model(UsbSpeed::Low, Box::new(kbd))
+            .unwrap();
+        let _ = c.pop_event(); // the hot-plug port status change
 
+        // ... and the guest's driver enables a slot and addresses the
+        // device at that port (input context: add A0|A1, slot context
+        // naming the 1-based port).
+        assert!(mem.write(0x1004, &0x3_u32.to_le_bytes()));
+        let dword1 = (u32::try_from(port).unwrap() + 1) << 16;
+        assert!(mem.write(0x1024, &dword1.to_le_bytes()));
+        c.submit_command(&CommandTrb::EnableSlot);
+        c.submit_command(&CommandTrb::AddressDevice {
+            slot_id: 1,
+            input_context_ptr: 0x1000,
+        });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        let _ = c.pop_event();
+        let _ = c.pop_event();
         // Driver posts an 8-byte interrupt IN TRB on EP1 IN (DCI 3).
-        let mut mem = VecDmaMemory::new(0x1000, 64);
         assert!(c.submit_transfer(
             1,
             3,
             &TransferTrb::Normal {
-                buffer: 0x1000,
+                buffer: 0x1080,
                 length: 8,
                 chain: false,
                 ioc: true,
@@ -658,6 +677,6 @@ mod tests {
             }
             other => panic!("expected a transfer event, got {other:?}"),
         }
-        assert_eq!(&mem.bytes()[..8], &[0, 0, 0x04, 0, 0, 0, 0, 0]);
+        assert_eq!(&mem.bytes()[0x80..0x88], &[0, 0, 0x04, 0, 0, 0, 0, 0]);
     }
 }
