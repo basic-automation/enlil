@@ -31,6 +31,9 @@ use std::collections::BTreeMap;
 
 use super::emulated::{UsbDeviceModel, UsbTransferResult};
 use super::types::DeviceSpeed as UsbSpeed;
+use super::xhci::context::{
+    EndpointContext, InputControlContext, MAX_DCI, input_context_entry_offset, read_context_entry,
+};
 use super::xhci::registers::XECP_OFFSET;
 use super::xhci::transfer::{
     CONTROL_DCI, DmaMemory, SetupPacket, TransferTrb, dci_endpoint_number, dci_is_in,
@@ -71,6 +74,10 @@ pub struct VirtualXhciController {
     /// [`submit_transfer`](Self::submit_transfer) — input-context-driven ring
     /// setup waits on guest-memory device contexts.
     transfer_rings: BTreeMap<(u8, u8), TransferRing>,
+    /// The endpoint contexts Configure Endpoint (and, for EP0, Address
+    /// Device) installed per (slot ID, DCI) — the EP types, max packet
+    /// sizes, and guest-memory ring addresses the driver declared.
+    endpoint_configs: BTreeMap<(u8, u8), EndpointContext>,
     /// The device model bound to each slot — where TDs terminate.
     device_models: BTreeMap<u8, Box<dyn UsbDeviceModel>>,
     /// EP0 control-transfer stage tracking per slot (Setup/Data/Status
@@ -119,6 +126,7 @@ impl VirtualXhciController {
             slots,
             caps,
             transfer_rings: BTreeMap::new(),
+            endpoint_configs: BTreeMap::new(),
             device_models: BTreeMap::new(),
             control_state: BTreeMap::new(),
             port_models: (0..num_ports).map(|_| None).collect(),
@@ -249,13 +257,21 @@ impl VirtualXhciController {
                     self.address_device(slot_id, input_context_ptr, mem),
                     slot_id,
                 ),
-                // Configure/stop endpoint contexts wait on richer
-                // device-context handling; succeed on an enabled slot so a
-                // driver's bring-up sequence can proceed, error otherwise.
-                Some(
-                    CommandTrb::ConfigureEndpoint { slot_id, .. }
-                    | CommandTrb::StopEndpoint { slot_id, .. },
-                ) => (self.slot_dependent_success(slot_id), slot_id),
+                // Configure Endpoint parses the input context's endpoint
+                // contexts and installs (or drops) the slot's transfer rings.
+                Some(CommandTrb::ConfigureEndpoint {
+                    slot_id,
+                    input_context_ptr,
+                    deconfigure,
+                }) => (
+                    self.configure_endpoint(slot_id, input_context_ptr, deconfigure, mem),
+                    slot_id,
+                ),
+                // Stop Endpoint waits on in-flight TD bookkeeping; succeed on
+                // an enabled slot so a driver's bring-up sequence proceeds.
+                Some(CommandTrb::StopEndpoint { slot_id, .. }) => {
+                    (self.slot_dependent_success(slot_id), slot_id)
+                }
                 // Reset Endpoint recovers a halted endpoint (xHCI §4.6.8):
                 // clear the halt so the ring processes TDs again.
                 Some(CommandTrb::ResetEndpoint {
@@ -302,6 +318,8 @@ impl VirtualXhciController {
             Some(used) if *used => {
                 *used = false;
                 self.transfer_rings.retain(|(slot, _), _| *slot != slot_id);
+                self.endpoint_configs
+                    .retain(|(slot, _), _| *slot != slot_id);
                 let model = self.device_models.remove(&slot_id);
                 if let Some(port) = self.slot_ports.remove(&slot_id)
                     && let Some(parked) = self.port_models.get_mut(port)
@@ -355,7 +373,91 @@ impl VirtualXhciController {
             self.device_models.insert(slot_id, model);
             self.slot_ports.insert(slot_id, port);
         }
+        // Record EP0's declared context (A1 carries it) so its max packet
+        // size and ring address are known; a zeroed EP0 context (pure
+        // port-status modelling) is tolerated.
+        if let Some(bytes) = read_context_entry(
+            mem,
+            input_context_ptr + input_context_entry_offset(CONTROL_DCI),
+        ) && let Some(context) = EndpointContext::parse(&bytes)
+        {
+            self.endpoint_configs
+                .insert((slot_id, CONTROL_DCI), context);
+        }
         TrbCompletionCode::Success
+    }
+
+    /// Configure Endpoint (xHCI §4.6.6): parse the input context and install
+    /// a transfer ring — at the declared TR Dequeue Pointer — for every
+    /// added endpoint context, dropping the endpoints the drop flags name.
+    /// The driver-side contract is A0 = 1 with A1 = D0 = D1 = 0 (the slot
+    /// context comes along; EP0 and the slot itself are not configurable
+    /// here), and every added context must carry a type valid for its DCI.
+    /// An invalid context leaves the slot's endpoints untouched.
+    fn configure_endpoint(
+        &mut self,
+        slot_id: u8,
+        input_context_ptr: u64,
+        deconfigure: bool,
+        mem: &dyn DmaMemory,
+    ) -> TrbCompletionCode {
+        if self.slot_dependent_success(slot_id) != TrbCompletionCode::Success {
+            return TrbCompletionCode::TrbError;
+        }
+        // Deconfigure (DC): drop every endpoint but EP0; the input context
+        // pointer is not referenced (xHCI §6.4.3.5).
+        if deconfigure {
+            self.transfer_rings
+                .retain(|&(slot, dci), _| slot != slot_id || dci <= CONTROL_DCI);
+            self.endpoint_configs
+                .retain(|&(slot, dci), _| slot != slot_id || dci <= CONTROL_DCI);
+            return TrbCompletionCode::Success;
+        }
+        let Some(control) = InputControlContext::read(mem, input_context_ptr) else {
+            return TrbCompletionCode::TrbError;
+        };
+        if control.drops(0) || control.drops(CONTROL_DCI) || control.adds(CONTROL_DCI) {
+            return TrbCompletionCode::ParameterError;
+        }
+        // Parse every added endpoint context before touching any state, so
+        // a bad context fails the whole command without partial effects.
+        let mut added = Vec::new();
+        for dci in (CONTROL_DCI + 1)..=MAX_DCI {
+            if !control.adds(dci) {
+                continue;
+            }
+            let entry = input_context_ptr + input_context_entry_offset(dci);
+            let Some(bytes) = read_context_entry(mem, entry) else {
+                return TrbCompletionCode::TrbError;
+            };
+            let Some(context) = EndpointContext::parse(&bytes) else {
+                return TrbCompletionCode::ParameterError;
+            };
+            if !context.endpoint_type.valid_for_dci(dci) {
+                return TrbCompletionCode::ParameterError;
+            }
+            added.push((dci, context));
+        }
+        for dci in (CONTROL_DCI + 1)..=MAX_DCI {
+            if control.drops(dci) {
+                self.transfer_rings.remove(&(slot_id, dci));
+                self.endpoint_configs.remove(&(slot_id, dci));
+            }
+        }
+        for (dci, context) in added {
+            let mut ring = TransferRing::with_default_size(slot_id, dci);
+            ring.ring_mut().set_base_addr(context.tr_dequeue_pointer);
+            self.transfer_rings.insert((slot_id, dci), ring);
+            self.endpoint_configs.insert((slot_id, dci), context);
+        }
+        TrbCompletionCode::Success
+    }
+
+    /// The endpoint context the guest's driver declared for (slot, DCI) —
+    /// installed by Configure Endpoint (EP0's by Address Device).
+    #[must_use]
+    pub fn endpoint_config(&self, slot_id: u8, dci: u8) -> Option<&EndpointContext> {
+        self.endpoint_configs.get(&(slot_id, dci))
     }
 
     fn slot_dependent_success(&self, slot_id: u8) -> TrbCompletionCode {
@@ -1757,5 +1859,240 @@ mod tests {
         let _ = c.pop_event();
         assert!(c.disconnect_device(port));
         assert!(c.take_port_model(port).is_none());
+    }
+
+    /// A bulk OUT endpoint context (EP1 OUT = DCI 2) with its ring at `ring`.
+    fn bulk_out_context(ring: u64) -> EndpointContext {
+        EndpointContext {
+            endpoint_type: super::super::xhci::EndpointType::BulkOut,
+            max_packet_size: 512,
+            max_burst_size: 0,
+            error_count: 3,
+            interval: 0,
+            tr_dequeue_pointer: ring,
+            dequeue_cycle_state: true,
+            average_trb_length: 512,
+        }
+    }
+
+    /// Write a Configure Endpoint input context at `ptr`: A0 plus an add
+    /// flag and context entry per `entries` element, and `drop_flags`.
+    fn write_configure_context(
+        mem: &mut super::super::xhci::VecDmaMemory,
+        ptr: u64,
+        drop_flags: u32,
+        entries: &[(u8, EndpointContext)],
+    ) {
+        use super::super::xhci::transfer::DmaMemory;
+        let mut add_flags = 1_u32; // A0: the slot context comes along
+        for (dci, _) in entries {
+            add_flags |= 1 << dci;
+        }
+        assert!(mem.write(ptr, &drop_flags.to_le_bytes()));
+        assert!(mem.write(ptr + 4, &add_flags.to_le_bytes()));
+        for (dci, context) in entries {
+            assert!(mem.write(ptr + input_context_entry_offset(*dci), &context.to_bytes()));
+        }
+    }
+
+    /// A running controller with slot 1 enabled and 0x200 bytes of guest
+    /// RAM at 0x1000 for input contexts.
+    fn controller_with_slot() -> (VirtualXhciController, super::super::xhci::VecDmaMemory) {
+        let mut c = running_controller();
+        c.submit_command(&CommandTrb::EnableSlot);
+        kick_commands(&mut c);
+        let _ = c.pop_event();
+        (c, super::super::xhci::VecDmaMemory::new(0x1000, 0x200))
+    }
+
+    /// Submit a Configure Endpoint and return its completion code.
+    fn configure(
+        c: &mut VirtualXhciController,
+        mem: &mut super::super::xhci::VecDmaMemory,
+        input_context_ptr: u64,
+        deconfigure: bool,
+    ) -> u8 {
+        c.submit_command(&CommandTrb::ConfigureEndpoint {
+            slot_id: 1,
+            input_context_ptr,
+            deconfigure,
+        });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(mem);
+        completion_code(c)
+    }
+
+    #[test]
+    fn configure_endpoint_installs_and_drops_rings_from_the_input_context() {
+        use super::super::xhci::EndpointType;
+        let (mut c, mut mem) = controller_with_slot();
+
+        // The driver declares EP1 OUT (DCI 2, bulk) and EP1 IN (DCI 3,
+        // interrupt — keyboard-shaped) with their rings in guest memory.
+        let interrupt_in = EndpointContext {
+            endpoint_type: EndpointType::InterruptIn,
+            max_packet_size: 8,
+            max_burst_size: 0,
+            error_count: 3,
+            interval: 7,
+            tr_dequeue_pointer: 0x7650,
+            dequeue_cycle_state: true,
+            average_trb_length: 8,
+        };
+        write_configure_context(
+            &mut mem,
+            0x1000,
+            0,
+            &[(2, bulk_out_context(0x4560)), (3, interrupt_in)],
+        );
+        assert_eq!(
+            configure(&mut c, &mut mem, 0x1000, false),
+            TrbCompletionCode::Success as u8
+        );
+
+        // Both endpoints carry the declared characteristics, and their
+        // rings sit at the declared TR Dequeue Pointers.
+        assert_eq!(c.endpoint_config(1, 2), Some(&bulk_out_context(0x4560)));
+        assert_eq!(c.endpoint_config(1, 3), Some(&interrupt_in));
+        assert_eq!(c.transfer_rings[&(1, 2)].ring().base_addr(), 0x4560);
+        assert_eq!(c.transfer_rings[&(1, 3)].ring().base_addr(), 0x7650);
+
+        // A follow-up configure dropping DCI 3 removes only that endpoint.
+        write_configure_context(&mut mem, 0x1000, 1 << 3, &[]);
+        assert_eq!(
+            configure(&mut c, &mut mem, 0x1000, false),
+            TrbCompletionCode::Success as u8
+        );
+        assert!(c.endpoint_config(1, 3).is_none());
+        assert!(!c.transfer_rings.contains_key(&(1, 3)));
+        assert!(c.endpoint_config(1, 2).is_some());
+
+        // Disable Slot clears the survivors with the slot.
+        c.submit_command(&CommandTrb::DisableSlot { slot_id: 1 });
+        kick_commands(&mut c);
+        let _ = c.pop_event();
+        assert!(c.endpoint_config(1, 2).is_none());
+    }
+
+    #[test]
+    fn configure_endpoint_validates_flags_and_contexts() {
+        use super::super::xhci::transfer::DmaMemory;
+        let (mut c, mut mem) = controller_with_slot();
+
+        // A disabled slot is a TRB error regardless of the context.
+        c.submit_command(&CommandTrb::ConfigureEndpoint {
+            slot_id: 5,
+            input_context_ptr: 0x1000,
+            deconfigure: false,
+        });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        assert_eq!(completion_code(&mut c), TrbCompletionCode::TrbError as u8);
+
+        // An unreadable input context pointer is a TRB error.
+        assert_eq!(
+            configure(&mut c, &mut mem, 0xDEAD_0000, false),
+            TrbCompletionCode::TrbError as u8
+        );
+
+        // A1 (EP0) cannot be re-configured here: parameter error.
+        write_configure_context(&mut mem, 0x1000, 0, &[]);
+        assert!(mem.write(0x1004, &0x3_u32.to_le_bytes())); // A0|A1
+        assert_eq!(
+            configure(&mut c, &mut mem, 0x1000, false),
+            TrbCompletionCode::ParameterError as u8
+        );
+
+        // D1 (EP0) is reserved: parameter error.
+        write_configure_context(&mut mem, 0x1000, 1 << 1, &[]);
+        assert_eq!(
+            configure(&mut c, &mut mem, 0x1000, false),
+            TrbCompletionCode::ParameterError as u8
+        );
+
+        // An added context whose EP Type is 0 (Not Valid) is a parameter
+        // error — the zeroed entry at DCI 4 was never written.
+        write_configure_context(&mut mem, 0x1000, 0, &[]);
+        assert!(mem.write(0x1004, &((1_u32 << 4) | 1).to_le_bytes()));
+        assert_eq!(
+            configure(&mut c, &mut mem, 0x1000, false),
+            TrbCompletionCode::ParameterError as u8
+        );
+
+        // A direction/DCI mismatch (bulk OUT context at an IN DCI) is a
+        // parameter error, and the valid entry alongside it must NOT have
+        // been installed (the command fails without partial effects).
+        write_configure_context(
+            &mut mem,
+            0x1000,
+            0,
+            &[(2, bulk_out_context(0x4560)), (5, bulk_out_context(0x8880))],
+        );
+        assert_eq!(
+            configure(&mut c, &mut mem, 0x1000, false),
+            TrbCompletionCode::ParameterError as u8
+        );
+        assert!(c.endpoint_config(1, 2).is_none());
+        assert!(!c.transfer_rings.contains_key(&(1, 2)));
+    }
+
+    #[test]
+    fn deconfigure_drops_every_endpoint_but_control() {
+        use super::super::xhci::transfer::TransferTrb;
+        let (mut c, mut mem) = controller_with_slot();
+        write_configure_context(&mut mem, 0x1000, 0, &[(2, bulk_out_context(0x4560))]);
+        assert_eq!(
+            configure(&mut c, &mut mem, 0x1000, false),
+            TrbCompletionCode::Success as u8
+        );
+        // EP0 has live ring state too (a pending NoOp creates its ring).
+        assert!(c.submit_transfer(1, CONTROL_DCI, &TransferTrb::NoOp { ioc: false }));
+
+        // DC set: the input context pointer is not referenced — a garbage
+        // pointer must not fail the command.
+        assert_eq!(
+            configure(&mut c, &mut mem, 0xDEAD_0000, true),
+            TrbCompletionCode::Success as u8
+        );
+        assert!(c.endpoint_config(1, 2).is_none());
+        assert!(!c.transfer_rings.contains_key(&(1, 2)));
+        assert!(
+            c.transfer_rings.contains_key(&(1, CONTROL_DCI)),
+            "EP0 survives"
+        );
+    }
+
+    #[test]
+    fn address_device_records_ep0s_declared_context() {
+        use super::super::xhci::EndpointType;
+        use super::super::xhci::transfer::DmaMemory;
+        let mut c = running_controller();
+        let mut mem = super::super::xhci::VecDmaMemory::new(0x1000, 0x100);
+        write_input_context(&mut mem, 0x1000, 1);
+        let ep0 = EndpointContext {
+            endpoint_type: EndpointType::Control,
+            max_packet_size: 64,
+            max_burst_size: 0,
+            error_count: 3,
+            interval: 0,
+            tr_dequeue_pointer: 0x2340,
+            dequeue_cycle_state: true,
+            average_trb_length: 8,
+        };
+        assert!(mem.write(
+            0x1000 + input_context_entry_offset(CONTROL_DCI),
+            &ep0.to_bytes()
+        ));
+
+        c.submit_command(&CommandTrb::EnableSlot);
+        c.submit_command(&CommandTrb::AddressDevice {
+            slot_id: 1,
+            input_context_ptr: 0x1000,
+        });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        let _ = c.pop_event();
+        assert_eq!(completion_code(&mut c), TrbCompletionCode::Success as u8);
+        assert_eq!(c.endpoint_config(1, CONTROL_DCI), Some(&ep0));
     }
 }

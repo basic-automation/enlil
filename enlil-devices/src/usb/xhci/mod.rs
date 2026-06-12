@@ -26,6 +26,7 @@
 //! └──────────────────────────────────────────────────────┘
 //! ```
 
+pub mod context;
 pub mod doorbell;
 pub mod event;
 pub mod registers;
@@ -33,6 +34,7 @@ pub mod ring;
 pub mod transfer;
 pub mod trb;
 
+pub use context::{EndpointContext, EndpointType, InputControlContext};
 pub use doorbell::{DoorbellArray, DoorbellTarget};
 pub use event::{EventRing, InterrupterRegisterSet};
 pub use registers::{
