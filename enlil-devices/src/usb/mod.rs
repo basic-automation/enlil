@@ -29,6 +29,8 @@
 pub mod controller;
 pub mod device;
 pub mod emulated;
+#[cfg(target_os = "linux")]
+pub mod forwarder;
 pub mod hotplug;
 pub mod monitor;
 pub mod registry;
@@ -42,6 +44,8 @@ pub use emulated::{
     EmulatedKeyboard, KEYBOARD_INTERRUPT_ENDPOINT, LoopbackDevice, UsbDeviceModel,
     UsbTransferResult,
 };
+#[cfg(target_os = "linux")]
+pub use forwarder::LibusbDevice;
 pub use hotplug::{HotplugDispatcher, HotplugOutcome};
 pub use monitor::{UsbHotplugEvent, UsbMonitor};
 pub use registry::{AttachOutcome, DevicePlacement, RegistryError, XhciRegistry};
