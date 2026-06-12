@@ -38,7 +38,10 @@ pub mod xhci;
 
 pub use controller::{SharedXhci, VirtualXhciController, XhciMmio};
 pub use device::{UsbClass, UsbDevice, UsbDeviceId, UsbDeviceState, UsbSpeed};
-pub use emulated::{LoopbackDevice, UsbDeviceModel, UsbTransferResult};
+pub use emulated::{
+    EmulatedKeyboard, KEYBOARD_INTERRUPT_ENDPOINT, LoopbackDevice, UsbDeviceModel,
+    UsbTransferResult,
+};
 pub use hotplug::{HotplugDispatcher, HotplugOutcome};
 pub use monitor::{UsbHotplugEvent, UsbMonitor};
 pub use registry::{AttachOutcome, DevicePlacement, RegistryError, XhciRegistry};
