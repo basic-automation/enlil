@@ -295,7 +295,7 @@ impl VirtualXhciController {
         let (code, slot_id) = match CommandTrb::from_trb(trb) {
             Some(CommandTrb::NoOp) => (TrbCompletionCode::Success, 0),
             Some(CommandTrb::EnableSlot) => self.enable_slot(),
-            Some(CommandTrb::DisableSlot { slot_id }) => (self.disable_slot(slot_id), slot_id),
+            Some(CommandTrb::DisableSlot { slot_id }) => (self.disable_slot(slot_id, mem), slot_id),
             // Address Device reads the input context out of guest memory
             // and binds the named port's parked device model to the slot.
             Some(CommandTrb::AddressDevice {
@@ -360,10 +360,14 @@ impl VirtualXhciController {
     /// bound from a port parks there again (the device is still physically
     /// connected, so the guest can re-enumerate it), while an explicitly
     /// bound model is dropped.
-    fn disable_slot(&mut self, slot_id: u8) -> TrbCompletionCode {
+    fn disable_slot(&mut self, slot_id: u8, mem: &mut dyn DmaMemory) -> TrbCompletionCode {
         match self.slots.get_mut(usize::from(slot_id.wrapping_sub(1))) {
             Some(used) if *used => {
                 *used = false;
+                // EP0 plus any configured endpoints, to zero in the output
+                // device context the driver reads back.
+                let mut dcis = vec![CONTROL_DCI];
+                dcis.extend(self.slot_endpoint_dcis(slot_id));
                 self.transfer_rings.retain(|(slot, _), _| *slot != slot_id);
                 self.endpoint_configs
                     .retain(|(slot, _), _| *slot != slot_id);
@@ -374,9 +378,34 @@ impl VirtualXhciController {
                     *parked = model;
                 }
                 self.control_state.remove(&slot_id);
+                self.publish_disabled_context(slot_id, &dcis, mem);
                 TrbCompletionCode::Success
             }
             _ => TrbCompletionCode::TrbError,
+        }
+    }
+
+    /// Publish the output device context after Disable Slot (xHCI §4.6.4):
+    /// the slot context returns to the Disabled state with no valid endpoint
+    /// contexts, and every endpoint the slot held is zeroed. A no-op without
+    /// `DCBAAP`/a backed DCBAA entry.
+    fn publish_disabled_context(&self, slot_id: u8, dcis: &[u8], mem: &mut dyn DmaMemory) {
+        if self.op.dcbaap == 0 {
+            return;
+        }
+        let Some(out_ctx) = device_context_pointer(mem, self.op.dcbaap, slot_id) else {
+            return;
+        };
+        if let Some(slot_bytes) = read_context_entry(mem, out_ctx + device_context_entry_offset(0))
+        {
+            let mut slot = SlotContext::parse(&slot_bytes);
+            slot.slot_state = SlotState::DisabledEnabled as u8;
+            slot.context_entries = 0;
+            slot.usb_device_address = 0;
+            let _ = mem.write(out_ctx + device_context_entry_offset(0), &slot.to_bytes());
+        }
+        for &dci in dcis {
+            let _ = mem.write(out_ctx + device_context_entry_offset(dci), &[0_u8; 32]);
         }
     }
 
@@ -2218,6 +2247,57 @@ mod tests {
             SlotContext::parse(&slot_bytes).slot_state,
             SlotState::Addressed as u8
         );
+        assert!(mem.read(out_ctx + device_context_entry_offset(2), &mut ep_bytes));
+        assert_eq!(ep_bytes, [0_u8; 32]);
+    }
+
+    #[test]
+    fn disable_slot_publishes_the_disabled_output_context() {
+        use super::super::xhci::transfer::DmaMemory;
+        let mut c = running_controller();
+        let mut mem = super::super::xhci::VecDmaMemory::new(0x1000, 0x4000);
+        let dcbaap = 0x2000_u64;
+        let out_ctx = 0x3000_u64;
+        let op = u32::from(c.caps.caplength);
+        c.write_register(op + 0x30, u32_of(dcbaap));
+        assert!(mem.write(dcbaap + 8, &out_ctx.to_le_bytes()));
+
+        // Address then configure an endpoint so the output context is populated.
+        let addr_in = 0x1000_u64;
+        write_input_context(&mut mem, addr_in, 1);
+        c.submit_command(&CommandTrb::EnableSlot);
+        c.submit_command(&CommandTrb::AddressDevice {
+            slot_id: 1,
+            input_context_ptr: addr_in,
+        });
+        let cfg_in = 0x1100_u64;
+        write_configure_context(&mut mem, cfg_in, 0, &[(2, bulk_out_context(0x4000))]);
+        c.submit_command(&CommandTrb::ConfigureEndpoint {
+            slot_id: 1,
+            input_context_ptr: cfg_in,
+            deconfigure: false,
+        });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        for _ in 0..3 {
+            let _ = c.pop_event();
+        }
+
+        // Disable Slot returns the output slot context to the Disabled state
+        // with no address and zeroes the held endpoint contexts.
+        c.submit_command(&CommandTrb::DisableSlot { slot_id: 1 });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        assert_eq!(completion_code(&mut c), TrbCompletionCode::Success as u8);
+
+        let mut slot_bytes = [0_u8; 32];
+        assert!(mem.read(out_ctx + device_context_entry_offset(0), &mut slot_bytes));
+        let slot_out = SlotContext::parse(&slot_bytes);
+        assert_eq!(slot_out.slot_state, SlotState::DisabledEnabled as u8);
+        assert_eq!(slot_out.usb_device_address, 0);
+        assert_eq!(slot_out.context_entries, 0);
+
+        let mut ep_bytes = [0_u8; 32];
         assert!(mem.read(out_ctx + device_context_entry_offset(2), &mut ep_bytes));
         assert_eq!(ep_bytes, [0_u8; 32]);
     }
