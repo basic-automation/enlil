@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 use super::emulated::{UsbDeviceModel, UsbTransferResult};
 use super::types::DeviceSpeed as UsbSpeed;
 use super::xhci::context::{
-    EndpointContext, InputControlContext, MAX_DCI, SlotContext, SlotState,
+    EndpointContext, EpState, InputControlContext, MAX_DCI, SlotContext, SlotState,
     device_context_entry_offset, device_context_pointer, input_context_entry_offset,
     read_context_entry,
 };
@@ -324,11 +324,12 @@ impl VirtualXhciController {
                 self.evaluate_context(slot_id, input_context_ptr, mem),
                 slot_id,
             ),
-            // Stop Endpoint waits on in-flight TD bookkeeping; succeed on
-            // an enabled slot so a driver's bring-up sequence proceeds.
-            Some(CommandTrb::StopEndpoint { slot_id, .. }) => {
-                (self.slot_dependent_success(slot_id), slot_id)
-            }
+            // Stop Endpoint pauses the ring and transitions the endpoint to
+            // the Stopped state the driver reads back before repointing it.
+            Some(CommandTrb::StopEndpoint {
+                slot_id,
+                endpoint_id,
+            }) => (self.stop_endpoint(slot_id, endpoint_id, mem), slot_id),
             // Reset Endpoint recovers a halted endpoint (xHCI §4.6.8):
             // clear the halt so the ring processes TDs again.
             Some(CommandTrb::ResetEndpoint {
@@ -709,6 +710,43 @@ impl VirtualXhciController {
             let _ = mem.write(out_ctx + device_context_entry_offset(CONTROL_DCI), &out);
         }
         TrbCompletionCode::Success
+    }
+
+    /// Stop Endpoint (xHCI §4.6.9): pause the endpoint's transfer ring and
+    /// transition it to the Stopped state in the output device context — the
+    /// state the driver requires before it issues Set TR Dequeue Pointer.
+    fn stop_endpoint(
+        &mut self,
+        slot_id: u8,
+        endpoint_id: u8,
+        mem: &mut dyn DmaMemory,
+    ) -> TrbCompletionCode {
+        let code = self.slot_dependent_success(slot_id);
+        if code != TrbCompletionCode::Success {
+            return code;
+        }
+        if let Some(ring) = self.transfer_rings.get_mut(&(slot_id, endpoint_id)) {
+            ring.ring_mut().stop();
+        }
+        self.publish_ep_state(slot_id, endpoint_id, EpState::Stopped, mem);
+        code
+    }
+
+    /// Patch one endpoint's EP State (dword 0, bits 2:0) in the output device
+    /// context, preserving the rest of the context. A no-op without `DCBAAP`
+    /// or when the output endpoint context is not backed.
+    fn publish_ep_state(&self, slot_id: u8, dci: u8, state: EpState, mem: &mut dyn DmaMemory) {
+        if self.op.dcbaap == 0 {
+            return;
+        }
+        let Some(out_ctx) = device_context_pointer(mem, self.op.dcbaap, slot_id) else {
+            return;
+        };
+        let entry = out_ctx + device_context_entry_offset(dci);
+        if let Some(mut bytes) = read_context_entry(mem, entry) {
+            bytes[0] = (bytes[0] & !0x7) | (state as u8 & 0x7);
+            let _ = mem.write(entry, &bytes);
+        }
     }
 
     /// Set TR Dequeue Pointer (xHCI §4.6.10): repoint an endpoint's transfer
@@ -2501,6 +2539,61 @@ mod tests {
         assert_eq!(
             EndpointContext::parse(&ep0_bytes).unwrap().max_packet_size,
             64
+        );
+    }
+
+    #[test]
+    fn stop_endpoint_transitions_the_output_context_to_stopped() {
+        use super::super::xhci::EpState;
+        use super::super::xhci::transfer::DmaMemory;
+        let mut c = running_controller();
+        let mut mem = super::super::xhci::VecDmaMemory::new(0x1000, 0x4000);
+        let dcbaap = 0x2000_u64;
+        let out_ctx = 0x3000_u64;
+        let op = u32::from(c.caps.caplength);
+        c.write_register(op + 0x30, u32_of(dcbaap));
+        assert!(mem.write(dcbaap + 8, &out_ctx.to_le_bytes()));
+
+        let addr_in = 0x1000_u64;
+        write_input_context(&mut mem, addr_in, 1);
+        c.submit_command(&CommandTrb::EnableSlot);
+        c.submit_command(&CommandTrb::AddressDevice {
+            slot_id: 1,
+            input_context_ptr: addr_in,
+        });
+        let cfg_in = 0x1100_u64;
+        write_configure_context(&mut mem, cfg_in, 0, &[(2, bulk_out_context(0x4000))]);
+        c.submit_command(&CommandTrb::ConfigureEndpoint {
+            slot_id: 1,
+            input_context_ptr: cfg_in,
+            deconfigure: false,
+        });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        for _ in 0..3 {
+            let _ = c.pop_event();
+        }
+        // EP2 is Running after Configure Endpoint.
+        let mut ep_bytes = [0_u8; 32];
+        assert!(mem.read(out_ctx + device_context_entry_offset(2), &mut ep_bytes));
+        assert_eq!(ep_bytes[0] & 0x7, EpState::Running as u8);
+
+        // Stop Endpoint transitions it to Stopped.
+        c.submit_command(&CommandTrb::StopEndpoint {
+            slot_id: 1,
+            endpoint_id: 2,
+        });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        assert_eq!(completion_code(&mut c), TrbCompletionCode::Success as u8);
+        assert!(mem.read(out_ctx + device_context_entry_offset(2), &mut ep_bytes));
+        assert_eq!(ep_bytes[0] & 0x7, EpState::Stopped as u8);
+        // The rest of the endpoint context is preserved (its declared ring).
+        assert_eq!(
+            EndpointContext::parse(&ep_bytes)
+                .unwrap()
+                .tr_dequeue_pointer,
+            0x4000
         );
     }
 

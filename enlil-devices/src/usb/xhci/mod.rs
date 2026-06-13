@@ -35,7 +35,7 @@ pub mod transfer;
 pub mod trb;
 
 pub use context::{
-    EndpointContext, EndpointType, InputControlContext, SlotContext, SlotState,
+    EndpointContext, EndpointType, EpState, InputControlContext, SlotContext, SlotState,
     device_context_entry_offset, device_context_pointer,
 };
 pub use doorbell::{DoorbellArray, DoorbellTarget};

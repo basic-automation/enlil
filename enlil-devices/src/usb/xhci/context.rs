@@ -136,6 +136,24 @@ impl EndpointType {
     }
 }
 
+/// Endpoint State (xHCI Table 6-8), the Endpoint Context's dword 0 bits 2:0 —
+/// the per-endpoint state a driver reads back out of the output device
+/// context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum EpState {
+    /// Disabled (the endpoint context is not valid).
+    Disabled = 0,
+    /// Running (processing transfer descriptors).
+    Running = 1,
+    /// Halted (a STALL — recovered via Reset Endpoint).
+    Halted = 2,
+    /// Stopped (Stop Endpoint paused it — repointed via Set TR Dequeue Pointer).
+    Stopped = 3,
+    /// Error (a fatal endpoint error).
+    Error = 4,
+}
+
 /// A decoded 32-byte Endpoint Context (xHCI §6.2.3).
 ///
 /// Carries the endpoint's declared transfer characteristics and where its
