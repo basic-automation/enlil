@@ -7,10 +7,31 @@
 Type-1 hypervisor. Custom target `x86_64-unknown-enlil.json`; toolchain pinned in
 `rust-toolchain.toml`.
 
-**ENVIRONMENT:** This runs unattended on a cloud Linux runner with the repo checked out
-(daily cron). Always `cargo build`, `cargo test`, and `cargo clippy`. If KVM / nested
-virtualization is available, also run guest-boot / integration tests; otherwise mark them
-"not run (no nested virt)" — never claim or fake a boot or benchmark you didn't run.
+**ENVIRONMENT (LOCAL + WSL, since 2026-06-12):** This runs unattended on the Windows
+workstation as the Claude Code scheduled task `enlil-dev-routine`, and does ALL of its
+build/test/git work **inside the Ubuntu WSL2 distro** on a native clone at `~/enlil` (ext4 —
+never build on `/mnt/...`; the 9p bridge is slow and breaks cargo's mtimes). Drive it as
+`wsl -d Ubuntu -- bash -lc 'cd ~/enlil && <cmd>'`. The decisive reason for running here rather
+than the old cloud runner: **`/dev/kvm` is available** (nested virtualization on, custom WSL
+kernel with KVM built in), so the Linux KVM host backend (`enlil-platform` / `enlil-devices`,
+the `target_os = "linux"` paths) builds AND the **guest-boot / KVM integration tests actually
+RUN** every night — they are no longer auto-skipped as "no nested virt." Always `cargo build`,
+`cargo test`, `cargo clippy`; run the guest-boot/KVM tests for real and record measured results.
+Only mark a KVM test "not run" if `/dev/kvm` is genuinely absent that night (say exactly why) —
+never claim or fake a boot or benchmark you didn't run.
+
+**EXECUTION (local WSL mechanics):**
+- Every command runs in WSL: `wsl -d Ubuntu -- bash -lc 'cd ~/enlil && <cmd>'`. `~/enlil` is a
+  dedicated clone, separate from the user's Windows checkout — no worktree collision.
+- **git auth is pre-wired:** WSL git uses the Windows credential manager (`credential.helper` →
+  `git-credential-manager.exe`), so `git push` and `git credential fill` reuse the host's GitHub
+  login with no prompt. There is **no `gh` inside WSL** — get a token with `gh.exe auth token`
+  (the Windows gh, already authenticated) and open the PR via the GitHub REST API
+  (`POST https://api.github.com/repos/physics515/enlil/pulls`).
+- **KVM access** requires the WSL user in the `kvm` group (one-time, human: `sudo usermod -aG
+  kvm physi` then `wsl --shutdown`). Probe each run with `test -w /dev/kvm`; if it fails the
+  group step hasn't taken effect yet — log KVM tests "not run (kvm group pending)" and proceed
+  with the rest rather than stalling.
 
 **NORTH STAR:** Enlil is a Rust Type-1 hypervisor that mediates *both directions* of every
 hardware interaction (OS→HW and HW→OS) and routes them across a pool of physical nodes —
@@ -82,15 +103,18 @@ Do these in order, looping for the whole session:
 ### 5. Verify (a step isn't done until this is green)
 - `cargo build` (+ `--target x86_64-unknown-enlil.json` for no_std crates), `cargo test`,
   and `cargo clippy` — fix warnings in code you touched.
-- Record exactly which tests ran and which were skipped (KVM/guest-boot paths → "not run
-  (no nested virt)" when unavailable). Never claim a boot or benchmark you didn't run.
+- **Run the KVM / guest-boot tests for real** — `/dev/kvm` is available in this WSL environment.
+  Record exactly which ran and their measured results; only mark one skipped if `/dev/kvm` is
+  genuinely absent that night (e.g. `kvm` group pending — say why). Never claim a boot or
+  benchmark you didn't run.
 
 ### 6. Land each increment, then loop (hand off once at the end)
-- **Commit each green increment on its own.** The remote environment automatically puts the
-  run's commits on a branch and opens a PR — it does *not* push to `master` directly. Use commit
-  message format `routine(phase-N): <what you did>`, **one commit per complete increment**.
-  **Only commit work that builds and passes the tests you could run** — if an increment isn't
-  green, commit nothing for it and record the blocker in `PROGRESS.md`.
+- **Commit each green increment on its own**, on the run's branch `routine/enlil-<YYYY-MM-DD>`
+  (same-day rerun: `-2`; **never push `master`**). Use commit message format
+  `routine(phase-N): <what you did>`, **one commit per complete increment**, staging explicit
+  paths (never `git add -A`). **Only commit work that builds and passes the tests you could
+  run** — if an increment isn't green, commit nothing for it and record the blocker in
+  `PROGRESS.md`.
 - **Then loop.** As long as the **wall-clock budget (3–4 hours of real elapsed time) has not run
   out** and there's a tractable, unblocked next item, go back to step 1 and build it as a *new*
   commit on the same branch. Don't stop after a few increments — finishing the PIC (or any one
@@ -98,10 +122,15 @@ Do these in order, looping for the whole session:
   keep going. Stop only when ~3–4 hours have actually elapsed, every remaining item is blocked,
   or the only work left is something you can't finish and test cleanly in the time remaining (in
   which case leave it for tomorrow rather than committing it half-done).
-- **Hand off once, at the end.** Append a single dated `PROGRESS.md` entry covering the whole
-  session: each increment landed (with its commit) and the research that informed it, exact test
-  results, and the recommended next step(s) for tomorrow. This file + `git log` are how the next
-  run (which has no memory of today) resumes without redoing or re-researching work.
+- **Hand off once, at the end — log, push, open the PR.** Append a single dated `PROGRESS.md`
+  entry covering the whole session: each increment landed (with its commit) and the research that
+  informed it, exact test results (**including the KVM / guest-boot outcomes**), an explicit
+  **STOP REASON** (wall-clock budget spent · no unblocked item left · environment blocker), and
+  the recommended next step(s) for tomorrow. Then push the branch and **open the PR** (base
+  `master`) via the GitHub REST API using the `gh.exe auth token` token — **the PR is the last
+  act of the run, never the end of the first increment.** Never finish a run without a PR (or a
+  logged reason you couldn't open one). This file + `git log` are how the next run (no memory of
+  today) resumes without redoing or re-researching work.
 
 ---
 
