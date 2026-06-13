@@ -397,6 +397,10 @@ pub enum CommandTrb {
         /// Dequeue Cycle State (parameter bit 0).
         dcs: bool,
     },
+    /// Reset Device (xHCI §4.6.11): return an addressed/configured slot to the
+    /// Default state — USB address 0, all non-control endpoints disabled —
+    /// after a USB bus reset, ready for re-enumeration.
+    ResetDevice { slot_id: u8 },
     /// No-op command (for testing).
     NoOp,
 }
@@ -470,6 +474,10 @@ impl CommandTrb {
                 trb.control |= u32::from(*slot_id) << 24;
                 trb.control |= u32::from(*endpoint_id) << 16;
             }
+            Self::ResetDevice { slot_id } => {
+                trb.set_trb_type(TrbType::ResetDeviceCommand);
+                trb.control |= u32::from(*slot_id) << 24;
+            }
             Self::NoOp => {
                 trb.set_trb_type(TrbType::NoOpCommand);
             }
@@ -515,6 +523,7 @@ impl CommandTrb {
                 dequeue_ptr: trb.parameter & !0xF,
                 dcs: trb.parameter & 1 != 0,
             }),
+            TrbType::ResetDeviceCommand => Some(Self::ResetDevice { slot_id }),
             TrbType::NoOpCommand => Some(Self::NoOp),
             _ => None,
         }
@@ -719,6 +728,16 @@ mod tests {
                 assert!(dcs);
             }
             other => panic!("expected SetTrDequeuePointer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_trb_reset_device_round_trips() {
+        let trb = CommandTrb::ResetDevice { slot_id: 7 }.to_trb(true);
+        assert_eq!(trb.decoded_type(), TrbType::ResetDeviceCommand);
+        match CommandTrb::from_trb(&trb) {
+            Some(CommandTrb::ResetDevice { slot_id }) => assert_eq!(slot_id, 7),
+            other => panic!("expected ResetDevice, got {other:?}"),
         }
     }
 

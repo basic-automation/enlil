@@ -355,6 +355,9 @@ impl VirtualXhciController {
                 self.set_tr_dequeue_pointer(slot_id, endpoint_id, dequeue_ptr, dcs),
                 slot_id,
             ),
+            // Reset Device returns the slot to the Default state for
+            // re-enumeration (xHCI §4.6.11).
+            Some(CommandTrb::ResetDevice { slot_id }) => (self.reset_device(slot_id, mem), slot_id),
             // An undecodable TRB on the command ring is a TRB error.
             None => (TrbCompletionCode::TrbError, 0),
         };
@@ -731,6 +734,39 @@ impl VirtualXhciController {
         inner.set_base_addr(dequeue_ptr);
         inner.set_cycle_state(dcs);
         inner.start();
+        TrbCompletionCode::Success
+    }
+
+    /// Reset Device (xHCI §4.6.11): a USB bus reset returns the slot to the
+    /// Default state — USB address 0, every non-control endpoint disabled and
+    /// its ring dropped — leaving EP0 for re-enumeration. The slot stays
+    /// allocated and its device model bound.
+    fn reset_device(&mut self, slot_id: u8, mem: &mut dyn DmaMemory) -> TrbCompletionCode {
+        if self.slot_dependent_success(slot_id) != TrbCompletionCode::Success {
+            return TrbCompletionCode::TrbError;
+        }
+        let dropped = self.slot_endpoint_dcis(slot_id);
+        self.transfer_rings
+            .retain(|&(slot, dci), _| slot != slot_id || dci <= CONTROL_DCI);
+        self.endpoint_configs
+            .retain(|&(slot, dci), _| slot != slot_id || dci <= CONTROL_DCI);
+        self.control_state.remove(&slot_id);
+        if self.op.dcbaap != 0
+            && let Some(out_ctx) = device_context_pointer(mem, self.op.dcbaap, slot_id)
+        {
+            if let Some(slot_bytes) =
+                read_context_entry(mem, out_ctx + device_context_entry_offset(0))
+            {
+                let mut slot = SlotContext::parse(&slot_bytes);
+                slot.slot_state = SlotState::Default as u8;
+                slot.usb_device_address = 0;
+                slot.context_entries = 1;
+                let _ = mem.write(out_ctx + device_context_entry_offset(0), &slot.to_bytes());
+            }
+            for dci in dropped {
+                let _ = mem.write(out_ctx + device_context_entry_offset(dci), &[0_u8; 32]);
+            }
+        }
         TrbCompletionCode::Success
     }
 
@@ -2466,6 +2502,60 @@ mod tests {
             EndpointContext::parse(&ep0_bytes).unwrap().max_packet_size,
             64
         );
+    }
+
+    #[test]
+    fn reset_device_returns_the_slot_to_default() {
+        use super::super::xhci::transfer::DmaMemory;
+        let mut c = running_controller();
+        let mut mem = super::super::xhci::VecDmaMemory::new(0x1000, 0x4000);
+        let dcbaap = 0x2000_u64;
+        let out_ctx = 0x3000_u64;
+        let op = u32::from(c.caps.caplength);
+        c.write_register(op + 0x30, u32_of(dcbaap));
+        assert!(mem.write(dcbaap + 8, &out_ctx.to_le_bytes()));
+
+        // Address then configure an endpoint.
+        let addr_in = 0x1000_u64;
+        write_input_context(&mut mem, addr_in, 1);
+        c.submit_command(&CommandTrb::EnableSlot);
+        c.submit_command(&CommandTrb::AddressDevice {
+            slot_id: 1,
+            input_context_ptr: addr_in,
+        });
+        let cfg_in = 0x1100_u64;
+        write_configure_context(&mut mem, cfg_in, 0, &[(2, bulk_out_context(0x4000))]);
+        c.submit_command(&CommandTrb::ConfigureEndpoint {
+            slot_id: 1,
+            input_context_ptr: cfg_in,
+            deconfigure: false,
+        });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        for _ in 0..3 {
+            let _ = c.pop_event();
+        }
+        assert!(c.endpoint_config(1, 2).is_some());
+
+        // Reset Device: slot returns to Default with address 0, EP2 dropped,
+        // EP0 retained; the slot stays enabled.
+        c.submit_command(&CommandTrb::ResetDevice { slot_id: 1 });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        assert_eq!(completion_code(&mut c), TrbCompletionCode::Success as u8);
+        assert!(c.slot_enabled(1));
+        assert!(c.endpoint_config(1, 2).is_none());
+
+        let mut slot_bytes = [0_u8; 32];
+        assert!(mem.read(out_ctx + device_context_entry_offset(0), &mut slot_bytes));
+        let slot_out = SlotContext::parse(&slot_bytes);
+        assert_eq!(slot_out.slot_state, SlotState::Default as u8);
+        assert_eq!(slot_out.usb_device_address, 0);
+        assert_eq!(slot_out.context_entries, 1);
+
+        let mut ep_bytes = [0_u8; 32];
+        assert!(mem.read(out_ctx + device_context_entry_offset(2), &mut ep_bytes));
+        assert_eq!(ep_bytes, [0_u8; 32]);
     }
 
     #[test]
