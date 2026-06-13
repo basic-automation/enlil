@@ -315,6 +315,15 @@ impl VirtualXhciController {
                 self.configure_endpoint(slot_id, input_context_ptr, deconfigure, mem),
                 slot_id,
             ),
+            // Evaluate Context re-reads the input context's evaluable fields
+            // (EP0 Max Packet Size) without changing slot/endpoint state.
+            Some(CommandTrb::EvaluateContext {
+                slot_id,
+                input_context_ptr,
+            }) => (
+                self.evaluate_context(slot_id, input_context_ptr, mem),
+                slot_id,
+            ),
             // Stop Endpoint waits on in-flight TD bookkeeping; succeed on
             // an enabled slot so a driver's bring-up sequence proceeds.
             Some(CommandTrb::StopEndpoint { slot_id, .. }) => {
@@ -637,6 +646,54 @@ impl VirtualXhciController {
         for &dci in dropped {
             let _ = mem.write(out_ctx + device_context_entry_offset(dci), &[0_u8; 32]);
         }
+    }
+
+    /// Evaluate Context (xHCI §4.6.7): re-evaluate the input context without
+    /// changing slot or endpoint *state*. The only field this model carries
+    /// that a driver evaluates is EP0's Max Packet Size (updated once the
+    /// driver reads the device descriptor and learns the real value); the
+    /// slot context's evaluable fields (Max Exit Latency, Interrupter Target)
+    /// are not modelled (single interrupter), so A0 is accepted as a no-op.
+    /// Only A0/A1 are valid adds for Evaluate Context.
+    fn evaluate_context(
+        &mut self,
+        slot_id: u8,
+        input_context_ptr: u64,
+        mem: &mut dyn DmaMemory,
+    ) -> TrbCompletionCode {
+        if self.slot_dependent_success(slot_id) != TrbCompletionCode::Success {
+            return TrbCompletionCode::TrbError;
+        }
+        let Some(control) = InputControlContext::read(mem, input_context_ptr) else {
+            return TrbCompletionCode::TrbError;
+        };
+        if !control.adds(CONTROL_DCI) {
+            // Nothing this model evaluates was requested (only A0): succeed.
+            return TrbCompletionCode::Success;
+        }
+        let entry = input_context_ptr + input_context_entry_offset(CONTROL_DCI);
+        let Some(bytes) = read_context_entry(mem, entry) else {
+            return TrbCompletionCode::TrbError;
+        };
+        let Some(new_ep0) = EndpointContext::parse(&bytes) else {
+            return TrbCompletionCode::ParameterError;
+        };
+        // Update only EP0's Max Packet Size, keeping its ring and the rest of
+        // its declared context intact.
+        if let Some(ep0) = self.endpoint_configs.get_mut(&(slot_id, CONTROL_DCI)) {
+            ep0.max_packet_size = new_ep0.max_packet_size;
+        }
+        // Reflect the updated EP0 into the output context, preserving its
+        // Running state.
+        if self.op.dcbaap != 0
+            && let Some(out_ctx) = device_context_pointer(mem, self.op.dcbaap, slot_id)
+            && let Some(ep0) = self.endpoint_configs.get(&(slot_id, CONTROL_DCI))
+        {
+            let mut out = ep0.to_bytes();
+            out[0] = (out[0] & !0x7) | 1; // EP State = Running
+            let _ = mem.write(out_ctx + device_context_entry_offset(CONTROL_DCI), &out);
+        }
+        TrbCompletionCode::Success
     }
 
     /// Publish the output device context after a Deconfigure (DC = 1): the
@@ -2249,6 +2306,85 @@ mod tests {
         );
         assert!(mem.read(out_ctx + device_context_entry_offset(2), &mut ep_bytes));
         assert_eq!(ep_bytes, [0_u8; 32]);
+    }
+
+    #[test]
+    fn evaluate_context_updates_ep0_max_packet_size() {
+        use super::super::xhci::transfer::DmaMemory;
+        let mut c = running_controller();
+        let mut mem = super::super::xhci::VecDmaMemory::new(0x1000, 0x4000);
+        let dcbaap = 0x2000_u64;
+        let out_ctx = 0x3000_u64;
+        let op = u32::from(c.caps.caplength);
+        c.write_register(op + 0x30, u32_of(dcbaap));
+        assert!(mem.write(dcbaap + 8, &out_ctx.to_le_bytes()));
+
+        // Address the slot with an EP0 declaring the spec's initial 8-byte
+        // max packet size (a full-speed device before its descriptor is read).
+        let addr_in = 0x1000_u64;
+        assert!(mem.write(addr_in + 4, &0x3_u32.to_le_bytes())); // A0|A1
+        assert!(mem.write(addr_in + 0x24, &(1_u32 << 16).to_le_bytes())); // port 1
+        let ep0_small = EndpointContext {
+            endpoint_type: super::super::xhci::EndpointType::Control,
+            max_packet_size: 8,
+            max_burst_size: 0,
+            error_count: 3,
+            interval: 0,
+            tr_dequeue_pointer: 0x4000,
+            dequeue_cycle_state: true,
+            average_trb_length: 8,
+        };
+        assert!(mem.write(
+            addr_in + input_context_entry_offset(CONTROL_DCI),
+            &ep0_small.to_bytes()
+        ));
+        c.submit_command(&CommandTrb::EnableSlot);
+        c.submit_command(&CommandTrb::AddressDevice {
+            slot_id: 1,
+            input_context_ptr: addr_in,
+        });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        let _ = c.pop_event();
+        let _ = c.pop_event();
+        assert_eq!(
+            c.endpoint_config(1, CONTROL_DCI).unwrap().max_packet_size,
+            8
+        );
+
+        // Evaluate Context with EP0 now declaring the real 64-byte max packet.
+        let eval_in = 0x1100_u64;
+        assert!(mem.write(eval_in + 4, &0x2_u32.to_le_bytes())); // A1 (EP0)
+        let mut ep0_full = ep0_small;
+        ep0_full.max_packet_size = 64;
+        assert!(mem.write(
+            eval_in + input_context_entry_offset(CONTROL_DCI),
+            &ep0_full.to_bytes()
+        ));
+        c.submit_command(&CommandTrb::EvaluateContext {
+            slot_id: 1,
+            input_context_ptr: eval_in,
+        });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        assert_eq!(completion_code(&mut c), TrbCompletionCode::Success as u8);
+
+        // The stored EP0 config and the output context both carry 64 now, and
+        // EP0 is still Running (state unchanged).
+        assert_eq!(
+            c.endpoint_config(1, CONTROL_DCI).unwrap().max_packet_size,
+            64
+        );
+        let mut ep0_bytes = [0_u8; 32];
+        assert!(mem.read(
+            out_ctx + device_context_entry_offset(CONTROL_DCI),
+            &mut ep0_bytes
+        ));
+        assert_eq!(ep0_bytes[0] & 0x7, 1); // Running
+        assert_eq!(
+            EndpointContext::parse(&ep0_bytes).unwrap().max_packet_size,
+            64
+        );
     }
 
     #[test]

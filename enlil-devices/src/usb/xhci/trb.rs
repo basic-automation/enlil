@@ -372,6 +372,11 @@ pub enum CommandTrb {
         /// the input context pointer is not referenced (xHCI §6.4.3.5).
         deconfigure: bool,
     },
+    /// Evaluate a device context (xHCI §4.6.7): re-evaluate the input
+    /// context's slot/EP0 fields (Max Exit Latency, EP0 Max Packet Size)
+    /// without changing endpoint or slot state — issued mid-enumeration once
+    /// the driver has read the device descriptor.
+    EvaluateContext { slot_id: u8, input_context_ptr: u64 },
     /// Reset an endpoint.
     ResetEndpoint { slot_id: u8, endpoint_id: u8 },
     /// Stop an endpoint.
@@ -413,6 +418,14 @@ impl CommandTrb {
                 if *deconfigure {
                     trb.control |= 1 << 9;
                 }
+            }
+            Self::EvaluateContext {
+                slot_id,
+                input_context_ptr,
+            } => {
+                trb.set_trb_type(TrbType::EvaluateContextCommand);
+                trb.parameter = *input_context_ptr;
+                trb.control |= u32::from(*slot_id) << 24;
             }
             Self::ResetEndpoint {
                 slot_id,
@@ -456,6 +469,10 @@ impl CommandTrb {
                 slot_id,
                 input_context_ptr: trb.parameter,
                 deconfigure: trb.control & (1 << 9) != 0,
+            }),
+            TrbType::EvaluateContextCommand => Some(Self::EvaluateContext {
+                slot_id,
+                input_context_ptr: trb.parameter,
             }),
             TrbType::ResetEndpointCommand => Some(Self::ResetEndpoint {
                 slot_id,
@@ -644,6 +661,26 @@ mod tests {
         let trb = cmd.to_trb(true);
         assert_eq!(trb.decoded_type(), TrbType::EnableSlotCommand);
         assert!(trb.cycle_bit());
+    }
+
+    #[test]
+    fn command_trb_evaluate_context_round_trips() {
+        let trb = CommandTrb::EvaluateContext {
+            slot_id: 5,
+            input_context_ptr: 0x1_2340,
+        }
+        .to_trb(true);
+        assert_eq!(trb.decoded_type(), TrbType::EvaluateContextCommand);
+        match CommandTrb::from_trb(&trb) {
+            Some(CommandTrb::EvaluateContext {
+                slot_id,
+                input_context_ptr,
+            }) => {
+                assert_eq!(slot_id, 5);
+                assert_eq!(input_context_ptr, 0x1_2340);
+            }
+            other => panic!("expected EvaluateContext, got {other:?}"),
+        }
     }
 
     #[test]
