@@ -73,7 +73,7 @@ impl BlockRequestHeader {
     ///
     /// Returns `None` if the input is less than 16 bytes.
     #[must_use]
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+    pub const fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < 16 {
             return None;
         }

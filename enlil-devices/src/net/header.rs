@@ -80,7 +80,7 @@ impl VirtioNetHeader {
     ///
     /// If `merge_rxbuf` is true, expects 12 bytes; otherwise 10.
     #[must_use]
-    pub fn from_bytes(data: &[u8], merge_rxbuf: bool) -> Option<Self> {
+    pub const fn from_bytes(data: &[u8], merge_rxbuf: bool) -> Option<Self> {
         let min_len = if merge_rxbuf {
             VIRTIO_NET_HDR_SIZE_MRG
         } else {

@@ -136,6 +136,24 @@ impl EndpointType {
     }
 }
 
+/// Endpoint State (xHCI Table 6-8), the Endpoint Context's dword 0 bits 2:0 —
+/// the per-endpoint state a driver reads back out of the output device
+/// context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum EpState {
+    /// Disabled (the endpoint context is not valid).
+    Disabled = 0,
+    /// Running (processing transfer descriptors).
+    Running = 1,
+    /// Halted (a STALL — recovered via Reset Endpoint).
+    Halted = 2,
+    /// Stopped (Stop Endpoint paused it — repointed via Set TR Dequeue Pointer).
+    Stopped = 3,
+    /// Error (a fatal endpoint error).
+    Error = 4,
+}
+
 /// A decoded 32-byte Endpoint Context (xHCI §6.2.3).
 ///
 /// Carries the endpoint's declared transfer characteristics and where its
@@ -210,6 +228,125 @@ impl EndpointContext {
         bytes[16..20].copy_from_slice(&u32::from(self.average_trb_length).to_le_bytes());
         bytes
     }
+}
+
+// ---------------------------------------------------------------------------
+// Slot Context
+// ---------------------------------------------------------------------------
+
+/// Slot State (xHCI Table 6-4), the Slot Context's bits 31:27 — the
+/// device-state field a driver reads back out of the *output* device context
+/// to confirm a command's effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SlotState {
+    /// Disabled / Enabled (the slot is allocated but not yet addressed).
+    DisabledEnabled = 0,
+    /// Default (a USB address of 0 — set by Address Device with BSR = 1).
+    Default = 1,
+    /// Addressed (Address Device has assigned a USB device address).
+    Addressed = 2,
+    /// Configured (Configure Endpoint has installed the device's endpoints).
+    Configured = 3,
+}
+
+/// A decoded 32-byte Slot Context (xHCI §6.2.2) — the driver-visible fields.
+///
+/// Fields this controller does not model (Max Exit Latency, hub/parent and
+/// interrupter-target routing — it has a single interrupter and models no
+/// hubs) are not carried and read back zero, which is correct for a
+/// single-interrupter, hubless virtual controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SlotContext {
+    /// Route String (dword 0, bits 19:0): the hub-port path to the device.
+    pub route_string: u32,
+    /// Speed (dword 0, bits 23:20): the `PORTSC`/protocol speed ID.
+    pub speed: u8,
+    /// Context Entries (dword 0, bits 31:27): the index of the last valid
+    /// endpoint context (1 once EP0 is valid).
+    pub context_entries: u8,
+    /// Root Hub Port Number (dword 1, bits 23:16), 1-based.
+    pub root_hub_port_number: u8,
+    /// USB Device Address (dword 3, bits 7:0): assigned by Address Device.
+    pub usb_device_address: u8,
+    /// Slot State (dword 3, bits 31:27).
+    pub slot_state: u8,
+}
+
+impl SlotContext {
+    /// Decode a 32-byte slot context entry (every bit pattern is valid — a
+    /// slot context has no "not valid" encoding, unlike an endpoint context).
+    #[must_use]
+    pub fn parse(bytes: &[u8; 32]) -> Self {
+        let dword = |i: usize| {
+            u32::from_le_bytes([
+                bytes[4 * i],
+                bytes[4 * i + 1],
+                bytes[4 * i + 2],
+                bytes[4 * i + 3],
+            ])
+        };
+        let d0 = dword(0);
+        let d1 = dword(1);
+        let d3 = dword(3);
+        Self {
+            route_string: d0 & 0x000F_FFFF,
+            speed: u8_of((d0 >> 20) & 0xF),
+            context_entries: u8_of((d0 >> 27) & 0x1F),
+            root_hub_port_number: u8_of((d1 >> 16) & 0xFF),
+            usb_device_address: u8_of(d3 & 0xFF),
+            slot_state: u8_of((d3 >> 27) & 0x1F),
+        }
+    }
+
+    /// Encode into a 32-byte slot context entry (the inverse of
+    /// [`parse`](Self::parse) over the modelled fields) — how the controller
+    /// writes the output slot context back, and how tests author one.
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; 32] {
+        let d0 = (self.route_string & 0x000F_FFFF)
+            | (u32::from(self.speed & 0xF) << 20)
+            | (u32::from(self.context_entries & 0x1F) << 27);
+        let d1 = u32::from(self.root_hub_port_number) << 16;
+        let d3 = u32::from(self.usb_device_address) | (u32::from(self.slot_state & 0x1F) << 27);
+        let mut bytes = [0_u8; 32];
+        bytes[0..4].copy_from_slice(&d0.to_le_bytes());
+        bytes[4..8].copy_from_slice(&d1.to_le_bytes());
+        bytes[12..16].copy_from_slice(&d3.to_le_bytes());
+        bytes
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Device Context Base Address Array (DCBAA)
+// ---------------------------------------------------------------------------
+
+/// Offset of DCI `n`'s entry within an *output* (device) context.
+///
+/// Unlike an input context there is no Input Control Context prefix, so the
+/// slot context (DCI 0) is at `+0` and EP0 (DCI 1) at `+0x20` (xHCI §6.2.1).
+#[must_use]
+pub fn device_context_entry_offset(dci: u8) -> u64 {
+    CONTEXT_SIZE * u64::from(dci)
+}
+
+/// Dereference the Device Context Base Address Array (xHCI §6.1).
+///
+/// The output device context for `slot_id` lives at the 64-bit pointer stored
+/// at `dcbaap + slot_id * 8` (entry 0 is the scratchpad-buffer array, never a
+/// slot). The pointer is 64-byte aligned. `None` if `slot_id` is 0, the array
+/// entry is unbacked, or the stored pointer is null.
+#[must_use]
+pub fn device_context_pointer(mem: &dyn DmaMemory, dcbaap: u64, slot_id: u8) -> Option<u64> {
+    if slot_id == 0 {
+        return None;
+    }
+    let mut bytes = [0_u8; 8];
+    if !mem.read(dcbaap + u64::from(slot_id) * 8, &mut bytes) {
+        return None;
+    }
+    let ptr = u64::from_le_bytes(bytes) & !0x3F;
+    (ptr != 0).then_some(ptr)
 }
 
 // ---------------------------------------------------------------------------
@@ -298,6 +435,50 @@ mod tests {
         assert_eq!(input_context_entry_offset(0), 0x20); // slot context
         assert_eq!(input_context_entry_offset(1), 0x40); // EP0
         assert_eq!(input_context_entry_offset(3), 0x80); // EP1 IN
+    }
+
+    #[test]
+    fn slot_context_round_trips_the_driver_visible_fields() {
+        let slot = SlotContext {
+            route_string: 0x0_1234,
+            speed: 4,
+            context_entries: 3,
+            root_hub_port_number: 7,
+            usb_device_address: 9,
+            slot_state: SlotState::Addressed as u8,
+        };
+        let bytes = slot.to_bytes();
+        // Dword 0: route string 19:0, speed 23:20, context entries 31:27.
+        let d0 = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        assert_eq!(d0 & 0x000F_FFFF, 0x0_1234);
+        assert_eq!((d0 >> 20) & 0xF, 4);
+        assert_eq!(d0 >> 27, 3);
+        // Dword 1: root-hub port number 23:16.
+        assert_eq!(bytes[6], 7);
+        // Dword 3: USB device address 7:0, slot state 31:27.
+        assert_eq!(bytes[12], 9);
+        assert_eq!(bytes[15] >> 3, SlotState::Addressed as u8);
+        assert_eq!(SlotContext::parse(&bytes), slot);
+    }
+
+    #[test]
+    fn device_context_offsets_have_no_input_control_prefix() {
+        assert_eq!(device_context_entry_offset(0), 0); // slot context
+        assert_eq!(device_context_entry_offset(1), 0x20); // EP0
+        assert_eq!(device_context_entry_offset(2), 0x40); // EP1 OUT
+    }
+
+    #[test]
+    fn device_context_pointer_dereferences_the_dcbaa() {
+        let mut mem = VecDmaMemory::new(0x2000, 0x40);
+        // DCBAA[1] points at a 64-byte-aligned output device context.
+        assert!(mem.write(0x2000 + 8, &0x3040_u64.to_le_bytes()));
+        assert_eq!(device_context_pointer(&mem, 0x2000, 1), Some(0x3040));
+        // Slot 0 is the scratchpad array, never a device context.
+        assert_eq!(device_context_pointer(&mem, 0x2000, 0), None);
+        // A null entry yields nothing; an unbacked array does too.
+        assert_eq!(device_context_pointer(&mem, 0x2000, 2), None);
+        assert_eq!(device_context_pointer(&mem, 0xDEAD_0000, 1), None);
     }
 
     #[test]
