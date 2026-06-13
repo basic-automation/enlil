@@ -343,6 +343,18 @@ impl VirtualXhciController {
                 }
                 (code, slot_id)
             }
+            // Set TR Dequeue Pointer repoints a stopped/halted endpoint's
+            // transfer ring (xHCI §4.6.10) — the second half of STALL
+            // recovery after Reset Endpoint.
+            Some(CommandTrb::SetTrDequeuePointer {
+                slot_id,
+                endpoint_id,
+                dequeue_ptr,
+                dcs,
+            }) => (
+                self.set_tr_dequeue_pointer(slot_id, endpoint_id, dequeue_ptr, dcs),
+                slot_id,
+            ),
             // An undecodable TRB on the command ring is a TRB error.
             None => (TrbCompletionCode::TrbError, 0),
         };
@@ -693,6 +705,32 @@ impl VirtualXhciController {
             out[0] = (out[0] & !0x7) | 1; // EP State = Running
             let _ = mem.write(out_ctx + device_context_entry_offset(CONTROL_DCI), &out);
         }
+        TrbCompletionCode::Success
+    }
+
+    /// Set TR Dequeue Pointer (xHCI §4.6.10): repoint an endpoint's transfer
+    /// ring at `dequeue_ptr` with the given Dequeue Cycle State, the second
+    /// half of STALL recovery (Reset Endpoint clears the halt; this tells the
+    /// controller where to resume). The endpoint must be configured;
+    /// otherwise the command is a Context State Error.
+    fn set_tr_dequeue_pointer(
+        &mut self,
+        slot_id: u8,
+        endpoint_id: u8,
+        dequeue_ptr: u64,
+        dcs: bool,
+    ) -> TrbCompletionCode {
+        if self.slot_dependent_success(slot_id) != TrbCompletionCode::Success {
+            return TrbCompletionCode::TrbError;
+        }
+        let Some(ring) = self.transfer_rings.get_mut(&(slot_id, endpoint_id)) else {
+            return TrbCompletionCode::ContextStateError;
+        };
+        ring.reset();
+        let inner = ring.ring_mut();
+        inner.set_base_addr(dequeue_ptr);
+        inner.set_cycle_state(dcs);
+        inner.start();
         TrbCompletionCode::Success
     }
 
@@ -1907,6 +1945,49 @@ mod tests {
         let _ = c.pop_event();
         assert!(!c.endpoint_halted(1, CONTROL_DCI));
         assert!(c.submit_transfer(1, CONTROL_DCI, &TransferTrb::NoOp { ioc: true }));
+    }
+
+    #[test]
+    fn set_tr_dequeue_pointer_repoints_the_ring() {
+        use super::super::xhci::transfer::TransferTrb;
+        let (mut c, mut mem) = controller_with_loopback();
+
+        // A transfer on EP1 IN (DCI 3) auto-creates its ring.
+        assert!(c.submit_transfer(1, 3, &TransferTrb::NoOp { ioc: true }));
+        ring_and_service(&mut c, 3, &mut mem);
+        let _ = c.pop_event();
+
+        // Repoint the ring to a fresh guest address (STALL recovery's second
+        // half, after Reset Endpoint).
+        c.submit_command(&CommandTrb::SetTrDequeuePointer {
+            slot_id: 1,
+            endpoint_id: 3,
+            dequeue_ptr: 0x5000,
+            dcs: true,
+        });
+        kick_commands(&mut c);
+        assert_eq!(completion_code(&mut c), TrbCompletionCode::Success as u8);
+
+        // A subsequent transfer reports its TRB pointer from the new base.
+        assert!(c.submit_transfer(1, 3, &TransferTrb::NoOp { ioc: true }));
+        ring_and_service(&mut c, 3, &mut mem);
+        match c.pop_event() {
+            Some(EventTrb::TransferEvent { trb_pointer, .. }) => assert_eq!(trb_pointer, 0x5000),
+            other => panic!("expected a transfer event, got {other:?}"),
+        }
+
+        // Repointing an endpoint with no transfer ring is a Context State Error.
+        c.submit_command(&CommandTrb::SetTrDequeuePointer {
+            slot_id: 1,
+            endpoint_id: 6,
+            dequeue_ptr: 0x6000,
+            dcs: true,
+        });
+        kick_commands(&mut c);
+        assert_eq!(
+            completion_code(&mut c),
+            TrbCompletionCode::ContextStateError as u8
+        );
     }
 
     #[test]

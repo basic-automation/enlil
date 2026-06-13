@@ -263,6 +263,10 @@ pub enum TrbCompletionCode {
     RingOverrun = 15,
     /// Parameter error (malformed context or command parameter).
     ParameterError = 17,
+    /// Context state error: a command found a slot/endpoint in a state that
+    /// does not permit it (e.g. Set TR Dequeue Pointer on a non-stopped or
+    /// unconfigured endpoint).
+    ContextStateError = 19,
     /// Command ring stopped.
     CommandRingStopped = 24,
     /// Command aborted.
@@ -291,6 +295,7 @@ impl TrbCompletionCode {
             14 => Self::RingUnderrun,
             15 => Self::RingOverrun,
             17 => Self::ParameterError,
+            19 => Self::ContextStateError,
             24 => Self::CommandRingStopped,
             25 => Self::CommandAborted,
             26 => Self::Stopped,
@@ -381,6 +386,17 @@ pub enum CommandTrb {
     ResetEndpoint { slot_id: u8, endpoint_id: u8 },
     /// Stop an endpoint.
     StopEndpoint { slot_id: u8, endpoint_id: u8 },
+    /// Set TR Dequeue Pointer (xHCI §4.6.10): repoint an endpoint's transfer
+    /// ring after a halt/stop, carrying the new dequeue pointer and the
+    /// Dequeue Cycle State the consumer resumes with.
+    SetTrDequeuePointer {
+        slot_id: u8,
+        endpoint_id: u8,
+        /// New TR Dequeue Pointer (16-byte aligned guest address).
+        dequeue_ptr: u64,
+        /// Dequeue Cycle State (parameter bit 0).
+        dcs: bool,
+    },
     /// No-op command (for testing).
     NoOp,
 }
@@ -443,6 +459,17 @@ impl CommandTrb {
                 trb.control |= u32::from(*slot_id) << 24;
                 trb.control |= u32::from(*endpoint_id) << 16;
             }
+            Self::SetTrDequeuePointer {
+                slot_id,
+                endpoint_id,
+                dequeue_ptr,
+                dcs,
+            } => {
+                trb.set_trb_type(TrbType::SetTrDequeuePointerCommand);
+                trb.parameter = (*dequeue_ptr & !0xF) | u64::from(*dcs);
+                trb.control |= u32::from(*slot_id) << 24;
+                trb.control |= u32::from(*endpoint_id) << 16;
+            }
             Self::NoOp => {
                 trb.set_trb_type(TrbType::NoOpCommand);
             }
@@ -481,6 +508,12 @@ impl CommandTrb {
             TrbType::StopEndpointCommand => Some(Self::StopEndpoint {
                 slot_id,
                 endpoint_id,
+            }),
+            TrbType::SetTrDequeuePointerCommand => Some(Self::SetTrDequeuePointer {
+                slot_id,
+                endpoint_id,
+                dequeue_ptr: trb.parameter & !0xF,
+                dcs: trb.parameter & 1 != 0,
             }),
             TrbType::NoOpCommand => Some(Self::NoOp),
             _ => None,
@@ -661,6 +694,32 @@ mod tests {
         let trb = cmd.to_trb(true);
         assert_eq!(trb.decoded_type(), TrbType::EnableSlotCommand);
         assert!(trb.cycle_bit());
+    }
+
+    #[test]
+    fn command_trb_set_tr_dequeue_pointer_round_trips() {
+        let trb = CommandTrb::SetTrDequeuePointer {
+            slot_id: 3,
+            endpoint_id: 4,
+            dequeue_ptr: 0x8_0000,
+            dcs: true,
+        }
+        .to_trb(true);
+        assert_eq!(trb.decoded_type(), TrbType::SetTrDequeuePointerCommand);
+        match CommandTrb::from_trb(&trb) {
+            Some(CommandTrb::SetTrDequeuePointer {
+                slot_id,
+                endpoint_id,
+                dequeue_ptr,
+                dcs,
+            }) => {
+                assert_eq!(slot_id, 3);
+                assert_eq!(endpoint_id, 4);
+                assert_eq!(dequeue_ptr, 0x8_0000);
+                assert!(dcs);
+            }
+            other => panic!("expected SetTrDequeuePointer, got {other:?}"),
+        }
     }
 
     #[test]

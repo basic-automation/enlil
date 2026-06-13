@@ -142,6 +142,11 @@ impl TrbRing {
         self.guest_base_addr = addr;
     }
 
+    /// Set the consumer/producer cycle state (Set TR Dequeue Pointer's DCS).
+    pub const fn set_cycle_state(&mut self, cycle: bool) {
+        self.cycle_state = cycle;
+    }
+
     /// Get the guest physical base address.
     #[must_use]
     pub const fn base_addr(&self) -> u64 {
