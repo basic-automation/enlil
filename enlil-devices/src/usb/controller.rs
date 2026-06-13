@@ -312,7 +312,7 @@ impl VirtualXhciController {
                 input_context_ptr,
                 deconfigure,
             }) => (
-                self.configure_endpoint(slot_id, input_context_ptr, deconfigure, &*mem),
+                self.configure_endpoint(slot_id, input_context_ptr, deconfigure, mem),
                 slot_id,
             ),
             // Stop Endpoint waits on in-flight TD bookkeeping; succeed on
@@ -490,7 +490,7 @@ impl VirtualXhciController {
         slot_id: u8,
         input_context_ptr: u64,
         deconfigure: bool,
-        mem: &dyn DmaMemory,
+        mem: &mut dyn DmaMemory,
     ) -> TrbCompletionCode {
         if self.slot_dependent_success(slot_id) != TrbCompletionCode::Success {
             return TrbCompletionCode::TrbError;
@@ -498,10 +498,12 @@ impl VirtualXhciController {
         // Deconfigure (DC): drop every endpoint but EP0; the input context
         // pointer is not referenced (xHCI §6.4.3.5).
         if deconfigure {
+            let dropped = self.slot_endpoint_dcis(slot_id);
             self.transfer_rings
                 .retain(|&(slot, dci), _| slot != slot_id || dci <= CONTROL_DCI);
             self.endpoint_configs
                 .retain(|&(slot, dci), _| slot != slot_id || dci <= CONTROL_DCI);
+            self.publish_deconfigured_context(slot_id, &dropped, mem);
             return TrbCompletionCode::Success;
         }
         let Some(control) = InputControlContext::read(mem, input_context_ptr) else {
@@ -529,19 +531,107 @@ impl VirtualXhciController {
             }
             added.push((dci, context));
         }
+        let mut dropped = Vec::new();
         for dci in (CONTROL_DCI + 1)..=MAX_DCI {
             if control.drops(dci) {
                 self.transfer_rings.remove(&(slot_id, dci));
                 self.endpoint_configs.remove(&(slot_id, dci));
+                dropped.push(dci);
             }
         }
+        let added_dcis: Vec<u8> = added.iter().map(|(dci, _)| *dci).collect();
         for (dci, context) in added {
             let mut ring = TransferRing::with_default_size(slot_id, dci);
             ring.ring_mut().set_base_addr(context.tr_dequeue_pointer);
             self.transfer_rings.insert((slot_id, dci), ring);
             self.endpoint_configs.insert((slot_id, dci), context);
         }
+        self.publish_configured_context(slot_id, input_context_ptr, &added_dcis, &dropped, mem);
         TrbCompletionCode::Success
+    }
+
+    /// The DCIs of a slot's configured endpoints beyond EP0 (DCI > 1).
+    fn slot_endpoint_dcis(&self, slot_id: u8) -> Vec<u8> {
+        self.endpoint_configs
+            .keys()
+            .filter(|&&(slot, dci)| slot == slot_id && dci > CONTROL_DCI)
+            .map(|&(_, dci)| dci)
+            .collect()
+    }
+
+    /// The highest DCI with a configured endpoint context for a slot (0 if
+    /// none) — the Context Entries field the output slot context advertises.
+    fn highest_configured_dci(&self, slot_id: u8) -> u8 {
+        self.endpoint_configs
+            .keys()
+            .filter(|&&(slot, _)| slot == slot_id)
+            .map(|&(_, dci)| dci)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Publish the output device context after a successful Configure Endpoint
+    /// (xHCI §4.6.6): the slot context with Slot State = Configured and
+    /// Context Entries = the highest configured DCI, each added endpoint's
+    /// output context with EP State = Running, and each dropped endpoint's
+    /// output context zeroed (EP State = Disabled). A no-op when `DCBAAP`/the
+    /// slot's DCBAA entry is not backed.
+    fn publish_configured_context(
+        &self,
+        slot_id: u8,
+        input_context_ptr: u64,
+        added: &[u8],
+        dropped: &[u8],
+        mem: &mut dyn DmaMemory,
+    ) {
+        if self.op.dcbaap == 0 {
+            return;
+        }
+        let Some(out_ctx) = device_context_pointer(mem, self.op.dcbaap, slot_id) else {
+            return;
+        };
+        if let Some(slot_bytes) =
+            read_context_entry(mem, input_context_ptr + input_context_entry_offset(0))
+        {
+            let mut slot = SlotContext::parse(&slot_bytes);
+            slot.slot_state = SlotState::Configured as u8;
+            slot.context_entries = self.highest_configured_dci(slot_id).max(1);
+            let _ = mem.write(out_ctx + device_context_entry_offset(0), &slot.to_bytes());
+        }
+        for &dci in added {
+            if let Some(ctx) = self.endpoint_configs.get(&(slot_id, dci)) {
+                let mut bytes = ctx.to_bytes();
+                bytes[0] = (bytes[0] & !0x7) | 1; // EP State = Running
+                let _ = mem.write(out_ctx + device_context_entry_offset(dci), &bytes);
+            }
+        }
+        for &dci in dropped {
+            let _ = mem.write(out_ctx + device_context_entry_offset(dci), &[0_u8; 32]);
+        }
+    }
+
+    /// Publish the output device context after a Deconfigure (DC = 1): the
+    /// slot returns to the Addressed state with only EP0 valid, and every
+    /// previously-configured endpoint's output context is zeroed (EP State =
+    /// Disabled). The current output slot context is read back and patched
+    /// (there is no input context on the DC path). A no-op without `DCBAAP`.
+    fn publish_deconfigured_context(&self, slot_id: u8, dropped: &[u8], mem: &mut dyn DmaMemory) {
+        if self.op.dcbaap == 0 {
+            return;
+        }
+        let Some(out_ctx) = device_context_pointer(mem, self.op.dcbaap, slot_id) else {
+            return;
+        };
+        if let Some(slot_bytes) = read_context_entry(mem, out_ctx + device_context_entry_offset(0))
+        {
+            let mut slot = SlotContext::parse(&slot_bytes);
+            slot.slot_state = SlotState::Addressed as u8;
+            slot.context_entries = 1;
+            let _ = mem.write(out_ctx + device_context_entry_offset(0), &slot.to_bytes());
+        }
+        for &dci in dropped {
+            let _ = mem.write(out_ctx + device_context_entry_offset(dci), &[0_u8; 32]);
+        }
     }
 
     /// The endpoint context the guest's driver declared for (slot, DCI) —
@@ -2058,6 +2148,78 @@ mod tests {
         c.service_doorbells(&mut mem);
         let _ = c.pop_event();
         assert_eq!(completion_code(&mut c), TrbCompletionCode::Success as u8);
+    }
+
+    #[test]
+    fn configure_endpoint_publishes_the_output_device_context() {
+        use super::super::xhci::transfer::DmaMemory;
+        let mut c = running_controller();
+        let mut mem = super::super::xhci::VecDmaMemory::new(0x1000, 0x4000);
+        let dcbaap = 0x2000_u64;
+        let out_ctx = 0x3000_u64;
+        let op = u32::from(c.caps.caplength);
+        c.write_register(op + 0x30, u32_of(dcbaap));
+        assert!(mem.write(dcbaap + 8, &out_ctx.to_le_bytes())); // DCBAA[1]
+
+        // Enable + Address the slot so it reaches the Addressed state.
+        let addr_in = 0x1000_u64;
+        write_input_context(&mut mem, addr_in, 1);
+        c.submit_command(&CommandTrb::EnableSlot);
+        c.submit_command(&CommandTrb::AddressDevice {
+            slot_id: 1,
+            input_context_ptr: addr_in,
+        });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        let _ = c.pop_event(); // enable
+        let _ = c.pop_event(); // address
+
+        // Configure Endpoint adding a bulk OUT endpoint at EP1 OUT (DCI 2).
+        let cfg_in = 0x1100_u64;
+        write_configure_context(&mut mem, cfg_in, 0, &[(2, bulk_out_context(0x4000))]);
+        c.submit_command(&CommandTrb::ConfigureEndpoint {
+            slot_id: 1,
+            input_context_ptr: cfg_in,
+            deconfigure: false,
+        });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        assert_eq!(completion_code(&mut c), TrbCompletionCode::Success as u8);
+
+        // The output slot context is now Configured with Context Entries = 2.
+        let mut slot_bytes = [0_u8; 32];
+        assert!(mem.read(out_ctx + device_context_entry_offset(0), &mut slot_bytes));
+        let slot_out = SlotContext::parse(&slot_bytes);
+        assert_eq!(slot_out.slot_state, SlotState::Configured as u8);
+        assert_eq!(slot_out.context_entries, 2);
+
+        // The added EP2 output context is Running with its declared ring.
+        let mut ep_bytes = [0_u8; 32];
+        assert!(mem.read(out_ctx + device_context_entry_offset(2), &mut ep_bytes));
+        assert_eq!(ep_bytes[0] & 0x7, 1);
+        assert_eq!(
+            EndpointContext::parse(&ep_bytes)
+                .unwrap()
+                .tr_dequeue_pointer,
+            0x4000
+        );
+
+        // Deconfigure (DC = 1) returns the slot to Addressed and zeroes EP2.
+        c.submit_command(&CommandTrb::ConfigureEndpoint {
+            slot_id: 1,
+            input_context_ptr: 0,
+            deconfigure: true,
+        });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        assert_eq!(completion_code(&mut c), TrbCompletionCode::Success as u8);
+        assert!(mem.read(out_ctx + device_context_entry_offset(0), &mut slot_bytes));
+        assert_eq!(
+            SlotContext::parse(&slot_bytes).slot_state,
+            SlotState::Addressed as u8
+        );
+        assert!(mem.read(out_ctx + device_context_entry_offset(2), &mut ep_bytes));
+        assert_eq!(ep_bytes, [0_u8; 32]);
     }
 
     /// A bulk OUT endpoint context (EP1 OUT = DCI 2) with its ring at `ring`.
