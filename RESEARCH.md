@@ -1164,6 +1164,40 @@ The transparency question for this increment: does the emulated chipset's *ident
 
 ---
 
+## 2026-06-13 — xHCI Device Context output write-back + the remaining slot/endpoint commands (Phase 4.4)
+
+Targeted spec check before completing the guest-memory device-context loop (the broad
+RustVMM/ACRN architecture case is already logged above; nothing new in the literature
+changed the plan — this is grounded in the xHCI 1.2 specification, the authoritative
+primary source for command semantics):
+
+- **The Output Device Context is the controller→driver channel** (xHCI 1.2 §4.6.5,
+  §6.2.1): after Address Device / Configure Endpoint the xHC *copies* the input contexts
+  into the Output Device Context that `DCBAA[slot_id]` names, updating the controller-owned
+  fields — **Slot State**, **USB Device Address**, and per-endpoint **EP State** — which the
+  driver reads back to confirm the command. We had been reading input contexts but never
+  writing outputs, so a real driver would never see its device addressed. → added a
+  `SlotContext`/`EpState` codec, `DCBAA` dereferencing, and output write-back on every
+  slot/endpoint command.
+- **DCBAA layout** (§6.1): `DCBAAP` points at an array of 64-bit, 64-byte-aligned device
+  context pointers; **entry 0 is the Scratchpad Buffer Array, not a slot** — slot N's
+  context is at `DCBAAP + N*8`. Output (device) contexts have **no** Input Control Context
+  prefix (unlike input contexts), so DCI N sits at `+N*0x20`. → `device_context_pointer` /
+  `device_context_entry_offset`.
+- **Slot/EP state machines** (Tables 6-4, 6-8): Slot States Disabled(0)/Default(1)/
+  Addressed(2)/Configured(3); EP States Disabled(0)/Running(1)/Halted(2)/Stopped(3)/
+  Error(4). Address Device→Addressed (or **Default** when **BSR**=1, control bit 9, §4.6.5,
+  which Linux issues first to read the descriptor at address 0); Configure Endpoint→
+  Configured; Deconfigure/Reset Device→Default; Disable Slot→Disabled; STALL→Halted, Reset
+  Endpoint→Running; Stop Endpoint→Stopped.
+- **Evaluate Context** (§4.6.7) re-evaluates only EP0 Max Packet Size + slot Max Exit
+  Latency/Interrupter Target *without* changing state — issued mid-enumeration once the
+  driver reads the real EP0 max packet size. **Set TR Dequeue Pointer** (§4.6.10) repoints a
+  Stopped/Halted ring (DCS in parameter bit 0, pointer in bits 63:4) and is the second half
+  of STALL recovery after Reset Endpoint; on a non-stopped/unconfigured endpoint it returns
+  **Context State Error** (code 19). → both commands were undecoded (→ TRB error, stalling a
+  real driver) and are now handled.
+
 ## 2026-06-12 — xHCI transfer-ring (TD) processing: ACRN's TD assembly + the spec's event-length semantics (Phase 4.4)
 
 Targeted check before building the TD-processing increment (the broad ACRN-architecture

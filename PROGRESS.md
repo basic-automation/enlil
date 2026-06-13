@@ -6,6 +6,106 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-13 — Session: Phase 4.4 — xHCI Output Device Context write-back + the full slot/endpoint command set
+
+**10 increments, each independently green and committed** (branch
+`claude/wonderful-mccarthy-cx0zer`). This session closed the last open part of the
+2026-06-12 hand-off's item #4 (*"Guest-memory-resident rings: CRCR/DCBAAP/ERSTBA
+dereferencing through `DmaMemory`"*) — PR #24 had landed the command ring (CRCR) and event
+ring (ERST/ERDP); this run added **DCBAAP / Output Device Context** write-back and then
+completed the xHCI command set that depends on it. The `enlil-devices` lib test suite grew
+**734 → 750** (+16 tests); `cargo test --workspace` aggregates **1010 passed, 0 failed,
+1 ignored** (the ignored one is the `/dev/kvm` self-skip). `cargo build --workspace`,
+`cargo fmt --all -- --check`, `cargo clippy --all-targets --workspace -- -D warnings` green
+at every commit. `/dev/kvm` **still absent** (verified — no nested virt).
+
+### Situation found
+The controller read **input** device contexts (Address Device / Configure Endpoint) but
+never wrote the **output** device context back through the DCBAA, so a real guest driver
+would never see its device addressed/configured (it reads the output Slot/EP contexts to
+confirm each command). Several enumeration/recovery commands were also undecoded
+(`EvaluateContext`, `SetTrDequeuePointer`, `ResetDevice`) → `CommandTrb::from_trb` returned
+`None` → `TrbError`, which would stall a real driver. Also found: the current toolchain's
+clippy (`missing_const_for_fn`, nursery) newly flags two pre-existing `from_bytes` parsers
+as const-eligible, so HEAD was not `clippy -D warnings`-clean on this runner.
+
+### Increments (each its own green commit)
+1. **`b3de331` (phase-4)** const-eligible `from_bytes` parsers — fixes clippy toolchain
+   drift (`block.rs`, `net/header.rs`) so the workspace clippy gate is green again. *(Not a
+   feature; a prerequisite so every later commit passes `clippy -D warnings`.)*
+2. **`636b5c4` (4.4)** Output device context after **Address Device** — new `SlotContext`
+   codec + `SlotState`, `device_context_pointer` (DCBAA deref) + `device_context_entry_offset`,
+   and `publish_addressed_context`: copies the input slot/EP0 contexts with Slot State →
+   Addressed and an assigned USB address; EP0 → Running. Threaded `&mut dyn DmaMemory`
+   through `process_command_ring`/`execute_command`/`address_device`.
+3. **`4a326e4` (4.4)** Output context after **Configure Endpoint** — Slot State →
+   Configured, Context Entries = highest configured DCI, added EPs → Running, dropped EPs
+   zeroed; the Deconfigure (DC=1) path returns the slot to Addressed.
+4. **`0b28893` (4.4)** Output context after **Disable Slot** — slot → Disabled, address 0,
+   entries 0, held endpoints zeroed.
+5. **`3a203db` (4.4)** **Evaluate Context** decode + handler — re-evaluates EP0 Max Packet
+   Size without changing state (the mid-enumeration MPS update).
+6. **`a5ee258` (4.4)** **Set TR Dequeue Pointer** decode + handler — repoints a ring after
+   a stop/halt (STALL recovery's second half); added `TrbRing::set_cycle_state` and the
+   `ContextStateError` (19) completion code.
+7. **`b8bd492` (4.4)** **Reset Device** decode + handler — slot → Default, address 0,
+   non-control endpoints dropped, EP0 retained, ready for re-enumeration.
+8. **`2514a01` (4.4)** **Stop Endpoint** → Stopped — added `EpState` enum + `publish_ep_state`
+   (patches just the EP State field in the output context); Stop Endpoint pauses the ring
+   and publishes Stopped.
+9. **`279468a` (4.4)** STALL → Halted, Reset Endpoint → Running in the output context
+   (threaded mem through the control-status/`stall_endpoint` path). Completes the
+   Running/Stopped/Halted EP-state story.
+10. **`6e00047` (4.4)** Address Device **BSR** (bit 9): slot-context-only setup → Default
+    state at address 0 (the first pass Linux issues before the real addressing).
+
+All commands are reachable both via the internal `submit_command` modelling path and the
+guest-memory **CRCR** command ring (`process_command_ring` decodes via `CommandTrb::from_trb`
+either way), so the whole loop — command ring fetched from guest memory, contexts read and
+written through the DCBAA, events delivered to the ERST event ring — is now guest-memory
+resident.
+
+### Research (informed the build) — logged in RESEARCH.md → 2026-06-13
+xHCI 1.2 §4.6.5 (Address Device + BSR), §4.6.6 (Configure Endpoint), §4.6.7 (Evaluate
+Context), §4.6.9 (Stop Endpoint), §4.6.10 (Set TR Dequeue Pointer), §4.6.11 (Reset Device),
+§6.1 (DCBAA; entry 0 = scratchpad), §6.2.1–6.2.3 (context layout — output contexts have no
+Input Control Context prefix), Tables 6-4/6-8 (Slot/EP state encodings). No new external
+literature changed the plan; the work is grounded in the primary spec.
+
+### Test results (exact)
+- `cargo build --workspace` OK · `cargo fmt --all -- --check` OK ·
+  `cargo clippy --all-targets --workspace -- -D warnings` OK ·
+  `cargo test --workspace` → all binaries pass, **0 failed, 1 ignored** (the `/dev/kvm`
+  self-skip). New tests this session: **16** (controller + trb + context: output-context
+  publishing for Address/Configure/Disable, Evaluate/SetTRDequeue/ResetDevice/StopEndpoint
+  handlers + TRB round-trips, STALL/Reset EP-state, BSR, SlotContext/DCBAA codecs).
+- `/dev/kvm`: **not run — absent (no nested virt)**, verified. no_std custom target: N/A
+  (no crate is `#![no_std]`).
+
+### Recommended next steps (tomorrow)
+1. **Transfer rings resident in guest memory.** The command ring (CRCR) and device contexts
+   (DCBAA) now live in guest memory, but **transfer rings still use the internal index-based
+   `TrbRing`** fed by `submit_transfer` (with `base_addr` only for event-pointer reporting).
+   Give each endpoint a `GuestRingCursor` (like the command ring) seeded from its EP context
+   TR Dequeue Pointer + DCS, so `process_transfer_ring` fetches TDs from guest memory by
+   cycle bit. This is the last piece making the *entire* xHCI path guest-memory driven and
+   is what the KVM run loop will exercise. (Touches `submit_transfer`/`process_transfer_ring`/
+   `gather_td` and many tests — scope it carefully; Set TR Dequeue Pointer then sets the
+   cursor directly instead of resetting the internal ring.)
+2. **TUI USB tab** (Phase 4.5 milestone UI): ratatui table over `UsbDeviceList`/
+   `UsbHotplugNotice` + `UsbCommand{Reassign,Detach}`; the protocol seam landed 2026-06-12.
+   The old `tui/mod.rs` was a corrupt placeholder (removed) — build fresh; also the core-side
+   daemon answering `RequestUsbDevices` from `XhciRegistry::placements()` + `UsbMonitor`
+   does not exist yet.
+3. **Machine-identity profile coherence** (open since 2026-06-11): wire `from_host`
+   CPUID/SMBIOS into the boot/`fw_cfg` delivery path so the run presents one coherent
+   captured machine (AMD host → prefer `from_host` over the default Intel-Q35 profile).
+4. **KVM run loop** still blocked on `/dev/kvm` (ask for a nested-virt runner). When it
+   lands, the now-complete command/context/event guest-memory loop is ready to drive a real
+   guest's xHCI enumeration.
+
+---
+
 ## 2026-06-12 — Session: Phase 4 USB routing — TD processing, device models, routing→controller binding, hot-plug bridge
 
 **6 increments, each independently green and committed.** Increments 1–3 went out as
