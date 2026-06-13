@@ -32,7 +32,9 @@ use std::collections::BTreeMap;
 use super::emulated::{UsbDeviceModel, UsbTransferResult};
 use super::types::DeviceSpeed as UsbSpeed;
 use super::xhci::context::{
-    EndpointContext, InputControlContext, MAX_DCI, input_context_entry_offset, read_context_entry,
+    EndpointContext, InputControlContext, MAX_DCI, SlotContext, SlotState,
+    device_context_entry_offset, device_context_pointer, input_context_entry_offset,
+    read_context_entry,
 };
 use super::xhci::registers::XECP_OFFSET;
 use super::xhci::ring::GuestRingCursor;
@@ -259,7 +261,7 @@ impl VirtualXhciController {
     /// A driver-programmed `CRCR` means the ring lives in guest memory and
     /// commands are fetched there (cycle-bit delimited, Link TRBs followed);
     /// the internal ring remains the modelling path while `CRCR` is zero.
-    fn process_command_ring(&mut self, mem: &dyn DmaMemory) {
+    fn process_command_ring(&mut self, mem: &mut dyn DmaMemory) {
         if !self.op.is_running() {
             return;
         }
@@ -277,7 +279,7 @@ impl VirtualXhciController {
         // Bounded per doorbell so a guest authoring a self-linking ring of
         // forever-valid TRBs cannot wedge the controller.
         for _ in 0..COMMAND_BURST_LIMIT {
-            let Some((address, trb)) = cursor.fetch(mem) else {
+            let Some((address, trb)) = cursor.fetch(&*mem) else {
                 break;
             };
             self.execute_command(&trb, address, mem);
@@ -289,7 +291,7 @@ impl VirtualXhciController {
     /// event reporting `trb_pointer` as the command-TRB address (the guest
     /// ring's real fetch address; the parameter field on the internal
     /// modelling path).
-    fn execute_command(&mut self, trb: &Trb, trb_pointer: u64, mem: &dyn DmaMemory) {
+    fn execute_command(&mut self, trb: &Trb, trb_pointer: u64, mem: &mut dyn DmaMemory) {
         let (code, slot_id) = match CommandTrb::from_trb(trb) {
             Some(CommandTrb::NoOp) => (TrbCompletionCode::Success, 0),
             Some(CommandTrb::EnableSlot) => self.enable_slot(),
@@ -310,7 +312,7 @@ impl VirtualXhciController {
                 input_context_ptr,
                 deconfigure,
             }) => (
-                self.configure_endpoint(slot_id, input_context_ptr, deconfigure, mem),
+                self.configure_endpoint(slot_id, input_context_ptr, deconfigure, &*mem),
                 slot_id,
             ),
             // Stop Endpoint waits on in-flight TD bookkeeping; succeed on
@@ -386,7 +388,7 @@ impl VirtualXhciController {
         &mut self,
         slot_id: u8,
         input_context_ptr: u64,
-        mem: &dyn DmaMemory,
+        mem: &mut dyn DmaMemory,
     ) -> TrbCompletionCode {
         if self.slot_dependent_success(slot_id) != TrbCompletionCode::Success {
             return TrbCompletionCode::TrbError;
@@ -429,7 +431,51 @@ impl VirtualXhciController {
             self.endpoint_configs
                 .insert((slot_id, CONTROL_DCI), context);
         }
+        // Publish the Output Device Context (xHCI §4.6.5): the xHC copies the
+        // input slot/EP0 contexts into the device context the DCBAA names for
+        // this slot, with Slot State → Addressed and the assigned USB Device
+        // Address — the values the driver reads back to confirm the device is
+        // addressed. Best-effort: skipped (the pre-run-loop modelling path)
+        // when the driver has not programmed DCBAAP or its array is unbacked.
+        self.publish_addressed_context(slot_id, input_context_ptr, mem);
         TrbCompletionCode::Success
+    }
+
+    /// Write the output device context for a freshly-addressed slot: the slot
+    /// context with Slot State = Addressed and USB Device Address = `slot_id`
+    /// (a deterministic, valid per-slot address), and — when the driver
+    /// supplied a valid EP0 context — the EP0 output context with EP State =
+    /// Running. A no-op when `DCBAAP`/the slot's DCBAA entry is not backed.
+    fn publish_addressed_context(
+        &self,
+        slot_id: u8,
+        input_context_ptr: u64,
+        mem: &mut dyn DmaMemory,
+    ) {
+        if self.op.dcbaap == 0 {
+            return;
+        }
+        let Some(out_ctx) = device_context_pointer(mem, self.op.dcbaap, slot_id) else {
+            return;
+        };
+        let Some(slot_bytes) =
+            read_context_entry(mem, input_context_ptr + input_context_entry_offset(0))
+        else {
+            return;
+        };
+        let mut slot = SlotContext::parse(&slot_bytes);
+        slot.slot_state = SlotState::Addressed as u8;
+        slot.usb_device_address = slot_id;
+        // EP0 is valid once addressed, so Context Entries is at least 1.
+        slot.context_entries = slot.context_entries.max(1);
+        let _ = mem.write(out_ctx + device_context_entry_offset(0), &slot.to_bytes());
+        // EP0 output context: the driver's declared EP0, EP State = Running
+        // (dword 0, bits 2:0 = 1).
+        if let Some(ep0) = self.endpoint_configs.get(&(slot_id, CONTROL_DCI)) {
+            let mut bytes = ep0.to_bytes();
+            bytes[0] = (bytes[0] & !0x7) | 1;
+            let _ = mem.write(out_ctx + device_context_entry_offset(CONTROL_DCI), &bytes);
+        }
     }
 
     /// Configure Endpoint (xHCI §4.6.6): parse the input context and install
@@ -565,7 +611,7 @@ impl VirtualXhciController {
         }
         for target in self.doorbells.drain_pending() {
             match target {
-                DoorbellTarget::HostCommand => self.process_command_ring(&*mem),
+                DoorbellTarget::HostCommand => self.process_command_ring(mem),
                 DoorbellTarget::ControlEndpoint { slot_id } => {
                     self.process_transfer_ring(slot_id, CONTROL_DCI, mem);
                 }
@@ -1916,6 +1962,102 @@ mod tests {
         let _ = c.pop_event();
         assert!(c.disconnect_device(port));
         assert!(c.take_port_model(port).is_none());
+    }
+
+    #[test]
+    fn address_device_publishes_the_output_device_context() {
+        use super::super::xhci::transfer::DmaMemory;
+        let mut c = running_controller();
+        let mut mem = super::super::xhci::VecDmaMemory::new(0x1000, 0x4000);
+
+        // DCBAAP names a Device Context Base Array; slot 1's entry points at
+        // where the controller must publish the output device context.
+        let dcbaap = 0x2000_u64;
+        let out_ctx = 0x3000_u64;
+        let op = u32::from(c.caps.caplength);
+        c.write_register(op + 0x30, u32_of(dcbaap)); // DCBAAP lo
+        c.write_register(op + 0x34, 0); // DCBAAP hi
+        assert!(mem.write(dcbaap + 8, &out_ctx.to_le_bytes())); // DCBAA[1]
+
+        // A full Address Device input context: A0|A1, a slot context naming
+        // port 1 at high speed, and a valid EP0 control context.
+        let input = 0x1000_u64;
+        assert!(mem.write(input + 4, &0x3_u32.to_le_bytes())); // add A0|A1
+        let slot_in = SlotContext {
+            route_string: 0,
+            speed: 3,
+            context_entries: 1,
+            root_hub_port_number: 1,
+            usb_device_address: 0,
+            slot_state: SlotState::DisabledEnabled as u8,
+        };
+        assert!(mem.write(input + input_context_entry_offset(0), &slot_in.to_bytes()));
+        let ep0 = EndpointContext {
+            endpoint_type: super::super::xhci::EndpointType::Control,
+            max_packet_size: 64,
+            max_burst_size: 0,
+            error_count: 3,
+            interval: 0,
+            tr_dequeue_pointer: 0x4000,
+            dequeue_cycle_state: true,
+            average_trb_length: 8,
+        };
+        assert!(mem.write(
+            input + input_context_entry_offset(CONTROL_DCI),
+            &ep0.to_bytes()
+        ));
+
+        c.submit_command(&CommandTrb::EnableSlot);
+        c.submit_command(&CommandTrb::AddressDevice {
+            slot_id: 1,
+            input_context_ptr: input,
+        });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        let _ = c.pop_event(); // Enable Slot completion
+        assert_eq!(completion_code(&mut c), TrbCompletionCode::Success as u8);
+
+        // The driver reads back the output slot context: Addressed, with the
+        // assigned address, and speed/port preserved from the input.
+        let mut slot_bytes = [0_u8; 32];
+        assert!(mem.read(out_ctx + device_context_entry_offset(0), &mut slot_bytes));
+        let slot_out = SlotContext::parse(&slot_bytes);
+        assert_eq!(slot_out.slot_state, SlotState::Addressed as u8);
+        assert_eq!(slot_out.usb_device_address, 1);
+        assert_eq!(slot_out.speed, 3);
+        assert_eq!(slot_out.root_hub_port_number, 1);
+        assert!(slot_out.context_entries >= 1);
+
+        // The output EP0 context carries EP State = Running (bits 2:0 = 1)
+        // and the driver's declared max packet size.
+        let mut ep0_bytes = [0_u8; 32];
+        assert!(mem.read(
+            out_ctx + device_context_entry_offset(CONTROL_DCI),
+            &mut ep0_bytes
+        ));
+        assert_eq!(ep0_bytes[0] & 0x7, 1);
+        assert_eq!(
+            EndpointContext::parse(&ep0_bytes).unwrap().max_packet_size,
+            64
+        );
+    }
+
+    #[test]
+    fn address_device_without_dcbaap_skips_the_output_context() {
+        // The pre-run-loop modelling path: no DCBAAP programmed, so there is
+        // nowhere to publish — Address Device still succeeds and binds.
+        let mut c = running_controller();
+        let mut mem = super::super::xhci::VecDmaMemory::new(0x1000, 0x100);
+        write_input_context(&mut mem, 0x1000, 1);
+        c.submit_command(&CommandTrb::EnableSlot);
+        c.submit_command(&CommandTrb::AddressDevice {
+            slot_id: 1,
+            input_context_ptr: 0x1000,
+        });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        let _ = c.pop_event();
+        assert_eq!(completion_code(&mut c), TrbCompletionCode::Success as u8);
     }
 
     /// A bulk OUT endpoint context (EP1 OUT = DCI 2) with its ring at `ring`.

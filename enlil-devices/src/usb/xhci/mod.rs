@@ -34,7 +34,10 @@ pub mod ring;
 pub mod transfer;
 pub mod trb;
 
-pub use context::{EndpointContext, EndpointType, InputControlContext};
+pub use context::{
+    EndpointContext, EndpointType, InputControlContext, SlotContext, SlotState,
+    device_context_entry_offset, device_context_pointer,
+};
 pub use doorbell::{DoorbellArray, DoorbellTarget};
 pub use event::{EventRing, EventRingSegment, GuestEventRing, InterrupterRegisterSet};
 pub use registers::{
