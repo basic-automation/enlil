@@ -341,6 +341,9 @@ impl VirtualXhciController {
                     && let Some(ring) = self.transfer_rings.get_mut(&(slot_id, endpoint_id))
                 {
                     ring.clear_halt();
+                    // The endpoint runs again — reflect Running in the output
+                    // context so the driver sees the recovery.
+                    self.publish_ep_state(slot_id, endpoint_id, EpState::Running, mem);
                 }
                 (code, slot_id)
             }
@@ -1030,7 +1033,7 @@ impl VirtualXhciController {
                 self.execute_control_data(slot_id, td, dir_in, mem);
             }
             TransferTrb::Status { ioc, .. } => {
-                self.execute_control_status(slot_id, last_pointer, ioc);
+                self.execute_control_status(slot_id, last_pointer, ioc, mem);
             }
             TransferTrb::NoOp { ioc } => {
                 if ioc {
@@ -1122,7 +1125,7 @@ impl VirtualXhciController {
                     self.complete_td(last_pointer, requested, written, ioc, slot_id, CONTROL_DCI);
                 }
                 UsbTransferResult::Stall => {
-                    self.stall_endpoint(slot_id, CONTROL_DCI, last_pointer, requested);
+                    self.stall_endpoint(slot_id, CONTROL_DCI, last_pointer, requested, mem);
                 }
                 UsbTransferResult::Ack(_) | UsbTransferResult::Error => {
                     self.post_transfer_event(
@@ -1168,7 +1171,13 @@ impl VirtualXhciController {
     /// The Status Stage TD: run the request if the data stage did not
     /// already (OUT and no-data transfers), then complete the control
     /// transfer. Errors always post an event; success posts on IOC.
-    fn execute_control_status(&mut self, slot_id: u8, trb_pointer: u64, ioc: bool) {
+    fn execute_control_status(
+        &mut self,
+        slot_id: u8,
+        trb_pointer: u64,
+        ioc: bool,
+        mem: &mut dyn DmaMemory,
+    ) {
         let code = match self.control_state.remove(&slot_id) {
             Some(ControlStage::DataDone {
                 responded: true, ..
@@ -1185,7 +1194,7 @@ impl VirtualXhciController {
             None => TrbCompletionCode::TrbError,
         };
         if code == TrbCompletionCode::StallError {
-            self.stall_endpoint(slot_id, CONTROL_DCI, trb_pointer, 0);
+            self.stall_endpoint(slot_id, CONTROL_DCI, trb_pointer, 0, mem);
             return;
         }
         if ioc || code != TrbCompletionCode::Success {
@@ -1274,7 +1283,7 @@ impl VirtualXhciController {
                 self.complete_td(last_pointer, requested, accepted, ioc, slot_id, dci);
             }
             UsbTransferResult::Stall => {
-                self.stall_endpoint(slot_id, dci, last_pointer, requested);
+                self.stall_endpoint(slot_id, dci, last_pointer, requested, mem);
             }
             UsbTransferResult::Error => {
                 self.post_transfer_event(
@@ -1314,13 +1323,23 @@ impl VirtualXhciController {
 
     /// STALL: halt the endpoint (TDs stop processing until Reset Endpoint)
     /// and post the Stall Error event.
-    fn stall_endpoint(&mut self, slot_id: u8, dci: u8, trb_pointer: u64, residual: u32) {
+    fn stall_endpoint(
+        &mut self,
+        slot_id: u8,
+        dci: u8,
+        trb_pointer: u64,
+        residual: u32,
+        mem: &mut dyn DmaMemory,
+    ) {
         if let Some(ring) = self.transfer_rings.get_mut(&(slot_id, dci)) {
             ring.halt();
         }
         if dci == CONTROL_DCI {
             self.control_state.remove(&slot_id);
         }
+        // Reflect the Halted state into the output context (the driver reads
+        // it to confirm the STALL before recovering with Reset Endpoint).
+        self.publish_ep_state(slot_id, dci, EpState::Halted, mem);
         self.post_transfer_event(
             trb_pointer,
             residual,
@@ -2019,6 +2038,112 @@ mod tests {
         let _ = c.pop_event();
         assert!(!c.endpoint_halted(1, CONTROL_DCI));
         assert!(c.submit_transfer(1, CONTROL_DCI, &TransferTrb::NoOp { ioc: true }));
+    }
+
+    #[test]
+    fn stall_and_reset_reflect_ep_state_in_the_output_context() {
+        use super::super::emulated::LoopbackDevice;
+        use super::super::xhci::EpState;
+        use super::super::xhci::transfer::{DmaMemory, SetupPacket, TransferTrb, TransferType};
+        let mut c = running_controller();
+        let mut mem = super::super::xhci::VecDmaMemory::new(0x1000, 0x4000);
+        let dcbaap = 0x2000_u64;
+        let out_ctx = 0x3000_u64;
+        let op = u32::from(c.caps.caplength);
+        c.write_register(op + 0x30, u32_of(dcbaap));
+        assert!(mem.write(dcbaap + 8, &out_ctx.to_le_bytes()));
+
+        // Park a stalling loopback at port 1 and address it with a valid EP0.
+        let port = c
+            .attach_device_with_model(UsbSpeed::High, Box::new(LoopbackDevice::new(1, 2)))
+            .unwrap();
+        let _ = c.pop_event();
+        let addr_in = 0x1000_u64;
+        assert!(mem.write(addr_in + 4, &0x3_u32.to_le_bytes())); // A0|A1
+        assert!(mem.write(
+            addr_in + 0x24,
+            &(u32::try_from(port + 1).unwrap() << 16).to_le_bytes()
+        ));
+        let ep0 = EndpointContext {
+            endpoint_type: super::super::xhci::EndpointType::Control,
+            max_packet_size: 64,
+            max_burst_size: 0,
+            error_count: 3,
+            interval: 0,
+            tr_dequeue_pointer: 0x4000,
+            dequeue_cycle_state: true,
+            average_trb_length: 8,
+        };
+        assert!(mem.write(
+            addr_in + input_context_entry_offset(CONTROL_DCI),
+            &ep0.to_bytes()
+        ));
+        c.submit_command(&CommandTrb::EnableSlot);
+        c.submit_command(&CommandTrb::AddressDevice {
+            slot_id: 1,
+            input_context_ptr: addr_in,
+        });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        let _ = c.pop_event();
+        let _ = c.pop_event();
+
+        // EP0 is Running in the output context after Address Device.
+        let mut ep0_out = [0_u8; 32];
+        assert!(mem.read(
+            out_ctx + device_context_entry_offset(CONTROL_DCI),
+            &mut ep0_out
+        ));
+        assert_eq!(ep0_out[0] & 0x7, EpState::Running as u8);
+
+        // An unsupported vendor control request STALLs at the status stage.
+        let weird = SetupPacket {
+            request_type: 0x40,
+            request: 0x42,
+            value: 0,
+            index: 0,
+            length: 0,
+        };
+        assert!(c.submit_transfer(
+            1,
+            CONTROL_DCI,
+            &TransferTrb::Setup {
+                packet: weird,
+                transfer_type: TransferType::NoData,
+                ioc: false,
+            },
+        ));
+        assert!(c.submit_transfer(
+            1,
+            CONTROL_DCI,
+            &TransferTrb::Status {
+                dir_in: true,
+                ioc: true,
+            },
+        ));
+        ring_and_service(&mut c, CONTROL_DCI, &mut mem);
+        let _ = c.pop_event(); // the StallError transfer event
+
+        // The output EP0 context now reads Halted.
+        assert!(mem.read(
+            out_ctx + device_context_entry_offset(CONTROL_DCI),
+            &mut ep0_out
+        ));
+        assert_eq!(ep0_out[0] & 0x7, EpState::Halted as u8);
+
+        // Reset Endpoint recovers it back to Running.
+        c.submit_command(&CommandTrb::ResetEndpoint {
+            slot_id: 1,
+            endpoint_id: CONTROL_DCI,
+        });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        let _ = c.pop_event();
+        assert!(mem.read(
+            out_ctx + device_context_entry_offset(CONTROL_DCI),
+            &mut ep0_out
+        ));
+        assert_eq!(ep0_out[0] & 0x7, EpState::Running as u8);
     }
 
     #[test]
