@@ -298,13 +298,19 @@ impl VirtualXhciController {
             Some(CommandTrb::DisableSlot { slot_id }) => (self.disable_slot(slot_id, mem), slot_id),
             // Address Device reads the input context out of guest memory
             // and binds the named port's parked device model to the slot.
+            // BSR (Block Set Address Request, control bit 9, xHCI §4.6.5):
+            // set up the slot context only, leaving the device in the Default
+            // state at address 0 — Linux issues this before the real pass.
             Some(CommandTrb::AddressDevice {
                 slot_id,
                 input_context_ptr,
-            }) => (
-                self.address_device(slot_id, input_context_ptr, mem),
-                slot_id,
-            ),
+            }) => {
+                let bsr = trb.control & (1 << 9) != 0;
+                (
+                    self.address_device(slot_id, input_context_ptr, bsr, mem),
+                    slot_id,
+                )
+            }
             // Configure Endpoint parses the input context's endpoint
             // contexts and installs (or drops) the slot's transfer rings.
             Some(CommandTrb::ConfigureEndpoint {
@@ -445,6 +451,7 @@ impl VirtualXhciController {
         &mut self,
         slot_id: u8,
         input_context_ptr: u64,
+        bsr: bool,
         mem: &mut dyn DmaMemory,
     ) -> TrbCompletionCode {
         if self.slot_dependent_success(slot_id) != TrbCompletionCode::Success {
@@ -494,19 +501,23 @@ impl VirtualXhciController {
         // Address — the values the driver reads back to confirm the device is
         // addressed. Best-effort: skipped (the pre-run-loop modelling path)
         // when the driver has not programmed DCBAAP or its array is unbacked.
-        self.publish_addressed_context(slot_id, input_context_ptr, mem);
+        self.publish_addressed_context(slot_id, input_context_ptr, bsr, mem);
         TrbCompletionCode::Success
     }
 
-    /// Write the output device context for a freshly-addressed slot: the slot
-    /// context with Slot State = Addressed and USB Device Address = `slot_id`
-    /// (a deterministic, valid per-slot address), and — when the driver
-    /// supplied a valid EP0 context — the EP0 output context with EP State =
-    /// Running. A no-op when `DCBAAP`/the slot's DCBAA entry is not backed.
+    /// Write the output device context for a freshly-addressed slot. Without
+    /// BSR the slot context reaches the Addressed state with USB Device
+    /// Address = `slot_id` (a deterministic, valid per-slot address); with BSR
+    /// (Block Set Address Request) it reaches the Default state at address 0,
+    /// the slot-context-only setup Linux does before the real addressing pass.
+    /// The EP0 output context (when the driver supplied a valid one) is
+    /// published with EP State = Running. A no-op when `DCBAAP`/the slot's
+    /// DCBAA entry is not backed.
     fn publish_addressed_context(
         &self,
         slot_id: u8,
         input_context_ptr: u64,
+        bsr: bool,
         mem: &mut dyn DmaMemory,
     ) {
         if self.op.dcbaap == 0 {
@@ -521,8 +532,13 @@ impl VirtualXhciController {
             return;
         };
         let mut slot = SlotContext::parse(&slot_bytes);
-        slot.slot_state = SlotState::Addressed as u8;
-        slot.usb_device_address = slot_id;
+        if bsr {
+            slot.slot_state = SlotState::Default as u8;
+            slot.usb_device_address = 0;
+        } else {
+            slot.slot_state = SlotState::Addressed as u8;
+            slot.usb_device_address = slot_id;
+        }
         // EP0 is valid once addressed, so Context Entries is at least 1.
         slot.context_entries = slot.context_entries.max(1);
         let _ = mem.write(out_ctx + device_context_entry_offset(0), &slot.to_bytes());
@@ -2496,6 +2512,55 @@ mod tests {
             EndpointContext::parse(&ep0_bytes).unwrap().max_packet_size,
             64
         );
+    }
+
+    #[test]
+    fn address_device_with_bsr_leaves_the_slot_in_default() {
+        use super::super::xhci::transfer::DmaMemory;
+        let mut c = running_controller();
+        let mut mem = super::super::xhci::VecDmaMemory::new(0x1000, 0x4000);
+        let dcbaap = 0x2000_u64;
+        let out_ctx = 0x3000_u64;
+        let op = u32::from(c.caps.caplength);
+        c.write_register(op + 0x30, u32_of(dcbaap));
+        assert!(mem.write(dcbaap + 8, &out_ctx.to_le_bytes()));
+
+        let addr_in = 0x1000_u64;
+        write_input_context(&mut mem, addr_in, 1);
+        c.submit_command(&CommandTrb::EnableSlot);
+        // Address Device with the BSR control bit (9) set: crafted on the
+        // command ring directly, since BSR is a raw-command modifier.
+        let mut trb = CommandTrb::AddressDevice {
+            slot_id: 1,
+            input_context_ptr: addr_in,
+        }
+        .to_trb(true);
+        trb.control |= 1 << 9; // BSR
+        assert!(c.command_ring.submit(trb));
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        let _ = c.pop_event(); // enable
+        assert_eq!(completion_code(&mut c), TrbCompletionCode::Success as u8);
+
+        // The slot reaches the Default state at address 0 (not Addressed).
+        let mut slot_bytes = [0_u8; 32];
+        assert!(mem.read(out_ctx + device_context_entry_offset(0), &mut slot_bytes));
+        let slot_out = SlotContext::parse(&slot_bytes);
+        assert_eq!(slot_out.slot_state, SlotState::Default as u8);
+        assert_eq!(slot_out.usb_device_address, 0);
+
+        // A second Address Device without BSR completes the addressing.
+        c.submit_command(&CommandTrb::AddressDevice {
+            slot_id: 1,
+            input_context_ptr: addr_in,
+        });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        assert_eq!(completion_code(&mut c), TrbCompletionCode::Success as u8);
+        assert!(mem.read(out_ctx + device_context_entry_offset(0), &mut slot_bytes));
+        let slot_out = SlotContext::parse(&slot_bytes);
+        assert_eq!(slot_out.slot_state, SlotState::Addressed as u8);
+        assert_eq!(slot_out.usb_device_address, 1);
     }
 
     #[test]
