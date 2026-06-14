@@ -1129,6 +1129,25 @@ mod tests {
         }
     }
 
+    /// MMIO device claimed at a low, real-mode-reachable address so a 16-bit
+    /// guest blob can drive it. Records the last write and returns a fixed
+    /// sentinel on read.
+    struct LowMmio {
+        last_write: Rc<RefCell<Option<(u64, u64)>>>,
+    }
+
+    impl MmioDevice for LowMmio {
+        fn mmio_read(&mut self, _offset: u64, _size: u8) -> u64 {
+            0x3C
+        }
+        fn mmio_write(&mut self, offset: u64, _size: u8, data: u64) {
+            *self.last_write.borrow_mut() = Some((offset, data));
+        }
+        fn mmio_range(&self) -> (u64, u64) {
+            (0x8000, 0x9000)
+        }
+    }
+
     #[test]
     fn io_out_forwards_guest_bytes_to_the_serial_device() {
         let out = Rc::new(RefCell::new(Vec::new()));
@@ -2445,5 +2464,87 @@ mod tests {
         // proving the device's input data reached the guest register and
         // round-tripped back out through the bus on real KVM.
         assert_eq!(&*captured.lock().unwrap(), &[0x60]);
+    }
+
+    // Proves the MMIO exit path (read and write) end-to-end on real KVM. The
+    // PIO smoke tests above cover port I/O; xHCI and the other modern devices
+    // are MMIO-driven, so the doorbell/ring work depends on this path. A
+    // real-mode blob writes a byte to a device mapped at a low (16-bit
+    // reachable) address, then reads it back and echoes the read to COM1.
+    //
+    // Self-skips when `/dev/kvm` is unavailable rather than faking a pass.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mmio_path_smoke() {
+        use crate::kvm_backend::{is_kvm_available, GuestExit, GuestRam, KvmBackend};
+        use crate::serial::{SerialOutput, SerialOutputMode, SerialPort};
+        use std::sync::{Arc, Mutex};
+
+        if !is_kvm_available() {
+            eprintln!("skipping mmio_path_smoke: /dev/kvm not available");
+            return;
+        }
+
+        // 16-bit real-mode blob (DS base 0, so [0x8000] is guest-physical
+        // 0x8000 — unmapped RAM, so KVM traps it as MMIO):
+        //   B0 55         mov al, 0x55
+        //   A2 00 80      mov [0x8000], al   ; MMIO write 0x55 -> device off 0
+        //   A0 00 80      mov al, [0x8000]   ; MMIO read -> al = 0x3C sentinel
+        //   BA F8 03      mov dx, 0x3F8      ; COM1 transmit holding register
+        //   EE            out dx, al         ; echo the read byte out
+        //   F4            hlt
+        #[rustfmt::skip]
+        let code: [u8; 13] = [
+            0xB0, 0x55,
+            0xA2, 0x00, 0x80,
+            0xA0, 0x00, 0x80,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0xF4,
+        ];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let serial = SerialPort::com1(SerialOutput::new(
+            "mmio-smoke",
+            SerialOutputMode::Shared(Arc::clone(&captured)),
+        ));
+        let last_write = Rc::new(RefCell::new(None));
+        let mut bus = DeviceBus::new();
+        bus.add_serial(serial).unwrap();
+        bus.add_mmio(Box::new(LowMmio {
+            last_write: Rc::clone(&last_write),
+        }))
+        .unwrap();
+
+        let mut halted = false;
+        for _ in 0..100 {
+            let exit = backend.run_vcpu(0, &mut bus).expect("run vcpu");
+            if exit == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+
+        // The MMIO write reached the device at offset 0 with the byte the guest
+        // stored, and the value the device returned on the MMIO read flowed
+        // back into the guest register (then out to the serial sink).
+        assert_eq!(*last_write.borrow(), Some((0, 0x55)));
+        assert_eq!(&*captured.lock().unwrap(), &[0x3C]);
     }
 }
