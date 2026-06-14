@@ -959,6 +959,22 @@ impl StandardPc {
         self.assert_pci_intx(XHCI_BDF.device, 1, level);
     }
 
+    /// Flush xHCI events the controller queued *outside* doorbell servicing —
+    /// hot-plug Port Status Change events above all — into the guest's event
+    /// ring, returning how many were delivered.
+    ///
+    /// Hot-plug ([`connect_usb_device`](Self::connect_usb_device) /
+    /// [`attach_usb_device`](Self::attach_usb_device)) posts the event and
+    /// asserts `INTA#` immediately, but the event TRB itself can only be
+    /// written once guest memory is in hand; the run loop calls this after such
+    /// a notification with the VM's [`GuestMemory`](KvmBackend::guest_memory).
+    /// Returns zero until the driver has programmed `ERSTBA`/`ERSTSZ`.
+    /// [`service_usb_dma`](Self::service_usb_dma) flushes on its own, so this is
+    /// only needed for the non-doorbell event sources.
+    pub fn flush_usb_events(&self, mem: &mut dyn DmaMemory) -> usize {
+        self.xhci.borrow_mut().flush_events(mem)
+    }
+
     pub fn assert_pci_intx(&self, slot: u8, pin: u8, level: bool) {
         route_pci_intx(&self.pcie, &self.pic, &self.ioapic, slot, pin, level);
     }
@@ -2098,6 +2114,65 @@ mod tests {
             }) => assert_eq!(completion_code as u8, TrbCompletionCode::Success as u8),
             other => panic!("expected a command completion, got {other:?}"),
         }
+    }
+
+    /// The run-loop flush seam for events posted *outside* doorbell servicing:
+    /// a hot-plug posts a Port Status Change to the controller's internal queue
+    /// (and asserts INTA#) at notify time, but the event TRB can only be
+    /// written when guest memory is in hand. `flush_usb_events` delivers it
+    /// into the guest's event ring.
+    #[test]
+    fn xhci_hotplug_event_flushed_to_guest_ring_through_the_run_loop_seam() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::usb::xhci::{DmaMemory, VecDmaMemory};
+
+        let mut pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            1_780_838_055,
+            1,
+        )
+        .unwrap();
+
+        // BAR0 / RTSOFF (runtime registers) for the xHCI function.
+        const XHCI_BAR0: u64 = 0xFE90_0000;
+        const RTSOFF: u64 = 0x1000;
+
+        // Guest RAM with an ERST (one segment of 16 TRBs) and the event-ring
+        // segment it points at.
+        const ERSTBA: u64 = 0x2000;
+        const SEG_BASE: u64 = 0x2100;
+        let mut mem = VecDmaMemory::new(0, 0x4000);
+        assert!(mem.write(ERSTBA, &SEG_BASE.to_le_bytes())); // segment base
+        assert!(mem.write(ERSTBA + 8, &16u16.to_le_bytes())); // segment size (TRBs)
+
+        // Program interrupter 0 through the BAR like a driver: ERSTSZ, ERSTBA,
+        // ERDP (parked at the segment base), then enable the interrupter.
+        for (off, v) in [
+            (0x28_u64, 1_u32),                  // ERSTSZ = 1 segment
+            (0x30, ERSTBA as u32),              // ERSTBA lo
+            (0x34, 0),                          // ERSTBA hi
+            (0x38, SEG_BASE as u32),            // ERDP lo
+            (0x3C, 0),                          // ERDP hi
+            (0x20, 2),                          // IMAN.IE
+        ] {
+            VmExitHandler::mmio_write(&mut pc.bus, XHCI_BAR0 + RTSOFF + off, &v.to_le_bytes());
+        }
+
+        // Nothing queued yet.
+        assert_eq!(pc.flush_usb_events(&mut mem), 0);
+
+        // Hot-plug a SuperSpeed device on port 0: posts a Port Status Change.
+        assert!(pc.connect_usb_device(0, 4, true));
+
+        // The run loop flushes it into the guest event ring: exactly one event
+        // delivered, and the TRB at ERDP is a Port Status Change Event (type
+        // 34); a second flush has nothing left.
+        assert_eq!(pc.flush_usb_events(&mut mem), 1);
+        let mut trb = [0u8; 16];
+        assert!(mem.read(SEG_BASE, &mut trb));
+        let control = u32::from_le_bytes([trb[12], trb[13], trb[14], trb[15]]);
+        assert_eq!((control >> 10) & 0x3F, 34, "expected a Port Status Change Event");
+        assert_eq!(pc.flush_usb_events(&mut mem), 0);
     }
 
     #[test]
