@@ -2366,6 +2366,117 @@ mod tests {
         assert!(c.pop_event().is_none());
     }
 
+    /// A running controller with guest-resident transfers enabled and a
+    /// loopback device addressed at slot 1, EP0's transfer ring placed at
+    /// `ring` in guest memory. Returns it with the backing memory.
+    fn guest_addressed_controller(ring: u64) -> (VirtualXhciController, super::super::xhci::VecDmaMemory) {
+        use super::super::emulated::LoopbackDevice;
+        use super::super::xhci::VecDmaMemory;
+
+        let mut c = running_controller();
+        c.set_guest_resident_transfers(true);
+        let mut mem = VecDmaMemory::new(0x1000, 0x6000);
+        let dcbaap = 0x2000_u64;
+        let out_ctx = 0x3000_u64;
+        let op = u32::from(c.caps.caplength);
+        c.write_register(op + 0x30, u32_of(dcbaap));
+        assert!(mem.write(dcbaap + 8, &out_ctx.to_le_bytes()));
+
+        let port = c
+            .attach_device_with_model(UsbSpeed::High, Box::new(LoopbackDevice::new(0x1234, 0x5678)))
+            .unwrap();
+        let _ = c.pop_event();
+        let addr_in = 0x1000_u64;
+        assert!(mem.write(addr_in + 4, &0x3_u32.to_le_bytes())); // A0|A1
+        assert!(mem.write(
+            addr_in + 0x24,
+            &(u32::try_from(port + 1).unwrap() << 16).to_le_bytes()
+        ));
+        let ep0 = EndpointContext {
+            endpoint_type: super::super::xhci::EndpointType::Control,
+            max_packet_size: 64,
+            max_burst_size: 0,
+            error_count: 3,
+            interval: 0,
+            tr_dequeue_pointer: ring,
+            dequeue_cycle_state: true,
+            average_trb_length: 8,
+        };
+        assert!(mem.write(
+            addr_in + input_context_entry_offset(CONTROL_DCI),
+            &ep0.to_bytes()
+        ));
+        c.submit_command(&CommandTrb::EnableSlot);
+        c.submit_command(&CommandTrb::AddressDevice {
+            slot_id: 1,
+            input_context_ptr: addr_in,
+        });
+        let db = c.caps.dboff;
+        c.write_register(db, 0);
+        c.service_doorbells(&mut mem);
+        let _ = c.pop_event();
+        let _ = c.pop_event();
+        (c, mem)
+    }
+
+    // A full multi-TD control transfer (Setup → Data IN → Status) fetched from
+    // the guest's EP0 ring in one doorbell: the cursor advances across the
+    // three TDs and the loopback's device descriptor is DMA'd into the guest
+    // data buffer — proving the guest-resident path moves data, not just NoOps.
+    #[test]
+    fn guest_resident_control_transfer_fills_a_guest_buffer() {
+        use super::super::xhci::transfer::{SetupPacket, TransferTrb, TransferType};
+
+        const RING: u64 = 0x4000;
+        let (mut c, mut mem) = guest_addressed_controller(RING);
+
+        let setup = SetupPacket {
+            request_type: 0x80,
+            request: 6,
+            value: 0x0100,
+            index: 0,
+            length: 18,
+        };
+        let trbs = [
+            TransferTrb::Setup {
+                packet: setup,
+                transfer_type: TransferType::InData,
+                ioc: false,
+            },
+            TransferTrb::Data {
+                buffer: 0x1100,
+                length: 18,
+                dir_in: true,
+                chain: false,
+                ioc: false,
+            },
+            TransferTrb::Status {
+                dir_in: false,
+                ioc: true,
+            },
+        ];
+        for (i, t) in trbs.iter().enumerate() {
+            assert!(mem.write(RING + (i as u64) * 16, &t.to_trb(true).to_bytes()));
+        }
+
+        // One EP0 doorbell drains all three TDs from guest memory.
+        ring_and_service(&mut c, CONTROL_DCI, &mut mem);
+
+        // The 18-byte device descriptor landed in the guest buffer at 0x1100.
+        let bytes = mem.bytes();
+        assert_eq!(bytes[0x100], 18, "bLength");
+        assert_eq!(bytes[0x101], 1, "bDescriptorType DEVICE");
+        assert_eq!(&bytes[0x108..0x10C], &[0x34, 0x12, 0x78, 0x56], "VID/PID");
+
+        // The IOC'd status stage posted a Success transfer event.
+        match c.pop_event() {
+            Some(EventTrb::TransferEvent {
+                completion_code, ..
+            }) => assert_eq!(completion_code as u8, TrbCompletionCode::Success as u8),
+            other => panic!("expected a success transfer event, got {other:?}"),
+        }
+    }
+
     #[test]
     fn set_tr_dequeue_pointer_repoints_the_ring() {
         use super::super::xhci::transfer::TransferTrb;
