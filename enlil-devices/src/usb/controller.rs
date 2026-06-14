@@ -816,14 +816,22 @@ impl VirtualXhciController {
         if self.slot_dependent_success(slot_id) != TrbCompletionCode::Success {
             return TrbCompletionCode::TrbError;
         }
-        let Some(ring) = self.transfer_rings.get_mut(&(slot_id, endpoint_id)) else {
+        // The endpoint must exist either as an internal ring (legacy path) or as
+        // a declared endpoint context (guest-resident path — EP0 after Address
+        // Device has a context but no internal ring). Repointing an unknown
+        // endpoint is a Context State Error.
+        let has_internal = self.transfer_rings.contains_key(&(slot_id, endpoint_id));
+        let has_context = self.endpoint_configs.contains_key(&(slot_id, endpoint_id));
+        if !has_internal && !has_context {
             return TrbCompletionCode::ContextStateError;
-        };
-        ring.reset();
-        let inner = ring.ring_mut();
-        inner.set_base_addr(dequeue_ptr);
-        inner.set_cycle_state(dcs);
-        inner.start();
+        }
+        if let Some(ring) = self.transfer_rings.get_mut(&(slot_id, endpoint_id)) {
+            ring.reset();
+            let inner = ring.ring_mut();
+            inner.set_base_addr(dequeue_ptr);
+            inner.set_cycle_state(dcs);
+            inner.start();
+        }
         // Keep the endpoint context (the guest-resident path's source of truth)
         // in step with the repositioned ring, and drop any live guest cursor so
         // it rebuilds from the new dequeue pointer.
@@ -2474,6 +2482,59 @@ mod tests {
                 completion_code, ..
             }) => assert_eq!(completion_code as u8, TrbCompletionCode::Success as u8),
             other => panic!("expected a success transfer event, got {other:?}"),
+        }
+    }
+
+    // Set TR Dequeue Pointer repositions the guest-resident cursor: after a
+    // first TD is consumed from one ring address, the command moves the
+    // endpoint to a new ring, and the next doorbell fetches from there —
+    // proving the cursor is invalidated and rebuilt from the updated context.
+    #[test]
+    fn guest_resident_cursor_follows_set_tr_dequeue_pointer() {
+        use super::super::xhci::transfer::TransferTrb;
+
+        const RING_A: u64 = 0x4000;
+        const RING_B: u64 = 0x5000;
+        let (mut c, mut mem) = guest_addressed_controller(RING_A);
+
+        // First doorbell: a No-Op from ring A completes.
+        assert!(mem.write(RING_A, &TransferTrb::NoOp { ioc: true }.to_trb(true).to_bytes()));
+        ring_and_service(&mut c, CONTROL_DCI, &mut mem);
+        assert!(matches!(
+            c.pop_event(),
+            Some(EventTrb::TransferEvent { .. })
+        ));
+
+        // Set TR Dequeue Pointer moves EP0 to ring B (DCS = 1).
+        c.submit_command(&CommandTrb::SetTrDequeuePointer {
+            slot_id: 1,
+            endpoint_id: CONTROL_DCI,
+            dequeue_ptr: RING_B,
+            dcs: true,
+        });
+        let db = c.caps.dboff;
+        c.write_register(db, 0);
+        c.service_doorbells(&mut mem);
+        // The Set TR Dequeue Pointer command itself must succeed.
+        match c.pop_event() {
+            Some(EventTrb::CommandCompletion {
+                completion_code, ..
+            }) => assert_eq!(
+                completion_code as u8,
+                TrbCompletionCode::Success as u8,
+                "Set TR Dequeue Pointer must succeed"
+            ),
+            other => panic!("expected a command completion, got {other:?}"),
+        }
+
+        // A No-Op placed in ring B is now what the next doorbell fetches.
+        assert!(mem.write(RING_B, &TransferTrb::NoOp { ioc: true }.to_trb(true).to_bytes()));
+        ring_and_service(&mut c, CONTROL_DCI, &mut mem);
+        match c.pop_event() {
+            Some(EventTrb::TransferEvent {
+                completion_code, ..
+            }) => assert_eq!(completion_code as u8, TrbCompletionCode::Success as u8),
+            other => panic!("expected a transfer event from ring B, got {other:?}"),
         }
     }
 
