@@ -9,7 +9,8 @@ the recommended next step so the next run (which has no memory) can resume.
 ## 2026-06-14 (b) — Session: every xHCI ring is now guest-resident + the run-loop watchdog primitive (Phase 4 / 5)
 
 **6 increments, each independently green and committed** (branch
-`routine/enlil-2026-06-14-2`; same-day rerun after PR #27 merged). This session
+`routine/enlil-2026-06-14-2`, PR https://github.com/physics515/enlil/pull/28;
+same-day rerun after PR #27 merged). This session
 delivered **both** documented next-steps from the earlier run: guest-resident
 transfer rings (the last xHCI ring still sourced from an internal queue) and the
 production run-loop watchdog primitive.
