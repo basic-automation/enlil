@@ -7,11 +7,13 @@
 Type-1 hypervisor. Custom target `x86_64-unknown-enlil.json`; toolchain pinned in
 `rust-toolchain.toml`.
 
-**ENVIRONMENT (LOCAL + WSL, since 2026-06-12):** This runs unattended on the Windows
-workstation as the Claude Code scheduled task `enlil-dev-routine`, and does ALL of its
-build/test/git work **inside the Ubuntu WSL2 distro** on a native clone at `~/enlil` (ext4 —
-never build on `/mnt/...`; the 9p bridge is slow and breaks cargo's mtimes). Drive it as
-`wsl -d Ubuntu -- bash -lc 'cd ~/enlil && <cmd>'`. The decisive reason for running here rather
+**ENVIRONMENT (LOCAL + WSL + Windows, since 2026-06-12):** This runs unattended on the Windows
+workstation as the Claude Code scheduled task `enlil-dev-routine`. It does its **Linux/KVM**
+build/test + **all git/PR** work **inside the Ubuntu WSL2 distro** on a native clone at `~/enlil`
+(ext4 — never build the Linux side on `/mnt/...`; the 9p bridge is slow and breaks cargo's
+mtimes), driven as `wsl -d Ubuntu -- bash -lc 'cd ~/enlil && <cmd>'`; AND it runs **Windows-native
+builds** for the host-agnostic crates + cross-targets (see **BUILD MATRIX** below) so the project
+stays buildable on both toolchains, whichever a given change needs. The decisive reason for running here rather
 than the old cloud runner: **`/dev/kvm` is available** (nested virtualization on, custom WSL
 kernel with KVM built in), so the Linux KVM host backend (`enlil-platform` / `enlil-devices`,
 the `target_os = "linux"` paths) builds AND the **guest-boot / KVM integration tests actually
@@ -32,6 +34,42 @@ never claim or fake a boot or benchmark you didn't run.
   kvm physi` then `wsl --shutdown`). Probe each run with `test -w /dev/kvm`; if it fails the
   group step hasn't taken effect yet — log KVM tests "not run (kvm group pending)" and proceed
   with the rest rather than stalling.
+
+**BUILD MATRIX — test on Windows AND Linux, whichever the change needs.** Enlil has no
+Windows-*host* backend today (zero `target_os = "windows"`), but it is OS-agnostic by intent and
+must stay buildable on both toolchains. Per increment, build/test in the environment(s) the change
+actually targets — don't blindly run both, and don't skip a side a change clearly affects:
+- **Linux / KVM host backend** — `enlil-platform` / `enlil-devices` `target_os = "linux"` paths,
+  anything touching `/dev/kvm`, the guest-boot/integration tests: **WSL only** (`wsl -d Ubuntu --
+  bash -lc 'cd ~/enlil && cargo build/test …'`). The primary environment and the only one with
+  `/dev/kvm`.
+- **Host-agnostic** — the `no_std` core (`enlil-core`/`enlil-hal`), the `x86_64-unknown-uefi`
+  bare-metal payload and the custom `x86_64-unknown-enlil` target — **and** the std tooling crates
+  (`enlil-config`/`enlil-mgmt`/`enlil-setup`/`enlil-std`): build on **BOTH** when touched (WSL +
+  Windows-native), so a Linux-only dep or path can't silently break the Windows dev build. The
+  Windows toolchain already has `x86_64-unknown-uefi` + `x86_64-pc-windows-msvc` installed.
+- **Windows-native build mechanism** (no second clone — build against the WSL clone over 9p with a
+  *Windows* target-dir so the two toolchains never stomp each other's `target/`), run from
+  PowerShell on the Windows side:
+  ```
+  cargo build [-p CRATE] [--target x86_64-unknown-uefi] `
+    --manifest-path \\wsl.localhost\Ubuntu\home\physi\enlil\Cargo.toml `
+    --target-dir D:\Development\.enlil-win-target
+  ```
+  Pick the right `-p CRATE` / `--target` for what you touched — **do not** `--workspace` it (the
+  Linux-only crates won't compile on Windows; that's expected, not a failure). Record which
+  toolchain(s) you built/tested on; never claim a Windows pass you didn't run. (A known issue a
+  Windows/uefi build surfaces: `enlil-core` currently pulls `tokio`, which won't cross-compile to
+  `x86_64-unknown-uefi` — a real no_std-hygiene bug worth a fix-increment, not an infra problem.)
+
+**Parallel background builds — fill the wait, land more.** The two toolchains (and slow cross-
+target builds) are independent, so **run them concurrently in the background** and work the next
+increment while they churn — the same "push where there is mush" idea as the board routine. Launch
+the WSL build/test and the Windows build as background jobs, start implementing the next increment,
+then collect each build's result when it finishes and commit that increment once its required
+builds are actually green. Don't serialize the run through one-build-at-a-time waits; a 3–4 hour
+session should overlap them. Each increment's commit stays gated on its own **real** green results
+— never commit on a build still in flight or one you didn't read.
 
 **NORTH STAR:** Enlil is a Rust Type-1 hypervisor that mediates *both directions* of every
 hardware interaction (OS→HW and HW→OS) and routes them across a pool of physical nodes —
@@ -101,8 +139,11 @@ Do these in order, looping for the whole session:
   boundaries before adding anything new.
 
 ### 5. Verify (a step isn't done until this is green)
-- `cargo build` (+ `--target x86_64-unknown-enlil.json` for no_std crates), `cargo test`,
-  and `cargo clippy` — fix warnings in code you touched.
+- `cargo build` (+ the cross-target for no_std / bare-metal crates), `cargo test`, and `cargo
+  clippy` — fix warnings in code you touched — **on the toolchain(s) the change needs per the
+  BUILD MATRIX**: Linux/KVM paths → WSL; host-agnostic + std-tooling crates → WSL *and*
+  Windows-native. Run the two toolchains' builds **concurrently in the background** and gate each
+  increment's commit on its own real green results (parallel-background-builds, above).
 - **Run the KVM / guest-boot tests for real** — `/dev/kvm` is available in this WSL environment.
   Record exactly which ran and their measured results; only mark one skipped if `/dev/kvm` is
   genuinely absent that night (e.g. `kvm` group pending — say why). Never claim a boot or
