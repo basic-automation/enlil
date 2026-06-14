@@ -9,7 +9,8 @@ the recommended next step so the next run (which has no memory) can resume.
 ## 2026-06-14 — Session: the KVM run loop comes alive — guest-boot proofs, GuestMemory DMA, and the xHCI run-loop seams (Phase 0.2 / 4 / 5)
 
 **11 increments, each independently green and committed** (branch
-`routine/enlil-2026-06-14`). First run with `/dev/kvm` actually read-writable
+`routine/enlil-2026-06-14`, PR https://github.com/physics515/enlil/pull/27).
+First run with `/dev/kvm` actually read-writable
 (WSL2 Ubuntu, AMD SVM, nested virt, `kvm` group active), so the guest-boot path
 that had always self-skipped finally ran for real — and immediately exposed a
 hang that had silently broken the previous (2026-06-13) run.
