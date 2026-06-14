@@ -2319,7 +2319,10 @@ mod tests {
 
         // Park a loopback at port 1 and address it; EP0's ring lives at 0x4000.
         let port = c
-            .attach_device_with_model(UsbSpeed::High, Box::new(LoopbackDevice::new(0x1234, 0x5678)))
+            .attach_device_with_model(
+                UsbSpeed::High,
+                Box::new(LoopbackDevice::new(0x1234, 0x5678)),
+            )
             .unwrap();
         let _ = c.pop_event();
         let addr_in = 0x1000_u64;
@@ -2354,7 +2357,10 @@ mod tests {
 
         // The "guest" writes a No-Op transfer TRB into EP0's ring (cycle = 1, the
         // initial Consumer Cycle State) — no submit_transfer is used.
-        assert!(mem.write(RING, &TransferTrb::NoOp { ioc: true }.to_trb(true).to_bytes()));
+        assert!(mem.write(
+            RING,
+            &TransferTrb::NoOp { ioc: true }.to_trb(true).to_bytes()
+        ));
 
         // Ring the EP0 doorbell: the ring is fetched from guest memory and the
         // No-Op completes with Success.
@@ -2369,7 +2375,10 @@ mod tests {
         // With the flag OFF the same doorbell processes nothing (no enqueued
         // internal TRBs) — proving the guest path is what drove the completion.
         c.set_guest_resident_transfers(false);
-        assert!(mem.write(RING + 16, &TransferTrb::NoOp { ioc: true }.to_trb(true).to_bytes()));
+        assert!(mem.write(
+            RING + 16,
+            &TransferTrb::NoOp { ioc: true }.to_trb(true).to_bytes()
+        ));
         ring_and_service(&mut c, CONTROL_DCI, &mut mem);
         assert!(c.pop_event().is_none());
     }
@@ -2377,7 +2386,9 @@ mod tests {
     /// A running controller with guest-resident transfers enabled and a
     /// loopback device addressed at slot 1, EP0's transfer ring placed at
     /// `ring` in guest memory. Returns it with the backing memory.
-    fn guest_addressed_controller(ring: u64) -> (VirtualXhciController, super::super::xhci::VecDmaMemory) {
+    fn guest_addressed_controller(
+        ring: u64,
+    ) -> (VirtualXhciController, super::super::xhci::VecDmaMemory) {
         use super::super::emulated::LoopbackDevice;
         use super::super::xhci::VecDmaMemory;
 
@@ -2391,7 +2402,10 @@ mod tests {
         assert!(mem.write(dcbaap + 8, &out_ctx.to_le_bytes()));
 
         let port = c
-            .attach_device_with_model(UsbSpeed::High, Box::new(LoopbackDevice::new(0x1234, 0x5678)))
+            .attach_device_with_model(
+                UsbSpeed::High,
+                Box::new(LoopbackDevice::new(0x1234, 0x5678)),
+            )
             .unwrap();
         let _ = c.pop_event();
         let addr_in = 0x1000_u64;
@@ -2498,7 +2512,10 @@ mod tests {
         let (mut c, mut mem) = guest_addressed_controller(RING_A);
 
         // First doorbell: a No-Op from ring A completes.
-        assert!(mem.write(RING_A, &TransferTrb::NoOp { ioc: true }.to_trb(true).to_bytes()));
+        assert!(mem.write(
+            RING_A,
+            &TransferTrb::NoOp { ioc: true }.to_trb(true).to_bytes()
+        ));
         ring_and_service(&mut c, CONTROL_DCI, &mut mem);
         assert!(matches!(
             c.pop_event(),
@@ -2528,7 +2545,10 @@ mod tests {
         }
 
         // A No-Op placed in ring B is now what the next doorbell fetches.
-        assert!(mem.write(RING_B, &TransferTrb::NoOp { ioc: true }.to_trb(true).to_bytes()));
+        assert!(mem.write(
+            RING_B,
+            &TransferTrb::NoOp { ioc: true }.to_trb(true).to_bytes()
+        ));
         ring_and_service(&mut c, CONTROL_DCI, &mut mem);
         match c.pop_event() {
             Some(EventTrb::TransferEvent {

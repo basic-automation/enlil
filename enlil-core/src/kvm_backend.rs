@@ -963,7 +963,9 @@ mod tests {
 
         // Arm the bound, then run: the spinning guest is kicked straight back
         // out instead of blocking the thread forever.
-        backend.set_immediate_exit(0, true).expect("arm immediate exit");
+        backend
+            .set_immediate_exit(0, true)
+            .expect("arm immediate exit");
         assert_eq!(
             backend.run_vcpu(0, &mut NoopHandler).expect("run vcpu"),
             GuestExit::Interrupted
@@ -971,7 +973,9 @@ mod tests {
 
         // Disarmed, the same run would re-enter the spin — so just confirm the
         // flag clears without error (the run loop disarms after a kick).
-        backend.set_immediate_exit(0, false).expect("disarm immediate exit");
+        backend
+            .set_immediate_exit(0, false)
+            .expect("disarm immediate exit");
     }
 
     /// A do-nothing [`VmExitHandler`] for guests that only touch RAM.

@@ -2155,12 +2155,12 @@ mod tests {
         // Program interrupter 0 through the BAR like a driver: ERSTSZ, ERSTBA,
         // ERDP (parked at the segment base), then enable the interrupter.
         for (off, v) in [
-            (0x28_u64, 1_u32),                  // ERSTSZ = 1 segment
-            (0x30, ERSTBA as u32),              // ERSTBA lo
-            (0x34, 0),                          // ERSTBA hi
-            (0x38, SEG_BASE as u32),            // ERDP lo
-            (0x3C, 0),                          // ERDP hi
-            (0x20, 2),                          // IMAN.IE
+            (0x28_u64, 1_u32),       // ERSTSZ = 1 segment
+            (0x30, ERSTBA as u32),   // ERSTBA lo
+            (0x34, 0),               // ERSTBA hi
+            (0x38, SEG_BASE as u32), // ERDP lo
+            (0x3C, 0),               // ERDP hi
+            (0x20, 2),               // IMAN.IE
         ] {
             VmExitHandler::mmio_write(&mut pc.bus, XHCI_BAR0 + RTSOFF + off, &v.to_le_bytes());
         }
@@ -2178,7 +2178,11 @@ mod tests {
         let mut trb = [0u8; 16];
         assert!(mem.read(SEG_BASE, &mut trb));
         let control = u32::from_le_bytes([trb[12], trb[13], trb[14], trb[15]]);
-        assert_eq!((control >> 10) & 0x3F, 34, "expected a Port Status Change Event");
+        assert_eq!(
+            (control >> 10) & 0x3F,
+            34,
+            "expected a Port Status Change Event"
+        );
         assert_eq!(pc.flush_usb_events(&mut mem), 0);
     }
 
@@ -2196,7 +2200,9 @@ mod tests {
             input_context_entry_offset, EndpointContext, EndpointType,
         };
         use enlil_devices::usb::xhci::transfer::DmaMemory;
-        use enlil_devices::usb::xhci::{CommandTrb, EventTrb, TransferTrb, TrbCompletionCode, VecDmaMemory};
+        use enlil_devices::usb::xhci::{
+            CommandTrb, EventTrb, TransferTrb, TrbCompletionCode, VecDmaMemory,
+        };
         use enlil_devices::usb::UsbSpeed;
 
         const CONTROL_DCI: u8 = 1;
@@ -2224,7 +2230,10 @@ mod tests {
             x.write_register(op, 1); // USBCMD R/S
             x.write_register(op + 0x30, dcbaap as u32); // DCBAAP lo
             let port = x
-                .attach_device_with_model(UsbSpeed::High, Box::new(LoopbackDevice::new(0x1234, 0x5678)))
+                .attach_device_with_model(
+                    UsbSpeed::High,
+                    Box::new(LoopbackDevice::new(0x1234, 0x5678)),
+                )
                 .unwrap();
             let _ = x.pop_event();
             let addr_in = 0x1000_u64;
@@ -2261,7 +2270,10 @@ mod tests {
         };
 
         // The guest writes a No-Op transfer TRB into EP0's ring (cycle = 1).
-        assert!(mem.write(RING, &TransferTrb::NoOp { ioc: true }.to_trb(true).to_bytes()));
+        assert!(mem.write(
+            RING,
+            &TransferTrb::NoOp { ioc: true }.to_trb(true).to_bytes()
+        ));
 
         // The guest rings the EP0 doorbell over the BAR (slot 1 = dboff + 4,
         // value = the control endpoint's DCI), and the run loop services it.
@@ -2863,7 +2875,10 @@ mod tests {
                 break;
             }
         }
-        assert!(got, "guest produced no serial output under the production IRQ chip");
+        assert!(
+            got,
+            "guest produced no serial output under the production IRQ chip"
+        );
         assert_eq!(&*captured.lock().unwrap(), b"OK");
     }
 }
