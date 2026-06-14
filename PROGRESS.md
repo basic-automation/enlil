@@ -6,6 +6,121 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-14 — Session: the KVM run loop comes alive — guest-boot proofs, GuestMemory DMA, and the xHCI run-loop seams (Phase 0.2 / 4 / 5)
+
+**11 increments, each independently green and committed** (branch
+`routine/enlil-2026-06-14`, PR https://github.com/physics515/enlil/pull/27).
+First run with `/dev/kvm` actually read-writable
+(WSL2 Ubuntu, AMD SVM, nested virt, `kvm` group active), so the guest-boot path
+that had always self-skipped finally ran for real — and immediately exposed a
+hang that had silently broken the previous (2026-06-13) run.
+
+**Salvage + root-cause (the headline).** The 2026-06-13 branch had uncommitted,
+never-pushed work in the tree: a page-aligned `GuestRam` + `validate_region`
+guard. Carried it onto today's branch. Running the suite for real showed the
+`serial_console_smoke` guest-boot test *hangs* — and a hung test process from
+Jun 13 was still alive, explaining why that run never committed/PR'd. Bisected
+with a direct `kvm-ioctls` probe: tss-only boots `O`/`K`/`HLT` in <1 ms, but
+adding `create_irq_chip` reproduces the hang exactly. Root cause: with the
+in-kernel local APIC, KVM handles `HLT` itself (the vCPU parks waiting for an
+interrupt) and never returns `KVM_EXIT_HLT`, so a "run a blob until it halts"
+probe blocks forever in `KVM_RUN`.
+
+### Increments (commit — what)
+1. `c738a64` — **real-mode guest-boot smoke test actually boots under KVM.**
+   Salvaged `GuestRam` (page-aligned; KVM requires page-aligned `userspace_addr`)
+   + `validate_region`; split the backend into `new()` (production, in-kernel IRQ
+   chip) and `new_without_irqchip()` (HLT exits to userspace) and pointed the
+   smoke test at the latter.
+2. `2f8c94e` — **prove the KVM input (`in`) path**: a guest reads the COM1 LSR
+   and echoes it; the device-computed `0x60` (idle UART THRE|TEMT) round-trips
+   device → `KVM_EXIT_IO`(in) → guest AL → out → sink.
+3. `18746cd` — **prove the KVM MMIO path**: real-mode blob writes/reads a device
+   at a low (16-bit reachable) address; both MMIO exits confirmed (KVM emulates
+   real-mode MMIO instructions).
+4. `0fa7299` — **`GuestMemory` DMA view**: `MemSlot` retains `host_addr`; a new
+   `GuestMemory` implements enlil-devices' `DmaMemory` over the slot table
+   (GPA→HVA, bounds-checked, multi-slot). `KvmBackend::guest_memory()`.
+5. `1e19430` — **end-to-end DMA coherence**: a guest writes a byte into its RAM;
+   the host reads it back through `guest_memory()` against the real slot table.
+6. `8c5a182` — **`StandardPc::service_usb_dma`**: the run loop's USB DMA entry
+   point. A guest doorbell write latches in `XhciMmio`; this drains it against
+   guest memory (command/transfer rings → events) and reconciles `INTA#`.
+   Integration test drives MMIO-doorbell → latch → service → Command Completion.
+7. `55fc725` — **docs**: folded the KVM findings into RESEARCH.md (irqchip/HLT,
+   page alignment, real-mode MMIO) and a Phase-4 ROADMAP status note.
+8. `7a2905c` — **exercise device PIO on the production (`new()`, IRQ-chip)
+   backend** — every other guest-boot test uses `new_without_irqchip`; this proves
+   port I/O exits reach the DeviceBus even with the in-kernel APIC (stops at the
+   output rather than waiting for the absorbed HLT).
+9. `cd2c454` — **`StandardPc::flush_usb_events`**: the run-loop seam for events
+   posted *outside* doorbell servicing (hot-plug Port Status Change). Test
+   programs the interrupter via the BAR, hot-plugs a device, flushes exactly one
+   PSC event (type 34) into the guest event ring.
+10. `2c388b7` — **docs correction (honesty)**: my increment-7 note wrongly said
+    command rings were internal. Verified the command ring *is* guest-resident
+    (`GuestRingCursor` off `CRCR`) and device contexts come from `DCBAAP`;
+    corrected the note to scope the real remaining gap (transfer rings).
+11. `0c33578` — **`gather_transfer_td`**: the core mechanism for guest-resident
+    transfer rings, landed as an isolated, fully-tested building block (chained
+    TD by chain bit, Link/cycle inherited from `GuestRingCursor`, undecodable →
+    `Err(addr)`) **without** touching the live `process_transfer_ring` (so the
+    750 existing transfer tests are untouched).
+
+### Research (informed the build)
+RESEARCH.md `2026-06-14`: KVM API behaviours surfaced once `/dev/kvm` ran for
+real — `KVM_CREATE_IRQCHIP` changing `HLT` semantics, `KVM_SET_USER_MEMORY_REGION`
+page-alignment, KVM emulating real-mode MMIO. Grounded in the KVM API reference
+and corroborated by the direct-`kvm-ioctls` bisection above.
+
+### Test results (exact)
+- **`/dev/kvm`: read-writable** (probe `KVM_RW_OK`, user in `kvm` group). The
+  guest-boot / KVM tests **ran for real, not skipped**:
+  - `device_bus::tests::serial_console_smoke` — PASS (boots, `out` "OK", HLT).
+  - `serial_input_path_smoke` — PASS (LSR `0x60` round-trips through `in`).
+  - `mmio_path_smoke` — PASS (MMIO write `0x55`, read `0x3C`).
+  - `guest_memory_reads_what_the_guest_wrote` — PASS (guest write → host DMA read).
+  - `serial_output_under_production_irqchip` — PASS (PIO on the in-kernel-IRQ-chip
+    backend).
+  - `xhci_doorbell_is_serviced_through_the_run_loop_dma_seam`,
+    `xhci_hotplug_event_flushed_..._run_loop_seam` — PASS.
+- `cargo test -p enlil-core --lib`: **152 passed, 0 failed**.
+- `cargo test -p enlil-devices --lib`: **753 passed, 0 failed** (+3 gather tests).
+- `cargo clippy` clean for every crate touched (`enlil-core`, `enlil-devices`,
+  `--lib --tests`); workspace clippy green.
+- **Toolchains:** all increments built/tested **Linux/WSL** (nightly,
+  `x86_64-unknown-linux-gnu`); the host-agnostic ones (increments 6, 9, 11 —
+  `service_usb_dma`, `flush_usb_events`, `gather_transfer_td`) were **also built
+  Windows-native** (`x86_64-pc-windows-msvc`, exit 0) via the WSL-source +
+  `D:\Development\.enlil-win-target` mechanism. Increments 1–5, 8 are entirely
+  within `#[cfg(target_os = "linux")]` (KVM), so Windows does not apply.
+
+### STOP REASON
+Tractable, **regression-safe** work in this subsystem is done; the next step
+(wiring `gather_transfer_td` into the live `process_transfer_ring`) is a careful
+change to the most-tested code path and is **not safe to rush**. `configure_endpoint`
+always inserts an empty internal ring entry with the endpoint's
+`tr_dequeue_pointer`, so any auto-trigger for the guest path could fire spuriously
+on existing tests whose dequeue pointer aims at zeroed memory (cycle/decode then
+posts a TRB error) — it needs a per-endpoint cursor lifecycle and a trigger that
+can't misfire, designed fresh rather than under time pressure. Wall-clock budget
+was not fully spent, but per the guardrail ("leave it for tomorrow rather than
+committing it half-done") I handed off rather than risk the transfer path.
+
+### Recommended next step (tomorrow)
+1. **Wire `gather_transfer_td` into `process_transfer_ring`** behind a
+   per-endpoint `GuestRingCursor` (new `guest_transfer_rings: BTreeMap<(u8,u8),
+   GuestRingCursor>`), built from the endpoint context's `tr_dequeue_pointer` +
+   `dequeue_cycle_state`. Trigger it only for endpoints the guest actually drives
+   in guest-memory mode (NOT auto on every empty internal ring — see STOP
+   REASON), and invalidate the cursor at Configure Endpoint / Set TR Dequeue
+   Pointer / Reset Endpoint / Disable Slot. Feed the gathered TD straight into
+   the existing `execute_control_td` / `execute_normal_td`. Audit each existing
+   transfer test's `tr_dequeue_pointer`/DCS before flipping the trigger.
+2. **Production run-loop watchdog**: an `immediate_exit`/signal-based kick so the
+   `new()` (IRQ-chip) backend can bound a vCPU that idles in `HLT` or fails to
+   progress — flagged in the RESEARCH note.
+
 ## 2026-06-13 — Session: Phase 4.4 — xHCI Output Device Context write-back + the full slot/endpoint command set
 
 **10 increments, each independently green and committed** (branch

@@ -1587,6 +1587,28 @@ Physical USB Devices
 > handling; the TUI USB tab (the protocol seam is ready; note the prior `tui/mod.rs` was
 > a corrupt placeholder and was removed).
 
+> **Status (2026-06-14):** the **KVM run loop now exists and the xHCI DMA seam
+> is wired to it.** The real-mode guest-boot path runs on `/dev/kvm` (PIO in/out
+> and MMIO read/write all proven by guest-boot smoke tests, not just unit
+> calls). `enlil-core` gained a page-aligned `GuestRam` and a `GuestMemory`
+> view that implements the device-facing `DmaMemory` over the VM's registered
+> slots (GPA→HVA translation, bounds-checked, multi-slot), DMA-coherent with
+> what the guest writes (verified end-to-end on KVM). `StandardPc::service_usb_dma`
+> is the run loop's USB DMA entry point: a guest doorbell write latches in
+> `XhciMmio`, and `service_usb_dma` drains it against guest memory (command/
+> transfer rings → events) — closing the "waits on the KVM run loop" gap for
+> the `DmaMemory` seam. The **command ring is already guest-resident** (the
+> controller fetches command TRBs from the guest's `CRCR` via `GuestRingCursor`,
+> falling back to its internal queue only when `CRCR` is unprogrammed), and
+> **device contexts are dereferenced from `DCBAAP`** (Enable/Disable/Configure
+> publish the output context into guest memory). **Still remaining for Phase 4:**
+> guest-resident **transfer rings** — `process_transfer_ring` still drains an
+> internal `TransferRing` per `(slot, dci)` rather than fetching TRBs from the
+> endpoint context's TR Dequeue Pointer in guest memory (the command-ring
+> `GuestRingCursor` pattern is the template); the libusb-backed `UsbDeviceModel`
+> forwarder for physical devices; the TUI USB tab. (Configure Endpoint context
+> handling is already implemented.)
+
 ### 4.4 Virtual xHCI Controller
 - Present each guest with an emulated xHCI (USB 3.x) host controller
 - **Primary approach: Software-emulated xHCI with TRB-level interception (recommended)**

@@ -32,6 +32,7 @@ use enlil_devices::timer::{
     AcpiPmTimer, Pit, RtcTime, SharedAcpiPmTimer, SharedHpet, SharedPit, SharedRtc,
     SystemControlPortB, HPET_TICK_NS, RTC_IRQ,
 };
+use enlil_devices::usb::xhci::transfer::DmaMemory;
 use enlil_devices::usb::{SharedXhci, UsbSpeed, VirtualXhciController, XhciMmio};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -937,6 +938,43 @@ impl StandardPc {
         port
     }
 
+    /// Drain any xHCI doorbells the guest rang against guest memory, then
+    /// reconcile the controller's `INTA#` with what the servicing produced.
+    ///
+    /// This is the run loop's USB DMA entry point. A guest rings a doorbell by
+    /// writing the doorbell register; that MMIO exit reaches
+    /// [`XhciMmio`](enlil_devices::usb::XhciMmio) and *latches* the doorbell
+    /// (the ring can't be processed there — guest memory isn't in hand on an
+    /// MMIO write). Call this after [`run_vcpu`](KvmBackend::run_vcpu) returns
+    /// with the VM's [`GuestMemory`](KvmBackend::guest_memory) so the command
+    /// and transfer rings are processed and the produced events delivered into
+    /// the guest's event ring. The interrupt line is then driven to match the
+    /// controller's resulting state, exactly as the MMIO write path does.
+    pub fn service_usb_dma(&self, mem: &mut dyn DmaMemory) {
+        let level = {
+            let mut xhci = self.xhci.borrow_mut();
+            xhci.service_doorbells(mem);
+            xhci.intx_level()
+        };
+        self.assert_pci_intx(XHCI_BDF.device, 1, level);
+    }
+
+    /// Flush xHCI events the controller queued *outside* doorbell servicing —
+    /// hot-plug Port Status Change events above all — into the guest's event
+    /// ring, returning how many were delivered.
+    ///
+    /// Hot-plug ([`connect_usb_device`](Self::connect_usb_device) /
+    /// [`attach_usb_device`](Self::attach_usb_device)) posts the event and
+    /// asserts `INTA#` immediately, but the event TRB itself can only be
+    /// written once guest memory is in hand; the run loop calls this after such
+    /// a notification with the VM's [`GuestMemory`](KvmBackend::guest_memory).
+    /// Returns zero until the driver has programmed `ERSTBA`/`ERSTSZ`.
+    /// [`service_usb_dma`](Self::service_usb_dma) flushes on its own, so this is
+    /// only needed for the non-doorbell event sources.
+    pub fn flush_usb_events(&self, mem: &mut dyn DmaMemory) -> usize {
+        self.xhci.borrow_mut().flush_events(mem)
+    }
+
     pub fn assert_pci_intx(&self, slot: u8, pin: u8, level: bool) {
         route_pci_intx(&self.pcie, &self.pic, &self.ioapic, slot, pin, level);
     }
@@ -1126,6 +1164,25 @@ mod tests {
         }
         fn mmio_range(&self) -> (u64, u64) {
             (0xFEB0_0000, 0xFEB0_1000)
+        }
+    }
+
+    /// MMIO device claimed at a low, real-mode-reachable address so a 16-bit
+    /// guest blob can drive it. Records the last write and returns a fixed
+    /// sentinel on read.
+    struct LowMmio {
+        last_write: Rc<RefCell<Option<(u64, u64)>>>,
+    }
+
+    impl MmioDevice for LowMmio {
+        fn mmio_read(&mut self, _offset: u64, _size: u8) -> u64 {
+            0x3C
+        }
+        fn mmio_write(&mut self, offset: u64, _size: u8, data: u64) {
+            *self.last_write.borrow_mut() = Some((offset, data));
+        }
+        fn mmio_range(&self) -> (u64, u64) {
+            (0x8000, 0x9000)
         }
     }
 
@@ -2006,6 +2063,118 @@ mod tests {
         assert_eq!(pc.ioapic.with(|c| c.pending_vector(0)), Some(0x70));
     }
 
+    /// The run-loop USB DMA seam: a guest rings the host-command doorbell
+    /// through the BAR (an MMIO exit that only *latches* it), and the doorbell
+    /// is then drained by `service_usb_dma` — with guest memory in hand — which
+    /// processes the command ring and produces its Command Completion event.
+    /// This is the integration the MMIO write path can't do on its own.
+    #[test]
+    fn xhci_doorbell_is_serviced_through_the_run_loop_dma_seam() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::usb::xhci::{CommandTrb, EventTrb, TrbCompletionCode, VecDmaMemory};
+
+        let mut pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            1_780_838_055,
+            1,
+        )
+        .unwrap();
+
+        // BAR0 the firmware assigned the xHCI function (see the test above).
+        const XHCI_BAR0: u64 = 0xFE90_0000;
+        let (op, dboff) = {
+            let xhci = pc.xhci.borrow();
+            (u64::from(xhci.caps.caplength), u64::from(xhci.caps.dboff))
+        };
+
+        // Bring the controller up through the BAR like a driver: CONFIG's
+        // MaxSlotsEn, then USBCMD Run/Stop.
+        VmExitHandler::mmio_write(&mut pc.bus, XHCI_BAR0 + op + 0x38, &8u32.to_le_bytes());
+        VmExitHandler::mmio_write(&mut pc.bus, XHCI_BAR0 + op, &1u32.to_le_bytes());
+
+        // Queue a No-Op command on the command ring.
+        assert!(pc.xhci.borrow_mut().submit_command(&CommandTrb::NoOp));
+
+        // Ring doorbell 0 (host command) through the BAR. The MMIO write only
+        // latches it — no event yet, since guest memory wasn't in hand here.
+        VmExitHandler::mmio_write(&mut pc.bus, XHCI_BAR0 + dboff, &0u32.to_le_bytes());
+        assert!(
+            pc.xhci.borrow_mut().pop_event().is_none(),
+            "doorbell MMIO write must only latch, not process the ring"
+        );
+
+        // The run loop drains the latched doorbell with guest memory: the
+        // No-Op is processed and its Command Completion event produced.
+        let mut mem = VecDmaMemory::new(0, 0);
+        pc.service_usb_dma(&mut mem);
+        let event = pc.xhci.borrow_mut().pop_event();
+        match event {
+            Some(EventTrb::CommandCompletion {
+                completion_code, ..
+            }) => assert_eq!(completion_code as u8, TrbCompletionCode::Success as u8),
+            other => panic!("expected a command completion, got {other:?}"),
+        }
+    }
+
+    /// The run-loop flush seam for events posted *outside* doorbell servicing:
+    /// a hot-plug posts a Port Status Change to the controller's internal queue
+    /// (and asserts INTA#) at notify time, but the event TRB can only be
+    /// written when guest memory is in hand. `flush_usb_events` delivers it
+    /// into the guest's event ring.
+    #[test]
+    fn xhci_hotplug_event_flushed_to_guest_ring_through_the_run_loop_seam() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::usb::xhci::{DmaMemory, VecDmaMemory};
+
+        let mut pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            1_780_838_055,
+            1,
+        )
+        .unwrap();
+
+        // BAR0 / RTSOFF (runtime registers) for the xHCI function.
+        const XHCI_BAR0: u64 = 0xFE90_0000;
+        const RTSOFF: u64 = 0x1000;
+
+        // Guest RAM with an ERST (one segment of 16 TRBs) and the event-ring
+        // segment it points at.
+        const ERSTBA: u64 = 0x2000;
+        const SEG_BASE: u64 = 0x2100;
+        let mut mem = VecDmaMemory::new(0, 0x4000);
+        assert!(mem.write(ERSTBA, &SEG_BASE.to_le_bytes())); // segment base
+        assert!(mem.write(ERSTBA + 8, &16u16.to_le_bytes())); // segment size (TRBs)
+
+        // Program interrupter 0 through the BAR like a driver: ERSTSZ, ERSTBA,
+        // ERDP (parked at the segment base), then enable the interrupter.
+        for (off, v) in [
+            (0x28_u64, 1_u32),                  // ERSTSZ = 1 segment
+            (0x30, ERSTBA as u32),              // ERSTBA lo
+            (0x34, 0),                          // ERSTBA hi
+            (0x38, SEG_BASE as u32),            // ERDP lo
+            (0x3C, 0),                          // ERDP hi
+            (0x20, 2),                          // IMAN.IE
+        ] {
+            VmExitHandler::mmio_write(&mut pc.bus, XHCI_BAR0 + RTSOFF + off, &v.to_le_bytes());
+        }
+
+        // Nothing queued yet.
+        assert_eq!(pc.flush_usb_events(&mut mem), 0);
+
+        // Hot-plug a SuperSpeed device on port 0: posts a Port Status Change.
+        assert!(pc.connect_usb_device(0, 4, true));
+
+        // The run loop flushes it into the guest event ring: exactly one event
+        // delivered, and the TRB at ERDP is a Port Status Change Event (type
+        // 34); a second flush has nothing left.
+        assert_eq!(pc.flush_usb_events(&mut mem), 1);
+        let mut trb = [0u8; 16];
+        assert!(mem.read(SEG_BASE, &mut trb));
+        let control = u32::from_le_bytes([trb[12], trb[13], trb[14], trb[15]]);
+        assert_eq!((control >> 10) & 0x3F, 34, "expected a Port Status Change Event");
+        assert_eq!(pc.flush_usb_events(&mut mem), 0);
+    }
+
     #[test]
     fn advance_clocks_keeps_the_platform_timers_coherent_from_one_time_base() {
         use crate::serial::{SerialOutput, SerialOutputMode};
@@ -2297,7 +2466,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn serial_console_smoke() {
-        use crate::kvm_backend::{is_kvm_available, GuestExit, KvmBackend};
+        use crate::kvm_backend::{is_kvm_available, GuestExit, GuestRam, KvmBackend};
         use crate::serial::{SerialOutput, SerialOutputMode, SerialPort};
         use std::sync::{Arc, Mutex};
 
@@ -2323,16 +2492,23 @@ mod tests {
             0xF4,
         ];
 
-        // Back the guest with one page; place the code at guest-physical 0x1000.
+        // Back the guest with one page-aligned page; place the code at
+        // guest-physical 0x1000. A plain `Vec<u8>` is only byte-aligned and
+        // KVM would reject it with EINVAL, so use page-aligned `GuestRam`.
         const ENTRY: u64 = 0x1000;
         const SIZE: usize = 0x1000;
-        let mut mem = vec![0u8; SIZE];
-        mem[..code.len()].copy_from_slice(&code);
-        let host_addr = mem.as_mut_ptr() as u64;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
 
-        let mut backend = KvmBackend::new().expect("create KVM VM");
-        // SAFETY: `mem` outlives `backend` within this test scope.
-        unsafe { backend.map_memory(ENTRY, host_addr, SIZE as u64) }.expect("map guest memory");
+        // No in-kernel IRQ chip: with an in-kernel local APIC, KVM handles
+        // `HLT` itself (the vCPU parks waiting for an interrupt) and never
+        // exits with `KVM_EXIT_HLT`, so this "run until it halts" probe would
+        // block forever. Without the IRQ chip, `HLT` exits to userspace.
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
         backend.create_vcpu(0).expect("create vcpu");
         backend
             .prepare_real_mode_vcpu(0, ENTRY)
@@ -2362,6 +2538,225 @@ mod tests {
 
         // The bytes the guest `out`-ed to COM1 traversed the real KVM exit →
         // DeviceBus → SerialPort → UART path and landed in the shared sink.
+        assert_eq!(&*captured.lock().unwrap(), b"OK");
+    }
+
+    // Proves the *input* (`in`) path end-to-end on real KVM: the guest reads
+    // the COM1 line-status register, and the byte the SerialPort returns has to
+    // flow device → KVM `KVM_EXIT_IO`(in) → guest `AL` → KVM `KVM_EXIT_IO`(out)
+    // → SerialPort sink. The smoke test above only covers the output path.
+    //
+    // Self-skips when `/dev/kvm` is unavailable rather than faking a pass.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn serial_input_path_smoke() {
+        use crate::kvm_backend::{is_kvm_available, GuestExit, GuestRam, KvmBackend};
+        use crate::serial::{SerialOutput, SerialOutputMode, SerialPort};
+        use std::sync::{Arc, Mutex};
+
+        if !is_kvm_available() {
+            eprintln!("skipping serial_input_path_smoke: /dev/kvm not available");
+            return;
+        }
+
+        // 16-bit real-mode blob: read COM1 LSR into AL, echo AL to COM1, halt.
+        //   BA FD 03   mov dx, 0x3FD   ; line-status register
+        //   EC         in  al, dx      ; al = LSR (0x60 = THRE|TEMT, idle UART)
+        //   BA F8 03   mov dx, 0x3F8   ; transmit holding register
+        //   EE         out dx, al      ; echo the status byte back out
+        //   F4         hlt
+        #[rustfmt::skip]
+        let code: [u8; 9] = [
+            0xBA, 0xFD, 0x03,
+            0xEC,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0xF4,
+        ];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        // No in-kernel IRQ chip, so `HLT` exits to userspace (see the smoke
+        // test above for why).
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let serial = SerialPort::com1(SerialOutput::new(
+            "in-smoke",
+            SerialOutputMode::Shared(Arc::clone(&captured)),
+        ));
+        let mut bus = DeviceBus::new();
+        bus.add_serial(serial).unwrap();
+
+        let mut halted = false;
+        for _ in 0..100 {
+            let exit = backend.run_vcpu(0, &mut bus).expect("run vcpu");
+            if exit == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+
+        // The single byte echoed back is exactly the LSR value the SerialPort
+        // computed on the `in` exit — an idle UART reports THRE|TEMT (0x60) —
+        // proving the device's input data reached the guest register and
+        // round-tripped back out through the bus on real KVM.
+        assert_eq!(&*captured.lock().unwrap(), &[0x60]);
+    }
+
+    // Proves the MMIO exit path (read and write) end-to-end on real KVM. The
+    // PIO smoke tests above cover port I/O; xHCI and the other modern devices
+    // are MMIO-driven, so the doorbell/ring work depends on this path. A
+    // real-mode blob writes a byte to a device mapped at a low (16-bit
+    // reachable) address, then reads it back and echoes the read to COM1.
+    //
+    // Self-skips when `/dev/kvm` is unavailable rather than faking a pass.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mmio_path_smoke() {
+        use crate::kvm_backend::{is_kvm_available, GuestExit, GuestRam, KvmBackend};
+        use crate::serial::{SerialOutput, SerialOutputMode, SerialPort};
+        use std::sync::{Arc, Mutex};
+
+        if !is_kvm_available() {
+            eprintln!("skipping mmio_path_smoke: /dev/kvm not available");
+            return;
+        }
+
+        // 16-bit real-mode blob (DS base 0, so [0x8000] is guest-physical
+        // 0x8000 — unmapped RAM, so KVM traps it as MMIO):
+        //   B0 55         mov al, 0x55
+        //   A2 00 80      mov [0x8000], al   ; MMIO write 0x55 -> device off 0
+        //   A0 00 80      mov al, [0x8000]   ; MMIO read -> al = 0x3C sentinel
+        //   BA F8 03      mov dx, 0x3F8      ; COM1 transmit holding register
+        //   EE            out dx, al         ; echo the read byte out
+        //   F4            hlt
+        #[rustfmt::skip]
+        let code: [u8; 13] = [
+            0xB0, 0x55,
+            0xA2, 0x00, 0x80,
+            0xA0, 0x00, 0x80,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0xF4,
+        ];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let serial = SerialPort::com1(SerialOutput::new(
+            "mmio-smoke",
+            SerialOutputMode::Shared(Arc::clone(&captured)),
+        ));
+        let last_write = Rc::new(RefCell::new(None));
+        let mut bus = DeviceBus::new();
+        bus.add_serial(serial).unwrap();
+        bus.add_mmio(Box::new(LowMmio {
+            last_write: Rc::clone(&last_write),
+        }))
+        .unwrap();
+
+        let mut halted = false;
+        for _ in 0..100 {
+            let exit = backend.run_vcpu(0, &mut bus).expect("run vcpu");
+            if exit == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+
+        // The MMIO write reached the device at offset 0 with the byte the guest
+        // stored, and the value the device returned on the MMIO read flowed
+        // back into the guest register (then out to the serial sink).
+        assert_eq!(*last_write.borrow(), Some((0, 0x55)));
+        assert_eq!(&*captured.lock().unwrap(), &[0x3C]);
+    }
+
+    // The other guest-boot tests use new_without_irqchip() so HLT exits. This
+    // one runs a guest on the *production* backend (new(), in-kernel IRQ chip)
+    // to prove device PIO exits still reach the DeviceBus there. Port I/O exits
+    // to userspace even with the in-kernel APIC; only HLT is absorbed by it, so
+    // we stop once the expected output arrives rather than waiting for a halt
+    // that never surfaces. Self-skips without /dev/kvm.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn serial_output_under_production_irqchip() {
+        use crate::kvm_backend::{is_kvm_available, GuestRam, KvmBackend};
+        use crate::serial::{SerialOutput, SerialOutputMode, SerialPort};
+        use std::sync::{Arc, Mutex};
+
+        if !is_kvm_available() {
+            eprintln!("skipping serial_output_under_production_irqchip: no /dev/kvm");
+            return;
+        }
+
+        // Same OK-then-HLT blob as the smoke test (out 'O', out 'K', hlt).
+        #[rustfmt::skip]
+        let code: [u8; 10] = [0xBA,0xF8,0x03, 0xB0,0x4F, 0xEE, 0xB0,0x4B, 0xEE, 0xF4];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        // Production constructor: WITH the in-kernel IRQ chip.
+        let mut backend = KvmBackend::new().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let serial = SerialPort::com1(SerialOutput::new(
+            "prod-irqchip",
+            SerialOutputMode::Shared(Arc::clone(&captured)),
+        ));
+        let mut bus = DeviceBus::new();
+        bus.add_serial(serial).unwrap();
+
+        // Run until the two output bytes have been collected. Crucially, do not
+        // call run_vcpu again afterwards: the guest's next instruction is HLT,
+        // which the in-kernel APIC parks on (no KVM_EXIT_HLT), so another
+        // KVM_RUN would block.
+        let mut got = false;
+        for _ in 0..100 {
+            backend.run_vcpu(0, &mut bus).expect("run vcpu");
+            if captured.lock().unwrap().len() >= 2 {
+                got = true;
+                break;
+            }
+        }
+        assert!(got, "guest produced no serial output under the production IRQ chip");
         assert_eq!(&*captured.lock().unwrap(), b"OK");
     }
 }

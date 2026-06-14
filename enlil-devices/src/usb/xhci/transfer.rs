@@ -13,6 +13,7 @@
 //! [`DmaMemory`] seam: the KVM run loop will pass real guest RAM, tests pass
 //! a [`VecDmaMemory`].
 
+use super::ring::GuestRingCursor;
 use super::trb::{Trb, TrbType};
 use crate::truncate::{u8_of, usize_of};
 
@@ -383,6 +384,52 @@ impl DmaMemory for VecDmaMemory {
 }
 
 // ---------------------------------------------------------------------------
+// Guest-resident transfer-ring TD gathering
+// ---------------------------------------------------------------------------
+
+/// Gather one Transfer Descriptor from a **guest-resident** transfer ring.
+///
+/// This is the guest-memory counterpart of the controller's internal
+/// `gather_td`: instead of dequeuing from an in-process `TransferRing`, it
+/// pulls TRBs from guest memory through a [`GuestRingCursor`] (which follows
+/// Link TRBs and honours the Consumer Cycle State — that behaviour is tested
+/// with the cursor itself). TRBs chain while the control **chain bit** is set;
+/// the first chain-clear TRB closes the TD (ACRN's `USB_DATA_PART`/
+/// `USB_DATA_FULL` model). Each entry pairs the guest address the TRB was
+/// fetched from (what a Transfer Event reports) with the decoded
+/// [`TransferTrb`].
+///
+/// Returns the gathered TRBs — empty when the ring is exhausted (the next
+/// TRB's cycle bit says so), or a short TD if the ring runs out mid-chain — or
+/// the guest address of the first undecodable TRB as `Err`, matching the
+/// internal path's TRB-error reporting. It is the eventual replacement source
+/// for `process_transfer_ring`'s internal ring once the per-endpoint cursor
+/// lifecycle is wired in.
+///
+/// # Errors
+/// Returns the guest address of the first TRB that does not decode to a
+/// [`TransferTrb`].
+pub fn gather_transfer_td(
+    cursor: &mut GuestRingCursor,
+    mem: &dyn DmaMemory,
+) -> Result<Vec<(u64, TransferTrb)>, u64> {
+    let mut td = Vec::new();
+    while let Some((address, raw)) = cursor.fetch(mem) {
+        match TransferTrb::from_trb(&raw) {
+            Some(trb) => {
+                let chains = trb.chains();
+                td.push((address, trb));
+                if !chains {
+                    break;
+                }
+            }
+            None => return Err(address),
+        }
+    }
+    Ok(td)
+}
+
+// ---------------------------------------------------------------------------
 // DCI helpers
 // ---------------------------------------------------------------------------
 
@@ -530,5 +577,72 @@ mod tests {
     fn transfer_type_reserved_value_is_rejected() {
         assert_eq!(TransferType::from_raw(1), None);
         assert_eq!(TransferType::from_raw(3), Some(TransferType::InData));
+    }
+
+    // -- guest-resident TD gathering ----------------------------------------
+
+    /// Write a transfer TRB into the guest ring at `addr` with cycle `cycle`.
+    fn put(mem: &mut VecDmaMemory, addr: u64, t: &TransferTrb, cycle: bool) {
+        assert!(mem.write(addr, &t.to_trb(cycle).to_bytes()));
+    }
+
+    fn normal(buffer: u64, chain: bool) -> TransferTrb {
+        TransferTrb::Normal {
+            buffer,
+            length: 8,
+            chain,
+            ioc: !chain,
+            isp: false,
+        }
+    }
+
+    #[test]
+    fn gather_transfer_td_gathers_a_chained_td_and_advances() {
+        let mut mem = VecDmaMemory::new(0x1000, 0x100);
+        // Three chained TRBs; the last clears the chain bit, closing the TD.
+        put(&mut mem, 0x1000, &normal(0xAA00, true), true);
+        put(&mut mem, 0x1010, &normal(0xBB00, true), true);
+        put(&mut mem, 0x1020, &normal(0xCC00, false), true);
+
+        let mut cursor = GuestRingCursor::new(0x1000, true);
+        let td = gather_transfer_td(&mut cursor, &mem).unwrap();
+
+        assert_eq!(td.len(), 3);
+        assert_eq!(td[0].0, 0x1000);
+        assert_eq!(td[1].0, 0x1010);
+        assert_eq!(td[2].0, 0x1020);
+        assert!(matches!(td[0].1, TransferTrb::Normal { buffer: 0xAA00, .. }));
+        assert!(matches!(td[2].1, TransferTrb::Normal { buffer: 0xCC00, chain: false, .. }));
+        // The cursor consumed exactly the three TRBs.
+        assert_eq!(cursor.dequeue_pointer(), 0x1030);
+    }
+
+    #[test]
+    fn gather_transfer_td_stops_at_cycle_exhaustion() {
+        let mut mem = VecDmaMemory::new(0x1000, 0x100);
+        // One self-contained TD, then a slot left at cycle 0 (zeroed memory).
+        put(&mut mem, 0x1000, &normal(0xAA00, false), true);
+
+        let mut cursor = GuestRingCursor::new(0x1000, true);
+        let td = gather_transfer_td(&mut cursor, &mem).unwrap();
+        assert_eq!(td.len(), 1);
+
+        // The next slot's cycle bit (0) mismatches the cursor's CCS (1): the
+        // ring is exhausted, so the next gather yields an empty TD.
+        let empty = gather_transfer_td(&mut cursor, &mem).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn gather_transfer_td_reports_an_undecodable_trb() {
+        let mut mem = VecDmaMemory::new(0x1000, 0x100);
+        // A TRB of a type that is neither a transfer TRB nor a Link (type 5),
+        // with the matching cycle bit so the cursor hands it back.
+        let mut bad = Trb::zeroed();
+        bad.control = (5 << 10) | 1;
+        assert!(mem.write(0x1000, &bad.to_bytes()));
+
+        let mut cursor = GuestRingCursor::new(0x1000, true);
+        assert_eq!(gather_transfer_td(&mut cursor, &mem), Err(0x1000));
     }
 }
