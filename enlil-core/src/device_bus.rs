@@ -2622,4 +2622,66 @@ mod tests {
         assert_eq!(*last_write.borrow(), Some((0, 0x55)));
         assert_eq!(&*captured.lock().unwrap(), &[0x3C]);
     }
+
+    // The other guest-boot tests use new_without_irqchip() so HLT exits. This
+    // one runs a guest on the *production* backend (new(), in-kernel IRQ chip)
+    // to prove device PIO exits still reach the DeviceBus there. Port I/O exits
+    // to userspace even with the in-kernel APIC; only HLT is absorbed by it, so
+    // we stop once the expected output arrives rather than waiting for a halt
+    // that never surfaces. Self-skips without /dev/kvm.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn serial_output_under_production_irqchip() {
+        use crate::kvm_backend::{is_kvm_available, GuestRam, KvmBackend};
+        use crate::serial::{SerialOutput, SerialOutputMode, SerialPort};
+        use std::sync::{Arc, Mutex};
+
+        if !is_kvm_available() {
+            eprintln!("skipping serial_output_under_production_irqchip: no /dev/kvm");
+            return;
+        }
+
+        // Same OK-then-HLT blob as the smoke test (out 'O', out 'K', hlt).
+        #[rustfmt::skip]
+        let code: [u8; 10] = [0xBA,0xF8,0x03, 0xB0,0x4F, 0xEE, 0xB0,0x4B, 0xEE, 0xF4];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        // Production constructor: WITH the in-kernel IRQ chip.
+        let mut backend = KvmBackend::new().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let serial = SerialPort::com1(SerialOutput::new(
+            "prod-irqchip",
+            SerialOutputMode::Shared(Arc::clone(&captured)),
+        ));
+        let mut bus = DeviceBus::new();
+        bus.add_serial(serial).unwrap();
+
+        // Run until the two output bytes have been collected. Crucially, do not
+        // call run_vcpu again afterwards: the guest's next instruction is HLT,
+        // which the in-kernel APIC parks on (no KVM_EXIT_HLT), so another
+        // KVM_RUN would block.
+        let mut got = false;
+        for _ in 0..100 {
+            backend.run_vcpu(0, &mut bus).expect("run vcpu");
+            if captured.lock().unwrap().len() >= 2 {
+                got = true;
+                break;
+            }
+        }
+        assert!(got, "guest produced no serial output under the production IRQ chip");
+        assert_eq!(&*captured.lock().unwrap(), b"OK");
+    }
 }
