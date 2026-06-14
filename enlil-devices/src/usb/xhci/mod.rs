@@ -44,5 +44,8 @@ pub use registers::{
     CapabilityRegisters, OperationalRegisters, PortRegisterSet, PortState, RuntimeRegisters,
 };
 pub use ring::{CommandRing, TransferRing, TrbRing};
-pub use transfer::{CONTROL_DCI, DmaMemory, SetupPacket, TransferTrb, TransferType, VecDmaMemory};
+pub use transfer::{
+    gather_transfer_td, CONTROL_DCI, DmaMemory, SetupPacket, TransferTrb, TransferType,
+    VecDmaMemory,
+};
 pub use trb::{CommandTrb, EventTrb, NormalTrb, Trb, TrbCompletionCode, TrbType};
