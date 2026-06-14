@@ -146,6 +146,13 @@ mod linux {
     use crate::error::{Error, Result};
     use kvm_bindings::kvm_userspace_memory_region;
     use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
+    use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
+    use std::ptr::NonNull;
+
+    /// Host page size (4 KiB on x86-64). KVM requires a memory region's guest
+    /// physical base, size, and backing host address to all be multiples of
+    /// this — `KVM_SET_USER_MEMORY_REGION` returns `EINVAL` otherwise.
+    pub const HOST_PAGE_SIZE: usize = 4096;
 
     /// Returns `true` if this host exposes a usable `/dev/kvm`.
     ///
@@ -154,6 +161,106 @@ mod linux {
     #[must_use]
     pub fn is_kvm_available() -> bool {
         Kvm::new().is_ok()
+    }
+
+    /// A page-aligned, zeroed host buffer suitable for backing guest RAM.
+    ///
+    /// `KVM_SET_USER_MEMORY_REGION` requires the `userspace_addr` of a guest
+    /// memory slot to be page-aligned; a plain `Vec<u8>` is only byte-aligned,
+    /// so it cannot legally back a KVM memory region (the ioctl rejects it with
+    /// `EINVAL`). `GuestRam` owns a page-aligned allocation, rounded up to a
+    /// whole number of pages, and hands out its host base address and a slice
+    /// over the bytes. Drop releases the allocation.
+    pub struct GuestRam {
+        ptr: NonNull<u8>,
+        layout: Layout,
+    }
+
+    impl GuestRam {
+        /// Allocate `size` bytes of zeroed, page-aligned host memory. `size`
+        /// is rounded up to a whole number of pages.
+        ///
+        /// # Panics
+        /// Panics if `size` is zero, if the page-rounded size overflows a
+        /// valid [`Layout`], or if the allocation fails.
+        #[must_use]
+        pub fn new(size: usize) -> Self {
+            assert!(size != 0, "guest RAM size must be non-zero");
+            let pages = size.div_ceil(HOST_PAGE_SIZE);
+            let alloc_size = pages * HOST_PAGE_SIZE;
+            let layout = Layout::from_size_align(alloc_size, HOST_PAGE_SIZE)
+                .expect("page-aligned guest RAM layout");
+            // SAFETY: `layout` has a non-zero size (size != 0 ⇒ pages ≥ 1).
+            let raw = unsafe { alloc_zeroed(layout) };
+            let ptr = NonNull::new(raw).unwrap_or_else(|| handle_alloc_error(layout));
+            Self { ptr, layout }
+        }
+
+        /// Host virtual base address as a `u64` — the page-aligned
+        /// `userspace_addr` to register with [`KvmBackend::map_memory`].
+        #[must_use]
+        pub fn host_addr(&self) -> u64 {
+            self.ptr.as_ptr() as u64
+        }
+
+        /// Allocated size in bytes (the requested size rounded up to a whole
+        /// number of pages).
+        #[must_use]
+        pub fn len(&self) -> usize {
+            self.layout.size()
+        }
+
+        /// Always `false` — a [`GuestRam`] is never empty (size is non-zero).
+        #[must_use]
+        pub const fn is_empty(&self) -> bool {
+            false
+        }
+
+        /// The backing bytes as a shared slice.
+        #[must_use]
+        pub fn as_slice(&self) -> &[u8] {
+            // SAFETY: `ptr` is valid for `layout.size()` zeroed bytes we own
+            // and keep alive for `&self`.
+            unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.layout.size()) }
+        }
+
+        /// The backing bytes as a mutable slice.
+        #[must_use]
+        pub fn as_mut_slice(&mut self) -> &mut [u8] {
+            // SAFETY: as `as_slice`, with unique access via `&mut self`.
+            unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.layout.size()) }
+        }
+    }
+
+    impl Drop for GuestRam {
+        fn drop(&mut self) {
+            // SAFETY: `ptr`/`layout` came from `alloc_zeroed(layout)` and the
+            // region has not been freed elsewhere.
+            unsafe { dealloc(self.ptr.as_ptr(), self.layout) }
+        }
+    }
+
+    /// Validate that a memory region meets KVM's page-alignment requirements
+    /// *before* the ioctl, so a misaligned region produces an actionable error
+    /// instead of the kernel's opaque `EINVAL`.
+    ///
+    /// # Errors
+    /// Returns [`Error::HypervisorError`] if `size` is zero or any of
+    /// `guest_phys_addr`, `host_addr`, or `size` is not page-aligned.
+    pub(super) fn validate_region(guest_phys_addr: u64, host_addr: u64, size: u64) -> Result<()> {
+        const PAGE_MASK: u64 = HOST_PAGE_SIZE as u64 - 1;
+        if size == 0 {
+            return Err(Error::HypervisorError(
+                "guest memory region size must be non-zero".to_string(),
+            ));
+        }
+        if guest_phys_addr & PAGE_MASK != 0 || host_addr & PAGE_MASK != 0 || size & PAGE_MASK != 0 {
+            return Err(Error::HypervisorError(format!(
+                "KVM memory region must be page-aligned ({HOST_PAGE_SIZE:#x}): \
+                 guest_phys_addr={guest_phys_addr:#x}, host_addr={host_addr:#x}, size={size:#x}"
+            )));
+        }
+        Ok(())
     }
 
     /// A guest memory region registered with KVM.
@@ -181,10 +288,43 @@ mod linux {
         /// in-kernel IRQ chip and the x86 TSS/identity-map scratch regions set
         /// up (required before creating vCPUs on Intel hosts).
         ///
+        /// This is the production constructor: the in-kernel IRQ chip
+        /// (LAPIC/IOAPIC/PIC) is what real guests need to take interrupts
+        /// without a userspace round-trip per IRQ. **Note its effect on
+        /// `HLT`:** with the in-kernel local APIC present, `HLT` is handled
+        /// *inside* KVM — the vCPU parks waiting for an interrupt and
+        /// [`run_vcpu`](Self::run_vcpu) does **not** return
+        /// [`GuestExit::Halted`]. Code that wants `HLT` to surface to userspace
+        /// (e.g. a "run a blob until it halts" smoke test) must use
+        /// [`new_without_irqchip`](Self::new_without_irqchip) instead.
+        ///
         /// # Errors
         /// Returns [`Error::HypervisorError`] if KVM is unavailable, the API
         /// version is unexpected, or any setup ioctl fails.
         pub fn new() -> Result<Self> {
+            Self::with_irqchip(true)
+        }
+
+        /// Like [`new`](Self::new) but **without** the in-kernel IRQ chip.
+        ///
+        /// Without an in-kernel local APIC, `HLT` exits to userspace as
+        /// [`GuestExit::Halted`] (the classic `KVM_EXIT_HLT`). This is the
+        /// right choice for running a self-contained code blob that signals
+        /// completion by halting, and for any flow that drives interrupts from
+        /// userspace. It cannot deliver in-kernel interrupts, so it is not
+        /// suitable for booting a full interrupt-driven guest.
+        ///
+        /// # Errors
+        /// As [`new`](Self::new).
+        pub fn new_without_irqchip() -> Result<Self> {
+            Self::with_irqchip(false)
+        }
+
+        /// Shared constructor body. `create_irqchip` selects whether the
+        /// in-kernel IRQ chip is created — see [`new`](Self::new) vs
+        /// [`new_without_irqchip`](Self::new_without_irqchip) for the
+        /// behavioural difference (notably `HLT` handling).
+        fn with_irqchip(create_irqchip: bool) -> Result<Self> {
             let kvm =
                 Kvm::new().map_err(|e| Error::HypervisorError(format!("open /dev/kvm: {e}")))?;
 
@@ -206,9 +346,13 @@ mod linux {
                 .map_err(|e| Error::HypervisorError(format!("KVM_SET_TSS_ADDR: {e}")))?;
 
             // In-kernel IRQ chip (LAPIC/IOAPIC/PIC) so we can later route
-            // interrupts without userspace round-trips.
-            vm.create_irq_chip()
-                .map_err(|e| Error::HypervisorError(format!("KVM_CREATE_IRQCHIP: {e}")))?;
+            // interrupts without userspace round-trips. When present it also
+            // makes the in-kernel APIC handle `HLT`, so callers that need
+            // `HLT` to exit to userspace opt out via `new_without_irqchip`.
+            if create_irqchip {
+                vm.create_irq_chip()
+                    .map_err(|e| Error::HypervisorError(format!("KVM_CREATE_IRQCHIP: {e}")))?;
+            }
 
             Ok(Self {
                 kvm,
@@ -238,6 +382,7 @@ mod linux {
             host_addr: u64,
             size: u64,
         ) -> Result<MemSlot> {
+            validate_region(guest_phys_addr, host_addr, size)?;
             let slot = self.next_slot;
             let region = kvm_userspace_memory_region {
                 slot,
@@ -402,7 +547,7 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{is_kvm_available, KvmBackend, MemSlot};
+pub use linux::{is_kvm_available, GuestRam, KvmBackend, MemSlot, HOST_PAGE_SIZE};
 
 #[cfg(test)]
 mod tests {
@@ -481,12 +626,13 @@ mod tests {
 
         let mut backend = KvmBackend::new().expect("create KVM VM");
 
-        // Back the guest with a page-aligned host buffer.
+        // Back the guest with a page-aligned host buffer (a plain `Vec<u8>`
+        // is only byte-aligned and KVM would reject it with EINVAL).
         const SIZE: usize = 0x1000;
-        let mut mem = vec![0u8; SIZE];
-        let host_addr = mem.as_mut_ptr() as u64;
-        // SAFETY: `mem` outlives `backend` within this test scope.
-        let slot = unsafe { backend.map_memory(0x1000, host_addr, SIZE as u64) }
+        let ram = GuestRam::new(SIZE);
+        let host_addr = ram.host_addr();
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        let slot = unsafe { backend.map_memory(0x1000, host_addr, ram.len() as u64) }
             .expect("map guest memory");
         assert_eq!(slot.slot, 0);
         assert_eq!(backend.mem_slots().len(), 1);
@@ -494,5 +640,47 @@ mod tests {
         let idx = backend.create_vcpu(0).expect("create vcpu");
         assert_eq!(idx, 0);
         assert_eq!(backend.vcpu_count(), 1);
+    }
+
+    // -- page-aligned guest RAM (no KVM required) ---------------------------
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guest_ram_is_page_aligned_zeroed_and_writable() {
+        let mut ram = GuestRam::new(100);
+        // Rounded up to a whole page.
+        assert_eq!(ram.len(), HOST_PAGE_SIZE);
+        assert!(!ram.is_empty());
+        // Page-aligned host base — the property KVM requires.
+        assert_eq!(ram.host_addr() % HOST_PAGE_SIZE as u64, 0);
+        // Zero-initialised.
+        assert!(ram.as_slice().iter().all(|&b| b == 0));
+        // Writable through the mutable slice.
+        ram.as_mut_slice()[0] = 0xAB;
+        ram.as_mut_slice()[HOST_PAGE_SIZE - 1] = 0xCD;
+        assert_eq!(ram.as_slice()[0], 0xAB);
+        assert_eq!(ram.as_slice()[HOST_PAGE_SIZE - 1], 0xCD);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guest_ram_rounds_multi_page_size_up() {
+        let ram = GuestRam::new(HOST_PAGE_SIZE + 1);
+        assert_eq!(ram.len(), 2 * HOST_PAGE_SIZE);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validate_region_rejects_misaligned_and_zero() {
+        // Misaligned guest physical address.
+        assert!(super::linux::validate_region(0x1001, 0x1000, 0x1000).is_err());
+        // Misaligned host address.
+        assert!(super::linux::validate_region(0x1000, 0x1001, 0x1000).is_err());
+        // Misaligned (non-page-multiple) size.
+        assert!(super::linux::validate_region(0x1000, 0x1000, 0x800).is_err());
+        // Zero size.
+        assert!(super::linux::validate_region(0x1000, 0x1000, 0).is_err());
+        // A fully page-aligned region is accepted.
+        assert!(super::linux::validate_region(0x1000, 0x2000, 0x1000).is_ok());
     }
 }

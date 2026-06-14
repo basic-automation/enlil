@@ -2297,7 +2297,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn serial_console_smoke() {
-        use crate::kvm_backend::{is_kvm_available, GuestExit, KvmBackend};
+        use crate::kvm_backend::{is_kvm_available, GuestExit, GuestRam, KvmBackend};
         use crate::serial::{SerialOutput, SerialOutputMode, SerialPort};
         use std::sync::{Arc, Mutex};
 
@@ -2323,16 +2323,23 @@ mod tests {
             0xF4,
         ];
 
-        // Back the guest with one page; place the code at guest-physical 0x1000.
+        // Back the guest with one page-aligned page; place the code at
+        // guest-physical 0x1000. A plain `Vec<u8>` is only byte-aligned and
+        // KVM would reject it with EINVAL, so use page-aligned `GuestRam`.
         const ENTRY: u64 = 0x1000;
         const SIZE: usize = 0x1000;
-        let mut mem = vec![0u8; SIZE];
-        mem[..code.len()].copy_from_slice(&code);
-        let host_addr = mem.as_mut_ptr() as u64;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
 
-        let mut backend = KvmBackend::new().expect("create KVM VM");
-        // SAFETY: `mem` outlives `backend` within this test scope.
-        unsafe { backend.map_memory(ENTRY, host_addr, SIZE as u64) }.expect("map guest memory");
+        // No in-kernel IRQ chip: with an in-kernel local APIC, KVM handles
+        // `HLT` itself (the vCPU parks waiting for an interrupt) and never
+        // exits with `KVM_EXIT_HLT`, so this "run until it halts" probe would
+        // block forever. Without the IRQ chip, `HLT` exits to userspace.
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
         backend.create_vcpu(0).expect("create vcpu");
         backend
             .prepare_real_mode_vcpu(0, ENTRY)
