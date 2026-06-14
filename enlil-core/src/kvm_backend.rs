@@ -850,4 +850,63 @@ mod tests {
         assert_eq!(ram_lo.as_slice()[0], 0xAA);
         assert_eq!(ram_hi.as_slice()[0], 0xBB);
     }
+
+    // End-to-end DMA coherence on real KVM: a guest writes a byte into its own
+    // RAM, and the host then reads that byte back through the device-facing
+    // GuestMemory view built from the backend's real slot table — proving the
+    // DMA view sees exactly what the guest wrote (what xHCI ring/context
+    // residency relies on). Self-skips without /dev/kvm rather than faking it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guest_memory_reads_what_the_guest_wrote() {
+        use enlil_devices::usb::xhci::transfer::DmaMemory;
+
+        if !is_kvm_available() {
+            eprintln!("skipping guest_memory_reads_what_the_guest_wrote: no /dev/kvm");
+            return;
+        }
+
+        // 16-bit real-mode blob (DS base 0): store 0x42 into guest RAM at GPA
+        // 0x1800 (a normal memory write — no vmexit), then halt.
+        //   B0 42      mov al, 0x42
+        //   A2 00 18   mov [0x1800], al
+        //   F4         hlt
+        #[rustfmt::skip]
+        let code: [u8; 6] = [0xB0, 0x42, 0xA2, 0x00, 0x18, 0xF4];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        const DATA_GPA: u64 = 0x1800;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        let mut halted = false;
+        for _ in 0..100 {
+            if backend.run_vcpu(0, &mut NoopHandler).expect("run vcpu") == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+
+        // Read the byte the guest stored, through the real backend slot table.
+        let mem = backend.guest_memory();
+        let mut buf = [0u8; 1];
+        assert!(mem.read(DATA_GPA, &mut buf));
+        assert_eq!(buf, [0x42]);
+    }
+
+    /// A do-nothing [`VmExitHandler`] for guests that only touch RAM.
+    struct NoopHandler;
+    impl VmExitHandler for NoopHandler {}
 }
