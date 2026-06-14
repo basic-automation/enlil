@@ -1587,6 +1587,23 @@ Physical USB Devices
 > handling; the TUI USB tab (the protocol seam is ready; note the prior `tui/mod.rs` was
 > a corrupt placeholder and was removed).
 
+> **Status (2026-06-14):** the **KVM run loop now exists and the xHCI DMA seam
+> is wired to it.** The real-mode guest-boot path runs on `/dev/kvm` (PIO in/out
+> and MMIO read/write all proven by guest-boot smoke tests, not just unit
+> calls). `enlil-core` gained a page-aligned `GuestRam` and a `GuestMemory`
+> view that implements the device-facing `DmaMemory` over the VM's registered
+> slots (GPA→HVA translation, bounds-checked, multi-slot), DMA-coherent with
+> what the guest writes (verified end-to-end on KVM). `StandardPc::service_usb_dma`
+> is the run loop's USB DMA entry point: a guest doorbell write latches in
+> `XhciMmio`, and `service_usb_dma` drains it against guest memory (command/
+> transfer rings → events) — closing the "waits on the KVM run loop" gap for
+> the `DmaMemory` seam. **Still remaining for Phase 4:** rings/contexts actually
+> fetched from the guest's `CRCR`/`DCBAAP` (the seam and the run-loop call are
+> ready; the controller still uses its internal command/transfer queues rather
+> than dereferencing guest-resident rings); the libusb-backed `UsbDeviceModel`
+> forwarder for physical devices; the TUI USB tab. (Configure Endpoint context
+> handling is already implemented.)
+
 ### 4.4 Virtual xHCI Controller
 - Present each guest with an emulated xHCI (USB 3.x) host controller
 - **Primary approach: Software-emulated xHCI with TRB-level interception (recommended)**

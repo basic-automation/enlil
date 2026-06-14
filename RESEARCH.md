@@ -1232,3 +1232,33 @@ case was already logged under "USB Passthrough — ACRN's Architecture as Refere
   in hand. → device-slot doorbells latch pending in the `DoorbellArray` and a
   `service_doorbells(&mut dyn DmaMemory)` entry point drains them — exactly the call the
   KVM run loop will make; tests drive it with a Vec-backed memory.
+
+## 2026-06-14 — KVM run loop: in-kernel IRQ chip vs HLT, memory-region alignment, real-mode device exits (Phase 0.2 / 4 / 5)
+
+First run with `/dev/kvm` actually available end-to-end, so the previously
+self-skipping guest-boot path ran for real and surfaced three KVM API
+behaviours that shape the run loop. Primary source: the Linux KVM API
+reference (`Documentation/virt/kvm/api.rst`), corroborated empirically by
+bisecting a direct `kvm-ioctls` probe on this host (AMD SVM, nested virt).
+
+- **`KVM_CREATE_IRQCHIP` changes `HLT` semantics.** With the in-kernel local
+  APIC present, `HLT` is handled inside KVM — the vCPU halts waiting for an
+  interrupt and `KVM_RUN` does **not** return `KVM_EXIT_HLT`. Without the IRQ
+  chip, `HLT` exits to userspace. → the run loop can't treat "vCPU reached
+  HLT" as an exit when the production IRQ chip is enabled; a guest that idles
+  via `HLT` will block in `KVM_RUN` until an interrupt or a userspace kick
+  (`KVM_SET_SIGNAL_MASK`/`immediate_exit`). We split the backend into `new()`
+  (IRQ chip, production) and `new_without_irqchip()` (HLT exits to userspace,
+  for self-contained code blobs / userspace-driven IRQs). A future increment
+  should add an `immediate_exit`/signal-based watchdog so the production path
+  can bound a non-progressing or idle vCPU.
+- **`KVM_SET_USER_MEMORY_REGION` requires a page-aligned `userspace_addr`**
+  (and page-aligned `guest_phys_addr`/`memory_size`); a plain `Vec<u8>` is
+  only byte-aligned and the ioctl rejects it with `EINVAL`. → guest RAM must
+  come from a page-aligned allocation (`GuestRam`), and a pre-ioctl
+  `validate_region` guard turns the opaque `EINVAL` into an actionable error.
+- **KVM emulates real-mode MMIO instructions** (e.g. `moffs` `mov`), so a
+  16-bit guest blob can drive an MMIO device below 1 MiB and the access exits
+  to userspace as `KVM_EXIT_MMIO`. → real-mode smoke tests can exercise the
+  full MMIO device path (not just PIO) without entering protected mode, which
+  is how the xHCI doorbell/ring DMA path is now tested end-to-end.
