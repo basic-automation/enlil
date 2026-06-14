@@ -6,6 +6,85 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-14 (b) — Session: every xHCI ring is now guest-resident + the run-loop watchdog primitive (Phase 4 / 5)
+
+**6 increments, each independently green and committed** (branch
+`routine/enlil-2026-06-14-2`; same-day rerun after PR #27 merged). This session
+delivered **both** documented next-steps from the earlier run: guest-resident
+transfer rings (the last xHCI ring still sourced from an internal queue) and the
+production run-loop watchdog primitive.
+
+### Increments (commit — what)
+1. `4a33750` — **drive transfer rings from guest memory (opt-in).** Wires
+   `gather_transfer_td` into the live path: `process_transfer_ring` drains the
+   internal `submit_transfer` ring (refactored into `drain_internal_transfer_ring`)
+   then, behind `set_guest_resident_transfers` (default OFF — all 753 tests
+   unaffected), runs `process_guest_transfer_ring`: a persistent per-`(slot,dci)`
+   `GuestRingCursor` gathers TDs and feeds the existing executors, bounded by
+   `TRANSFER_BURST_LIMIT`, stopping at a STALL. Cursor invalidated at Configure
+   Endpoint, Set TR Dequeue Pointer, Reset Device, Disable Slot.
+2. `a4a17a8` — **enable guest-resident transfers on the run-loop xHCI**
+   (`standard_pc_complete`) + a StandardPc end-to-end test: address a loopback,
+   write a No-Op into EP0's guest ring, ring the doorbell over the BAR, and
+   `service_usb_dma` completes it — no `submit_transfer`.
+3. `7bd46e7` — **data-moving test**: a full GET_DESCRIPTOR control transfer
+   (Setup→Data→Status, 3 TDs) fetched from the guest ring in one doorbell DMAs
+   the device descriptor into a guest buffer — proving multi-TD cursor advance +
+   real data movement, not just NoOps.
+4. `dcb2c33` — **Set TR Dequeue Pointer works for guest-resident endpoints.**
+   It used to ContextStateError without an internal ring; EP0 (context, no
+   internal ring) could never be repointed. Now accepts an endpoint that exists
+   as either an internal ring or a declared context, updates the context, and
+   drops the cursor. Lifecycle test: consume from ring A, SetTRDequeue to ring B,
+   next doorbell fetches from B.
+5. `27d62f8` — **docs**: ROADMAP status (every xHCI ring now guest-resident;
+   remaining Phase 4 = libusb forwarder + TUI tab) and a RESEARCH note grounding
+   it in xHCI 1.2 §4.9 / §6.2.3.
+6. `48ad93e` — **immediate-exit run-loop bound** (`KvmBackend::set_immediate_exit`):
+   with the in-kernel IRQ chip a guest that idles in `HLT` (or spins) blocks
+   `KVM_RUN` forever; armed, `run_vcpu` returns Interrupted at once. The
+   synchronous watchdog primitive flagged in the 2026-06-14 RESEARCH note. Test:
+   a `jmp $` guest that would hang is bounded.
+
+### Research (informed the build)
+RESEARCH.md `2026-06-14 (b)`: xHCI 1.2 §4.9 (transfer rings in guest memory) +
+§6.2.3 (endpoint-context TR Dequeue Pointer), cross-checked vs ACRN's
+doorbell-deferred processing. Drove the `GuestRingCursor`-per-endpoint design
+and the Set-TR-Dequeue-for-context-only-endpoints fix.
+
+### Test results (exact)
+- **`/dev/kvm`: read-writable** (`KVM_RW_OK`). KVM tests ran for real:
+  `immediate_exit_bounds_an_unending_run` (the `jmp $` guest is bounded, not
+  hung), plus all prior guest-boot tests still pass.
+- `cargo test -p enlil-devices --lib`: **756 passed, 0 failed** (started at 753;
+  +gather-already-landed, +guest-resident control + cursor lifecycle tests).
+- `cargo test -p enlil-core --lib`: **154 passed, 0 failed**.
+- `cargo clippy` clean for `enlil-core` and `enlil-devices` (`--lib --tests`).
+- **Toolchains:** all Linux/WSL (nightly `x86_64-unknown-linux-gnu`); the
+  host-agnostic production increments (1, 2, 4) **also built Windows-native**
+  (`x86_64-pc-windows-msvc`, exit 0). Increment 3 is test-only (cross-platform
+  APIs); increment 6 is `#[cfg(target_os = "linux")]` (KVM), so Windows N/A.
+
+### STOP REASON
+Both concrete next-steps from PR #27 are done and the guest-resident transfer
+feature is comprehensively tested. The remaining work does not decompose into a
+clean, testable increment now: the **full threaded watchdog** (signal-kick from
+a dedicated vCPU thread) needs a multi-threaded vCPU execution model — an
+architectural change to the synchronous `run_vcpu`, multi-session; the **libusb
+`UsbDeviceModel` forwarder** needs real USB hardware enumeration not available
+in this headless WSL env; the **TUI USB tab** is separate UI work. Wall-clock
+budget was not fully spent, but per the guardrail I handed off rather than rush
+an architectural change or start a hardware-blocked feature.
+
+### Recommended next step (tomorrow)
+1. **Threaded vCPU run model + watchdog**: run each vCPU on its own thread with
+   the backend behind shared state, install a signal handler, and have a
+   watchdog thread `set_immediate_exit` + signal the vCPU thread to kick it out
+   of `KVM_RUN` (the primitive landed this session is the synchronous half).
+2. **libusb-backed `UsbDeviceModel` forwarder** for physical pass-through
+   (needs a host with a spare USB device; gate the tests on hardware).
+3. **TUI USB tab** (the `enlil-mgmt::protocol` seam is ready).
+
 ## 2026-06-14 — Session: the KVM run loop comes alive — guest-boot proofs, GuestMemory DMA, and the xHCI run-loop seams (Phase 0.2 / 4 / 5)
 
 **11 increments, each independently green and committed** (branch
