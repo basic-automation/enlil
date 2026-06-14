@@ -611,8 +611,18 @@ mod tests {
         assert_eq!(td[0].0, 0x1000);
         assert_eq!(td[1].0, 0x1010);
         assert_eq!(td[2].0, 0x1020);
-        assert!(matches!(td[0].1, TransferTrb::Normal { buffer: 0xAA00, .. }));
-        assert!(matches!(td[2].1, TransferTrb::Normal { buffer: 0xCC00, chain: false, .. }));
+        assert!(matches!(
+            td[0].1,
+            TransferTrb::Normal { buffer: 0xAA00, .. }
+        ));
+        assert!(matches!(
+            td[2].1,
+            TransferTrb::Normal {
+                buffer: 0xCC00,
+                chain: false,
+                ..
+            }
+        ));
         // The cursor consumed exactly the three TRBs.
         assert_eq!(cursor.dequeue_pointer(), 0x1030);
     }

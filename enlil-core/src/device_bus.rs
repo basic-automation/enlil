@@ -759,7 +759,14 @@ impl DeviceBus {
                 ));
             }
         }
-        let xhci: SharedXhci = Rc::new(RefCell::new(VirtualXhciController::new(XHCI_PORTS)));
+        let xhci: SharedXhci = {
+            // The run loop has guest memory in hand at doorbell time, so drive
+            // transfer rings from the guest's TR Dequeue Pointers (the real
+            // hardware path) rather than the internal submit_transfer queue.
+            let mut controller = VirtualXhciController::new(XHCI_PORTS);
+            controller.set_guest_resident_transfers(true);
+            Rc::new(RefCell::new(controller))
+        };
         let mut xhci_mmio =
             XhciMmio::new(Rc::clone(&xhci), u64::from(XHCI_MMIO_BASE), XHCI_MMIO_SIZE);
         {
@@ -2148,12 +2155,12 @@ mod tests {
         // Program interrupter 0 through the BAR like a driver: ERSTSZ, ERSTBA,
         // ERDP (parked at the segment base), then enable the interrupter.
         for (off, v) in [
-            (0x28_u64, 1_u32),                  // ERSTSZ = 1 segment
-            (0x30, ERSTBA as u32),              // ERSTBA lo
-            (0x34, 0),                          // ERSTBA hi
-            (0x38, SEG_BASE as u32),            // ERDP lo
-            (0x3C, 0),                          // ERDP hi
-            (0x20, 2),                          // IMAN.IE
+            (0x28_u64, 1_u32),       // ERSTSZ = 1 segment
+            (0x30, ERSTBA as u32),   // ERSTBA lo
+            (0x34, 0),               // ERSTBA hi
+            (0x38, SEG_BASE as u32), // ERDP lo
+            (0x3C, 0),               // ERDP hi
+            (0x20, 2),               // IMAN.IE
         ] {
             VmExitHandler::mmio_write(&mut pc.bus, XHCI_BAR0 + RTSOFF + off, &v.to_le_bytes());
         }
@@ -2171,8 +2178,120 @@ mod tests {
         let mut trb = [0u8; 16];
         assert!(mem.read(SEG_BASE, &mut trb));
         let control = u32::from_le_bytes([trb[12], trb[13], trb[14], trb[15]]);
-        assert_eq!((control >> 10) & 0x3F, 34, "expected a Port Status Change Event");
+        assert_eq!(
+            (control >> 10) & 0x3F,
+            34,
+            "expected a Port Status Change Event"
+        );
         assert_eq!(pc.flush_usb_events(&mut mem), 0);
+    }
+
+    /// End-to-end: the StandardPc run loop drives a guest-resident transfer
+    /// ring through `service_usb_dma`. The controller is constructed with
+    /// guest-resident transfers enabled, so a No-Op TRB the guest wrote into
+    /// EP0's ring (and announced by ringing the endpoint doorbell over the BAR)
+    /// is fetched from guest memory and completed when the run loop services
+    /// the doorbell — no `submit_transfer` involved.
+    #[test]
+    fn standardpc_drives_a_guest_transfer_ring_through_service_usb_dma() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::usb::emulated::LoopbackDevice;
+        use enlil_devices::usb::xhci::context::{
+            input_context_entry_offset, EndpointContext, EndpointType,
+        };
+        use enlil_devices::usb::xhci::transfer::DmaMemory;
+        use enlil_devices::usb::xhci::{
+            CommandTrb, EventTrb, TransferTrb, TrbCompletionCode, VecDmaMemory,
+        };
+        use enlil_devices::usb::UsbSpeed;
+
+        const CONTROL_DCI: u8 = 1;
+        const XHCI_BAR0: u64 = 0xFE90_0000;
+        const RING: u64 = 0x4000;
+
+        let mut pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            1_780_838_055,
+            1,
+        )
+        .unwrap();
+
+        let mut mem = VecDmaMemory::new(0x1000, 0x6000);
+        let dcbaap = 0x2000_u64;
+        let out_ctx = 0x3000_u64;
+        assert!(mem.write(dcbaap + 8, &out_ctx.to_le_bytes()));
+
+        // Bring the controller up and address a loopback device with EP0's
+        // transfer ring at RING — driven through the controller handle (setup).
+        let dboff = {
+            let mut x = pc.xhci.borrow_mut();
+            let op = u32::from(x.caps.caplength);
+            x.write_register(op + 0x38, 8); // CONFIG MaxSlotsEn
+            x.write_register(op, 1); // USBCMD R/S
+            x.write_register(op + 0x30, dcbaap as u32); // DCBAAP lo
+            let port = x
+                .attach_device_with_model(
+                    UsbSpeed::High,
+                    Box::new(LoopbackDevice::new(0x1234, 0x5678)),
+                )
+                .unwrap();
+            let _ = x.pop_event();
+            let addr_in = 0x1000_u64;
+            assert!(mem.write(addr_in + 4, &0x3_u32.to_le_bytes())); // A0|A1
+            assert!(mem.write(
+                addr_in + 0x24,
+                &(u32::try_from(port + 1).unwrap() << 16).to_le_bytes()
+            ));
+            let ep0 = EndpointContext {
+                endpoint_type: EndpointType::Control,
+                max_packet_size: 64,
+                max_burst_size: 0,
+                error_count: 3,
+                interval: 0,
+                tr_dequeue_pointer: RING,
+                dequeue_cycle_state: true,
+                average_trb_length: 8,
+            };
+            assert!(mem.write(
+                addr_in + input_context_entry_offset(CONTROL_DCI),
+                &ep0.to_bytes()
+            ));
+            x.submit_command(&CommandTrb::EnableSlot);
+            x.submit_command(&CommandTrb::AddressDevice {
+                slot_id: 1,
+                input_context_ptr: addr_in,
+            });
+            let db = x.caps.dboff;
+            x.write_register(db, 0);
+            x.service_doorbells(&mut mem);
+            let _ = x.pop_event();
+            let _ = x.pop_event();
+            u64::from(db)
+        };
+
+        // The guest writes a No-Op transfer TRB into EP0's ring (cycle = 1).
+        assert!(mem.write(
+            RING,
+            &TransferTrb::NoOp { ioc: true }.to_trb(true).to_bytes()
+        ));
+
+        // The guest rings the EP0 doorbell over the BAR (slot 1 = dboff + 4,
+        // value = the control endpoint's DCI), and the run loop services it.
+        VmExitHandler::mmio_write(
+            &mut pc.bus,
+            XHCI_BAR0 + dboff + 4,
+            &u32::from(CONTROL_DCI).to_le_bytes(),
+        );
+        pc.service_usb_dma(&mut mem);
+
+        // The No-Op fetched from EP0's guest ring completed with Success.
+        let event = pc.xhci.borrow_mut().pop_event();
+        match event {
+            Some(EventTrb::TransferEvent {
+                completion_code, ..
+            }) => assert_eq!(completion_code as u8, TrbCompletionCode::Success as u8),
+            other => panic!("expected a transfer completion from the guest ring, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2756,7 +2875,10 @@ mod tests {
                 break;
             }
         }
-        assert!(got, "guest produced no serial output under the production IRQ chip");
+        assert!(
+            got,
+            "guest produced no serial output under the production IRQ chip"
+        );
         assert_eq!(&*captured.lock().unwrap(), b"OK");
     }
 }

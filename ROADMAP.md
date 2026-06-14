@@ -1601,12 +1601,21 @@ Physical USB Devices
 > controller fetches command TRBs from the guest's `CRCR` via `GuestRingCursor`,
 > falling back to its internal queue only when `CRCR` is unprogrammed), and
 > **device contexts are dereferenced from `DCBAAP`** (Enable/Disable/Configure
-> publish the output context into guest memory). **Still remaining for Phase 4:**
-> guest-resident **transfer rings** — `process_transfer_ring` still drains an
-> internal `TransferRing` per `(slot, dci)` rather than fetching TRBs from the
-> endpoint context's TR Dequeue Pointer in guest memory (the command-ring
-> `GuestRingCursor` pattern is the template); the libusb-backed `UsbDeviceModel`
-> forwarder for physical devices; the TUI USB tab. (Configure Endpoint context
+> publish the output context into guest memory).
+
+> **Status (2026-06-14b):** **transfer rings are now guest-resident too — every
+> xHCI ring is fetched from guest memory.** `process_transfer_ring` drains the
+> internal `submit_transfer` ring (legacy modelling path) and then, behind an
+> opt-in `set_guest_resident_transfers` flag (the run-loop controller enables
+> it), fetches TRBs from the endpoint context's TR Dequeue Pointer via a
+> persistent per-`(slot, dci)` `GuestRingCursor` (`gather_transfer_td`), feeding
+> the existing `execute_control_td`/`execute_normal_td`. Cursor lifecycle is
+> invalidated at Configure Endpoint, Set TR Dequeue Pointer (which now also works
+> for context-only endpoints like EP0), Reset Device, and Disable Slot. Proven
+> end-to-end: a control GET_DESCRIPTOR DMAs the descriptor into a guest buffer,
+> and the StandardPc run loop drives a guest transfer through `service_usb_dma`.
+> **Still remaining for Phase 4:** the libusb-backed `UsbDeviceModel` forwarder
+> for physical devices (host side); the TUI USB tab. (Configure Endpoint context
 > handling is already implemented.)
 
 ### 4.4 Virtual xHCI Controller

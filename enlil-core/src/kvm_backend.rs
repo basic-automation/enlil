@@ -588,6 +588,28 @@ mod linux {
             }
         }
 
+        /// Arm (or disarm) a vCPU's KVM immediate-exit flag.
+        ///
+        /// With it armed, the next [`run_vcpu`](Self::run_vcpu) returns
+        /// [`GuestExit::Interrupted`] without entering the guest — and an
+        /// arm-from-another-thread *while* `KVM_RUN` is in flight kicks the
+        /// vCPU straight back out. This is the bound the run loop needs over an
+        /// otherwise-unbounded `KVM_RUN`: with the in-kernel IRQ chip a guest
+        /// that idles in `HLT` (or spins without exiting) never returns on its
+        /// own, so a watchdog arms this to reclaim the thread. The caller
+        /// disarms it (pass `false`) after the run returns before re-entering.
+        ///
+        /// # Errors
+        /// Returns [`Error::Vcpu`] if `index` is out of range.
+        pub fn set_immediate_exit(&mut self, index: usize, armed: bool) -> Result<()> {
+            let vcpu = self
+                .vcpus
+                .get_mut(index)
+                .ok_or_else(|| Error::Vcpu(format!("no vcpu at index {index}")))?;
+            vcpu.set_kvm_immediate_exit(u8::from(armed));
+            Ok(())
+        }
+
         /// Translate a single `kvm-ioctls` exit into a [`GuestExit`], invoking
         /// the handler for data transfer. Split out so the mapping is easy to
         /// reason about.
@@ -904,6 +926,56 @@ mod tests {
         let mut buf = [0u8; 1];
         assert!(mem.read(DATA_GPA, &mut buf));
         assert_eq!(buf, [0x42]);
+    }
+
+    // The immediate-exit flag bounds an otherwise-unbounded run: a guest that
+    // spins forever with no exit (`jmp $`) would block KVM_RUN indefinitely,
+    // but with immediate-exit armed run_vcpu returns Interrupted at once. This
+    // is the watchdog primitive for the in-kernel-IRQ-chip HLT-idle case.
+    // Self-skips without /dev/kvm rather than faking it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn immediate_exit_bounds_an_unending_run() {
+        if !is_kvm_available() {
+            eprintln!("skipping immediate_exit_bounds_an_unending_run: no /dev/kvm");
+            return;
+        }
+
+        // 16-bit real-mode `jmp $` — an infinite loop that produces no exit, so
+        // without the immediate-exit bound KVM_RUN would never return.
+        #[rustfmt::skip]
+        let code: [u8; 2] = [0xEB, 0xFE];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        // Arm the bound, then run: the spinning guest is kicked straight back
+        // out instead of blocking the thread forever.
+        backend
+            .set_immediate_exit(0, true)
+            .expect("arm immediate exit");
+        assert_eq!(
+            backend.run_vcpu(0, &mut NoopHandler).expect("run vcpu"),
+            GuestExit::Interrupted
+        );
+
+        // Disarmed, the same run would re-enter the spin — so just confirm the
+        // flag clears without error (the run loop disarms after a kick).
+        backend
+            .set_immediate_exit(0, false)
+            .expect("disarm immediate exit");
     }
 
     /// A do-nothing [`VmExitHandler`] for guests that only touch RAM.

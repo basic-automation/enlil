@@ -45,7 +45,7 @@ pub use registers::{
 };
 pub use ring::{CommandRing, TransferRing, TrbRing};
 pub use transfer::{
-    gather_transfer_td, CONTROL_DCI, DmaMemory, SetupPacket, TransferTrb, TransferType,
-    VecDmaMemory,
+    CONTROL_DCI, DmaMemory, SetupPacket, TransferTrb, TransferType, VecDmaMemory,
+    gather_transfer_td,
 };
 pub use trb::{CommandTrb, EventTrb, NormalTrb, Trb, TrbCompletionCode, TrbType};

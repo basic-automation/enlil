@@ -40,6 +40,7 @@ use super::xhci::registers::XECP_OFFSET;
 use super::xhci::ring::GuestRingCursor;
 use super::xhci::transfer::{
     CONTROL_DCI, DmaMemory, SetupPacket, TransferTrb, dci_endpoint_number, dci_is_in,
+    gather_transfer_td,
 };
 use super::xhci::{
     CapabilityRegisters, CommandRing, CommandTrb, DoorbellArray, DoorbellTarget, EventRing,
@@ -55,6 +56,10 @@ const USBSTS_PCD: u32 = 1 << 4;
 /// Commands executed per doorbell-0 service at most, bounding a guest that
 /// authors a self-linking command ring of forever-valid TRBs.
 const COMMAND_BURST_LIMIT: usize = 256;
+/// Transfer Descriptors processed per endpoint doorbell at most, bounding a
+/// guest that authors a self-linking transfer ring (the transfer-ring analogue
+/// of [`COMMAND_BURST_LIMIT`]).
+const TRANSFER_BURST_LIMIT: usize = 256;
 
 /// The per-guest virtual xHCI controller.
 ///
@@ -99,6 +104,17 @@ pub struct VirtualXhciController {
     /// The port each slot's model was bound from (the model parks there
     /// again on Disable Slot, so the guest can re-enumerate it).
     slot_ports: BTreeMap<u8, usize>,
+    /// Opt-in: when set, an endpoint with no enqueued internal TRBs has its
+    /// transfer ring fetched from guest memory at the endpoint context's TR
+    /// Dequeue Pointer (the real hardware path). Off by default so the legacy
+    /// [`submit_transfer`](Self::submit_transfer) modelling path — and every
+    /// test that uses it — is unaffected. The KVM run loop enables it.
+    guest_resident_transfers: bool,
+    /// Per-(slot ID, DCI) consumer cursor for a guest-memory transfer ring,
+    /// established from the endpoint context's TR Dequeue Pointer and
+    /// re-established whenever that pointer changes (Configure Endpoint, Set TR
+    /// Dequeue Pointer) or the endpoint is torn down (Reset/Disable).
+    guest_transfer_rings: BTreeMap<(u8, u8), GuestRingCursor>,
 }
 
 /// Where slot's EP0 is within the Setup → Data → Status sequence.
@@ -142,7 +158,18 @@ impl VirtualXhciController {
             control_state: BTreeMap::new(),
             port_models: (0..num_ports).map(|_| None).collect(),
             slot_ports: BTreeMap::new(),
+            guest_resident_transfers: false,
+            guest_transfer_rings: BTreeMap::new(),
         }
+    }
+
+    /// Enable (or disable) guest-resident transfer rings: when enabled, an
+    /// endpoint with no enqueued internal TRBs is driven from its guest-memory
+    /// ring at the endpoint context's TR Dequeue Pointer (the real hardware
+    /// path). Off by default so the legacy [`submit_transfer`](Self::submit_transfer)
+    /// path is unchanged; the KVM run loop turns it on.
+    pub const fn set_guest_resident_transfers(&mut self, enabled: bool) {
+        self.guest_resident_transfers = enabled;
     }
 
     /// Read a 32-bit register at `offset` within the controller's MMIO window.
@@ -405,6 +432,8 @@ impl VirtualXhciController {
                 self.transfer_rings.retain(|(slot, _), _| *slot != slot_id);
                 self.endpoint_configs
                     .retain(|(slot, _), _| *slot != slot_id);
+                self.guest_transfer_rings
+                    .retain(|(slot, _), _| *slot != slot_id);
                 let model = self.device_models.remove(&slot_id);
                 if let Some(port) = self.slot_ports.remove(&slot_id)
                     && let Some(parked) = self.port_models.get_mut(port)
@@ -609,6 +638,7 @@ impl VirtualXhciController {
             if control.drops(dci) {
                 self.transfer_rings.remove(&(slot_id, dci));
                 self.endpoint_configs.remove(&(slot_id, dci));
+                self.guest_transfer_rings.remove(&(slot_id, dci));
                 dropped.push(dci);
             }
         }
@@ -618,6 +648,9 @@ impl VirtualXhciController {
             ring.ring_mut().set_base_addr(context.tr_dequeue_pointer);
             self.transfer_rings.insert((slot_id, dci), ring);
             self.endpoint_configs.insert((slot_id, dci), context);
+            // A re-added endpoint may declare a new TR Dequeue Pointer; drop any
+            // stale guest cursor so it rebuilds from the new context.
+            self.guest_transfer_rings.remove(&(slot_id, dci));
         }
         self.publish_configured_context(slot_id, input_context_ptr, &added_dcis, &dropped, mem);
         TrbCompletionCode::Success
@@ -783,14 +816,30 @@ impl VirtualXhciController {
         if self.slot_dependent_success(slot_id) != TrbCompletionCode::Success {
             return TrbCompletionCode::TrbError;
         }
-        let Some(ring) = self.transfer_rings.get_mut(&(slot_id, endpoint_id)) else {
+        // The endpoint must exist either as an internal ring (legacy path) or as
+        // a declared endpoint context (guest-resident path — EP0 after Address
+        // Device has a context but no internal ring). Repointing an unknown
+        // endpoint is a Context State Error.
+        let has_internal = self.transfer_rings.contains_key(&(slot_id, endpoint_id));
+        let has_context = self.endpoint_configs.contains_key(&(slot_id, endpoint_id));
+        if !has_internal && !has_context {
             return TrbCompletionCode::ContextStateError;
-        };
-        ring.reset();
-        let inner = ring.ring_mut();
-        inner.set_base_addr(dequeue_ptr);
-        inner.set_cycle_state(dcs);
-        inner.start();
+        }
+        if let Some(ring) = self.transfer_rings.get_mut(&(slot_id, endpoint_id)) {
+            ring.reset();
+            let inner = ring.ring_mut();
+            inner.set_base_addr(dequeue_ptr);
+            inner.set_cycle_state(dcs);
+            inner.start();
+        }
+        // Keep the endpoint context (the guest-resident path's source of truth)
+        // in step with the repositioned ring, and drop any live guest cursor so
+        // it rebuilds from the new dequeue pointer.
+        if let Some(ctx) = self.endpoint_configs.get_mut(&(slot_id, endpoint_id)) {
+            ctx.tr_dequeue_pointer = dequeue_ptr & !0xF;
+            ctx.dequeue_cycle_state = dcs;
+        }
+        self.guest_transfer_rings.remove(&(slot_id, endpoint_id));
         TrbCompletionCode::Success
     }
 
@@ -806,6 +855,8 @@ impl VirtualXhciController {
         self.transfer_rings
             .retain(|&(slot, dci), _| slot != slot_id || dci <= CONTROL_DCI);
         self.endpoint_configs
+            .retain(|&(slot, dci), _| slot != slot_id || dci <= CONTROL_DCI);
+        self.guest_transfer_rings
             .retain(|&(slot, dci), _| slot != slot_id || dci <= CONTROL_DCI);
         self.control_state.remove(&slot_id);
         if self.op.dcbaap != 0
@@ -962,6 +1013,29 @@ impl VirtualXhciController {
         if !self.slot_enabled(slot_id) {
             return;
         }
+        // A halted endpoint processes nothing until Reset Endpoint clears it
+        // (neither the internal nor the guest-resident path).
+        if self
+            .transfer_rings
+            .get(&(slot_id, dci))
+            .is_some_and(TransferRing::is_halted)
+        {
+            return;
+        }
+        // Internal (submit_transfer) modelling path: drain enqueued TRBs first.
+        self.drain_internal_transfer_ring(slot_id, dci, mem);
+        // Guest-resident path (opt-in): fetch TRBs from the endpoint's guest
+        // ring at its TR Dequeue Pointer — the real hardware path.
+        if self.guest_resident_transfers {
+            self.process_guest_transfer_ring(slot_id, dci, mem);
+        }
+    }
+
+    /// Drain the in-process [`TransferRing`] an endpoint accumulated via
+    /// [`submit_transfer`](Self::submit_transfer) — the legacy modelling path,
+    /// run before the guest-resident path. Stops at a halt, an empty ring, or
+    /// a missing ring.
+    fn drain_internal_transfer_ring(&mut self, slot_id: u8, dci: u8, mem: &mut dyn DmaMemory) {
         loop {
             let Some(ring) = self.transfer_rings.get_mut(&(slot_id, dci)) else {
                 return;
@@ -990,6 +1064,65 @@ impl VirtualXhciController {
                 }
             }
         }
+    }
+
+    /// Drain an endpoint's **guest-memory** transfer ring (the
+    /// `guest_resident_transfers` path): fetch TDs from the endpoint context's
+    /// TR Dequeue Pointer via a persistent [`GuestRingCursor`] and execute
+    /// them, exactly as the internal path executes `submit_transfer`'d TDs.
+    /// Bounded per doorbell so a self-linking ring can't wedge the controller;
+    /// stops at a halt (a STALL'd TD) or when the ring's cycle bit says it is
+    /// exhausted.
+    fn process_guest_transfer_ring(&mut self, slot_id: u8, dci: u8, mem: &mut dyn DmaMemory) {
+        if self
+            .transfer_rings
+            .get(&(slot_id, dci))
+            .is_some_and(TransferRing::is_halted)
+        {
+            return;
+        }
+        // The endpoint must have declared a guest-memory ring in its context.
+        let (deq, dcs) = match self.endpoint_configs.get(&(slot_id, dci)) {
+            Some(ctx) if ctx.tr_dequeue_pointer != 0 => {
+                (ctx.tr_dequeue_pointer, ctx.dequeue_cycle_state)
+            }
+            _ => return,
+        };
+        let mut cursor = self
+            .guest_transfer_rings
+            .remove(&(slot_id, dci))
+            .unwrap_or_else(|| GuestRingCursor::new(deq, dcs));
+        for _ in 0..TRANSFER_BURST_LIMIT {
+            match gather_transfer_td(&mut cursor, &*mem) {
+                Ok(td) if td.is_empty() => break,
+                Ok(td) => {
+                    if dci == CONTROL_DCI {
+                        self.execute_control_td(slot_id, &td, mem);
+                    } else {
+                        self.execute_normal_td(slot_id, dci, &td, mem);
+                    }
+                    // A TD that halted the endpoint (STALL) stops the burst.
+                    if self
+                        .transfer_rings
+                        .get(&(slot_id, dci))
+                        .is_some_and(TransferRing::is_halted)
+                    {
+                        break;
+                    }
+                }
+                Err(trb_pointer) => {
+                    self.post_transfer_event(
+                        trb_pointer,
+                        0,
+                        TrbCompletionCode::TrbError,
+                        slot_id,
+                        dci,
+                    );
+                    break;
+                }
+            }
+        }
+        self.guest_transfer_rings.insert((slot_id, dci), cursor);
     }
 
     /// Gather one TD off the ring: TRBs chain while the chain bit is set,
@@ -2160,6 +2293,269 @@ mod tests {
             &mut ep0_out
         ));
         assert_eq!(ep0_out[0] & 0x7, EpState::Running as u8);
+    }
+
+    // With guest-resident transfers enabled, an endpoint with nothing enqueued
+    // via submit_transfer is driven straight from its guest-memory ring at the
+    // endpoint context's TR Dequeue Pointer — the real hardware path. A No-Op
+    // transfer TRB the "guest" wrote into EP0's ring is fetched and completed.
+    #[test]
+    fn guest_resident_transfer_ring_is_driven_from_guest_memory() {
+        use super::super::emulated::LoopbackDevice;
+        use super::super::xhci::VecDmaMemory;
+        use super::super::xhci::transfer::TransferTrb;
+
+        // EP0's guest-memory transfer ring.
+        const RING: u64 = 0x4000;
+
+        let mut c = running_controller();
+        c.set_guest_resident_transfers(true);
+        let mut mem = VecDmaMemory::new(0x1000, 0x6000);
+        let dcbaap = 0x2000_u64;
+        let out_ctx = 0x3000_u64;
+        let op = u32::from(c.caps.caplength);
+        c.write_register(op + 0x30, u32_of(dcbaap));
+        assert!(mem.write(dcbaap + 8, &out_ctx.to_le_bytes()));
+
+        // Park a loopback at port 1 and address it; EP0's ring lives at 0x4000.
+        let port = c
+            .attach_device_with_model(
+                UsbSpeed::High,
+                Box::new(LoopbackDevice::new(0x1234, 0x5678)),
+            )
+            .unwrap();
+        let _ = c.pop_event();
+        let addr_in = 0x1000_u64;
+        assert!(mem.write(addr_in + 4, &0x3_u32.to_le_bytes())); // A0|A1
+        assert!(mem.write(
+            addr_in + 0x24,
+            &(u32::try_from(port + 1).unwrap() << 16).to_le_bytes()
+        ));
+        let ep0 = EndpointContext {
+            endpoint_type: super::super::xhci::EndpointType::Control,
+            max_packet_size: 64,
+            max_burst_size: 0,
+            error_count: 3,
+            interval: 0,
+            tr_dequeue_pointer: RING,
+            dequeue_cycle_state: true,
+            average_trb_length: 8,
+        };
+        assert!(mem.write(
+            addr_in + input_context_entry_offset(CONTROL_DCI),
+            &ep0.to_bytes()
+        ));
+        c.submit_command(&CommandTrb::EnableSlot);
+        c.submit_command(&CommandTrb::AddressDevice {
+            slot_id: 1,
+            input_context_ptr: addr_in,
+        });
+        c.write_register(c.caps.dboff, 0);
+        c.service_doorbells(&mut mem);
+        let _ = c.pop_event();
+        let _ = c.pop_event();
+
+        // The "guest" writes a No-Op transfer TRB into EP0's ring (cycle = 1, the
+        // initial Consumer Cycle State) — no submit_transfer is used.
+        assert!(mem.write(
+            RING,
+            &TransferTrb::NoOp { ioc: true }.to_trb(true).to_bytes()
+        ));
+
+        // Ring the EP0 doorbell: the ring is fetched from guest memory and the
+        // No-Op completes with Success.
+        ring_and_service(&mut c, CONTROL_DCI, &mut mem);
+        match c.pop_event() {
+            Some(EventTrb::TransferEvent {
+                completion_code, ..
+            }) => assert_eq!(completion_code as u8, TrbCompletionCode::Success as u8),
+            other => panic!("expected a transfer completion from the guest ring, got {other:?}"),
+        }
+
+        // With the flag OFF the same doorbell processes nothing (no enqueued
+        // internal TRBs) — proving the guest path is what drove the completion.
+        c.set_guest_resident_transfers(false);
+        assert!(mem.write(
+            RING + 16,
+            &TransferTrb::NoOp { ioc: true }.to_trb(true).to_bytes()
+        ));
+        ring_and_service(&mut c, CONTROL_DCI, &mut mem);
+        assert!(c.pop_event().is_none());
+    }
+
+    /// A running controller with guest-resident transfers enabled and a
+    /// loopback device addressed at slot 1, EP0's transfer ring placed at
+    /// `ring` in guest memory. Returns it with the backing memory.
+    fn guest_addressed_controller(
+        ring: u64,
+    ) -> (VirtualXhciController, super::super::xhci::VecDmaMemory) {
+        use super::super::emulated::LoopbackDevice;
+        use super::super::xhci::VecDmaMemory;
+
+        let mut c = running_controller();
+        c.set_guest_resident_transfers(true);
+        let mut mem = VecDmaMemory::new(0x1000, 0x6000);
+        let dcbaap = 0x2000_u64;
+        let out_ctx = 0x3000_u64;
+        let op = u32::from(c.caps.caplength);
+        c.write_register(op + 0x30, u32_of(dcbaap));
+        assert!(mem.write(dcbaap + 8, &out_ctx.to_le_bytes()));
+
+        let port = c
+            .attach_device_with_model(
+                UsbSpeed::High,
+                Box::new(LoopbackDevice::new(0x1234, 0x5678)),
+            )
+            .unwrap();
+        let _ = c.pop_event();
+        let addr_in = 0x1000_u64;
+        assert!(mem.write(addr_in + 4, &0x3_u32.to_le_bytes())); // A0|A1
+        assert!(mem.write(
+            addr_in + 0x24,
+            &(u32::try_from(port + 1).unwrap() << 16).to_le_bytes()
+        ));
+        let ep0 = EndpointContext {
+            endpoint_type: super::super::xhci::EndpointType::Control,
+            max_packet_size: 64,
+            max_burst_size: 0,
+            error_count: 3,
+            interval: 0,
+            tr_dequeue_pointer: ring,
+            dequeue_cycle_state: true,
+            average_trb_length: 8,
+        };
+        assert!(mem.write(
+            addr_in + input_context_entry_offset(CONTROL_DCI),
+            &ep0.to_bytes()
+        ));
+        c.submit_command(&CommandTrb::EnableSlot);
+        c.submit_command(&CommandTrb::AddressDevice {
+            slot_id: 1,
+            input_context_ptr: addr_in,
+        });
+        let db = c.caps.dboff;
+        c.write_register(db, 0);
+        c.service_doorbells(&mut mem);
+        let _ = c.pop_event();
+        let _ = c.pop_event();
+        (c, mem)
+    }
+
+    // A full multi-TD control transfer (Setup → Data IN → Status) fetched from
+    // the guest's EP0 ring in one doorbell: the cursor advances across the
+    // three TDs and the loopback's device descriptor is DMA'd into the guest
+    // data buffer — proving the guest-resident path moves data, not just NoOps.
+    #[test]
+    fn guest_resident_control_transfer_fills_a_guest_buffer() {
+        use super::super::xhci::transfer::{SetupPacket, TransferTrb, TransferType};
+
+        const RING: u64 = 0x4000;
+        let (mut c, mut mem) = guest_addressed_controller(RING);
+
+        let setup = SetupPacket {
+            request_type: 0x80,
+            request: 6,
+            value: 0x0100,
+            index: 0,
+            length: 18,
+        };
+        let trbs = [
+            TransferTrb::Setup {
+                packet: setup,
+                transfer_type: TransferType::InData,
+                ioc: false,
+            },
+            TransferTrb::Data {
+                buffer: 0x1100,
+                length: 18,
+                dir_in: true,
+                chain: false,
+                ioc: false,
+            },
+            TransferTrb::Status {
+                dir_in: false,
+                ioc: true,
+            },
+        ];
+        for (i, t) in trbs.iter().enumerate() {
+            assert!(mem.write(RING + (i as u64) * 16, &t.to_trb(true).to_bytes()));
+        }
+
+        // One EP0 doorbell drains all three TDs from guest memory.
+        ring_and_service(&mut c, CONTROL_DCI, &mut mem);
+
+        // The 18-byte device descriptor landed in the guest buffer at 0x1100.
+        let bytes = mem.bytes();
+        assert_eq!(bytes[0x100], 18, "bLength");
+        assert_eq!(bytes[0x101], 1, "bDescriptorType DEVICE");
+        assert_eq!(&bytes[0x108..0x10C], &[0x34, 0x12, 0x78, 0x56], "VID/PID");
+
+        // The IOC'd status stage posted a Success transfer event.
+        match c.pop_event() {
+            Some(EventTrb::TransferEvent {
+                completion_code, ..
+            }) => assert_eq!(completion_code as u8, TrbCompletionCode::Success as u8),
+            other => panic!("expected a success transfer event, got {other:?}"),
+        }
+    }
+
+    // Set TR Dequeue Pointer repositions the guest-resident cursor: after a
+    // first TD is consumed from one ring address, the command moves the
+    // endpoint to a new ring, and the next doorbell fetches from there —
+    // proving the cursor is invalidated and rebuilt from the updated context.
+    #[test]
+    fn guest_resident_cursor_follows_set_tr_dequeue_pointer() {
+        use super::super::xhci::transfer::TransferTrb;
+
+        const RING_A: u64 = 0x4000;
+        const RING_B: u64 = 0x5000;
+        let (mut c, mut mem) = guest_addressed_controller(RING_A);
+
+        // First doorbell: a No-Op from ring A completes.
+        assert!(mem.write(
+            RING_A,
+            &TransferTrb::NoOp { ioc: true }.to_trb(true).to_bytes()
+        ));
+        ring_and_service(&mut c, CONTROL_DCI, &mut mem);
+        assert!(matches!(
+            c.pop_event(),
+            Some(EventTrb::TransferEvent { .. })
+        ));
+
+        // Set TR Dequeue Pointer moves EP0 to ring B (DCS = 1).
+        c.submit_command(&CommandTrb::SetTrDequeuePointer {
+            slot_id: 1,
+            endpoint_id: CONTROL_DCI,
+            dequeue_ptr: RING_B,
+            dcs: true,
+        });
+        let db = c.caps.dboff;
+        c.write_register(db, 0);
+        c.service_doorbells(&mut mem);
+        // The Set TR Dequeue Pointer command itself must succeed.
+        match c.pop_event() {
+            Some(EventTrb::CommandCompletion {
+                completion_code, ..
+            }) => assert_eq!(
+                completion_code as u8,
+                TrbCompletionCode::Success as u8,
+                "Set TR Dequeue Pointer must succeed"
+            ),
+            other => panic!("expected a command completion, got {other:?}"),
+        }
+
+        // A No-Op placed in ring B is now what the next doorbell fetches.
+        assert!(mem.write(
+            RING_B,
+            &TransferTrb::NoOp { ioc: true }.to_trb(true).to_bytes()
+        ));
+        ring_and_service(&mut c, CONTROL_DCI, &mut mem);
+        match c.pop_event() {
+            Some(EventTrb::TransferEvent {
+                completion_code, ..
+            }) => assert_eq!(completion_code as u8, TrbCompletionCode::Success as u8),
+            other => panic!("expected a transfer event from ring B, got {other:?}"),
+        }
     }
 
     #[test]

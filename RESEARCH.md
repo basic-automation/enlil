@@ -1262,3 +1262,23 @@ bisecting a direct `kvm-ioctls` probe on this host (AMD SVM, nested virt).
   to userspace as `KVM_EXIT_MMIO`. → real-mode smoke tests can exercise the
   full MMIO device path (not just PIO) without entering protected mode, which
   is how the xHCI doorbell/ring DMA path is now tested end-to-end.
+
+## 2026-06-14 (b) — xHCI transfer rings resident in guest memory (Phase 4)
+
+Source: xHCI 1.2 §4.9 (Transfer Rings) and §6.2.3 (Endpoint Context — the TR
+Dequeue Pointer + Dequeue Cycle State field), cross-checked against ACRN's
+doorbell-deferred ring processing (already logged 2026-06-02).
+
+- A guest's transfer ring lives entirely in guest memory; the controller learns
+  its start address and initial cycle state from the **endpoint context's TR
+  Dequeue Pointer** (set by Address Device for EP0 / Configure Endpoint for
+  other endpoints, repositioned by Set TR Dequeue Pointer). → our controller
+  now persists a per-`(slot, dci)` `GuestRingCursor` built from that field and
+  advances it across doorbells, instead of an internal `submit_transfer` queue.
+- **Set TR Dequeue Pointer applies to any declared endpoint, not only ones with
+  an in-process ring.** EP0 has a context but (in our model) no internal ring,
+  so the command must work off the endpoint context — which is also the natural
+  home for the dequeue pointer once rings are guest-resident. → repointing now
+  succeeds for context-only endpoints and updates the context (the cursor's
+  source of truth); it remains a Context State Error only for wholly unknown
+  endpoints.
