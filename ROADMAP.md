@@ -1597,10 +1597,15 @@ Physical USB Devices
 > is the run loop's USB DMA entry point: a guest doorbell write latches in
 > `XhciMmio`, and `service_usb_dma` drains it against guest memory (command/
 > transfer rings → events) — closing the "waits on the KVM run loop" gap for
-> the `DmaMemory` seam. **Still remaining for Phase 4:** rings/contexts actually
-> fetched from the guest's `CRCR`/`DCBAAP` (the seam and the run-loop call are
-> ready; the controller still uses its internal command/transfer queues rather
-> than dereferencing guest-resident rings); the libusb-backed `UsbDeviceModel`
+> the `DmaMemory` seam. The **command ring is already guest-resident** (the
+> controller fetches command TRBs from the guest's `CRCR` via `GuestRingCursor`,
+> falling back to its internal queue only when `CRCR` is unprogrammed), and
+> **device contexts are dereferenced from `DCBAAP`** (Enable/Disable/Configure
+> publish the output context into guest memory). **Still remaining for Phase 4:**
+> guest-resident **transfer rings** — `process_transfer_ring` still drains an
+> internal `TransferRing` per `(slot, dci)` rather than fetching TRBs from the
+> endpoint context's TR Dequeue Pointer in guest memory (the command-ring
+> `GuestRingCursor` pattern is the template); the libusb-backed `UsbDeviceModel`
 > forwarder for physical devices; the TUI USB tab. (Configure Endpoint context
 > handling is already implemented.)
 
