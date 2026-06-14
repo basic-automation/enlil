@@ -2371,4 +2371,79 @@ mod tests {
         // DeviceBus → SerialPort → UART path and landed in the shared sink.
         assert_eq!(&*captured.lock().unwrap(), b"OK");
     }
+
+    // Proves the *input* (`in`) path end-to-end on real KVM: the guest reads
+    // the COM1 line-status register, and the byte the SerialPort returns has to
+    // flow device → KVM `KVM_EXIT_IO`(in) → guest `AL` → KVM `KVM_EXIT_IO`(out)
+    // → SerialPort sink. The smoke test above only covers the output path.
+    //
+    // Self-skips when `/dev/kvm` is unavailable rather than faking a pass.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn serial_input_path_smoke() {
+        use crate::kvm_backend::{is_kvm_available, GuestExit, GuestRam, KvmBackend};
+        use crate::serial::{SerialOutput, SerialOutputMode, SerialPort};
+        use std::sync::{Arc, Mutex};
+
+        if !is_kvm_available() {
+            eprintln!("skipping serial_input_path_smoke: /dev/kvm not available");
+            return;
+        }
+
+        // 16-bit real-mode blob: read COM1 LSR into AL, echo AL to COM1, halt.
+        //   BA FD 03   mov dx, 0x3FD   ; line-status register
+        //   EC         in  al, dx      ; al = LSR (0x60 = THRE|TEMT, idle UART)
+        //   BA F8 03   mov dx, 0x3F8   ; transmit holding register
+        //   EE         out dx, al      ; echo the status byte back out
+        //   F4         hlt
+        #[rustfmt::skip]
+        let code: [u8; 9] = [
+            0xBA, 0xFD, 0x03,
+            0xEC,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0xF4,
+        ];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        // No in-kernel IRQ chip, so `HLT` exits to userspace (see the smoke
+        // test above for why).
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let serial = SerialPort::com1(SerialOutput::new(
+            "in-smoke",
+            SerialOutputMode::Shared(Arc::clone(&captured)),
+        ));
+        let mut bus = DeviceBus::new();
+        bus.add_serial(serial).unwrap();
+
+        let mut halted = false;
+        for _ in 0..100 {
+            let exit = backend.run_vcpu(0, &mut bus).expect("run vcpu");
+            if exit == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+
+        // The single byte echoed back is exactly the LSR value the SerialPort
+        // computed on the `in` exit — an idle UART reports THRE|TEMT (0x60) —
+        // proving the device's input data reached the guest register and
+        // round-tripped back out through the bus on real KVM.
+        assert_eq!(&*captured.lock().unwrap(), &[0x60]);
+    }
 }
