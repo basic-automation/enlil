@@ -144,6 +144,7 @@ impl VmExitHandler for RecordingHandler {
 mod linux {
     use super::{GuestExit, VmExitHandler};
     use crate::error::{Error, Result};
+    use enlil_devices::usb::xhci::transfer::DmaMemory;
     use kvm_bindings::kvm_userspace_memory_region;
     use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
     use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
@@ -272,6 +273,78 @@ mod linux {
         pub guest_phys_addr: u64,
         /// Region size in bytes.
         pub size: u64,
+        /// Host virtual base address backing this region — the same
+        /// `host_addr` passed to [`KvmBackend::map_memory`]. Retained so the
+        /// hypervisor can translate guest-physical addresses back to host
+        /// pointers for device DMA (see [`GuestMemory`]).
+        pub host_addr: u64,
+    }
+
+    /// A device-facing view over a VM's registered guest-physical memory.
+    ///
+    /// Emulated devices (xHCI rings/contexts, virtio queues, …) DMA into and
+    /// out of guest RAM through the [`DmaMemory`] seam. This view translates a
+    /// guest-physical address to the host pointer of whichever registered
+    /// [`MemSlot`] contains it and copies through it. Obtain one with
+    /// [`KvmBackend::guest_memory`].
+    ///
+    /// It borrows the backend's slot table, so it cannot outlive the VM; the
+    /// raw-pointer accesses are sound by the same contract that
+    /// [`KvmBackend::map_memory`] already requires (each registered region is a
+    /// valid host mapping for the VM's lifetime). A single access must fall
+    /// entirely within one slot, mirroring how the guest sees discontiguous
+    /// physical regions.
+    pub struct GuestMemory<'a> {
+        slots: &'a [MemSlot],
+    }
+
+    impl<'a> GuestMemory<'a> {
+        /// Build a DMA view over a slot table. Usually obtained via
+        /// [`KvmBackend::guest_memory`]; exposed directly so a slot table can
+        /// be wrapped without a live VM (e.g. in tests).
+        #[must_use]
+        pub fn new(slots: &'a [MemSlot]) -> Self {
+            Self { slots }
+        }
+
+        /// Host pointer for `[addr, addr + len)` if it lies wholly within one
+        /// registered slot, else `None`.
+        fn host_ptr(&self, addr: u64, len: usize) -> Option<*mut u8> {
+            let len = len as u64;
+            for s in self.slots {
+                let Some(offset) = addr.checked_sub(s.guest_phys_addr) else {
+                    continue;
+                };
+                if offset.checked_add(len).is_some_and(|end| end <= s.size) {
+                    // `host_addr` is page-aligned and `offset < size`, so this
+                    // stays within the registered region.
+                    return Some((s.host_addr + offset) as *mut u8);
+                }
+            }
+            None
+        }
+    }
+
+    impl DmaMemory for GuestMemory<'_> {
+        fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+            let Some(ptr) = self.host_ptr(addr, buf.len()) else {
+                return false;
+            };
+            // SAFETY: `host_ptr` returned a pointer to `buf.len()` bytes inside
+            // a registered region, whose host mapping `map_memory`'s contract
+            // guarantees valid for the VM lifetime (which outlives this view).
+            unsafe { std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), buf.len()) };
+            true
+        }
+
+        fn write(&mut self, addr: u64, data: &[u8]) -> bool {
+            let Some(ptr) = self.host_ptr(addr, data.len()) else {
+                return false;
+            };
+            // SAFETY: as `read`, with the copy going into guest memory.
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len()) };
+            true
+        }
     }
 
     /// A live KVM virtual machine plus its vCPUs.
@@ -402,6 +475,7 @@ mod linux {
                 slot,
                 guest_phys_addr,
                 size,
+                host_addr,
             };
             self.slots.push(entry);
             Ok(entry)
@@ -476,6 +550,14 @@ mod linux {
             &self.slots
         }
 
+        /// A [`DmaMemory`] view over this VM's registered guest RAM, for
+        /// emulated devices that DMA into/out of guest memory (xHCI rings,
+        /// virtio queues, …). Borrows the backend, so it cannot outlive the VM.
+        #[must_use]
+        pub fn guest_memory(&self) -> GuestMemory<'_> {
+            GuestMemory::new(&self.slots)
+        }
+
         /// Access the underlying [`Kvm`] handle (capability queries, etc.).
         #[must_use]
         pub fn kvm(&self) -> &Kvm {
@@ -547,7 +629,7 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{is_kvm_available, GuestRam, KvmBackend, MemSlot, HOST_PAGE_SIZE};
+pub use linux::{is_kvm_available, GuestMemory, GuestRam, KvmBackend, MemSlot, HOST_PAGE_SIZE};
 
 #[cfg(test)]
 mod tests {
@@ -682,5 +764,90 @@ mod tests {
         assert!(super::linux::validate_region(0x1000, 0x1000, 0).is_err());
         // A fully page-aligned region is accepted.
         assert!(super::linux::validate_region(0x1000, 0x2000, 0x1000).is_ok());
+    }
+
+    // -- GuestMemory DMA view (no KVM required) -----------------------------
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guest_memory_dma_round_trips_real_guest_ram() {
+        use enlil_devices::usb::xhci::transfer::DmaMemory;
+
+        const GPA: u64 = 0x4000;
+        let ram = GuestRam::new(HOST_PAGE_SIZE);
+        let slots = [MemSlot {
+            slot: 0,
+            guest_phys_addr: GPA,
+            size: ram.len() as u64,
+            host_addr: ram.host_addr(),
+        }];
+
+        let mut mem = GuestMemory::new(&slots);
+        assert!(mem.write(GPA + 0x10, &[0xDE, 0xAD, 0xBE, 0xEF]));
+        let mut buf = [0u8; 4];
+        assert!(mem.read(GPA + 0x10, &mut buf));
+        assert_eq!(buf, [0xDE, 0xAD, 0xBE, 0xEF]);
+
+        // The write landed in the backing RAM the guest actually sees.
+        assert_eq!(&ram.as_slice()[0x10..0x14], &[0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guest_memory_rejects_out_of_range_access() {
+        use enlil_devices::usb::xhci::transfer::DmaMemory;
+
+        const GPA: u64 = 0x4000;
+        let ram = GuestRam::new(HOST_PAGE_SIZE);
+        let size = ram.len() as u64;
+        let slots = [MemSlot {
+            slot: 0,
+            guest_phys_addr: GPA,
+            size,
+            host_addr: ram.host_addr(),
+        }];
+
+        let mut mem = GuestMemory::new(&slots);
+        let mut buf = [0u8; 8];
+        // Starts below the slot.
+        assert!(!mem.read(GPA - 1, &mut buf));
+        // Straddles the end of the slot.
+        assert!(!mem.read(GPA + size - 4, &mut buf));
+        // Entirely above the slot.
+        assert!(!mem.write(GPA + size, &[1, 2, 3, 4]));
+        // The last 8 bytes are in range.
+        assert!(mem.read(GPA + size - 8, &mut buf));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guest_memory_routes_across_multiple_slots() {
+        use enlil_devices::usb::xhci::transfer::DmaMemory;
+
+        let ram_lo = GuestRam::new(HOST_PAGE_SIZE);
+        let ram_hi = GuestRam::new(HOST_PAGE_SIZE);
+        let slots = [
+            MemSlot {
+                slot: 0,
+                guest_phys_addr: 0x1000,
+                size: ram_lo.len() as u64,
+                host_addr: ram_lo.host_addr(),
+            },
+            MemSlot {
+                slot: 1,
+                guest_phys_addr: 0x9000,
+                size: ram_hi.len() as u64,
+                host_addr: ram_hi.host_addr(),
+            },
+        ];
+
+        let mut mem = GuestMemory::new(&slots);
+        assert!(mem.write(0x1000, &[0xAA]));
+        assert!(mem.write(0x9000, &[0xBB]));
+        // The gap between the two slots is unbacked.
+        assert!(!mem.write(0x5000, &[0xCC]));
+
+        assert_eq!(ram_lo.as_slice()[0], 0xAA);
+        assert_eq!(ram_hi.as_slice()[0], 0xBB);
     }
 }
