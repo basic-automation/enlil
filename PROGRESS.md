@@ -6,7 +6,111 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
-## 2026-06-14 (b) — Session: every xHCI ring is now guest-resident + the run-loop watchdog primitive (Phase 4 / 5)
+## 2026-06-15 — Session: the Phase-5 MSR/CPUID stealth stack, end to end on real KVM
+
+**13 code + 2 doc increments, each independently green and committed** (branch
+`routine/enlil-2026-06-15`). This session built the entire MSR-exit / timing /
+PMC / LBR / CPUID **stealth integration** for the live KVM backend — from the
+exit-vocabulary seam up through a platform install seam and a run loop that
+drives the shadow counters — and proved each layer on `/dev/kvm` (which was
+read-writable this run, `KVM_RW_OK`). It then corrected three roadmap notes that
+prior runs had already addressed but left marked "remaining."
+
+### Increments (commit — what)
+1. `8d4cf36` — **model guest MSR exits in the KVM run-loop seam.** `GuestExit::MsrRead`/
+   `MsrWrite`, `VmExitHandler::rdmsr`/`wrmsr` (default: refuse → `#GP`), dispatch of
+   `VcpuExit::X86Rdmsr`/`X86Wrmsr`, and `KvmBackend::enable_userspace_msr_exits`
+   (`KVM_CAP_X86_USER_SPACE_MSR`, unknown|filter reasons).
+2. `fcba8e6` — **`enlil-core::stealth_msr::StealthMsrRouter`**: maps the MSR number space
+   onto the stealth shadows (APERF/MPERF ↔ `VcpuTimingState`, PMC ↔ `PmcState`, LBR ↔
+   `LbrState`) from one `PmcRateModel`. 9 unit tests incl. the APERF/MPERF↔RDPMC cross-check.
+3. `5eaec2e` — **serve stealth MSRs through `DeviceBus`** (`rdmsr`/`wrmsr` delegate to the
+   installed router; `set_stealth_msr_router`/`stealth_msr_mut`).
+4. `785f3a8` — **AMD last-branch-record stealth** (this host is AMD SVM): `LbrState` gains
+   the single LastBranch/LastInt pair (0x1DB–0x1DE); `sanitize_after_exit` branches on
+   platform (AMD erases the branch pair, Intel the 32-entry stack); router routes the AMD MSRs.
+5. `19553a4` — **clear the CPUID hypervisor-present bit on the live guest**
+   (`clear_cpuid_hypervisor_bit`: `GET_SUPPORTED_CPUID` → clear leaf 1 ECX[31] → `SET_CPUID2`).
+6. `c542889` — **`StandardPc::install_stealth_msr_router`**: one-call platform seam that
+   builds + seeds the router (model ratio, not the 1.0 tell) and returns the shared timing `Arc`.
+7. `2c9a251` — **docs** (RESEARCH 2026-06-15 + ROADMAP 5.3/5.4) grounding the seam in
+   the KVM API / Intel SDM / AMD APM, with the measured KVM facts.
+8. `8489754` — **`run_vcpu_timed`**: drive the timing shadows around `KVM_RUN`
+   (`on_vmresume`/`advance`/`on_vmexit`) so APERF/MPERF hide exit overhead, ratio preserved.
+9. `fb795f8` — **`KVM_X86_SET_MSR_FILTER`** (`forward_msrs_to_userspace`, raw ioctl via
+   `vmm_sys_util::ioctl_iow_nr!`): forward the *KVM-known* stealth MSRs (APERF/MPERF/PMC/
+   DEBUGCTL), which the cap alone does not reach.
+10. `73e268b` — **docs** ROADMAP 5.4 (filter + timed loop landed).
+11. `8ac6c14` — **`StealthMsrRouter::filter_ranges`**: platform-correct `(base,count)` MSR
+    ranges — one source of truth shared by the router and the KVM filter (AMD vs Intel LBR).
+12. `1eef647` — **end-to-end stealth stack test**: a guest `rdmsr` APERF reads the run-loop-
+    seeded shadow (0xBE) through install + filter + DeviceBus router, echoed out COM1.
+13. `3450094` — **`StealthMsrRouter::advance`**: drive APERF/MPERF and RDPMC from the same
+    model + delta in one call.
+14. `b94872a` — **`run_vcpu_timed` returns the guest-cycle delta** so the run loop drives the
+    (non-shared) PMC counters in lockstep with the timing shadows.
+15. `be3f462` — **docs**: corrected stale ROADMAP 5.1 (`_SRS`/`_DIS` PIRQRC reprogramming is
+    already implemented + verified) and 5.2 (`enlil-core::smbios` duplicate already removed).
+
+### Research (informed the build)
+RESEARCH.md `2026-06-15`: KVM API (`KVM_CAP_X86_USER_SPACE_MSR` / `KVM_X86_SET_MSR_FILTER`,
+`api.rst`); Intel SDM 3B / AMD APM on `IA32_APERF`/`MPERF` and the effective-frequency ratio
+an IET detector reads; AMD APM Vol. 2 LBRV (single last-branch pair, 0x1DB–0x1DE); the CPUID
+hypervisor-present bit. No new third-party research — these are the authoritative primary specs.
+
+### Test results (exact)
+- **`/dev/kvm`: read-writable (`KVM_RW_OK`).** All KVM/guest-boot tests **ran for real**
+  (none skipped). New real-KVM tests this session, all passing:
+  `rdmsr_is_forwarded_and_value_round_trips_to_guest`,
+  `cpuid_stealth_installs_real_features_without_the_hypervisor_tell` (guest reads ECX[31]=0,
+  EDX[4]/TSC=1), `msr_filter_forwards_a_kvm_known_msr` (APERF forwarded, 0xCD round-trips),
+  `run_vcpu_timed_advances_shadows_at_the_model_ratio` (APERF/MPERF + RDPMC at the 1.15
+  model ratio), `full_stealth_stack_serves_seeded_aperf_to_a_guest` (seeded 0xBE read back).
+  Prior guest-boot tests (`serial_console_smoke`, `serial_input_path_smoke`, `mmio_path_smoke`,
+  `immediate_exit_bounds_an_unending_run`, `guest_memory_*`) still pass.
+- `cargo test -p enlil-core --lib`: **174 passed, 0 failed** (started 154).
+- `cargo test -p enlil-devices --lib`: **760 passed, 0 failed** (started 756; +9 LBR/router).
+- `cargo clippy` clean for `enlil-core` and `enlil-devices` (`--lib --tests`).
+- **Toolchains:** all increments built/tested on **Linux/WSL** (nightly `x86_64-unknown-linux-gnu`);
+  every increment touching the host-agnostic surface (`enlil-core` platform-agnostic exit
+  model, `enlil-devices` `stealth::lbr`) **also built Windows-native** (`x86_64-pc-windows-msvc`
+  via the `D:\Development\.enlil-win-target` 9p path), exit 0. The KVM backend internals
+  (`#[cfg(target_os = "linux")]`) are Linux-only, so Windows compiles the agnostic parts only —
+  confirmed clean each time.
+
+### STOP REASON
+**No tractable, cleanly-decomposable unblocked item remained in the in-flight phases** — the
+wall-clock budget was *not* fully spent (~1 h elapsed). After completing the stealth vertical I
+swept the codebase: there are **no `todo!`/`unimplemented!`/`FIXME` markers**, and the items the
+roadmap still listed as "remaining" in Phases 4/5 are either already done (5.1 `_SRS`/`_DIS`,
+5.2 SMBIOS dedup — corrected this run), **architectural / multi-session** (the production
+run-loop *driver* that wires `enable_userspace_msr_exits` + `forward_msrs_to_userspace` +
+`install_stealth_msr_router` together and ticks `advance` each iteration; the threaded-vCPU
+watchdog), **hardware-blocked** (the libusb `UsbDeviceModel` forwarder needs real USB hardware),
+**UI** (the TUI USB tab), or **vacuous-to-test on this host** (merging the full
+`CpuidStealthTable` into KVM's supported set — KVM-supported already matches the host CPU for
+the non-hypervisor leaves, so there is no observable delta to assert here). Per the guardrail I
+handed off rather than start an architectural change or a hardware-/host-blocked feature I
+couldn't finish and test cleanly. Every increment is independently green; `master` stays buildable.
+
+### Recommended next step (tomorrow)
+1. **Production run-loop driver** (the highest-value next step): a struct/fn that owns a
+   `KvmBackend` + `StandardPc`, calls (in the right order) `create_vcpu` →
+   `clear_cpuid_hypervisor_bit` and, before vCPUs, `enable_userspace_msr_exits` +
+   `forward_msrs_to_userspace(router.filter_ranges())`, then loops
+   `run_vcpu_timed` → feed the returned delta to `stealth_msr_mut().advance_counters` →
+   `service_usb_dma` / `poll_platform_events` / `advance_clocks`. This is the architectural
+   piece the stealth plumbing now waits on. Consider sharing `PmcState` (Arc) to let the loop
+   advance both surfaces in one place, or keep the delta-return pattern.
+2. **Threaded-vCPU watchdog** (signal-kick from a dedicated thread; the synchronous
+   `set_immediate_exit` primitive already exists).
+3. **libusb-backed `UsbDeviceModel` forwarder** (gate on real USB hardware).
+4. **TUI USB tab** (the `enlil-mgmt::protocol` seam is ready).
+5. Lower priority: merge the full `CpuidStealthTable` (vendor/brand/topology) into KVM's
+   supported set (needs a `CpuidStealthTable::get(leaf,sub) -> Option<_>` accessor; test
+   non-vacuously by shaping topology leaf 0xB for a >1-vCPU guest).
+
+
 
 **6 increments, each independently green and committed** (branch
 `routine/enlil-2026-06-14-2`, PR https://github.com/physics515/enlil/pull/28;
