@@ -510,6 +510,43 @@ mod linux {
                 .map_err(|e| Error::HypervisorError(format!("enable X86UserSpaceMsr: {e}")))
         }
 
+        /// Clear the CPUID **hypervisor-present** tell on every vCPU.
+        ///
+        /// Starts from KVM's `KVM_GET_SUPPORTED_CPUID`, clears leaf `0x1` ECX
+        /// bit 31 (the hypervisor-present bit — the single most-checked VM tell;
+        /// no bare-metal CPU sets it), and installs the result on each vCPU via
+        /// `KVM_SET_CPUID2`. KVM's supported set does not enumerate the
+        /// `0x4000_00xx` hypervisor leaves, so they are absent (an out-of-range
+        /// leaf, exactly like bare metal) without extra work.
+        ///
+        /// This is the Phase 5.3 baseline; the full vendor/brand/topology
+        /// rewrite (`enlil_devices::stealth::cpuid::CpuidStealthTable`) is a
+        /// later step that must merge into — not exceed — KVM's ≤80-entry set.
+        ///
+        /// Call after creating vCPUs and before running them.
+        ///
+        /// # Errors
+        /// Returns [`Error::Vcpu`] if querying the supported CPUID or setting it
+        /// on a vCPU fails.
+        pub fn clear_cpuid_hypervisor_bit(&self) -> Result<()> {
+            use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
+            let mut cpuid = self
+                .kvm
+                .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
+                .map_err(|e| Error::Vcpu(format!("KVM_GET_SUPPORTED_CPUID: {e}")))?;
+            for entry in cpuid.as_mut_slice() {
+                if entry.function == 1 {
+                    // Leaf 1 ECX bit 31 = hypervisor present.
+                    entry.ecx &= !(1u32 << 31);
+                }
+            }
+            for (i, vcpu) in self.vcpus.iter().enumerate() {
+                vcpu.set_cpuid2(&cpuid)
+                    .map_err(|e| Error::Vcpu(format!("KVM_SET_CPUID2 vcpu {i}: {e}")))?;
+            }
+            Ok(())
+        }
+
         /// Map a host buffer into the guest's physical address space.
         ///
         /// `host_addr` must point to at least `size` bytes of memory that
@@ -1186,6 +1223,87 @@ mod tests {
         assert_eq!(probe.seen, Some(MSR));
         // The low byte of the supplied MSR value reached EAX and was echoed.
         assert_eq!(probe.echoed, vec![0xAB]);
+    }
+
+    // Proves clear_cpuid_hypervisor_bit() installs the host's *real* feature
+    // set on the guest with the hypervisor-present tell cleared: after applying
+    // it, a guest running CPUID leaf 1 reads ECX bit 31 (hypervisor present) as
+    // 0 *and* EDX bit 4 (TSC) as 1 — i.e. it sees genuine CPU features, not an
+    // empty CPUID, and no VM tell. (In this minimal VM KVM does not set the
+    // hypervisor bit by default, so the value of this call is installing the
+    // supported feature set with the bit guaranteed clear, not flipping a 1.)
+    // Self-skips without /dev/kvm rather than faking it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cpuid_stealth_installs_real_features_without_the_hypervisor_tell() {
+        if !is_kvm_available() {
+            eprintln!("skipping cpuid_stealth_installs_real_features_...: no /dev/kvm");
+            return;
+        }
+
+        // 16-bit real-mode blob; echoes two status bytes to COM1:
+        //   66 B8 01 00 00 00   mov eax, 1      ; CPUID leaf 1
+        //   0F A2               cpuid
+        //   66 C1 E9 1F         shr ecx, 31     ; ecx = hypervisor-present bit
+        //   88 C8               mov al, cl
+        //   BA F8 03            mov dx, 0x3F8   ; COM1
+        //   EE                  out dx, al      ; byte 0: hypervisor bit
+        //   66 C1 EA 04         shr edx, 4      ; edx bit0 = TSC feature (EDX[4])
+        //   80 E2 01            and dl, 1
+        //   88 D0               mov al, dl
+        //   EE                  out dx, al      ; byte 1: TSC bit
+        //   F4                  hlt
+        #[rustfmt::skip]
+        let code: [u8; 29] = [
+            0x66, 0xB8, 0x01, 0x00, 0x00, 0x00,
+            0x0F, 0xA2,
+            0x66, 0xC1, 0xE9, 0x1F,
+            0x88, 0xC8,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0x66, 0xC1, 0xEA, 0x04,
+            0x80, 0xE2, 0x01,
+            0x88, 0xD0,
+            0xEE,
+            0xF4,
+        ];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu");
+        backend
+            .clear_cpuid_hypervisor_bit()
+            .expect("apply cpuid stealth");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        struct EchoOut(Vec<u8>);
+        impl VmExitHandler for EchoOut {
+            fn io_out(&mut self, _port: u16, data: &[u8]) {
+                self.0.extend_from_slice(data);
+            }
+        }
+        let mut echo = EchoOut(Vec::new());
+
+        let mut halted = false;
+        for _ in 0..100 {
+            if backend.run_vcpu(0, &mut echo).expect("run vcpu") == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        // byte 0: hypervisor-present bit clear; byte 1: TSC feature present.
+        assert_eq!(echo.0, vec![0, 1]);
     }
 
     /// A do-nothing [`VmExitHandler`] for guests that only touch RAM.
