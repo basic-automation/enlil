@@ -798,6 +798,14 @@ mod linux {
         /// `model` must be the same [`PmcRateModel`] used to drive the RDPMC
         /// fixed counters, or the two stealth surfaces would disagree.
         ///
+        /// Returns the exit **and** the in-guest reference-cycle delta this
+        /// entry advanced the timing shadows by. The PMC counters live in the
+        /// handler (not shared like the timing `Arc`), so they cannot be
+        /// advanced inside this call without aliasing `handler`; instead the
+        /// run loop feeds the returned delta to `PmcState::advance_counters`
+        /// (e.g. via `bus.stealth_msr_mut()`) *after* this returns, keeping the
+        /// RDPMC surface in lockstep with APERF/MPERF at the same model rate.
+        ///
         /// [`PmcRateModel`]: enlil_devices::stealth::pmc::PmcRateModel
         ///
         /// # Errors
@@ -808,7 +816,7 @@ mod linux {
             handler: &mut dyn VmExitHandler,
             timing: &crate::timing_stealth::VcpuTimingState,
             model: &enlil_devices::stealth::pmc::PmcRateModel,
-        ) -> Result<GuestExit> {
+        ) -> Result<(GuestExit, u64)> {
             // The RIP we are about to resume at — recorded for LBR sanitization
             // (on_vmresume stashes it); 0 if regs are unreadable.
             let guest_rip = self
@@ -826,10 +834,11 @@ mod linux {
 
             // SAFETY: as above.
             let exit_tsc = unsafe { core::arch::x86_64::_rdtsc() };
-            timing.advance(exit_tsc.saturating_sub(entry_tsc), model);
+            let guest_ref_cycles = exit_tsc.saturating_sub(entry_tsc);
+            timing.advance(guest_ref_cycles, model);
             timing.on_vmexit(exit_tsc);
 
-            Ok(exit)
+            Ok((exit, guest_ref_cycles))
         }
 
         /// Arm (or disarm) a vCPU's KVM immediate-exit flag.
@@ -1487,25 +1496,43 @@ mod tests {
         // Seed so the ratio is the model's from the first read (as the platform
         // install does), not the 1.0 identity.
         timing.advance(1_000_000, &model);
+        // A PMC the run loop drives with the returned delta, in lockstep.
+        let mut pmc = enlil_devices::stealth::pmc::PmcState::new();
+        pmc.fixed_ctr_ctrl = 0x330; // core + ref fixed counters
+        pmc.rate_model = model;
 
         let mut sink = RecordingHandler::default();
         let mut halted = false;
+        let mut total_guest_cycles = 0u64;
         for _ in 0..100 {
-            if backend
+            let (exit, guest_cycles) = backend
                 .run_vcpu_timed(0, &mut sink, &timing, &model)
-                .expect("run vcpu timed")
-                == GuestExit::Halted
-            {
+                .expect("run vcpu timed");
+            // The run loop feeds the same delta to the PMC surface.
+            pmc.advance_counters(guest_cycles);
+            total_guest_cycles += guest_cycles;
+            if exit == GuestExit::Halted {
                 halted = true;
                 break;
             }
         }
         assert!(halted, "guest never reached HLT");
         assert_eq!(sink.io_out.len(), 3, "guest issued its three OUTs");
+        assert!(total_guest_cycles > 0, "run loop measured guest cycles");
 
         let aperf = timing.read_aperf();
         let mperf = timing.read_mperf();
         assert!(aperf > 0 && mperf > 0, "shadows advanced for guest execution");
+        // The PMC core counter, driven by the same per-entry deltas, tracks the
+        // APERF shadow — the two surfaces stay in lockstep through the run loop.
+        let pmc_core = pmc.read_pmc(0x4000_0001);
+        let pmc_ref = pmc.read_pmc(0x4000_0002);
+        assert!(pmc_core > 0 && pmc_ref > 0, "PMC advanced with the guest");
+        assert!(
+            (pmc_core as f64 / pmc_ref as f64 - model.core_per_kilo_ref as f64 / 1000.0).abs()
+                < 0.02,
+            "RDPMC core/ref tracks the model ratio like APERF/MPERF"
+        );
         // The APERF/MPERF ratio is the model core/ref ratio (1.15), preserved
         // across the run and the hidden exits — not the 1.0 VM tell. Tolerance
         // covers per-step integer/float rounding in advance/on_vmresume.
