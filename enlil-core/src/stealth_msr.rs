@@ -107,6 +107,26 @@ impl StealthMsrRouter {
             )
     }
 
+    /// Advance both stealth time surfaces by `ref_cycles` of guest execution.
+    ///
+    /// The run loop calls this once per guest entry (the reference-cycle delta
+    /// being the in-guest TSC delta) so the guest sees its performance counters
+    /// move forward. Crucially it drives *both* surfaces from the **same**
+    /// rate model and the **same** delta — the APERF/MPERF shadows
+    /// ([`VcpuTimingState::advance`](crate::timing_stealth::VcpuTimingState::advance)
+    /// at the PMC state's `rate_model`) and the RDPMC fixed/GP counters
+    /// ([`PmcState::advance_counters`]) — so a detector cross-checking
+    /// APERF/MPERF against `CPU_CLK_UNHALTED.THREAD / REF_TSC` finds them
+    /// consistent (the invariant [`PmcRateModel`] documents).
+    ///
+    /// [`PmcState::advance_counters`]: enlil_devices::stealth::pmc::PmcState::advance_counters
+    /// [`PmcRateModel`]: enlil_devices::stealth::pmc::PmcRateModel
+    pub fn advance(&mut self, ref_cycles: u64) {
+        let model = self.pmc.rate_model;
+        self.timing.advance(ref_cycles, &model);
+        self.pmc.advance_counters(ref_cycles);
+    }
+
     /// The MSR ranges this router answers, as `(base, count)` pairs, for the
     /// router's platform — the single source of truth to hand to
     /// [`KvmBackend::forward_msrs_to_userspace`] so the KVM filter and this
@@ -343,6 +363,33 @@ mod tests {
         assert_eq!(r.read_msr(amd_msr::LAST_BRANCH_TO_IP), Some(0xBBBB));
         assert_eq!(r.read_msr(amd_msr::LAST_INT_FROM_IP), Some(0xCCCC));
         assert_eq!(r.read_msr(amd_msr::LAST_INT_TO_IP), Some(0xDDDD));
+    }
+
+    #[test]
+    fn advance_drives_both_surfaces_consistently() {
+        // One advance() call moves the APERF/MPERF shadows and the RDPMC fixed
+        // counters together; reading each back through the MSR map, the two
+        // surfaces agree exactly (core↔APERF, ref↔MPERF) and the ratio is not
+        // the 1.0 tell.
+        let mut r = router();
+        r.pmc.fixed_ctr_ctrl = 0x330; // enable core + ref fixed counters
+
+        r.advance(1_000_000);
+
+        let aperf = r.read_msr(timing_msr::IA32_APERF).unwrap();
+        let mperf = r.read_msr(timing_msr::IA32_MPERF).unwrap();
+        let core = r.read_msr(pmc_msr::IA32_FIXED_CTR0 + 1).unwrap();
+        let reff = r.read_msr(pmc_msr::IA32_FIXED_CTR0 + 2).unwrap();
+        assert_eq!(aperf, core, "APERF surface == RDPMC core counter");
+        assert_eq!(mperf, reff, "MPERF surface == RDPMC ref counter");
+        assert_ne!(aperf, mperf, "ratio is not the 1.0 tell");
+
+        // A second tick keeps them in lockstep.
+        r.advance(500_000);
+        assert_eq!(
+            r.read_msr(timing_msr::IA32_APERF).unwrap(),
+            r.read_msr(pmc_msr::IA32_FIXED_CTR0 + 1).unwrap()
+        );
     }
 
     #[test]
