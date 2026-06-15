@@ -9,7 +9,8 @@ the recommended next step so the next run (which has no memory) can resume.
 ## 2026-06-15 — Session: the Phase-5 MSR/CPUID stealth stack, end to end on real KVM
 
 **13 code + 2 doc increments, each independently green and committed** (branch
-`routine/enlil-2026-06-15`). This session built the entire MSR-exit / timing /
+`routine/enlil-2026-06-15`, PR https://github.com/physics515/enlil/pull/29).
+This session built the entire MSR-exit / timing /
 PMC / LBR / CPUID **stealth integration** for the live KVM backend — from the
 exit-vocabulary seam up through a platform install seam and a run loop that
 drives the shadow counters — and proved each layer on `/dev/kvm` (which was
