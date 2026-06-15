@@ -2954,6 +2954,92 @@ mod tests {
         assert_eq!(&*captured.lock().unwrap(), b"OK");
     }
 
+    // End-to-end on real KVM: the whole stealth MSR stack assembled through the
+    // platform — install_stealth_msr_router on the bus, enable_userspace_msr_exits
+    // + forward_msrs_to_userspace(router.filter_ranges()) on the backend — lets a
+    // guest rdmsr APERF (KVM-known, normally in-kernel) and read back the value
+    // the run loop seeded into the timing shadow, routed through the DeviceBus
+    // handler. Self-skips without /dev/kvm or the userspace-MSR cap.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_stealth_stack_serves_seeded_aperf_to_a_guest() {
+        use crate::kvm_backend::{is_kvm_available, GuestExit, GuestRam, KvmBackend};
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::stealth::lbr::LbrPlatform;
+        use std::sync::{Arc, Mutex};
+
+        if !is_kvm_available() {
+            eprintln!("skipping full_stealth_stack_...: no /dev/kvm");
+            return;
+        }
+
+        // rdmsr(IA32_APERF=0xE8); out 0x3F8, al; hlt.
+        #[rustfmt::skip]
+        let code: [u8; 13] = [
+            0x66, 0xB9, 0xE8, 0x00, 0x00, 0x00,
+            0x0F, 0x32,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0xF4,
+        ];
+        const ENTRY: u64 = 0x1000;
+        const APERF: u32 = 0xE8;
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let mut pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Shared(Arc::clone(&sink))),
+            0,
+            1,
+        )
+        .expect("build standard pc");
+
+        // Install the router and seed APERF with a known value (low byte 0xBE).
+        let timing = pc.install_stealth_msr_router(LbrPlatform::AmdSvm);
+        timing.write_aperf(0x0000_0000_0000_00BE);
+        let ranges = pc
+            .bus
+            .stealth_msr_mut()
+            .expect("router installed")
+            .filter_ranges();
+
+        let mut ram = GuestRam::new(0x1000);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        if let Err(e) = backend.enable_userspace_msr_exits() {
+            eprintln!("skipping full_stealth_stack_...: {e}");
+            return;
+        }
+        backend
+            .forward_msrs_to_userspace(&ranges)
+            .expect("install msr filter");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        let mut saw_aperf = false;
+        let mut halted = false;
+        for _ in 0..100 {
+            match backend.run_vcpu(0, &mut pc.bus).expect("run vcpu") {
+                GuestExit::Halted => {
+                    halted = true;
+                    break;
+                }
+                GuestExit::MsrRead { msr } if msr == APERF => saw_aperf = true,
+                _ => {}
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        assert!(saw_aperf, "APERF was not forwarded to the bus");
+        // The seeded shadow's low byte reached the guest and echoed out COM1.
+        assert_eq!(&*sink.lock().unwrap(), &[0xBE]);
+    }
+
     // The bus delegates forwarded MSR exits to an installed stealth router, and
     // refuses every MSR (→ #GP) when none is installed — the wiring that lets a
     // guest read spoofed APERF/MPERF/PMC/LBR values through the run-loop handler.
