@@ -1282,3 +1282,51 @@ doorbell-deferred ring processing (already logged 2026-06-02).
   succeeds for context-only endpoints and updates the context (the cursor's
   source of truth); it remains a Context State Error only for wholly unknown
   endpoints.
+
+## 2026-06-15 — Userspace MSR exits + the stealth MSR/CPUID seam (Phase 5)
+
+Primary specs consulted to ground the MSR-exit / timing-stealth wiring built
+this session (no new third-party research — these are the authoritative refs):
+
+- **KVM API — `KVM_CAP_X86_USER_SPACE_MSR` / `KVM_X86_SET_MSR_FILTER`**
+  (`Documentation/virt/kvm/api.rst`). Enabling the cap with the *unknown* /
+  *filter* reason bits makes KVM forward guest `RDMSR`/`WRMSR` it does not
+  emulate to userspace as `KVM_EXIT_X86_RDMSR`/`KVM_EXIT_X86_WRMSR`
+  (kvm-ioctls `VcpuExit::X86Rdmsr`/`X86Wrmsr`, carrying `index`, a writable
+  `data`, and an `error` byte that injects `#GP` when set). → modelled as
+  `GuestExit::MsrRead`/`MsrWrite` + `VmExitHandler::rdmsr`/`wrmsr`, the seam the
+  stealth shadows plug into. **Caveat that shapes the next step:** APERF/MPERF
+  and the PMC MSRs are *known* to KVM, so forwarding *those* needs an actual
+  `KVM_X86_SET_MSR_FILTER` bitmap, not just the cap — the unknown-reason path
+  only reaches truly unmodelled MSRs. `enable_userspace_msr_exits` already
+  requests the *filter* reason; installing the filter bitmap is the missing
+  piece, and `kvm-ioctls` 0.19 has no wrapper for it (raw ioctl needed).
+
+- **Intel SDM Vol. 3B / AMD APM — `IA32_APERF` (0xE8) & `IA32_MPERF` (0xE7).**
+  APERF counts actual core-frequency cycles, MPERF the nominal/TSC rate; their
+  *ratio* is the effective-frequency signal an IET divergence detector reads,
+  and it must equal RDPMC's `CPU_CLK_UNHALTED.THREAD / REF_TSC`. → the
+  `StealthMsrRouter` serves APERF/MPERF (from `VcpuTimingState`) and the PMC
+  MSRs (from `PmcState`) from the *same* `PmcRateModel`, and
+  `install_stealth_msr_router` seeds the shadows so the first guest read shows
+  the non-unity model ratio, never the all-zero 1.0 identity (itself a tell).
+
+- **AMD APM Vol. 2 — LBR Virtualization (LBRV).** AMD's basic LBRV exposes a
+  *single* last-branch pair (`LastBranchFromIP` 0x1DB / `ToIP` 0x1DC) plus a
+  last-interrupt pair (0x1DD/0x1DE), not Intel's 32-entry MSR stack; on
+  `#VMEXIT`, `LastBranchToIP` is left pointing into the hypervisor. → on this
+  AMD SVM host `LbrState` now models those four registers and
+  `sanitize_after_exit` branches on platform: AMD erases the branch pair (to
+  `guest_rip`), leaving the last-interrupt pair alone (a VMEXIT is not a guest
+  IRQ); the Intel 32-entry stack path is unchanged. The router routes the four
+  AMD LBR MSRs alongside the Intel FROM/TO/INFO blocks.
+
+- **CPUID hypervisor-present bit (leaf 1 ECX[31]).** No bare-metal CPU sets it;
+  the most-checked VM tell. → `clear_cpuid_hypervisor_bit` starts from
+  `KVM_GET_SUPPORTED_CPUID`, clears the bit, and `KVM_SET_CPUID2`s it onto each
+  vCPU. **Measured this run:** a bare KVM VM (no `SET_CPUID2`) does *not* set
+  the bit by default, so the call's present value is installing the real host
+  feature set *with the bit guaranteed clear* (proven: a guest reads ECX[31]=0
+  and EDX[4]/TSC=1) — the 1→0 flip only matters once paravirt CPUID signature
+  leaves are added. The supported set also omits the 0x4000_00xx hypervisor
+  leaves, so they read out-of-range like bare metal for free.

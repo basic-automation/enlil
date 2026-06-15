@@ -1718,6 +1718,13 @@ Physical USB Devices
   extended max returns the **highest basic leaf's data**; on **AMD** it returns zeros.
   In-range-but-reserved leaves return zeros on both. (`CpuidStealthTable::lookup` now
   precomputes the vendor-correct out-of-range result.)
+- **Hypervisor-present bit cleared on the live KVM guest (2026-06-15):**
+  `KvmBackend::clear_cpuid_hypervisor_bit` starts from `KVM_GET_SUPPORTED_CPUID`,
+  clears leaf 1 ECX[31], and `KVM_SET_CPUID2`s it onto each vCPU; a real-mode
+  guest now reads ECX[31]=0 with real features intact (EDX[4]/TSC=1). KVM's
+  supported set omits the `0x4000_00xx` leaves, so they read out-of-range for
+  free. **Remaining:** apply the full `CpuidStealthTable` (vendor/brand/topology)
+  by *merging* into KVM's ≤80-entry supported set rather than replacing it.
 
 ### 5.4 Timing Stealth (Expanded — from 2024–2025 anti-cheat research)
 
@@ -1770,6 +1777,19 @@ Physical USB Devices
   the two), and CPUID leaf 0xA must advertise a PMU matching the shadow's counter counts
   (all-zeros = "PMU version 0" is itself a cloud-VM tell). The KVM run loop must seed
   `VcpuTimingState` APERF/MPERF with `PmcRateModel::core_per_kilo_ref` when it wires both.
+- **MSR-exit seam + stealth routing wired (2026-06-15):** the KVM run loop can now
+  forward guest `RDMSR`/`WRMSR` to userspace (`KvmBackend::enable_userspace_msr_exits`
+  → `GuestExit::MsrRead`/`MsrWrite` → `VmExitHandler::rdmsr`/`wrmsr`, proven on
+  `/dev/kvm`). `enlil-core::stealth_msr::StealthMsrRouter` answers APERF/MPERF
+  (from `VcpuTimingState`), the PMC MSRs (from `PmcState`), and the LBR registers
+  (`LbrState`) from one shared `PmcRateModel`; `DeviceBus`/`StandardPc` install it
+  via `install_stealth_msr_router`, which seeds the model ratio so the first guest
+  read is never the 1.0 identity. **AMD LBRV** is now modelled too: `LbrState` holds
+  AMD's single LastBranchFrom/ToIP + LastIntFrom/ToIP pair (0x1DB–0x1DE) and
+  `sanitize_after_exit` erases the AMD branch pair on the AMD path. **Remaining:**
+  install a `KVM_X86_SET_MSR_FILTER` bitmap (no kvm-ioctls 0.19 wrapper — raw ioctl)
+  so the *KVM-known* APERF/MPERF/PMC MSRs are forwarded, not just unknown ones; and
+  drive `on_vmexit`/`on_vmresume`/`advance` from the run loop around `KVM_RUN`.
 
 ### 5.5 Virtual TPM 2.0
 - Required for Windows 11
