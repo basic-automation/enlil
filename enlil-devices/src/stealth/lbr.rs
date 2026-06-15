@@ -50,6 +50,17 @@ pub struct LbrState {
     pub lbr_enabled: bool,
     /// Platform type for save/restore strategy
     pub platform: LbrPlatform,
+    /// AMD `LastBranchFromIP` (0x1DB) — branch source. AMD's basic LBRV
+    /// exposes a single last-branch register pair (plus a last-interrupt pair)
+    /// rather than Intel's 32-entry stack, so these four registers are the AMD
+    /// equivalent of the FROM/TO arrays above.
+    pub last_branch_from_ip: u64,
+    /// AMD `LastBranchToIP` (0x1DC) — branch target.
+    pub last_branch_to_ip: u64,
+    /// AMD `LastIntFromIP` (0x1DD) — source of the last interrupt/exception.
+    pub last_int_from_ip: u64,
+    /// AMD `LastIntToIP` (0x1DE) — target of the last interrupt/exception.
+    pub last_int_to_ip: u64,
 }
 
 /// LBR platform type
@@ -72,34 +83,74 @@ impl LbrState {
             debug_ctl: 0,
             lbr_enabled: false,
             platform,
+            last_branch_from_ip: 0,
+            last_branch_to_ip: 0,
+            last_int_from_ip: 0,
+            last_int_to_ip: 0,
         }
     }
 
-    /// Sanitize the LBR stack after a VMEXIT.
+    /// Sanitize the last-branch record after a VMEXIT.
     ///
-    /// The most recent LBR entry will contain the branch from guest code
-    /// into the hypervisor's VMEXIT handler. This must be removed or the
-    /// guest can detect the hypervisor by inspecting its own LBR stack.
+    /// The most recent branch record will contain the branch from guest code
+    /// into the hypervisor's VMEXIT handler. This must be erased or the guest
+    /// can detect the hypervisor by inspecting its own LBR state. The save
+    /// mechanism differs per platform (Intel's 32-entry MSR stack vs AMD's
+    /// single LastBranchFrom/ToIP pair), but the sanitization is the same idea:
+    /// overwrite the branch endpoints with `guest_rip` so it reads as ordinary
+    /// sequential execution, with no branch into the hypervisor.
     pub const fn sanitize_after_exit(&mut self, guest_rip: u64) {
         if !self.lbr_enabled {
             return;
         }
 
-        let tos_idx = self.tos as usize % LBR_STACK_SIZE;
+        match self.platform {
+            LbrPlatform::IntelVmx => {
+                let tos_idx = self.tos as usize % LBR_STACK_SIZE;
+                // The top-of-stack entry was just written by the VMEXIT:
+                // FROM = guest code, TO = hypervisor entry point. Overwrite it
+                // with a self-branch (no branch actually happened) and clear
+                // the info field (its cycle count would reveal the anomaly).
+                self.to_addresses[tos_idx] = guest_rip;
+                self.from_addresses[tos_idx] = guest_rip;
+                self.info[tos_idx] = 0;
+            }
+            LbrPlatform::AmdSvm => {
+                // AMD saves a single last-branch pair; #VMEXIT leaves
+                // LastBranchToIP pointing into the hypervisor. Erase the pair
+                // (the last-interrupt pair is left alone — the exit is not an
+                // architecturally-visible guest interrupt).
+                self.last_branch_from_ip = guest_rip;
+                self.last_branch_to_ip = guest_rip;
+            }
+        }
+    }
 
-        // The top-of-stack entry was just written by the VMEXIT.
-        // It contains: FROM = guest code, TO = hypervisor entry point.
-        // We need to either:
-        // 1. Remove it (decrement TOS), or
-        // 2. Overwrite it with a plausible guest-to-guest branch
-        //
-        // Strategy: overwrite the TO address with the instruction after
-        // the one that caused the VMEXIT, making it look like a normal
-        // sequential execution (no branch actually happened).
-        self.to_addresses[tos_idx] = guest_rip;
-        self.from_addresses[tos_idx] = guest_rip;
-        // Clear the info field (cycle count would reveal the anomaly)
-        self.info[tos_idx] = 0;
+    /// Handle RDMSR for an AMD last-branch/last-interrupt register
+    /// (`LastBranchFromIP`/`ToIP`, `LastIntFromIP`/`ToIP`). Returns `None` for
+    /// any other MSR.
+    #[must_use]
+    pub const fn read_amd_lbr(&self, msr: u32) -> Option<u64> {
+        match msr {
+            amd_msr::LAST_BRANCH_FROM_IP => Some(self.last_branch_from_ip),
+            amd_msr::LAST_BRANCH_TO_IP => Some(self.last_branch_to_ip),
+            amd_msr::LAST_INT_FROM_IP => Some(self.last_int_from_ip),
+            amd_msr::LAST_INT_TO_IP => Some(self.last_int_to_ip),
+            _ => None,
+        }
+    }
+
+    /// Handle WRMSR for an AMD last-branch/last-interrupt register. Returns
+    /// `true` if `msr` was one of them (and the write was applied).
+    pub const fn write_amd_lbr(&mut self, msr: u32, value: u64) -> bool {
+        match msr {
+            amd_msr::LAST_BRANCH_FROM_IP => self.last_branch_from_ip = value,
+            amd_msr::LAST_BRANCH_TO_IP => self.last_branch_to_ip = value,
+            amd_msr::LAST_INT_FROM_IP => self.last_int_from_ip = value,
+            amd_msr::LAST_INT_TO_IP => self.last_int_to_ip = value,
+            _ => return false,
+        }
+        true
     }
 
     /// Handle RDMSR for `IA32_DEBUGCTL`
@@ -215,5 +266,65 @@ mod tests {
     fn amd_platform() {
         let lbr = LbrState::new(LbrPlatform::AmdSvm);
         assert_eq!(lbr.platform, LbrPlatform::AmdSvm);
+    }
+
+    #[test]
+    fn amd_lbr_msrs_read_and_write() {
+        let mut lbr = LbrState::new(LbrPlatform::AmdSvm);
+        assert!(lbr.write_amd_lbr(amd_msr::LAST_BRANCH_FROM_IP, 0x1111));
+        assert!(lbr.write_amd_lbr(amd_msr::LAST_BRANCH_TO_IP, 0x2222));
+        assert!(lbr.write_amd_lbr(amd_msr::LAST_INT_FROM_IP, 0x3333));
+        assert!(lbr.write_amd_lbr(amd_msr::LAST_INT_TO_IP, 0x4444));
+        assert_eq!(lbr.read_amd_lbr(amd_msr::LAST_BRANCH_FROM_IP), Some(0x1111));
+        assert_eq!(lbr.read_amd_lbr(amd_msr::LAST_BRANCH_TO_IP), Some(0x2222));
+        assert_eq!(lbr.read_amd_lbr(amd_msr::LAST_INT_FROM_IP), Some(0x3333));
+        assert_eq!(lbr.read_amd_lbr(amd_msr::LAST_INT_TO_IP), Some(0x4444));
+        // A non-AMD-LBR MSR is not claimed.
+        assert_eq!(lbr.read_amd_lbr(0x1D9), None);
+        assert!(!lbr.write_amd_lbr(0x1D9, 1));
+    }
+
+    #[test]
+    fn amd_sanitize_erases_the_branch_into_the_hypervisor() {
+        let mut lbr = LbrState::new(LbrPlatform::AmdSvm);
+        lbr.write_debug_ctl(1); // enable LBR
+
+        // #VMEXIT left the branch pointing into the hypervisor; the
+        // last-interrupt pair holds an earlier, legitimate guest record.
+        lbr.last_branch_from_ip = 0x7FFF_2000;
+        lbr.last_branch_to_ip = 0xFFFF_8800_0001_0000; // hypervisor entry
+        lbr.last_int_from_ip = 0x7FFF_0100;
+        lbr.last_int_to_ip = 0x7FFF_0200;
+
+        let guest_next_rip = 0x7FFF_2002;
+        lbr.sanitize_after_exit(guest_next_rip);
+
+        // The branch pair now reads as sequential guest execution.
+        assert_eq!(lbr.last_branch_from_ip, guest_next_rip);
+        assert_eq!(lbr.last_branch_to_ip, guest_next_rip);
+        // The last-interrupt pair is untouched (the exit is not a guest IRQ).
+        assert_eq!(lbr.last_int_from_ip, 0x7FFF_0100);
+        assert_eq!(lbr.last_int_to_ip, 0x7FFF_0200);
+    }
+
+    #[test]
+    fn amd_sanitize_is_a_noop_when_lbr_disabled() {
+        let mut lbr = LbrState::new(LbrPlatform::AmdSvm);
+        lbr.last_branch_to_ip = 0xBEEF;
+        lbr.sanitize_after_exit(0x1234);
+        assert_eq!(lbr.last_branch_to_ip, 0xBEEF);
+    }
+
+    #[test]
+    fn intel_sanitize_leaves_amd_registers_untouched() {
+        let mut lbr = LbrState::new(LbrPlatform::IntelVmx);
+        lbr.write_debug_ctl(1);
+        lbr.last_branch_to_ip = 0xCAFE;
+        lbr.tos = 0;
+        lbr.to_addresses[0] = 0xFFFF_8800_0000_0000;
+        lbr.sanitize_after_exit(0x4000);
+        // Intel path sanitized the stack, not the (irrelevant) AMD registers.
+        assert_eq!(lbr.to_addresses[0], 0x4000);
+        assert_eq!(lbr.last_branch_to_ip, 0xCAFE);
     }
 }

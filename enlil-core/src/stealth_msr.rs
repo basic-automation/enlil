@@ -117,6 +117,9 @@ impl StealthMsrRouter {
             intel_msr::IA32_DEBUGCTL => Some(self.lbr.read_debug_ctl()),
             intel_msr::LBR_TOS => Some(self.lbr.read_tos()),
             _ => {
+                if let Some(v) = self.lbr.read_amd_lbr(msr) {
+                    return Some(v);
+                }
                 if let Some(i) = Self::lbr_from_index(msr) {
                     Some(self.lbr.read_from(i))
                 } else if let Some(i) = Self::lbr_to_index(msr) {
@@ -146,6 +149,7 @@ impl StealthMsrRouter {
                 self.lbr.write_debug_ctl(value);
                 true
             }
+            m if self.lbr.write_amd_lbr(m, value) => true,
             m if Self::is_pmc_msr(m) => {
                 self.pmc.write_msr(m, value);
                 true
@@ -235,6 +239,23 @@ mod tests {
         r.pmc.advance_counters(1000);
         // 1000 ref cycles -> 1150 core cycles under the default model.
         assert_eq!(r.read_msr(pmc_msr::IA32_FIXED_CTR0 + 1), Some(1150));
+    }
+
+    #[test]
+    fn amd_last_branch_registers_route_through_the_lbr_state() {
+        use enlil_devices::stealth::lbr::amd_msr;
+        let mut r = router();
+        // AMD's single last-branch pair (0x1DB/0x1DC) and last-interrupt pair
+        // (0x1DD/0x1DE) round-trip through the router, distinct from the Intel
+        // FROM/TO stack.
+        assert!(r.write_msr(amd_msr::LAST_BRANCH_FROM_IP, 0xAAAA));
+        assert!(r.write_msr(amd_msr::LAST_BRANCH_TO_IP, 0xBBBB));
+        assert!(r.write_msr(amd_msr::LAST_INT_FROM_IP, 0xCCCC));
+        assert!(r.write_msr(amd_msr::LAST_INT_TO_IP, 0xDDDD));
+        assert_eq!(r.read_msr(amd_msr::LAST_BRANCH_FROM_IP), Some(0xAAAA));
+        assert_eq!(r.read_msr(amd_msr::LAST_BRANCH_TO_IP), Some(0xBBBB));
+        assert_eq!(r.read_msr(amd_msr::LAST_INT_FROM_IP), Some(0xCCCC));
+        assert_eq!(r.read_msr(amd_msr::LAST_INT_TO_IP), Some(0xDDDD));
     }
 
     #[test]
