@@ -1682,9 +1682,12 @@ Physical USB Devices
   so the `_PRT`, the link devices, the `PirqRouter`, and the config-space bytes a guest
   reads all agree. A **FACS** is now emitted and pointed to by the FADT (was a zero
   `FIRMWARE_CTRL`). The SSDT now defines per-vCPU power objects (was CPU0-only).
-  **Remaining (future):** make `_SRS`/`_DIS` actually reprogram `PIRQRC` via an
-  `OperationRegion`/`Field` over the bridge config space (needs those AML primitives) so a
-  PIC-mode guest can *re*-route; add `_PSD`/`_CSD` SSDT domain coordination.
+  **Live `_SRS`/`_DIS`/`_CRS` reprogramming — DONE** (verified 2026-06-15): the AML
+  `OperationRegion`/`Field`/`Store`/dyadic primitives exist and the LNKA–D link devices'
+  `_CRS`/`_DIS`/`_SRS`/`_STA` read and rewrite the `PIRx` config byte over the bridge's
+  `OperationRegion` (e.g. `_SRS` does `FindSetRightBit` of the IRQ mask − 1 → `PIRx`), so a
+  PIC-mode guest that reroutes a PCI interrupt actually moves it and `_CRS` reflects it.
+  **Remaining (future):** `_PSD`/`_CSD` SSDT domain coordination.
 
 ### 5.2 SMBIOS Synthesis
 - Generate SMBIOS/DMI tables that report:
@@ -1698,9 +1701,10 @@ Physical USB Devices
   advertised the **"virtual machine" characteristic** (a VM tell — cleared), and Type 3 /
   Type 4 declared a `Length` longer than the formatted area they wrote (missing SKU byte /
   missing the SMBIOS-3.0 16-bit core counts), which shifted their string tables
-  (`<BAD INDEX>`). All fixed; install `dmidecode` in CI to gate it. **Note:** two SMBIOS
-  builders exist (`enlil-devices::smbios` — canonical — and `enlil-core::smbios`); neither
-  is wired into a delivery path yet, and they should be consolidated.
+  (`<BAD INDEX>`). All fixed; install `dmidecode` in CI to gate it. **Note (updated
+  2026-06-15):** the duplicate `enlil-core::smbios` builder no longer exists — only the
+  canonical `enlil-devices::smbios` remains (consolidation done). It is still not wired
+  into a delivery path yet.
 
 ### 5.3 CPUID Stealth
 - Intercept all CPUID exits and craft responses:
