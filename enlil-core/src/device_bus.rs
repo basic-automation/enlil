@@ -15,6 +15,7 @@
 
 use crate::kvm_backend::VmExitHandler;
 use crate::serial::{SerialOutput, SerialPort};
+use crate::stealth_msr::StealthMsrRouter;
 use enlil_devices::bus::{MmioBus, MmioDevice, PioBus, PioDevice};
 use enlil_devices::chipset::{Gpe0Block, SharedAcpiPm1Block, SharedSystemControlPortA};
 use enlil_devices::dma::{Dma8237, DmaPageRegisters};
@@ -48,6 +49,15 @@ pub struct DeviceBus {
     /// [`add_pcie`](Self::add_pcie) mounts it, so the platform layer can poll the
     /// guest's reboot request. `None` until `add_pcie` runs.
     pci_reset: Option<PciResetControl>,
+    /// Per-vCPU stealth MSR shadows (APERF/MPERF, PMC, LBR). When present, the
+    /// handler serves forwarded guest `RDMSR`/`WRMSR` for the modelled MSRs
+    /// from this router instead of `#GP`-ing them; `None` leaves all MSR exits
+    /// unhandled. This is the single-vCPU run loop's state — a multi-vCPU model
+    /// will hold one router per vCPU. `None` until [`set_stealth_msr_router`]
+    /// runs.
+    ///
+    /// [`set_stealth_msr_router`]: Self::set_stealth_msr_router
+    stealth_msr: Option<StealthMsrRouter>,
 }
 
 impl DeviceBus {
@@ -58,7 +68,25 @@ impl DeviceBus {
             pio: PioBus::new(),
             mmio: MmioBus::new(),
             pci_reset: None,
+            stealth_msr: None,
         }
+    }
+
+    /// Install the per-vCPU stealth MSR router so forwarded guest `RDMSR`/
+    /// `WRMSR` of the modelled MSRs (APERF/MPERF, the PMC counters, and the LBR
+    /// registers) are served from its shadows. Requires the backend to have
+    /// userspace MSR forwarding on
+    /// ([`KvmBackend::enable_userspace_msr_exits`](crate::kvm_backend::KvmBackend::enable_userspace_msr_exits)).
+    pub fn set_stealth_msr_router(&mut self, router: StealthMsrRouter) {
+        self.stealth_msr = Some(router);
+    }
+
+    /// Mutable access to the installed stealth MSR router, if any — so the run
+    /// loop can advance its shadow counters (`PmcState::advance_counters`,
+    /// `VcpuTimingState::advance`) between guest entries.
+    #[must_use]
+    pub fn stealth_msr_mut(&mut self) -> Option<&mut StealthMsrRouter> {
+        self.stealth_msr.as_mut()
     }
 
     /// Register a port-I/O device over the range it declares.
@@ -1128,6 +1156,14 @@ impl VmExitHandler for DeviceBus {
     }
     fn mmio_write(&mut self, addr: u64, data: &[u8]) {
         self.mmio.write(addr, data);
+    }
+    fn rdmsr(&mut self, msr: u32) -> Option<u64> {
+        self.stealth_msr.as_ref().and_then(|r| r.read_msr(msr))
+    }
+    fn wrmsr(&mut self, msr: u32, value: u64) -> bool {
+        self.stealth_msr
+            .as_mut()
+            .is_some_and(|r| r.write_msr(msr, value))
     }
 }
 
@@ -2880,5 +2916,38 @@ mod tests {
             "guest produced no serial output under the production IRQ chip"
         );
         assert_eq!(&*captured.lock().unwrap(), b"OK");
+    }
+
+    // The bus delegates forwarded MSR exits to an installed stealth router, and
+    // refuses every MSR (→ #GP) when none is installed — the wiring that lets a
+    // guest read spoofed APERF/MPERF/PMC/LBR values through the run-loop handler.
+    #[test]
+    fn stealth_msr_router_serves_msr_exits_through_the_bus() {
+        use crate::kvm_backend::VmExitHandler;
+        use crate::stealth_msr::StealthMsrRouter;
+        use crate::timing_stealth::VcpuTimingState;
+        use enlil_devices::stealth::lbr::{intel_msr, LbrPlatform, LbrState};
+        use enlil_devices::stealth::timing::msr as timing_msr;
+
+        let mut bus = DeviceBus::new();
+        // No router yet: an unmodelled MSR is refused, not silently spoofed.
+        assert_eq!(bus.rdmsr(timing_msr::IA32_APERF), None);
+        assert!(!bus.wrmsr(intel_msr::IA32_DEBUGCTL, 1));
+
+        let timing = VcpuTimingState::new();
+        timing.write_aperf(0xABCD);
+        bus.set_stealth_msr_router(StealthMsrRouter::new(
+            timing,
+            LbrState::new(LbrPlatform::AmdSvm),
+        ));
+
+        // Reads now come from the shadow state.
+        assert_eq!(bus.rdmsr(timing_msr::IA32_APERF), Some(0xABCD));
+        // Writes reach the shadows: enabling LBR via DEBUGCTL is observable.
+        assert!(bus.wrmsr(intel_msr::IA32_DEBUGCTL, 1));
+        assert_eq!(bus.rdmsr(intel_msr::IA32_DEBUGCTL), Some(1));
+        assert!(bus.stealth_msr_mut().unwrap().lbr.lbr_enabled);
+        // An MSR outside the modelled set still falls through to #GP.
+        assert_eq!(bus.rdmsr(0x10), None);
     }
 }
