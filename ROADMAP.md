@@ -1682,9 +1682,12 @@ Physical USB Devices
   so the `_PRT`, the link devices, the `PirqRouter`, and the config-space bytes a guest
   reads all agree. A **FACS** is now emitted and pointed to by the FADT (was a zero
   `FIRMWARE_CTRL`). The SSDT now defines per-vCPU power objects (was CPU0-only).
-  **Remaining (future):** make `_SRS`/`_DIS` actually reprogram `PIRQRC` via an
-  `OperationRegion`/`Field` over the bridge config space (needs those AML primitives) so a
-  PIC-mode guest can *re*-route; add `_PSD`/`_CSD` SSDT domain coordination.
+  **Live `_SRS`/`_DIS`/`_CRS` reprogramming — DONE** (verified 2026-06-15): the AML
+  `OperationRegion`/`Field`/`Store`/dyadic primitives exist and the LNKA–D link devices'
+  `_CRS`/`_DIS`/`_SRS`/`_STA` read and rewrite the `PIRx` config byte over the bridge's
+  `OperationRegion` (e.g. `_SRS` does `FindSetRightBit` of the IRQ mask − 1 → `PIRx`), so a
+  PIC-mode guest that reroutes a PCI interrupt actually moves it and `_CRS` reflects it.
+  **Remaining (future):** `_PSD`/`_CSD` SSDT domain coordination.
 
 ### 5.2 SMBIOS Synthesis
 - Generate SMBIOS/DMI tables that report:
@@ -1698,9 +1701,10 @@ Physical USB Devices
   advertised the **"virtual machine" characteristic** (a VM tell — cleared), and Type 3 /
   Type 4 declared a `Length` longer than the formatted area they wrote (missing SKU byte /
   missing the SMBIOS-3.0 16-bit core counts), which shifted their string tables
-  (`<BAD INDEX>`). All fixed; install `dmidecode` in CI to gate it. **Note:** two SMBIOS
-  builders exist (`enlil-devices::smbios` — canonical — and `enlil-core::smbios`); neither
-  is wired into a delivery path yet, and they should be consolidated.
+  (`<BAD INDEX>`). All fixed; install `dmidecode` in CI to gate it. **Note (updated
+  2026-06-15):** the duplicate `enlil-core::smbios` builder no longer exists — only the
+  canonical `enlil-devices::smbios` remains (consolidation done). It is still not wired
+  into a delivery path yet.
 
 ### 5.3 CPUID Stealth
 - Intercept all CPUID exits and craft responses:
@@ -1718,6 +1722,13 @@ Physical USB Devices
   extended max returns the **highest basic leaf's data**; on **AMD** it returns zeros.
   In-range-but-reserved leaves return zeros on both. (`CpuidStealthTable::lookup` now
   precomputes the vendor-correct out-of-range result.)
+- **Hypervisor-present bit cleared on the live KVM guest (2026-06-15):**
+  `KvmBackend::clear_cpuid_hypervisor_bit` starts from `KVM_GET_SUPPORTED_CPUID`,
+  clears leaf 1 ECX[31], and `KVM_SET_CPUID2`s it onto each vCPU; a real-mode
+  guest now reads ECX[31]=0 with real features intact (EDX[4]/TSC=1). KVM's
+  supported set omits the `0x4000_00xx` leaves, so they read out-of-range for
+  free. **Remaining:** apply the full `CpuidStealthTable` (vendor/brand/topology)
+  by *merging* into KVM's ≤80-entry supported set rather than replacing it.
 
 ### 5.4 Timing Stealth (Expanded — from 2024–2025 anti-cheat research)
 
@@ -1770,6 +1781,26 @@ Physical USB Devices
   the two), and CPUID leaf 0xA must advertise a PMU matching the shadow's counter counts
   (all-zeros = "PMU version 0" is itself a cloud-VM tell). The KVM run loop must seed
   `VcpuTimingState` APERF/MPERF with `PmcRateModel::core_per_kilo_ref` when it wires both.
+- **MSR-exit seam + stealth routing wired (2026-06-15):** the KVM run loop can now
+  forward guest `RDMSR`/`WRMSR` to userspace (`KvmBackend::enable_userspace_msr_exits`
+  → `GuestExit::MsrRead`/`MsrWrite` → `VmExitHandler::rdmsr`/`wrmsr`, proven on
+  `/dev/kvm`). `enlil-core::stealth_msr::StealthMsrRouter` answers APERF/MPERF
+  (from `VcpuTimingState`), the PMC MSRs (from `PmcState`), and the LBR registers
+  (`LbrState`) from one shared `PmcRateModel`; `DeviceBus`/`StandardPc` install it
+  via `install_stealth_msr_router`, which seeds the model ratio so the first guest
+  read is never the 1.0 identity. **AMD LBRV** is now modelled too: `LbrState` holds
+  AMD's single LastBranchFrom/ToIP + LastIntFrom/ToIP pair (0x1DB–0x1DE) and
+  `sanitize_after_exit` erases the AMD branch pair on the AMD path. The
+  *KVM-known* MSRs (APERF/MPERF, PMC, `IA32_DEBUGCTL`) are now forwarded too via
+  `KvmBackend::forward_msrs_to_userspace` (a `KVM_X86_SET_MSR_FILTER` default-allow
+  filter that denies just those ranges — proven on `/dev/kvm` for APERF), and
+  `run_vcpu_timed` drives `on_vmresume`/`advance`/`on_vmexit` around `KVM_RUN` so
+  the shadows count guest time at the model rate and hide exit overhead.
+  **Remaining:** assemble these into the production run loop (call
+  `enable_userspace_msr_exits` + `forward_msrs_to_userspace` + the
+  `StandardPc::install_stealth_msr_router` handle from one place, and drive the
+  PMC `advance_counters` alongside the timing `advance`); LBR save/restore via the
+  VMCS/VMCB controls is a bare-metal-backend (Phase 6) concern.
 
 ### 5.5 Virtual TPM 2.0
 - Required for Windows 11

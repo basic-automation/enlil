@@ -35,6 +35,14 @@ pub enum GuestExit {
     MmioRead { addr: u64, size: usize },
     /// Guest wrote `size` bytes to an MMIO address.
     MmioWrite { addr: u64, size: usize },
+    /// Guest executed `rdmsr` on a model-specific register forwarded to
+    /// userspace; the handler supplied (or refused) the value before this was
+    /// produced. Only fires when userspace MSR forwarding is enabled (see
+    /// [`KvmBackend::enable_userspace_msr_exits`]).
+    MsrRead { msr: u32 },
+    /// Guest executed `wrmsr` on a forwarded model-specific register with
+    /// `value`; the handler accepted (or refused) it before this was produced.
+    MsrWrite { msr: u32, value: u64 },
     /// Guest executed `hlt`.
     Halted,
     /// Guest requested shutdown / triple fault.
@@ -75,6 +83,8 @@ impl GuestExit {
             | Self::IoOut { .. }
             | Self::MmioRead { .. }
             | Self::MmioWrite { .. }
+            | Self::MsrRead { .. }
+            | Self::MsrWrite { .. }
             | Self::Debug
             | Self::Interrupted
             | Self::Unsupported(_) => RunOutcome::Continue,
@@ -106,6 +116,21 @@ pub trait VmExitHandler {
     fn mmio_write(&mut self, addr: u64, data: &[u8]) {
         let _ = (addr, data);
     }
+    /// Guest executed `rdmsr` on model-specific register `msr`. Return
+    /// `Some(value)` to supply the 64-bit contents, or `None` to inject a
+    /// `#GP` into the guest (the architecturally honest answer for an MSR this
+    /// hypervisor does not model). The default refuses every MSR.
+    fn rdmsr(&mut self, msr: u32) -> Option<u64> {
+        let _ = msr;
+        None
+    }
+    /// Guest executed `wrmsr` of `value` to model-specific register `msr`.
+    /// Return `true` if the write is accepted, or `false` to inject a `#GP`
+    /// (an MSR this hypervisor does not model). The default refuses every MSR.
+    fn wrmsr(&mut self, msr: u32, value: u64) -> bool {
+        let _ = (msr, value);
+        false
+    }
 }
 
 /// A [`VmExitHandler`] that records every access, for tests and tracing.
@@ -119,6 +144,10 @@ pub struct RecordingHandler {
     pub mmio_write: Vec<(u64, Vec<u8>)>,
     /// `(addr, size)` for each MMIO read, in order.
     pub mmio_read: Vec<(u64, usize)>,
+    /// Each `rdmsr` index, in order.
+    pub msr_read: Vec<u32>,
+    /// `(msr, value)` for each `wrmsr`, in order.
+    pub msr_write: Vec<(u32, u64)>,
 }
 
 impl VmExitHandler for RecordingHandler {
@@ -133,6 +162,14 @@ impl VmExitHandler for RecordingHandler {
     }
     fn mmio_write(&mut self, addr: u64, data: &[u8]) {
         self.mmio_write.push((addr, data.to_vec()));
+    }
+    fn rdmsr(&mut self, msr: u32) -> Option<u64> {
+        self.msr_read.push(msr);
+        Some(0)
+    }
+    fn wrmsr(&mut self, msr: u32, value: u64) -> bool {
+        self.msr_write.push((msr, value));
+        true
     }
 }
 
@@ -149,11 +186,24 @@ mod linux {
     use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
     use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
     use std::ptr::NonNull;
+    // `ioctl_iow_nr!` expands to a bare `ioctl_ioc_nr!` call, so both macros
+    // (and the `ioctl_with_ref` helper) must be in scope for KVM_X86_SET_MSR_FILTER.
+    use vmm_sys_util::ioctl::ioctl_with_ref;
+    use vmm_sys_util::ioctl_ioc_nr;
 
     /// Host page size (4 KiB on x86-64). KVM requires a memory region's guest
     /// physical base, size, and backing host address to all be multiples of
     /// this — `KVM_SET_USER_MEMORY_REGION` returns `EINVAL` otherwise.
     pub const HOST_PAGE_SIZE: usize = 4096;
+
+    // `KVM_X86_SET_MSR_FILTER` has no `kvm-ioctls` 0.19 wrapper, so declare the
+    // request number directly (`_IOW(KVMIO, 0xc6, struct kvm_msr_filter)`).
+    vmm_sys_util::ioctl_iow_nr!(
+        KVM_X86_SET_MSR_FILTER,
+        kvm_bindings::KVMIO,
+        0xc6,
+        kvm_bindings::kvm_msr_filter
+    );
 
     /// Returns `true` if this host exposes a usable `/dev/kvm`.
     ///
@@ -436,6 +486,148 @@ mod linux {
             })
         }
 
+        /// Forward guest MSR accesses KVM does not itself emulate to userspace
+        /// as [`GuestExit::MsrRead`] / [`GuestExit::MsrWrite`] exits, routed
+        /// through the handler's [`rdmsr`](VmExitHandler::rdmsr) /
+        /// [`wrmsr`](VmExitHandler::wrmsr) hooks.
+        ///
+        /// This enables `KVM_CAP_X86_USER_SPACE_MSR` for the *unknown* and
+        /// *filter* reasons. With it on, an `rdmsr`/`wrmsr` of an MSR KVM does
+        /// not recognise traps to userspace instead of immediately `#GP`-ing in
+        /// the guest — the seam the Phase 5 timing/PMC stealth shadows
+        /// (APERF/MPERF, RDPMC, LBR DEBUGCTL) plug into. The `filter` reason is
+        /// requested too so a future `KVM_X86_SET_MSR_FILTER` can also redirect
+        /// MSRs KVM *does* emulate; until a filter list is installed it has no
+        /// effect.
+        ///
+        /// Call before creating vCPUs.
+        ///
+        /// # Errors
+        /// Returns [`Error::HypervisorError`] if the host lacks
+        /// `KVM_CAP_X86_USER_SPACE_MSR` or the enable ioctl fails.
+        pub fn enable_userspace_msr_exits(&self) -> Result<()> {
+            use kvm_ioctls::{Cap, MsrExitReason};
+            if !self.vm.check_extension(Cap::X86UserSpaceMsr) {
+                return Err(Error::HypervisorError(
+                    "KVM_CAP_X86_USER_SPACE_MSR unavailable".to_string(),
+                ));
+            }
+            let reasons = MsrExitReason::Unknown | MsrExitReason::Filter;
+            let cap = kvm_bindings::kvm_enable_cap {
+                cap: Cap::X86UserSpaceMsr as u32,
+                args: [u64::from(reasons.bits()), 0, 0, 0],
+                ..Default::default()
+            };
+            self.vm
+                .enable_cap(&cap)
+                .map_err(|e| Error::HypervisorError(format!("enable X86UserSpaceMsr: {e}")))
+        }
+
+        /// Redirect the given MSR ranges — even ones KVM itself emulates — to
+        /// userspace via `KVM_X86_SET_MSR_FILTER`.
+        ///
+        /// [`enable_userspace_msr_exits`](Self::enable_userspace_msr_exits)
+        /// alone only forwards MSRs KVM does *not* know; the timing/PMC stealth
+        /// MSRs (APERF/MPERF, the PMC counters, `IA32_DEBUGCTL`) are KVM-known,
+        /// so they need an explicit filter. This installs a **default-allow**
+        /// filter (every other MSR keeps its in-kernel behaviour) whose only
+        /// ranges *deny* the listed MSRs; with the *filter* exit reason enabled,
+        /// a denied access traps to userspace as a `MsrRead`/`MsrWrite` exit
+        /// instead of `#GP` — so the [`StealthMsrRouter`] gets to answer it.
+        ///
+        /// Each `(base, count)` covers `count` consecutive MSRs from `base`. At
+        /// most [`KVM_MSR_FILTER_MAX_RANGES`](kvm_bindings::KVM_MSR_FILTER_MAX_RANGES)
+        /// (16) ranges are allowed. Call after
+        /// `enable_userspace_msr_exits` and before running the vCPUs.
+        ///
+        /// [`StealthMsrRouter`]: crate::stealth_msr::StealthMsrRouter
+        ///
+        /// # Errors
+        /// Returns [`Error::HypervisorError`] if more than 16 ranges are given
+        /// or the ioctl fails.
+        pub fn forward_msrs_to_userspace(&self, ranges: &[(u32, u32)]) -> Result<()> {
+            use kvm_bindings::{
+                kvm_msr_filter, kvm_msr_filter_range, KVM_MSR_FILTER_DEFAULT_ALLOW,
+                KVM_MSR_FILTER_MAX_RANGES, KVM_MSR_FILTER_READ, KVM_MSR_FILTER_WRITE,
+            };
+            if ranges.len() > KVM_MSR_FILTER_MAX_RANGES as usize {
+                return Err(Error::HypervisorError(format!(
+                    "MSR filter supports at most {KVM_MSR_FILTER_MAX_RANGES} ranges, got {}",
+                    ranges.len()
+                )));
+            }
+            // One all-zero bitmap per range: a clear bit denies that MSR (→
+            // forward to userspace). The bitmaps must stay alive across the
+            // ioctl, so hold them in `bitmaps` until after the call.
+            let bitmaps: Vec<Vec<u8>> = ranges
+                .iter()
+                .map(|&(_, count)| vec![0u8; (count as usize).div_ceil(8)])
+                .collect();
+
+            // SAFETY: `kvm_msr_filter` is plain-old-data; an all-zero value is a
+            // valid default-allow filter with no ranges.
+            let mut filter: kvm_msr_filter = unsafe { std::mem::zeroed() };
+            filter.flags = KVM_MSR_FILTER_DEFAULT_ALLOW;
+            for (i, (&(base, count), bitmap)) in ranges.iter().zip(&bitmaps).enumerate() {
+                filter.ranges[i] = kvm_msr_filter_range {
+                    flags: KVM_MSR_FILTER_READ | KVM_MSR_FILTER_WRITE,
+                    nmsrs: count,
+                    base,
+                    bitmap: bitmap.as_ptr().cast_mut(),
+                };
+            }
+
+            // SAFETY: `filter` is a valid `kvm_msr_filter` and every range's
+            // bitmap pointer refers to a live allocation in `bitmaps`, which
+            // outlives this call.
+            let ret = unsafe { ioctl_with_ref(&self.vm, KVM_X86_SET_MSR_FILTER(), &filter) };
+            drop(bitmaps);
+            if ret < 0 {
+                return Err(Error::HypervisorError(format!(
+                    "KVM_X86_SET_MSR_FILTER: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            Ok(())
+        }
+
+        /// Clear the CPUID **hypervisor-present** tell on every vCPU.
+        ///
+        /// Starts from KVM's `KVM_GET_SUPPORTED_CPUID`, clears leaf `0x1` ECX
+        /// bit 31 (the hypervisor-present bit — the single most-checked VM tell;
+        /// no bare-metal CPU sets it), and installs the result on each vCPU via
+        /// `KVM_SET_CPUID2`. KVM's supported set does not enumerate the
+        /// `0x4000_00xx` hypervisor leaves, so they are absent (an out-of-range
+        /// leaf, exactly like bare metal) without extra work.
+        ///
+        /// This is the Phase 5.3 baseline; the full vendor/brand/topology
+        /// rewrite (`enlil_devices::stealth::cpuid::CpuidStealthTable`) is a
+        /// later step that must merge into — not exceed — KVM's ≤80-entry set.
+        ///
+        /// Call after creating vCPUs and before running them.
+        ///
+        /// # Errors
+        /// Returns [`Error::Vcpu`] if querying the supported CPUID or setting it
+        /// on a vCPU fails.
+        pub fn clear_cpuid_hypervisor_bit(&self) -> Result<()> {
+            use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
+            let mut cpuid = self
+                .kvm
+                .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
+                .map_err(|e| Error::Vcpu(format!("KVM_GET_SUPPORTED_CPUID: {e}")))?;
+            for entry in cpuid.as_mut_slice() {
+                if entry.function == 1 {
+                    // Leaf 1 ECX bit 31 = hypervisor present.
+                    entry.ecx &= !(1u32 << 31);
+                }
+            }
+            for (i, vcpu) in self.vcpus.iter().enumerate() {
+                vcpu.set_cpuid2(&cpuid)
+                    .map_err(|e| Error::Vcpu(format!("KVM_SET_CPUID2 vcpu {i}: {e}")))?;
+            }
+            Ok(())
+        }
+
         /// Map a host buffer into the guest's physical address space.
         ///
         /// `host_addr` must point to at least `size` bytes of memory that
@@ -588,6 +780,67 @@ mod linux {
             }
         }
 
+        /// Run vCPU `index` once like [`run_vcpu`](Self::run_vcpu), but drive
+        /// the per-vCPU timing shadows around the entry so the guest-visible
+        /// APERF/MPERF hide the time spent handling the *previous* exit.
+        ///
+        /// Per call: read the host TSC just before re-entry and
+        /// [`on_vmresume`](crate::timing_stealth::VcpuTimingState::on_vmresume)
+        /// to subtract the userspace gap since the last exit (proportionally,
+        /// so the APERF/MPERF ratio is preserved); run; read the TSC again,
+        /// [`advance`](crate::timing_stealth::VcpuTimingState::advance) the
+        /// shadows by the in-guest delta at the model's core/ref rate, and
+        /// record the exit TSC for the next gap. The net effect: the shadows
+        /// count guest execution at the model frequency and never advance
+        /// across a VMEXIT — an IET divergence detector reading APERF/MPERF sees
+        /// continuous guest time with no hypervisor overhead.
+        ///
+        /// `model` must be the same [`PmcRateModel`] used to drive the RDPMC
+        /// fixed counters, or the two stealth surfaces would disagree.
+        ///
+        /// Returns the exit **and** the in-guest reference-cycle delta this
+        /// entry advanced the timing shadows by. The PMC counters live in the
+        /// handler (not shared like the timing `Arc`), so they cannot be
+        /// advanced inside this call without aliasing `handler`; instead the
+        /// run loop feeds the returned delta to `PmcState::advance_counters`
+        /// (e.g. via `bus.stealth_msr_mut()`) *after* this returns, keeping the
+        /// RDPMC surface in lockstep with APERF/MPERF at the same model rate.
+        ///
+        /// [`PmcRateModel`]: enlil_devices::stealth::pmc::PmcRateModel
+        ///
+        /// # Errors
+        /// As [`run_vcpu`](Self::run_vcpu).
+        pub fn run_vcpu_timed(
+            &mut self,
+            index: usize,
+            handler: &mut dyn VmExitHandler,
+            timing: &crate::timing_stealth::VcpuTimingState,
+            model: &enlil_devices::stealth::pmc::PmcRateModel,
+        ) -> Result<(GuestExit, u64)> {
+            // The RIP we are about to resume at — recorded for LBR sanitization
+            // (on_vmresume stashes it); 0 if regs are unreadable.
+            let guest_rip = self
+                .vcpus
+                .get(index)
+                .and_then(|v| v.get_regs().ok())
+                .map_or(0, |r| r.rip);
+
+            // SAFETY: `_rdtsc` is a baseline x86-64 instruction with no
+            // preconditions; the KVM backend only compiles for x86-64 Linux.
+            let entry_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+            timing.on_vmresume(entry_tsc, guest_rip);
+
+            let exit = self.run_vcpu(index, handler)?;
+
+            // SAFETY: as above.
+            let exit_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+            let guest_ref_cycles = exit_tsc.saturating_sub(entry_tsc);
+            timing.advance(guest_ref_cycles, model);
+            timing.on_vmexit(exit_tsc);
+
+            Ok((exit, guest_ref_cycles))
+        }
+
         /// Arm (or disarm) a vCPU's KVM immediate-exit flag.
         ///
         /// With it armed, the next [`run_vcpu`](Self::run_vcpu) returns
@@ -635,6 +888,25 @@ mod linux {
                     handler.mmio_write(addr, data);
                     GuestExit::MmioWrite { addr, size }
                 }
+                VcpuExit::X86Rdmsr(exit) => {
+                    let msr = exit.index;
+                    match handler.rdmsr(msr) {
+                        Some(value) => {
+                            *exit.data = value;
+                            *exit.error = 0;
+                        }
+                        // Refused: inject #GP into the guest on re-entry.
+                        None => *exit.error = 1,
+                    }
+                    GuestExit::MsrRead { msr }
+                }
+                VcpuExit::X86Wrmsr(exit) => {
+                    let msr = exit.index;
+                    let value = exit.data;
+                    // Refused: inject #GP into the guest on re-entry.
+                    *exit.error = u8::from(!handler.wrmsr(msr, value));
+                    GuestExit::MsrWrite { msr, value }
+                }
                 VcpuExit::Hlt => GuestExit::Halted,
                 VcpuExit::Shutdown | VcpuExit::SystemEvent(..) => GuestExit::Shutdown,
                 VcpuExit::Debug(_) => GuestExit::Debug,
@@ -642,8 +914,8 @@ mod linux {
                 VcpuExit::InternalError => GuestExit::InternalError,
                 VcpuExit::FailEntry(reason, _cpu) => GuestExit::FailedEntry(reason),
                 VcpuExit::Unsupported(reason) => GuestExit::Unsupported(reason),
-                // Everything else (Hypercall, MSR exits, NMI, …) is not yet
-                // modelled; surface a sentinel so the caller can log it.
+                // Everything else (Hypercall, NMI, …) is not yet modelled;
+                // surface a sentinel so the caller can log it.
                 _ => GuestExit::Unsupported(u32::MAX),
             }
         }
@@ -685,6 +957,18 @@ mod tests {
         );
         assert_eq!(GuestExit::Interrupted.outcome(), RunOutcome::Continue);
         assert_eq!(GuestExit::Unsupported(42).outcome(), RunOutcome::Continue);
+        assert_eq!(
+            GuestExit::MsrRead { msr: 0xE8 }.outcome(),
+            RunOutcome::Continue
+        );
+        assert_eq!(
+            GuestExit::MsrWrite {
+                msr: 0x1D9,
+                value: 1
+            }
+            .outcome(),
+            RunOutcome::Continue
+        );
     }
 
     #[test]
@@ -701,6 +985,11 @@ mod tests {
         assert_eq!(h.io_in, vec![(0x60, 4)]);
         assert_eq!(h.mmio_write, vec![(0xfed4_0000, vec![1, 2, 3])]);
         assert_eq!(h.mmio_read, vec![(0xfee0_0000, 8)]);
+
+        assert_eq!(h.rdmsr(0xE8), Some(0));
+        assert!(h.wrmsr(0x1D9, 0x42));
+        assert_eq!(h.msr_read, vec![0xE8]);
+        assert_eq!(h.msr_write, vec![(0x1D9, 0x42)]);
     }
 
     #[test]
@@ -715,6 +1004,10 @@ mod tests {
         h.io_out(0x3f8, &[0]);
         h.mmio_write(0x1000, &[0]);
         assert_eq!(buf, [0xaa, 0xaa]);
+        // An unmodelled MSR is refused by default (→ #GP in the guest), not
+        // silently spoofed.
+        assert_eq!(h.rdmsr(0xE8), None);
+        assert!(!h.wrmsr(0x1D9, 0x1));
     }
 
     // Integration test that touches real KVM. It is honest about the runner:
@@ -976,6 +1269,371 @@ mod tests {
         backend
             .set_immediate_exit(0, false)
             .expect("disarm immediate exit");
+    }
+
+    // Proves the MSR exit path end-to-end on real KVM: with userspace MSR
+    // forwarding on, a guest `rdmsr` of an MSR KVM does not emulate traps to
+    // userspace, the handler supplies the 64-bit value, and it round-trips into
+    // the guest (EDX:EAX) — the seam the Phase 5 timing/PMC stealth shadows
+    // serve their spoofed APERF/MPERF/PMC values through. Self-skips when
+    // /dev/kvm or the userspace-MSR cap is unavailable rather than faking it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rdmsr_is_forwarded_and_value_round_trips_to_guest() {
+        if !is_kvm_available() {
+            eprintln!("skipping rdmsr_is_forwarded_...: no /dev/kvm");
+            return;
+        }
+
+        // A handler that supplies a known MSR value and captures the byte the
+        // guest echoes back out — proving the supplied value reached EAX.
+        struct MsrProbe {
+            supplied: u64,
+            seen: Option<u32>,
+            echoed: Vec<u8>,
+        }
+        impl VmExitHandler for MsrProbe {
+            fn rdmsr(&mut self, msr: u32) -> Option<u64> {
+                self.seen = Some(msr);
+                Some(self.supplied)
+            }
+            fn io_out(&mut self, _port: u16, data: &[u8]) {
+                self.echoed.extend_from_slice(data);
+            }
+        }
+
+        // 16-bit real-mode blob:
+        //   66 B9 78 56 34 12   mov ecx, 0x12345678  ; an MSR KVM doesn't know
+        //   0F 32               rdmsr                ; edx:eax = supplied value
+        //   BA F8 03            mov dx, 0x3F8        ; COM1 transmit register
+        //   EE                  out dx, al           ; echo low byte of eax
+        //   F4                  hlt
+        #[rustfmt::skip]
+        let code: [u8; 13] = [
+            0x66, 0xB9, 0x78, 0x56, 0x34, 0x12,
+            0x0F, 0x32,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0xF4,
+        ];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        const MSR: u32 = 0x1234_5678;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // Forwarding the cap must precede vCPU creation. If the host kernel
+        // lacks it, skip honestly rather than failing.
+        if let Err(e) = backend.enable_userspace_msr_exits() {
+            eprintln!("skipping rdmsr_is_forwarded_...: {e}");
+            return;
+        }
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        let mut probe = MsrProbe {
+            supplied: 0x0000_0000_0000_00AB,
+            seen: None,
+            echoed: Vec::new(),
+        };
+
+        let mut halted = false;
+        let mut saw_msr_exit = false;
+        for _ in 0..100 {
+            match backend.run_vcpu(0, &mut probe).expect("run vcpu") {
+                GuestExit::Halted => {
+                    halted = true;
+                    break;
+                }
+                GuestExit::MsrRead { msr } => {
+                    assert_eq!(msr, MSR, "the forwarded MSR index must reach the handler");
+                    saw_msr_exit = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        assert!(saw_msr_exit, "rdmsr never trapped to userspace");
+        assert_eq!(probe.seen, Some(MSR));
+        // The low byte of the supplied MSR value reached EAX and was echoed.
+        assert_eq!(probe.echoed, vec![0xAB]);
+    }
+
+    // Proves clear_cpuid_hypervisor_bit() installs the host's *real* feature
+    // set on the guest with the hypervisor-present tell cleared: after applying
+    // it, a guest running CPUID leaf 1 reads ECX bit 31 (hypervisor present) as
+    // 0 *and* EDX bit 4 (TSC) as 1 — i.e. it sees genuine CPU features, not an
+    // empty CPUID, and no VM tell. (In this minimal VM KVM does not set the
+    // hypervisor bit by default, so the value of this call is installing the
+    // supported feature set with the bit guaranteed clear, not flipping a 1.)
+    // Self-skips without /dev/kvm rather than faking it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cpuid_stealth_installs_real_features_without_the_hypervisor_tell() {
+        if !is_kvm_available() {
+            eprintln!("skipping cpuid_stealth_installs_real_features_...: no /dev/kvm");
+            return;
+        }
+
+        // 16-bit real-mode blob; echoes two status bytes to COM1:
+        //   66 B8 01 00 00 00   mov eax, 1      ; CPUID leaf 1
+        //   0F A2               cpuid
+        //   66 C1 E9 1F         shr ecx, 31     ; ecx = hypervisor-present bit
+        //   88 C8               mov al, cl
+        //   BA F8 03            mov dx, 0x3F8   ; COM1
+        //   EE                  out dx, al      ; byte 0: hypervisor bit
+        //   66 C1 EA 04         shr edx, 4      ; edx bit0 = TSC feature (EDX[4])
+        //   80 E2 01            and dl, 1
+        //   88 D0               mov al, dl
+        //   EE                  out dx, al      ; byte 1: TSC bit
+        //   F4                  hlt
+        #[rustfmt::skip]
+        let code: [u8; 29] = [
+            0x66, 0xB8, 0x01, 0x00, 0x00, 0x00,
+            0x0F, 0xA2,
+            0x66, 0xC1, 0xE9, 0x1F,
+            0x88, 0xC8,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0x66, 0xC1, 0xEA, 0x04,
+            0x80, 0xE2, 0x01,
+            0x88, 0xD0,
+            0xEE,
+            0xF4,
+        ];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu");
+        backend
+            .clear_cpuid_hypervisor_bit()
+            .expect("apply cpuid stealth");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        struct EchoOut(Vec<u8>);
+        impl VmExitHandler for EchoOut {
+            fn io_out(&mut self, _port: u16, data: &[u8]) {
+                self.0.extend_from_slice(data);
+            }
+        }
+        let mut echo = EchoOut(Vec::new());
+
+        let mut halted = false;
+        for _ in 0..100 {
+            if backend.run_vcpu(0, &mut echo).expect("run vcpu") == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        // byte 0: hypervisor-present bit clear; byte 1: TSC feature present.
+        assert_eq!(echo.0, vec![0, 1]);
+    }
+
+    // Proves the run loop drives the timing shadows on real KVM: after running
+    // a guest that takes several exits via run_vcpu_timed, the APERF/MPERF
+    // shadows have advanced (guest executed cycles) and their ratio is the
+    // model's core/ref ratio — i.e. the shadows count guest time at the spoofed
+    // frequency and the exit overhead was hidden proportionally (no 1.0-ratio
+    // tell). Self-skips without /dev/kvm rather than faking it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn run_vcpu_timed_advances_shadows_at_the_model_ratio() {
+        use crate::timing_stealth::VcpuTimingState;
+        use enlil_devices::stealth::pmc::PmcRateModel;
+
+        if !is_kvm_available() {
+            eprintln!("skipping run_vcpu_timed_advances_shadows_...: no /dev/kvm");
+            return;
+        }
+
+        // 16-bit real-mode blob: three COM1 writes (three IO exits) then HLT,
+        // so the guest executes real cycles across several entries.
+        //   B0 41            mov al, 'A'
+        //   BA F8 03         mov dx, 0x3F8
+        //   EE               out dx, al
+        //   EE               out dx, al
+        //   EE               out dx, al
+        //   F4               hlt
+        #[rustfmt::skip]
+        let code: [u8; 9] = [0xB0, 0x41, 0xBA, 0xF8, 0x03, 0xEE, 0xEE, 0xEE, 0xF4];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        let timing = VcpuTimingState::new();
+        let model = PmcRateModel::DEFAULT;
+        // Seed so the ratio is the model's from the first read (as the platform
+        // install does), not the 1.0 identity.
+        timing.advance(1_000_000, &model);
+        // A PMC the run loop drives with the returned delta, in lockstep.
+        let mut pmc = enlil_devices::stealth::pmc::PmcState::new();
+        pmc.fixed_ctr_ctrl = 0x330; // core + ref fixed counters
+        pmc.rate_model = model;
+
+        let mut sink = RecordingHandler::default();
+        let mut halted = false;
+        let mut total_guest_cycles = 0u64;
+        for _ in 0..100 {
+            let (exit, guest_cycles) = backend
+                .run_vcpu_timed(0, &mut sink, &timing, &model)
+                .expect("run vcpu timed");
+            // The run loop feeds the same delta to the PMC surface.
+            pmc.advance_counters(guest_cycles);
+            total_guest_cycles += guest_cycles;
+            if exit == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        assert_eq!(sink.io_out.len(), 3, "guest issued its three OUTs");
+        assert!(total_guest_cycles > 0, "run loop measured guest cycles");
+
+        let aperf = timing.read_aperf();
+        let mperf = timing.read_mperf();
+        assert!(aperf > 0 && mperf > 0, "shadows advanced for guest execution");
+        // The PMC core counter, driven by the same per-entry deltas, tracks the
+        // APERF shadow — the two surfaces stay in lockstep through the run loop.
+        let pmc_core = pmc.read_pmc(0x4000_0001);
+        let pmc_ref = pmc.read_pmc(0x4000_0002);
+        assert!(pmc_core > 0 && pmc_ref > 0, "PMC advanced with the guest");
+        assert!(
+            (pmc_core as f64 / pmc_ref as f64 - model.core_per_kilo_ref as f64 / 1000.0).abs()
+                < 0.02,
+            "RDPMC core/ref tracks the model ratio like APERF/MPERF"
+        );
+        // The APERF/MPERF ratio is the model core/ref ratio (1.15), preserved
+        // across the run and the hidden exits — not the 1.0 VM tell. Tolerance
+        // covers per-step integer/float rounding in advance/on_vmresume.
+        let ratio = aperf as f64 / mperf as f64;
+        let model_ratio = model.core_per_kilo_ref as f64 / 1000.0;
+        assert!(
+            (ratio - model_ratio).abs() < 0.02,
+            "APERF/MPERF ratio {ratio} should track the model {model_ratio}"
+        );
+    }
+
+    // Proves the MSR *filter* forwards a KVM-*known* MSR to userspace on real
+    // KVM: APERF (0xE8) is normally emulated in-kernel, but after
+    // forward_msrs_to_userspace covers it, a guest rdmsr of APERF traps to our
+    // handler (which serves the stealth shadow) and the shadow value round-trips
+    // into the guest. Without the filter the unknown-reason cap alone would not
+    // forward APERF. Self-skips without /dev/kvm rather than faking it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn msr_filter_forwards_a_kvm_known_msr() {
+        if !is_kvm_available() {
+            eprintln!("skipping msr_filter_forwards_a_kvm_known_msr: no /dev/kvm");
+            return;
+        }
+
+        struct MsrProbe {
+            supplied: u64,
+            seen: Option<u32>,
+            echoed: Vec<u8>,
+        }
+        impl VmExitHandler for MsrProbe {
+            fn rdmsr(&mut self, msr: u32) -> Option<u64> {
+                self.seen = Some(msr);
+                Some(self.supplied)
+            }
+            fn io_out(&mut self, _port: u16, data: &[u8]) {
+                self.echoed.extend_from_slice(data);
+            }
+        }
+
+        // 16-bit real-mode blob: rdmsr(IA32_APERF=0xE8), echo AL, hlt.
+        //   66 B9 E8 00 00 00   mov ecx, 0xE8
+        //   0F 32               rdmsr
+        //   BA F8 03            mov dx, 0x3F8
+        //   EE                  out dx, al
+        //   F4                  hlt
+        #[rustfmt::skip]
+        let code: [u8; 13] = [
+            0x66, 0xB9, 0xE8, 0x00, 0x00, 0x00,
+            0x0F, 0x32,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0xF4,
+        ];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        const IA32_APERF: u32 = 0xE8;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        if let Err(e) = backend.enable_userspace_msr_exits() {
+            eprintln!("skipping msr_filter_forwards_a_kvm_known_msr: {e}");
+            return;
+        }
+        // Deny (forward) MPERF + APERF (0xE7, 0xE8) — both KVM-known.
+        backend
+            .forward_msrs_to_userspace(&[(0xE7, 2)])
+            .expect("install msr filter");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        let mut probe = MsrProbe {
+            supplied: 0x0000_0000_0000_00CD,
+            seen: None,
+            echoed: Vec::new(),
+        };
+        let mut halted = false;
+        let mut saw_aperf = false;
+        for _ in 0..100 {
+            match backend.run_vcpu(0, &mut probe).expect("run vcpu") {
+                GuestExit::Halted => {
+                    halted = true;
+                    break;
+                }
+                GuestExit::MsrRead { msr } if msr == IA32_APERF => saw_aperf = true,
+                _ => {}
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        assert!(saw_aperf, "APERF rdmsr was not forwarded by the filter");
+        assert_eq!(probe.seen, Some(IA32_APERF));
+        // The supplied shadow value's low byte reached the guest's AL.
+        assert_eq!(probe.echoed, vec![0xCD]);
     }
 
     /// A do-nothing [`VmExitHandler`] for guests that only touch RAM.

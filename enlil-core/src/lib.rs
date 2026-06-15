@@ -6,6 +6,7 @@ pub mod error;
 pub mod kvm_backend;
 pub mod memory;
 pub mod serial;
+pub mod stealth_msr;
 pub mod timing_stealth;
 pub mod vcpu;
 pub mod vm;

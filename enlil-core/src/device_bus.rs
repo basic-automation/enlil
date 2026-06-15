@@ -15,6 +15,7 @@
 
 use crate::kvm_backend::VmExitHandler;
 use crate::serial::{SerialOutput, SerialPort};
+use crate::stealth_msr::StealthMsrRouter;
 use enlil_devices::bus::{MmioBus, MmioDevice, PioBus, PioDevice};
 use enlil_devices::chipset::{Gpe0Block, SharedAcpiPm1Block, SharedSystemControlPortA};
 use enlil_devices::dma::{Dma8237, DmaPageRegisters};
@@ -48,6 +49,15 @@ pub struct DeviceBus {
     /// [`add_pcie`](Self::add_pcie) mounts it, so the platform layer can poll the
     /// guest's reboot request. `None` until `add_pcie` runs.
     pci_reset: Option<PciResetControl>,
+    /// Per-vCPU stealth MSR shadows (APERF/MPERF, PMC, LBR). When present, the
+    /// handler serves forwarded guest `RDMSR`/`WRMSR` for the modelled MSRs
+    /// from this router instead of `#GP`-ing them; `None` leaves all MSR exits
+    /// unhandled. This is the single-vCPU run loop's state — a multi-vCPU model
+    /// will hold one router per vCPU. `None` until [`set_stealth_msr_router`]
+    /// runs.
+    ///
+    /// [`set_stealth_msr_router`]: Self::set_stealth_msr_router
+    stealth_msr: Option<StealthMsrRouter>,
 }
 
 impl DeviceBus {
@@ -58,7 +68,25 @@ impl DeviceBus {
             pio: PioBus::new(),
             mmio: MmioBus::new(),
             pci_reset: None,
+            stealth_msr: None,
         }
+    }
+
+    /// Install the per-vCPU stealth MSR router so forwarded guest `RDMSR`/
+    /// `WRMSR` of the modelled MSRs (APERF/MPERF, the PMC counters, and the LBR
+    /// registers) are served from its shadows. Requires the backend to have
+    /// userspace MSR forwarding on
+    /// ([`KvmBackend::enable_userspace_msr_exits`](crate::kvm_backend::KvmBackend::enable_userspace_msr_exits)).
+    pub fn set_stealth_msr_router(&mut self, router: StealthMsrRouter) {
+        self.stealth_msr = Some(router);
+    }
+
+    /// Mutable access to the installed stealth MSR router, if any — so the run
+    /// loop can advance its shadow counters (`PmcState::advance_counters`,
+    /// `VcpuTimingState::advance`) between guest entries.
+    #[must_use]
+    pub fn stealth_msr_mut(&mut self) -> Option<&mut StealthMsrRouter> {
+        self.stealth_msr.as_mut()
     }
 
     /// Register a port-I/O device over the range it declares.
@@ -892,6 +920,42 @@ impl StandardPc {
         None
     }
 
+    /// Reference-cycle delta used to seed the timing shadows at install so the
+    /// guest's first APERF/MPERF read already shows the model's core/ref ratio
+    /// rather than the all-zero 1.0 identity (a VM tell in its own right — see
+    /// roadmap 5.4 and [`VcpuTimingState::advance`]). One million reference
+    /// cycles is sub-millisecond at multi-GHz and well below any counter wrap.
+    ///
+    /// [`VcpuTimingState::advance`]: crate::timing_stealth::VcpuTimingState::advance
+    pub const STEALTH_SEED_REF_CYCLES: u64 = 1_000_000;
+
+    /// Install a per-vCPU stealth MSR router on the device bus and return the
+    /// shared [`VcpuTimingState`](crate::timing_stealth::VcpuTimingState) handle
+    /// the run loop drives.
+    ///
+    /// Builds a [`StealthMsrRouter`] (a fresh `PmcState` and an `LbrState` for
+    /// `platform`) over a new timing state, seeds the APERF/MPERF shadows with
+    /// one [`STEALTH_SEED_REF_CYCLES`](Self::STEALTH_SEED_REF_CYCLES) advance at
+    /// the default [`PmcRateModel`] rate so a guest reading APERF/MPERF
+    /// immediately sees the non-unity model ratio, installs the router on the
+    /// bus, and hands back the `Arc` so the run loop can call
+    /// `on_vmexit`/`on_vmresume` around `KVM_RUN` and `advance` the shadows.
+    ///
+    /// The backend-side stealth setup (`enable_userspace_msr_exits` to forward
+    /// the MSR exits, `clear_cpuid_hypervisor_bit`) is configured separately on
+    /// the [`KvmBackend`](crate::kvm_backend::KvmBackend).
+    pub fn install_stealth_msr_router(
+        &mut self,
+        platform: enlil_devices::stealth::lbr::LbrPlatform,
+    ) -> std::sync::Arc<crate::timing_stealth::VcpuTimingState> {
+        use enlil_devices::stealth::{lbr::LbrState, pmc::PmcRateModel};
+        let timing = crate::timing_stealth::VcpuTimingState::new();
+        timing.advance(Self::STEALTH_SEED_REF_CYCLES, &PmcRateModel::DEFAULT);
+        let router = StealthMsrRouter::new(std::sync::Arc::clone(&timing), LbrState::new(platform));
+        self.bus.set_stealth_msr_router(router);
+        timing
+    }
+
     /// Drive a PCI device's level-triggered `INTx` line into the interrupt fabric,
     /// the way a real south-bridge does. `slot` is the device's PCI device number,
     /// `pin` its interrupt pin (`1`=INTA..`4`=INTD, from config `0x3D`), and
@@ -1128,6 +1192,14 @@ impl VmExitHandler for DeviceBus {
     }
     fn mmio_write(&mut self, addr: u64, data: &[u8]) {
         self.mmio.write(addr, data);
+    }
+    fn rdmsr(&mut self, msr: u32) -> Option<u64> {
+        self.stealth_msr.as_ref().and_then(|r| r.read_msr(msr))
+    }
+    fn wrmsr(&mut self, msr: u32, value: u64) -> bool {
+        self.stealth_msr
+            .as_mut()
+            .is_some_and(|r| r.write_msr(msr, value))
     }
 }
 
@@ -2880,5 +2952,161 @@ mod tests {
             "guest produced no serial output under the production IRQ chip"
         );
         assert_eq!(&*captured.lock().unwrap(), b"OK");
+    }
+
+    // End-to-end on real KVM: the whole stealth MSR stack assembled through the
+    // platform — install_stealth_msr_router on the bus, enable_userspace_msr_exits
+    // + forward_msrs_to_userspace(router.filter_ranges()) on the backend — lets a
+    // guest rdmsr APERF (KVM-known, normally in-kernel) and read back the value
+    // the run loop seeded into the timing shadow, routed through the DeviceBus
+    // handler. Self-skips without /dev/kvm or the userspace-MSR cap.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_stealth_stack_serves_seeded_aperf_to_a_guest() {
+        use crate::kvm_backend::{is_kvm_available, GuestExit, GuestRam, KvmBackend};
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::stealth::lbr::LbrPlatform;
+        use std::sync::{Arc, Mutex};
+
+        if !is_kvm_available() {
+            eprintln!("skipping full_stealth_stack_...: no /dev/kvm");
+            return;
+        }
+
+        // rdmsr(IA32_APERF=0xE8); out 0x3F8, al; hlt.
+        #[rustfmt::skip]
+        let code: [u8; 13] = [
+            0x66, 0xB9, 0xE8, 0x00, 0x00, 0x00,
+            0x0F, 0x32,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0xF4,
+        ];
+        const ENTRY: u64 = 0x1000;
+        const APERF: u32 = 0xE8;
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let mut pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Shared(Arc::clone(&sink))),
+            0,
+            1,
+        )
+        .expect("build standard pc");
+
+        // Install the router and seed APERF with a known value (low byte 0xBE).
+        let timing = pc.install_stealth_msr_router(LbrPlatform::AmdSvm);
+        timing.write_aperf(0x0000_0000_0000_00BE);
+        let ranges = pc
+            .bus
+            .stealth_msr_mut()
+            .expect("router installed")
+            .filter_ranges();
+
+        let mut ram = GuestRam::new(0x1000);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        if let Err(e) = backend.enable_userspace_msr_exits() {
+            eprintln!("skipping full_stealth_stack_...: {e}");
+            return;
+        }
+        backend
+            .forward_msrs_to_userspace(&ranges)
+            .expect("install msr filter");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        let mut saw_aperf = false;
+        let mut halted = false;
+        for _ in 0..100 {
+            match backend.run_vcpu(0, &mut pc.bus).expect("run vcpu") {
+                GuestExit::Halted => {
+                    halted = true;
+                    break;
+                }
+                GuestExit::MsrRead { msr } if msr == APERF => saw_aperf = true,
+                _ => {}
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        assert!(saw_aperf, "APERF was not forwarded to the bus");
+        // The seeded shadow's low byte reached the guest and echoed out COM1.
+        assert_eq!(&*sink.lock().unwrap(), &[0xBE]);
+    }
+
+    // The bus delegates forwarded MSR exits to an installed stealth router, and
+    // refuses every MSR (→ #GP) when none is installed — the wiring that lets a
+    // guest read spoofed APERF/MPERF/PMC/LBR values through the run-loop handler.
+    #[test]
+    fn stealth_msr_router_serves_msr_exits_through_the_bus() {
+        use crate::kvm_backend::VmExitHandler;
+        use crate::stealth_msr::StealthMsrRouter;
+        use crate::timing_stealth::VcpuTimingState;
+        use enlil_devices::stealth::lbr::{intel_msr, LbrPlatform, LbrState};
+        use enlil_devices::stealth::timing::msr as timing_msr;
+
+        let mut bus = DeviceBus::new();
+        // No router yet: an unmodelled MSR is refused, not silently spoofed.
+        assert_eq!(bus.rdmsr(timing_msr::IA32_APERF), None);
+        assert!(!bus.wrmsr(intel_msr::IA32_DEBUGCTL, 1));
+
+        let timing = VcpuTimingState::new();
+        timing.write_aperf(0xABCD);
+        bus.set_stealth_msr_router(StealthMsrRouter::new(
+            timing,
+            LbrState::new(LbrPlatform::AmdSvm),
+        ));
+
+        // Reads now come from the shadow state.
+        assert_eq!(bus.rdmsr(timing_msr::IA32_APERF), Some(0xABCD));
+        // Writes reach the shadows: enabling LBR via DEBUGCTL is observable.
+        assert!(bus.wrmsr(intel_msr::IA32_DEBUGCTL, 1));
+        assert_eq!(bus.rdmsr(intel_msr::IA32_DEBUGCTL), Some(1));
+        assert!(bus.stealth_msr_mut().unwrap().lbr.lbr_enabled);
+        // An MSR outside the modelled set still falls through to #GP.
+        assert_eq!(bus.rdmsr(0x10), None);
+    }
+
+    // The platform convenience installs a router seeded to the model ratio and
+    // hands back a shared timing handle the run loop drives — so APERF/MPERF
+    // read non-zero with the model's core/ref ratio (never the 1.0 tell), and
+    // driving the returned handle is visible through the bus.
+    #[test]
+    fn install_stealth_msr_router_seeds_the_model_ratio_and_shares_the_handle() {
+        use crate::kvm_backend::VmExitHandler;
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::stealth::lbr::LbrPlatform;
+        use enlil_devices::stealth::pmc::PmcRateModel;
+        use enlil_devices::stealth::timing::msr as timing_msr;
+
+        let mut pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            0,
+            1,
+        )
+        .expect("build standard pc");
+
+        let timing = pc.install_stealth_msr_router(LbrPlatform::AmdSvm);
+
+        let aperf = pc.bus.rdmsr(timing_msr::IA32_APERF).expect("APERF served");
+        let mperf = pc.bus.rdmsr(timing_msr::IA32_MPERF).expect("MPERF served");
+        assert!(aperf > 0 && mperf > 0, "shadows seeded non-zero");
+        assert_ne!(aperf, mperf, "seeded ratio must not be the 1.0 tell");
+        assert_eq!(
+            aperf * 1000 / mperf,
+            PmcRateModel::DEFAULT.core_per_kilo_ref,
+            "APERF/MPERF must encode the model core/ref ratio"
+        );
+
+        // The returned handle aliases the router's shadow: a run-loop write is
+        // visible through the bus's MSR read.
+        timing.write_aperf(0x1_2345);
+        assert_eq!(pc.bus.rdmsr(timing_msr::IA32_APERF), Some(0x1_2345));
     }
 }
