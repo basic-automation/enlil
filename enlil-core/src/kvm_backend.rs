@@ -699,6 +699,58 @@ mod linux {
             }
         }
 
+        /// Run vCPU `index` once like [`run_vcpu`](Self::run_vcpu), but drive
+        /// the per-vCPU timing shadows around the entry so the guest-visible
+        /// APERF/MPERF hide the time spent handling the *previous* exit.
+        ///
+        /// Per call: read the host TSC just before re-entry and
+        /// [`on_vmresume`](crate::timing_stealth::VcpuTimingState::on_vmresume)
+        /// to subtract the userspace gap since the last exit (proportionally,
+        /// so the APERF/MPERF ratio is preserved); run; read the TSC again,
+        /// [`advance`](crate::timing_stealth::VcpuTimingState::advance) the
+        /// shadows by the in-guest delta at the model's core/ref rate, and
+        /// record the exit TSC for the next gap. The net effect: the shadows
+        /// count guest execution at the model frequency and never advance
+        /// across a VMEXIT — an IET divergence detector reading APERF/MPERF sees
+        /// continuous guest time with no hypervisor overhead.
+        ///
+        /// `model` must be the same [`PmcRateModel`] used to drive the RDPMC
+        /// fixed counters, or the two stealth surfaces would disagree.
+        ///
+        /// [`PmcRateModel`]: enlil_devices::stealth::pmc::PmcRateModel
+        ///
+        /// # Errors
+        /// As [`run_vcpu`](Self::run_vcpu).
+        pub fn run_vcpu_timed(
+            &mut self,
+            index: usize,
+            handler: &mut dyn VmExitHandler,
+            timing: &crate::timing_stealth::VcpuTimingState,
+            model: &enlil_devices::stealth::pmc::PmcRateModel,
+        ) -> Result<GuestExit> {
+            // The RIP we are about to resume at — recorded for LBR sanitization
+            // (on_vmresume stashes it); 0 if regs are unreadable.
+            let guest_rip = self
+                .vcpus
+                .get(index)
+                .and_then(|v| v.get_regs().ok())
+                .map_or(0, |r| r.rip);
+
+            // SAFETY: `_rdtsc` is a baseline x86-64 instruction with no
+            // preconditions; the KVM backend only compiles for x86-64 Linux.
+            let entry_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+            timing.on_vmresume(entry_tsc, guest_rip);
+
+            let exit = self.run_vcpu(index, handler)?;
+
+            // SAFETY: as above.
+            let exit_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+            timing.advance(exit_tsc.saturating_sub(entry_tsc), model);
+            timing.on_vmexit(exit_tsc);
+
+            Ok(exit)
+        }
+
         /// Arm (or disarm) a vCPU's KVM immediate-exit flag.
         ///
         /// With it armed, the next [`run_vcpu`](Self::run_vcpu) returns
@@ -1304,6 +1356,84 @@ mod tests {
         assert!(halted, "guest never reached HLT");
         // byte 0: hypervisor-present bit clear; byte 1: TSC feature present.
         assert_eq!(echo.0, vec![0, 1]);
+    }
+
+    // Proves the run loop drives the timing shadows on real KVM: after running
+    // a guest that takes several exits via run_vcpu_timed, the APERF/MPERF
+    // shadows have advanced (guest executed cycles) and their ratio is the
+    // model's core/ref ratio — i.e. the shadows count guest time at the spoofed
+    // frequency and the exit overhead was hidden proportionally (no 1.0-ratio
+    // tell). Self-skips without /dev/kvm rather than faking it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn run_vcpu_timed_advances_shadows_at_the_model_ratio() {
+        use crate::timing_stealth::VcpuTimingState;
+        use enlil_devices::stealth::pmc::PmcRateModel;
+
+        if !is_kvm_available() {
+            eprintln!("skipping run_vcpu_timed_advances_shadows_...: no /dev/kvm");
+            return;
+        }
+
+        // 16-bit real-mode blob: three COM1 writes (three IO exits) then HLT,
+        // so the guest executes real cycles across several entries.
+        //   B0 41            mov al, 'A'
+        //   BA F8 03         mov dx, 0x3F8
+        //   EE               out dx, al
+        //   EE               out dx, al
+        //   EE               out dx, al
+        //   F4               hlt
+        #[rustfmt::skip]
+        let code: [u8; 9] = [0xB0, 0x41, 0xBA, 0xF8, 0x03, 0xEE, 0xEE, 0xEE, 0xF4];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        let timing = VcpuTimingState::new();
+        let model = PmcRateModel::DEFAULT;
+        // Seed so the ratio is the model's from the first read (as the platform
+        // install does), not the 1.0 identity.
+        timing.advance(1_000_000, &model);
+
+        let mut sink = RecordingHandler::default();
+        let mut halted = false;
+        for _ in 0..100 {
+            if backend
+                .run_vcpu_timed(0, &mut sink, &timing, &model)
+                .expect("run vcpu timed")
+                == GuestExit::Halted
+            {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        assert_eq!(sink.io_out.len(), 3, "guest issued its three OUTs");
+
+        let aperf = timing.read_aperf();
+        let mperf = timing.read_mperf();
+        assert!(aperf > 0 && mperf > 0, "shadows advanced for guest execution");
+        // The APERF/MPERF ratio is the model core/ref ratio (1.15), preserved
+        // across the run and the hidden exits — not the 1.0 VM tell. Tolerance
+        // covers per-step integer/float rounding in advance/on_vmresume.
+        let ratio = aperf as f64 / mperf as f64;
+        let model_ratio = model.core_per_kilo_ref as f64 / 1000.0;
+        assert!(
+            (ratio - model_ratio).abs() < 0.02,
+            "APERF/MPERF ratio {ratio} should track the model {model_ratio}"
+        );
     }
 
     /// A do-nothing [`VmExitHandler`] for guests that only touch RAM.
