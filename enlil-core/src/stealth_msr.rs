@@ -22,7 +22,7 @@
 //! [`VmExitHandler`]: crate::kvm_backend::VmExitHandler
 
 use crate::timing_stealth::VcpuTimingState;
-use enlil_devices::stealth::lbr::{intel_msr, LbrState, LBR_STACK_SIZE};
+use enlil_devices::stealth::lbr::{amd_msr, intel_msr, LbrPlatform, LbrState, LBR_STACK_SIZE};
 use enlil_devices::stealth::pmc::{msr as pmc_msr, PmcState, MAX_FIXED_PMCS, MAX_GP_PMCS};
 use enlil_devices::stealth::timing::msr as timing_msr;
 use std::sync::Arc;
@@ -107,6 +107,48 @@ impl StealthMsrRouter {
             )
     }
 
+    /// The MSR ranges this router answers, as `(base, count)` pairs, for the
+    /// router's platform — the single source of truth to hand to
+    /// [`KvmBackend::forward_msrs_to_userspace`] so the KVM filter and this
+    /// router cover exactly the same MSRs.
+    ///
+    /// Timing (APERF/MPERF), `IA32_DEBUGCTL`, and the PMC registers are
+    /// platform-independent; the last-branch MSRs are not: only the **AMD**
+    /// single-register pair (0x1DB–0x1DE) is included on `AmdSvm`, and only the
+    /// **Intel** TOS + FROM/TO/INFO stack blocks on `IntelVmx`. Forwarding the
+    /// other platform's LBR MSRs would make non-existent registers readable —
+    /// itself a tell — so each platform forwards only what it really exposes.
+    /// At most 11 ranges, within KVM's 16-range limit.
+    ///
+    /// [`KvmBackend::forward_msrs_to_userspace`]: crate::kvm_backend::KvmBackend::forward_msrs_to_userspace
+    #[must_use]
+    pub fn filter_ranges(&self) -> Vec<(u32, u32)> {
+        let gp = MAX_GP_PMCS as u32;
+        let fixed = MAX_FIXED_PMCS as u32;
+        let mut ranges = vec![
+            (timing_msr::IA32_MPERF, 2), // 0xE7 MPERF, 0xE8 APERF
+            (intel_msr::IA32_DEBUGCTL, 1),
+            (pmc_msr::IA32_PMC0, gp),
+            (pmc_msr::IA32_PERFEVTSEL0, gp),
+            (pmc_msr::IA32_FIXED_CTR0, fixed),
+            // FIXED_CTR_CTRL (0x38D), GLOBAL_STATUS (0x38E), GLOBAL_CTRL (0x38F),
+            // GLOBAL_STATUS_RESET (0x390) — four consecutive.
+            (pmc_msr::IA32_FIXED_CTR_CTRL, 4),
+        ];
+        match self.lbr.platform {
+            LbrPlatform::AmdSvm => {
+                ranges.push((amd_msr::LAST_BRANCH_FROM_IP, 4)); // 0x1DB..=0x1DE
+            }
+            LbrPlatform::IntelVmx => {
+                ranges.push((intel_msr::LBR_TOS, 1));
+                ranges.push((intel_msr::LBR_FROM_BASE, LBR_COUNT));
+                ranges.push((intel_msr::LBR_TO_BASE, LBR_COUNT));
+                ranges.push((intel_msr::LBR_INFO_BASE, LBR_COUNT));
+            }
+        }
+        ranges
+    }
+
     /// Serve a guest `RDMSR`. Returns `Some(value)` for an MSR this router
     /// models, or `None` to let the caller fall through (e.g. inject `#GP`).
     #[must_use]
@@ -167,6 +209,51 @@ mod tests {
 
     fn router() -> StealthMsrRouter {
         StealthMsrRouter::new(VcpuTimingState::new(), LbrState::new(LbrPlatform::IntelVmx))
+    }
+
+    fn router_for(platform: LbrPlatform) -> StealthMsrRouter {
+        StealthMsrRouter::new(VcpuTimingState::new(), LbrState::new(platform))
+    }
+
+    #[test]
+    fn filter_ranges_cover_exactly_what_the_router_serves() {
+        for platform in [LbrPlatform::IntelVmx, LbrPlatform::AmdSvm] {
+            let mut r = router_for(platform);
+            let ranges = r.filter_ranges();
+            assert!(ranges.len() <= 16, "within KVM's 16-range limit");
+            // Every MSR the filter forwards must be one the router answers
+            // (via read or write) — otherwise we'd forward an MSR only to #GP
+            // it, or model an MSR we never forward.
+            for (base, count) in ranges {
+                for msr in base..base + count {
+                    let served = r.read_msr(msr).is_some() || r.write_msr(msr, 0);
+                    assert!(served, "router must serve filtered MSR {msr:#x} on {platform:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn filter_ranges_are_platform_correct() {
+        let intel = router_for(LbrPlatform::IntelVmx).filter_ranges();
+        let amd = router_for(LbrPlatform::AmdSvm).filter_ranges();
+        let has = |rs: &[(u32, u32)], msr: u32| {
+            rs.iter().any(|&(b, c)| msr >= b && msr < b + c)
+        };
+        // Intel forwards the 32-entry stack + TOS, not the AMD pair.
+        assert!(has(&intel, intel_msr::LBR_FROM_BASE));
+        assert!(has(&intel, intel_msr::LBR_TOS));
+        assert!(!has(&intel, amd_msr::LAST_BRANCH_FROM_IP));
+        // AMD forwards the single pair, not the Intel stack.
+        assert!(has(&amd, amd_msr::LAST_BRANCH_FROM_IP));
+        assert!(has(&amd, amd_msr::LAST_INT_TO_IP));
+        assert!(!has(&amd, intel_msr::LBR_FROM_BASE));
+        // Both forward the platform-independent surfaces.
+        for rs in [&intel, &amd] {
+            assert!(has(rs, timing_msr::IA32_APERF));
+            assert!(has(rs, intel_msr::IA32_DEBUGCTL));
+            assert!(has(rs, pmc_msr::IA32_PERF_GLOBAL_STATUS_RESET));
+        }
     }
 
     #[test]
