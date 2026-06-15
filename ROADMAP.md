@@ -1786,10 +1786,17 @@ Physical USB Devices
   via `install_stealth_msr_router`, which seeds the model ratio so the first guest
   read is never the 1.0 identity. **AMD LBRV** is now modelled too: `LbrState` holds
   AMD's single LastBranchFrom/ToIP + LastIntFrom/ToIP pair (0x1DB–0x1DE) and
-  `sanitize_after_exit` erases the AMD branch pair on the AMD path. **Remaining:**
-  install a `KVM_X86_SET_MSR_FILTER` bitmap (no kvm-ioctls 0.19 wrapper — raw ioctl)
-  so the *KVM-known* APERF/MPERF/PMC MSRs are forwarded, not just unknown ones; and
-  drive `on_vmexit`/`on_vmresume`/`advance` from the run loop around `KVM_RUN`.
+  `sanitize_after_exit` erases the AMD branch pair on the AMD path. The
+  *KVM-known* MSRs (APERF/MPERF, PMC, `IA32_DEBUGCTL`) are now forwarded too via
+  `KvmBackend::forward_msrs_to_userspace` (a `KVM_X86_SET_MSR_FILTER` default-allow
+  filter that denies just those ranges — proven on `/dev/kvm` for APERF), and
+  `run_vcpu_timed` drives `on_vmresume`/`advance`/`on_vmexit` around `KVM_RUN` so
+  the shadows count guest time at the model rate and hide exit overhead.
+  **Remaining:** assemble these into the production run loop (call
+  `enable_userspace_msr_exits` + `forward_msrs_to_userspace` + the
+  `StandardPc::install_stealth_msr_router` handle from one place, and drive the
+  PMC `advance_counters` alongside the timing `advance`); LBR save/restore via the
+  VMCS/VMCB controls is a bare-metal-backend (Phase 6) concern.
 
 ### 5.5 Virtual TPM 2.0
 - Required for Windows 11
