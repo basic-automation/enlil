@@ -186,11 +186,24 @@ mod linux {
     use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
     use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
     use std::ptr::NonNull;
+    // `ioctl_iow_nr!` expands to a bare `ioctl_ioc_nr!` call, so both macros
+    // (and the `ioctl_with_ref` helper) must be in scope for KVM_X86_SET_MSR_FILTER.
+    use vmm_sys_util::ioctl::ioctl_with_ref;
+    use vmm_sys_util::ioctl_ioc_nr;
 
     /// Host page size (4 KiB on x86-64). KVM requires a memory region's guest
     /// physical base, size, and backing host address to all be multiples of
     /// this — `KVM_SET_USER_MEMORY_REGION` returns `EINVAL` otherwise.
     pub const HOST_PAGE_SIZE: usize = 4096;
+
+    // `KVM_X86_SET_MSR_FILTER` has no `kvm-ioctls` 0.19 wrapper, so declare the
+    // request number directly (`_IOW(KVMIO, 0xc6, struct kvm_msr_filter)`).
+    vmm_sys_util::ioctl_iow_nr!(
+        KVM_X86_SET_MSR_FILTER,
+        kvm_bindings::KVMIO,
+        0xc6,
+        kvm_bindings::kvm_msr_filter
+    );
 
     /// Returns `true` if this host exposes a usable `/dev/kvm`.
     ///
@@ -508,6 +521,74 @@ mod linux {
             self.vm
                 .enable_cap(&cap)
                 .map_err(|e| Error::HypervisorError(format!("enable X86UserSpaceMsr: {e}")))
+        }
+
+        /// Redirect the given MSR ranges — even ones KVM itself emulates — to
+        /// userspace via `KVM_X86_SET_MSR_FILTER`.
+        ///
+        /// [`enable_userspace_msr_exits`](Self::enable_userspace_msr_exits)
+        /// alone only forwards MSRs KVM does *not* know; the timing/PMC stealth
+        /// MSRs (APERF/MPERF, the PMC counters, `IA32_DEBUGCTL`) are KVM-known,
+        /// so they need an explicit filter. This installs a **default-allow**
+        /// filter (every other MSR keeps its in-kernel behaviour) whose only
+        /// ranges *deny* the listed MSRs; with the *filter* exit reason enabled,
+        /// a denied access traps to userspace as a `MsrRead`/`MsrWrite` exit
+        /// instead of `#GP` — so the [`StealthMsrRouter`] gets to answer it.
+        ///
+        /// Each `(base, count)` covers `count` consecutive MSRs from `base`. At
+        /// most [`KVM_MSR_FILTER_MAX_RANGES`](kvm_bindings::KVM_MSR_FILTER_MAX_RANGES)
+        /// (16) ranges are allowed. Call after
+        /// `enable_userspace_msr_exits` and before running the vCPUs.
+        ///
+        /// [`StealthMsrRouter`]: crate::stealth_msr::StealthMsrRouter
+        ///
+        /// # Errors
+        /// Returns [`Error::HypervisorError`] if more than 16 ranges are given
+        /// or the ioctl fails.
+        pub fn forward_msrs_to_userspace(&self, ranges: &[(u32, u32)]) -> Result<()> {
+            use kvm_bindings::{
+                kvm_msr_filter, kvm_msr_filter_range, KVM_MSR_FILTER_DEFAULT_ALLOW,
+                KVM_MSR_FILTER_MAX_RANGES, KVM_MSR_FILTER_READ, KVM_MSR_FILTER_WRITE,
+            };
+            if ranges.len() > KVM_MSR_FILTER_MAX_RANGES as usize {
+                return Err(Error::HypervisorError(format!(
+                    "MSR filter supports at most {KVM_MSR_FILTER_MAX_RANGES} ranges, got {}",
+                    ranges.len()
+                )));
+            }
+            // One all-zero bitmap per range: a clear bit denies that MSR (→
+            // forward to userspace). The bitmaps must stay alive across the
+            // ioctl, so hold them in `bitmaps` until after the call.
+            let bitmaps: Vec<Vec<u8>> = ranges
+                .iter()
+                .map(|&(_, count)| vec![0u8; (count as usize).div_ceil(8)])
+                .collect();
+
+            // SAFETY: `kvm_msr_filter` is plain-old-data; an all-zero value is a
+            // valid default-allow filter with no ranges.
+            let mut filter: kvm_msr_filter = unsafe { std::mem::zeroed() };
+            filter.flags = KVM_MSR_FILTER_DEFAULT_ALLOW;
+            for (i, (&(base, count), bitmap)) in ranges.iter().zip(&bitmaps).enumerate() {
+                filter.ranges[i] = kvm_msr_filter_range {
+                    flags: KVM_MSR_FILTER_READ | KVM_MSR_FILTER_WRITE,
+                    nmsrs: count,
+                    base,
+                    bitmap: bitmap.as_ptr().cast_mut(),
+                };
+            }
+
+            // SAFETY: `filter` is a valid `kvm_msr_filter` and every range's
+            // bitmap pointer refers to a live allocation in `bitmaps`, which
+            // outlives this call.
+            let ret = unsafe { ioctl_with_ref(&self.vm, KVM_X86_SET_MSR_FILTER(), &filter) };
+            drop(bitmaps);
+            if ret < 0 {
+                return Err(Error::HypervisorError(format!(
+                    "KVM_X86_SET_MSR_FILTER: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            Ok(())
         }
 
         /// Clear the CPUID **hypervisor-present** tell on every vCPU.
@@ -1434,6 +1515,98 @@ mod tests {
             (ratio - model_ratio).abs() < 0.02,
             "APERF/MPERF ratio {ratio} should track the model {model_ratio}"
         );
+    }
+
+    // Proves the MSR *filter* forwards a KVM-*known* MSR to userspace on real
+    // KVM: APERF (0xE8) is normally emulated in-kernel, but after
+    // forward_msrs_to_userspace covers it, a guest rdmsr of APERF traps to our
+    // handler (which serves the stealth shadow) and the shadow value round-trips
+    // into the guest. Without the filter the unknown-reason cap alone would not
+    // forward APERF. Self-skips without /dev/kvm rather than faking it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn msr_filter_forwards_a_kvm_known_msr() {
+        if !is_kvm_available() {
+            eprintln!("skipping msr_filter_forwards_a_kvm_known_msr: no /dev/kvm");
+            return;
+        }
+
+        struct MsrProbe {
+            supplied: u64,
+            seen: Option<u32>,
+            echoed: Vec<u8>,
+        }
+        impl VmExitHandler for MsrProbe {
+            fn rdmsr(&mut self, msr: u32) -> Option<u64> {
+                self.seen = Some(msr);
+                Some(self.supplied)
+            }
+            fn io_out(&mut self, _port: u16, data: &[u8]) {
+                self.echoed.extend_from_slice(data);
+            }
+        }
+
+        // 16-bit real-mode blob: rdmsr(IA32_APERF=0xE8), echo AL, hlt.
+        //   66 B9 E8 00 00 00   mov ecx, 0xE8
+        //   0F 32               rdmsr
+        //   BA F8 03            mov dx, 0x3F8
+        //   EE                  out dx, al
+        //   F4                  hlt
+        #[rustfmt::skip]
+        let code: [u8; 13] = [
+            0x66, 0xB9, 0xE8, 0x00, 0x00, 0x00,
+            0x0F, 0x32,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0xF4,
+        ];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        const IA32_APERF: u32 = 0xE8;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        if let Err(e) = backend.enable_userspace_msr_exits() {
+            eprintln!("skipping msr_filter_forwards_a_kvm_known_msr: {e}");
+            return;
+        }
+        // Deny (forward) MPERF + APERF (0xE7, 0xE8) — both KVM-known.
+        backend
+            .forward_msrs_to_userspace(&[(0xE7, 2)])
+            .expect("install msr filter");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        let mut probe = MsrProbe {
+            supplied: 0x0000_0000_0000_00CD,
+            seen: None,
+            echoed: Vec::new(),
+        };
+        let mut halted = false;
+        let mut saw_aperf = false;
+        for _ in 0..100 {
+            match backend.run_vcpu(0, &mut probe).expect("run vcpu") {
+                GuestExit::Halted => {
+                    halted = true;
+                    break;
+                }
+                GuestExit::MsrRead { msr } if msr == IA32_APERF => saw_aperf = true,
+                _ => {}
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        assert!(saw_aperf, "APERF rdmsr was not forwarded by the filter");
+        assert_eq!(probe.seen, Some(IA32_APERF));
+        // The supplied shadow value's low byte reached the guest's AL.
+        assert_eq!(probe.echoed, vec![0xCD]);
     }
 
     /// A do-nothing [`VmExitHandler`] for guests that only touch RAM.
