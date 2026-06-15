@@ -920,6 +920,42 @@ impl StandardPc {
         None
     }
 
+    /// Reference-cycle delta used to seed the timing shadows at install so the
+    /// guest's first APERF/MPERF read already shows the model's core/ref ratio
+    /// rather than the all-zero 1.0 identity (a VM tell in its own right — see
+    /// roadmap 5.4 and [`VcpuTimingState::advance`]). One million reference
+    /// cycles is sub-millisecond at multi-GHz and well below any counter wrap.
+    ///
+    /// [`VcpuTimingState::advance`]: crate::timing_stealth::VcpuTimingState::advance
+    pub const STEALTH_SEED_REF_CYCLES: u64 = 1_000_000;
+
+    /// Install a per-vCPU stealth MSR router on the device bus and return the
+    /// shared [`VcpuTimingState`](crate::timing_stealth::VcpuTimingState) handle
+    /// the run loop drives.
+    ///
+    /// Builds a [`StealthMsrRouter`] (a fresh `PmcState` and an `LbrState` for
+    /// `platform`) over a new timing state, seeds the APERF/MPERF shadows with
+    /// one [`STEALTH_SEED_REF_CYCLES`](Self::STEALTH_SEED_REF_CYCLES) advance at
+    /// the default [`PmcRateModel`] rate so a guest reading APERF/MPERF
+    /// immediately sees the non-unity model ratio, installs the router on the
+    /// bus, and hands back the `Arc` so the run loop can call
+    /// `on_vmexit`/`on_vmresume` around `KVM_RUN` and `advance` the shadows.
+    ///
+    /// The backend-side stealth setup (`enable_userspace_msr_exits` to forward
+    /// the MSR exits, `clear_cpuid_hypervisor_bit`) is configured separately on
+    /// the [`KvmBackend`](crate::kvm_backend::KvmBackend).
+    pub fn install_stealth_msr_router(
+        &mut self,
+        platform: enlil_devices::stealth::lbr::LbrPlatform,
+    ) -> std::sync::Arc<crate::timing_stealth::VcpuTimingState> {
+        use enlil_devices::stealth::{lbr::LbrState, pmc::PmcRateModel};
+        let timing = crate::timing_stealth::VcpuTimingState::new();
+        timing.advance(Self::STEALTH_SEED_REF_CYCLES, &PmcRateModel::DEFAULT);
+        let router = StealthMsrRouter::new(std::sync::Arc::clone(&timing), LbrState::new(platform));
+        self.bus.set_stealth_msr_router(router);
+        timing
+    }
+
     /// Drive a PCI device's level-triggered `INTx` line into the interrupt fabric,
     /// the way a real south-bridge does. `slot` is the device's PCI device number,
     /// `pin` its interrupt pin (`1`=INTA..`4`=INTD, from config `0x3D`), and
@@ -2949,5 +2985,42 @@ mod tests {
         assert!(bus.stealth_msr_mut().unwrap().lbr.lbr_enabled);
         // An MSR outside the modelled set still falls through to #GP.
         assert_eq!(bus.rdmsr(0x10), None);
+    }
+
+    // The platform convenience installs a router seeded to the model ratio and
+    // hands back a shared timing handle the run loop drives — so APERF/MPERF
+    // read non-zero with the model's core/ref ratio (never the 1.0 tell), and
+    // driving the returned handle is visible through the bus.
+    #[test]
+    fn install_stealth_msr_router_seeds_the_model_ratio_and_shares_the_handle() {
+        use crate::kvm_backend::VmExitHandler;
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::stealth::lbr::LbrPlatform;
+        use enlil_devices::stealth::pmc::PmcRateModel;
+        use enlil_devices::stealth::timing::msr as timing_msr;
+
+        let mut pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            0,
+            1,
+        )
+        .expect("build standard pc");
+
+        let timing = pc.install_stealth_msr_router(LbrPlatform::AmdSvm);
+
+        let aperf = pc.bus.rdmsr(timing_msr::IA32_APERF).expect("APERF served");
+        let mperf = pc.bus.rdmsr(timing_msr::IA32_MPERF).expect("MPERF served");
+        assert!(aperf > 0 && mperf > 0, "shadows seeded non-zero");
+        assert_ne!(aperf, mperf, "seeded ratio must not be the 1.0 tell");
+        assert_eq!(
+            aperf * 1000 / mperf,
+            PmcRateModel::DEFAULT.core_per_kilo_ref,
+            "APERF/MPERF must encode the model core/ref ratio"
+        );
+
+        // The returned handle aliases the router's shadow: a run-loop write is
+        // visible through the bus's MSR read.
+        timing.write_aperf(0x1_2345);
+        assert_eq!(pc.bus.rdmsr(timing_msr::IA32_APERF), Some(0x1_2345));
     }
 }
