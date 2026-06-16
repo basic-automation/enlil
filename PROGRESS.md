@@ -9,7 +9,8 @@ the recommended next step so the next run (which has no memory) can resume.
 ## 2026-06-16 — Session: the production run loop comes together — StealthRunLoop, live-guest topology stealth, reboot/shutdown handling (Phase 5)
 
 **7 code/doc increments, each independently green and committed** (branch
-`routine/enlil-2026-06-16`). This session built the **production vCPU run-loop
+`routine/enlil-2026-06-16`, PR https://github.com/physics515/enlil/pull/30).
+This session built the **production vCPU run-loop
 driver** the Phase-5 stealth primitives were always pointing at, applied **CPUID
 topology stealth** to the live guest, and made the loop **act on** the guest's
 reboot/shutdown events — all proven on `/dev/kvm` (read-writable this run,
