@@ -1820,8 +1820,12 @@ Physical USB Devices
   `on_vmexit` baseline → `entry_tsc - 0` huge overhead) — an `exit_seen` guard now
   skips the adjustment until a real exit exists. Proven on `/dev/kvm` (seeded APERF
   read back through the driver; RDPMC/APERF/MPERF in lockstep at the model ratio).
-  **Remaining:** a threaded-vCPU watchdog (the synchronous `set_immediate_exit`
-  primitive exists) and run-loop handling of the `RunStep` reset/sleep events; LBR
+  `StealthRunLoop::run_real_mode` now also *acts on* the `RunStep` platform events
+  the way hardware does — a `0x92`/`0xCF9` CPU reset reboots the vCPU to its reset
+  vector, an ACPI `SLP_EN` commit returns `LoopOutcome::Shutdown(slp_typ)` (`_S5` =
+  power off) — both proven on `/dev/kvm`. **Remaining:** only a threaded-vCPU
+  watchdog (the synchronous `set_immediate_exit` primitive exists; the full version
+  needs a multi-threaded vCPU execution model + signal kick — architectural). LBR
   save/restore via the VMCS/VMCB controls is a bare-metal-backend (Phase 6) concern.
 
 ### 5.5 Virtual TPM 2.0
