@@ -628,6 +628,104 @@ mod linux {
             Ok(())
         }
 
+        /// Apply the [`CpuidStealthTable`]'s **topology** view to every vCPU,
+        /// so the guest sees *its own* topology rather than the host's.
+        ///
+        /// KVM's `KVM_GET_SUPPORTED_CPUID` mirrors the host CPU, so its
+        /// extended-topology leaf `0xB` and the leaf-`1` `EBX[23:16]`
+        /// "max addressable logical-processor IDs" field encode the **host's**
+        /// logical-processor count. A guest with fewer vCPUs that reads them
+        /// finds a package far larger than the cores it actually has — a VM tell
+        /// (and a correctness problem for a guest scheduler counting CPUs from
+        /// CPUID). This overrides exactly those topology fields with the table's
+        /// guest-derived values (built for the guest's `vcpu_count` /
+        /// `threads_per_core`), leaving every other supported leaf — the feature
+        /// bits KVM actually backs — untouched. It also clears the leaf-`1`
+        /// `ECX[31]` hypervisor bit, so it subsumes
+        /// [`clear_cpuid_hypervisor_bit`](Self::clear_cpuid_hypervisor_bit)
+        /// when a table is available.
+        ///
+        /// Leaf `0xB` `EDX` (the per-vCPU x2APIC ID) is left as KVM provides it:
+        /// KVM fills it per vCPU, and the table carries a placeholder `0`.
+        ///
+        /// Call after creating vCPUs and before running them.
+        ///
+        /// # Errors
+        /// Returns [`Error::Vcpu`] if querying the supported CPUID or setting it
+        /// on a vCPU fails.
+        ///
+        /// [`CpuidStealthTable`]: enlil_devices::stealth::cpuid::CpuidStealthTable
+        pub fn apply_topology_stealth(
+            &self,
+            table: &enlil_devices::stealth::cpuid::CpuidStealthTable,
+        ) -> Result<()> {
+            use kvm_bindings::{
+                kvm_cpuid_entry2, CpuId, KVM_CPUID_FLAG_SIGNIFCANT_INDEX, KVM_MAX_CPUID_ENTRIES,
+            };
+            // EBX[23:16]: max addressable logical-processor IDs in the package.
+            const MAX_IDS_MASK: u32 = 0x00FF_0000;
+            // build_topology_leaves always emits subleaves 0 (SMT), 1 (core),
+            // 2 (terminator) — the full leaf-0xB enumeration.
+            const TOPOLOGY_SUBLEAVES: u32 = 3;
+
+            let supported = self
+                .kvm
+                .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
+                .map_err(|e| Error::Vcpu(format!("KVM_GET_SUPPORTED_CPUID: {e}")))?;
+
+            // Copy the supported set out so we can both patch existing entries
+            // and *add* the topology leaves KVM may not enumerate at all — AMD
+            // hosts often omit the Intel-style extended-topology leaf 0xB from
+            // the supported set, so an in-place patch would have nothing to
+            // rewrite and the guest would read leaf 0xB as all-zero.
+            let mut entries: Vec<kvm_cpuid_entry2> = supported.as_slice().to_vec();
+
+            for entry in &mut entries {
+                if entry.function == 1 {
+                    // Clear the hypervisor-present tell and align the package
+                    // width with the guest topology (leaf 0xB below).
+                    entry.ecx &= !(1u32 << 31);
+                    let table_ebx = table.lookup(1, 0).ebx;
+                    entry.ebx = (entry.ebx & !MAX_IDS_MASK) | (table_ebx & MAX_IDS_MASK);
+                }
+            }
+
+            // Overwrite or insert each leaf-0xB subleaf with the guest topology.
+            // EDX (the per-vCPU x2APIC ID) is left to KVM, which fills it per
+            // vCPU; the table carries a placeholder 0.
+            for sub in 0..TOPOLOGY_SUBLEAVES {
+                let r = table.lookup(0xB, sub);
+                if let Some(entry) = entries
+                    .iter_mut()
+                    .find(|e| e.function == 0xB && e.index == sub)
+                {
+                    entry.eax = r.eax;
+                    entry.ebx = r.ebx;
+                    entry.ecx = r.ecx;
+                    entry.flags |= KVM_CPUID_FLAG_SIGNIFCANT_INDEX;
+                } else {
+                    entries.push(kvm_cpuid_entry2 {
+                        function: 0xB,
+                        index: sub,
+                        flags: KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                        eax: r.eax,
+                        ebx: r.ebx,
+                        ecx: r.ecx,
+                        edx: 0,
+                        padding: [0; 3],
+                    });
+                }
+            }
+
+            let cpuid = CpuId::from_entries(&entries)
+                .map_err(|e| Error::Vcpu(format!("rebuild CpuId: {e:?}")))?;
+            for (i, vcpu) in self.vcpus.iter().enumerate() {
+                vcpu.set_cpuid2(&cpuid)
+                    .map_err(|e| Error::Vcpu(format!("KVM_SET_CPUID2 vcpu {i}: {e}")))?;
+            }
+            Ok(())
+        }
+
         /// Map a host buffer into the guest's physical address space.
         ///
         /// `host_addr` must point to at least `size` bytes of memory that
@@ -1446,6 +1544,88 @@ mod tests {
         assert!(halted, "guest never reached HLT");
         // byte 0: hypervisor-present bit clear; byte 1: TSC feature present.
         assert_eq!(echo.0, vec![0, 1]);
+    }
+
+    // apply_topology_stealth makes a guest see ITS OWN topology, not the host's.
+    // KVM's supported leaf 0xB mirrors the host's logical-processor count; a
+    // 2-vCPU guest reading leaf 0xB subleaf 1 EBX would otherwise find the host's
+    // (much larger) count — a VM tell. After applying a table built for 2 vCPUs,
+    // the guest's cpuid(0xB, 1).EBX reads exactly 2. Self-skips without /dev/kvm.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn topology_stealth_makes_the_guest_see_its_own_cpu_count() {
+        use enlil_devices::stealth::cpuid::{CpuidStealthConfig, CpuidStealthTable};
+
+        if !is_kvm_available() {
+            eprintln!("skipping topology_stealth_makes_the_guest_see_its_own_cpu_count: no /dev/kvm");
+            return;
+        }
+
+        // 16-bit real-mode blob; reads leaf 0xB subleaf 1 and echoes EBX low byte:
+        //   66 B8 0B 00 00 00   mov eax, 0xB    ; extended topology leaf
+        //   66 B9 01 00 00 00   mov ecx, 1      ; subleaf 1 (core level)
+        //   0F A2               cpuid
+        //   88 D8               mov al, bl      ; al = EBX[7:0] = logical-proc count
+        //   BA F8 03            mov dx, 0x3F8   ; COM1
+        //   EE                  out dx, al
+        //   F4                  hlt
+        #[rustfmt::skip]
+        let code: [u8; 21] = [
+            0x66, 0xB8, 0x0B, 0x00, 0x00, 0x00,
+            0x66, 0xB9, 0x01, 0x00, 0x00, 0x00,
+            0x0F, 0xA2,
+            0x88, 0xD8,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0xF4,
+        ];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        const GUEST_VCPUS: u32 = 2;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        // Two vCPUs, so the guest topology (2) differs from the host's count.
+        backend.create_vcpu(0).expect("create vcpu 0");
+        backend.create_vcpu(1).expect("create vcpu 1");
+        // Build the table for the guest's topology and apply it.
+        let table = CpuidStealthTable::build(&CpuidStealthConfig::from_host(GUEST_VCPUS, 1));
+        backend
+            .apply_topology_stealth(&table)
+            .expect("apply topology stealth");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        struct EchoOut(Vec<u8>);
+        impl VmExitHandler for EchoOut {
+            fn io_out(&mut self, _port: u16, data: &[u8]) {
+                self.0.extend_from_slice(data);
+            }
+        }
+        let mut echo = EchoOut(Vec::new());
+
+        let mut halted = false;
+        for _ in 0..100 {
+            if backend.run_vcpu(0, &mut echo).expect("run vcpu") == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        // The guest reports its own 2-vCPU topology, regardless of the host's
+        // real logical-processor count.
+        assert_eq!(
+            echo.0,
+            vec![GUEST_VCPUS as u8],
+            "leaf 0xB subleaf 1 EBX should be the guest vCPU count, not the host's"
+        );
     }
 
     // Proves the run loop drives the timing shadows on real KVM: after running
