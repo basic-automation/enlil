@@ -5,7 +5,7 @@
 //! in the canonical `enlil_devices::stealth::lbr` — see the note below.)
 
 use enlil_devices::stealth::pmc::PmcRateModel;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Per-vCPU timing state for stealth
@@ -20,6 +20,12 @@ pub struct VcpuTimingState {
     pub tsc_offset: AtomicI64,
     /// TSC value when last VMEXIT occurred
     pub last_exit_tsc: AtomicU64,
+    /// Whether a VMEXIT has ever been recorded ([`on_vmexit`](Self::on_vmexit)
+    /// has run). Distinct from `last_exit_tsc == 0`, which is a *valid* exit
+    /// timestamp — without this flag the very first `on_vmresume` would compute
+    /// `entry_tsc - 0`, an enormous bogus "exit overhead" that zeroes both
+    /// shadows on the first guest entry.
+    pub exit_seen: AtomicBool,
     /// Last guest instruction pointer before VMEXIT (for LBR sanitization)
     pub last_guest_rip: AtomicU64,
 }
@@ -32,6 +38,7 @@ impl VcpuTimingState {
             total_exit_time_ns: AtomicU64::new(0),
             tsc_offset: AtomicI64::new(0),
             last_exit_tsc: AtomicU64::new(0),
+            exit_seen: AtomicBool::new(false),
             last_guest_rip: AtomicU64::new(0),
         })
     }
@@ -39,6 +46,7 @@ impl VcpuTimingState {
     /// Called on VMEXIT: measure how long we spent outside the guest
     pub fn on_vmexit(&self, exit_tsc: u64) {
         self.last_exit_tsc.store(exit_tsc, Ordering::Release);
+        self.exit_seen.store(true, Ordering::Release);
     }
 
     /// Called before VMRESUME: account for exit time and adjust shadow counters.
@@ -50,6 +58,14 @@ impl VcpuTimingState {
     /// (MPERF runs at the nominal/TSC rate); APERF runs at the core frequency, i.e.
     /// `ratio * MPERF`, so its decrement is scaled by the established ratio.
     pub fn on_vmresume(&self, entry_tsc: u64, guest_rip: u64) {
+        // No exit has happened yet: there is no overhead to hide, and
+        // `entry_tsc - 0` would be a huge spurious decrement that zeroes the
+        // shadows (e.g. wiping a seeded APERF before the guest's first read).
+        // Record the RIP and return.
+        if !self.exit_seen.load(Ordering::Acquire) {
+            self.last_guest_rip.store(guest_rip, Ordering::Release);
+            return;
+        }
         let last_tsc = self.last_exit_tsc.load(Ordering::Acquire);
         let exit_overhead_cycles = entry_tsc.saturating_sub(last_tsc);
 
@@ -174,6 +190,27 @@ mod tests {
         assert_eq!(state.read_mperf(), 950, "MPERF must hide the exit overhead");
         assert_eq!(state.read_aperf(), 950, "APERF must hide the exit overhead");
         // The old code left MPERF at 1000 (ratio 0.95) — a detectable anomaly.
+    }
+
+    #[test]
+    fn first_resume_without_a_prior_exit_does_not_zero_the_shadows() {
+        // A run loop seeds the shadows, then the *first* run_vcpu_timed calls
+        // on_vmresume before any on_vmexit has set a baseline. Without the
+        // exit_seen guard, entry_tsc - 0 is a huge spurious overhead that wipes
+        // the seed; with it, the seeded values survive to the guest's first read.
+        let state = VcpuTimingState::new();
+        state.write_aperf(0xBE);
+        state.write_mperf(0xAB);
+        // A realistically large entry TSC, the value rdtsc would return.
+        state.on_vmresume(0x1234_5678_9ABC, 0x1000);
+        assert_eq!(state.read_aperf(), 0xBE, "seeded APERF must survive the first resume");
+        assert_eq!(state.read_mperf(), 0xAB, "seeded MPERF must survive the first resume");
+        assert_eq!(state.last_guest_rip.load(Ordering::Acquire), 0x1000);
+
+        // Once a real exit baseline exists, overhead hiding resumes normally.
+        state.on_vmexit(0x1234_5678_9ABC + 1000);
+        state.on_vmresume(0x1234_5678_9ABC + 1100, 0x2000); // 100 cycles overhead
+        assert_eq!(state.read_mperf(), 0xAB - 100, "overhead hiding resumes after an exit");
     }
 
     #[test]
