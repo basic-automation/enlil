@@ -247,7 +247,10 @@ mod tests {
             for (base, count) in ranges {
                 for msr in base..base + count {
                     let served = r.read_msr(msr).is_some() || r.write_msr(msr, 0);
-                    assert!(served, "router must serve filtered MSR {msr:#x} on {platform:?}");
+                    assert!(
+                        served,
+                        "router must serve filtered MSR {msr:#x} on {platform:?}"
+                    );
                 }
             }
         }
@@ -257,9 +260,7 @@ mod tests {
     fn filter_ranges_are_platform_correct() {
         let intel = router_for(LbrPlatform::IntelVmx).filter_ranges();
         let amd = router_for(LbrPlatform::AmdSvm).filter_ranges();
-        let has = |rs: &[(u32, u32)], msr: u32| {
-            rs.iter().any(|&(b, c)| msr >= b && msr < b + c)
-        };
+        let has = |rs: &[(u32, u32)], msr: u32| rs.iter().any(|&(b, c)| msr >= b && msr < b + c);
         // Intel forwards the 32-entry stack + TOS, not the AMD pair.
         assert!(has(&intel, intel_msr::LBR_FROM_BASE));
         assert!(has(&intel, intel_msr::LBR_TOS));
@@ -333,7 +334,9 @@ mod tests {
         assert_eq!(r.read_msr(pmc_msr::IA32_PMC0 + 2), Some(12345));
         // The write-only reset MSR is recognised for writes even though it has
         // no readable value.
-        assert!(StealthMsrRouter::is_pmc_msr(pmc_msr::IA32_PERF_GLOBAL_STATUS_RESET));
+        assert!(StealthMsrRouter::is_pmc_msr(
+            pmc_msr::IA32_PERF_GLOBAL_STATUS_RESET
+        ));
         assert!(r.write_msr(pmc_msr::IA32_PERF_GLOBAL_STATUS_RESET, 0));
     }
 
@@ -418,8 +421,14 @@ mod tests {
         let core = r.read_msr(pmc_msr::IA32_FIXED_CTR0 + 1).unwrap();
         let reff = r.read_msr(pmc_msr::IA32_FIXED_CTR0 + 2).unwrap();
 
-        assert_eq!(aperf, core, "APERF surface must equal the core fixed counter");
-        assert_eq!(mperf, reff, "MPERF surface must equal the ref fixed counter");
+        assert_eq!(
+            aperf, core,
+            "APERF surface must equal the core fixed counter"
+        );
+        assert_eq!(
+            mperf, reff,
+            "MPERF surface must equal the ref fixed counter"
+        );
         assert_ne!(aperf, mperf, "ratio must not be the 1.0 VM tell");
     }
 }

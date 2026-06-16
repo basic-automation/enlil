@@ -6,6 +6,130 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-16 — Session: the production run loop comes together — StealthRunLoop, live-guest topology stealth, reboot/shutdown handling (Phase 5)
+
+**7 code/doc increments, each independently green and committed** (branch
+`routine/enlil-2026-06-16`, PR https://github.com/physics515/enlil/pull/30).
+This session built the **production vCPU run-loop
+driver** the Phase-5 stealth primitives were always pointing at, applied **CPUID
+topology stealth** to the live guest, and made the loop **act on** the guest's
+reboot/shutdown events — all proven on `/dev/kvm` (read-writable this run,
+`KVM_RW_OK`). It also fixed a latent timing-shadow bug the run loop surfaced and
+corrected the nightly-rustfmt drift on `master`.
+
+### Increments (commit — what)
+1. `4daa018` — **`on_vmresume` must not zero the shadows before the first exit.**
+   The timed loop calls `on_vmresume` before any `on_vmexit`; `last_exit_tsc` is
+   still its init `0` (indistinguishable from a real exit at TSC 0, which the unit
+   tests use), so `entry_tsc - 0` was a huge spurious overhead that zeroed APERF/
+   MPERF on the first entry — wiping any seeded value. Added an `exit_seen` flag
+   set by `on_vmexit`; the first `on_vmresume` records only the RIP and returns.
+2. `26ff64d` — **`enlil-core::run_loop::StealthRunLoop`** — the production driver.
+   Owns the `KvmBackend` + `StandardPc`; `install` wires the router on the bus then
+   (KVM-required order, before any `KVM_RUN`) `enable_userspace_msr_exits` +
+   `forward_msrs_to_userspace(router.filter_ranges())`; `run_vcpu_once` calls
+   `run_vcpu_timed`, advances the (non-shared) PMC by the returned delta (timing
+   advanced once via the shared `Arc` — no double-count), and drains the platform
+   events into a `RunStep`; `run_vcpu_until_event` is a bounded loop. `target_os =
+   linux`-only.
+3. `2af6030` — **`KvmBackend::apply_topology_stealth(&CpuidStealthTable)`** —
+   overrides leaf `0xB` + leaf-`1` max-IDs with the guest topology and clears the
+   hypervisor bit. AMD KVM omits leaf `0xB` from `GET_SUPPORTED_CPUID`, so it
+   *rebuilds* the array via `CpuId::from_entries`, adding the `0xB` subleaves with
+   `SIGNIFCANT_INDEX` when absent rather than patching in place.
+4. `d8f2bb4` — **wire `apply_topology_stealth` into `StealthRunLoop`** so the
+   production path can apply full CPUID stealth (topology + hypervisor bit).
+5. `7d6d688` — **docs**: ROADMAP 5.3 (topology applied to live guest) + 5.4
+   (production run loop assembled) + RESEARCH 2026-06-16 (the two measured facts).
+6. `4b7466b` — **`StealthRunLoop::run_real_mode`** + `LoopOutcome` — the managed
+   loop *acts on* events: `0x92`/`0xCF9` reset → reboot the vCPU to its reset
+   vector; ACPI `SLP_EN` → `Shutdown(slp_typ)` (`_S5` = power off); `HLT` →
+   `Halted`; bounded → `Exhausted`.
+7. `a6c7bf4` — **`cargo fmt --all`**: the unpinned `nightly` channel drifted —
+   `stealth_msr.rs` (merged green in PR #29 under an older nightly) is now flagged
+   by the current nightly rustfmt, as was this session's new code. Pure formatting.
+8. `adcade5` — **docs**: ROADMAP 5.4 — `run_real_mode` closes the reset/sleep
+   remaining item; only the threaded watchdog is left.
+
+### Research (informed the build)
+RESEARCH.md `2026-06-16`: (a) the `on_vmresume` first-entry zeroing bug and the
+`exit_seen` fix; (b) **AMD KVM omits the Intel-style leaf `0xB`** from
+`GET_SUPPORTED_CPUID` (measured: a 2-vCPU guest read it all-zero), forcing the
+`CpuId::from_entries` rebuild path; `KVM_CPUID_FLAG_SIGNIFCANT_INDEX = 1`
+(kvm-bindings 0.10, `CpuId = FamStructWrapper<kvm_cpuid2>`); (c) the run-loop
+lockstep rationale (timing once via the shared `Arc`, PMC once in the loop).
+No new third-party research — KVM API + the in-tree stealth specs from prior runs.
+
+### Test results (exact)
+- **`/dev/kvm`: read-writable (`KVM_RW_OK`).** All KVM/guest-boot tests **ran for
+  real** (none skipped). New real-KVM tests this session, all passing:
+  `run_loop_serves_seeded_aperf_to_a_guest`,
+  `run_loop_keeps_pmc_and_timing_in_lockstep`,
+  `run_loop_applies_topology_stealth_to_a_multi_vcpu_guest`,
+  `topology_stealth_makes_the_guest_see_its_own_cpu_count` (2-vCPU guest reads
+  `cpuid(0xB,1).EBX == 2`, not the host's count),
+  `run_real_mode_reboots_on_a_cf9_reset` (guest emits 'A', reboots via 0xCF9,
+  emits 'B', halts), `run_real_mode_shuts_down_on_acpi_s5` (PM1a_CNT S5 →
+  `Shutdown(5)`). Plus a non-KVM unit test
+  `first_resume_without_a_prior_exit_does_not_zero_the_shadows`. Prior guest-boot
+  tests still pass.
+- `cargo test -p enlil-core --lib`: **181 passed, 0 failed** (started 174).
+- `cargo test -p enlil-devices --lib`: **760 passed, 0 failed** (unchanged — not
+  touched this session).
+- `cargo test --workspace`: **exit 0** (all crates).
+- `cargo clippy --all-targets --workspace -- -D warnings`: **exit 0**.
+- `cargo fmt --all -- --check`: **clean** (after increment 7).
+- **Toolchains:** all increments built/tested on **Linux/WSL** (nightly
+  `x86_64-unknown-linux-gnu`, rustfmt 1.9.0-nightly 2026-06-12). Every increment
+  touching `enlil-core` **also built Windows-native** (`x86_64-pc-windows-msvc`
+  via the `D:\Development\.enlil-win-target` 9p path), **exit 0** each time (after
+  increments 1+2, 3, 4, 6). The KVM internals are `#[cfg(target_os = "linux")]`,
+  so Windows compiles the platform-agnostic parts (`GuestExit`/`VmExitHandler`,
+  the run-loop module's empty cfg shell) — confirmed clean.
+  **Caveat:** CI uses `dtolnay/rust-toolchain@nightly` (latest nightly at CI time,
+  ≥ 2026-06-16); local rustfmt is 2026-06-12. The fmt commit makes the tip clean
+  under 2026-06-12; a few-days-newer nightly *could* in principle want a different
+  wrap, but no further drift was observed on these files.
+
+### STOP REASON
+**Remaining unblocked work is architectural or blocked, not a clean small
+increment.** The Phase-5 stealth vertical is now assembled end-to-end (production
+run loop + topology stealth + reboot/shutdown), and the only remaining run-loop
+item is the **threaded-vCPU watchdog**, which needs a multi-threaded vCPU
+execution model + signal kick — an architectural change I won't start and leave
+half-tested before the PR (the guardrail: don't stretch one increment across the
+"still broken" line). The other roadmap items are **blocked** (libusb
+`UsbDeviceModel` forwarder needs real USB hardware; TUI USB tab is separate UI)
+or **vacuous-to-test on this host** (brand/vendor CPUID spoof — KVM-supported
+brand already matches the host CPU). Wall-clock budget was not fully spent
+(~2h40m); per the guardrail I handed off rather than rush an architectural or
+host-blocked feature. Every increment is independently green; `master` stays
+buildable; the branch is CI-parity green (fmt + clippy + workspace test).
+
+### Recommended next step (tomorrow)
+1. **Threaded-vCPU watchdog** (the last run-loop piece): run each vCPU on its own
+   thread with the backend behind shared state, install a signal handler, and have
+   a watchdog thread `set_immediate_exit` + signal a vCPU thread to kick it out of
+   a blocking `KVM_RUN` (the synchronous primitive already exists). Decide the
+   shared-state model for the per-vCPU router/timing first (see #3).
+2. **CPUID leaf `0xA` (PMU) on the live guest** — so the advertised PMU version /
+   counter counts match the RDPMC shadow's (`PmcRateModel`); an all-zero leaf 0xA
+   is itself a cloud-VM tell (2026-06-10 research). Extend `apply_topology_stealth`
+   (or a sibling) — the `CpuId::from_entries` rebuild path already handles a leaf
+   KVM may omit. Non-vacuous where the host PMU ≠ the model's counter counts.
+3. **Per-vCPU stealth state**: the run loop shares ONE router/timing across all
+   vCPUs today; a multi-vCPU guest needs per-vCPU APERF/MPERF/PMC/LBR (each vCPU
+   reads its own counters). This is the prerequisite for #1's threading.
+4. Lower priority / blocked: libusb-backed `UsbDeviceModel` forwarder (USB
+   hardware), TUI USB tab (UI), brand/vendor CPUID spoof (only once Enlil presents
+   a different CPU identity than the host).
+5. **Housekeeping:** consider pinning the `nightly` toolchain in
+   `rust-toolchain.toml` to stop the recurring rustfmt drift (unpinned `nightly`
+   means CI's rustfmt can reformat already-merged files; this run had to re-fmt
+   `stealth_msr.rs`).
+
+---
+
 ## 2026-06-15 — Session: the Phase-5 MSR/CPUID stealth stack, end to end on real KVM
 
 **13 code + 2 doc increments, each independently green and committed** (branch

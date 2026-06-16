@@ -1727,8 +1727,20 @@ Physical USB Devices
   clears leaf 1 ECX[31], and `KVM_SET_CPUID2`s it onto each vCPU; a real-mode
   guest now reads ECX[31]=0 with real features intact (EDX[4]/TSC=1). KVM's
   supported set omits the `0x4000_00xx` leaves, so they read out-of-range for
-  free. **Remaining:** apply the full `CpuidStealthTable` (vendor/brand/topology)
-  by *merging* into KVM's ≤80-entry supported set rather than replacing it.
+  free.
+- **Topology applied to the live KVM guest (2026-06-16):**
+  `KvmBackend::apply_topology_stealth(&CpuidStealthTable)` overrides the
+  topology fields KVM mirrors from the host — extended-topology leaf `0xB` and
+  leaf-`1` `EBX[23:16]` max-IDs — with the table's guest-derived values, and
+  clears the hypervisor bit (subsuming `clear_cpuid_hypervisor_bit`). Since AMD
+  hosts often omit leaf `0xB` from `KVM_GET_SUPPORTED_CPUID`, it *rebuilds* the
+  CPUID array (`CpuId::from_entries`), adding the `0xB` subleaves with
+  `SIGNIFCANT_INDEX` when absent rather than only patching in place. Proven on
+  `/dev/kvm`: a 2-vCPU guest reads `cpuid(0xB,1).EBX == 2` (its own count), not
+  the host's. `StealthRunLoop::apply_topology_stealth` exposes it on the run
+  loop. **Remaining:** the vendor/brand leaves (0x0, 0x80000002–4) — currently
+  vacuous to merge on a host whose KVM-supported brand already matches; only
+  needed once Enlil spoofs a *different* CPU identity than the host's.
 
 ### 5.4 Timing Stealth (Expanded — from 2024–2025 anti-cheat research)
 
@@ -1796,11 +1808,25 @@ Physical USB Devices
   filter that denies just those ranges — proven on `/dev/kvm` for APERF), and
   `run_vcpu_timed` drives `on_vmresume`/`advance`/`on_vmexit` around `KVM_RUN` so
   the shadows count guest time at the model rate and hide exit overhead.
-  **Remaining:** assemble these into the production run loop (call
-  `enable_userspace_msr_exits` + `forward_msrs_to_userspace` + the
-  `StandardPc::install_stealth_msr_router` handle from one place, and drive the
-  PMC `advance_counters` alongside the timing `advance`); LBR save/restore via the
-  VMCS/VMCB controls is a bare-metal-backend (Phase 6) concern.
+- **Production run-loop assembled (2026-06-16):** `enlil-core::run_loop::StealthRunLoop`
+  owns the `KvmBackend` + `StandardPc` and does the whole assembly from one place:
+  `install` wires the router on the bus and, in KVM's required order before any
+  `KVM_RUN`, `enable_userspace_msr_exits` + `forward_msrs_to_userspace(router.filter_ranges())`;
+  `run_vcpu_once` calls `run_vcpu_timed` then drives `PmcState::advance_counters`
+  by the returned delta (timing advanced once via the shared `Arc`, PMC once here —
+  no double-count) and drains the platform-event latches into a `RunStep`;
+  `apply_topology_stealth` applies the CPUID topology. A latent bug this surfaced
+  was fixed: `on_vmresume` zeroed the shadows on the first entry (no prior
+  `on_vmexit` baseline → `entry_tsc - 0` huge overhead) — an `exit_seen` guard now
+  skips the adjustment until a real exit exists. Proven on `/dev/kvm` (seeded APERF
+  read back through the driver; RDPMC/APERF/MPERF in lockstep at the model ratio).
+  `StealthRunLoop::run_real_mode` now also *acts on* the `RunStep` platform events
+  the way hardware does — a `0x92`/`0xCF9` CPU reset reboots the vCPU to its reset
+  vector, an ACPI `SLP_EN` commit returns `LoopOutcome::Shutdown(slp_typ)` (`_S5` =
+  power off) — both proven on `/dev/kvm`. **Remaining:** only a threaded-vCPU
+  watchdog (the synchronous `set_immediate_exit` primitive exists; the full version
+  needs a multi-threaded vCPU execution model + signal kick — architectural). LBR
+  save/restore via the VMCS/VMCB controls is a bare-metal-backend (Phase 6) concern.
 
 ### 5.5 Virtual TPM 2.0
 - Required for Windows 11
