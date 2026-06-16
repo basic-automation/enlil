@@ -1330,3 +1330,38 @@ this session (no new third-party research — these are the authoritative refs):
   and EDX[4]/TSC=1) — the 1→0 flip only matters once paravirt CPUID signature
   leaves are added. The supported set also omits the 0x4000_00xx hypervisor
   leaves, so they read out-of-range like bare metal for free.
+
+## 2026-06-16 — Production run loop + applying topology stealth to the live guest (Phase 5)
+
+Integration session; the primary refs were the KVM API and the in-tree stealth
+state already grounded in prior entries. Two measured facts shaped the code:
+
+- **`on_vmresume` had a first-entry zeroing bug.** `VcpuTimingState::on_vmresume`
+  computes the exit overhead to hide as `entry_tsc - last_exit_tsc`. On the very
+  first guest entry no `on_vmexit` has run, so `last_exit_tsc` is still its init
+  value `0` — indistinguishable from a *real* exit at TSC 0 (which the unit tests
+  legitimately use). The overhead then becomes the full `entry_tsc` (a multi-GHz
+  absolute count), saturating both shadows to zero before the guest's first read.
+  → Added an `exit_seen` flag set by `on_vmexit`, distinct from the timestamp; the
+  first `on_vmresume` records only the RIP and returns. This is the seam the timed
+  run loop (`run_vcpu_timed`) depends on for any seeded value to survive.
+
+- **AMD KVM omits the Intel-style extended-topology leaf `0xB` from
+  `KVM_GET_SUPPORTED_CPUID`.** Measured on this AMD SVM host: a 2-vCPU guest read
+  `cpuid(0xB,1)` as all-zero after `SET_CPUID2` of the supported set, because no
+  `0xB` entry existed to carry the topology. → `apply_topology_stealth` must
+  *rebuild* the CPUID array via `CpuId::from_entries`, adding the `0xB` subleaves
+  (flagged `KVM_CPUID_FLAG_SIGNIFCANT_INDEX`, value 1, kvm-bindings 0.10) when
+  absent, not just patch entries in place. With the table built for the guest's
+  topology, the guest then reads `EBX == 2` (its own vCPU count), not the host's
+  much larger logical-processor count — the topology half of the CPUID-stealth
+  table merge. `kvm_bindings::CpuId` is a `FamStructWrapper<kvm_cpuid2>`;
+  `from_entries(&[kvm_cpuid_entry2])` is the supported rebuild path.
+
+- **Production run loop assembled.** `StealthRunLoop` (`enlil-core::run_loop`)
+  encapsulates the install-order the API requires (router on the bus, then
+  `enable_userspace_msr_exits` + `forward_msrs_to_userspace` before any
+  `KVM_RUN`) and the per-entry lockstep (timing advanced once inside
+  `run_vcpu_timed` via the shared `Arc`; the non-shared PMC advanced once in the
+  loop from the returned delta — advancing both via `StealthMsrRouter::advance`
+  would double-count the timing surface).
