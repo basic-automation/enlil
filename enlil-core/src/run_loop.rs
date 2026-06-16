@@ -145,10 +145,31 @@ mod linux {
         /// Clear the `CPUID.1:ECX[31]` hypervisor-present bit on **all** vCPUs
         /// created so far — call once after the vCPUs exist.
         ///
+        /// This is the minimal CPUID stealth; prefer
+        /// [`apply_topology_stealth`](Self::apply_topology_stealth) when a
+        /// [`CpuidStealthTable`](enlil_devices::stealth::cpuid::CpuidStealthTable)
+        /// is available, since it also fixes the topology leaves (and subsumes
+        /// this) so the guest does not read the host's logical-processor count.
+        ///
         /// # Errors
         /// Propagates [`KvmBackend::clear_cpuid_hypervisor_bit`].
         pub fn apply_cpuid_stealth(&mut self) -> Result<()> {
             self.backend.clear_cpuid_hypervisor_bit()
+        }
+
+        /// Apply the full topology view from `table` to **all** vCPUs created so
+        /// far: the guest sees its own `vcpu_count` topology (leaf `0xB`, leaf-`1`
+        /// max-IDs) instead of the host's, and the hypervisor-present bit is
+        /// cleared. Call once after the vCPUs exist; supersedes
+        /// [`apply_cpuid_stealth`](Self::apply_cpuid_stealth).
+        ///
+        /// # Errors
+        /// Propagates [`KvmBackend::apply_topology_stealth`].
+        pub fn apply_topology_stealth(
+            &mut self,
+            table: &enlil_devices::stealth::cpuid::CpuidStealthTable,
+        ) -> Result<()> {
+            self.backend.apply_topology_stealth(table)
         }
 
         /// Run vCPU `index` for one entry, then keep the stealth surfaces in
@@ -332,6 +353,73 @@ mod tests {
         assert!(halted, "guest never reached HLT through the run loop");
         assert!(saw_aperf, "APERF was not forwarded through the run loop");
         assert_eq!(&*sink.lock().unwrap(), &[0xBE]);
+    }
+
+    // Full stealth through the driver: install the MSR stack, create two vCPUs,
+    // apply the topology table, and a guest reading leaf 0xB subleaf 1 sees its
+    // own 2-vCPU count (not the host's). Proves apply_topology_stealth is
+    // reachable from the production path alongside the MSR/timing wiring.
+    #[test]
+    fn run_loop_applies_topology_stealth_to_a_multi_vcpu_guest() {
+        use enlil_devices::stealth::cpuid::{CpuidStealthConfig, CpuidStealthTable};
+
+        if !is_kvm_available() {
+            eprintln!("skipping run_loop_applies_topology_stealth_to_a_multi_vcpu_guest: no /dev/kvm");
+            return;
+        }
+
+        // 16-bit real-mode: cpuid(0xB, 1); out 0x3F8, bl; hlt.
+        #[rustfmt::skip]
+        let code: [u8; 21] = [
+            0x66, 0xB8, 0x0B, 0x00, 0x00, 0x00, // mov eax, 0xB
+            0x66, 0xB9, 0x01, 0x00, 0x00, 0x00, // mov ecx, 1
+            0x0F, 0xA2,                         // cpuid
+            0x88, 0xD8,                         // mov al, bl
+            0xBA, 0xF8, 0x03,                   // mov dx, 0x3F8
+            0xEE,                               // out dx, al
+            0xF4,                               // hlt
+        ];
+        const ENTRY: u64 = 0x1000;
+        const GUEST_VCPUS: u32 = 2;
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Shared(Arc::clone(&sink))),
+            0,
+            1,
+        )
+        .expect("build standard pc");
+        let backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        let mut run = match StealthRunLoop::install(backend, pc, LbrPlatform::AmdSvm) {
+            Ok(run) => run,
+            Err(e) => {
+                eprintln!("skipping run_loop_applies_topology_stealth_...: {e}");
+                return;
+            }
+        };
+
+        let mut ram = GuestRam::new(0x1000);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+        // SAFETY: `ram` outlives `run` within this test scope.
+        unsafe { run.backend_mut().map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        run.create_vcpu(0).expect("create vcpu 0");
+        run.create_vcpu(1).expect("create vcpu 1");
+        let table = CpuidStealthTable::build(&CpuidStealthConfig::from_host(GUEST_VCPUS, 1));
+        run.apply_topology_stealth(&table)
+            .expect("apply topology stealth");
+        run.backend_mut()
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        let (last, _) = run.run_vcpu_until_event(0, 100).expect("run until event");
+        assert_eq!(last.exit, GuestExit::Halted, "guest should reach HLT");
+        assert_eq!(
+            &*sink.lock().unwrap(),
+            &[GUEST_VCPUS as u8],
+            "guest reads its own vCPU count from leaf 0xB through the driver"
+        );
     }
 
     // The driver keeps both stealth surfaces in lockstep: after running a guest
