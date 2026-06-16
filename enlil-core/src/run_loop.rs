@@ -30,7 +30,7 @@
 //! [`StandardPc`]: crate::device_bus::StandardPc
 
 #[cfg(target_os = "linux")]
-pub use linux::{RunStep, StealthRunLoop};
+pub use linux::{LoopOutcome, RunStep, StealthRunLoop};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -56,6 +56,21 @@ mod linux {
         /// [`StandardPc`] latches *after* the exit was serviced, so a write to
         /// `0x92`/`0xCF9`/the PM1a block on this entry is seen here.
         pub event: Option<PlatformEvent>,
+    }
+
+    /// How a managed run ([`StealthRunLoop::run_real_mode`]) ended.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum LoopOutcome {
+        /// The guest executed `HLT` and the run returned (no in-kernel IRQ chip,
+        /// or nothing pending to wake it).
+        Halted,
+        /// The guest committed an ACPI sleep transition; the `SLP_TYP` value
+        /// (the DSDT's `_S5` value, `5`, means **power off**).
+        Shutdown(u8),
+        /// `max_entries` elapsed without the guest halting or sleeping — the
+        /// bound that keeps a never-halting or reboot-looping guest from
+        /// spinning here forever.
+        Exhausted,
     }
 
     impl RunStep {
@@ -240,6 +255,55 @@ mod linux {
                 }
             }
             Ok((last, total_cycles))
+        }
+
+        /// Drive a real-mode guest on vCPU `index`, *acting on* the platform
+        /// events it raises the way real hardware does, until it shuts down,
+        /// halts, or `max_entries` entries elapse.
+        ///
+        /// The vCPU must already be prepared at its initial entry (e.g. via
+        /// [`KvmBackend::prepare_real_mode_vcpu`] on
+        /// [`backend_mut`](Self::backend_mut)). Per entry, after
+        /// [`run_vcpu_once`](Self::run_vcpu_once):
+        ///
+        /// - [`PlatformEvent::Reset`] (a `0x92` / `0xCF9` CPU reset) → re-prepare
+        ///   the vCPU to `reset_entry` and continue — the guest reboots, exactly
+        ///   as a real platform restarts the boot CPU at its reset vector.
+        /// - [`PlatformEvent::Sleep`] (an ACPI `SLP_EN` commit) → return
+        ///   [`LoopOutcome::Shutdown`] with the `SLP_TYP` (`5` = power off).
+        /// - [`GuestExit::Halted`] with no event → return [`LoopOutcome::Halted`].
+        ///
+        /// `reset_entry` is usually the same guest-physical address the vCPU was
+        /// first prepared at (firmware reset vector). Returns
+        /// [`LoopOutcome::Exhausted`] if the bound is hit first.
+        ///
+        /// # Errors
+        /// Propagates [`run_vcpu_once`](Self::run_vcpu_once) and
+        /// [`KvmBackend::prepare_real_mode_vcpu`].
+        pub fn run_real_mode(
+            &mut self,
+            index: usize,
+            reset_entry: u64,
+            max_entries: usize,
+        ) -> Result<LoopOutcome> {
+            for _ in 0..max_entries {
+                let step = self.run_vcpu_once(index)?;
+                match step.event {
+                    Some(PlatformEvent::Sleep(slp_typ)) => {
+                        return Ok(LoopOutcome::Shutdown(slp_typ));
+                    }
+                    Some(PlatformEvent::Reset) => {
+                        // Reboot: restart the boot vCPU at its reset vector.
+                        self.backend.prepare_real_mode_vcpu(index, reset_entry)?;
+                        continue;
+                    }
+                    None => {}
+                }
+                if step.exit == GuestExit::Halted {
+                    return Ok(LoopOutcome::Halted);
+                }
+            }
+            Ok(LoopOutcome::Exhausted)
         }
 
         /// The shared timing handle the run loop drives — for a watchdog or test
@@ -515,6 +579,137 @@ mod tests {
             run.pc_mut().bus.rdmsr(timing_msr::IA32_APERF),
             Some(aperf),
             "the bus serves the same APERF the run loop advanced"
+        );
+    }
+
+    // run_real_mode reboots on a 0xCF9 CPU reset: a guest that emits 'A' then
+    // writes the RST_CNT reboot value to 0xCF9 is re-prepared at a second entry
+    // that emits 'B' and halts — proving the loop acts on PlatformEvent::Reset by
+    // restarting the boot vCPU at its reset vector, not just surfacing the event.
+    #[test]
+    fn run_real_mode_reboots_on_a_cf9_reset() {
+        if !is_kvm_available() {
+            eprintln!("skipping run_real_mode_reboots_on_a_cf9_reset: no /dev/kvm");
+            return;
+        }
+
+        // Entry A @ 0x1000: out 0x3F8,'A'; out 0xCF9, 0x06 (SYS_RST|RST_CPU); hlt.
+        #[rustfmt::skip]
+        let code_a: [u8; 11] = [
+            0xB0, 0x41,             // mov al, 'A'
+            0xBA, 0xF8, 0x03,       // mov dx, 0x3F8
+            0xEE,                   // out dx, al
+            0xBA, 0xF9, 0x0C,       // mov dx, 0xCF9
+            0xB0, 0x06,             // mov al, 0x06 (RST_CNT reboot)
+            // (out dx,al on next byte)
+        ];
+        // The reboot OUT + a trailing hlt that is never reached (reset re-points
+        // RIP before the next entry runs).
+        #[rustfmt::skip]
+        let code_a_tail: [u8; 2] = [0xEE, 0xF4]; // out dx, al ; hlt
+        // Entry B @ 0x1100: out 0x3F8,'B'; hlt.
+        #[rustfmt::skip]
+        let code_b: [u8; 6] = [0xB0, 0x42, 0xBA, 0xF8, 0x03, 0xEE]; // mov al,'B'; mov dx,0x3F8; out
+        const ENTRY_A: u64 = 0x1000;
+        const ENTRY_B: u64 = 0x1100;
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Shared(Arc::clone(&sink))),
+            0,
+            1,
+        )
+        .expect("build standard pc");
+        let backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        let mut run = match StealthRunLoop::install(backend, pc, LbrPlatform::AmdSvm) {
+            Ok(run) => run,
+            Err(e) => {
+                eprintln!("skipping run_real_mode_reboots_on_a_cf9_reset: {e}");
+                return;
+            }
+        };
+
+        let mut ram = GuestRam::new(0x2000);
+        {
+            let mem = ram.as_mut_slice();
+            mem[..code_a.len()].copy_from_slice(&code_a);
+            mem[code_a.len()..code_a.len() + code_a_tail.len()].copy_from_slice(&code_a_tail);
+            // Memory maps at ENTRY_A, so guest-physical ENTRY_B is at this offset.
+            let b = (ENTRY_B - ENTRY_A) as usize;
+            mem[b..b + code_b.len()].copy_from_slice(&code_b);
+            mem[b + code_b.len()] = 0xF4; // hlt
+        }
+        let host_addr = ram.host_addr();
+        // SAFETY: `ram` outlives `run` within this test scope.
+        unsafe { run.backend_mut().map_memory(ENTRY_A, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        run.create_vcpu(0).expect("create vcpu");
+        run.backend_mut()
+            .prepare_real_mode_vcpu(0, ENTRY_A)
+            .expect("set real-mode entry");
+
+        // On reset, reboot to entry B (the test's "reset vector").
+        let outcome = run.run_real_mode(0, ENTRY_B, 100).expect("run real mode");
+        assert_eq!(outcome, LoopOutcome::Halted, "guest halts after the reboot");
+        assert_eq!(
+            &*sink.lock().unwrap(),
+            b"AB",
+            "guest emitted 'A', rebooted via 0xCF9, then emitted 'B'"
+        );
+    }
+
+    // run_real_mode returns Shutdown on an ACPI S5 commit: a guest that writes
+    // SLP_TYP=5 | SLP_EN to PM1a_CNT (0x604) powers off — the loop surfaces it as
+    // LoopOutcome::Shutdown(5), the _S5 value the synthesized DSDT advertises.
+    #[test]
+    fn run_real_mode_shuts_down_on_acpi_s5() {
+        if !is_kvm_available() {
+            eprintln!("skipping run_real_mode_shuts_down_on_acpi_s5: no /dev/kvm");
+            return;
+        }
+
+        // out 0x604, ax where ax = (5<<10)|(1<<13) = 0x3400 (SLP_TYP=5, SLP_EN).
+        #[rustfmt::skip]
+        let code: [u8; 8] = [
+            0xBA, 0x04, 0x06,       // mov dx, 0x604
+            0xB8, 0x00, 0x34,       // mov ax, 0x3400
+            0xEF,                   // out dx, ax (word)
+            0xF4,                   // hlt (not reached)
+        ];
+        const ENTRY: u64 = 0x1000;
+        const S5: u8 = 5;
+
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            0,
+            1,
+        )
+        .expect("build standard pc");
+        let backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        let mut run = match StealthRunLoop::install(backend, pc, LbrPlatform::AmdSvm) {
+            Ok(run) => run,
+            Err(e) => {
+                eprintln!("skipping run_real_mode_shuts_down_on_acpi_s5: {e}");
+                return;
+            }
+        };
+
+        let mut ram = GuestRam::new(0x1000);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+        // SAFETY: `ram` outlives `run` within this test scope.
+        unsafe { run.backend_mut().map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        run.create_vcpu(0).expect("create vcpu");
+        run.backend_mut()
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        let outcome = run.run_real_mode(0, ENTRY, 100).expect("run real mode");
+        assert_eq!(
+            outcome,
+            LoopOutcome::Shutdown(S5),
+            "guest committed an S5 power-off via PM1a_CNT"
         );
     }
 }
