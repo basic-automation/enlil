@@ -203,14 +203,26 @@ mod tests {
         state.write_mperf(0xAB);
         // A realistically large entry TSC, the value rdtsc would return.
         state.on_vmresume(0x1234_5678_9ABC, 0x1000);
-        assert_eq!(state.read_aperf(), 0xBE, "seeded APERF must survive the first resume");
-        assert_eq!(state.read_mperf(), 0xAB, "seeded MPERF must survive the first resume");
+        assert_eq!(
+            state.read_aperf(),
+            0xBE,
+            "seeded APERF must survive the first resume"
+        );
+        assert_eq!(
+            state.read_mperf(),
+            0xAB,
+            "seeded MPERF must survive the first resume"
+        );
         assert_eq!(state.last_guest_rip.load(Ordering::Acquire), 0x1000);
 
         // Once a real exit baseline exists, overhead hiding resumes normally.
         state.on_vmexit(0x1234_5678_9ABC + 1000);
         state.on_vmresume(0x1234_5678_9ABC + 1100, 0x2000); // 100 cycles overhead
-        assert_eq!(state.read_mperf(), 0xAB - 100, "overhead hiding resumes after an exit");
+        assert_eq!(
+            state.read_mperf(),
+            0xAB - 100,
+            "overhead hiding resumes after an exit"
+        );
     }
 
     #[test]

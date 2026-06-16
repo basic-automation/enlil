@@ -1557,7 +1557,9 @@ mod tests {
         use enlil_devices::stealth::cpuid::{CpuidStealthConfig, CpuidStealthTable};
 
         if !is_kvm_available() {
-            eprintln!("skipping topology_stealth_makes_the_guest_see_its_own_cpu_count: no /dev/kvm");
+            eprintln!(
+                "skipping topology_stealth_makes_the_guest_see_its_own_cpu_count: no /dev/kvm"
+            );
             return;
         }
 
@@ -1702,7 +1704,10 @@ mod tests {
 
         let aperf = timing.read_aperf();
         let mperf = timing.read_mperf();
-        assert!(aperf > 0 && mperf > 0, "shadows advanced for guest execution");
+        assert!(
+            aperf > 0 && mperf > 0,
+            "shadows advanced for guest execution"
+        );
         // The PMC core counter, driven by the same per-entry deltas, tracks the
         // APERF shadow — the two surfaces stay in lockstep through the run loop.
         let pmc_core = pmc.read_pmc(0x4000_0001);

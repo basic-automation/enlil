@@ -336,8 +336,8 @@ mod linux {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use crate::kvm_backend::{is_kvm_available, GuestExit, GuestRam, KvmBackend, VmExitHandler};
     use crate::device_bus::DeviceBus;
+    use crate::kvm_backend::{is_kvm_available, GuestExit, GuestRam, KvmBackend, VmExitHandler};
     use crate::serial::{SerialOutput, SerialOutputMode};
     use enlil_devices::stealth::lbr::LbrPlatform;
     use enlil_devices::stealth::timing::msr as timing_msr;
@@ -392,8 +392,11 @@ mod tests {
         ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
         let host_addr = ram.host_addr();
         // SAFETY: `ram` outlives `run` within this test scope.
-        unsafe { run.backend_mut().map_memory(ENTRY, host_addr, ram.len() as u64) }
-            .expect("map guest memory");
+        unsafe {
+            run.backend_mut()
+                .map_memory(ENTRY, host_addr, ram.len() as u64)
+        }
+        .expect("map guest memory");
         run.create_vcpu(0).expect("create vcpu");
         run.apply_cpuid_stealth().expect("clear hypervisor bit");
         run.backend_mut()
@@ -428,7 +431,9 @@ mod tests {
         use enlil_devices::stealth::cpuid::{CpuidStealthConfig, CpuidStealthTable};
 
         if !is_kvm_available() {
-            eprintln!("skipping run_loop_applies_topology_stealth_to_a_multi_vcpu_guest: no /dev/kvm");
+            eprintln!(
+                "skipping run_loop_applies_topology_stealth_to_a_multi_vcpu_guest: no /dev/kvm"
+            );
             return;
         }
 
@@ -466,8 +471,11 @@ mod tests {
         ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
         let host_addr = ram.host_addr();
         // SAFETY: `ram` outlives `run` within this test scope.
-        unsafe { run.backend_mut().map_memory(ENTRY, host_addr, ram.len() as u64) }
-            .expect("map guest memory");
+        unsafe {
+            run.backend_mut()
+                .map_memory(ENTRY, host_addr, ram.len() as u64)
+        }
+        .expect("map guest memory");
         run.create_vcpu(0).expect("create vcpu 0");
         run.create_vcpu(1).expect("create vcpu 1");
         let table = CpuidStealthTable::build(&CpuidStealthConfig::from_host(GUEST_VCPUS, 1));
@@ -532,16 +540,17 @@ mod tests {
         ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
         let host_addr = ram.host_addr();
         // SAFETY: `ram` outlives `run` within this test scope.
-        unsafe { run.backend_mut().map_memory(ENTRY, host_addr, ram.len() as u64) }
-            .expect("map guest memory");
+        unsafe {
+            run.backend_mut()
+                .map_memory(ENTRY, host_addr, ram.len() as u64)
+        }
+        .expect("map guest memory");
         run.create_vcpu(0).expect("create vcpu");
         run.backend_mut()
             .prepare_real_mode_vcpu(0, ENTRY)
             .expect("set real-mode entry");
 
-        let (last, total_cycles) = run
-            .run_vcpu_until_event(0, 100)
-            .expect("run until event");
+        let (last, total_cycles) = run.run_vcpu_until_event(0, 100).expect("run until event");
         assert_eq!(last.exit, GuestExit::Halted, "guest should reach HLT");
         assert!(last.is_stop(), "HLT is a stopping point");
         assert!(total_cycles > 0, "run loop measured guest cycles");
@@ -607,7 +616,7 @@ mod tests {
         // RIP before the next entry runs).
         #[rustfmt::skip]
         let code_a_tail: [u8; 2] = [0xEE, 0xF4]; // out dx, al ; hlt
-        // Entry B @ 0x1100: out 0x3F8,'B'; hlt.
+                                                 // Entry B @ 0x1100: out 0x3F8,'B'; hlt.
         #[rustfmt::skip]
         let code_b: [u8; 6] = [0xB0, 0x42, 0xBA, 0xF8, 0x03, 0xEE]; // mov al,'B'; mov dx,0x3F8; out
         const ENTRY_A: u64 = 0x1000;
@@ -641,8 +650,11 @@ mod tests {
         }
         let host_addr = ram.host_addr();
         // SAFETY: `ram` outlives `run` within this test scope.
-        unsafe { run.backend_mut().map_memory(ENTRY_A, host_addr, ram.len() as u64) }
-            .expect("map guest memory");
+        unsafe {
+            run.backend_mut()
+                .map_memory(ENTRY_A, host_addr, ram.len() as u64)
+        }
+        .expect("map guest memory");
         run.create_vcpu(0).expect("create vcpu");
         run.backend_mut()
             .prepare_real_mode_vcpu(0, ENTRY_A)
@@ -698,8 +710,11 @@ mod tests {
         ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
         let host_addr = ram.host_addr();
         // SAFETY: `ram` outlives `run` within this test scope.
-        unsafe { run.backend_mut().map_memory(ENTRY, host_addr, ram.len() as u64) }
-            .expect("map guest memory");
+        unsafe {
+            run.backend_mut()
+                .map_memory(ENTRY, host_addr, ram.len() as u64)
+        }
+        .expect("map guest memory");
         run.create_vcpu(0).expect("create vcpu");
         run.backend_mut()
             .prepare_real_mode_vcpu(0, ENTRY)
