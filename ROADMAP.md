@@ -1738,7 +1738,33 @@ Physical USB Devices
   `SIGNIFCANT_INDEX` when absent rather than only patching in place. Proven on
   `/dev/kvm`: a 2-vCPU guest reads `cpuid(0xB,1).EBX == 2` (its own count), not
   the host's. `StealthRunLoop::apply_topology_stealth` exposes it on the run
-  loop. **Remaining:** the vendor/brand leaves (0x0, 0x80000002–4) — currently
+  loop.
+- **Full CPUID-stealth pass — PMU + the AMD topology triad (2026-06-18):**
+  `apply_topology_stealth` now folds four more leaves into the *same* single
+  `CpuId::from_entries` rebuild, so one call is the complete live-guest CPUID
+  stealth (topology + hypervisor bit + PMU), all proven on this AMD Ryzen 9
+  7950X3D host's `/dev/kvm`:
+  - **Leaf `0xA` (architectural PMU)** — KVM omits it on AMD, so a guest reads
+    "PMU version 0", a cloud tell that contradicts the RDPMC shadow; the table's
+    leaf-`0xA` (version 5, counter counts matching `stealth::pmc`) is now
+    installed. Also exposed standalone as `KvmBackend::apply_pmu_stealth` /
+    `StealthRunLoop::apply_pmu_stealth`. Test: an Intel-presented guest reads
+    `cpuid(0xA).EAX[7:0] == 5` (KVM would give 0).
+  - **Leaf `0x8000_0008` `ECX[7:0]` (NC = core count)** — KVM mirrors the host;
+    overridden to the guest count so it no longer contradicts leaf-1 EBX / leaf
+    0xB (the kernel cross-checks them). Test: 2-vCPU guest reads `NC == 1`.
+  - **Leaf `0x8000_001D` `EAX[25:14]` (per-cache sharing)** — KVM mirrors the
+    host's L3-shared-by-all-threads; the sharing sub-field is rewritten to the
+    guest topology (L1/L2 per core, L3 package-wide), host cache *sizes* intact.
+    Test: 2-vCPU guest reads L3 shared by 2.
+  - **Leaf `0x8000_001E` `EBX[15:8]` (SMT width)** — KVM defaults it to 0/no-SMT
+    regardless of vCPU count (measured), contradicting an SMT guest's leaf-0xB
+    SMT level; patched to the table's `ThreadsPerComputeUnit-1`. Test: an SMT-2
+    guest reads 1.
+  Each AMD sub-field patch is surgical (only the topology bits; host-backed
+  sizes / address widths / per-vCPU APIC-ID fields untouched) and a no-op when
+  KVM omits the leaf or for an Intel table.
+  **Remaining:** the vendor/brand leaves (0x0, 0x80000002–4) — currently
   vacuous to merge on a host whose KVM-supported brand already matches; only
   needed once Enlil spoofs a *different* CPU identity than the host's.
 
@@ -1793,6 +1819,10 @@ Physical USB Devices
   the two), and CPUID leaf 0xA must advertise a PMU matching the shadow's counter counts
   (all-zeros = "PMU version 0" is itself a cloud-VM tell). The KVM run loop must seed
   `VcpuTimingState` APERF/MPERF with `PmcRateModel::core_per_kilo_ref` when it wires both.
+  **Leaf-0xA consistency now applied on the live guest (2026-06-18):**
+  `apply_topology_stealth` (and standalone `apply_pmu_stealth`) installs the
+  table's leaf-0xA PMU on each vCPU, so the CPUID-advertised PMU version and
+  counter counts match the RDPMC shadow — see 5.3.
 - **MSR-exit seam + stealth routing wired (2026-06-15):** the KVM run loop can now
   forward guest `RDMSR`/`WRMSR` to userspace (`KvmBackend::enable_userspace_msr_exits`
   → `GuestExit::MsrRead`/`MsrWrite` → `VmExitHandler::rdmsr`/`wrmsr`, proven on
