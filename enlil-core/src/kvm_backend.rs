@@ -726,6 +726,83 @@ mod linux {
             Ok(())
         }
 
+        /// Apply the [`CpuidStealthTable`]'s **architectural-PMU** view (leaf
+        /// `0xA`) to every vCPU, so the guest enumerates a performance-monitoring
+        /// unit consistent with the RDPMC shadow it is being served.
+        ///
+        /// KVM does not synthesise leaf `0xA` from a virtual PMU model: on this
+        /// AMD host `KVM_GET_SUPPORTED_CPUID` omits the Intel-style leaf entirely,
+        /// so a guest reads it back as all-zero — **PMU version 0, "no
+        /// architectural PMU."** That is itself a cloud/VM tell (only vPMU-less
+        /// VMs report it) and it contradicts the `stealth::pmc` shadow that
+        /// services the guest's RDPMC: a guest that finds counters via RDPMC but
+        /// is told "version 0" by CPUID has caught the hypervisor. This installs
+        /// exactly the table's leaf-`0xA` value (PMU version + GP/fixed counter
+        /// counts and widths matching the shadow) so the two surfaces agree.
+        ///
+        /// For an AMD-vendor table the leaf is reserved-zero (correct for AMD,
+        /// where the PMU is enumerated via leaf `0x8000_0022` + MSRs, not `0xA`),
+        /// so this is a no-op there; it has effect for an Intel-presented guest.
+        /// Like [`apply_topology_stealth`](Self::apply_topology_stealth) it
+        /// *inserts* the leaf when KVM's supported set lacks it, rebuilding the
+        /// CPUID array via `CpuId::from_entries`, and leaves every other supported
+        /// leaf untouched. It does **not** clear the hypervisor bit or rewrite
+        /// topology. Because each CPUID-stealth installer re-derives from KVM's
+        /// supported baseline before `KVM_SET_CPUID2`, this is an **alternative**
+        /// full install, not a layer to chain after `apply_topology_stealth` —
+        /// chaining would have whichever runs last drop the other's edits. Use
+        /// this when only PMU stealth is wanted; for topology *and* PMU together,
+        /// apply them in a single CPUID rebuild.
+        ///
+        /// Call after creating vCPUs and before running them.
+        ///
+        /// # Errors
+        /// Returns [`Error::Vcpu`] if querying the supported CPUID or setting it
+        /// on a vCPU fails.
+        ///
+        /// [`CpuidStealthTable`]: enlil_devices::stealth::cpuid::CpuidStealthTable
+        pub fn apply_pmu_stealth(
+            &self,
+            table: &enlil_devices::stealth::cpuid::CpuidStealthTable,
+        ) -> Result<()> {
+            use kvm_bindings::{kvm_cpuid_entry2, CpuId, KVM_MAX_CPUID_ENTRIES};
+
+            let supported = self
+                .kvm
+                .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
+                .map_err(|e| Error::Vcpu(format!("KVM_GET_SUPPORTED_CPUID: {e}")))?;
+            let mut entries: Vec<kvm_cpuid_entry2> = supported.as_slice().to_vec();
+
+            // Leaf 0xA has a single (non-indexed) subleaf 0.
+            let r = table.lookup(0xA, 0);
+            if let Some(entry) = entries.iter_mut().find(|e| e.function == 0xA) {
+                entry.index = 0;
+                entry.eax = r.eax;
+                entry.ebx = r.ebx;
+                entry.ecx = r.ecx;
+                entry.edx = r.edx;
+            } else {
+                entries.push(kvm_cpuid_entry2 {
+                    function: 0xA,
+                    index: 0,
+                    flags: 0,
+                    eax: r.eax,
+                    ebx: r.ebx,
+                    ecx: r.ecx,
+                    edx: r.edx,
+                    padding: [0; 3],
+                });
+            }
+
+            let cpuid = CpuId::from_entries(&entries)
+                .map_err(|e| Error::Vcpu(format!("rebuild CpuId: {e:?}")))?;
+            for (i, vcpu) in self.vcpus.iter().enumerate() {
+                vcpu.set_cpuid2(&cpuid)
+                    .map_err(|e| Error::Vcpu(format!("KVM_SET_CPUID2 vcpu {i}: {e}")))?;
+            }
+            Ok(())
+        }
+
         /// Map a host buffer into the guest's physical address space.
         ///
         /// `host_addr` must point to at least `size` bytes of memory that
@@ -1627,6 +1704,91 @@ mod tests {
             echo.0,
             vec![GUEST_VCPUS as u8],
             "leaf 0xB subleaf 1 EBX should be the guest vCPU count, not the host's"
+        );
+    }
+
+    // apply_pmu_stealth makes a guest enumerate an architectural PMU (leaf 0xA)
+    // consistent with the RDPMC shadow it is served. On this AMD host KVM omits
+    // leaf 0xA from KVM_GET_SUPPORTED_CPUID, so without the override a guest
+    // reads it back as all-zero — "PMU version 0", the cloud/VM tell. After
+    // applying an Intel-vendor table whose leaf 0xA advertises PMU version 5,
+    // the guest's cpuid(0xA).EAX[7:0] reads exactly 5. The test is therefore
+    // non-vacuous on AMD: the 5 can only come from our injected leaf, not the
+    // host. Self-skips without /dev/kvm rather than faking it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pmu_stealth_makes_the_guest_see_an_architectural_pmu() {
+        use enlil_devices::stealth::cpuid::{CpuVendor, CpuidStealthConfig, CpuidStealthTable};
+
+        if !is_kvm_available() {
+            eprintln!("skipping pmu_stealth_makes_the_guest_see_an_architectural_pmu: no /dev/kvm");
+            return;
+        }
+
+        // 16-bit real-mode blob; reads PMU leaf 0xA and echoes the version byte:
+        //   66 B8 0A 00 00 00   mov eax, 0xA    ; architectural-PMU leaf
+        //   0F A2               cpuid           ; al = EAX[7:0] = PMU version
+        //   BA F8 03            mov dx, 0x3F8   ; COM1
+        //   EE                  out dx, al
+        //   F4                  hlt
+        #[rustfmt::skip]
+        let code: [u8; 13] = [
+            0x66, 0xB8, 0x0A, 0x00, 0x00, 0x00,
+            0x0F, 0xA2,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0xF4,
+        ];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu 0");
+
+        // Present the guest as Intel so the table populates leaf 0xA (it is
+        // reserved-zero for an AMD-vendor table). Only leaf 0xA is consulted by
+        // apply_pmu_stealth, so the rest of the (host-derived) table is moot here.
+        let mut config = CpuidStealthConfig::from_host(1, 1);
+        config.vendor = CpuVendor::Intel;
+        let table = CpuidStealthTable::build(&config);
+        // Sanity: the table really does advertise a non-zero PMU version.
+        assert_eq!(table.lookup(0xA, 0).eax & 0xFF, 5, "table PMU version");
+        backend
+            .apply_pmu_stealth(&table)
+            .expect("apply pmu stealth");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        struct EchoOut(Vec<u8>);
+        impl VmExitHandler for EchoOut {
+            fn io_out(&mut self, _port: u16, data: &[u8]) {
+                self.0.extend_from_slice(data);
+            }
+        }
+        let mut echo = EchoOut(Vec::new());
+
+        let mut halted = false;
+        for _ in 0..100 {
+            if backend.run_vcpu(0, &mut echo).expect("run vcpu") == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        // The guest reads PMU version 5 from leaf 0xA — which KVM would have
+        // reported as 0 on this AMD host without the injected leaf.
+        assert_eq!(
+            echo.0,
+            vec![5],
+            "leaf 0xA EAX[7:0] should be the injected PMU version (5)"
         );
     }
 

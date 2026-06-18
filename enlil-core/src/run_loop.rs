@@ -187,6 +187,25 @@ mod linux {
             self.backend.apply_topology_stealth(table)
         }
 
+        /// Apply the architectural-PMU view (leaf `0xA`) from `table` to **all**
+        /// vCPUs, so the guest enumerates a PMU consistent with the RDPMC shadow
+        /// the run loop serves through [`StealthMsrRouter`]. Without it the guest
+        /// reads leaf `0xA` as all-zero ("PMU version 0"), a VM tell that
+        /// contradicts the counters it can reach via RDPMC. Compose with
+        /// [`apply_topology_stealth`](Self::apply_topology_stealth) for full CPUID
+        /// stealth; call once after the vCPUs exist.
+        ///
+        /// # Errors
+        /// Propagates [`KvmBackend::apply_pmu_stealth`].
+        ///
+        /// [`StealthMsrRouter`]: crate::stealth_msr::StealthMsrRouter
+        pub fn apply_pmu_stealth(
+            &mut self,
+            table: &enlil_devices::stealth::cpuid::CpuidStealthTable,
+        ) -> Result<()> {
+            self.backend.apply_pmu_stealth(table)
+        }
+
         /// Run vCPU `index` for one entry, then keep the stealth surfaces in
         /// lockstep and drain any platform event.
         ///
