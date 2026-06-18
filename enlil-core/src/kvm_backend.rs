@@ -819,11 +819,14 @@ mod linux {
         /// so this is a no-op there; it has effect for an Intel-presented guest.
         /// Like [`apply_topology_stealth`](Self::apply_topology_stealth) it
         /// *inserts* the leaf when KVM's supported set lacks it, rebuilding the
-        /// CPUID array via `CpuId::from_entries`, and leaves every other supported
-        /// leaf untouched. It does **not** clear the hypervisor bit or rewrite
-        /// topology. Because each CPUID-stealth installer re-derives from KVM's
-        /// supported baseline before `KVM_SET_CPUID2`, this is an **alternative**
-        /// full install, not a layer to chain after `apply_topology_stealth` —
+        /// CPUID array via `CpuId::from_entries`, and also clears the leaf-`1`
+        /// `ECX[31]` hypervisor-present bit — the universal CPUID-stealth baseline
+        /// — so a standalone PMU install never leaves the single biggest tell set
+        /// (a guest that advertises a real PMU but still flags itself a
+        /// hypervisor is self-contradicting). It does **not** rewrite topology.
+        /// Because each CPUID-stealth installer re-derives from KVM's supported
+        /// baseline before `KVM_SET_CPUID2`, this is an **alternative** full
+        /// install, not a layer to chain after `apply_topology_stealth` —
         /// chaining would have whichever runs last drop the other's edits. Use
         /// this when only PMU stealth is wanted; for topology *and* PMU together
         /// call [`apply_topology_stealth`](Self::apply_topology_stealth), which
@@ -848,6 +851,14 @@ mod linux {
                 .map_err(|e| Error::Vcpu(format!("KVM_GET_SUPPORTED_CPUID: {e}")))?;
             let mut entries: Vec<kvm_cpuid_entry2> = supported.as_slice().to_vec();
 
+            // Clear the leaf-1 ECX[31] hypervisor-present bit so a standalone PMU
+            // install is still hv-bit-safe (the universal baseline the other
+            // CPUID installers also apply).
+            for entry in &mut entries {
+                if entry.function == 1 {
+                    entry.ecx &= !(1u32 << 31);
+                }
+            }
             Self::upsert_pmu_leaf(&mut entries, table);
 
             let cpuid = CpuId::from_entries(&entries)
@@ -1811,17 +1822,27 @@ mod tests {
             return;
         }
 
-        // 16-bit real-mode blob; reads PMU leaf 0xA and echoes the version byte:
+        // 16-bit real-mode blob; echoes the PMU version then the hypervisor bit:
         //   66 B8 0A 00 00 00   mov eax, 0xA    ; architectural-PMU leaf
         //   0F A2               cpuid           ; al = EAX[7:0] = PMU version
         //   BA F8 03            mov dx, 0x3F8   ; COM1
-        //   EE                  out dx, al
+        //   EE                  out dx, al      ; echo PMU version
+        //   66 B8 01 00 00 00   mov eax, 1      ; feature leaf
+        //   0F A2               cpuid
+        //   66 C1 E9 1F         shr ecx, 31     ; cl = ECX[31] = hypervisor bit
+        //   88 C8               mov al, cl
+        //   EE                  out dx, al      ; echo hypervisor bit
         //   F4                  hlt
         #[rustfmt::skip]
-        let code: [u8; 13] = [
+        let code: [u8; 28] = [
             0x66, 0xB8, 0x0A, 0x00, 0x00, 0x00,
             0x0F, 0xA2,
             0xBA, 0xF8, 0x03,
+            0xEE,
+            0x66, 0xB8, 0x01, 0x00, 0x00, 0x00,
+            0x0F, 0xA2,
+            0x66, 0xC1, 0xE9, 0x1F,
+            0x88, 0xC8,
             0xEE,
             0xF4,
         ];
@@ -1870,11 +1891,13 @@ mod tests {
         }
         assert!(halted, "guest never reached HLT");
         // The guest reads PMU version 5 from leaf 0xA — which KVM would have
-        // reported as 0 on this AMD host without the injected leaf.
+        // reported as 0 on this AMD host without the injected leaf — and the
+        // hypervisor-present bit is cleared, so a standalone PMU install is not
+        // self-contradicting (real PMU, yet "I'm a hypervisor").
         assert_eq!(
             echo.0,
-            vec![5],
-            "leaf 0xA EAX[7:0] should be the injected PMU version (5)"
+            vec![5, 0],
+            "leaf 0xA PMU version (5) then leaf-1 ECX[31] hypervisor bit (0)"
         );
     }
 
