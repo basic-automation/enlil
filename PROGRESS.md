@@ -9,7 +9,7 @@ the recommended next step so the next run (which has no memory) can resume.
 ## 2026-06-18 — Session: the full live-guest CPUID-stealth pass — PMU leaf + the complete AMD topology-consistency set (Phase 5)
 
 **7 increments (6 code/test + 1 docs), each independently green and committed**
-(branch `routine/enlil-2026-06-18`, PR <!-- PR_URL -->). This session turned
+(branch `routine/enlil-2026-06-18`, PR https://github.com/physics515/enlil/pull/31). This session turned
 `apply_topology_stealth` into the **complete live-guest CPUID-stealth pass**:
 one call now installs topology + hypervisor-bit + the architectural PMU + the
 full AMD topology-consistency set, every leaf proven on this host's `/dev/kvm`
