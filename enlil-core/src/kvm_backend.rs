@@ -643,7 +643,11 @@ mod linux {
         /// bits KVM actually backs — untouched. It also clears the leaf-`1`
         /// `ECX[31]` hypervisor bit, so it subsumes
         /// [`clear_cpuid_hypervisor_bit`](Self::clear_cpuid_hypervisor_bit)
-        /// when a table is available.
+        /// when a table is available, and folds in the architectural-PMU leaf
+        /// `0xA` (see [`apply_pmu_stealth`](Self::apply_pmu_stealth)) in the same
+        /// rebuild — so this single call is the **full CPUID-stealth** path
+        /// (topology + hypervisor bit + PMU). The PMU fold is a no-op for an
+        /// AMD-vendor table and effective for an Intel-presented one.
         ///
         /// Leaf `0xB` `EDX` (the per-vCPU x2APIC ID) is left as KVM provides it:
         /// KVM fills it per vCPU, and the table carries a placeholder `0`.
@@ -717,6 +721,13 @@ mod linux {
                 }
             }
 
+            // Fold in the architectural-PMU leaf (0xA) in the same single rebuild,
+            // so this one call yields full CPUID stealth (topology + hypervisor
+            // bit + PMU) and the guest never reads a leaf-0xA "PMU version 0" tell
+            // that contradicts the RDPMC shadow. No-op for an AMD-vendor table
+            // (leaf 0xA reserved-zero there), effective for an Intel-presented one.
+            Self::upsert_pmu_leaf(&mut entries, table);
+
             let cpuid = CpuId::from_entries(&entries)
                 .map_err(|e| Error::Vcpu(format!("rebuild CpuId: {e:?}")))?;
             for (i, vcpu) in self.vcpus.iter().enumerate() {
@@ -751,8 +762,9 @@ mod linux {
         /// supported baseline before `KVM_SET_CPUID2`, this is an **alternative**
         /// full install, not a layer to chain after `apply_topology_stealth` —
         /// chaining would have whichever runs last drop the other's edits. Use
-        /// this when only PMU stealth is wanted; for topology *and* PMU together,
-        /// apply them in a single CPUID rebuild.
+        /// this when only PMU stealth is wanted; for topology *and* PMU together
+        /// call [`apply_topology_stealth`](Self::apply_topology_stealth), which
+        /// folds this leaf into its single rebuild.
         ///
         /// Call after creating vCPUs and before running them.
         ///
@@ -773,7 +785,26 @@ mod linux {
                 .map_err(|e| Error::Vcpu(format!("KVM_GET_SUPPORTED_CPUID: {e}")))?;
             let mut entries: Vec<kvm_cpuid_entry2> = supported.as_slice().to_vec();
 
-            // Leaf 0xA has a single (non-indexed) subleaf 0.
+            Self::upsert_pmu_leaf(&mut entries, table);
+
+            let cpuid = CpuId::from_entries(&entries)
+                .map_err(|e| Error::Vcpu(format!("rebuild CpuId: {e:?}")))?;
+            for (i, vcpu) in self.vcpus.iter().enumerate() {
+                vcpu.set_cpuid2(&cpuid)
+                    .map_err(|e| Error::Vcpu(format!("KVM_SET_CPUID2 vcpu {i}: {e}")))?;
+            }
+            Ok(())
+        }
+
+        /// Overwrite (or insert) leaf `0xA` in `entries` with the table's
+        /// architectural-PMU view. Leaf `0xA` is non-indexed (single subleaf 0).
+        /// Shared by [`apply_pmu_stealth`](Self::apply_pmu_stealth) and
+        /// [`apply_topology_stealth`](Self::apply_topology_stealth) so both reach
+        /// the guest through one consistent leaf-`0xA` rewrite.
+        fn upsert_pmu_leaf(
+            entries: &mut Vec<kvm_bindings::kvm_cpuid_entry2>,
+            table: &enlil_devices::stealth::cpuid::CpuidStealthTable,
+        ) {
             let r = table.lookup(0xA, 0);
             if let Some(entry) = entries.iter_mut().find(|e| e.function == 0xA) {
                 entry.index = 0;
@@ -782,7 +813,7 @@ mod linux {
                 entry.ecx = r.ecx;
                 entry.edx = r.edx;
             } else {
-                entries.push(kvm_cpuid_entry2 {
+                entries.push(kvm_bindings::kvm_cpuid_entry2 {
                     function: 0xA,
                     index: 0,
                     flags: 0,
@@ -793,14 +824,6 @@ mod linux {
                     padding: [0; 3],
                 });
             }
-
-            let cpuid = CpuId::from_entries(&entries)
-                .map_err(|e| Error::Vcpu(format!("rebuild CpuId: {e:?}")))?;
-            for (i, vcpu) in self.vcpus.iter().enumerate() {
-                vcpu.set_cpuid2(&cpuid)
-                    .map_err(|e| Error::Vcpu(format!("KVM_SET_CPUID2 vcpu {i}: {e}")))?;
-            }
-            Ok(())
         }
 
         /// Map a host buffer into the guest's physical address space.
@@ -1789,6 +1812,98 @@ mod tests {
             echo.0,
             vec![5],
             "leaf 0xA EAX[7:0] should be the injected PMU version (5)"
+        );
+    }
+
+    // apply_topology_stealth is the full CPUID-stealth path: a single call must
+    // give the guest BOTH its own topology (leaf 0xB) AND a consistent
+    // architectural PMU (leaf 0xA) in one rebuild. With an Intel-vendor 2-vCPU
+    // table, the guest reads leaf 0xB subleaf 1 EBX == 2 and leaf 0xA
+    // EAX[7:0] == 5 from the same install. On this AMD host both values can only
+    // come from our injected leaves (KVM reports the host's count for 0xB and
+    // omits 0xA entirely), so the test is non-vacuous. Self-skips without /dev/kvm.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn topology_stealth_also_applies_the_pmu_leaf() {
+        use enlil_devices::stealth::cpuid::{CpuVendor, CpuidStealthConfig, CpuidStealthTable};
+
+        if !is_kvm_available() {
+            eprintln!("skipping topology_stealth_also_applies_the_pmu_leaf: no /dev/kvm");
+            return;
+        }
+
+        // 16-bit real-mode blob; echoes the topology count then the PMU version:
+        //   66 B8 0B 00 00 00   mov eax, 0xB    ; extended topology leaf
+        //   66 B9 01 00 00 00   mov ecx, 1      ; subleaf 1 (core level)
+        //   0F A2               cpuid
+        //   88 D8               mov al, bl      ; al = logical-proc count
+        //   BA F8 03            mov dx, 0x3F8   ; COM1
+        //   EE                  out dx, al
+        //   66 B8 0A 00 00 00   mov eax, 0xA    ; architectural-PMU leaf
+        //   0F A2               cpuid           ; al = EAX[7:0] = PMU version
+        //   EE                  out dx, al
+        //   F4                  hlt
+        #[rustfmt::skip]
+        let code: [u8; 30] = [
+            0x66, 0xB8, 0x0B, 0x00, 0x00, 0x00,
+            0x66, 0xB9, 0x01, 0x00, 0x00, 0x00,
+            0x0F, 0xA2,
+            0x88, 0xD8,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0x66, 0xB8, 0x0A, 0x00, 0x00, 0x00,
+            0x0F, 0xA2,
+            0xEE,
+            0xF4,
+        ];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        const GUEST_VCPUS: u32 = 2;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu 0");
+        backend.create_vcpu(1).expect("create vcpu 1");
+
+        // Intel-presented 2-vCPU table: leaf 0xB carries the topology, leaf 0xA
+        // the PMU. A single apply_topology_stealth must install both.
+        let mut config = CpuidStealthConfig::from_host(GUEST_VCPUS, 1);
+        config.vendor = CpuVendor::Intel;
+        let table = CpuidStealthTable::build(&config);
+        backend
+            .apply_topology_stealth(&table)
+            .expect("apply topology + pmu stealth");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        struct EchoOut(Vec<u8>);
+        impl VmExitHandler for EchoOut {
+            fn io_out(&mut self, _port: u16, data: &[u8]) {
+                self.0.extend_from_slice(data);
+            }
+        }
+        let mut echo = EchoOut(Vec::new());
+
+        let mut halted = false;
+        for _ in 0..100 {
+            if backend.run_vcpu(0, &mut echo).expect("run vcpu") == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        // One install → both surfaces: 2-vCPU topology and PMU version 5.
+        assert_eq!(
+            echo.0,
+            vec![GUEST_VCPUS as u8, 5],
+            "one apply_topology_stealth should yield topology (2) AND PMU version (5)"
         );
     }
 
