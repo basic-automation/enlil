@@ -6,6 +6,136 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-18 — Session: the full live-guest CPUID-stealth pass — PMU leaf + the complete AMD topology-consistency set (Phase 5)
+
+**7 increments (6 code/test + 1 docs), each independently green and committed**
+(branch `routine/enlil-2026-06-18`, PR <!-- PR_URL -->). This session turned
+`apply_topology_stealth` into the **complete live-guest CPUID-stealth pass**:
+one call now installs topology + hypervisor-bit + the architectural PMU + the
+full AMD topology-consistency set, every leaf proven on this host's `/dev/kvm`
+(read-writable this run, `KVM_RW_OK`). The driver was the 2026-06-16 recommended
+next step #2 (CPUID leaf 0xA on the live guest); it expanded into the adjacent
+AMD topology leaves that KVM mirrors from the host, which a guest can
+cross-check against each other.
+
+### Increments (commit — what)
+1. `a3a8713` — **`KvmBackend::apply_pmu_stealth` (+ `StealthRunLoop` wrapper)** —
+   installs the table's leaf `0xA` (architectural PMU: version 5, GP/fixed
+   counter counts matching the `stealth::pmc` shadow) on each vCPU. KVM omits
+   leaf `0xA` on AMD, so a guest otherwise reads "PMU version 0" — a cloud tell
+   that contradicts the RDPMC shadow. Inserts the leaf via `CpuId::from_entries`
+   like the topology path.
+2. `eaced80` — **fold leaf `0xA` into `apply_topology_stealth`** — one rebuild now
+   yields full CPUID stealth (topology + hv bit + PMU); the shared find-or-insert
+   logic is extracted to a private `upsert_pmu_leaf`. No-op for an AMD table
+   (leaf reserved-zero), effective for an Intel-presented one.
+3. `d280e6b` — **fix AMD core-count leaf `0x8000_0008` `ECX[7:0]` (NC)** — KVM
+   mirrors the host's core count there, contradicting the leaf-1 EBX / leaf-0xB
+   count the topology pass already fixed (kernel cross-checks all three). Patches
+   only ECX (NC + ApicIdSize), leaving the host-real EAX address sizes.
+4. `44cb880` — **fix AMD L3 cache sharing `0x8000_001D` `EAX[25:14]`** — KVM
+   mirrors the host's "shared by every thread"; the sharing sub-field is
+   rewritten per cache to the guest topology (L1/L2 per core, L3 package-wide),
+   matched to KVM subleaves by index + cache type/level, host cache sizes intact.
+5. `039c8e2` — **fix AMD SMT width `0x8000_001E` `EBX[15:8]`** — KVM defaults this
+   to 0/no-SMT regardless of vCPU count (measured), contradicting an SMT guest's
+   leaf-0xB SMT level; patched to the table's `ThreadsPerComputeUnit-1`.
+6. `a82b282` — **docs**: ROADMAP 5.3 (the full pass) + 5.4 (leaf-0xA PMU applied
+   live) + RESEARCH 2026-06-18 (per-leaf record of what KVM mirrors vs defaults
+   vs omits, measured on this host).
+7. `eac6f80` — **`apply_pmu_stealth` also clears the hv bit** — a standalone PMU
+   install previously left leaf-1 ECX[31] set (a guest advertising a real PMU yet
+   flagging itself a hypervisor); now hv-bit-safe, aligning it with its sibling
+   installers. `apply_topology_stealth` unaffected (already cleared it).
+
+### Research (informed the build)
+RESEARCH.md `2026-06-18`: no new third-party sources — the entry records facts
+**measured directly on this AMD Ryzen 9 7950X3D `/dev/kvm`** about what
+`KVM_GET_SUPPORTED_CPUID` does per leaf, because the fix differs by case:
+KVM **mirrors the host** for `0x8000_0008` NC and `0x8000_001D` sharing (must
+override), **defaults to neutral** for `0x8000_001E` SMT = 0 (override only for
+an SMT guest), and **omits** leaf `0xA` on AMD (must insert). General rule
+logged: patch the topology *sub-field* of host-mirrored leaves; insert whole
+synthetic leaves only when KVM omits them. Established via a throwaway
+no-stealth baseline guest that read KVM's native `0x8000_001E` SMT field as 0.
+
+### Test results (exact)
+- **`/dev/kvm`: read-writable (`KVM_RW_OK`).** All KVM / guest-boot tests **ran
+  for real** (none skipped). New real-KVM real-mode guest-boot tests this
+  session, all passing:
+  `pmu_stealth_makes_the_guest_see_an_architectural_pmu` (guest reads leaf-0xA
+  version 5 **and** leaf-1 ECX[31]=0 → echoes `[5, 0]`),
+  `topology_stealth_also_applies_the_pmu_leaf` (one apply → topology 2 **and**
+  PMU 5),
+  `topology_stealth_fixes_the_amd_core_count_leaf` (2-vCPU guest reads
+  `0x8000_0008.ECX[7:0] == 1`, not the host's ~11),
+  `topology_stealth_fixes_the_amd_l3_sharing_leaf` (guest L3 `0x8000_001D`
+  shared by 2),
+  `topology_stealth_fixes_the_amd_smt_width_leaf` (SMT-2 guest reads
+  `0x8000_001E.EBX[15:8] == 1`, where KVM natively reports 0). The pre-existing
+  guest-boot tests (`topology_stealth_makes_the_guest_see_its_own_cpu_count`,
+  the run-loop/seeded-APERF/reset/S5 boots) still pass.
+- `cargo test -p enlil-core --lib`: **186 passed, 0 failed** (started 181).
+- **Full workspace CI-parity** (the exact `.github/workflows/ci.yml` commands):
+  `cargo fmt --all -- --check` → clean; `cargo clippy --all-targets --workspace
+  -- -D warnings` → exit 0; `cargo test --workspace` → all green
+  (enlil-core 186, enlil-devices 760, + the smaller crates; 1 pre-existing
+  ignored test).
+- **Toolchains:** every increment built/tested on **Linux/WSL** (nightly
+  `x86_64-unknown-linux-gnu`, rustc 1.98.0-nightly 2026-06-12). Every increment
+  touching `enlil-core` **also built Windows-native**
+  (`x86_64-pc-windows-msvc`, `cargo build -p enlil-core` against the WSL manifest
+  with `D:\Development\.enlil-win-target`): **exit 0** each time (after
+  increments 1, 2, 3, 4, 5, 7). The KVM internals are `#[cfg(target_os =
+  "linux")]`, so Windows compiles the platform-agnostic parts and confirms no
+  Linux-only dep/path leaked in.
+
+### STOP REASON
+**No cleanly-tractable, testable, non-vacuous increment left in reach; remaining
+unblocked work is architectural or host-untestable here.** The live-guest CPUID
+topology/PMU surface is now complete and internally consistent on AMD, and the
+items that remain are exactly the kind the guardrail says not to start-and-half-
+finish or to skip when vacuous: (a) **architectural** — the threaded-vCPU
+watchdog and per-vCPU stealth state (multi-threaded vCPU model + signal kick;
+the run loop still shares one router/timing across vCPUs); (b) **needs fresh
+research + a deeper change** — the AMD **PerfMonV2 leaf `0x8000_0022`** (the AMD
+analog of leaf 0xA for an AMD-presented guest) requires checking the PMC-MSR
+routing actually shadows the AMD PerfCtr MSRs and that the host advertises
+PerfMonV2, too big to finish-and-test cleanly tonight; (c) **host-untestable /
+vacuous here** — Intel leaf-4 cache sharing (no Intel leaf-4 data on this AMD
+host) and the vendor/brand spoof (KVM-supported brand already matches the host);
+(d) **CI-config, unverifiable without a CI run** — pinning the `nightly`
+toolchain (CI uses `dtolnay/rust-toolchain@nightly`, so a real fix touches the
+workflow; the recurring rustfmt drift bit this run too). Wall-clock ~2h of the
+3–4h budget was used; per the depth/honesty guardrails I handed off rather than
+force a marginal, architectural, or CI-risky change. Every increment is
+independently green; `master` stays buildable; the branch is CI-parity green.
+
+### Recommended next step (tomorrow)
+1. **AMD PerfMonV2 leaf `0x8000_0022`** — the AMD-guest analog of this session's
+   leaf-0xA PMU fix (the production default on this AMD host presents as AMD,
+   where leaf 0xA is reserved). First verify `StealthMsrRouter` shadows the AMD
+   PerfCtr MSRs (`0xC001_020x` PerfMonV2 / `0xC001_000x` legacy) the leaf would
+   advertise, and that the host supports PerfMonV2; then add `build_leaf_8000_0022`
+   to the devices `CpuidStealthTable` and fold it into `apply_topology_stealth`
+   like leaf 0xA, with a real-KVM test on an AMD-presented guest.
+2. **Per-vCPU stealth state** — the run loop shares ONE router/timing/PMC across
+   all vCPUs; a multi-vCPU guest needs per-vCPU APERF/MPERF/PMC/LBR (each reads
+   its own counters). This is the prerequisite for the threaded-vCPU watchdog
+   (#3 below). Decide the shared-state model first.
+3. **Threaded-vCPU watchdog** (the last run-loop piece) — run each vCPU on its
+   own thread with the backend behind shared state, install a signal handler,
+   and have a watchdog `set_immediate_exit` + signal a vCPU thread out of a
+   blocking `KVM_RUN` (the synchronous primitive already exists).
+4. **Housekeeping** — pin `nightly` in `rust-toolchain.toml` **and** the CI
+   workflow (`dtolnay/rust-toolchain@nightly-<date>`) together to stop the
+   recurring rustfmt drift; needs a CI run to confirm, so do it as its own PR.
+5. Lower priority / blocked: libusb-backed `UsbDeviceModel` forwarder (USB
+   hardware), TUI USB tab (UI), Intel leaf-4 cache sharing + vendor/brand spoof
+   (vacuous until Enlil presents a CPU identity different from the host).
+
+---
+
 ## 2026-06-16 — Session: the production run loop comes together — StealthRunLoop, live-guest topology stealth, reboot/shutdown handling (Phase 5)
 
 **7 code/doc increments, each independently green and committed** (branch
