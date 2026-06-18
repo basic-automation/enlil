@@ -639,8 +639,10 @@ mod linux {
         /// (and a correctness problem for a guest scheduler counting CPUs from
         /// CPUID). This overrides exactly those topology fields with the table's
         /// guest-derived values (built for the guest's `vcpu_count` /
-        /// `threads_per_core`), leaving every other supported leaf — the feature
-        /// bits KVM actually backs — untouched. It also clears the leaf-`1`
+        /// `threads_per_core`) — plus, for AMD, the leaf-`0x8000_0008` `ECX`
+        /// core-count (`NC`) / APIC-ID-width field the kernel cross-checks
+        /// against them — leaving every other supported leaf (and that leaf's
+        /// host-backed `EAX` address sizes) untouched. It also clears the leaf-`1`
         /// `ECX[31]` hypervisor bit, so it subsumes
         /// [`clear_cpuid_hypervisor_bit`](Self::clear_cpuid_hypervisor_bit)
         /// when a table is available, and folds in the architectural-PMU leaf
@@ -719,6 +721,22 @@ mod linux {
                         padding: [0; 3],
                     });
                 }
+            }
+
+            // AMD encodes the package's core count in leaf 0x8000_0008 ECX[7:0]
+            // (NC = cores-1) and the APIC-ID width in ECX[15:12]; the kernel
+            // cross-checks these against leaf-1 EBX[23:16] and leaf 0xB. KVM
+            // mirrors the host there, so without this an AMD guest's
+            // 0x8000_0008.ECX would still report the host's core count and
+            // *contradict* the guest topology just installed in leaf 1 / 0xB — a
+            // one-instruction cross-check tell. Patch ECX from the table (the
+            // host-backed EAX/EBX/EDX — address sizes and feature bits — are left
+            // intact); reserved-zero for an Intel table, so a no-op there. Only
+            // patch when KVM enumerates the leaf (it always does on x86_64); never
+            // synthesise it, since EAX carries the real physical-address width.
+            let ext8_ecx = table.lookup(0x8000_0008, 0).ecx;
+            if let Some(entry) = entries.iter_mut().find(|e| e.function == 0x8000_0008) {
+                entry.ecx = ext8_ecx;
             }
 
             // Fold in the architectural-PMU leaf (0xA) in the same single rebuild,
@@ -1904,6 +1922,92 @@ mod tests {
             echo.0,
             vec![GUEST_VCPUS as u8, 5],
             "one apply_topology_stealth should yield topology (2) AND PMU version (5)"
+        );
+    }
+
+    // apply_topology_stealth must also make an AMD guest's leaf 0x8000_0008
+    // ECX[7:0] (NC = cores-1) report the guest's core count, not the host's.
+    // KVM mirrors the host there, so a guest with fewer vCPUs would otherwise
+    // read the host's NC — and contradict the topology installed in leaf 1 /
+    // leaf 0xB (the kernel cross-checks the two). After applying a table built
+    // for this (AMD) host's vendor, the guest reads exactly the table's NC. The
+    // expected value is taken from the table so the test is vendor-correct; on
+    // this AMD host it is 1 (2 vCPUs), which differs from the host's real core
+    // count, making it non-vacuous. Self-skips without /dev/kvm.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn topology_stealth_fixes_the_amd_core_count_leaf() {
+        use enlil_devices::stealth::cpuid::{CpuidStealthConfig, CpuidStealthTable};
+
+        if !is_kvm_available() {
+            eprintln!("skipping topology_stealth_fixes_the_amd_core_count_leaf: no /dev/kvm");
+            return;
+        }
+
+        // 16-bit real-mode blob; reads leaf 0x8000_0008 and echoes ECX low byte:
+        //   66 B8 08 00 00 80   mov eax, 0x80000008  ; extended address/topology
+        //   0F A2               cpuid
+        //   88 C8               mov al, cl           ; al = ECX[7:0] = NC
+        //   BA F8 03            mov dx, 0x3F8        ; COM1
+        //   EE                  out dx, al
+        //   F4                  hlt
+        #[rustfmt::skip]
+        let code: [u8; 15] = [
+            0x66, 0xB8, 0x08, 0x00, 0x00, 0x80,
+            0x0F, 0xA2,
+            0x88, 0xC8,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0xF4,
+        ];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        const GUEST_VCPUS: u32 = 2;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu 0");
+        backend.create_vcpu(1).expect("create vcpu 1");
+
+        // Build for the host's own vendor (AMD here) so the 0x8000_0008 ECX
+        // override is the one the guest would actually receive in production.
+        let table = CpuidStealthTable::build(&CpuidStealthConfig::from_host(GUEST_VCPUS, 1));
+        let want_nc = (table.lookup(0x8000_0008, 0).ecx & 0xFF) as u8;
+        backend
+            .apply_topology_stealth(&table)
+            .expect("apply topology stealth");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        struct EchoOut(Vec<u8>);
+        impl VmExitHandler for EchoOut {
+            fn io_out(&mut self, _port: u16, data: &[u8]) {
+                self.0.extend_from_slice(data);
+            }
+        }
+        let mut echo = EchoOut(Vec::new());
+
+        let mut halted = false;
+        for _ in 0..100 {
+            if backend.run_vcpu(0, &mut echo).expect("run vcpu") == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        // The guest reads its own NC from leaf 0x8000_0008, consistent with the
+        // leaf-1 / leaf-0xB topology — not the host's core count.
+        assert_eq!(
+            echo.0,
+            vec![want_nc],
+            "leaf 0x8000_0008 ECX[7:0] should be the guest's NC, not the host's"
         );
     }
 
