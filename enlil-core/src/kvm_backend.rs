@@ -641,8 +641,11 @@ mod linux {
         /// guest-derived values (built for the guest's `vcpu_count` /
         /// `threads_per_core`) — plus, for AMD, the leaf-`0x8000_0008` `ECX`
         /// core-count (`NC`) / APIC-ID-width field the kernel cross-checks
-        /// against them — leaving every other supported leaf (and that leaf's
-        /// host-backed `EAX` address sizes) untouched. It also clears the leaf-`1`
+        /// against them, and the per-cache sharing counts in leaf
+        /// `0x8000_001D` `EAX[25:14]` (so the guest sees its L3 shared by its own
+        /// vCPUs, not the host's) — leaving every other supported leaf (and
+        /// those leaves' host-backed sizes / address bits) untouched. It also
+        /// clears the leaf-`1`
         /// `ECX[31]` hypervisor bit, so it subsumes
         /// [`clear_cpuid_hypervisor_bit`](Self::clear_cpuid_hypervisor_bit)
         /// when a table is available, and folds in the architectural-PMU leaf
@@ -737,6 +740,34 @@ mod linux {
             let ext8_ecx = table.lookup(0x8000_0008, 0).ecx;
             if let Some(entry) = entries.iter_mut().find(|e| e.function == 0x8000_0008) {
                 entry.ecx = ext8_ecx;
+            }
+
+            // AMD leaf 0x8000_001D encodes, per cache, how many logical
+            // processors share it (EAX[25:14] = NumSharingCache-1). KVM mirrors
+            // the host, so a guest with fewer vCPUs reads e.g. the host's
+            // package-wide L3 as shared by every host thread — a cache-topology
+            // tell that also contradicts the core count just fixed in
+            // 0x8000_0008 / leaf 0xB. Rewrite *only* the sharing sub-field of
+            // each cache from the table (which derives it from the guest
+            // topology: L1/L2 per core, L3 package-wide), matching KVM's subleaf
+            // by index and cache type+level so the host-real cache sizes
+            // (EBX/ECX) stay intact. No-op when KVM does not enumerate the leaf
+            // (older hosts / no TOPOEXT pass-through) and for an Intel table
+            // (which carries no 0x8000_001D; Intel uses leaf 4).
+            const CACHE_SHARING_MASK: u32 = 0x03FF_C000; // EAX[25:14]
+            const CACHE_TYPE_LEVEL_MASK: u32 = 0x0000_00FF; // EAX[7:0]: type + level
+            for sub in 0..16u32 {
+                let t = table.lookup(0x8000_001D, sub);
+                if t.eax & 0x1F == 0 {
+                    break; // null cache type terminates the table's enumeration
+                }
+                if let Some(entry) = entries.iter_mut().find(|e| {
+                    e.function == 0x8000_001D
+                        && e.index == sub
+                        && (e.eax & CACHE_TYPE_LEVEL_MASK) == (t.eax & CACHE_TYPE_LEVEL_MASK)
+                }) {
+                    entry.eax = (entry.eax & !CACHE_SHARING_MASK) | (t.eax & CACHE_SHARING_MASK);
+                }
             }
 
             // Fold in the architectural-PMU leaf (0xA) in the same single rebuild,
@@ -2008,6 +2039,105 @@ mod tests {
             echo.0,
             vec![want_nc],
             "leaf 0x8000_0008 ECX[7:0] should be the guest's NC, not the host's"
+        );
+    }
+
+    // apply_topology_stealth must also fix the AMD per-cache sharing count in
+    // leaf 0x8000_001D: a guest with fewer vCPUs should read its package-wide L3
+    // as shared by its own vCPUs, not the host's logical-processor count. The
+    // L3 subleaf's EAX[25:14] (NumSharingCache-1) must reflect the guest. With a
+    // 2-vCPU AMD table the guest computes 2 sharers for L3, where the host
+    // reports many more. Expected derived from the table; self-skips without
+    // /dev/kvm. (Fails loudly if KVM here does not enumerate 0x8000_001D, which
+    // would mean the no-op path was taken — a real signal, not a silent pass.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn topology_stealth_fixes_the_amd_l3_sharing_leaf() {
+        use enlil_devices::stealth::cpuid::{CpuidStealthConfig, CpuidStealthTable};
+
+        if !is_kvm_available() {
+            eprintln!("skipping topology_stealth_fixes_the_amd_l3_sharing_leaf: no /dev/kvm");
+            return;
+        }
+
+        // 16-bit real-mode blob; reads leaf 0x8000_001D subleaf 3 (L3) and
+        // echoes the sharing count = EAX[25:14] + 1:
+        //   66 B8 1D 00 00 80   mov eax, 0x8000001D
+        //   66 B9 03 00 00 00   mov ecx, 3           ; subleaf 3 = L3
+        //   0F A2               cpuid
+        //   66 C1 E8 0E         shr eax, 14          ; drop the type/level bits
+        //   66 25 FF 0F 00 00   and eax, 0xFFF       ; isolate NumSharingCache-1
+        //   FE C0               inc al               ; -> sharing count
+        //   BA F8 03            mov dx, 0x3F8        ; COM1
+        //   EE                  out dx, al
+        //   F4                  hlt
+        #[rustfmt::skip]
+        let code: [u8; 31] = [
+            0x66, 0xB8, 0x1D, 0x00, 0x00, 0x80,
+            0x66, 0xB9, 0x03, 0x00, 0x00, 0x00,
+            0x0F, 0xA2,
+            0x66, 0xC1, 0xE8, 0x0E,
+            0x66, 0x25, 0xFF, 0x0F, 0x00, 0x00,
+            0xFE, 0xC0,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0xF4,
+        ];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        const GUEST_VCPUS: u32 = 2;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu 0");
+        backend.create_vcpu(1).expect("create vcpu 1");
+
+        let table = CpuidStealthTable::build(&CpuidStealthConfig::from_host(GUEST_VCPUS, 1));
+        let l3 = table.lookup(0x8000_001D, 3);
+        assert_eq!(
+            (l3.eax >> 5) & 0x7,
+            3,
+            "table subleaf 3 should be the L3 cache"
+        );
+        let want_shared = (((l3.eax >> 14) & 0xFFF) + 1) as u8;
+        assert_eq!(
+            want_shared, GUEST_VCPUS as u8,
+            "L3 should be shared by exactly the guest's vCPUs"
+        );
+        backend
+            .apply_topology_stealth(&table)
+            .expect("apply topology stealth");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        struct EchoOut(Vec<u8>);
+        impl VmExitHandler for EchoOut {
+            fn io_out(&mut self, _port: u16, data: &[u8]) {
+                self.0.extend_from_slice(data);
+            }
+        }
+        let mut echo = EchoOut(Vec::new());
+
+        let mut halted = false;
+        for _ in 0..100 {
+            if backend.run_vcpu(0, &mut echo).expect("run vcpu") == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        // The guest sees its L3 shared by its own 2 vCPUs, not the host's count.
+        assert_eq!(
+            echo.0,
+            vec![want_shared],
+            "leaf 0x8000_001D L3 EAX[25:14]+1 should be the guest's sharing count"
         );
     }
 
