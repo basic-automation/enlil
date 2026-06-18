@@ -1365,3 +1365,47 @@ state already grounded in prior entries. Two measured facts shaped the code:
   `run_vcpu_timed` via the shared `Arc`; the non-shared PMC advanced once in the
   loop from the returned delta — advancing both via `StealthMsrRouter::advance`
   would double-count the timing surface).
+
+---
+
+## 2026-06-18 — What KVM's `GET_SUPPORTED_CPUID` mirrors vs. defaults, leaf by leaf (Phase 5)
+
+No new third-party sources — this entry records facts **measured directly on this
+AMD Ryzen 9 7950X3D host's `/dev/kvm`** while extending `apply_topology_stealth`
+to a full live-guest CPUID-stealth pass. They matter because the fix for each
+leaf depends on whether KVM *mirrors the host* (must override) or *defaults to a
+neutral value* (override only when the guest wants non-default), and getting that
+wrong yields either a vacuous patch or a missed tell:
+
+- **Leaf `0xA` (architectural PMU): KVM omits it entirely on AMD.** A guest reads
+  it all-zero = "PMU version 0", which only vPMU-less cloud VMs report and which
+  contradicts the `stealth::pmc` RDPMC shadow. → must *insert* the table's leaf
+  `0xA` (PMU v5, GP/fixed counts matching the shadow). The `CpuId::from_entries`
+  rebuild already handles a KVM-absent leaf. Verified: Intel-presented guest then
+  reads `cpuid(0xA).EAX[7:0] == 5`.
+- **Leaf `0x8000_0008` `ECX[7:0]` (NC, core count): KVM mirrors the host.** A
+  2-vCPU guest read the host's ~11, contradicting the leaf-1 EBX / leaf-0xB count
+  the topology pass already fixed (the kernel cross-checks all three). → patch
+  ECX from the table (NC + ApicIdSize), leaving the host-real `EAX` address
+  widths. Verified: guest reads `NC == 1`.
+- **Leaf `0x8000_001D` `EAX[25:14]` (per-cache NumSharingCache): KVM mirrors the
+  host.** A 2-vCPU guest read its L3 as shared by every host thread. → rewrite
+  only the sharing sub-field per cache (L1/L2 per core, L3 package-wide), matched
+  to KVM's subleaves by index + cache type/level so host cache *sizes* stay. The
+  sharing field is `(shared-1) << 14`, mask `0x03FF_C000`. Verified: guest L3
+  shared by 2.
+- **Leaf `0x8000_001E` `EBX[15:8]` (ThreadsPerComputeUnit-1, SMT width): KVM
+  defaults to 0** regardless of vCPU count — it does *not* infer SMT from the
+  number of vCPUs (measured via a no-stealth baseline guest). So this is the
+  inverse case: vacuous for an SMT-1 guest, but for an SMT-2 guest the table's
+  `1` must be installed or the SMT field contradicts the leaf-0xB SMT level and
+  leaf-1 HTT bit. → patch only `EBX[15:8]` (mask `0x0000_FF00`), leaving the
+  per-vCPU APIC/core-id fields KVM fills. Verified: SMT-2 guest reads `1`.
+
+**General rule for live-guest CPUID stealth:** patch the *topology sub-field*
+of a host-mirrored leaf and leave the hardware-backed remainder (sizes, address
+widths, per-vCPU IDs) to KVM; insert whole leaves only when KVM omits them and
+the value is fully synthetic (leaf `0xB`, leaf `0xA`). The AMD topology surface a
+guest can cross-check is the set {leaf-1 EBX[23:16], leaf 0xB, `0x8000_0008` NC,
+`0x8000_001D` sharing, `0x8000_001E` SMT} — they must all agree, and as of this
+run `apply_topology_stealth` makes them agree in one rebuild.

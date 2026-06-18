@@ -639,11 +639,21 @@ mod linux {
         /// (and a correctness problem for a guest scheduler counting CPUs from
         /// CPUID). This overrides exactly those topology fields with the table's
         /// guest-derived values (built for the guest's `vcpu_count` /
-        /// `threads_per_core`), leaving every other supported leaf — the feature
-        /// bits KVM actually backs — untouched. It also clears the leaf-`1`
+        /// `threads_per_core`) — plus, for AMD, the leaf-`0x8000_0008` `ECX`
+        /// core-count (`NC`) / APIC-ID-width field the kernel cross-checks
+        /// against them, the per-cache sharing counts in leaf `0x8000_001D`
+        /// `EAX[25:14]` (so the guest sees its L3 shared by its own vCPUs, not
+        /// the host's), and the SMT width in leaf `0x8000_001E` `EBX[15:8]`
+        /// (which KVM defaults to 0/no-SMT) — leaving every other supported leaf
+        /// (and those leaves' host-backed sizes / per-vCPU APIC-ID fields)
+        /// untouched. It also clears the leaf-`1`
         /// `ECX[31]` hypervisor bit, so it subsumes
         /// [`clear_cpuid_hypervisor_bit`](Self::clear_cpuid_hypervisor_bit)
-        /// when a table is available.
+        /// when a table is available, and folds in the architectural-PMU leaf
+        /// `0xA` (see [`apply_pmu_stealth`](Self::apply_pmu_stealth)) in the same
+        /// rebuild — so this single call is the **full CPUID-stealth** path
+        /// (topology + hypervisor bit + PMU). The PMU fold is a no-op for an
+        /// AMD-vendor table and effective for an Intel-presented one.
         ///
         /// Leaf `0xB` `EDX` (the per-vCPU x2APIC ID) is left as KVM provides it:
         /// KVM fills it per vCPU, and the table carries a placeholder `0`.
@@ -717,6 +727,70 @@ mod linux {
                 }
             }
 
+            // AMD encodes the package's core count in leaf 0x8000_0008 ECX[7:0]
+            // (NC = cores-1) and the APIC-ID width in ECX[15:12]; the kernel
+            // cross-checks these against leaf-1 EBX[23:16] and leaf 0xB. KVM
+            // mirrors the host there, so without this an AMD guest's
+            // 0x8000_0008.ECX would still report the host's core count and
+            // *contradict* the guest topology just installed in leaf 1 / 0xB — a
+            // one-instruction cross-check tell. Patch ECX from the table (the
+            // host-backed EAX/EBX/EDX — address sizes and feature bits — are left
+            // intact); reserved-zero for an Intel table, so a no-op there. Only
+            // patch when KVM enumerates the leaf (it always does on x86_64); never
+            // synthesise it, since EAX carries the real physical-address width.
+            let ext8_ecx = table.lookup(0x8000_0008, 0).ecx;
+            if let Some(entry) = entries.iter_mut().find(|e| e.function == 0x8000_0008) {
+                entry.ecx = ext8_ecx;
+            }
+
+            // AMD leaf 0x8000_001D encodes, per cache, how many logical
+            // processors share it (EAX[25:14] = NumSharingCache-1). KVM mirrors
+            // the host, so a guest with fewer vCPUs reads e.g. the host's
+            // package-wide L3 as shared by every host thread — a cache-topology
+            // tell that also contradicts the core count just fixed in
+            // 0x8000_0008 / leaf 0xB. Rewrite *only* the sharing sub-field of
+            // each cache from the table (which derives it from the guest
+            // topology: L1/L2 per core, L3 package-wide), matching KVM's subleaf
+            // by index and cache type+level so the host-real cache sizes
+            // (EBX/ECX) stay intact. No-op when KVM does not enumerate the leaf
+            // (older hosts / no TOPOEXT pass-through) and for an Intel table
+            // (which carries no 0x8000_001D; Intel uses leaf 4).
+            const CACHE_SHARING_MASK: u32 = 0x03FF_C000; // EAX[25:14]
+            const CACHE_TYPE_LEVEL_MASK: u32 = 0x0000_00FF; // EAX[7:0]: type + level
+            for sub in 0..16u32 {
+                let t = table.lookup(0x8000_001D, sub);
+                if t.eax & 0x1F == 0 {
+                    break; // null cache type terminates the table's enumeration
+                }
+                if let Some(entry) = entries.iter_mut().find(|e| {
+                    e.function == 0x8000_001D
+                        && e.index == sub
+                        && (e.eax & CACHE_TYPE_LEVEL_MASK) == (t.eax & CACHE_TYPE_LEVEL_MASK)
+                }) {
+                    entry.eax = (entry.eax & !CACHE_SHARING_MASK) | (t.eax & CACHE_SHARING_MASK);
+                }
+            }
+
+            // AMD leaf 0x8000_001E EBX[15:8] is ThreadsPerComputeUnit-1 (SMT
+            // width); KVM mirrors the host, so an SMT-1 guest on an SMT-2 host
+            // would read 1 here and contradict the single-thread topology in leaf
+            // 0xB / leaf-1 EBX. Patch only that sub-field from the table, leaving
+            // the per-vCPU EAX (extended APIC id) and EBX[7:0] (core/compute-unit
+            // id) — which KVM fills per vCPU — and ECX (node id) untouched.
+            // Reserved for an Intel table (no 0x8000_001E), so a no-op there.
+            const SMT_WIDTH_MASK: u32 = 0x0000_FF00; // EBX[15:8]
+            let ext1e_ebx = table.lookup(0x8000_001E, 0).ebx;
+            if let Some(entry) = entries.iter_mut().find(|e| e.function == 0x8000_001E) {
+                entry.ebx = (entry.ebx & !SMT_WIDTH_MASK) | (ext1e_ebx & SMT_WIDTH_MASK);
+            }
+
+            // Fold in the architectural-PMU leaf (0xA) in the same single rebuild,
+            // so this one call yields full CPUID stealth (topology + hypervisor
+            // bit + PMU) and the guest never reads a leaf-0xA "PMU version 0" tell
+            // that contradicts the RDPMC shadow. No-op for an AMD-vendor table
+            // (leaf 0xA reserved-zero there), effective for an Intel-presented one.
+            Self::upsert_pmu_leaf(&mut entries, table);
+
             let cpuid = CpuId::from_entries(&entries)
                 .map_err(|e| Error::Vcpu(format!("rebuild CpuId: {e:?}")))?;
             for (i, vcpu) in self.vcpus.iter().enumerate() {
@@ -724,6 +798,106 @@ mod linux {
                     .map_err(|e| Error::Vcpu(format!("KVM_SET_CPUID2 vcpu {i}: {e}")))?;
             }
             Ok(())
+        }
+
+        /// Apply the [`CpuidStealthTable`]'s **architectural-PMU** view (leaf
+        /// `0xA`) to every vCPU, so the guest enumerates a performance-monitoring
+        /// unit consistent with the RDPMC shadow it is being served.
+        ///
+        /// KVM does not synthesise leaf `0xA` from a virtual PMU model: on this
+        /// AMD host `KVM_GET_SUPPORTED_CPUID` omits the Intel-style leaf entirely,
+        /// so a guest reads it back as all-zero — **PMU version 0, "no
+        /// architectural PMU."** That is itself a cloud/VM tell (only vPMU-less
+        /// VMs report it) and it contradicts the `stealth::pmc` shadow that
+        /// services the guest's RDPMC: a guest that finds counters via RDPMC but
+        /// is told "version 0" by CPUID has caught the hypervisor. This installs
+        /// exactly the table's leaf-`0xA` value (PMU version + GP/fixed counter
+        /// counts and widths matching the shadow) so the two surfaces agree.
+        ///
+        /// For an AMD-vendor table the leaf is reserved-zero (correct for AMD,
+        /// where the PMU is enumerated via leaf `0x8000_0022` + MSRs, not `0xA`),
+        /// so this is a no-op there; it has effect for an Intel-presented guest.
+        /// Like [`apply_topology_stealth`](Self::apply_topology_stealth) it
+        /// *inserts* the leaf when KVM's supported set lacks it, rebuilding the
+        /// CPUID array via `CpuId::from_entries`, and also clears the leaf-`1`
+        /// `ECX[31]` hypervisor-present bit — the universal CPUID-stealth baseline
+        /// — so a standalone PMU install never leaves the single biggest tell set
+        /// (a guest that advertises a real PMU but still flags itself a
+        /// hypervisor is self-contradicting). It does **not** rewrite topology.
+        /// Because each CPUID-stealth installer re-derives from KVM's supported
+        /// baseline before `KVM_SET_CPUID2`, this is an **alternative** full
+        /// install, not a layer to chain after `apply_topology_stealth` —
+        /// chaining would have whichever runs last drop the other's edits. Use
+        /// this when only PMU stealth is wanted; for topology *and* PMU together
+        /// call [`apply_topology_stealth`](Self::apply_topology_stealth), which
+        /// folds this leaf into its single rebuild.
+        ///
+        /// Call after creating vCPUs and before running them.
+        ///
+        /// # Errors
+        /// Returns [`Error::Vcpu`] if querying the supported CPUID or setting it
+        /// on a vCPU fails.
+        ///
+        /// [`CpuidStealthTable`]: enlil_devices::stealth::cpuid::CpuidStealthTable
+        pub fn apply_pmu_stealth(
+            &self,
+            table: &enlil_devices::stealth::cpuid::CpuidStealthTable,
+        ) -> Result<()> {
+            use kvm_bindings::{kvm_cpuid_entry2, CpuId, KVM_MAX_CPUID_ENTRIES};
+
+            let supported = self
+                .kvm
+                .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
+                .map_err(|e| Error::Vcpu(format!("KVM_GET_SUPPORTED_CPUID: {e}")))?;
+            let mut entries: Vec<kvm_cpuid_entry2> = supported.as_slice().to_vec();
+
+            // Clear the leaf-1 ECX[31] hypervisor-present bit so a standalone PMU
+            // install is still hv-bit-safe (the universal baseline the other
+            // CPUID installers also apply).
+            for entry in &mut entries {
+                if entry.function == 1 {
+                    entry.ecx &= !(1u32 << 31);
+                }
+            }
+            Self::upsert_pmu_leaf(&mut entries, table);
+
+            let cpuid = CpuId::from_entries(&entries)
+                .map_err(|e| Error::Vcpu(format!("rebuild CpuId: {e:?}")))?;
+            for (i, vcpu) in self.vcpus.iter().enumerate() {
+                vcpu.set_cpuid2(&cpuid)
+                    .map_err(|e| Error::Vcpu(format!("KVM_SET_CPUID2 vcpu {i}: {e}")))?;
+            }
+            Ok(())
+        }
+
+        /// Overwrite (or insert) leaf `0xA` in `entries` with the table's
+        /// architectural-PMU view. Leaf `0xA` is non-indexed (single subleaf 0).
+        /// Shared by [`apply_pmu_stealth`](Self::apply_pmu_stealth) and
+        /// [`apply_topology_stealth`](Self::apply_topology_stealth) so both reach
+        /// the guest through one consistent leaf-`0xA` rewrite.
+        fn upsert_pmu_leaf(
+            entries: &mut Vec<kvm_bindings::kvm_cpuid_entry2>,
+            table: &enlil_devices::stealth::cpuid::CpuidStealthTable,
+        ) {
+            let r = table.lookup(0xA, 0);
+            if let Some(entry) = entries.iter_mut().find(|e| e.function == 0xA) {
+                entry.index = 0;
+                entry.eax = r.eax;
+                entry.ebx = r.ebx;
+                entry.ecx = r.ecx;
+                entry.edx = r.edx;
+            } else {
+                entries.push(kvm_bindings::kvm_cpuid_entry2 {
+                    function: 0xA,
+                    index: 0,
+                    flags: 0,
+                    eax: r.eax,
+                    ebx: r.ebx,
+                    ecx: r.ecx,
+                    edx: r.edx,
+                    padding: [0; 3],
+                });
+            }
         }
 
         /// Map a host buffer into the guest's physical address space.
@@ -1627,6 +1801,474 @@ mod tests {
             echo.0,
             vec![GUEST_VCPUS as u8],
             "leaf 0xB subleaf 1 EBX should be the guest vCPU count, not the host's"
+        );
+    }
+
+    // apply_pmu_stealth makes a guest enumerate an architectural PMU (leaf 0xA)
+    // consistent with the RDPMC shadow it is served. On this AMD host KVM omits
+    // leaf 0xA from KVM_GET_SUPPORTED_CPUID, so without the override a guest
+    // reads it back as all-zero — "PMU version 0", the cloud/VM tell. After
+    // applying an Intel-vendor table whose leaf 0xA advertises PMU version 5,
+    // the guest's cpuid(0xA).EAX[7:0] reads exactly 5. The test is therefore
+    // non-vacuous on AMD: the 5 can only come from our injected leaf, not the
+    // host. Self-skips without /dev/kvm rather than faking it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pmu_stealth_makes_the_guest_see_an_architectural_pmu() {
+        use enlil_devices::stealth::cpuid::{CpuVendor, CpuidStealthConfig, CpuidStealthTable};
+
+        if !is_kvm_available() {
+            eprintln!("skipping pmu_stealth_makes_the_guest_see_an_architectural_pmu: no /dev/kvm");
+            return;
+        }
+
+        // 16-bit real-mode blob; echoes the PMU version then the hypervisor bit:
+        //   66 B8 0A 00 00 00   mov eax, 0xA    ; architectural-PMU leaf
+        //   0F A2               cpuid           ; al = EAX[7:0] = PMU version
+        //   BA F8 03            mov dx, 0x3F8   ; COM1
+        //   EE                  out dx, al      ; echo PMU version
+        //   66 B8 01 00 00 00   mov eax, 1      ; feature leaf
+        //   0F A2               cpuid
+        //   66 C1 E9 1F         shr ecx, 31     ; cl = ECX[31] = hypervisor bit
+        //   88 C8               mov al, cl
+        //   EE                  out dx, al      ; echo hypervisor bit
+        //   F4                  hlt
+        #[rustfmt::skip]
+        let code: [u8; 28] = [
+            0x66, 0xB8, 0x0A, 0x00, 0x00, 0x00,
+            0x0F, 0xA2,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0x66, 0xB8, 0x01, 0x00, 0x00, 0x00,
+            0x0F, 0xA2,
+            0x66, 0xC1, 0xE9, 0x1F,
+            0x88, 0xC8,
+            0xEE,
+            0xF4,
+        ];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu 0");
+
+        // Present the guest as Intel so the table populates leaf 0xA (it is
+        // reserved-zero for an AMD-vendor table). Only leaf 0xA is consulted by
+        // apply_pmu_stealth, so the rest of the (host-derived) table is moot here.
+        let mut config = CpuidStealthConfig::from_host(1, 1);
+        config.vendor = CpuVendor::Intel;
+        let table = CpuidStealthTable::build(&config);
+        // Sanity: the table really does advertise a non-zero PMU version.
+        assert_eq!(table.lookup(0xA, 0).eax & 0xFF, 5, "table PMU version");
+        backend
+            .apply_pmu_stealth(&table)
+            .expect("apply pmu stealth");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        struct EchoOut(Vec<u8>);
+        impl VmExitHandler for EchoOut {
+            fn io_out(&mut self, _port: u16, data: &[u8]) {
+                self.0.extend_from_slice(data);
+            }
+        }
+        let mut echo = EchoOut(Vec::new());
+
+        let mut halted = false;
+        for _ in 0..100 {
+            if backend.run_vcpu(0, &mut echo).expect("run vcpu") == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        // The guest reads PMU version 5 from leaf 0xA — which KVM would have
+        // reported as 0 on this AMD host without the injected leaf — and the
+        // hypervisor-present bit is cleared, so a standalone PMU install is not
+        // self-contradicting (real PMU, yet "I'm a hypervisor").
+        assert_eq!(
+            echo.0,
+            vec![5, 0],
+            "leaf 0xA PMU version (5) then leaf-1 ECX[31] hypervisor bit (0)"
+        );
+    }
+
+    // apply_topology_stealth is the full CPUID-stealth path: a single call must
+    // give the guest BOTH its own topology (leaf 0xB) AND a consistent
+    // architectural PMU (leaf 0xA) in one rebuild. With an Intel-vendor 2-vCPU
+    // table, the guest reads leaf 0xB subleaf 1 EBX == 2 and leaf 0xA
+    // EAX[7:0] == 5 from the same install. On this AMD host both values can only
+    // come from our injected leaves (KVM reports the host's count for 0xB and
+    // omits 0xA entirely), so the test is non-vacuous. Self-skips without /dev/kvm.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn topology_stealth_also_applies_the_pmu_leaf() {
+        use enlil_devices::stealth::cpuid::{CpuVendor, CpuidStealthConfig, CpuidStealthTable};
+
+        if !is_kvm_available() {
+            eprintln!("skipping topology_stealth_also_applies_the_pmu_leaf: no /dev/kvm");
+            return;
+        }
+
+        // 16-bit real-mode blob; echoes the topology count then the PMU version:
+        //   66 B8 0B 00 00 00   mov eax, 0xB    ; extended topology leaf
+        //   66 B9 01 00 00 00   mov ecx, 1      ; subleaf 1 (core level)
+        //   0F A2               cpuid
+        //   88 D8               mov al, bl      ; al = logical-proc count
+        //   BA F8 03            mov dx, 0x3F8   ; COM1
+        //   EE                  out dx, al
+        //   66 B8 0A 00 00 00   mov eax, 0xA    ; architectural-PMU leaf
+        //   0F A2               cpuid           ; al = EAX[7:0] = PMU version
+        //   EE                  out dx, al
+        //   F4                  hlt
+        #[rustfmt::skip]
+        let code: [u8; 30] = [
+            0x66, 0xB8, 0x0B, 0x00, 0x00, 0x00,
+            0x66, 0xB9, 0x01, 0x00, 0x00, 0x00,
+            0x0F, 0xA2,
+            0x88, 0xD8,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0x66, 0xB8, 0x0A, 0x00, 0x00, 0x00,
+            0x0F, 0xA2,
+            0xEE,
+            0xF4,
+        ];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        const GUEST_VCPUS: u32 = 2;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu 0");
+        backend.create_vcpu(1).expect("create vcpu 1");
+
+        // Intel-presented 2-vCPU table: leaf 0xB carries the topology, leaf 0xA
+        // the PMU. A single apply_topology_stealth must install both.
+        let mut config = CpuidStealthConfig::from_host(GUEST_VCPUS, 1);
+        config.vendor = CpuVendor::Intel;
+        let table = CpuidStealthTable::build(&config);
+        backend
+            .apply_topology_stealth(&table)
+            .expect("apply topology + pmu stealth");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        struct EchoOut(Vec<u8>);
+        impl VmExitHandler for EchoOut {
+            fn io_out(&mut self, _port: u16, data: &[u8]) {
+                self.0.extend_from_slice(data);
+            }
+        }
+        let mut echo = EchoOut(Vec::new());
+
+        let mut halted = false;
+        for _ in 0..100 {
+            if backend.run_vcpu(0, &mut echo).expect("run vcpu") == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        // One install → both surfaces: 2-vCPU topology and PMU version 5.
+        assert_eq!(
+            echo.0,
+            vec![GUEST_VCPUS as u8, 5],
+            "one apply_topology_stealth should yield topology (2) AND PMU version (5)"
+        );
+    }
+
+    // apply_topology_stealth must also make an AMD guest's leaf 0x8000_0008
+    // ECX[7:0] (NC = cores-1) report the guest's core count, not the host's.
+    // KVM mirrors the host there, so a guest with fewer vCPUs would otherwise
+    // read the host's NC — and contradict the topology installed in leaf 1 /
+    // leaf 0xB (the kernel cross-checks the two). After applying a table built
+    // for this (AMD) host's vendor, the guest reads exactly the table's NC. The
+    // expected value is taken from the table so the test is vendor-correct; on
+    // this AMD host it is 1 (2 vCPUs), which differs from the host's real core
+    // count, making it non-vacuous. Self-skips without /dev/kvm.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn topology_stealth_fixes_the_amd_core_count_leaf() {
+        use enlil_devices::stealth::cpuid::{CpuidStealthConfig, CpuidStealthTable};
+
+        if !is_kvm_available() {
+            eprintln!("skipping topology_stealth_fixes_the_amd_core_count_leaf: no /dev/kvm");
+            return;
+        }
+
+        // 16-bit real-mode blob; reads leaf 0x8000_0008 and echoes ECX low byte:
+        //   66 B8 08 00 00 80   mov eax, 0x80000008  ; extended address/topology
+        //   0F A2               cpuid
+        //   88 C8               mov al, cl           ; al = ECX[7:0] = NC
+        //   BA F8 03            mov dx, 0x3F8        ; COM1
+        //   EE                  out dx, al
+        //   F4                  hlt
+        #[rustfmt::skip]
+        let code: [u8; 15] = [
+            0x66, 0xB8, 0x08, 0x00, 0x00, 0x80,
+            0x0F, 0xA2,
+            0x88, 0xC8,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0xF4,
+        ];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        const GUEST_VCPUS: u32 = 2;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu 0");
+        backend.create_vcpu(1).expect("create vcpu 1");
+
+        // Build for the host's own vendor (AMD here) so the 0x8000_0008 ECX
+        // override is the one the guest would actually receive in production.
+        let table = CpuidStealthTable::build(&CpuidStealthConfig::from_host(GUEST_VCPUS, 1));
+        let want_nc = (table.lookup(0x8000_0008, 0).ecx & 0xFF) as u8;
+        backend
+            .apply_topology_stealth(&table)
+            .expect("apply topology stealth");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        struct EchoOut(Vec<u8>);
+        impl VmExitHandler for EchoOut {
+            fn io_out(&mut self, _port: u16, data: &[u8]) {
+                self.0.extend_from_slice(data);
+            }
+        }
+        let mut echo = EchoOut(Vec::new());
+
+        let mut halted = false;
+        for _ in 0..100 {
+            if backend.run_vcpu(0, &mut echo).expect("run vcpu") == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        // The guest reads its own NC from leaf 0x8000_0008, consistent with the
+        // leaf-1 / leaf-0xB topology — not the host's core count.
+        assert_eq!(
+            echo.0,
+            vec![want_nc],
+            "leaf 0x8000_0008 ECX[7:0] should be the guest's NC, not the host's"
+        );
+    }
+
+    // apply_topology_stealth must also fix the AMD per-cache sharing count in
+    // leaf 0x8000_001D: a guest with fewer vCPUs should read its package-wide L3
+    // as shared by its own vCPUs, not the host's logical-processor count. The
+    // L3 subleaf's EAX[25:14] (NumSharingCache-1) must reflect the guest. With a
+    // 2-vCPU AMD table the guest computes 2 sharers for L3, where the host
+    // reports many more. Expected derived from the table; self-skips without
+    // /dev/kvm. (Fails loudly if KVM here does not enumerate 0x8000_001D, which
+    // would mean the no-op path was taken — a real signal, not a silent pass.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn topology_stealth_fixes_the_amd_l3_sharing_leaf() {
+        use enlil_devices::stealth::cpuid::{CpuidStealthConfig, CpuidStealthTable};
+
+        if !is_kvm_available() {
+            eprintln!("skipping topology_stealth_fixes_the_amd_l3_sharing_leaf: no /dev/kvm");
+            return;
+        }
+
+        // 16-bit real-mode blob; reads leaf 0x8000_001D subleaf 3 (L3) and
+        // echoes the sharing count = EAX[25:14] + 1:
+        //   66 B8 1D 00 00 80   mov eax, 0x8000001D
+        //   66 B9 03 00 00 00   mov ecx, 3           ; subleaf 3 = L3
+        //   0F A2               cpuid
+        //   66 C1 E8 0E         shr eax, 14          ; drop the type/level bits
+        //   66 25 FF 0F 00 00   and eax, 0xFFF       ; isolate NumSharingCache-1
+        //   FE C0               inc al               ; -> sharing count
+        //   BA F8 03            mov dx, 0x3F8        ; COM1
+        //   EE                  out dx, al
+        //   F4                  hlt
+        #[rustfmt::skip]
+        let code: [u8; 31] = [
+            0x66, 0xB8, 0x1D, 0x00, 0x00, 0x80,
+            0x66, 0xB9, 0x03, 0x00, 0x00, 0x00,
+            0x0F, 0xA2,
+            0x66, 0xC1, 0xE8, 0x0E,
+            0x66, 0x25, 0xFF, 0x0F, 0x00, 0x00,
+            0xFE, 0xC0,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0xF4,
+        ];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        const GUEST_VCPUS: u32 = 2;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu 0");
+        backend.create_vcpu(1).expect("create vcpu 1");
+
+        let table = CpuidStealthTable::build(&CpuidStealthConfig::from_host(GUEST_VCPUS, 1));
+        let l3 = table.lookup(0x8000_001D, 3);
+        assert_eq!(
+            (l3.eax >> 5) & 0x7,
+            3,
+            "table subleaf 3 should be the L3 cache"
+        );
+        let want_shared = (((l3.eax >> 14) & 0xFFF) + 1) as u8;
+        assert_eq!(
+            want_shared, GUEST_VCPUS as u8,
+            "L3 should be shared by exactly the guest's vCPUs"
+        );
+        backend
+            .apply_topology_stealth(&table)
+            .expect("apply topology stealth");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        struct EchoOut(Vec<u8>);
+        impl VmExitHandler for EchoOut {
+            fn io_out(&mut self, _port: u16, data: &[u8]) {
+                self.0.extend_from_slice(data);
+            }
+        }
+        let mut echo = EchoOut(Vec::new());
+
+        let mut halted = false;
+        for _ in 0..100 {
+            if backend.run_vcpu(0, &mut echo).expect("run vcpu") == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        // The guest sees its L3 shared by its own 2 vCPUs, not the host's count.
+        assert_eq!(
+            echo.0,
+            vec![want_shared],
+            "leaf 0x8000_001D L3 EAX[25:14]+1 should be the guest's sharing count"
+        );
+    }
+
+    // apply_topology_stealth must also make an AMD SMT guest's leaf 0x8000_001E
+    // EBX[15:8] (ThreadsPerComputeUnit-1) report its SMT width. KVM defaults this
+    // field to 0 (no SMT) regardless of how many vCPUs exist — measured on this
+    // host — so a guest presented as 2 threads per core (the table sets
+    // EBX[15:8] = 1) would otherwise read 0 and contradict its own leaf-0xB SMT
+    // level and leaf-1 HTT bit. After the override the guest reads 1. The
+    // expected value comes from the table; non-vacuous because KVM's native
+    // value here is 0. Self-skips without /dev/kvm.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn topology_stealth_fixes_the_amd_smt_width_leaf() {
+        use enlil_devices::stealth::cpuid::{CpuidStealthConfig, CpuidStealthTable};
+
+        if !is_kvm_available() {
+            eprintln!("skipping topology_stealth_fixes_the_amd_smt_width_leaf: no /dev/kvm");
+            return;
+        }
+
+        // 16-bit real-mode blob; reads leaf 0x8000_001E and echoes EBX[15:8]:
+        //   66 B8 1E 00 00 80   mov eax, 0x8000001E
+        //   0F A2               cpuid
+        //   66 C1 EB 08         shr ebx, 8        ; bl = EBX[15:8]
+        //   88 D8               mov al, bl
+        //   BA F8 03            mov dx, 0x3F8    ; COM1
+        //   EE                  out dx, al
+        //   F4                  hlt
+        #[rustfmt::skip]
+        let code: [u8; 19] = [
+            0x66, 0xB8, 0x1E, 0x00, 0x00, 0x80,
+            0x0F, 0xA2,
+            0x66, 0xC1, 0xEB, 0x08,
+            0x88, 0xD8,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0xF4,
+        ];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        // 2 vCPUs, 2 threads/core => a single SMT-2 core. The table's
+        // 0x8000_001E SMT field is then 1 (threads-1), which KVM never reports.
+        const GUEST_VCPUS: u32 = 2;
+        const THREADS_PER_CORE: u32 = 2;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu 0");
+        backend.create_vcpu(1).expect("create vcpu 1");
+
+        let table = CpuidStealthTable::build(&CpuidStealthConfig::from_host(
+            GUEST_VCPUS,
+            THREADS_PER_CORE,
+        ));
+        let want_smt = ((table.lookup(0x8000_001E, 0).ebx >> 8) & 0xFF) as u8;
+        assert_eq!(
+            want_smt, 1,
+            "an SMT-2 core encodes ThreadsPerComputeUnit-1 = 1"
+        );
+        backend
+            .apply_topology_stealth(&table)
+            .expect("apply topology stealth");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        struct EchoOut(Vec<u8>);
+        impl VmExitHandler for EchoOut {
+            fn io_out(&mut self, _port: u16, data: &[u8]) {
+                self.0.extend_from_slice(data);
+            }
+        }
+        let mut echo = EchoOut(Vec::new());
+
+        let mut halted = false;
+        for _ in 0..100 {
+            if backend.run_vcpu(0, &mut echo).expect("run vcpu") == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        // The guest reads its SMT width (1), not KVM's native 0.
+        assert_eq!(
+            echo.0,
+            vec![want_smt],
+            "leaf 0x8000_001E EBX[15:8] should be the guest's ThreadsPerComputeUnit-1"
         );
     }
 
