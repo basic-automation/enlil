@@ -641,11 +641,12 @@ mod linux {
         /// guest-derived values (built for the guest's `vcpu_count` /
         /// `threads_per_core`) — plus, for AMD, the leaf-`0x8000_0008` `ECX`
         /// core-count (`NC`) / APIC-ID-width field the kernel cross-checks
-        /// against them, and the per-cache sharing counts in leaf
-        /// `0x8000_001D` `EAX[25:14]` (so the guest sees its L3 shared by its own
-        /// vCPUs, not the host's) — leaving every other supported leaf (and
-        /// those leaves' host-backed sizes / address bits) untouched. It also
-        /// clears the leaf-`1`
+        /// against them, the per-cache sharing counts in leaf `0x8000_001D`
+        /// `EAX[25:14]` (so the guest sees its L3 shared by its own vCPUs, not
+        /// the host's), and the SMT width in leaf `0x8000_001E` `EBX[15:8]`
+        /// (which KVM defaults to 0/no-SMT) — leaving every other supported leaf
+        /// (and those leaves' host-backed sizes / per-vCPU APIC-ID fields)
+        /// untouched. It also clears the leaf-`1`
         /// `ECX[31]` hypervisor bit, so it subsumes
         /// [`clear_cpuid_hypervisor_bit`](Self::clear_cpuid_hypervisor_bit)
         /// when a table is available, and folds in the architectural-PMU leaf
@@ -768,6 +769,19 @@ mod linux {
                 }) {
                     entry.eax = (entry.eax & !CACHE_SHARING_MASK) | (t.eax & CACHE_SHARING_MASK);
                 }
+            }
+
+            // AMD leaf 0x8000_001E EBX[15:8] is ThreadsPerComputeUnit-1 (SMT
+            // width); KVM mirrors the host, so an SMT-1 guest on an SMT-2 host
+            // would read 1 here and contradict the single-thread topology in leaf
+            // 0xB / leaf-1 EBX. Patch only that sub-field from the table, leaving
+            // the per-vCPU EAX (extended APIC id) and EBX[7:0] (core/compute-unit
+            // id) — which KVM fills per vCPU — and ECX (node id) untouched.
+            // Reserved for an Intel table (no 0x8000_001E), so a no-op there.
+            const SMT_WIDTH_MASK: u32 = 0x0000_FF00; // EBX[15:8]
+            let ext1e_ebx = table.lookup(0x8000_001E, 0).ebx;
+            if let Some(entry) = entries.iter_mut().find(|e| e.function == 0x8000_001E) {
+                entry.ebx = (entry.ebx & !SMT_WIDTH_MASK) | (ext1e_ebx & SMT_WIDTH_MASK);
             }
 
             // Fold in the architectural-PMU leaf (0xA) in the same single rebuild,
@@ -2138,6 +2152,100 @@ mod tests {
             echo.0,
             vec![want_shared],
             "leaf 0x8000_001D L3 EAX[25:14]+1 should be the guest's sharing count"
+        );
+    }
+
+    // apply_topology_stealth must also make an AMD SMT guest's leaf 0x8000_001E
+    // EBX[15:8] (ThreadsPerComputeUnit-1) report its SMT width. KVM defaults this
+    // field to 0 (no SMT) regardless of how many vCPUs exist — measured on this
+    // host — so a guest presented as 2 threads per core (the table sets
+    // EBX[15:8] = 1) would otherwise read 0 and contradict its own leaf-0xB SMT
+    // level and leaf-1 HTT bit. After the override the guest reads 1. The
+    // expected value comes from the table; non-vacuous because KVM's native
+    // value here is 0. Self-skips without /dev/kvm.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn topology_stealth_fixes_the_amd_smt_width_leaf() {
+        use enlil_devices::stealth::cpuid::{CpuidStealthConfig, CpuidStealthTable};
+
+        if !is_kvm_available() {
+            eprintln!("skipping topology_stealth_fixes_the_amd_smt_width_leaf: no /dev/kvm");
+            return;
+        }
+
+        // 16-bit real-mode blob; reads leaf 0x8000_001E and echoes EBX[15:8]:
+        //   66 B8 1E 00 00 80   mov eax, 0x8000001E
+        //   0F A2               cpuid
+        //   66 C1 EB 08         shr ebx, 8        ; bl = EBX[15:8]
+        //   88 D8               mov al, bl
+        //   BA F8 03            mov dx, 0x3F8    ; COM1
+        //   EE                  out dx, al
+        //   F4                  hlt
+        #[rustfmt::skip]
+        let code: [u8; 19] = [
+            0x66, 0xB8, 0x1E, 0x00, 0x00, 0x80,
+            0x0F, 0xA2,
+            0x66, 0xC1, 0xEB, 0x08,
+            0x88, 0xD8,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0xF4,
+        ];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        // 2 vCPUs, 2 threads/core => a single SMT-2 core. The table's
+        // 0x8000_001E SMT field is then 1 (threads-1), which KVM never reports.
+        const GUEST_VCPUS: u32 = 2;
+        const THREADS_PER_CORE: u32 = 2;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu 0");
+        backend.create_vcpu(1).expect("create vcpu 1");
+
+        let table = CpuidStealthTable::build(&CpuidStealthConfig::from_host(
+            GUEST_VCPUS,
+            THREADS_PER_CORE,
+        ));
+        let want_smt = ((table.lookup(0x8000_001E, 0).ebx >> 8) & 0xFF) as u8;
+        assert_eq!(
+            want_smt, 1,
+            "an SMT-2 core encodes ThreadsPerComputeUnit-1 = 1"
+        );
+        backend
+            .apply_topology_stealth(&table)
+            .expect("apply topology stealth");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        struct EchoOut(Vec<u8>);
+        impl VmExitHandler for EchoOut {
+            fn io_out(&mut self, _port: u16, data: &[u8]) {
+                self.0.extend_from_slice(data);
+            }
+        }
+        let mut echo = EchoOut(Vec::new());
+
+        let mut halted = false;
+        for _ in 0..100 {
+            if backend.run_vcpu(0, &mut echo).expect("run vcpu") == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        // The guest reads its SMT width (1), not KVM's native 0.
+        assert_eq!(
+            echo.0,
+            vec![want_smt],
+            "leaf 0x8000_001E EBX[15:8] should be the guest's ThreadsPerComputeUnit-1"
         );
     }
 
