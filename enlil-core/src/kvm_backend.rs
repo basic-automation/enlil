@@ -1639,6 +1639,124 @@ mod tests {
         assert_eq!(probe.echoed, vec![0xAB]);
     }
 
+    // End-to-end proof that the AMD PMC MSR surface added to the stealth router
+    // is actually forwarded and served on the live guest: forwarding *exactly*
+    // `StealthMsrRouter::filter_ranges()` for an AMD platform, a guest `rdmsr` of
+    // the AMD PerfMonV2 core PerfCtr0 (0xC0010201 — which KVM otherwise emulates
+    // in-kernel) traps to userspace and the router serves its model-driven shadow
+    // value (not KVM's overhead-revealing one). Self-skips without /dev/kvm or
+    // the userspace-MSR cap rather than faking it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn amd_perfmon_v2_counter_is_forwarded_and_serves_the_router_shadow() {
+        use crate::stealth_msr::StealthMsrRouter;
+        use crate::timing_stealth::VcpuTimingState;
+        use enlil_devices::stealth::lbr::{LbrPlatform, LbrState};
+        use enlil_devices::stealth::pmc::msr as pmc_msr;
+
+        if !is_kvm_available() {
+            eprintln!("skipping amd_perfmon_v2_counter_...: no /dev/kvm");
+            return;
+        }
+
+        // An AMD-platform router with a known shadow value in PerfCtr0 (index 0).
+        let mut router =
+            StealthMsrRouter::new(VcpuTimingState::new(), LbrState::new(LbrPlatform::AmdSvm));
+        router.pmc.gp_counters[0] = 0x0000_0000_0000_00C7; // low byte 0xC7
+
+        // The handler routes the guest's rdmsr through the router and echoes the
+        // low byte the router supplied.
+        struct RouterHandler {
+            router: StealthMsrRouter,
+            echoed: Vec<u8>,
+        }
+        impl VmExitHandler for RouterHandler {
+            fn rdmsr(&mut self, msr: u32) -> Option<u64> {
+                self.router.read_msr(msr)
+            }
+            fn io_out(&mut self, _port: u16, data: &[u8]) {
+                self.echoed.extend_from_slice(data);
+            }
+        }
+
+        // 16-bit real-mode blob:
+        //   66 B9 01 02 01 C0   mov ecx, 0xC0010201  ; AMD PerfMonV2 PerfCtr0
+        //   0F 32               rdmsr                ; edx:eax = router shadow
+        //   BA F8 03            mov dx, 0x3F8        ; COM1 transmit register
+        //   EE                  out dx, al           ; echo low byte of eax
+        //   F4                  hlt
+        #[rustfmt::skip]
+        let code: [u8; 13] = [
+            0x66, 0xB9, 0x01, 0x02, 0x01, 0xC0,
+            0x0F, 0x32,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0xF4,
+        ];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        if let Err(e) = backend.enable_userspace_msr_exits() {
+            eprintln!("skipping amd_perfmon_v2_counter_...: {e}");
+            return;
+        }
+        // Forward exactly what the AMD router serves — this is what proves the
+        // AMD PerfCtr address really is one of the ranges the router emits.
+        let ranges = router.filter_ranges();
+        assert!(
+            ranges.iter().any(
+                |&(b, c)| pmc_msr::AMD_CORE_PERFCTR0 >= b && pmc_msr::AMD_CORE_PERFCTR0 < b + c
+            ),
+            "AMD PerfCtr0 must be in the AMD router's filter ranges"
+        );
+        if let Err(e) = backend.forward_msrs_to_userspace(&ranges) {
+            eprintln!("skipping amd_perfmon_v2_counter_...: {e}");
+            return;
+        }
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        let mut handler = RouterHandler {
+            router,
+            echoed: Vec::new(),
+        };
+
+        let mut halted = false;
+        let mut saw_msr = false;
+        for _ in 0..100 {
+            match backend.run_vcpu(0, &mut handler).expect("run vcpu") {
+                GuestExit::Halted => {
+                    halted = true;
+                    break;
+                }
+                GuestExit::MsrRead { msr } => {
+                    assert_eq!(
+                        msr,
+                        pmc_msr::AMD_CORE_PERFCTR0,
+                        "the forwarded AMD PerfCtr MSR must reach the handler"
+                    );
+                    saw_msr = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        assert!(saw_msr, "AMD PerfCtr0 rdmsr never trapped to userspace");
+        // The router's shadow value (low byte 0xC7) reached EAX and was echoed —
+        // KVM's in-kernel PMU emulation was overridden by our forwarding.
+        assert_eq!(handler.echoed, vec![0xC7]);
+    }
+
     // Proves clear_cpuid_hypervisor_bit() installs the host's *real* feature
     // set on the guest with the hypervisor-present tell cleared: after applying
     // it, a guest running CPUID leaf 1 reads ECX bit 31 (hypervisor present) as
