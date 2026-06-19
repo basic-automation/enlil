@@ -99,6 +99,23 @@ impl FwCfgDevice {
         self.add_smbios(anchor, tables);
     }
 
+    /// Synthesize and register the ACPI file set from an [`AcpiTableSetConfig`].
+    ///
+    /// Builds the table set ([`build_acpi_tables`]) and registers its RSDP and
+    /// concatenated table blob as `etc/acpi/rsdp` / `etc/acpi/tables` — the
+    /// firmware reads both off `fw_cfg`. As with QEMU, the inter-table pointers
+    /// (RSDP→XSDT→FADT→…) are placed assuming a base of 0 and patched at boot by
+    /// the `etc/table-loader` `ADD_POINTER` commands once the firmware chooses
+    /// the load address. The synthesis→delivery link for ACPI, mirroring
+    /// [`add_smbios_from_config`](Self::add_smbios_from_config).
+    ///
+    /// [`AcpiTableSetConfig`]: crate::acpi::AcpiTableSetConfig
+    /// [`build_acpi_tables`]: crate::acpi::build_acpi_tables
+    pub fn add_acpi_from_config(&mut self, config: &crate::acpi::AcpiTableSetConfig) {
+        let set = crate::acpi::build_acpi_tables(config);
+        self.add_acpi_tables(set.rsdp, set.tables);
+    }
+
     /// Handle port I/O write to selector port (0x510)
     pub const fn write_selector(&mut self, value: u16) {
         self.current_selector = value;
@@ -269,6 +286,29 @@ mod tests {
         let mut dev = FwCfgDevice::new();
         dev.add_acpi_tables(vec![1, 2, 3], vec![4, 5, 6, 7]);
         assert_eq!(dev.file_count(), 2);
+    }
+
+    #[test]
+    fn acpi_from_config_registers_the_synthesized_tables() {
+        use crate::acpi::{AcpiTableSetConfig, build_acpi_tables};
+        let config = AcpiTableSetConfig::default();
+        let mut dev = FwCfgDevice::new();
+        dev.add_acpi_from_config(&config);
+        // etc/acpi/rsdp (0x20) then etc/acpi/tables (0x21).
+        assert_eq!(dev.file_count(), 2);
+
+        let expected = build_acpi_tables(&config);
+        // The delivered tables blob matches the canonical assembler byte for byte.
+        dev.write_selector(0x21);
+        let got: Vec<u8> = (0..expected.tables.len())
+            .map(|_| dev.read_data())
+            .collect();
+        assert_eq!(got, expected.tables);
+        assert!(!expected.tables.is_empty(), "the assembler produced tables");
+        // And the RSDP file (0x20) carries the assembled RSDP.
+        dev.write_selector(0x20);
+        let rsdp: Vec<u8> = (0..expected.rsdp.len()).map(|_| dev.read_data()).collect();
+        assert_eq!(rsdp, expected.rsdp);
     }
 
     #[test]
