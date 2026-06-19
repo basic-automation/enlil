@@ -1409,3 +1409,37 @@ the value is fully synthetic (leaf `0xB`, leaf `0xA`). The AMD topology surface 
 guest can cross-check is the set {leaf-1 EBX[23:16], leaf 0xB, `0x8000_0008` NC,
 `0x8000_001D` sharing, `0x8000_001E` SMT} — they must all agree, and as of this
 run `apply_topology_stealth` makes them agree in one rebuild.
+
+## 2026-06-19 — AMD PMC MSR surface: legacy vs PerfMonV2 register map (Phase 5.4)
+
+Measured on this host (`cpuid` leaf `0x8000_0000` → `max_ext = 0x8000_0021`, leaf
+`0x8000_0022` = all-zeros): **this nested WSL host does NOT advertise AMD
+PerfMonV2** (it is itself a guest under Hyper-V, which does not pass leaf
+`0x8000_0022` through). So the CPUID leaf-`0x8000_0022` advertise + "KVM mirrors
+host PerfMonV2" path the 2026-06-18 next-step proposed is **untestable on this
+runner** and would advertise a feature the apparent host lacks — a tell, not a
+fix. The genuinely testable, host-agnostic prerequisite is the AMD **PMC MSR**
+surface, which the `StealthMsrRouter`/`PmcState` did **not** yet cover (Intel
+`IA32_PMC0`/`PERFEVTSEL`/`FIXED_CTR` only):
+
+- **AMD legacy (K7) PMCs** — `PerfEvtSel0..3` = `0xC001_0000..0xC001_0003`,
+  `PerfCtr0..3` = `0xC001_0004..0xC001_0007` (4 counters). On real AMD parts the
+  legacy block **aliases** the first four core counters (AMD APM vol. 2 §13.2).
+- **AMD core / PerfMonV2 PMCs** — interleaved EvtSel/Ctr pairs:
+  `PerfEvtSel[n] = 0xC001_0200 + 2n` (even), `PerfCtr[n] = 0xC001_0201 + 2n`
+  (odd), n = 0..5 (6 counters on Zen).
+- **PerfMonV2 global block** — `PerfCntrGlobalStatus = 0xC000_0300`,
+  `PerfCntrGlobalCtl = 0xC000_0301`, `PerfCntrGlobalStatusClr = 0xC000_0302`
+  (AMD PPR Family 19h). Global-ctl bit n enables core counter n, mirroring the
+  role Intel `IA32_PERF_GLOBAL_CTRL` plays for the existing advance() gating.
+
+Change made: `PmcState` now maps both AMD blocks (legacy + core) and the
+PerfMonV2 global registers onto the existing shadow arrays — legacy n and core n
+share index n, exactly the hardware aliasing — so RDMSR/WRMSR/RDPMC on an
+AMD-presented guest read the model-driven shadow (hiding VMEXIT overhead) instead
+of falling through to KVM. `StealthMsrRouter::filter_ranges` is now
+platform-correct: it forwards the AMD PMC ranges on `AmdSvm` and the Intel PMC
+ranges on `IntelVmx`, never the other platform's (forwarding the wrong vendor's
+PMC MSRs would make non-existent registers readable — the same tell the LBR fork
+already avoids). The synthetic leaf-`0x8000_0022` advertise is left for a host
+that actually exposes PerfMonV2.

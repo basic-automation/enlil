@@ -1823,6 +1823,18 @@ Physical USB Devices
   `apply_topology_stealth` (and standalone `apply_pmu_stealth`) installs the
   table's leaf-0xA PMU on each vCPU, so the CPUID-advertised PMU version and
   counter counts match the RDPMC shadow — see 5.3.
+  **AMD PMC MSR surface shadowed (2026-06-19):** `PmcState` previously modelled
+  only the Intel `IA32_*` PMC MSRs; an AMD-presented guest reads its counters via
+  the AMD legacy (`0xC001_000x`) and `PerfMonV2` core (`0xC001_020x`) blocks plus
+  the `PerfMonV2` global registers (`0xC000_030x`), which fell straight through to
+  KVM and exposed VMEXIT overhead. `PmcState` now maps both AMD blocks onto the
+  same shadow arrays (legacy n aliases core n, as on hardware), and
+  `StealthMsrRouter::filter_ranges` is now **vendor-correct** — it forwards the AMD
+  PMC ranges on `AmdSvm` and the Intel block on `IntelVmx`, never the other
+  vendor's (a readable non-existent register is itself a tell). The synthetic
+  CPUID leaf-`0x8000_0022` advertise is deferred: this nested host reports
+  `max_ext = 0x8000_0021` (no `PerfMonV2`), so advertising it would claim a feature
+  the apparent host lacks.
 - **MSR-exit seam + stealth routing wired (2026-06-15):** the KVM run loop can now
   forward guest `RDMSR`/`WRMSR` to userspace (`KvmBackend::enable_userspace_msr_exits`
   → `GuestExit::MsrRead`/`MsrWrite` → `VmExitHandler::rdmsr`/`wrmsr`, proven on
