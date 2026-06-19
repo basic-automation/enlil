@@ -1757,6 +1757,117 @@ mod tests {
         assert_eq!(handler.echoed, vec![0xC7]);
     }
 
+    // The guest WRMSR path: every other forwarding test reads MSRs, but a write
+    // must reach the router too (GuestExit::MsrWrite -> VmExitHandler::wrmsr). A
+    // guest that WRMSRs IA32_DEBUGCTL then RDMSRs it back gets its own written
+    // value (proving the write landed in the router's LbrState), and the router
+    // observed the LBR-enable bit. Self-skips without /dev/kvm or the
+    // userspace-MSR cap rather than faking it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wrmsr_is_forwarded_and_the_written_value_round_trips() {
+        use crate::stealth_msr::StealthMsrRouter;
+        use crate::timing_stealth::VcpuTimingState;
+        use enlil_devices::stealth::lbr::{intel_msr, LbrPlatform, LbrState};
+
+        if !is_kvm_available() {
+            eprintln!("skipping wrmsr_is_forwarded_...: no /dev/kvm");
+            return;
+        }
+
+        struct RouterHandler {
+            router: StealthMsrRouter,
+            echoed: Vec<u8>,
+        }
+        impl VmExitHandler for RouterHandler {
+            fn rdmsr(&mut self, msr: u32) -> Option<u64> {
+                self.router.read_msr(msr)
+            }
+            fn wrmsr(&mut self, msr: u32, value: u64) -> bool {
+                self.router.write_msr(msr, value)
+            }
+            fn io_out(&mut self, _port: u16, data: &[u8]) {
+                self.echoed.extend_from_slice(data);
+            }
+        }
+
+        // 16-bit real-mode blob:
+        //   66 B9 D9 01 00 00   mov ecx, 0x1D9   ; IA32_DEBUGCTL
+        //   66 B8 09 00 00 00   mov eax, 0x09    ; LBR-enable (bit 0) + bit 3
+        //   66 BA 00 00 00 00   mov edx, 0
+        //   0F 30               wrmsr            ; DEBUGCTL = 0x09
+        //   0F 32               rdmsr            ; read it back -> edx:eax
+        //   BA F8 03            mov dx, 0x3F8    ; COM1
+        //   EE                  out dx, al       ; echo low byte (0x09)
+        //   F4                  hlt
+        #[rustfmt::skip]
+        let code: [u8; 27] = [
+            0x66, 0xB9, 0xD9, 0x01, 0x00, 0x00,
+            0x66, 0xB8, 0x09, 0x00, 0x00, 0x00,
+            0x66, 0xBA, 0x00, 0x00, 0x00, 0x00,
+            0x0F, 0x30,
+            0x0F, 0x32,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0xF4,
+        ];
+        const ENTRY: u64 = 0x1000;
+
+        let router =
+            StealthMsrRouter::new(VcpuTimingState::new(), LbrState::new(LbrPlatform::IntelVmx));
+
+        let mut ram = GuestRam::new(0x1000);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        if let Err(e) = backend.enable_userspace_msr_exits() {
+            eprintln!("skipping wrmsr_is_forwarded_...: {e}");
+            return;
+        }
+        let ranges = router.filter_ranges();
+        if let Err(e) = backend.forward_msrs_to_userspace(&ranges) {
+            eprintln!("skipping wrmsr_is_forwarded_...: {e}");
+            return;
+        }
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        let mut handler = RouterHandler {
+            router,
+            echoed: Vec::new(),
+        };
+
+        let mut halted = false;
+        let mut saw_write = false;
+        for _ in 0..100 {
+            match backend.run_vcpu(0, &mut handler).expect("run vcpu") {
+                GuestExit::Halted => {
+                    halted = true;
+                    break;
+                }
+                GuestExit::MsrWrite { msr, value } => {
+                    assert_eq!(msr, intel_msr::IA32_DEBUGCTL);
+                    assert_eq!(value, 0x09);
+                    saw_write = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        assert!(saw_write, "wrmsr never trapped to userspace");
+        // The written DEBUGCTL value round-tripped back into the guest...
+        assert_eq!(handler.echoed, vec![0x09]);
+        // ...and the router's LbrState recorded the write (LBR-enable observed).
+        assert_eq!(handler.router.lbr.read_debug_ctl(), 0x09);
+        assert!(handler.router.lbr.lbr_enabled);
+    }
+
     // Proves clear_cpuid_hypervisor_bit() installs the host's *real* feature
     // set on the guest with the hypervisor-present tell cleared: after applying
     // it, a guest running CPUID leaf 1 reads ECX bit 31 (hypervisor present) as
