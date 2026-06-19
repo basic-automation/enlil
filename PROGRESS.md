@@ -9,7 +9,8 @@ the recommended next step so the next run (which has no memory) can resume.
 ## 2026-06-19 — Session: complete the AMD PerfMonV2 stealth surface + open the fw_cfg table-delivery path (Phase 5)
 
 **11 increments, each independently green and committed** (branch
-`routine/enlil-2026-06-19`). Two coherent advances: (1) finishing the AMD
+`routine/enlil-2026-06-19`, PR https://github.com/physics515/enlil/pull/32).
+Two coherent advances: (1) finishing the AMD
 PerfMonV2/PMC/LBR stealth surface the 2026-06-18 next-step #1 pointed at — MSR
 shadowing + CPUID leaf + a full cross-vendor live-forwarding test matrix on this
 host's `/dev/kvm`; and (2) opening the ACPI/SMBIOS **delivery path** by mounting
