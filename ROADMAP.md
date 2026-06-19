@@ -1703,8 +1703,18 @@ Physical USB Devices
   missing the SMBIOS-3.0 16-bit core counts), which shifted their string tables
   (`<BAD INDEX>`). All fixed; install `dmidecode` in CI to gate it. **Note (updated
   2026-06-15):** the duplicate `enlil-core::smbios` builder no longer exists — only the
-  canonical `enlil-devices::smbios` remains (consolidation done). It is still not wired
-  into a delivery path yet.
+  canonical `enlil-devices::smbios` remains (consolidation done).
+- **Delivery path — `fw_cfg` now bus-mountable (2026-06-19):** the QEMU `fw_cfg`
+  device (`enlil-devices::fw_cfg`, with `add_acpi_tables`/`add_smbios`) existed and
+  was unit-tested but was **never on the bus**, so neither the ACPI nor the SMBIOS
+  table set could reach a guest. `FwCfgDevice` now implements the bus `PioDevice`
+  trait (16-bit item selector at `0x510`, byte-stream data register at `0x511`) and
+  `DeviceBus::add_fw_cfg` mounts it; a guest reads the QEMU signature and the
+  registered `etc/...` files straight off the bus (proven by an in-process PIO test
+  through `VmExitHandler::io_in/io_out`). **Remaining for full delivery:** populate a
+  mounted `fw_cfg` from the synthesized ACPI/SMBIOS in `standard_pc_complete`, and
+  emit the `etc/table-loader` link script (ALLOCATE / ADD_POINTER / ADD_CHECKSUM)
+  so OVMF/SeaBIOS places and patches the tables at guest-chosen addresses.
 
 ### 5.3 CPUID Stealth
 - Intercept all CPUID exits and craft responses:

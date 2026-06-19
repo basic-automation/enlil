@@ -144,22 +144,6 @@ impl FwCfgDevice {
         dir
     }
 
-    /// Handle PIO read
-    #[must_use]
-    pub fn pio_read(&mut self, port: u16) -> u8 {
-        match port {
-            FW_CFG_PORT_DATA => self.read_data(),
-            _ => 0,
-        }
-    }
-
-    /// Handle PIO write
-    pub const fn pio_write(&mut self, port: u16, value: u16) {
-        if port == FW_CFG_PORT_SEL {
-            self.write_selector(value);
-        }
-    }
-
     /// Get the number of registered files
     #[must_use]
     pub const fn file_count(&self) -> usize {
@@ -170,6 +154,37 @@ impl FwCfgDevice {
 impl Default for FwCfgDevice {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Bus-level port I/O: the firmware writes the 16-bit item selector to `0x510`
+/// and then reads the selected item one byte at a time from the data register
+/// `0x511`. The data register is read-only here (DMA at `0x514` is not modelled;
+/// byte-stream reads are sufficient to deliver the table/file set). The selector
+/// register is write-only — reads from it return 0, matching real `fw_cfg`.
+impl crate::bus::PioDevice for FwCfgDevice {
+    fn pio_read(&mut self, port: u16, size: u8) -> u32 {
+        if port != FW_CFG_PORT_DATA {
+            return 0;
+        }
+        // Assemble up to `size` little-endian bytes from the item stream; each
+        // read advances the offset, exactly as a `rep insb` over the data port.
+        let mut value = 0u32;
+        for i in 0..size.min(4) {
+            value |= u32::from(self.read_data()) << (8 * u32::from(i));
+        }
+        value
+    }
+
+    fn pio_write(&mut self, port: u16, _size: u8, data: u32) {
+        if port == FW_CFG_PORT_SEL {
+            self.write_selector((data & 0xFFFF) as u16);
+        }
+    }
+
+    fn port_range(&self) -> (u16, u16) {
+        // [0x510, 0x512): the selector and data registers.
+        (FW_CFG_PORT_SEL, FW_CFG_PORT_DATA + 1)
     }
 }
 
@@ -240,8 +255,26 @@ mod tests {
 
     #[test]
     fn pio_interface() {
+        use crate::bus::PioDevice;
         let mut dev = FwCfgDevice::new();
-        dev.pio_write(FW_CFG_PORT_SEL, selector::SIGNATURE);
-        assert_eq!(dev.pio_read(FW_CFG_PORT_DATA), b'Q');
+        // Select the signature item via a 16-bit write to the selector port,
+        // then read its first byte from the data port — the bus-trait path.
+        dev.pio_write(FW_CFG_PORT_SEL, 2, u32::from(selector::SIGNATURE));
+        assert_eq!(dev.pio_read(FW_CFG_PORT_DATA, 1), u32::from(b'Q'));
+        assert_eq!(dev.pio_read(FW_CFG_PORT_DATA, 1), u32::from(b'E'));
+        // The selector port is write-only; reads return 0.
+        assert_eq!(dev.pio_read(FW_CFG_PORT_SEL, 1), 0);
+        // The claimed range is the two registers.
+        assert_eq!(dev.port_range(), (FW_CFG_PORT_SEL, FW_CFG_PORT_DATA + 1));
+    }
+
+    #[test]
+    fn pio_multi_byte_read_assembles_little_endian() {
+        use crate::bus::PioDevice;
+        let mut dev = FwCfgDevice::new();
+        let sel = dev.add_file("test", vec![0x11, 0x22, 0x33, 0x44]);
+        dev.pio_write(FW_CFG_PORT_SEL, 2, u32::from(sel));
+        // A 4-byte read pulls four stream bytes, low byte first.
+        assert_eq!(dev.pio_read(FW_CFG_PORT_DATA, 4), 0x4433_2211);
     }
 }
