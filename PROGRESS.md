@@ -6,6 +6,138 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-19 — Session: complete the AMD PerfMonV2 stealth surface + open the fw_cfg table-delivery path (Phase 5)
+
+**11 increments, each independently green and committed** (branch
+`routine/enlil-2026-06-19`, PR https://github.com/physics515/enlil/pull/32).
+Two coherent advances: (1) finishing the AMD
+PerfMonV2/PMC/LBR stealth surface the 2026-06-18 next-step #1 pointed at — MSR
+shadowing + CPUID leaf + a full cross-vendor live-forwarding test matrix on this
+host's `/dev/kvm`; and (2) opening the ACPI/SMBIOS **delivery path** by mounting
+the QEMU `fw_cfg` device on the bus and wiring the table synthesizers into it.
+
+### Increments (commit — what)
+1. `4a714b9` — **AMD PMC MSR surface shadowed.** `PmcState` modelled only the
+   Intel `IA32_*` PMC MSRs; an AMD-presented guest reads its counters via the AMD
+   legacy (`0xC001_000x`) and PerfMonV2 core (`0xC001_020x`) blocks + the
+   PerfMonV2 global registers (`0xC000_030x`), which fell through to KVM and
+   exposed VMEXIT overhead. Map both AMD blocks onto the shadow arrays (legacy n
+   aliases core n, as on hardware), add `is_amd_pmc_msr`, and make
+   `StealthMsrRouter::filter_ranges` **vendor-correct** (forward the AMD PMC block
+   on `AmdSvm`, the Intel block on `IntelVmx`, never the other vendor). +7 unit.
+2. `36d0722` — **live-KVM: AMD PerfMonV2 PerfCtr is forwarded + served.** Forwarding
+   the AMD router's filter ranges, a guest `rdmsr 0xC0010201` traps to userspace
+   and reads the router's shadow, not KVM's in-kernel PMU value.
+3. `0f6bca7` — **live-KVM: production run loop serves + advances AMD counters.**
+   `StealthRunLoop::install(AmdSvm)` auto-forwards the AMD PMC blocks; a guest
+   reads a seeded PerfCtr0 shadow through the full path and an enabled PerfCtr1
+   advances over the run (disabled PerfCtr0 keeps its seed).
+4. `50e2877` — **live-KVM: guest WRMSR forwarding round-trips.** First test of the
+   write side (`GuestExit::MsrWrite -> wrmsr`): a guest `wrmsr IA32_DEBUGCTL=0x09`
+   then `rdmsr` reads its own value back and the router's `LbrState` recorded it.
+5. `d750760` — **host-gated AMD PerfMonV2 CPUID leaf `0x8000_0022` builder.**
+   `from_host` captures the leaf only when the host advertises it
+   (`max_ext ≥ 0x8000_0022`, non-zero EAX); `build` then raises the AMD max
+   extended leaf and emits the capability. No-op on this nested host. +3 unit.
+6. `b76e2d9` — **constrain that leaf to what the MSR router backs.** Advertise
+   PerfMonV2 (EAX bit 0) with `NumCorePmc` clamped to the shadowed count and the
+   `LbrStack`/`LbrAndPmcFreeze` bits + `LbrStackSize` cleared (the router models
+   only the legacy LBR pair, not the extended stack). +1 unit.
+7. `ab7f234` — **live-KVM: AMD last-branch MSR forwarded.** A guest `rdmsr 0x1DB`
+   traps and reads the router's `LbrState` shadow (the anti-cheat force-VMEXIT
+   LBR check). First live LBR coverage.
+8. `6b0b0d1` — **live-KVM: Intel PMC + LBR-stack forwarding symmetry.** `IA32_PMC0`
+   (`0xC1`) and `LBR_FROM_BASE` (`0x680`) on an `IntelVmx` router. Every forwarded
+   stealth MSR surface (APERF, DEBUGCTL, PMC, LBR) is now proven live for **both**
+   vendors.
+9. `a0273fb` — **mount `fw_cfg` on the PIO bus.** The device existed and was
+   unit-tested but was never on the bus, so neither ACPI nor SMBIOS could reach a
+   guest. Implement the bus `PioDevice` trait (selector `0x510`, data `0x511`) and
+   `DeviceBus::add_fw_cfg`; an in-process test drives the firmware probe protocol
+   via `VmExitHandler::io_in/io_out`. +3 tests. (Built Windows-native too.)
+10. `07042dd` — **SMBIOS synthesis→delivery link.** `FwCfgDevice::add_smbios_from_config`
+    builds the structure table + a 3.0 entry point (zero base, loader-patched) and
+    registers `etc/smbios/smbios-{tables,anchor}`; test confirms the delivered file
+    matches `SmbiosBuilder::build_structures()` byte for byte. +1.
+11. `1ae17b5` — **ACPI synthesis→delivery link.** Mirror of #10:
+    `add_acpi_from_config` registers `etc/acpi/{rsdp,tables}` from
+    `build_acpi_tables`; test confirms both match the assembler. +1.
+
+### Research (informed the build)
+`RESEARCH.md 2026-06-19` and `2026-06-19 (b)`: the AMD PMC MSR map (legacy
+`0xC001_000x` aliasing the first four core counters, PerfMonV2 core
+`0xC001_020x` interleaved EvtSel/Ctr, global block `0xC000_030x` — AMD APM
+vol. 2 §13.2 / PPR Family 19h), and the AMD `CPUID Fn8000_0022` PerfMonV2 layout.
+**Measured on this host:** `cpuid` leaf `0x8000_0000` → `max_ext = 0x8000_0021`,
+leaf `0x8000_0022` = all-zeros — this nested WSL host (itself under Hyper-V) does
+**not** advertise PerfMonV2, so the leaf-`0x8000_0022` advertise + "KVM mirrors
+host PerfMonV2" live path is untestable here; the MSR shadowing is the
+host-agnostic prerequisite that is. ROADMAP 5.2/5.3/5.4 updated surgically.
+
+### Test results (exact)
+- **`/dev/kvm`: read-writable this run (`KVM_RW_OK`, `crw-rw---- root kvm`).** All
+  KVM / guest-boot tests **ran for real** (none skipped for absence of KVM). New
+  real-KVM real-mode guest-boot tests, all passing:
+  `amd_perfmon_v2_counter_is_forwarded_and_serves_the_router_shadow`,
+  `run_loop_serves_and_advances_amd_perfmon_v2_counters`,
+  `wrmsr_is_forwarded_and_the_written_value_round_trips`,
+  `amd_last_branch_msr_is_forwarded_and_serves_the_router_shadow`,
+  `intel_pmc_msr_is_forwarded_and_serves_the_router_shadow`,
+  `intel_lbr_stack_msr_is_forwarded_and_serves_the_router_shadow`. The pre-existing
+  KVM run-loop / topology-stealth / reset / S5 boots still pass.
+- **Full workspace CI-parity** (the exact `.github/workflows/ci.yml` commands):
+  `cargo fmt --all -- --check` → clean; `cargo clippy --all-targets --workspace -- -D warnings`
+  → exit 0; `cargo test --workspace` → all green (**enlil-core 194**, started 186;
+  **enlil-devices 771**, started 760; + the smaller crates; 1 pre-existing ignored).
+- **Toolchains:** every increment built/tested on **Linux/WSL** (nightly
+  `x86_64-unknown-linux-gnu`). The increments touching `enlil-core`/`enlil-devices`
+  non-test logic were **also built Windows-native** (`x86_64-pc-windows-msvc`,
+  `cargo build -p enlil-core` against the WSL manifest with
+  `D:\Development\.enlil-win-target`): **exit 0** (after increments 1 and 9). The KVM
+  internals stay `#[cfg(target_os = "linux")]`; the Windows build confirms no
+  Linux-only path leaked into the host-agnostic crates.
+
+### STOP REASON
+**Remaining unblocked work is architectural or host-unvalidatable here — deferred
+per the depth/honesty guardrails rather than rushed.** The cleanly-tractable,
+finish-and-test-tonight Phase-5 work in reach is done: the AMD PerfMonV2 stealth
+surface is complete and consistent across MSRs + CPUID, with a full cross-vendor
+live-forwarding matrix, and the `fw_cfg` delivery path is now reachable + fed by
+both table synthesizers. What's left is exactly the kind the guardrails say not to
+start-and-half-finish at 1am: (a) **architectural** — per-vCPU stealth state (the
+run loop still shares ONE router/PMC/timing/LBR across vCPUs; needs a deliberate
+shared-state model) and the threaded-vCPU watchdog that depends on it; (b)
+**host-unvalidatable binary format** — the `etc/table-loader` (bios-linker-loader)
+emitter is the next delivery piece, but its correctness can only be proven by an
+OVMF/SeaBIOS boot, which isn't set up here; writing it from memory would risk a
+latent wrong-offset bug my own unit tests would falsely pass, so it is deferred
+rather than guessed; (c) **premature pending (b)** — populating `fw_cfg` inside
+`standard_pc_complete` only becomes useful once the loader patches the tables; (d)
+**separate-PR / blocked** — pinning `nightly` in CI (workflow change, needs a CI
+run), libusb forwarder (USB hardware), TUI USB tab (UI), Intel leaf-4 / vendor
+spoof (vacuous until Enlil presents a non-host CPU identity). Wall-clock ~1 h of
+the 3–4 h budget was used; I worked efficiently rather than padding, and every
+increment is independently green so `master` stays buildable.
+
+### Recommended next step (tomorrow)
+1. **`etc/table-loader` emitter** — the bios-linker-loader command stream
+   (`ALLOCATE` / `ADD_POINTER` / `ADD_CHECKSUM`, 128-byte entries) so OVMF places
+   and patches the `fw_cfg` ACPI/SMBIOS tables. **Get the exact struct layout from
+   the QEMU source / `docs/specs/fw_cfg.txt`, and validate with a real OVMF boot —
+   do not implement it from memory.** Then wire a populated `fw_cfg` (ACPI + SMBIOS
+   + loader) into `standard_pc_complete`.
+2. **Per-vCPU stealth state** — give each vCPU its own APERF/MPERF/PMC/LBR (the run
+   loop shares one today); decide the shared-state model first (swap the active
+   vCPU's state into the bus router per entry, or index the router by vCPU). This
+   unblocks the threaded-vCPU watchdog.
+3. **Pin `nightly`** in `rust-toolchain.toml` **and** the CI workflow together
+   (own PR; needs a CI run to confirm).
+4. Lower priority / blocked: AMD `fw_cfg` DMA (`0x514`) interface (needs guest-memory
+   access from the device); libusb forwarder; TUI USB tab.
+
+
+---
+
 ## 2026-06-18 — Session: the full live-guest CPUID-stealth pass — PMU leaf + the complete AMD topology-consistency set (Phase 5)
 
 **7 increments (6 code/test + 1 docs), each independently green and committed**

@@ -1703,8 +1703,18 @@ Physical USB Devices
   missing the SMBIOS-3.0 16-bit core counts), which shifted their string tables
   (`<BAD INDEX>`). All fixed; install `dmidecode` in CI to gate it. **Note (updated
   2026-06-15):** the duplicate `enlil-core::smbios` builder no longer exists — only the
-  canonical `enlil-devices::smbios` remains (consolidation done). It is still not wired
-  into a delivery path yet.
+  canonical `enlil-devices::smbios` remains (consolidation done).
+- **Delivery path — `fw_cfg` now bus-mountable (2026-06-19):** the QEMU `fw_cfg`
+  device (`enlil-devices::fw_cfg`, with `add_acpi_tables`/`add_smbios`) existed and
+  was unit-tested but was **never on the bus**, so neither the ACPI nor the SMBIOS
+  table set could reach a guest. `FwCfgDevice` now implements the bus `PioDevice`
+  trait (16-bit item selector at `0x510`, byte-stream data register at `0x511`) and
+  `DeviceBus::add_fw_cfg` mounts it; a guest reads the QEMU signature and the
+  registered `etc/...` files straight off the bus (proven by an in-process PIO test
+  through `VmExitHandler::io_in/io_out`). **Remaining for full delivery:** populate a
+  mounted `fw_cfg` from the synthesized ACPI/SMBIOS in `standard_pc_complete`, and
+  emit the `etc/table-loader` link script (ALLOCATE / ADD_POINTER / ADD_CHECKSUM)
+  so OVMF/SeaBIOS places and patches the tables at guest-chosen addresses.
 
 ### 5.3 CPUID Stealth
 - Intercept all CPUID exits and craft responses:
@@ -1823,6 +1833,31 @@ Physical USB Devices
   `apply_topology_stealth` (and standalone `apply_pmu_stealth`) installs the
   table's leaf-0xA PMU on each vCPU, so the CPUID-advertised PMU version and
   counter counts match the RDPMC shadow — see 5.3.
+  **AMD PMC MSR surface shadowed (2026-06-19):** `PmcState` previously modelled
+  only the Intel `IA32_*` PMC MSRs; an AMD-presented guest reads its counters via
+  the AMD legacy (`0xC001_000x`) and `PerfMonV2` core (`0xC001_020x`) blocks plus
+  the `PerfMonV2` global registers (`0xC000_030x`), which fell straight through to
+  KVM and exposed VMEXIT overhead. `PmcState` now maps both AMD blocks onto the
+  same shadow arrays (legacy n aliases core n, as on hardware), and
+  `StealthMsrRouter::filter_ranges` is now **vendor-correct** — it forwards the AMD
+  PMC ranges on `AmdSvm` and the Intel block on `IntelVmx`, never the other
+  vendor's (a readable non-existent register is itself a tell).
+  **CPUID leaf `0x8000_0022` (PerfMonV2 capability) — host-gated builder
+  (2026-06-19):** `CpuidStealthConfig::from_host` now captures leaf
+  `0x8000_0022` verbatim only when the host actually advertises it
+  (`max_ext ≥ 0x8000_0022` and non-zero `EAX`); `CpuidStealthTable::build`
+  then raises the AMD max extended leaf to `0x8000_0022` and emits the
+  capability **constrained to what the MSR router backs** — `PerfMonV2` (`EAX`
+  bit 0) with `NumCorePmc` clamped to the shadowed core-PMC count, and the
+  `LbrStack`/`LbrAndPmcFreeze` bits + `LbrStackSize` cleared (the router models
+  only the legacy LBR pair, not the PerfMonV2 extended LBR stack, so advertising
+  it would promise MSRs RDMSR then `#GP`s) — so a guest's CPUID-enumerated PMU
+  matches the AMD PerfCtr MSRs the router shadows. On a
+  host without PerfMonV2 (this nested runner: `max_ext = 0x8000_0021`) it is a
+  no-op — the leaf stays out of range — so we never claim a counter surface the
+  apparent host lacks. Live-guest injection isn't needed: a real PerfMonV2 host's
+  KVM already mirrors the leaf; the builder is for the bare-metal backend (which
+  serves CPUID from the table directly) and for completeness.
 - **MSR-exit seam + stealth routing wired (2026-06-15):** the KVM run loop can now
   forward guest `RDMSR`/`WRMSR` to userspace (`KvmBackend::enable_userspace_msr_exits`
   → `GuestExit::MsrRead`/`MsrWrite` → `VmExitHandler::rdmsr`/`wrmsr`, proven on

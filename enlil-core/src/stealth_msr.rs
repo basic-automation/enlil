@@ -88,8 +88,9 @@ impl StealthMsrRouter {
     }
 
     /// Whether `msr` is one of the performance-monitoring-counter MSRs the
-    /// [`PmcState`] models (including the write-only `GLOBAL_STATUS_RESET`,
-    /// which [`PmcState::read_msr`] cannot report).
+    /// [`PmcState`] models — the Intel `IA32_*` block (including the write-only
+    /// `GLOBAL_STATUS_RESET`, which [`PmcState::read_msr`] cannot report) **or**
+    /// the AMD legacy / `PerfMonV2` block. Used to route writes to [`PmcState`].
     #[must_use]
     pub const fn is_pmc_msr(msr: u32) -> bool {
         let gp = pmc_msr::IA32_PMC0;
@@ -105,6 +106,7 @@ impl StealthMsrRouter {
                     | pmc_msr::IA32_PERF_GLOBAL_STATUS
                     | pmc_msr::IA32_PERF_GLOBAL_STATUS_RESET
             )
+            || PmcState::is_amd_pmc_msr(msr)
     }
 
     /// Advance both stealth time surfaces by `ref_cycles` of guest execution.
@@ -132,11 +134,12 @@ impl StealthMsrRouter {
     /// [`KvmBackend::forward_msrs_to_userspace`] so the KVM filter and this
     /// router cover exactly the same MSRs.
     ///
-    /// Timing (APERF/MPERF), `IA32_DEBUGCTL`, and the PMC registers are
-    /// platform-independent; the last-branch MSRs are not: only the **AMD**
-    /// single-register pair (0x1DB–0x1DE) is included on `AmdSvm`, and only the
-    /// **Intel** TOS + FROM/TO/INFO stack blocks on `IntelVmx`. Forwarding the
-    /// other platform's LBR MSRs would make non-existent registers readable —
+    /// Timing (APERF/MPERF) and `IA32_DEBUGCTL` exist on both vendors and are
+    /// always forwarded; the PMC **and** last-branch MSRs are vendor-specific.
+    /// On `IntelVmx` we forward the Intel `IA32_*` PMC block and the TOS +
+    /// FROM/TO/INFO LBR stack; on `AmdSvm` the AMD legacy / `PerfMonV2` PMC block and
+    /// the single AMD last-branch pair (0x1DB–0x1DE). Forwarding the other
+    /// vendor's PMC or LBR MSRs would make non-existent registers readable —
     /// itself a tell — so each platform forwards only what it really exposes.
     /// At most 11 ranges, within KVM's 16-range limit.
     ///
@@ -148,18 +151,24 @@ impl StealthMsrRouter {
         let mut ranges = vec![
             (timing_msr::IA32_MPERF, 2), // 0xE7 MPERF, 0xE8 APERF
             (intel_msr::IA32_DEBUGCTL, 1),
-            (pmc_msr::IA32_PMC0, gp),
-            (pmc_msr::IA32_PERFEVTSEL0, gp),
-            (pmc_msr::IA32_FIXED_CTR0, fixed),
-            // FIXED_CTR_CTRL (0x38D), GLOBAL_STATUS (0x38E), GLOBAL_CTRL (0x38F),
-            // GLOBAL_STATUS_RESET (0x390) — four consecutive.
-            (pmc_msr::IA32_FIXED_CTR_CTRL, 4),
         ];
         match self.lbr.platform {
             LbrPlatform::AmdSvm => {
+                // AMD legacy (4) + interleaved core EvtSel/Ctr (12) + PerfMonV2
+                // global block (status/ctl/clr — 3 consecutive).
+                ranges.push((pmc_msr::AMD_LEGACY_PERFEVTSEL0, pmc_msr::AMD_LEGACY_PMCS));
+                ranges.push((pmc_msr::AMD_LEGACY_PERFCTR0, pmc_msr::AMD_LEGACY_PMCS));
+                ranges.push((pmc_msr::AMD_CORE_PERFEVTSEL0, 2 * pmc_msr::AMD_CORE_PMCS));
+                ranges.push((pmc_msr::AMD_PERF_CNTR_GLOBAL_STATUS, 3));
                 ranges.push((amd_msr::LAST_BRANCH_FROM_IP, 4)); // 0x1DB..=0x1DE
             }
             LbrPlatform::IntelVmx => {
+                ranges.push((pmc_msr::IA32_PMC0, gp));
+                ranges.push((pmc_msr::IA32_PERFEVTSEL0, gp));
+                ranges.push((pmc_msr::IA32_FIXED_CTR0, fixed));
+                // FIXED_CTR_CTRL (0x38D), GLOBAL_STATUS (0x38E), GLOBAL_CTRL
+                // (0x38F), GLOBAL_STATUS_RESET (0x390) — four consecutive.
+                ranges.push((pmc_msr::IA32_FIXED_CTR_CTRL, 4));
                 ranges.push((intel_msr::LBR_TOS, 1));
                 ranges.push((intel_msr::LBR_FROM_BASE, LBR_COUNT));
                 ranges.push((intel_msr::LBR_TO_BASE, LBR_COUNT));
@@ -269,11 +278,20 @@ mod tests {
         assert!(has(&amd, amd_msr::LAST_BRANCH_FROM_IP));
         assert!(has(&amd, amd_msr::LAST_INT_TO_IP));
         assert!(!has(&amd, intel_msr::LBR_FROM_BASE));
+        // PMC MSRs are vendor-specific: Intel forwards the IA32 block, AMD the
+        // legacy/PerfMonV2 block — never the other vendor's (a non-existent
+        // register a guest could read is itself a tell).
+        assert!(has(&intel, pmc_msr::IA32_PERF_GLOBAL_STATUS_RESET));
+        assert!(has(&intel, pmc_msr::IA32_PMC0));
+        assert!(!has(&intel, pmc_msr::AMD_CORE_PERFCTR0));
+        assert!(has(&amd, pmc_msr::AMD_CORE_PERFCTR0));
+        assert!(has(&amd, pmc_msr::AMD_LEGACY_PERFEVTSEL0));
+        assert!(has(&amd, pmc_msr::AMD_PERF_CNTR_GLOBAL_CTL));
+        assert!(!has(&amd, pmc_msr::IA32_PMC0));
         // Both forward the platform-independent surfaces.
         for rs in [&intel, &amd] {
             assert!(has(rs, timing_msr::IA32_APERF));
             assert!(has(rs, intel_msr::IA32_DEBUGCTL));
-            assert!(has(rs, pmc_msr::IA32_PERF_GLOBAL_STATUS_RESET));
         }
     }
 
@@ -349,6 +367,19 @@ mod tests {
         r.pmc.advance_counters(1000);
         // 1000 ref cycles -> 1150 core cycles under the default model.
         assert_eq!(r.read_msr(pmc_msr::IA32_FIXED_CTR0 + 1), Some(1150));
+    }
+
+    #[test]
+    fn amd_pmc_msrs_route_to_the_pmc_state() {
+        // An AMD-presented guest's PerfMonV2 counter writes/reads round-trip
+        // through the router's PmcState, just like the Intel block.
+        let mut r = router_for(LbrPlatform::AmdSvm);
+        assert!(r.write_msr(pmc_msr::AMD_CORE_PERFCTR0 + 2, 0xCAFE)); // PerfCtr1
+        assert_eq!(r.read_msr(pmc_msr::AMD_CORE_PERFCTR0 + 2), Some(0xCAFE));
+        assert!(r.write_msr(pmc_msr::AMD_PERF_CNTR_GLOBAL_CTL, 0b11));
+        assert_eq!(r.read_msr(pmc_msr::AMD_PERF_CNTR_GLOBAL_CTL), Some(0b11));
+        // The write-only clear MSR is recognised for writes.
+        assert!(r.write_msr(pmc_msr::AMD_PERF_CNTR_GLOBAL_STATUS_CLR, 0));
     }
 
     #[test]

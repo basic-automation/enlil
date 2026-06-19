@@ -109,6 +109,83 @@ pub mod msr {
     pub const IA32_PERF_GLOBAL_CTRL: u32 = 0x38F;
     pub const IA32_PERF_GLOBAL_STATUS: u32 = 0x38E;
     pub const IA32_PERF_GLOBAL_STATUS_RESET: u32 = 0x390;
+
+    // --- AMD PMC MSRs (AMD APM vol. 2 §13.2 / PPR Family 19h) ---
+    //
+    // An AMD-presented guest reads its performance counters through these, not
+    // the Intel `IA32_*` registers above. The legacy (K7) block aliases the
+    // first four core counters on real silicon, so both map to the same shadow.
+
+    /// AMD legacy `PerfEvtSel0..3` (`0xC001_0000..0xC001_0003`).
+    pub const AMD_LEGACY_PERFEVTSEL0: u32 = 0xC001_0000;
+    /// AMD legacy `PerfCtr0..3` (`0xC001_0004..0xC001_0007`).
+    pub const AMD_LEGACY_PERFCTR0: u32 = 0xC001_0004;
+    /// Number of legacy AMD PMCs.
+    pub const AMD_LEGACY_PMCS: u32 = 4;
+
+    /// AMD core / `PerfMonV2` `PerfEvtSel[n] = 0xC001_0200 + 2n` (even MSRs).
+    pub const AMD_CORE_PERFEVTSEL0: u32 = 0xC001_0200;
+    /// AMD core / `PerfMonV2` `PerfCtr[n] = 0xC001_0201 + 2n` (odd MSRs).
+    pub const AMD_CORE_PERFCTR0: u32 = 0xC001_0201;
+    /// Number of core AMD PMCs (Zen exposes 6).
+    pub const AMD_CORE_PMCS: u32 = 6;
+
+    /// AMD `PerfMonV2` `PerfCntrGlobalStatus` (`0xC000_0300`).
+    pub const AMD_PERF_CNTR_GLOBAL_STATUS: u32 = 0xC000_0300;
+    /// AMD `PerfMonV2` `PerfCntrGlobalCtl` (`0xC000_0301`).
+    pub const AMD_PERF_CNTR_GLOBAL_CTL: u32 = 0xC000_0301;
+    /// AMD `PerfMonV2` `PerfCntrGlobalStatusClr` (`0xC000_0302`).
+    pub const AMD_PERF_CNTR_GLOBAL_STATUS_CLR: u32 = 0xC000_0302;
+}
+
+/// What an AMD PMC MSR addresses within the shared shadow arrays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AmdPmcTarget {
+    /// A counter value (`gp_counters[idx]`).
+    Counter(usize),
+    /// An event-select register (`event_select[idx]`).
+    EventSelect(usize),
+    /// The `PerfMonV2` global-control MSR (`global_ctrl`).
+    GlobalCtrl,
+    /// The `PerfMonV2` global-status MSR (`global_status`, read-only here).
+    GlobalStatus,
+    /// The `PerfMonV2` global-status-clear MSR (write clears `global_status`).
+    GlobalStatusClr,
+}
+
+/// Map an AMD PMC MSR number onto the shadow arrays, or `None` if `msr` is not
+/// an AMD PMC register. The legacy (K7) block aliases the first four core
+/// counters, exactly as on hardware, so both decode to the same index.
+const fn amd_pmc_target(msr: u32) -> Option<AmdPmcTarget> {
+    use msr::{
+        AMD_CORE_PERFEVTSEL0, AMD_CORE_PMCS, AMD_LEGACY_PERFCTR0, AMD_LEGACY_PERFEVTSEL0,
+        AMD_LEGACY_PMCS, AMD_PERF_CNTR_GLOBAL_CTL, AMD_PERF_CNTR_GLOBAL_STATUS,
+        AMD_PERF_CNTR_GLOBAL_STATUS_CLR,
+    };
+    if msr >= AMD_LEGACY_PERFEVTSEL0 && msr < AMD_LEGACY_PERFEVTSEL0 + AMD_LEGACY_PMCS {
+        return Some(AmdPmcTarget::EventSelect(
+            (msr - AMD_LEGACY_PERFEVTSEL0) as usize,
+        ));
+    }
+    if msr >= AMD_LEGACY_PERFCTR0 && msr < AMD_LEGACY_PERFCTR0 + AMD_LEGACY_PMCS {
+        return Some(AmdPmcTarget::Counter((msr - AMD_LEGACY_PERFCTR0) as usize));
+    }
+    // Core / PerfMonV2 counters interleave EvtSel (even) and Ctr (odd).
+    if msr >= AMD_CORE_PERFEVTSEL0 && msr < AMD_CORE_PERFEVTSEL0 + 2 * AMD_CORE_PMCS {
+        let off = msr - AMD_CORE_PERFEVTSEL0;
+        let idx = (off / 2) as usize;
+        return Some(if off.is_multiple_of(2) {
+            AmdPmcTarget::EventSelect(idx)
+        } else {
+            AmdPmcTarget::Counter(idx)
+        });
+    }
+    match msr {
+        AMD_PERF_CNTR_GLOBAL_CTL => Some(AmdPmcTarget::GlobalCtrl),
+        AMD_PERF_CNTR_GLOBAL_STATUS => Some(AmdPmcTarget::GlobalStatus),
+        AMD_PERF_CNTR_GLOBAL_STATUS_CLR => Some(AmdPmcTarget::GlobalStatusClr),
+        _ => None,
+    }
 }
 
 impl PmcState {
@@ -149,6 +226,13 @@ impl PmcState {
         }
     }
 
+    /// Whether `msr` is one of the AMD PMC MSRs this state models (legacy or
+    /// core counters/event-selects, or the `PerfMonV2` global registers).
+    #[must_use]
+    pub const fn is_amd_pmc_msr(msr: u32) -> bool {
+        amd_pmc_target(msr).is_some()
+    }
+
     /// Handle WRMSR for a PMC MSR
     pub fn write_msr(&mut self, msr: u32, value: u64) {
         match msr {
@@ -169,6 +253,21 @@ impl PmcState {
             msr::IA32_PERF_GLOBAL_STATUS_RESET => {
                 self.global_status &= !value;
             }
+            m => self.write_amd_msr(m, value),
+        }
+    }
+
+    /// Apply a WRMSR to an AMD PMC MSR. A no-op for any MSR this state does not
+    /// model. The legacy and core counter blocks alias to the same shadow index.
+    const fn write_amd_msr(&mut self, msr: u32, value: u64) {
+        match amd_pmc_target(msr) {
+            Some(AmdPmcTarget::Counter(i)) if i < MAX_GP_PMCS => self.gp_counters[i] = value,
+            Some(AmdPmcTarget::EventSelect(i)) if i < MAX_GP_PMCS => self.event_select[i] = value,
+            Some(AmdPmcTarget::GlobalCtrl) => self.global_ctrl = value,
+            // Writing the clear MSR clears the set status bits (write-1-to-clear),
+            // matching the Intel `GLOBAL_STATUS_RESET` semantics above.
+            Some(AmdPmcTarget::GlobalStatusClr) => self.global_status &= !value,
+            // `GlobalStatus` is read-only; an out-of-range index is ignored.
             _ => {}
         }
     }
@@ -192,6 +291,20 @@ impl PmcState {
             msr::IA32_FIXED_CTR_CTRL => Some(self.fixed_ctr_ctrl),
             msr::IA32_PERF_GLOBAL_CTRL => Some(self.global_ctrl),
             msr::IA32_PERF_GLOBAL_STATUS => Some(self.global_status),
+            m => self.read_amd_msr(m),
+        }
+    }
+
+    /// Serve an RDMSR for an AMD PMC MSR, or `None` if `msr` is not one. The
+    /// legacy block reads the same shadow as the aliased core counters.
+    #[must_use]
+    const fn read_amd_msr(&self, msr: u32) -> Option<u64> {
+        match amd_pmc_target(msr) {
+            Some(AmdPmcTarget::Counter(i)) if i < MAX_GP_PMCS => Some(self.gp_counters[i]),
+            Some(AmdPmcTarget::EventSelect(i)) if i < MAX_GP_PMCS => Some(self.event_select[i]),
+            Some(AmdPmcTarget::GlobalCtrl) => Some(self.global_ctrl),
+            Some(AmdPmcTarget::GlobalStatus) => Some(self.global_status),
+            // `GlobalStatusClr` is write-only; out-of-range index unmodelled.
             _ => None,
         }
     }
@@ -355,5 +468,65 @@ mod tests {
         pmc.global_status = 0xFF;
         pmc.write_msr(msr::IA32_PERF_GLOBAL_STATUS_RESET, 0x0F);
         assert_eq!(pmc.global_status, 0xF0);
+    }
+
+    #[test]
+    fn amd_core_pmc_msrs_round_trip_through_the_shadow() {
+        // An AMD-presented guest reads/writes its counters via the interleaved
+        // core block (EvtSel even, Ctr odd). Counter n = 0xC0010201 + 2n.
+        let mut pmc = PmcState::new();
+        pmc.write_msr(msr::AMD_CORE_PERFCTR0 + 2 * 3, 0xDEAD); // PerfCtr3
+        pmc.write_msr(msr::AMD_CORE_PERFEVTSEL0 + 2 * 3, 0x76); // PerfEvtSel3
+        assert_eq!(pmc.read_msr(msr::AMD_CORE_PERFCTR0 + 2 * 3), Some(0xDEAD));
+        assert_eq!(pmc.read_msr(msr::AMD_CORE_PERFEVTSEL0 + 2 * 3), Some(0x76));
+        // It is the same physical counter RDPMC index 3 reads.
+        assert_eq!(pmc.read_pmc(3), 0xDEAD);
+    }
+
+    #[test]
+    fn amd_legacy_block_aliases_the_first_core_counters() {
+        // On real AMD parts the legacy 0xC001_000x block aliases core 0..3.
+        let mut pmc = PmcState::new();
+        pmc.write_msr(msr::AMD_CORE_PERFCTR0, 0x1234); // core counter 0
+        // Legacy PerfCtr0 (0xC0010004) reads the same shadow.
+        assert_eq!(pmc.read_msr(msr::AMD_LEGACY_PERFCTR0), Some(0x1234));
+        // Writing the legacy MSR is visible through the core MSR too.
+        pmc.write_msr(msr::AMD_LEGACY_PERFEVTSEL0 + 1, 0x99); // legacy EvtSel1
+        assert_eq!(pmc.read_msr(msr::AMD_CORE_PERFEVTSEL0 + 2), Some(0x99));
+    }
+
+    #[test]
+    fn amd_perfmon_v2_global_registers() {
+        let mut pmc = PmcState::new();
+        pmc.write_msr(msr::AMD_PERF_CNTR_GLOBAL_CTL, 0b101);
+        assert_eq!(pmc.read_msr(msr::AMD_PERF_CNTR_GLOBAL_CTL), Some(0b101));
+        // Global ctl bit n enables core counter n for advance(), mirroring Intel.
+        pmc.event_select[0] = 0x42;
+        pmc.event_select[2] = 0x42;
+        pmc.advance_counters(1000);
+        assert_eq!(pmc.gp_counters[0], 1150, "counter 0 enabled by global ctl");
+        assert_eq!(pmc.gp_counters[1], 0, "counter 1 not enabled");
+        assert_eq!(pmc.gp_counters[2], 1150, "counter 2 enabled by global ctl");
+        // Global status is write-1-to-clear via the dedicated Clr MSR.
+        pmc.global_status = 0b111;
+        pmc.write_msr(msr::AMD_PERF_CNTR_GLOBAL_STATUS_CLR, 0b010);
+        assert_eq!(pmc.read_msr(msr::AMD_PERF_CNTR_GLOBAL_STATUS), Some(0b101));
+    }
+
+    #[test]
+    fn amd_pmc_predicate_excludes_intel_and_unrelated_msrs() {
+        assert!(PmcState::is_amd_pmc_msr(msr::AMD_CORE_PERFCTR0));
+        assert!(PmcState::is_amd_pmc_msr(msr::AMD_LEGACY_PERFEVTSEL0));
+        assert!(PmcState::is_amd_pmc_msr(msr::AMD_PERF_CNTR_GLOBAL_CTL));
+        // Intel PMC and unrelated MSRs are not AMD PMC MSRs.
+        assert!(!PmcState::is_amd_pmc_msr(msr::IA32_PMC0));
+        assert!(!PmcState::is_amd_pmc_msr(0x10)); // IA32_TSC
+        // One past each AMD block must not be claimed.
+        assert!(!PmcState::is_amd_pmc_msr(
+            msr::AMD_CORE_PERFEVTSEL0 + 2 * msr::AMD_CORE_PMCS
+        ));
+        assert!(!PmcState::is_amd_pmc_msr(
+            msr::AMD_LEGACY_PERFCTR0 + msr::AMD_LEGACY_PMCS
+        ));
     }
 }

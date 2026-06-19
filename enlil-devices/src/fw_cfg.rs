@@ -81,6 +81,41 @@ impl FwCfgDevice {
         self.add_file("etc/smbios/smbios-tables", tables);
     }
 
+    /// Synthesize and register the SMBIOS file set from a [`SmbiosConfig`].
+    ///
+    /// Builds the structure table (`etc/smbios/smbios-tables`) and a 3.0 entry
+    /// point (`etc/smbios/smbios-anchor`) with a **zero** structure-table
+    /// address — the placeholder the `etc/table-loader` `ADD_POINTER` command
+    /// patches to the guest-chosen load address at boot, exactly as QEMU does.
+    /// This is the synthesis→delivery link: it ties the canonical
+    /// [`SmbiosBuilder`] to the `fw_cfg` channel a firmware reads the tables off.
+    ///
+    /// [`SmbiosConfig`]: crate::smbios::SmbiosConfig
+    /// [`SmbiosBuilder`]: crate::smbios::SmbiosBuilder
+    pub fn add_smbios_from_config(&mut self, config: &crate::smbios::SmbiosConfig) {
+        let builder = crate::smbios::SmbiosBuilder::new(config.clone());
+        let tables = builder.build_structures();
+        let anchor = builder.build_entry_point(0);
+        self.add_smbios(anchor, tables);
+    }
+
+    /// Synthesize and register the ACPI file set from an [`AcpiTableSetConfig`].
+    ///
+    /// Builds the table set ([`build_acpi_tables`]) and registers its RSDP and
+    /// concatenated table blob as `etc/acpi/rsdp` / `etc/acpi/tables` — the
+    /// firmware reads both off `fw_cfg`. As with QEMU, the inter-table pointers
+    /// (RSDP→XSDT→FADT→…) are placed assuming a base of 0 and patched at boot by
+    /// the `etc/table-loader` `ADD_POINTER` commands once the firmware chooses
+    /// the load address. The synthesis→delivery link for ACPI, mirroring
+    /// [`add_smbios_from_config`](Self::add_smbios_from_config).
+    ///
+    /// [`AcpiTableSetConfig`]: crate::acpi::AcpiTableSetConfig
+    /// [`build_acpi_tables`]: crate::acpi::build_acpi_tables
+    pub fn add_acpi_from_config(&mut self, config: &crate::acpi::AcpiTableSetConfig) {
+        let set = crate::acpi::build_acpi_tables(config);
+        self.add_acpi_tables(set.rsdp, set.tables);
+    }
+
     /// Handle port I/O write to selector port (0x510)
     pub const fn write_selector(&mut self, value: u16) {
         self.current_selector = value;
@@ -144,22 +179,6 @@ impl FwCfgDevice {
         dir
     }
 
-    /// Handle PIO read
-    #[must_use]
-    pub fn pio_read(&mut self, port: u16) -> u8 {
-        match port {
-            FW_CFG_PORT_DATA => self.read_data(),
-            _ => 0,
-        }
-    }
-
-    /// Handle PIO write
-    pub const fn pio_write(&mut self, port: u16, value: u16) {
-        if port == FW_CFG_PORT_SEL {
-            self.write_selector(value);
-        }
-    }
-
     /// Get the number of registered files
     #[must_use]
     pub const fn file_count(&self) -> usize {
@@ -170,6 +189,37 @@ impl FwCfgDevice {
 impl Default for FwCfgDevice {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Bus-level port I/O: the firmware writes the 16-bit item selector to `0x510`
+/// and then reads the selected item one byte at a time from the data register
+/// `0x511`. The data register is read-only here (DMA at `0x514` is not modelled;
+/// byte-stream reads are sufficient to deliver the table/file set). The selector
+/// register is write-only — reads from it return 0, matching real `fw_cfg`.
+impl crate::bus::PioDevice for FwCfgDevice {
+    fn pio_read(&mut self, port: u16, size: u8) -> u32 {
+        if port != FW_CFG_PORT_DATA {
+            return 0;
+        }
+        // Assemble up to `size` little-endian bytes from the item stream; each
+        // read advances the offset, exactly as a `rep insb` over the data port.
+        let mut value = 0u32;
+        for i in 0..size.min(4) {
+            value |= u32::from(self.read_data()) << (8 * u32::from(i));
+        }
+        value
+    }
+
+    fn pio_write(&mut self, port: u16, _size: u8, data: u32) {
+        if port == FW_CFG_PORT_SEL {
+            self.write_selector((data & 0xFFFF) as u16);
+        }
+    }
+
+    fn port_range(&self) -> (u16, u16) {
+        // [0x510, 0x512): the selector and data registers.
+        (FW_CFG_PORT_SEL, FW_CFG_PORT_DATA + 1)
     }
 }
 
@@ -239,9 +289,73 @@ mod tests {
     }
 
     #[test]
-    fn pio_interface() {
+    fn acpi_from_config_registers_the_synthesized_tables() {
+        use crate::acpi::{AcpiTableSetConfig, build_acpi_tables};
+        let config = AcpiTableSetConfig::default();
         let mut dev = FwCfgDevice::new();
-        dev.pio_write(FW_CFG_PORT_SEL, selector::SIGNATURE);
-        assert_eq!(dev.pio_read(FW_CFG_PORT_DATA), b'Q');
+        dev.add_acpi_from_config(&config);
+        // etc/acpi/rsdp (0x20) then etc/acpi/tables (0x21).
+        assert_eq!(dev.file_count(), 2);
+
+        let expected = build_acpi_tables(&config);
+        // The delivered tables blob matches the canonical assembler byte for byte.
+        dev.write_selector(0x21);
+        let got: Vec<u8> = (0..expected.tables.len())
+            .map(|_| dev.read_data())
+            .collect();
+        assert_eq!(got, expected.tables);
+        assert!(!expected.tables.is_empty(), "the assembler produced tables");
+        // And the RSDP file (0x20) carries the assembled RSDP.
+        dev.write_selector(0x20);
+        let rsdp: Vec<u8> = (0..expected.rsdp.len()).map(|_| dev.read_data()).collect();
+        assert_eq!(rsdp, expected.rsdp);
+    }
+
+    #[test]
+    fn smbios_from_config_registers_the_synthesized_tables() {
+        use crate::smbios::{SmbiosBuilder, SmbiosConfig};
+        let config = SmbiosConfig::default();
+        let mut dev = FwCfgDevice::new();
+        let tables_sel = dev.add_file("placeholder", Vec::new()); // selector 0x20
+        dev.add_smbios_from_config(&config);
+        // add_smbios_from_config registered anchor (0x21) then tables (0x22).
+        assert_eq!(dev.file_count(), 3);
+
+        // The smbios-tables file matches the canonical builder's structures byte
+        // for byte (proving the delivery channel carries the real synthesis).
+        let expected = SmbiosBuilder::new(config).build_structures();
+        let tables_file_sel = tables_sel + 2; // 0x20 -> placeholder, +1 anchor, +2 tables
+        dev.write_selector(tables_file_sel);
+        let got: Vec<u8> = (0..expected.len()).map(|_| dev.read_data()).collect();
+        assert_eq!(got, expected);
+        assert!(
+            !expected.is_empty(),
+            "the builder produced a non-empty table"
+        );
+    }
+
+    #[test]
+    fn pio_interface() {
+        use crate::bus::PioDevice;
+        let mut dev = FwCfgDevice::new();
+        // Select the signature item via a 16-bit write to the selector port,
+        // then read its first byte from the data port — the bus-trait path.
+        dev.pio_write(FW_CFG_PORT_SEL, 2, u32::from(selector::SIGNATURE));
+        assert_eq!(dev.pio_read(FW_CFG_PORT_DATA, 1), u32::from(b'Q'));
+        assert_eq!(dev.pio_read(FW_CFG_PORT_DATA, 1), u32::from(b'E'));
+        // The selector port is write-only; reads return 0.
+        assert_eq!(dev.pio_read(FW_CFG_PORT_SEL, 1), 0);
+        // The claimed range is the two registers.
+        assert_eq!(dev.port_range(), (FW_CFG_PORT_SEL, FW_CFG_PORT_DATA + 1));
+    }
+
+    #[test]
+    fn pio_multi_byte_read_assembles_little_endian() {
+        use crate::bus::PioDevice;
+        let mut dev = FwCfgDevice::new();
+        let sel = dev.add_file("test", vec![0x11, 0x22, 0x33, 0x44]);
+        dev.pio_write(FW_CFG_PORT_SEL, 2, u32::from(sel));
+        // A 4-byte read pulls four stream bytes, low byte first.
+        assert_eq!(dev.pio_read(FW_CFG_PORT_DATA, 4), 0x4433_2211);
     }
 }

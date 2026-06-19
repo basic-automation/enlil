@@ -503,6 +503,30 @@ impl DeviceBus {
         self.add_pio(Box::new(DmaPageRegisters::new()))
     }
 
+    /// Mount the **QEMU `fw_cfg`** device ([`FwCfgDevice`]) on the PIO bus over
+    /// its two registers `0x510` (16-bit item selector) and `0x511` (byte-stream
+    /// data). This is the firmware-configuration channel an OVMF/SeaBIOS guest
+    /// reads the synthesized ACPI and SMBIOS table set from at boot (via the
+    /// `etc/acpi/*` and `etc/smbios/*` files), and the `etc/table-loader` link
+    /// script that places and checksums them. The caller populates `fw_cfg`
+    /// (e.g. [`FwCfgDevice::add_acpi_tables`] / [`FwCfgDevice::add_smbios`])
+    /// before mounting; the device is read-only to the guest after that, so the
+    /// bus owns it outright.
+    ///
+    /// [`FwCfgDevice`]: enlil_devices::fw_cfg::FwCfgDevice
+    /// [`FwCfgDevice::add_acpi_tables`]: enlil_devices::fw_cfg::FwCfgDevice::add_acpi_tables
+    /// [`FwCfgDevice::add_smbios`]: enlil_devices::fw_cfg::FwCfgDevice::add_smbios
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if `0x510`..`0x512` overlaps
+    /// an already-registered device.
+    pub fn add_fw_cfg(
+        &mut self,
+        fw_cfg: enlil_devices::fw_cfg::FwCfgDevice,
+    ) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_pio(Box::new(fw_cfg))
+    }
+
     /// Like [`standard_pc`](Self::standard_pc), but wires the legacy devices'
     /// interrupt lines into the dual-8259 `pic` (the early-boot interrupt
     /// controller) and mounts its four ports: the 8254 PIT's channel-0 line
@@ -1312,6 +1336,54 @@ mod tests {
         // Writes to nothing are silently dropped.
         VmExitHandler::io_out(&mut bus, 0xCF8, &[0xDE, 0xAD]);
         VmExitHandler::mmio_write(&mut bus, 0x1234_0000, &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn fw_cfg_mounts_and_serves_the_file_set_over_pio() {
+        use enlil_devices::fw_cfg::{selector, FwCfgDevice, FW_CFG_PORT_DATA, FW_CFG_PORT_SEL};
+
+        // A populated fw_cfg: the SMBIOS file set plus a known file we can read
+        // back by its returned selector.
+        let mut fw = FwCfgDevice::new();
+        fw.add_smbios(vec![0xAA, 0xBB], vec![0x01, 0x02, 0x03]);
+        let probe_sel = fw.add_file("etc/enlil/probe", vec![0xDE, 0xAD, 0xBE, 0xEF]);
+
+        let mut bus = DeviceBus::new();
+        bus.add_fw_cfg(fw).expect("mount fw_cfg");
+        // The device claims exactly its two registers.
+        assert!(bus.pio.is_mapped(FW_CFG_PORT_SEL));
+        assert!(bus.pio.is_mapped(FW_CFG_PORT_DATA));
+        assert!(!bus.pio.is_mapped(FW_CFG_PORT_DATA + 1));
+
+        // Helper: read `n` bytes from the data port one at a time, as firmware
+        // does over the byte-stream register.
+        fn read_stream(bus: &mut DeviceBus, n: usize) -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    let mut one = [0u8; 1];
+                    VmExitHandler::io_in(bus, FW_CFG_PORT_DATA, &mut one);
+                    one[0]
+                })
+                .collect()
+        }
+
+        // Select the signature item (16-bit selector write) and read "QEMU" —
+        // the probe an OVMF/SeaBIOS guest does to detect fw_cfg.
+        VmExitHandler::io_out(
+            &mut bus,
+            FW_CFG_PORT_SEL,
+            &selector::SIGNATURE.to_le_bytes(),
+        );
+        assert_eq!(read_stream(&mut bus, 4), b"QEMU");
+
+        // Select our registered file and read its bytes back through the bus —
+        // proving a guest can pull a delivered table/file off the mounted device.
+        VmExitHandler::io_out(&mut bus, FW_CFG_PORT_SEL, &probe_sel.to_le_bytes());
+        assert_eq!(read_stream(&mut bus, 4), vec![0xDE, 0xAD, 0xBE, 0xEF]);
+
+        // Re-selecting rewinds the stream (the firmware re-reads from offset 0).
+        VmExitHandler::io_out(&mut bus, FW_CFG_PORT_SEL, &probe_sel.to_le_bytes());
+        assert_eq!(read_stream(&mut bus, 1), vec![0xDE]);
     }
 
     #[test]
