@@ -441,6 +441,108 @@ mod tests {
         assert_eq!(&*sink.lock().unwrap(), &[0xBE]);
     }
 
+    // The production path forwards and serves the AMD PMC MSR surface: install
+    // the run loop for an AMD platform (so filter_ranges emits the AMD blocks),
+    // seed PerfCtr0's shadow and enable PerfCtr1, and a guest that `rdmsr
+    // 0xC0010201` (AMD PerfMonV2 core PerfCtr0) reads the router's seeded shadow
+    // — not KVM's in-kernel PMU value — straight through StealthRunLoop. After
+    // the run, the enabled-but-unread counter 1 has advanced, proving the AMD GP
+    // counters participate in the same per-entry advance() the loop drives.
+    #[test]
+    fn run_loop_serves_and_advances_amd_perfmon_v2_counters() {
+        use enlil_devices::stealth::pmc::msr as pmc_msr;
+
+        if !is_kvm_available() {
+            eprintln!("skipping run_loop_serves_and_advances_amd_perfmon_v2_counters: no /dev/kvm");
+            return;
+        }
+
+        // rdmsr(0xC0010201 = AMD PerfMonV2 PerfCtr0); out 0x3F8, al; hlt.
+        #[rustfmt::skip]
+        let code: [u8; 13] = [
+            0x66, 0xB9, 0x01, 0x02, 0x01, 0xC0, // mov ecx, 0xC0010201
+            0x0F, 0x32,                         // rdmsr
+            0xBA, 0xF8, 0x03,                   // mov dx, 0x3F8
+            0xEE,                               // out dx, al
+            0xF4,                               // hlt
+        ];
+        const ENTRY: u64 = 0x1000;
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Shared(Arc::clone(&sink))),
+            0,
+            1,
+        )
+        .expect("build standard pc");
+        let backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        let mut run = match StealthRunLoop::install(backend, pc, LbrPlatform::AmdSvm) {
+            Ok(run) => run,
+            Err(e) => {
+                eprintln!("skipping run_loop_serves_and_advances_amd_perfmon_v2_counters: {e}");
+                return;
+            }
+        };
+
+        // Seed PerfCtr0 (read by the guest, kept static), and enable PerfCtr1 so
+        // the run loop's advance() moves it.
+        {
+            let pmc = &mut run
+                .pc_mut()
+                .bus
+                .stealth_msr_mut()
+                .expect("router installed")
+                .pmc;
+            pmc.gp_counters[0] = 0x0000_0000_0000_009D; // low byte 0x9D
+            pmc.event_select[1] = 0x0042; // some event on counter 1
+            pmc.global_ctrl = 0b10; // PerfMonV2 global ctl enables counter 1
+        }
+
+        let mut ram = GuestRam::new(0x1000);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+        // SAFETY: `ram` outlives `run` within this test scope.
+        unsafe {
+            run.backend_mut()
+                .map_memory(ENTRY, host_addr, ram.len() as u64)
+        }
+        .expect("map guest memory");
+        run.create_vcpu(0).expect("create vcpu");
+        run.backend_mut()
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        let (last, total_cycles) = run.run_vcpu_until_event(0, 100).expect("run until event");
+        assert_eq!(last.exit, GuestExit::Halted, "guest should reach HLT");
+        assert!(total_cycles > 0, "the run loop measured guest cycles");
+        // The router's PerfCtr0 shadow (low byte 0x9D) reached the guest through
+        // the production forwarding path.
+        assert_eq!(
+            &*sink.lock().unwrap(),
+            &[0x9D],
+            "guest reads the router's AMD PerfCtr0 shadow through StealthRunLoop"
+        );
+
+        // Counter 1 (enabled, never read by the guest) advanced over the run —
+        // the AMD GP counters track the per-entry advance() like the Intel ones.
+        let pmc = &run
+            .pc_mut()
+            .bus
+            .stealth_msr_mut()
+            .expect("router installed")
+            .pmc;
+        assert!(
+            pmc.read_msr(pmc_msr::AMD_CORE_PERFCTR0 + 2).unwrap() > 0,
+            "enabled AMD PerfCtr1 advanced through the run loop"
+        );
+        // Counter 0 stayed at its seed (disabled — event_select[0] == 0).
+        assert_eq!(
+            pmc.read_msr(pmc_msr::AMD_CORE_PERFCTR0),
+            Some(0x9D),
+            "disabled AMD PerfCtr0 kept its seeded value"
+        );
+    }
+
     // Full stealth through the driver: install the MSR stack, create two vCPUs,
     // apply the topology table, and a guest reading leaf 0xB subleaf 1 sees its
     // own 2-vCPU count (not the host's). Proves apply_topology_stealth is
