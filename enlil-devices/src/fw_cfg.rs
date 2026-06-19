@@ -81,6 +81,24 @@ impl FwCfgDevice {
         self.add_file("etc/smbios/smbios-tables", tables);
     }
 
+    /// Synthesize and register the SMBIOS file set from a [`SmbiosConfig`].
+    ///
+    /// Builds the structure table (`etc/smbios/smbios-tables`) and a 3.0 entry
+    /// point (`etc/smbios/smbios-anchor`) with a **zero** structure-table
+    /// address — the placeholder the `etc/table-loader` `ADD_POINTER` command
+    /// patches to the guest-chosen load address at boot, exactly as QEMU does.
+    /// This is the synthesis→delivery link: it ties the canonical
+    /// [`SmbiosBuilder`] to the `fw_cfg` channel a firmware reads the tables off.
+    ///
+    /// [`SmbiosConfig`]: crate::smbios::SmbiosConfig
+    /// [`SmbiosBuilder`]: crate::smbios::SmbiosBuilder
+    pub fn add_smbios_from_config(&mut self, config: &crate::smbios::SmbiosConfig) {
+        let builder = crate::smbios::SmbiosBuilder::new(config.clone());
+        let tables = builder.build_structures();
+        let anchor = builder.build_entry_point(0);
+        self.add_smbios(anchor, tables);
+    }
+
     /// Handle port I/O write to selector port (0x510)
     pub const fn write_selector(&mut self, value: u16) {
         self.current_selector = value;
@@ -251,6 +269,29 @@ mod tests {
         let mut dev = FwCfgDevice::new();
         dev.add_acpi_tables(vec![1, 2, 3], vec![4, 5, 6, 7]);
         assert_eq!(dev.file_count(), 2);
+    }
+
+    #[test]
+    fn smbios_from_config_registers_the_synthesized_tables() {
+        use crate::smbios::{SmbiosBuilder, SmbiosConfig};
+        let config = SmbiosConfig::default();
+        let mut dev = FwCfgDevice::new();
+        let tables_sel = dev.add_file("placeholder", Vec::new()); // selector 0x20
+        dev.add_smbios_from_config(&config);
+        // add_smbios_from_config registered anchor (0x21) then tables (0x22).
+        assert_eq!(dev.file_count(), 3);
+
+        // The smbios-tables file matches the canonical builder's structures byte
+        // for byte (proving the delivery channel carries the real synthesis).
+        let expected = SmbiosBuilder::new(config).build_structures();
+        let tables_file_sel = tables_sel + 2; // 0x20 -> placeholder, +1 anchor, +2 tables
+        dev.write_selector(tables_file_sel);
+        let got: Vec<u8> = (0..expected.len()).map(|_| dev.read_data()).collect();
+        assert_eq!(got, expected);
+        assert!(
+            !expected.is_empty(),
+            "the builder produced a non-empty table"
+        );
     }
 
     #[test]
