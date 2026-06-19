@@ -1831,10 +1831,19 @@ Physical USB Devices
   same shadow arrays (legacy n aliases core n, as on hardware), and
   `StealthMsrRouter::filter_ranges` is now **vendor-correct** — it forwards the AMD
   PMC ranges on `AmdSvm` and the Intel block on `IntelVmx`, never the other
-  vendor's (a readable non-existent register is itself a tell). The synthetic
-  CPUID leaf-`0x8000_0022` advertise is deferred: this nested host reports
-  `max_ext = 0x8000_0021` (no `PerfMonV2`), so advertising it would claim a feature
-  the apparent host lacks.
+  vendor's (a readable non-existent register is itself a tell).
+  **CPUID leaf `0x8000_0022` (PerfMonV2 capability) — host-gated builder
+  (2026-06-19):** `CpuidStealthConfig::from_host` now captures leaf
+  `0x8000_0022` verbatim only when the host actually advertises it
+  (`max_ext ≥ 0x8000_0022` and non-zero `EAX`); `CpuidStealthTable::build`
+  then raises the AMD max extended leaf to `0x8000_0022` and emits the
+  capability (`EAX` bit 0 + the host's `EBX[3:0]` core-PMC count), so a guest's
+  CPUID-enumerated PMU matches the AMD PerfCtr MSRs the router shadows. On a
+  host without PerfMonV2 (this nested runner: `max_ext = 0x8000_0021`) it is a
+  no-op — the leaf stays out of range — so we never claim a counter surface the
+  apparent host lacks. Live-guest injection isn't needed: a real PerfMonV2 host's
+  KVM already mirrors the leaf; the builder is for the bare-metal backend (which
+  serves CPUID from the table directly) and for completeness.
 - **MSR-exit seam + stealth routing wired (2026-06-15):** the KVM run loop can now
   forward guest `RDMSR`/`WRMSR` to userspace (`KvmBackend::enable_userspace_msr_exits`
   → `GuestExit::MsrRead`/`MsrWrite` → `VmExitHandler::rdmsr`/`wrmsr`, proven on

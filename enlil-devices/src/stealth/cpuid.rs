@@ -79,6 +79,15 @@ pub struct CpuidStealthConfig {
     pub base_frequency_mhz: u32,
     /// Maximum turbo frequency in MHz (leaf 0x16 EBX)
     pub max_frequency_mhz: u32,
+    /// The host's AMD `PerfMonV2` capability leaf (`0x8000_0022`), captured
+    /// verbatim when the host actually advertises it (max extended leaf
+    /// ≥ `0x8000_0022` and a non-zero `EAX`); `None` otherwise. Only AMD parts
+    /// from Zen 4 on expose it. When present, the synthesized table advertises
+    /// `PerfMonV2` (EAX bit 0 + the host's core-PMC count in `EBX[3:0]`) so an
+    /// AMD-presented guest enumerates a PMU consistent with the AMD `PerfCtr`
+    /// MSRs the stealth router shadows; when absent it is **not** advertised
+    /// (claiming a counter surface the apparent host lacks is itself a tell).
+    pub perfmon_v2: Option<CpuidResult>,
 }
 
 /// Leaf 7 EBX bits safe to pass through from a host capture.
@@ -196,6 +205,27 @@ impl CpuidStealthConfig {
             }
         }
 
+        // AMD PerfMonV2 capability leaf (0x8000_0022), captured verbatim only
+        // when the host really advertises it — so we never claim a PMU surface
+        // the apparent host lacks (this nested host, e.g., reports max extended
+        // leaf 0x8000_0021 and a zero 0x8000_0022).
+        let max_ext = __cpuid(0x8000_0000).eax;
+        let perfmon_v2 = if vendor == CpuVendor::Amd && max_ext >= 0x8000_0022 {
+            let r = __cpuid(0x8000_0022);
+            if r.eax != 0 {
+                Some(CpuidResult {
+                    eax: r.eax,
+                    ebx: r.ebx,
+                    ecx: r.ecx,
+                    edx: r.edx,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Host frequencies from Intel leaf 0x16, when enumerated; otherwise
         // the plausible defaults the synthetic profile uses.
         let (base_frequency_mhz, max_frequency_mhz) = if leaf0.eax >= 0x16 {
@@ -223,6 +253,7 @@ impl CpuidStealthConfig {
             cache_info,
             base_frequency_mhz,
             max_frequency_mhz,
+            perfmon_v2,
         }
     }
 }
@@ -642,6 +673,21 @@ impl CpuidStealthTable {
                 edx: 0,
             },
         });
+
+        // 0x8000_0022: AMD PerfMonV2 capability (Zen 4+). Advertised only when
+        // the host really exposes it (captured in `from_host`), so the guest's
+        // CPUID-enumerated PMU (EAX bit 0 = PerfMonV2, EBX[3:0] = core-PMC count)
+        // matches the AMD PerfCtr MSRs the stealth router shadows. The leaf is
+        // passed through verbatim — its counts are a host fact, like the brand
+        // string — and `build` has already raised the max extended leaf to cover
+        // it. A no-op on a host without PerfMonV2 (and on Intel).
+        if let Some(perfmon_v2) = config.perfmon_v2 {
+            entries.push(CpuidCacheEntry {
+                leaf: 0x8000_0022,
+                subleaf: 0,
+                result: perfmon_v2,
+            });
+        }
     }
 
     /// Build the stealth CPUID table from physical CPU info.
@@ -655,7 +701,12 @@ impl CpuidStealthTable {
         // zeros here, consistent with not advertising SME/SEV anywhere else).
         let (max_standard_leaf, max_extended_leaf) = match config.vendor {
             CpuVendor::Intel => (0x16, 0x8000_0008), // frequency / address sizes
-            CpuVendor::Amd => (0x10, 0x8000_001F),   // PQOS / SEV
+            // AMD's extended range normally ends at 0x8000_001F (the SEV leaf);
+            // a PerfMonV2 host (Zen 4+) extends it to 0x8000_0022 so the
+            // capability leaf below is in range. Leaves 0x8000_0020/0021 stay
+            // in-range reserved-zero (not advertised), like the SEV leaf.
+            CpuVendor::Amd if config.perfmon_v2.is_some() => (0x10, 0x8000_0022),
+            CpuVendor::Amd => (0x10, 0x8000_001F), // PQOS / SEV
         };
 
         Self::push_standard_leaves(config, max_standard_leaf, &mut entries);
@@ -975,6 +1026,7 @@ mod tests {
             cache_info: Vec::new(),
             base_frequency_mhz: 2800,
             max_frequency_mhz: 3300,
+            perfmon_v2: None,
         }
     }
 
@@ -996,6 +1048,58 @@ mod tests {
             assert_eq!(result.ecx, 0);
             assert_eq!(result.edx, 0);
         }
+    }
+
+    #[test]
+    fn amd_perfmon_v2_leaf_absent_when_host_lacks_it() {
+        // The default AMD test_config has perfmon_v2 = None (this nested host's
+        // case): leaf 0x8000_0022 must be out of range and the max extended leaf
+        // stays at the SEV leaf 0x8000_001F.
+        let table = CpuidStealthTable::build(&test_config());
+        assert_eq!(table.lookup(0x8000_0000, 0).eax, 0x8000_001F);
+        assert_eq!(table.lookup(0x8000_0022, 0), CpuidResult::default());
+    }
+
+    #[test]
+    fn amd_perfmon_v2_leaf_advertised_when_host_has_it() {
+        // A Zen 4-style host: PerfMonV2 (EAX bit 0) with 6 core PMCs (EBX[3:0]).
+        let host_leaf = CpuidResult {
+            eax: 0x1,
+            ebx: 0x6,
+            ecx: 0,
+            edx: 0,
+        };
+        let cfg = CpuidStealthConfig {
+            perfmon_v2: Some(host_leaf),
+            ..test_config()
+        };
+        let table = CpuidStealthTable::build(&cfg);
+        // Max extended leaf is raised to cover 0x8000_0022.
+        assert_eq!(table.lookup(0x8000_0000, 0).eax, 0x8000_0022);
+        // The capability leaf is passed through verbatim.
+        assert_eq!(table.lookup(0x8000_0022, 0), host_leaf);
+        // 0x8000_0020/0021 stay in-range reserved-zero (not advertised).
+        assert_eq!(table.lookup(0x8000_0020, 0), CpuidResult::default());
+        assert_eq!(table.lookup(0x8000_0021, 0), CpuidResult::default());
+        // 0x8000_0023 is now out of range → AMD zeros.
+        assert_eq!(table.lookup(0x8000_0023, 0), CpuidResult::default());
+    }
+
+    #[test]
+    fn intel_config_never_advertises_amd_perfmon_v2() {
+        // Even if a (nonsensical) Intel config carried perfmon_v2, the AMD-only
+        // emission path must not fire for an Intel vendor.
+        let cfg = CpuidStealthConfig {
+            perfmon_v2: Some(CpuidResult {
+                eax: 0x1,
+                ..CpuidResult::default()
+            }),
+            ..intel_config()
+        };
+        let table = CpuidStealthTable::build(&cfg);
+        assert_eq!(table.lookup(0x8000_0000, 0).eax, 0x8000_0008);
+        // Out of range on Intel → mirrors the highest basic leaf, not the leaf.
+        assert_ne!(table.lookup(0x8000_0022, 0).eax, 0x1);
     }
 
     fn intel_config() -> CpuidStealthConfig {

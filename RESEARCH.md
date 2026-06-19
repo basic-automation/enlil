@@ -1443,3 +1443,21 @@ ranges on `IntelVmx`, never the other platform's (forwarding the wrong vendor's
 PMC MSRs would make non-existent registers readable — the same tell the LBR fork
 already avoids). The synthetic leaf-`0x8000_0022` advertise is left for a host
 that actually exposes PerfMonV2.
+
+## 2026-06-19 (b) — AMD PerfMonV2 CPUID leaf 0x8000_0022 (Phase 5.3)
+
+Follow-on to 2026-06-19 (AMD PMC MSR surface). AMD `CPUID Fn8000_0022` (Zen 4+,
+AMD PPR Family 19h) advertises Performance Monitoring Version 2: `EAX` bit 0 =
+PerfMonV2, bit 1 = `LbrStack`, bit 2 = `LbrAndPmcFreeze`; `EBX[3:0]` =
+`NumCorePmc` (core perf-counter count, 6 on Zen 4), `EBX[9:4]` = `LbrStackSize`.
+A guest that enumerates PerfMonV2 and then finds the AMD PerfCtr MSRs unanswered
+(or vice-versa) has a cross-surface tell, so the CPUID advertise and the MSR
+shadow must agree. `CpuidStealthConfig` now carries an optional captured
+`0x8000_0022`, populated by `from_host` only when the host genuinely exposes it,
+and `build` emits it host-gated (raising the AMD max extended leaf to
+`0x8000_0022`; `0x8000_0020/0021` stay in-range reserved-zero, not advertised,
+like the SEV leaf `0x8000_001F`). Measured: this nested host reports
+`max_ext = 0x8000_0021`, so the builder is a no-op here and we do not advertise a
+feature the apparent host lacks — the honest default. The leaf matters for the
+bare-metal backend (which serves CPUID from the table) and on real Zen 4 silicon
+where KVM already mirrors it.
