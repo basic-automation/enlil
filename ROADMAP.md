@@ -1837,8 +1837,12 @@ Physical USB Devices
   `0x8000_0022` verbatim only when the host actually advertises it
   (`max_ext ≥ 0x8000_0022` and non-zero `EAX`); `CpuidStealthTable::build`
   then raises the AMD max extended leaf to `0x8000_0022` and emits the
-  capability (`EAX` bit 0 + the host's `EBX[3:0]` core-PMC count), so a guest's
-  CPUID-enumerated PMU matches the AMD PerfCtr MSRs the router shadows. On a
+  capability **constrained to what the MSR router backs** — `PerfMonV2` (`EAX`
+  bit 0) with `NumCorePmc` clamped to the shadowed core-PMC count, and the
+  `LbrStack`/`LbrAndPmcFreeze` bits + `LbrStackSize` cleared (the router models
+  only the legacy LBR pair, not the PerfMonV2 extended LBR stack, so advertising
+  it would promise MSRs RDMSR then `#GP`s) — so a guest's CPUID-enumerated PMU
+  matches the AMD PerfCtr MSRs the router shadows. On a
   host without PerfMonV2 (this nested runner: `max_ext = 0x8000_0021`) it is a
   no-op — the leaf stays out of range — so we never claim a counter surface the
   apparent host lacks. Live-guest injection isn't needed: a real PerfMonV2 host's

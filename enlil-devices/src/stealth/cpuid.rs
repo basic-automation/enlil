@@ -676,16 +676,30 @@ impl CpuidStealthTable {
 
         // 0x8000_0022: AMD PerfMonV2 capability (Zen 4+). Advertised only when
         // the host really exposes it (captured in `from_host`), so the guest's
-        // CPUID-enumerated PMU (EAX bit 0 = PerfMonV2, EBX[3:0] = core-PMC count)
-        // matches the AMD PerfCtr MSRs the stealth router shadows. The leaf is
-        // passed through verbatim — its counts are a host fact, like the brand
-        // string — and `build` has already raised the max extended leaf to cover
-        // it. A no-op on a host without PerfMonV2 (and on Intel).
+        // CPUID-enumerated PMU matches the AMD PerfCtr MSRs the stealth router
+        // shadows. `build` has already raised the max extended leaf to cover it.
+        // A no-op on a host without PerfMonV2 (and on Intel).
+        //
+        // The leaf is **constrained to what the MSR router actually backs**, not
+        // passed through verbatim: we advertise PerfMonV2 (EAX bit 0) with
+        // `NumCorePmc` (EBX[3:0]) clamped to the shadowed core-PMC count, and
+        // clear the LBR-stack capabilities — `LbrStack`/`LbrAndPmcFreeze`
+        // (EAX bits 1/2) and `LbrStackSize` (EBX[9:4]). The router models only
+        // the legacy single LBR pair (0x1DB–0x1DE), not the PerfMonV2 extended
+        // LBR stack, so advertising a stack whose MSRs we cannot serve would be a
+        // cross-surface tell (CPUID promises a register set RDMSR then #GPs).
         if let Some(perfmon_v2) = config.perfmon_v2 {
+            let shadowed_pmcs = super::pmc::msr::AMD_CORE_PMCS;
+            let num_core_pmc = (perfmon_v2.ebx & 0xF).min(shadowed_pmcs);
             entries.push(CpuidCacheEntry {
                 leaf: 0x8000_0022,
                 subleaf: 0,
-                result: perfmon_v2,
+                result: CpuidResult {
+                    eax: perfmon_v2.eax & 0x1, // PerfMonV2 only; no LBR-stack caps
+                    ebx: num_core_pmc,         // NumCorePmc only; no LbrStackSize
+                    ecx: 0,
+                    edx: 0,
+                },
             });
         }
     }
@@ -1076,13 +1090,42 @@ mod tests {
         let table = CpuidStealthTable::build(&cfg);
         // Max extended leaf is raised to cover 0x8000_0022.
         assert_eq!(table.lookup(0x8000_0000, 0).eax, 0x8000_0022);
-        // The capability leaf is passed through verbatim.
+        // PerfMonV2 with 6 core PMCs and no LBR-stack bits is already exactly
+        // what the router backs, so it survives the constraining unchanged.
         assert_eq!(table.lookup(0x8000_0022, 0), host_leaf);
         // 0x8000_0020/0021 stay in-range reserved-zero (not advertised).
         assert_eq!(table.lookup(0x8000_0020, 0), CpuidResult::default());
         assert_eq!(table.lookup(0x8000_0021, 0), CpuidResult::default());
         // 0x8000_0023 is now out of range → AMD zeros.
         assert_eq!(table.lookup(0x8000_0023, 0), CpuidResult::default());
+    }
+
+    #[test]
+    fn amd_perfmon_v2_leaf_advertises_only_what_the_router_backs() {
+        // Host advertises PerfMonV2 + LbrStack + LbrAndPmcFreeze (EAX bits 0-2)
+        // and a large NumCorePmc (EBX[3:0]=15) + LbrStackSize (EBX[9:4]=16). The
+        // router backs only core-PMC counting and the legacy LBR pair, so the
+        // emitted leaf keeps PerfMonV2 with NumCorePmc clamped to the shadowed
+        // count and drops every LBR-stack capability.
+        let host_leaf = CpuidResult {
+            eax: 0x7,
+            ebx: 0xF | (0x10 << 4),
+            ecx: 0xDEAD,
+            edx: 0xBEEF,
+        };
+        let cfg = CpuidStealthConfig {
+            perfmon_v2: Some(host_leaf),
+            ..test_config()
+        };
+        let leaf = CpuidStealthTable::build(&cfg).lookup(0x8000_0022, 0);
+        assert_eq!(leaf.eax, 0x1, "PerfMonV2 only; LbrStack/Freeze cleared");
+        assert_eq!(
+            leaf.ebx,
+            crate::stealth::pmc::msr::AMD_CORE_PMCS,
+            "NumCorePmc clamped to the shadowed count; LbrStackSize cleared"
+        );
+        assert_eq!(leaf.ecx, 0);
+        assert_eq!(leaf.edx, 0);
     }
 
     #[test]
