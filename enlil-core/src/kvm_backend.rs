@@ -1868,6 +1868,118 @@ mod tests {
         assert!(handler.router.lbr.lbr_enabled);
     }
 
+    // The AMD last-branch MSRs are forwarded and served on the live guest: an
+    // anti-cheat reads LastBranchFromIP (0x1DB) after forcing a VMEXIT to spot a
+    // branch into the hypervisor. Forwarding the AMD router's filter ranges, a
+    // guest rdmsr of 0x1DB (which KVM otherwise emulates) traps to userspace and
+    // reads the router's sanitized LbrState shadow, not a real branch record.
+    // Self-skips without /dev/kvm or the userspace-MSR cap rather than faking it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn amd_last_branch_msr_is_forwarded_and_serves_the_router_shadow() {
+        use crate::stealth_msr::StealthMsrRouter;
+        use crate::timing_stealth::VcpuTimingState;
+        use enlil_devices::stealth::lbr::{amd_msr, LbrPlatform, LbrState};
+
+        if !is_kvm_available() {
+            eprintln!("skipping amd_last_branch_msr_...: no /dev/kvm");
+            return;
+        }
+
+        struct RouterHandler {
+            router: StealthMsrRouter,
+            echoed: Vec<u8>,
+        }
+        impl VmExitHandler for RouterHandler {
+            fn rdmsr(&mut self, msr: u32) -> Option<u64> {
+                self.router.read_msr(msr)
+            }
+            fn io_out(&mut self, _port: u16, data: &[u8]) {
+                self.echoed.extend_from_slice(data);
+            }
+        }
+
+        // An AMD-platform router whose LastBranchFromIP shadow has low byte 0x3E.
+        let mut router =
+            StealthMsrRouter::new(VcpuTimingState::new(), LbrState::new(LbrPlatform::AmdSvm));
+        assert!(router
+            .lbr
+            .write_amd_lbr(amd_msr::LAST_BRANCH_FROM_IP, 0x0000_0000_0000_003E));
+
+        // 16-bit real-mode blob:
+        //   66 B9 DB 01 00 00   mov ecx, 0x1DB   ; AMD LastBranchFromIP
+        //   0F 32               rdmsr
+        //   BA F8 03            mov dx, 0x3F8
+        //   EE                  out dx, al
+        //   F4                  hlt
+        #[rustfmt::skip]
+        let code: [u8; 13] = [
+            0x66, 0xB9, 0xDB, 0x01, 0x00, 0x00,
+            0x0F, 0x32,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0xF4,
+        ];
+        const ENTRY: u64 = 0x1000;
+
+        let mut ram = GuestRam::new(0x1000);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        if let Err(e) = backend.enable_userspace_msr_exits() {
+            eprintln!("skipping amd_last_branch_msr_...: {e}");
+            return;
+        }
+        let ranges = router.filter_ranges();
+        assert!(
+            ranges
+                .iter()
+                .any(|&(b, c)| amd_msr::LAST_BRANCH_FROM_IP >= b
+                    && amd_msr::LAST_BRANCH_FROM_IP < b + c),
+            "the AMD last-branch pair must be in the AMD router's filter ranges"
+        );
+        if let Err(e) = backend.forward_msrs_to_userspace(&ranges) {
+            eprintln!("skipping amd_last_branch_msr_...: {e}");
+            return;
+        }
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        let mut handler = RouterHandler {
+            router,
+            echoed: Vec::new(),
+        };
+
+        let mut halted = false;
+        let mut saw_msr = false;
+        for _ in 0..100 {
+            match backend.run_vcpu(0, &mut handler).expect("run vcpu") {
+                GuestExit::Halted => {
+                    halted = true;
+                    break;
+                }
+                GuestExit::MsrRead { msr } => {
+                    assert_eq!(msr, amd_msr::LAST_BRANCH_FROM_IP);
+                    saw_msr = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        assert!(
+            saw_msr,
+            "AMD LastBranchFromIP rdmsr never trapped to userspace"
+        );
+        // The router's shadow (low byte 0x3E) reached the guest.
+        assert_eq!(handler.echoed, vec![0x3E]);
+    }
+
     // Proves clear_cpuid_hypervisor_bit() installs the host's *real* feature
     // set on the guest with the hypervisor-present tell cleared: after applying
     // it, a guest running CPUID leaf 1 reads ECX bit 31 (hypervisor present) as
