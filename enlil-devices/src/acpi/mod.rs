@@ -588,6 +588,59 @@ mod tests {
     }
 
     #[test]
+    fn loader_relocates_and_revalidates_the_whole_acpi_set() {
+        // The end-to-end proof, without an OVMF boot: build the set at base 0,
+        // build its etc/table-loader, then *execute* that loader (the firmware
+        // side) placing the files at chosen addresses. Afterward the pointer
+        // chain must resolve to the relocated tables and every ACPI checksum
+        // must validate — exactly what a real firmware would end up with.
+        use crate::fw_cfg_loader::LoaderExecutor;
+        const TABLES_BASE: u64 = 0x7F00_0000;
+        const RSDP_BASE: u64 = 0x000E_0000;
+
+        let config = AcpiTableSetConfig {
+            table_base_address: 0,
+            ..AcpiTableSetConfig::default()
+        };
+        let set = build_acpi_tables(&config);
+        let loader = build_acpi_table_loader(&set);
+
+        let mut exec = LoaderExecutor::new();
+        exec.add_file("etc/acpi/tables", TABLES_BASE, set.tables.clone());
+        exec.add_file("etc/acpi/rsdp", RSDP_BASE, set.rsdp.clone());
+        exec.execute(&loader).expect("loader executes cleanly");
+
+        let tables = exec.file("etc/acpi/tables").unwrap();
+        let rsdp = exec.file("etc/acpi/rsdp").unwrap();
+        let off = |name: &str| set.table_offsets.iter().find(|(n, _)| n == name).unwrap().1;
+        let le64 = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+
+        // RSDP -> XSDT now points at the relocated XSDT (offset 0 in tables).
+        assert_eq!(le64(rsdp, 24), TABLES_BASE);
+        // XSDT entry 0 -> FADT, FADT X_DSDT -> DSDT, both at the new base.
+        assert_eq!(
+            le64(tables, off("XSDT") + 36),
+            TABLES_BASE + off("FADT") as u64
+        );
+        assert_eq!(
+            le64(tables, off("FADT") + 140),
+            TABLES_BASE + off("DSDT") as u64
+        );
+
+        // Every SDT checksum validates (whole-table byte sum == 0).
+        for (name, start) in &set.table_offsets {
+            let len = u32::from_le_bytes(tables[start + 4..start + 8].try_into().unwrap()) as usize;
+            let sum = tables[*start..start + len]
+                .iter()
+                .fold(0u8, |a, &b| a.wrapping_add(b));
+            assert_eq!(sum, 0, "{name} checksum invalid after relocation");
+        }
+        // RSDP's two checksums validate (first 20 bytes, then all 36).
+        assert_eq!(rsdp[..20].iter().fold(0u8, |a, &b| a.wrapping_add(b)), 0);
+        assert_eq!(rsdp[..36].iter().fold(0u8, |a, &b| a.wrapping_add(b)), 0);
+    }
+
+    #[test]
     fn table_loader_checksum_spans_match_table_lengths() {
         let config = AcpiTableSetConfig {
             table_base_address: 0,

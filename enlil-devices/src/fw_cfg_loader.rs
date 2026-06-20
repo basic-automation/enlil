@@ -212,6 +212,189 @@ impl Entry {
     }
 }
 
+/// Why executing a bios-linker-loader command stream failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoaderError {
+    /// A command referenced a file that was never added to the executor.
+    UnknownFile(String),
+    /// A command's field/offset fell outside the referenced file.
+    OutOfBounds {
+        /// The file the access was against.
+        file: String,
+        /// The byte offset that was out of range.
+        offset: usize,
+    },
+    /// An `ADD_POINTER`/`WRITE_POINTER` declared an unsupported pointer width.
+    BadPointerSize(u8),
+    /// The stream length was not a whole number of 128-byte commands.
+    TruncatedStream(usize),
+    /// An unknown command opcode.
+    UnknownCommand(u32),
+}
+
+/// A minimal in-process executor of a bios-linker-loader command stream — the
+/// *firmware* side of the `etc/table-loader` contract.
+///
+/// It exists to validate a generated loader (and the base-0 tables it
+/// relocates) without a full OVMF/SeaBIOS boot: place each delivered file at a
+/// caller-chosen base with [`add_file`](Self::add_file), [`execute`](Self::execute)
+/// the stream, and inspect the relocated bytes with [`file`](Self::file). The
+/// `ADD_POINTER` and `ADD_CHECKSUM` semantics mirror QEMU/edk2:
+/// `*(dest+offset) += base(src)` over a little-endian pointer, and the checksum
+/// byte is decremented by the sum of its covered range (so the range sums to 0).
+#[derive(Debug, Clone, Default)]
+pub struct LoaderExecutor {
+    /// name -> (allocation base, file image).
+    files: std::collections::HashMap<String, (u64, Vec<u8>)>,
+}
+
+impl LoaderExecutor {
+    /// A new executor with no files.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Place `data` (a delivered `fw_cfg` file) at allocation address `base`.
+    pub fn add_file(&mut self, name: &str, base: u64, data: Vec<u8>) {
+        self.files.insert(name.to_string(), (base, data));
+    }
+
+    /// The (relocated) image of a previously added file.
+    #[must_use]
+    pub fn file(&self, name: &str) -> Option<&[u8]> {
+        self.files.get(name).map(|(_, d)| d.as_slice())
+    }
+
+    /// The allocation base a file was placed at.
+    #[must_use]
+    pub fn base(&self, name: &str) -> Option<u64> {
+        self.files.get(name).map(|(b, _)| *b)
+    }
+
+    fn base_of(&self, name: &str) -> Result<u64, LoaderError> {
+        self.files
+            .get(name)
+            .map(|(b, _)| *b)
+            .ok_or_else(|| LoaderError::UnknownFile(name.to_string()))
+    }
+
+    /// Execute every command in `stream`, mutating the added file images in
+    /// place exactly as the firmware would.
+    ///
+    /// # Errors
+    /// Returns a [`LoaderError`] if the stream is malformed, names an unknown
+    /// file, addresses outside a file, or uses an unsupported command/size.
+    pub fn execute(&mut self, stream: &[u8]) -> Result<(), LoaderError> {
+        if !stream.len().is_multiple_of(ENTRY_SIZE) {
+            return Err(LoaderError::TruncatedStream(stream.len()));
+        }
+        for e in stream.chunks_exact(ENTRY_SIZE) {
+            match read_u32(e, 0x00) {
+                COMMAND_ALLOCATE => {
+                    // The caller models allocation by pre-placing files; just
+                    // confirm the target exists.
+                    self.base_of(&read_name(e, 0x04))?;
+                }
+                COMMAND_ADD_POINTER => self.add_pointer(e)?,
+                COMMAND_ADD_CHECKSUM => self.add_checksum(e)?,
+                COMMAND_WRITE_POINTER => self.write_pointer(e)?,
+                other => return Err(LoaderError::UnknownCommand(other)),
+            }
+        }
+        Ok(())
+    }
+
+    fn add_pointer(&mut self, e: &[u8]) -> Result<(), LoaderError> {
+        let dest = read_name(e, 0x04);
+        let src = read_name(e, 0x38);
+        let offset = read_u32(e, 0x6C) as usize;
+        let size = e[0x70];
+        let src_base = self.base_of(&src)?;
+        let (_, data) = self
+            .files
+            .get_mut(&dest)
+            .ok_or_else(|| LoaderError::UnknownFile(dest.clone()))?;
+        let cur = read_le(data, offset, size).ok_or_else(|| LoaderError::OutOfBounds {
+            file: dest.clone(),
+            offset,
+        })?;
+        write_le(data, offset, size, cur.wrapping_add(src_base))
+    }
+
+    fn write_pointer(&mut self, e: &[u8]) -> Result<(), LoaderError> {
+        let dest = read_name(e, 0x04);
+        let src = read_name(e, 0x38);
+        let dst_offset = read_u32(e, 0x6C) as usize;
+        let src_offset = u64::from(read_u32(e, 0x70));
+        let size = e[0x74];
+        let src_base = self.base_of(&src)?;
+        let (_, data) = self
+            .files
+            .get_mut(&dest)
+            .ok_or_else(|| LoaderError::UnknownFile(dest.clone()))?;
+        write_le(data, dst_offset, size, src_base.wrapping_add(src_offset))
+    }
+
+    fn add_checksum(&mut self, e: &[u8]) -> Result<(), LoaderError> {
+        let file = read_name(e, 0x04);
+        let offset = read_u32(e, 0x3C) as usize;
+        let start = read_u32(e, 0x40) as usize;
+        let length = read_u32(e, 0x44) as usize;
+        let (_, data) = self
+            .files
+            .get_mut(&file)
+            .ok_or_else(|| LoaderError::UnknownFile(file.clone()))?;
+        if offset >= data.len() || start.checked_add(length).is_none_or(|end| end > data.len()) {
+            return Err(LoaderError::OutOfBounds { file, offset });
+        }
+        let sum = data[start..start + length]
+            .iter()
+            .fold(0u8, |a, &b| a.wrapping_add(b));
+        data[offset] = data[offset].wrapping_sub(sum);
+        Ok(())
+    }
+}
+
+const fn read_u32(b: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+}
+
+fn read_name(b: &[u8], off: usize) -> String {
+    let field = &b[off..off + FILE_NAME_SIZE];
+    let end = field.iter().position(|&c| c == 0).unwrap_or(FILE_NAME_SIZE);
+    String::from_utf8_lossy(&field[..end]).into_owned()
+}
+
+/// Read a `size`-byte (1/2/4/8) little-endian value at `offset`, or `None` if
+/// it would read past the end of `data`.
+fn read_le(data: &[u8], offset: usize, size: u8) -> Option<u64> {
+    let n = size as usize;
+    let slice = data.get(offset..offset.checked_add(n)?)?;
+    let mut v = 0u64;
+    for (i, &b) in slice.iter().enumerate() {
+        v |= u64::from(b) << (8 * i);
+    }
+    Some(v)
+}
+
+fn write_le(data: &mut [u8], offset: usize, size: u8, value: u64) -> Result<(), LoaderError> {
+    let n = match size {
+        1 | 2 | 4 | 8 => size as usize,
+        other => return Err(LoaderError::BadPointerSize(other)),
+    };
+    let end = offset.checked_add(n).filter(|&e| e <= data.len());
+    let Some(end) = end else {
+        return Err(LoaderError::OutOfBounds {
+            file: String::new(),
+            offset,
+        });
+    };
+    let bytes = value.to_le_bytes();
+    data[offset..end].copy_from_slice(&bytes[..n]);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,5 +512,57 @@ mod tests {
         l.allocate("etc/acpi/tables", 0x40, AllocZone::High);
         let borrowed = l.as_bytes().to_vec();
         assert_eq!(l.into_bytes(), borrowed);
+    }
+
+    #[test]
+    fn executor_relocates_a_pointer_by_the_source_base() {
+        // A "tables" file with an 8-byte field at offset 0 holding the in-blob
+        // offset 0x10; ALLOCATE it at base 0x4000_0000, then ADD_POINTER should
+        // make the field read 0x4000_0010.
+        let mut l = BiosLinkerLoader::new();
+        l.allocate("t", 1, AllocZone::High)
+            .add_pointer("t", "t", 0, 8);
+
+        let mut data = vec![0u8; 16];
+        data[0..8].copy_from_slice(&0x10u64.to_le_bytes());
+        let mut exec = LoaderExecutor::new();
+        exec.add_file("t", 0x4000_0000, data);
+        exec.execute(l.as_bytes()).unwrap();
+
+        let got = u64::from_le_bytes(exec.file("t").unwrap()[0..8].try_into().unwrap());
+        assert_eq!(got, 0x4000_0010);
+    }
+
+    #[test]
+    fn executor_checksum_makes_the_range_sum_to_zero() {
+        // ADD_CHECKSUM over a 4-byte range with the checksum byte inside it must
+        // leave the range summing to 0 (mod 256), like an ACPI table checksum.
+        let mut l = BiosLinkerLoader::new();
+        l.allocate("t", 1, AllocZone::High)
+            .add_checksum("t", 0, 0, 4); // checksum byte at 0, over [0,4)
+
+        let mut exec = LoaderExecutor::new();
+        exec.add_file("t", 0, vec![0x00, 0x11, 0x22, 0x33]);
+        exec.execute(l.as_bytes()).unwrap();
+
+        let f = exec.file("t").unwrap();
+        let sum = f[0..4].iter().fold(0u8, |a, &b| a.wrapping_add(b));
+        assert_eq!(sum, 0);
+    }
+
+    #[test]
+    fn executor_rejects_truncated_and_unknown_files() {
+        let mut exec = LoaderExecutor::new();
+        assert_eq!(
+            exec.execute(&[0u8; 7]),
+            Err(LoaderError::TruncatedStream(7))
+        );
+
+        let mut l = BiosLinkerLoader::new();
+        l.add_pointer("missing", "alsogone", 0, 8);
+        assert!(matches!(
+            exec.execute(l.as_bytes()),
+            Err(LoaderError::UnknownFile(_))
+        ));
     }
 }
