@@ -6,6 +6,124 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-20 — Session: the complete ACPI `etc/table-loader` delivery path, proven end-to-end without OVMF (Phase 5)
+
+**9 increments (8 code/test + 1 docs), each independently green and committed**
+(branch `routine/enlil-2026-06-20`, PR _(added below)_). This session built the
+**entire firmware table-loader delivery path** the 2026-06-19 next-step #1 pointed
+at — the piece the prior run deliberately *deferred* because "its correctness can
+only be proven by an OVMF boot." It is now built **and** proven in-process: a
+faithful firmware-side loader executor relocates the synthesized ACPI set to a
+real address and confirms the pointer chain resolves and every checksum
+validates, so no OVMF boot is needed to know the stream is correct.
+
+### Increments (commit — what)
+1. `7717cf3` — **`fw_cfg_loader::BiosLinkerLoader`** — byte-exact emitter for the
+   QEMU `etc/table-loader` command stream (ALLOCATE / ADD_POINTER / ADD_CHECKSUM
+   / WRITE_POINTER). The 128-byte `QEMU_PACKED` entry layout + field offsets are
+   **transcribed from `qemu/hw/acpi/bios-linker-loader.c`** (not from memory — the
+   prior run's exact caution), asserted byte-for-byte. +9 tests.
+2. `fa09e93` — **ACPI relocation reporter, byte-validated.** `build_acpi_tables`
+   now reports `pointers: Vec<AcpiPointer>` (RSDP→XSDT, the 10 XSDT entries, FADT
+   FACS/DSDT ×{32,64}-bit = 15) as `{pointer_file, target_file, offset, size,
+   target_offset}`. The `pointer_self_validates_against_built_bytes` test re-reads
+   each claimed offset in the actually-built bytes and asserts it holds
+   `base+target_offset` — a wrong offset fails CI here, no firmware needed. +2.
+3. `13fc56c` — **`build_acpi_table_loader(&set)`** turns the relocation map into a
+   full loader: ALLOCATE tables(high)+rsdp(fseg), one ADD_POINTER per relocation,
+   per-SDT ADD_CHECKSUM (span read from each table's own header length) + the RSDP
+   20/36-byte checksums, checksums last. +2.
+4. `62108a0` — **`FwCfgDevice::add_acpi_with_loader`** builds the set at base 0 and
+   registers `etc/acpi/rsdp` + `etc/acpi/tables` + `etc/table-loader`. Derive
+   `Clone` on `AcpiTableSetConfig` (+`Clone,Copy` on `DsdtConfig`). +1.
+5. `f3661a3` — **`fw_cfg_loader::LoaderExecutor` (the firmware side) + the OVMF-free
+   end-to-end proof.** Executes ALLOCATE/ADD_POINTER/ADD_CHECKSUM/WRITE_POINTER
+   over caller-placed files exactly as edk2 does. The payoff test relocates a
+   base-0 set to `0x7F00_0000`/F-seg and asserts the RSDP→XSDT→FADT→DSDT chain
+   resolves and all 14 ACPI checksums validate. +4.
+6. `59bf19c` — **`StandardPc::install_acpi_fw_cfg`** mounts the populated `fw_cfg`
+   on the assembled PC's PIO bus (opt-in, not baked into `standard_pc_complete`).
+   +1 (drives it over the real bus).
+7. `168c86c` — **docs:** `RESEARCH.md` bios-linker-loader ABI entry; `ROADMAP.md`
+   5.2 marked the ACPI table-loader delivery DONE with honest remaining items.
+8. `c5d5a05` — **pin the fixed 276-byte FADT layout** with a test (the hardcoded
+   `madt_start = fadt_offset + 276` and the FADT relocation offsets depend on it).
+9. `15ed055` — **`StandardPc::install_firmware_tables(acpi, smbios)`** — one
+   `fw_cfg` carrying ACPI+loader **and** the SMBIOS file set. +1.
+   `a5c2a60` — **device→executor seam test**: the bytes a guest reads *off the
+   FwCfgDevice* (not the builder output) relocate + revalidate through the loader.
+
+(Two commits landed under increment 9's heading: `15ed055` and `a5c2a60`.)
+
+### Research (informed the build)
+`RESEARCH.md 2026-06-20`: the QEMU `etc/table-loader` (bios-linker-loader) ABI,
+transcribed directly from `qemu/hw/acpi/bios-linker-loader.c` (128-byte entries,
+command opcodes 1–4, exact field offsets, all LE). Key finding that shaped scope:
+**SMBIOS is NOT routed through table-loader** — OVMF's `SmbiosPlatformDxe` reads
+`etc/smbios/{anchor,tables}` and re-installs the structures via the EFI SMBIOS
+protocol itself (the anchor's `structure_table_address` is recomputed by
+firmware), and QEMU emits no SMBIOS bios-linker-loader commands, so we don't
+either — SMBIOS is delivered as plain `fw_cfg` files.
+
+### Test results (exact)
+- **`/dev/kvm`: read-writable this run (`KVM_RW_OK`, confirmed again at wrap).**
+  The KVM / guest-boot tests **ran for real** (none skipped): `kvm_backend` 28
+  passed incl. `kvm_create_vm_and_map_memory`, `guest_memory_dma_round_trips_real_guest_ram`,
+  `guest_ram_is_page_aligned_zeroed_and_writable`, and the live real-mode MSR/CPUID
+  forwarding + run-loop boots from prior runs — all green, no regression (this
+  session touched the ACPI/fw_cfg/device_bus *delivery* paths, not the KVM path).
+- **Full workspace CI-parity** (the `.github/workflows/ci.yml` commands):
+  `cargo fmt --all -- --check` → clean; `cargo clippy --all-targets --workspace
+  -- -D warnings` → exit 0; `cargo test --workspace` → **1106 passed, 0 failed**
+  (**enlil-devices 791**, started 771; **enlil-core 196**, started 194; + the
+  smaller crates; 1 pre-existing ignored). The `acpi_iasl_validation` /
+  `dmidecode` integration tests self-skipped — **`iasl`/`dmidecode` are not
+  installed on this host** (so the AML/SMBIOS reference-compiler gates did not run
+  this session; not a fabricated pass).
+- **Toolchains:** every increment built/tested on **Linux/WSL** (nightly
+  `x86_64-unknown-linux-gnu`). All host-agnostic increments were **also built
+  Windows-native** (`x86_64-pc-windows-msvc`, `cargo build -p {enlil-devices,
+  enlil-core}` against the WSL manifest with `D:\Development\.enlil-win-target`):
+  **exit 0** after every one. fw_cfg/ACPI/device_bus are host-agnostic and carry
+  no `target_os` gates, confirmed green on both.
+
+### STOP REASON
+**The cleanly-tractable, finish-and-test-tonight Phase-5 delivery work is
+complete; the remaining unblocked work is architectural or environment-blocked,
+and the guardrails say not to start-and-half-finish those.** Specifically: (a)
+**architectural** — per-vCPU stealth state (the run loop still shares one
+router/PMC/timing/LBR across vCPUs; the prior run *and* this one judge it needs a
+deliberate shared-state design, not a 1am refactor); (b) **needs absent tooling**
+— `iasl`/`acpica-tools` and `dmidecode` are not installed here, so adding complex
+AML (`_PSD`/`_CSD`) or new SMBIOS structures would ship without the reference-
+compiler gate the prior runs rely on, and an OVMF/SeaBIOS smoke boot (the only
+thing beyond the in-tree executor that could further validate the loader) isn't
+set up; (c) **hardware/UI/separate-PR** — libusb USB forwarder (needs hardware),
+TUI USB tab (UI), pinning `nightly` in CI (own PR + CI run). The ACPI delivery
+path is the natural unit and it is finished and independently green per commit, so
+`master` stays buildable. Wall-clock ~45 min of the budget was used efficiently
+on one deep, complete, well-tested feature rather than padded with churn or a
+risky half-refactor.
+
+### Recommended next step (tomorrow)
+1. **Per-vCPU stealth state** (now the top unblocked item): give each vCPU its own
+   APERF/MPERF/PMC/LBR. **Decide the shared-state model first** — either swap the
+   active vCPU's state into the bus router on each entry, or index the router by
+   vCPU index — then rewire `StealthRunLoop::run_vcpu_once` and
+   `install_stealth_msr_router`. Fully KVM-testable here. Unblocks the
+   threaded-vCPU watchdog.
+2. **Install `acpica-tools` + `dmidecode` (and ideally OVMF) on this WSL host** so
+   the self-skipping AML/SMBIOS gates run and an OVMF smoke boot can confirm the
+   new `etc/table-loader` against a real firmware (the in-tree `LoaderExecutor` is
+   the proxy until then). One-time human/setup step.
+3. **Bake `install_firmware_tables` into a guest-boot assembly path** (or
+   `standard_pc_complete` behind a flag) once a full boot is exercised, so a
+   booted guest actually receives the ACPI+SMBIOS set.
+4. Lower priority / blocked: AML `_PSD`/`_CSD` (after `iasl`); pin `nightly` in CI
+   (own PR); libusb forwarder (hardware); TUI USB tab (UI).
+
+---
+
 ## 2026-06-19 — Session: complete the AMD PerfMonV2 stealth surface + open the fw_cfg table-delivery path (Phase 5)
 
 **11 increments, each independently green and committed** (branch
