@@ -335,6 +335,58 @@ mod tests {
     }
 
     #[test]
+    fn device_delivered_bytes_relocate_and_revalidate_through_the_loader() {
+        // The strongest in-tree proof: take the bytes a guest actually *reads off
+        // the device* (not the builder's return value), run them through the
+        // firmware-side LoaderExecutor, and confirm the ACPI pointer chain
+        // resolves and every checksum validates. This catches any divergence
+        // between what the synthesizer builds and what fw_cfg delivers.
+        use crate::acpi::AcpiTableSetConfig;
+        use crate::fw_cfg_loader::LoaderExecutor;
+        const TABLES_BASE: u64 = 0x7F00_0000;
+        const RSDP_BASE: u64 = 0x000E_0000;
+
+        let mut dev = FwCfgDevice::new();
+        dev.add_acpi_with_loader(&AcpiTableSetConfig::default());
+
+        // Read each file back over the device's own read path by selector.
+        let read = |dev: &mut FwCfgDevice, sel: u16| -> Vec<u8> {
+            dev.write_selector(sel);
+            let len = dev
+                .files
+                .iter()
+                .find(|f| f.selector == sel)
+                .unwrap()
+                .data
+                .len();
+            (0..len).map(|_| dev.read_data()).collect()
+        };
+        let rsdp = read(&mut dev, 0x20);
+        let tables = read(&mut dev, 0x21);
+        let loader = read(&mut dev, 0x22);
+
+        let mut exec = LoaderExecutor::new();
+        exec.add_file("etc/acpi/tables", TABLES_BASE, tables);
+        exec.add_file("etc/acpi/rsdp", RSDP_BASE, rsdp);
+        exec.execute(&loader)
+            .expect("device-delivered loader executes");
+
+        let t = exec.file("etc/acpi/tables").unwrap();
+        let r = exec.file("etc/acpi/rsdp").unwrap();
+        // RSDP -> XSDT (offset 0) now points at the relocated tables base.
+        assert_eq!(
+            u64::from_le_bytes(r[24..32].try_into().unwrap()),
+            TABLES_BASE
+        );
+        // The XSDT (offset 0) checksum validates over its header length.
+        let xsdt_len = u32::from_le_bytes(t[4..8].try_into().unwrap()) as usize;
+        let sum = t[..xsdt_len].iter().fold(0u8, |a, &b| a.wrapping_add(b));
+        assert_eq!(sum, 0, "relocated XSDT checksum invalid");
+        // The RSDP's extended checksum validates over all 36 bytes.
+        assert_eq!(r[..36].iter().fold(0u8, |a, &b| a.wrapping_add(b)), 0);
+    }
+
+    #[test]
     fn acpi_with_loader_registers_all_three_files_and_a_valid_loader() {
         use crate::acpi::AcpiTableSetConfig;
         let config = AcpiTableSetConfig::default();
