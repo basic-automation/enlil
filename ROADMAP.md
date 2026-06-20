@@ -166,6 +166,46 @@ requirement, not a nicety**:
   counters count host events at a workload-varying ratio — the Phase 5.4 consistency
   surfaces cannot be faked under translation. Mesh/hybrid compute make no stealth claim.
 
+### Trust domains: an "Enlil device" (your own pool) vs federating with others
+
+The latency and ISA axes decide *what can be pooled and where it runs natively*. A third,
+orthogonal axis decides *how compute must be protected when the pool spans more than one
+owner*: the **trust domain**.
+
+- **An "Enlil device" = every node under one owner / one trust domain.** Your phone, desktop,
+  and laptop join into a single pool that presents as one logical-machine device. Inside this
+  boundary compute is **trusted**: shared in the clear, exactly the Core Model above —
+  plaintext memory tiers, zero-copy fabric back-ends, native vCPU placement, and the hot/cold
+  working-set split governed by the latency law. One owner, one trust domain, one composable
+  device.
+- **Federation across owners = untrusted compute.** Two Enlil devices can share capacity —
+  your device borrows a friend's idle GPU or cores. Across that boundary the remote nodes are
+  **untrusted**: you gain capacity but must never expose plaintext to, or depend on the
+  integrity of, a node you do not own. This is the Nillion-style **blind-compute** regime —
+  secret-shared / MPC / ZK-verified work units (see Phase 9.12 and 8.7) so no foreign node
+  sees plaintext and a compromised or dishonest peer can neither exfiltrate nor silently
+  corrupt the result. Merely establishing that the peer runs genuine Enlil needs the Phase
+  8.7/8.9/11 attestation (a threshold-signed quorum + ZK isolation proof); the blind-compute
+  layer is what lets you use it *without* having to trust it with the data.
+- **Trust is orthogonal to latency.** The governing law decides what can be pooled; the trust
+  domain decides how it must be protected when pooled across owners. A node can be
+  near-but-untrusted (a friend's machine on the same LAN) or far-but-trusted (your own remote
+  VPS). So a logical machine's placement key gains a **trust dimension** on top of
+  `(latency class, ISA, vendor, feature baseline)`.
+
+| | **trusted** (your own nodes) | **untrusted** (federated / market nodes) |
+|---|---|---|
+| **low latency** | full pooling — plaintext, hot vCPU+RAM working set shareable/migratable, zero-copy fabric | **blind compute only** — even nearby, never plaintext or hot state; secret-shared / verifiable work units |
+| **high latency** | coarse/async plaintext pooling (latency law) — storage, offload, whole-guest migration | blind compute, with the MPC preprocessing/online split (9.12) hiding the cross-trust round-trips |
+
+- **Admission / policy (mirrors the execution-mode admission rule):** each logical machine
+  declares which trust domains may serve it. A sensitive guest pins to the owner's own nodes
+  (`trust = owner-only`); fungible, decomposable work (the Phase 9 compute-queue, vGPU-offload
+  surface) may spill to **federated untrusted** capacity as blind compute
+  (`allow = federated-blind`). This is what extends "*N guests on M hosts*" to *M hosts owned
+  by different people* — the "resource market + reputation" plane below is precisely how
+  untrusted capacity is discovered, scored, and compensated.
+
 ### Distributed-compute planes (Phase 9 Fabric / Phase 11 Mesh)
 
 Patterns for routing latency-tolerant work across heterogeneous, possibly untrusted nodes —
