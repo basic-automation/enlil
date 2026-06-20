@@ -1711,10 +1711,26 @@ Physical USB Devices
   trait (16-bit item selector at `0x510`, byte-stream data register at `0x511`) and
   `DeviceBus::add_fw_cfg` mounts it; a guest reads the QEMU signature and the
   registered `etc/...` files straight off the bus (proven by an in-process PIO test
-  through `VmExitHandler::io_in/io_out`). **Remaining for full delivery:** populate a
-  mounted `fw_cfg` from the synthesized ACPI/SMBIOS in `standard_pc_complete`, and
-  emit the `etc/table-loader` link script (ALLOCATE / ADD_POINTER / ADD_CHECKSUM)
-  so OVMF/SeaBIOS places and patches the tables at guest-chosen addresses.
+  through `VmExitHandler::io_in/io_out`).
+- **`etc/table-loader` ACPI delivery — DONE (2026-06-20):** the bios-linker-loader
+  command-stream emitter (`enlil-devices::fw_cfg_loader::BiosLinkerLoader`,
+  ALLOCATE / ADD_POINTER / ADD_CHECKSUM / WRITE_POINTER, 128-byte entries
+  transcribed byte-for-byte from `qemu/hw/acpi/bios-linker-loader.c`) now exists.
+  `build_acpi_tables` reports its 15 inter-table pointer relocations (RSDP→XSDT,
+  the 10 XSDT entries, FADT FACS/DSDT in both 32- and 64-bit form) *validated
+  against the built bytes*, `acpi::build_acpi_table_loader` turns them into the
+  loader (relocations + per-SDT and RSDP checksums), and
+  `FwCfgDevice::add_acpi_with_loader` / `StandardPc::install_acpi_fw_cfg` build
+  the set at base 0 and register `etc/acpi/rsdp` + `etc/acpi/tables` +
+  `etc/table-loader`. Correctness is proven *without an OVMF boot* by an
+  in-process `fw_cfg_loader::LoaderExecutor` (the firmware side) that relocates
+  the set to a real address and confirms the RSDP→XSDT→FADT→DSDT chain resolves
+  and every ACPI checksum validates. **SMBIOS is intentionally not table-loader
+  routed** — OVMF's `SmbiosPlatformDxe` reads `etc/smbios/*` and re-installs the
+  structures itself (anchor address recomputed by firmware), matching QEMU, which
+  emits no SMBIOS bios-linker-loader commands. **Remaining:** `install_acpi_fw_cfg`
+  is opt-in, not yet baked into `standard_pc_complete`; an OVMF/SeaBIOS smoke
+  boot to confirm against a real firmware (the executor is the in-tree proxy).
 
 ### 5.3 CPUID Stealth
 - Intercept all CPUID exits and craft responses:

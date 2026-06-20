@@ -13,6 +13,7 @@ use super::tables::{AcpiSdtHeader, OemInfo};
 use crate::truncate::u32_of;
 
 /// DSDT builder configuration
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DsdtConfig {
     pub vcpu_count: u8,
     pub pci_hole_start: u32,

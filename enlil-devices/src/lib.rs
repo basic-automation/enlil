@@ -44,6 +44,7 @@ pub mod crypto;
 pub mod display;
 pub mod dma;
 pub mod fw_cfg;
+pub mod fw_cfg_loader;
 pub mod hda;
 pub mod interrupt;
 pub mod net;
