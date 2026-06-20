@@ -9,7 +9,7 @@ the recommended next step so the next run (which has no memory) can resume.
 ## 2026-06-20 — Session: the complete ACPI `etc/table-loader` delivery path, proven end-to-end without OVMF (Phase 5)
 
 **9 increments (8 code/test + 1 docs), each independently green and committed**
-(branch `routine/enlil-2026-06-20`, PR _(added below)_). This session built the
+(branch `routine/enlil-2026-06-20`, PR https://github.com/physics515/enlil/pull/33). This session built the
 **entire firmware table-loader delivery path** the 2026-06-19 next-step #1 pointed
 at — the piece the prior run deliberately *deferred* because "its correctness can
 only be proven by an OVMF boot." It is now built **and** proven in-process: a
