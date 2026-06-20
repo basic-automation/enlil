@@ -231,7 +231,9 @@ pub fn build_acpi_tables(config: &AcpiTableSetConfig) -> AcpiTableSet {
     let facs_bytes = facs::FacsBuilder::new().build();
     let facs_gpa = base + facs_offset as u64;
 
-    // Build FADT with DSDT + FACS addresses
+    // Build FADT with DSDT + FACS addresses. The layout and the FADT relocation
+    // offsets assume the fixed 276-byte FADT (= madt_start - fadt_offset); the
+    // fadt_fixed_layout_assumption_holds test pins that.
     let dsdt_gpa = base + dsdt_start as u64;
     let fadt_bytes = fadt::FadtBuilder::new(dsdt_gpa)
         .firmware_ctrl(facs_gpa)
@@ -491,6 +493,53 @@ mod tests {
                 p.target_offset
             );
         }
+    }
+
+    #[test]
+    fn fadt_fixed_layout_assumption_holds() {
+        // build_acpi_tables hardcodes madt_start = fadt_offset + 276 and the FADT
+        // relocation offsets assume a 276-byte FADT (X_DSDT@140 etc.). Pin that:
+        // the FADT lands exactly where MADT begins, occupies 276 bytes, and its
+        // own header length field agrees — so a FADT size change trips this test.
+        let ts = build_acpi_tables(&AcpiTableSetConfig::default());
+        let fadt_start = ts
+            .table_offsets
+            .iter()
+            .find(|(n, _)| n == "FADT")
+            .unwrap()
+            .1;
+        let madt_start = ts
+            .table_offsets
+            .iter()
+            .find(|(n, _)| n == "MADT")
+            .unwrap()
+            .1;
+        assert_eq!(
+            madt_start - fadt_start,
+            276,
+            "FADT occupies its fixed 276 bytes"
+        );
+        let hdr_len = u32::from_le_bytes(
+            ts.tables[fadt_start + 4..fadt_start + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(hdr_len, 276, "FADT header length field matches the layout");
+        // X_DSDT (offset 140) must hold the DSDT address, proving the field the
+        // relocation map targets is where we think it is.
+        let dsdt_start = ts
+            .table_offsets
+            .iter()
+            .find(|(n, _)| n == "DSDT")
+            .unwrap()
+            .1 as u64;
+        let base = AcpiTableSetConfig::default().table_base_address;
+        let x_dsdt = u64::from_le_bytes(
+            ts.tables[fadt_start + 140..fadt_start + 148]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(x_dsdt, base + dsdt_start);
     }
 
     #[test]
