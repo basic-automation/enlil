@@ -38,6 +38,7 @@ pub mod xsdt;
 use tables::OemInfo;
 
 /// Configuration for complete ACPI table set generation
+#[derive(Debug, Clone)]
 pub struct AcpiTableSetConfig {
     /// OEM identification (shared across all tables)
     pub oem: OemInfo,

@@ -116,6 +116,29 @@ impl FwCfgDevice {
         self.add_acpi_tables(set.rsdp, set.tables);
     }
 
+    /// Synthesize the ACPI set **and** its `etc/table-loader` relocation stream,
+    /// then register all three firmware files (`etc/acpi/rsdp`,
+    /// `etc/acpi/tables`, `etc/table-loader`).
+    ///
+    /// Unlike [`add_acpi_from_config`](Self::add_acpi_from_config) — which
+    /// leaves the inter-table pointers placed at the config's
+    /// `table_base_address` — this builds the set at **base 0** and ships the
+    /// QEMU bios-linker-loader command stream that tells OVMF/SeaBIOS where to
+    /// place the files and how to relocate every pointer and recompute every
+    /// checksum at load time: the complete delivery path a real firmware boot
+    /// drives. The `table_base_address` of `config` is ignored (the firmware
+    /// chooses the load address).
+    pub fn add_acpi_with_loader(&mut self, config: &crate::acpi::AcpiTableSetConfig) {
+        let zero_based = crate::acpi::AcpiTableSetConfig {
+            table_base_address: 0,
+            ..config.clone()
+        };
+        let set = crate::acpi::build_acpi_tables(&zero_based);
+        let loader = crate::acpi::build_acpi_table_loader(&set);
+        self.add_acpi_tables(set.rsdp, set.tables);
+        self.add_file("etc/table-loader", loader);
+    }
+
     /// Handle port I/O write to selector port (0x510)
     pub const fn write_selector(&mut self, value: u16) {
         self.current_selector = value;
@@ -309,6 +332,46 @@ mod tests {
         dev.write_selector(0x20);
         let rsdp: Vec<u8> = (0..expected.rsdp.len()).map(|_| dev.read_data()).collect();
         assert_eq!(rsdp, expected.rsdp);
+    }
+
+    #[test]
+    fn acpi_with_loader_registers_all_three_files_and_a_valid_loader() {
+        use crate::acpi::AcpiTableSetConfig;
+        let config = AcpiTableSetConfig::default();
+        let mut dev = FwCfgDevice::new();
+        dev.add_acpi_with_loader(&config);
+        // etc/acpi/rsdp (0x20), etc/acpi/tables (0x21), etc/table-loader (0x22).
+        assert_eq!(dev.file_count(), 3);
+
+        // The delivered tables/rsdp are the base-0 build (so the loader's
+        // ADD_POINTERs are valid): the RSDP XsdtAddress (offset 24) is the pure
+        // XSDT offset (0), not a config base address.
+        dev.write_selector(0x20);
+        let rsdp: Vec<u8> = (0..36).map(|_| dev.read_data()).collect();
+        let xsdt_addr = u64::from_le_bytes(rsdp[24..32].try_into().unwrap());
+        assert_eq!(
+            xsdt_addr, 0,
+            "tables must be delivered at base 0 for the loader"
+        );
+
+        // The etc/table-loader file is a whole number of 128-byte commands and
+        // its first command is ALLOCATE (0x1) of etc/acpi/tables.
+        dev.write_selector(0x22);
+        // The loader length is unknown to the test; read until the stream is
+        // exhausted (read_data returns 0 past the end, but commands are 128 B so
+        // read a generous bound and trim by the directory-reported size instead).
+        let loader_len = dev
+            .files
+            .iter()
+            .find(|f| f.name == "etc/table-loader")
+            .map(|f| f.data.len())
+            .unwrap();
+        assert!(loader_len % 128 == 0 && loader_len > 0);
+        let loader: Vec<u8> = (0..loader_len).map(|_| dev.read_data()).collect();
+        let cmd0 = u32::from_le_bytes(loader[0..4].try_into().unwrap());
+        assert_eq!(cmd0, 0x1, "first loader command is ALLOCATE");
+        let name0_end = loader[4..60].iter().position(|&c| c == 0).unwrap();
+        assert_eq!(&loader[4..4 + name0_end], b"etc/acpi/tables");
     }
 
     #[test]
