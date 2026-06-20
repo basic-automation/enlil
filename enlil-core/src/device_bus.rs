@@ -944,6 +944,34 @@ impl StandardPc {
         None
     }
 
+    /// Synthesize the ACPI table set for `config` and mount a populated QEMU
+    /// `fw_cfg` device that delivers it through the **full firmware path** —
+    /// `etc/acpi/rsdp`, `etc/acpi/tables`, and the `etc/table-loader` command
+    /// stream that relocates and re-checksums the tables at the guest-chosen
+    /// load address (see [`FwCfgDevice::add_acpi_with_loader`]). The device is
+    /// mounted read-only on the PIO bus at `0x510`/`0x511`.
+    ///
+    /// This is the assembled-platform counterpart to the standalone
+    /// [`FwCfgDevice::add_acpi_with_loader`]: a guest's OVMF/SeaBIOS reads the
+    /// tables off this `fw_cfg` and installs them itself. `fw_cfg` is *not*
+    /// mounted by [`standard_pc_complete`](Self::standard_pc_complete), so call
+    /// this once on the assembled PC when ACPI delivery is wanted.
+    ///
+    /// [`FwCfgDevice`]: enlil_devices::fw_cfg::FwCfgDevice
+    /// [`FwCfgDevice::add_acpi_with_loader`]: enlil_devices::fw_cfg::FwCfgDevice::add_acpi_with_loader
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if the `fw_cfg` ports overlap
+    /// an already-mounted device (e.g. if called twice).
+    pub fn install_acpi_fw_cfg(
+        &mut self,
+        config: &enlil_devices::acpi::AcpiTableSetConfig,
+    ) -> Result<(), enlil_devices::bus::BusError> {
+        let mut fw_cfg = enlil_devices::fw_cfg::FwCfgDevice::new();
+        fw_cfg.add_acpi_with_loader(config);
+        self.bus.add_fw_cfg(fw_cfg)
+    }
+
     /// Reference-cycle delta used to seed the timing shadows at install so the
     /// guest's first APERF/MPERF read already shows the model's core/ref ratio
     /// rather than the all-zero 1.0 identity (a VM tell in its own right — see
@@ -1384,6 +1412,46 @@ mod tests {
         // Re-selecting rewinds the stream (the firmware re-reads from offset 0).
         VmExitHandler::io_out(&mut bus, FW_CFG_PORT_SEL, &probe_sel.to_le_bytes());
         assert_eq!(read_stream(&mut bus, 1), vec![0xDE]);
+    }
+
+    #[test]
+    fn install_acpi_fw_cfg_delivers_the_full_loader_path_over_pio() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::acpi::AcpiTableSetConfig;
+        use enlil_devices::fw_cfg::{FW_CFG_PORT_DATA, FW_CFG_PORT_SEL};
+
+        let mut pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            0,
+            4,
+        )
+        .expect("assemble standard PC");
+        pc.install_acpi_fw_cfg(&AcpiTableSetConfig::default())
+            .expect("mount populated fw_cfg");
+
+        // The two fw_cfg registers are now on the assembled PC's PIO bus.
+        assert!(pc.bus.pio.is_mapped(FW_CFG_PORT_SEL));
+        assert!(pc.bus.pio.is_mapped(FW_CFG_PORT_DATA));
+
+        let read_file = |bus: &mut DeviceBus, sel: u16, n: usize| -> Vec<u8> {
+            VmExitHandler::io_out(bus, FW_CFG_PORT_SEL, &sel.to_le_bytes());
+            (0..n)
+                .map(|_| {
+                    let mut one = [0u8; 1];
+                    VmExitHandler::io_in(bus, FW_CFG_PORT_DATA, &mut one);
+                    one[0]
+                })
+                .collect()
+        };
+
+        // Files registered in order: etc/acpi/rsdp (0x20), etc/acpi/tables
+        // (0x21), etc/table-loader (0x22). The RSDP is delivered at base 0 (its
+        // XsdtAddress @24 is the pure offset 0), so the loader's ADD_POINTERs
+        // are valid; the table-loader file begins with an ALLOCATE command.
+        let rsdp = read_file(&mut pc.bus, 0x20, 32);
+        assert_eq!(u64::from_le_bytes(rsdp[24..32].try_into().unwrap()), 0);
+        let loader_head = read_file(&mut pc.bus, 0x22, 4);
+        assert_eq!(u32::from_le_bytes(loader_head.try_into().unwrap()), 0x1);
     }
 
     #[test]
