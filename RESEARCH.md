@@ -1461,3 +1461,37 @@ like the SEV leaf `0x8000_001F`). Measured: this nested host reports
 feature the apparent host lacks — the honest default. The leaf matters for the
 bare-metal backend (which serves CPUID from the table) and on real Zen 4 silicon
 where KVM already mirrors it.
+
+---
+
+## 2026-06-20 — QEMU `etc/table-loader` (bios-linker-loader) ABI (Phase 5.1/5.2)
+
+Source: `qemu/hw/acpi/bios-linker-loader.c` + `include/hw/acpi/bios-linker-loader.h`
+(transcribed directly, not recalled — the prior run flagged that guessing the
+struct offsets from memory risks a latent wrong-offset bug unit tests would
+falsely pass). `fw_cfg` only *delivers* the ACPI/SMBIOS bytes; the firmware
+needs a separate `etc/table-loader` file to place them and fix the inter-table
+pointers, since the load addresses aren't known until the firmware allocates.
+
+**ABI:** the stream is a sequence of fixed **128-byte** `QEMU_PACKED` command
+entries: `u32 command` at `0x00`, then a 124-byte union, all multi-byte fields
+**little-endian** (`cpu_to_le32`), file-name fields 56 bytes NUL-padded.
+Commands: `ALLOCATE=1` (`file[56]@0x04`, `align u32@0x3C`, `zone u8@0x40`; zones
+`HIGH=1`/`FSEG=2`), `ADD_POINTER=2` (`dest_file@0x04`, `src_file@0x38`,
+`offset u32@0x6C`, `size u8@0x70` — `*(dest+offset) += base(src)` over an LE
+pointer), `ADD_CHECKSUM=3` (`file@0x04`, `offset u32@0x3C`, `start@0x40`,
+`length@0x44` — checksum byte `-=` byte-sum of the range), `WRITE_POINTER=4`
+(reverse link, NVDIMM `hardware_errors`).
+
+**How it changed what we build:** implemented `fw_cfg_loader::BiosLinkerLoader`
+(byte-exact emitter), had `build_acpi_tables` *report* its 15 pointer
+relocations (RSDP→XSDT, 10 XSDT entries, FADT FACS/DSDT ×{32,64}-bit) validated
+against the built bytes, generated the ACPI loader from that, and — to close the
+"only an OVMF boot can prove this" gap — wrote an in-process `LoaderExecutor`
+(the firmware side) and an end-to-end test that relocates a base-0 set to a real
+address and asserts the RSDP→XSDT→FADT→DSDT chain resolves and every ACPI
+checksum validates. **SMBIOS is deliberately NOT routed through table-loader:**
+OVMF's `SmbiosPlatformDxe` reads `etc/smbios/smbios-{anchor,tables}` and
+re-installs the structures via the EFI SMBIOS protocol itself (the anchor's
+`structure_table_address` is recomputed by firmware, not patched), so QEMU emits
+no SMBIOS bios-linker-loader commands and neither do we.
