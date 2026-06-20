@@ -360,6 +360,53 @@ fn build_acpi_pointers(
     pointers
 }
 
+/// Build the `etc/table-loader` command stream that relocates and re-checksums
+/// `set` at firmware load time.
+///
+/// `set` must have been built with `table_base_address == 0` so the stored
+/// pointer values are pure offsets the firmware adds the runtime allocation
+/// base to (see [`AcpiTableSet::pointers`]). The stream is, in firmware
+/// execution order:
+/// 1. **`ALLOCATE`** `etc/acpi/tables` (high memory) and `etc/acpi/rsdp` (the
+///    F-segment, where a legacy OS scans for the RSDP).
+/// 2. **`ADD_POINTER`** for every relocation in `set.pointers`.
+/// 3. **`ADD_CHECKSUM`** for each SDT (header checksum at offset 9, length read
+///    from the table's own header so the span is exact) and the RSDP's two
+///    checksums (the 20-byte ACPI-1.0 sum at offset 8 and the 36-byte extended
+///    sum at offset 32). Checksums come last so they cover the relocated bytes.
+///
+/// # Panics
+/// Panics if a `set.table_offsets` entry does not point at a full 8-byte SDT
+/// header within `set.tables` — impossible for a set from [`build_acpi_tables`].
+#[must_use]
+pub fn build_acpi_table_loader(set: &AcpiTableSet) -> Vec<u8> {
+    use crate::fw_cfg_loader::{AllocZone, BiosLinkerLoader};
+    let u32_of = crate::truncate::u32_of;
+    let tables = AcpiFile::Tables.fw_cfg_name();
+    let rsdp = AcpiFile::Rsdp.fw_cfg_name();
+
+    let mut loader = BiosLinkerLoader::new();
+    loader.allocate(tables, 64, AllocZone::High);
+    loader.allocate(rsdp, 16, AllocZone::FSeg);
+    for p in &set.pointers {
+        loader.add_pointer(
+            p.pointer_file.fw_cfg_name(),
+            p.target_file.fw_cfg_name(),
+            p.offset,
+            p.size,
+        );
+    }
+    // Each SDT carries its length at header offset 4 and its checksum byte at
+    // offset 9 — derive the span from the bytes themselves, never a guess.
+    for (_name, start) in &set.table_offsets {
+        let len = u32::from_le_bytes(set.tables[start + 4..start + 8].try_into().unwrap());
+        loader.add_checksum(tables, u32_of(start + 9), u32_of(*start), len);
+    }
+    loader.add_checksum(rsdp, 8, 0, 20);
+    loader.add_checksum(rsdp, 32, 0, 36);
+    loader.into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,6 +512,105 @@ mod tests {
             u64::MAX
         } else {
             (1u64 << (size * 8)) - 1
+        }
+    }
+
+    /// A decoded bios-linker-loader command (just the fields the tests check).
+    struct Cmd {
+        command: u32,
+        dest: String,
+        src: String,
+        offset: u32,
+        size: u8,
+        cksum_offset: u32,
+        cksum_start: u32,
+        cksum_len: u32,
+    }
+
+    fn decode_loader(bytes: &[u8]) -> Vec<Cmd> {
+        let name = |b: &[u8], o: usize| {
+            let f = &b[o..o + 56];
+            let end = f.iter().position(|&c| c == 0).unwrap_or(56);
+            String::from_utf8(f[..end].to_vec()).unwrap()
+        };
+        let le32 = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        bytes
+            .chunks_exact(128)
+            .map(|e| Cmd {
+                command: le32(e, 0),
+                dest: name(e, 0x04),
+                src: name(e, 0x38),
+                offset: le32(e, 0x6C),
+                size: e[0x70],
+                cksum_offset: le32(e, 0x3C),
+                cksum_start: le32(e, 0x40),
+                cksum_len: le32(e, 0x44),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn table_loader_encodes_every_relocation() {
+        // Build at base 0 — the table-loader contract (stored pointer = offset).
+        let config = AcpiTableSetConfig {
+            table_base_address: 0,
+            ..AcpiTableSetConfig::default()
+        };
+        let set = build_acpi_tables(&config);
+        let cmds = decode_loader(&build_acpi_table_loader(&set));
+
+        let allocs: Vec<&Cmd> = cmds.iter().filter(|c| c.command == 0x1).collect();
+        let pointers: Vec<&Cmd> = cmds.iter().filter(|c| c.command == 0x2).collect();
+        let cksum_count = cmds.iter().filter(|c| c.command == 0x3).count();
+
+        // Two ALLOCATEs: tables (high=1) and rsdp (fseg=2).
+        assert_eq!(allocs.len(), 2);
+        assert_eq!(allocs[0].dest, "etc/acpi/tables");
+        assert_eq!(allocs[1].dest, "etc/acpi/rsdp");
+
+        // One ADD_POINTER per reported relocation, in order, with matching
+        // dest/src files, offset and size.
+        assert_eq!(pointers.len(), set.pointers.len());
+        for (cmd, p) in pointers.iter().zip(&set.pointers) {
+            assert_eq!(cmd.dest, p.pointer_file.fw_cfg_name());
+            assert_eq!(cmd.src, p.target_file.fw_cfg_name());
+            assert_eq!(cmd.offset, p.offset);
+            assert_eq!(cmd.size, p.size);
+        }
+
+        // One checksum per SDT plus the RSDP's two; every command precedes no
+        // pointer (checksums are emitted last).
+        assert_eq!(cksum_count, set.table_offsets.len() + 2);
+        let last_pointer = cmds.iter().rposition(|c| c.command == 0x2).unwrap();
+        let first_cksum = cmds.iter().position(|c| c.command == 0x3).unwrap();
+        assert!(last_pointer < first_cksum, "checksums must follow pointers");
+    }
+
+    #[test]
+    fn table_loader_checksum_spans_match_table_lengths() {
+        let config = AcpiTableSetConfig {
+            table_base_address: 0,
+            ..AcpiTableSetConfig::default()
+        };
+        let set = build_acpi_tables(&config);
+        let cmds = decode_loader(&build_acpi_table_loader(&set));
+
+        // For each SDT checksum over etc/acpi/tables, the covered span must equal
+        // the table's own header length field, and the checksum byte sits at
+        // start+9 — derived from the bytes, so this catches a wrong span.
+        for (_name, start) in &set.table_offsets {
+            let start = u32::try_from(*start).unwrap();
+            let cmd = cmds
+                .iter()
+                .find(|c| c.command == 0x3 && c.dest == "etc/acpi/tables" && c.cksum_start == start)
+                .expect("a checksum command for each SDT");
+            let hdr_len = u32::from_le_bytes(
+                set.tables[start as usize + 4..start as usize + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            assert_eq!(cmd.cksum_len, hdr_len);
+            assert_eq!(cmd.cksum_offset, start + 9);
         }
     }
 
