@@ -80,6 +80,56 @@ pub struct AcpiTableSet {
     pub tables: Vec<u8>,
     /// Individual table offsets within `tables` (for debugging)
     pub table_offsets: Vec<(String, usize)>,
+    /// Every inter-table pointer the firmware must relocate once it places the
+    /// delivered files in guest RAM — the data the QEMU `etc/table-loader`
+    /// `ADD_POINTER` commands are generated from. Reported relative to each
+    /// file's base, so for a set built with `table_base_address == 0` the value
+    /// stored at the pointer field equals [`AcpiPointer::target_offset`].
+    pub pointers: Vec<AcpiPointer>,
+}
+
+/// Which delivered `fw_cfg` file a pointer lives in or targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcpiFile {
+    /// `etc/acpi/rsdp` — the Root System Description Pointer.
+    Rsdp,
+    /// `etc/acpi/tables` — the concatenated table blob (XSDT, FADT, …).
+    Tables,
+}
+
+impl AcpiFile {
+    /// The `fw_cfg` file name the firmware matches in an `ADD_POINTER` command.
+    #[must_use]
+    pub const fn fw_cfg_name(self) -> &'static str {
+        match self {
+            Self::Rsdp => "etc/acpi/rsdp",
+            Self::Tables => "etc/acpi/tables",
+        }
+    }
+}
+
+/// One inter-table pointer to relocate at firmware load time.
+///
+/// In QEMU `etc/table-loader` `ADD_POINTER` terms: the pointer field lives in
+/// [`pointer_file`](Self::pointer_file) (the command's `dest_file`) at
+/// [`offset`](Self::offset), is [`size`](Self::size) bytes wide, and is
+/// relocated by adding the runtime base of [`target_file`](Self::target_file)
+/// (the command's `src_file`). [`target_offset`](Self::target_offset) is where
+/// inside the target file the pointer aims — i.e. exactly the little-endian
+/// value stored at the field when the set is built at base 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcpiPointer {
+    /// File containing the pointer field (the loader command's `dest_file`).
+    pub pointer_file: AcpiFile,
+    /// File the pointer targets (the loader command's `src_file`).
+    pub target_file: AcpiFile,
+    /// Byte offset of the pointer field within `pointer_file`.
+    pub offset: u32,
+    /// Width of the pointer field in bytes (4 for the legacy 32-bit fields,
+    /// 8 for the `X_` 64-bit fields).
+    pub size: u8,
+    /// Offset of the target within `target_file` (the base-0 stored value).
+    pub target_offset: u64,
 }
 
 /// The ACPI tables that have no inter-table address dependencies.
@@ -187,30 +237,28 @@ pub fn build_acpi_tables(config: &AcpiTableSetConfig) -> AcpiTableSet {
         .oem_info(config.oem.clone())
         .build();
 
-    // Build XSDT with all table addresses
-    let fadt_gpa = base + fadt_offset as u64;
-    let madt_gpa = base + madt_start as u64;
-    let mcfg_gpa = base + mcfg_start as u64;
-    let hpet_gpa = base + hpet_start as u64;
-    let ssdt_gpa = base + ssdt_start as u64;
-    let srat_gpa = base + srat_start as u64;
-    let slit_gpa = base + slit_start as u64;
-    let waet_gpa = base + waet_start as u64;
-    let bgrt_gpa = base + bgrt_start as u64;
-    let tpm2_gpa = base + tpm2_start as u64;
-
+    // Build XSDT with all table addresses, in layout order. The same offset
+    // list feeds the pointer-relocation map below, so the XSDT entries and the
+    // table-loader ADD_POINTER offsets can never disagree.
+    let xsdt_entry_targets = [
+        fadt_offset,
+        madt_start,
+        mcfg_start,
+        hpet_start,
+        ssdt_start,
+        srat_start,
+        slit_start,
+        waet_start,
+        bgrt_start,
+        tpm2_start,
+    ];
+    let xsdt_gpas: Vec<u64> = xsdt_entry_targets
+        .iter()
+        .map(|&o| base + o as u64)
+        .collect();
     let xsdt_bytes = xsdt::XsdtBuilder::new()
         .oem_info(config.oem.clone())
-        .add_table(fadt_gpa)
-        .add_table(madt_gpa)
-        .add_table(mcfg_gpa)
-        .add_table(hpet_gpa)
-        .add_table(ssdt_gpa)
-        .add_table(srat_gpa)
-        .add_table(slit_gpa)
-        .add_table(waet_gpa)
-        .add_table(bgrt_gpa)
-        .add_table(tpm2_gpa)
+        .add_tables(&xsdt_gpas)
         .build();
 
     // Assemble all tables into a contiguous buffer (XSDT at 0, FADT at fadt_offset).
@@ -244,11 +292,72 @@ pub fn build_acpi_tables(config: &AcpiTableSetConfig) -> AcpiTableSet {
         .xsdt_address(xsdt_gpa)
         .build();
 
+    let pointers = build_acpi_pointers(
+        xsdt_offset,
+        fadt_offset,
+        facs_offset,
+        dsdt_start,
+        &xsdt_entry_targets,
+    );
+
     AcpiTableSet {
         rsdp,
         tables,
         table_offsets: offsets,
+        pointers,
     }
+}
+
+/// Compute the inter-table pointer relocations (the `etc/table-loader`
+/// `ADD_POINTER` inputs) from the concrete table layout.
+///
+/// Offsets are confirmed against the builders: RSDP `XsdtAddress` @24
+/// (`rsdp.rs`), XSDT entries @`36 + i*8` after the 36-byte SDT header
+/// (`xsdt.rs`), FADT `FIRMWARE_CTRL` @36 / `DSDT` @40 / `X_FIRMWARE_CTRL` @132 /
+/// `X_DSDT` @140 (`fadt.rs`). The `pointer_self_validates_against_built_bytes`
+/// test re-checks every one against the actual bytes, so a wrong offset here
+/// fails CI rather than silently mis-patching a real firmware load.
+fn build_acpi_pointers(
+    xsdt_offset: usize,
+    fadt_offset: usize,
+    facs_offset: usize,
+    dsdt_start: usize,
+    xsdt_entry_targets: &[usize],
+) -> Vec<AcpiPointer> {
+    let u32_of = crate::truncate::u32_of;
+    let mut pointers = vec![AcpiPointer {
+        pointer_file: AcpiFile::Rsdp,
+        target_file: AcpiFile::Tables,
+        offset: 24,
+        size: 8,
+        target_offset: xsdt_offset as u64,
+    }];
+    // XSDT entries → each table, in the add_table() order.
+    for (i, &target) in xsdt_entry_targets.iter().enumerate() {
+        pointers.push(AcpiPointer {
+            pointer_file: AcpiFile::Tables,
+            target_file: AcpiFile::Tables,
+            offset: u32_of(xsdt_offset + 36 + i * 8),
+            size: 8,
+            target_offset: target as u64,
+        });
+    }
+    // FADT → FACS and DSDT, both the legacy 32-bit and the X_ 64-bit fields.
+    for &(field_off, size, target) in &[
+        (36u32, 4u8, facs_offset),
+        (40, 4, dsdt_start),
+        (132, 8, facs_offset),
+        (140, 8, dsdt_start),
+    ] {
+        pointers.push(AcpiPointer {
+            pointer_file: AcpiFile::Tables,
+            target_file: AcpiFile::Tables,
+            offset: u32_of(fadt_offset) + field_off,
+            size,
+            target_offset: target as u64,
+        });
+    }
+    pointers
 }
 
 #[cfg(test)]
@@ -288,6 +397,75 @@ mod tests {
         assert!(names.contains(&"BGRT"));
         assert!(names.contains(&"TPM2"));
         assert!(names.contains(&"DSDT"));
+    }
+
+    #[test]
+    fn pointer_self_validates_against_built_bytes() {
+        // For every reported relocation, the little-endian value actually stored
+        // at the claimed offset in the built file must equal base + target_offset.
+        // This proves each reported pointer-field offset is *really* where that
+        // pointer lives — catching a wrong offset here without needing a firmware
+        // boot, and confirming the set is relocatable as the table-loader assumes.
+        let config = AcpiTableSetConfig {
+            table_base_address: 0xF000_0000,
+            ..AcpiTableSetConfig::default()
+        };
+        let base = config.table_base_address;
+        let ts = build_acpi_tables(&config);
+        assert!(!ts.pointers.is_empty());
+
+        for p in &ts.pointers {
+            let file = match p.pointer_file {
+                AcpiFile::Rsdp => &ts.rsdp,
+                AcpiFile::Tables => &ts.tables,
+            };
+            let off = usize::try_from(p.offset).unwrap();
+            let stored = match p.size {
+                4 => u64::from(u32::from_le_bytes(file[off..off + 4].try_into().unwrap())),
+                8 => u64::from_le_bytes(file[off..off + 8].try_into().unwrap()),
+                other => panic!("unexpected pointer size {other}"),
+            };
+            let expected = base.wrapping_add(p.target_offset) & mask(p.size);
+            assert_eq!(
+                stored, expected,
+                "{:?} pointer at offset {:#x} (size {}) -> target_offset {:#x}: \
+                 stored {:#x} != base+target {:#x}",
+                p.pointer_file, p.offset, p.size, p.target_offset, stored, expected
+            );
+            // The target offset must land inside the target file.
+            let target_file_len = match p.target_file {
+                AcpiFile::Rsdp => ts.rsdp.len(),
+                AcpiFile::Tables => ts.tables.len(),
+            };
+            assert!(
+                usize::try_from(p.target_offset).unwrap() < target_file_len,
+                "target_offset {:#x} out of range for target file",
+                p.target_offset
+            );
+        }
+    }
+
+    #[test]
+    fn pointers_cover_rsdp_xsdt_and_fadt_links() {
+        // The relocation set must include the RSDP->XSDT link, one XSDT entry per
+        // table the XSDT references (10), and the four FADT FACS/DSDT pointers.
+        let ts = build_acpi_tables(&AcpiTableSetConfig::default());
+        let rsdp_links = ts
+            .pointers
+            .iter()
+            .filter(|p| p.pointer_file == AcpiFile::Rsdp)
+            .count();
+        assert_eq!(rsdp_links, 1, "exactly the RSDP->XSDT pointer");
+        // 1 (RSDP) + 10 (XSDT entries) + 4 (FADT FACS/DSDT x {32,64}-bit) = 15.
+        assert_eq!(ts.pointers.len(), 15);
+    }
+
+    fn mask(size: u8) -> u64 {
+        if size == 8 {
+            u64::MAX
+        } else {
+            (1u64 << (size * 8)) - 1
+        }
     }
 
     #[test]
