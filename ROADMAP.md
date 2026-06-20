@@ -166,6 +166,46 @@ requirement, not a nicety**:
   counters count host events at a workload-varying ratio — the Phase 5.4 consistency
   surfaces cannot be faked under translation. Mesh/hybrid compute make no stealth claim.
 
+### Trust domains: an "Enlil device" (your own pool) vs federating with others
+
+The latency and ISA axes decide *what can be pooled and where it runs natively*. A third,
+orthogonal axis decides *how compute must be protected when the pool spans more than one
+owner*: the **trust domain**.
+
+- **An "Enlil device" = every node under one owner / one trust domain.** Your phone, desktop,
+  and laptop join into a single pool that presents as one logical-machine device. Inside this
+  boundary compute is **trusted**: shared in the clear, exactly the Core Model above —
+  plaintext memory tiers, zero-copy fabric back-ends, native vCPU placement, and the hot/cold
+  working-set split governed by the latency law. One owner, one trust domain, one composable
+  device.
+- **Federation across owners = untrusted compute.** Two Enlil devices can share capacity —
+  your device borrows a friend's idle GPU or cores. Across that boundary the remote nodes are
+  **untrusted**: you gain capacity but must never expose plaintext to, or depend on the
+  integrity of, a node you do not own. This is the Nillion-style **blind-compute** regime —
+  secret-shared / MPC / ZK-verified work units (see Phase 9.12 and 8.7) so no foreign node
+  sees plaintext and a compromised or dishonest peer can neither exfiltrate nor silently
+  corrupt the result. Merely establishing that the peer runs genuine Enlil needs the Phase
+  8.7/8.9/11 attestation (a threshold-signed quorum + ZK isolation proof); the blind-compute
+  layer is what lets you use it *without* having to trust it with the data.
+- **Trust is orthogonal to latency.** The governing law decides what can be pooled; the trust
+  domain decides how it must be protected when pooled across owners. A node can be
+  near-but-untrusted (a friend's machine on the same LAN) or far-but-trusted (your own remote
+  VPS). So a logical machine's placement key gains a **trust dimension** on top of
+  `(latency class, ISA, vendor, feature baseline)`.
+
+| | **trusted** (your own nodes) | **untrusted** (federated / market nodes) |
+|---|---|---|
+| **low latency** | full pooling — plaintext, hot vCPU+RAM working set shareable/migratable, zero-copy fabric | **blind compute only** — even nearby, never plaintext or hot state; secret-shared / verifiable work units |
+| **high latency** | coarse/async plaintext pooling (latency law) — storage, offload, whole-guest migration | blind compute, with the MPC preprocessing/online split (9.12) hiding the cross-trust round-trips |
+
+- **Admission / policy (mirrors the execution-mode admission rule):** each logical machine
+  declares which trust domains may serve it. A sensitive guest pins to the owner's own nodes
+  (`trust = owner-only`); fungible, decomposable work (the Phase 9 compute-queue, vGPU-offload
+  surface) may spill to **federated untrusted** capacity as blind compute
+  (`allow = federated-blind`). This is what extends "*N guests on M hosts*" to *M hosts owned
+  by different people* — the "resource market + reputation" plane below is precisely how
+  untrusted capacity is discovered, scored, and compensated.
+
 ### Distributed-compute planes (Phase 9 Fabric / Phase 11 Mesh)
 
 Patterns for routing latency-tolerant work across heterogeneous, possibly untrusted nodes —
@@ -2378,6 +2418,12 @@ Both guests producing audio simultaneously (music on Linux, game on Windows) mus
 - This is active research in confidential computing — Enlil implementing it would be genuinely novel
 - Performance consideration: proof generation is expensive (seconds, not microseconds). Attestation is infrequent (boot time, on-demand), so this is acceptable.
 
+**Cross-PET composition & threshold attestation (Nillion research, 2026-06-20):**
+A single CVM's attestation is one closed-firmware root of trust (AMD ASP / Intel TDX Module). Nillion's "blind compute" thesis argues no single privacy primitive suffices and TEEs are "fragile" — they depend on chip integrity *and* the attestation process and are best for *stateless* compute — so **compose PETs, don't bet on one**. For Enlil:
+- **Threshold / quorum attestation:** instead of trusting one node's TEE quote, a threshold-signature scheme over a cluster yields a quorum-signed attestation resilient to up to **n−1** corrupted nodes in the online phase (Nillion's preprocessing-setup threshold ECDSA). This pairs with the 8.7/8.9 ZK attestation: ZK proves the *property* (isolation), the threshold quorum anchors the *identity* (genuine Enlil cluster) without a single chip as the linchpin.
+- **MPC as a TEE-independent privacy complement** for cross-node compute — see Phase 9.12. Unlike CVM mode (which conflicts with Phase 5 stealth — attestation/encrypted memory are "I know I'm in a VM" features), secret-sharing the work across nodes leaks no such signal.
+- See `RESEARCH.md 2026-06-20 (Nillion)`.
+
 ### 8.8 Paravisor Mode (Stretch Goal — from Microsoft OpenHCL architecture)
 
 - Instead of running device backends in the hypervisor or service VM, run them *inside* the guest at a higher privilege level (VMPL0 on AMD SEV-SNP, TD partitioning on Intel TDX)
@@ -3173,6 +3219,8 @@ When the fabric routes a SPIR-V kernel to the CPU backend instead of the GPU, th
   framework = "risc0"  # risc0 | sp1
   ```
 - `sample` mode: randomly verify a fraction of dispatches. If any verification fails, switch to `always` mode and alert.
+
+**Private (not just verified) fabric compute via MPC — TEE-independent (Nillion research, 2026-06-20):** the ZK proof above shows the result is *correct*, but the prover (the executing node) still sees the plaintext inputs. For workloads that must hide inputs from the executing node, **secret-share the work across N fabric nodes** so no single node ever sees plaintext — node compromise ≠ data disclosure, with no hardware-TEE dependency (complements, does not replace, the CVM path). Nillion's LSSS sum-of-products and threshold-ECDSA reports give the key latency technique: an **input-independent preprocessing phase** stages the correlated randomness (masks, shares) ahead of time, leaving a **non-interactive online phase** — each node broadcasts its masked inputs `⟨x⟩ = x·g^−λ` once, computes locally, and reveals; no round-trips during compute. This **decouples interaction-latency from computation** (Core Model governing law): the round-heavy preprocessing is deferrable/poolable into idle-interconnect windows, so even RDMA/WAN-class nodes can serve a 1–2-round online phase. Cost is the offline preprocessing + a modest share-size overhead. See `RESEARCH.md 2026-06-20 (Nillion)`.
 
 ---
 

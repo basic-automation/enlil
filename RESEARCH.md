@@ -1464,6 +1464,93 @@ where KVM already mirrors it.
 
 ---
 
+## 2026-06-20 (Nillion) — Blind compute: composing PETs + the MPC preprocessing/online split (Phases 8/9/11)
+
+Reviewed the Nillion Network technical reports (`nillion.pub`, hosted at
+`github.com/NillionNetwork/nillionnetwork.github.io`). Nillion is a decentralized
+**"blind computation"** network — process sensitive data without ever seeing it.
+Several of its design choices map directly onto Enlil's confidential-compute
+(8.7), verifiable/private fabric (9), and Mesh (11) phases.
+
+**Sources read:**
+- *The Nillion Standard* (May 2025) — <https://nillion.pub/the_nillion_standard.pdf>
+- *Evaluation of Arithmetic Sum-of-Products Expressions in LSSS with a
+  Non-Interactive Computation Phase* (de Vega, Lapets, Jarecki, Malten, Ugurbil,
+  Howe; Nov 2023) — <https://nillion.pub/sum-of-products-lsss-non-interactive.pdf>
+- *Threshold ECDSA in the Preprocessing Setup* (Santos, de Vega, Malten, Ugurbil,
+  Regnault; Dec 2023) — <https://nillion.pub/threshold-ecdsa-preprocessing-setup.pdf>
+- *Curl: Private LLMs through Wavelet-Encoded Look-Up Tables* (Santos, Mouris,
+  Ugurbil, Jarecki, Reis, Sengupta, de Vega) —
+  <https://nillion.pub/curl-private-llms-through-dwt-lut.pdf>
+- *Ripple: Accelerating Programmable Bootstraps for FHE with Wavelet
+  Approximations* (Gouert, Ugurbil, Mouris, de Vega, Tsoutsos) —
+  <https://nillion.pub/ripple-accelerating-pbs-with-dwt.pdf>
+- *Humanity's First Blind Computer* and *Securing an Agentic World* — vision
+  papers (image-only PDFs; read via the Standard + the technical reports above).
+
+**1. Compose PETs; a single TEE is the weak link (the Standard's core thesis).**
+Nillion's framing: every privacy primitive fails on its own — FHE too slow,
+**TEEs "too fragile"** (they depend on chip integrity *and* the attestation
+process, and are "best suited for stateless compute"), ZK too narrow (the prover
+still sees the inputs), MPC too bandwidth-heavy. Their answer is *composition*
+(the Petnet: clusters running custom PET mixes), not picking one. **How it
+changes Enlil:** Phase 8.7 currently leans on hardware CVMs (SEV-SNP/TDX) plus the
+8.7/8.9 ZK attestation. Nillion's TEE critique is a direct caution — a single
+chip's quote is one closed-firmware root of trust. Fold in (a) **MPC/secret-
+sharing as a TEE-independent complement** for cross-node private compute (Phase
+9/11: no single node sees plaintext, so a node compromise ≠ data loss), and (b)
+**threshold/quorum attestation** (§3 below) so the trust anchor is a quorum, not
+one ASP/TDX Module. CVM mode + stealth already conflict (8.7); MPC splitting is
+the privacy story that does *not* announce "I'm in a VM." Folded into ROADMAP 8.7.
+
+**2. The preprocessing/online split decouples interaction-latency from
+computation — directly relevant to the Core Model's governing law.** Both the LSSS
+sum-of-products paper and the threshold-ECDSA paper hinge on the same structure:
+an **input-independent preprocessing phase** generates correlated randomness
+(masks λ, Shamir/additive shares, "presignatures") *ahead of time*, after which
+the **online phase is non-interactive** — each party broadcasts its masked input
+`⟨x⟩_λ = x·g^−λ` once, computes locally, and reveals the result, with **no
+round-trips between nodes during computation**. The masked factor is a
+multiplicative one-time pad and is information-theoretically secure (n = 2t+1
+parties, ≤ t passive adversaries for the LSSS variant); only the mask *exponents*
+need a linear scheme, so any LSSS hides them. **How it changes Enlil:** this is a
+concrete technique for the Core Model law "interconnect latency sets the
+granularity of sharing." Enlil's fabric (Phase 9) and Mesh (Phase 11) can run
+*private* cross-node compute over high-latency links by pre-staging the
+round-heavy correlated randomness in a latency-tolerant async window (idle
+interconnect), leaving a 1–2-round online phase. Beaver-triple-style preprocessing
+thus becomes a first-class **scheduling** concept: the chatty part is
+poolable/deferrable, the latency-sensitive part is minimized. Folded into ROADMAP
+9.12.
+
+**3. Threshold signatures with n−1 online-corruption tolerance (quorum
+attestation / node identity).** The threshold-ECDSA paper builds a client-server
+TSS whose online phase tolerates *full* signer collusion and resists user
+impersonation, with an optimal 2-round online phase enabled by preprocessing
+(client holds the secret key of the encryption over the signers' shares, so
+signers cannot forge alone). **How it changes Enlil:** Phase 11 Mesh needs a
+node/cluster identity and attestation that does not rest on one machine. A
+threshold signature over a cluster yields a quorum-signed attestation/identity
+resilient to up to n−1 corrupted nodes in the online phase — strictly stronger
+than trusting one node's TEE quote, and the natural pairing with the 8.7/8.9 ZK
+attestation (ZK proves the *property*; the quorum anchors the *identity*).
+
+**4. Private AI inference on pooled compute (Curl / Ripple / nilAI) — Phase 7/9
+reference.** Curl runs MPC LLM inference (BERT/GPT-2/GPT-Neo), evaluating
+non-linear functions (log, reciprocal, GELU…) as **wavelet-compressed lookup
+tables** — a discrete wavelet transform shrinks the LUT for up to **19× round/
+communication reduction** vs CrypTen with better accuracy than polynomial
+approximations; it also proves probabilistic-truncation security in the
+stand-alone model. Ripple applies the same DWT-LUT idea to FHE (CGGI programmable
+bootstrapping). nilAI (Nillion product) runs LLMs inside CPU/GPU TEEs. **How it
+changes Enlil:** if Enlil offers confidential AI across pooled GPUs (Phase 7 GPU
+sharing + Phase 9 GPU backend), these are the reference techniques — TEE-resident
+inference (nilAI: cheapest, fragile) vs MPC/FHE inference (no hardware trust, with
+DWT-LUT to make non-linearities affordable). Lower priority than the hypervisor
+core; logged for the GPU / confidential-AI track.
+
+---
+
 ## 2026-06-20 — QEMU `etc/table-loader` (bios-linker-loader) ABI (Phase 5.1/5.2)
 
 Source: `qemu/hw/acpi/bios-linker-loader.c` + `include/hw/acpi/bios-linker-loader.h`
