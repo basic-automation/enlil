@@ -2378,6 +2378,12 @@ Both guests producing audio simultaneously (music on Linux, game on Windows) mus
 - This is active research in confidential computing — Enlil implementing it would be genuinely novel
 - Performance consideration: proof generation is expensive (seconds, not microseconds). Attestation is infrequent (boot time, on-demand), so this is acceptable.
 
+**Cross-PET composition & threshold attestation (Nillion research, 2026-06-20):**
+A single CVM's attestation is one closed-firmware root of trust (AMD ASP / Intel TDX Module). Nillion's "blind compute" thesis argues no single privacy primitive suffices and TEEs are "fragile" — they depend on chip integrity *and* the attestation process and are best for *stateless* compute — so **compose PETs, don't bet on one**. For Enlil:
+- **Threshold / quorum attestation:** instead of trusting one node's TEE quote, a threshold-signature scheme over a cluster yields a quorum-signed attestation resilient to up to **n−1** corrupted nodes in the online phase (Nillion's preprocessing-setup threshold ECDSA). This pairs with the 8.7/8.9 ZK attestation: ZK proves the *property* (isolation), the threshold quorum anchors the *identity* (genuine Enlil cluster) without a single chip as the linchpin.
+- **MPC as a TEE-independent privacy complement** for cross-node compute — see Phase 9.12. Unlike CVM mode (which conflicts with Phase 5 stealth — attestation/encrypted memory are "I know I'm in a VM" features), secret-sharing the work across nodes leaks no such signal.
+- See `RESEARCH.md 2026-06-20 (Nillion)`.
+
 ### 8.8 Paravisor Mode (Stretch Goal — from Microsoft OpenHCL architecture)
 
 - Instead of running device backends in the hypervisor or service VM, run them *inside* the guest at a higher privilege level (VMPL0 on AMD SEV-SNP, TD partitioning on Intel TDX)
@@ -3173,6 +3179,8 @@ When the fabric routes a SPIR-V kernel to the CPU backend instead of the GPU, th
   framework = "risc0"  # risc0 | sp1
   ```
 - `sample` mode: randomly verify a fraction of dispatches. If any verification fails, switch to `always` mode and alert.
+
+**Private (not just verified) fabric compute via MPC — TEE-independent (Nillion research, 2026-06-20):** the ZK proof above shows the result is *correct*, but the prover (the executing node) still sees the plaintext inputs. For workloads that must hide inputs from the executing node, **secret-share the work across N fabric nodes** so no single node ever sees plaintext — node compromise ≠ data disclosure, with no hardware-TEE dependency (complements, does not replace, the CVM path). Nillion's LSSS sum-of-products and threshold-ECDSA reports give the key latency technique: an **input-independent preprocessing phase** stages the correlated randomness (masks, shares) ahead of time, leaving a **non-interactive online phase** — each node broadcasts its masked inputs `⟨x⟩ = x·g^−λ` once, computes locally, and reveals; no round-trips during compute. This **decouples interaction-latency from computation** (Core Model governing law): the round-heavy preprocessing is deferrable/poolable into idle-interconnect windows, so even RDMA/WAN-class nodes can serve a 1–2-round online phase. Cost is the offline preprocessing + a modest share-size overhead. See `RESEARCH.md 2026-06-20 (Nillion)`.
 
 ---
 
