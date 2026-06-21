@@ -13,6 +13,7 @@ pub const VIRTIO_BLK_T_OUT: u32 = 1; // Write
 pub const VIRTIO_BLK_T_FLUSH: u32 = 4; // Flush
 pub const VIRTIO_BLK_T_GET_ID: u32 = 8; // Get device ID
 pub const VIRTIO_BLK_T_DISCARD: u32 = 11; // Discard/trim
+pub const VIRTIO_BLK_T_WRITE_ZEROES: u32 = 13; // Write zeroes
 
 // VirtIO block status codes
 pub const VIRTIO_BLK_S_OK: u8 = 0;
@@ -32,6 +33,7 @@ bitflags::bitflags! {
         const TOPOLOGY    = 1 << 10;
         const CONFIG_WCE  = 1 << 11;
         const DISCARD     = 1 << 13;
+        const WRITE_ZEROES = 1 << 14;
         // VirtIO generic feature bits
         const RING_INDIRECT_DESC = 1 << 28;
         const RING_EVENT_IDX     = 1 << 29;
@@ -109,6 +111,7 @@ pub struct BlockStats {
     pub writes: u64,
     pub flushes: u64,
     pub discards: u64,
+    pub write_zeroes: u64,
     pub read_bytes: u64,
     pub write_bytes: u64,
     pub errors: u64,
@@ -130,7 +133,7 @@ impl VirtioBlockDevice {
             features |= BlockFeatures::RO;
         }
 
-        features |= BlockFeatures::DISCARD;
+        features |= BlockFeatures::DISCARD | BlockFeatures::WRITE_ZEROES;
 
         let config = BlockConfig {
             capacity: capacity / 512,
@@ -253,6 +256,10 @@ impl VirtioBlockDevice {
                 header.sector,
                 u64::from(u32::try_from(data_buf.len()).unwrap_or(u32::MAX)),
             ),
+            VIRTIO_BLK_T_WRITE_ZEROES => self.handle_write_zeroes(
+                header.sector,
+                u64::from(u32::try_from(data_buf.len()).unwrap_or(u32::MAX)),
+            ),
             _ => {
                 self.stats.errors += 1;
                 (VIRTIO_BLK_S_UNSUPP, 0)
@@ -313,6 +320,43 @@ impl VirtioBlockDevice {
             self.stats.errors += 1;
             (VIRTIO_BLK_S_IOERR, 0)
         }
+    }
+
+    /// Zero `len_bytes` of the backend starting at `sector`. A modern guest
+    /// issues `VIRTIO_BLK_T_WRITE_ZEROES` to clear a range (mkfs, partition
+    /// wipes, swap init) far more efficiently than streaming an all-zero write
+    /// payload. Bounded to the device capacity and written in capped chunks so
+    /// a large request does not allocate a huge buffer.
+    fn handle_write_zeroes(&mut self, sector: u64, len_bytes: u64) -> (u8, usize) {
+        if self.backend.is_readonly() {
+            self.stats.errors += 1;
+            return (VIRTIO_BLK_S_IOERR, 0);
+        }
+        let offset = sector * 512;
+        let capacity = self.backend.capacity();
+        if offset >= capacity {
+            self.stats.errors += 1;
+            return (VIRTIO_BLK_S_IOERR, 0);
+        }
+        // Clamp the range to the device so we never write past the end.
+        let mut remaining = len_bytes.min(capacity - offset);
+        let mut at = offset;
+        let chunk_size: u64 = 64 * 1024;
+        let zeros = vec![0u8; usize_of(chunk_size.min(remaining.max(1)))];
+        while remaining > 0 {
+            let this = usize_of(remaining.min(chunk_size));
+            match self.backend.write_at(at, &zeros[..this]) {
+                Ok(n) if n == this => {}
+                _ => {
+                    self.stats.errors += 1;
+                    return (VIRTIO_BLK_S_IOERR, 0);
+                }
+            }
+            at += this as u64;
+            remaining -= this as u64;
+        }
+        self.stats.write_zeroes += 1;
+        (VIRTIO_BLK_S_OK, 0)
     }
 }
 
@@ -390,6 +434,44 @@ mod tests {
         let (status, _) = dev.process_request(&header, &mut buf);
         assert_eq!(status, VIRTIO_BLK_S_OK);
         assert_eq!(dev.stats().discards, 1);
+    }
+
+    #[test]
+    fn test_write_zeroes_clears_a_range() {
+        let mut dev = make_device();
+        assert!(dev.features().contains(BlockFeatures::WRITE_ZEROES));
+
+        // Fill sectors 0 and 1 (1KB) with 0xFF.
+        let header = make_header(VIRTIO_BLK_T_OUT, 0);
+        let mut data = vec![0xFF; 1024];
+        let (status, _) = dev.process_request(&header, &mut data);
+        assert_eq!(status, VIRTIO_BLK_S_OK);
+
+        // WRITE_ZEROES the 1KB starting at sector 0 (range = data_buf length).
+        let header = make_header(VIRTIO_BLK_T_WRITE_ZEROES, 0);
+        let mut buf = vec![0u8; 1024];
+        let (status, _) = dev.process_request(&header, &mut buf);
+        assert_eq!(status, VIRTIO_BLK_S_OK);
+        assert_eq!(dev.stats().write_zeroes, 1);
+
+        // The range now reads back as zeros.
+        let header = make_header(VIRTIO_BLK_T_IN, 0);
+        let mut readback = vec![0xAAu8; 1024];
+        let (status, n) = dev.process_request(&header, &mut readback);
+        assert_eq!(status, VIRTIO_BLK_S_OK);
+        assert_eq!(n, 1024);
+        assert!(readback.iter().all(|&b| b == 0), "range was zeroed");
+    }
+
+    #[test]
+    fn test_write_zeroes_rejected_on_readonly() {
+        let backend = Arc::new(MemoryBackend::new_readonly(vec![0xFFu8; 1_048_576]));
+        let mut dev = VirtioBlockDevice::new(backend, "ro-disk");
+        let header = make_header(VIRTIO_BLK_T_WRITE_ZEROES, 0);
+        let mut buf = vec![0u8; 512];
+        let (status, _) = dev.process_request(&header, &mut buf);
+        assert_eq!(status, VIRTIO_BLK_S_IOERR);
+        assert_eq!(dev.stats().write_zeroes, 0);
     }
 
     #[test]
