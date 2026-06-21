@@ -9,7 +9,7 @@ the recommended next step so the next run (which has no memory) can resume.
 ## 2026-06-21 — Session: per-vCPU stealth state (Phase 5) + a broad device-fidelity sweep (Phase 3)
 
 **16 increments + 1 fmt-hygiene commit, each independently green and committed**
-(branch `routine/enlil-2026-06-21`, PR <PR_URL>). Two threads: (1) finished the
+(branch `routine/enlil-2026-06-21`, PR https://github.com/physics515/enlil/pull/35). Two threads: (1) finished the
 2026-06-20 next-step #1 — **per-vCPU stealth state** — and fixed **two real
 per-vCPU APIC-identity bugs** it surfaced, all proven live on `/dev/kvm`; then,
 once that and the rest of Phase 5's cleanly-tractable work was done, (2) a
