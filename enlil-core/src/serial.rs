@@ -123,6 +123,21 @@ pub const IIR_NO_INTERRUPT: u8 = 0x01;
 pub const IIR_THR_EMPTY: u8 = 0x02;
 /// Received Data Available interrupt pending (higher priority than THRE).
 pub const IIR_RX_AVAILABLE: u8 = 0x04;
+/// IIR bits 7:6, set when the FIFOs are enabled — `0b11` identifies a working
+/// 16550A (vs `0b00` for a FIFO-less 8250/16450), the value a guest's UART
+/// autoconfig reads back after writing [`FCR_ENABLE`] to decide the part type.
+pub const IIR_FIFO_ENABLED: u8 = 0xC0;
+
+// ---------------------------------------------------------------------------
+// FCR bit flags (FIFO Control Register — write side of the IIR port)
+// ---------------------------------------------------------------------------
+
+/// Enable the RX/TX FIFOs.
+pub const FCR_ENABLE: u8 = 0x01;
+/// Clear (reset) the receive FIFO.
+pub const FCR_CLEAR_RX: u8 = 0x02;
+/// Clear (reset) the transmit FIFO.
+pub const FCR_CLEAR_TX: u8 = 0x04;
 
 // ---------------------------------------------------------------------------
 // SerialConfig
@@ -366,6 +381,9 @@ pub struct UartState {
     msr_loop_delta: u8,
     /// Scratch Register.
     pub scr: u8,
+    /// Whether the guest has enabled the FIFOs via the FCR. Reported in the IIR
+    /// (bits 7:6) so a guest's autoconfig identifies the part as a 16550A.
+    fifo_enabled: bool,
     /// Divisor latch (when DLAB=1, `DATA_REG` and `IER_REG` access this).
     pub divisor: u16,
     /// Receive buffer — bytes injected by the host for the guest to read.
@@ -394,6 +412,7 @@ impl UartState {
             msr: 0,
             msr_loop_delta: 0,
             scr: 0,
+            fifo_enabled: false,
             divisor: 0x000C, // 9600 baud default (115200 / 9600 = 12)
             rx_fifo: VecDeque::with_capacity(64),
             thr_empty_pending: false,
@@ -460,6 +479,7 @@ impl UartState {
                 self.divisor = (self.divisor & 0x00FF) | (u16::from(value) << 8);
             }
             IER_REG => self.write_ier(value),
+            IIR_REG => self.write_fcr(value), // offset 2 reads IIR, writes FCR
             LCR_REG => self.lcr = value,
             MCR_REG => self.write_mcr(value & 0x1F),
             SCR_REG => self.scr = value,
@@ -552,6 +572,19 @@ impl UartState {
         }
     }
 
+    /// Handle a write to the FIFO Control Register (offset 2, write side).
+    ///
+    /// Tracks the FIFO-enable bit (reported back in the IIR so a guest detects a
+    /// 16550A) and honours the RX/TX FIFO-clear bits. Our RX queue stands in for
+    /// the hardware RX FIFO; TX completes immediately so its clear is a no-op.
+    fn write_fcr(&mut self, value: u8) {
+        self.fifo_enabled = value & FCR_ENABLE != 0;
+        if value & FCR_CLEAR_RX != 0 {
+            self.rx_fifo.clear();
+        }
+        // FCR_CLEAR_TX: TX drains immediately in emulation — nothing buffered.
+    }
+
     /// Handle a write to the Interrupt Enable Register.
     ///
     /// Only the low four bits are writable. Enabling the THRE interrupt while
@@ -600,13 +633,19 @@ impl UartState {
     }
 
     /// Read the IIR. Per the 16550, reading IIR acknowledges (clears) a pending
-    /// THRE interrupt — but only when THRE is the source actually reported.
+    /// THRE interrupt — but only when THRE is the source actually reported. When
+    /// the FIFOs are enabled, bits 7:6 read back as `0b11` so a guest's
+    /// autoconfig identifies the part as a 16550A.
     fn read_iir(&mut self) -> u8 {
         let iir = self.compute_iir();
         if iir == IIR_THR_EMPTY {
             self.thr_empty_pending = false;
         }
-        iir
+        if self.fifo_enabled {
+            iir | IIR_FIFO_ENABLED
+        } else {
+            iir
+        }
     }
 
     /// Whether an enabled interrupt source is currently pending — i.e. whether
@@ -1449,6 +1488,31 @@ mod tests {
         uart.write_register(DATA_REG, b'!');
         assert!(uart.interrupt_pending());
         assert_eq!(uart.read_register(IIR_REG), IIR_RX_AVAILABLE);
+    }
+
+    // -- FIFO control (FCR / IIR bits 7:6) tests --
+
+    #[test]
+    fn test_fifo_detection_reports_16550a_when_enabled() {
+        let mut uart = null_uart();
+        // FIFOs off by default: IIR bits 7:6 read back 0 (a guest sees 8250).
+        assert_eq!(uart.read_register(IIR_REG) & 0xC0, 0);
+        // Enabling the FIFO (FCR write to offset 2) makes IIR bits 7:6 read
+        // 0b11 — the 16550A signature a guest's autoconfig looks for.
+        uart.write_register(IIR_REG, FCR_ENABLE);
+        assert_eq!(uart.read_register(IIR_REG) & 0xC0, IIR_FIFO_ENABLED);
+        // Bit 0 still reflects "no interrupt pending".
+        assert_ne!(uart.read_register(IIR_REG) & IIR_NO_INTERRUPT, 0);
+    }
+
+    #[test]
+    fn test_fcr_clear_rx_flushes_the_receive_fifo() {
+        let mut uart = null_uart();
+        uart.inject_input(b"stale");
+        assert!(uart.has_input());
+        // FCR with the RX-clear bit empties the receive FIFO.
+        uart.write_register(IIR_REG, FCR_ENABLE | FCR_CLEAR_RX);
+        assert!(!uart.has_input(), "RX FIFO cleared by FCR");
     }
 
     #[test]
