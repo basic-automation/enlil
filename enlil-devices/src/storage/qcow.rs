@@ -492,6 +492,53 @@ mod tests {
     }
 
     #[test]
+    fn reads_fall_through_to_a_raw_backing_image() {
+        // A qcow2 overlay over a *raw* base file (format detected by magic).
+        let base = tempfile::NamedTempFile::new().unwrap();
+        let mut raw = vec![0u8; 1024 * 1024];
+        for (i, b) in raw.iter_mut().take(256).enumerate() {
+            *b = u8_of((i ^ 0x5A) & 0xFF);
+        }
+        std::fs::write(base.path(), &raw).unwrap();
+
+        let overlay = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            overlay.path(),
+            make_overlay_qcow2(base.path().to_str().unwrap()),
+        )
+        .unwrap();
+
+        let backend = QcowBackend::open(overlay.path()).unwrap();
+        let mut buf = vec![0u8; 256];
+        backend.read_at(0, &mut buf).unwrap();
+        for (i, &b) in buf.iter().enumerate() {
+            assert_eq!(b, u8_of((i ^ 0x5A) & 0xFF), "byte {i} from the raw backing");
+        }
+    }
+
+    #[test]
+    fn reads_traverse_a_multi_level_qcow2_chain() {
+        // base.qcow2 (cluster 0 = pattern) <- mid.qcow2 (empty) <- top.qcow2.
+        let base = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(base.path(), make_minimal_qcow2()).unwrap();
+        let mid = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            mid.path(),
+            make_overlay_qcow2(base.path().to_str().unwrap()),
+        )
+        .unwrap();
+        let top = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(top.path(), make_overlay_qcow2(mid.path().to_str().unwrap())).unwrap();
+
+        let backend = QcowBackend::open(top.path()).unwrap();
+        let mut buf = vec![0u8; 256];
+        backend.read_at(0, &mut buf).unwrap();
+        for (i, &b) in buf.iter().enumerate() {
+            assert_eq!(b, u8_of(i & 0xFF), "byte {i} traverses top->mid->base");
+        }
+    }
+
+    #[test]
     fn overlay_write_to_allocated_cluster_does_not_touch_backing() {
         // Build an overlay that *has* its own cluster 0 (via make_minimal_qcow2,
         // pattern data) but also names a backing image. A write to that
