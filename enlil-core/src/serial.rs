@@ -76,6 +76,44 @@ pub const IER_RX_LINE_STATUS: u8 = 0x04;
 pub const IER_MODEM_STATUS: u8 = 0x08;
 
 // ---------------------------------------------------------------------------
+// MCR bit flags (Modem Control Register)
+// ---------------------------------------------------------------------------
+
+/// Data Terminal Ready output.
+pub const MCR_DTR: u8 = 0x01;
+/// Request To Send output.
+pub const MCR_RTS: u8 = 0x02;
+/// Auxiliary output 1.
+pub const MCR_OUT1: u8 = 0x04;
+/// Auxiliary output 2.
+pub const MCR_OUT2: u8 = 0x08;
+/// Diagnostic loopback enable: TX is internally wired to RX and the four MCR
+/// control outputs feed the four MSR status inputs (16550 §"Loop" mode). Guest
+/// serial drivers and BIOS POST use it to probe the UART.
+pub const MCR_LOOP: u8 = 0x10;
+
+// ---------------------------------------------------------------------------
+// MSR bit flags (Modem Status Register)
+// ---------------------------------------------------------------------------
+
+/// Delta Clear To Send (CTS changed since last MSR read).
+pub const MSR_DCTS: u8 = 0x01;
+/// Delta Data Set Ready (DSR changed since last MSR read).
+pub const MSR_DDSR: u8 = 0x02;
+/// Trailing Edge Ring Indicator (RI 1→0 since last MSR read).
+pub const MSR_TERI: u8 = 0x04;
+/// Delta Data Carrier Detect (DCD changed since last MSR read).
+pub const MSR_DDCD: u8 = 0x08;
+/// Clear To Send input.
+pub const MSR_CTS: u8 = 0x10;
+/// Data Set Ready input.
+pub const MSR_DSR: u8 = 0x20;
+/// Ring Indicator input.
+pub const MSR_RI: u8 = 0x40;
+/// Data Carrier Detect input.
+pub const MSR_DCD: u8 = 0x80;
+
+// ---------------------------------------------------------------------------
 // IIR identification values (Interrupt Identification Register, bits 0-3)
 // ---------------------------------------------------------------------------
 
@@ -320,8 +358,12 @@ pub struct UartState {
     pub mcr: u8,
     /// Line Status Register (dynamically computed on read).
     lsr_overrides: u8,
-    /// Modem Status Register.
+    /// Modem Status Register (external modem lines; used when not in loopback).
     pub msr: u8,
+    /// Accumulated MSR delta bits (low nibble) while in loopback — set when a
+    /// looped-back modem line changes on an MCR write, cleared when the guest
+    /// reads the MSR (matching the 16550's read-to-clear delta behaviour).
+    msr_loop_delta: u8,
     /// Scratch Register.
     pub scr: u8,
     /// Divisor latch (when DLAB=1, `DATA_REG` and `IER_REG` access this).
@@ -350,6 +392,7 @@ impl UartState {
             mcr: 0,
             lsr_overrides: 0,
             msr: 0,
+            msr_loop_delta: 0,
             scr: 0,
             divisor: 0x000C, // 9600 baud default (115200 / 9600 = 12)
             rx_fifo: VecDeque::with_capacity(64),
@@ -392,7 +435,7 @@ impl UartState {
                 self.lsr_overrides &= !LSR_OVERRUN_ERROR;
                 lsr
             }
-            MSR_REG => self.msr,
+            MSR_REG => self.read_msr(),
             SCR_REG => self.scr,
             _ => 0xFF, // unmapped
         };
@@ -418,7 +461,7 @@ impl UartState {
             }
             IER_REG => self.write_ier(value),
             LCR_REG => self.lcr = value,
-            MCR_REG => self.mcr = value & 0x1F,
+            MCR_REG => self.write_mcr(value & 0x1F),
             SCR_REG => self.scr = value,
             _ => {}
         }
@@ -430,10 +473,83 @@ impl UartState {
     // -- TX path --
 
     fn write_data(&mut self, byte: u8) {
-        self.output.write_byte(byte);
+        if self.mcr & MCR_LOOP != 0 {
+            // Diagnostic loopback: the transmitted byte is wired straight back
+            // into the receiver instead of going out the sink. Honour the same
+            // FIFO bound + overrun flag as a real RX (inject_input), then the
+            // looped byte can raise the RX-available interrupt.
+            if self.rx_fifo.len() >= RX_FIFO_CAPACITY {
+                self.lsr_overrides |= LSR_OVERRUN_ERROR;
+            } else {
+                self.rx_fifo.push_back(byte);
+            }
+        } else {
+            self.output.write_byte(byte);
+        }
         // TX completes immediately in emulation, so the transmitter holding
         // register is empty again — re-arm the THRE interrupt.
         self.thr_empty_pending = true;
+    }
+
+    /// Write the Modem Control Register. Only the low five bits exist. While
+    /// loopback ([`MCR_LOOP`]) is active the four control outputs feed the MSR
+    /// status inputs, so a change to a mapped output latches the corresponding
+    /// MSR delta bit (set until the guest reads the MSR), exactly as the looped
+    /// modem line would on hardware.
+    fn write_mcr(&mut self, value: u8) {
+        if value & MCR_LOOP != 0 {
+            let before = Self::loop_modem_high(self.mcr);
+            let after = Self::loop_modem_high(value);
+            let changed = before ^ after;
+            // CTS/DSR/DCD: any change sets the delta. RI: trailing edge only
+            // (1→0), per the 16550 TERI semantics.
+            if changed & MSR_CTS != 0 {
+                self.msr_loop_delta |= MSR_DCTS;
+            }
+            if changed & MSR_DSR != 0 {
+                self.msr_loop_delta |= MSR_DDSR;
+            }
+            if changed & MSR_DCD != 0 {
+                self.msr_loop_delta |= MSR_DDCD;
+            }
+            if before & MSR_RI != 0 && after & MSR_RI == 0 {
+                self.msr_loop_delta |= MSR_TERI;
+            }
+        }
+        self.mcr = value;
+    }
+
+    /// The MSR status-input high nibble produced by loopback from an MCR value:
+    /// DTR→DSR, RTS→CTS, OUT1→RI, OUT2→DCD.
+    const fn loop_modem_high(mcr: u8) -> u8 {
+        let mut status = 0;
+        if mcr & MCR_DTR != 0 {
+            status |= MSR_DSR;
+        }
+        if mcr & MCR_RTS != 0 {
+            status |= MSR_CTS;
+        }
+        if mcr & MCR_OUT1 != 0 {
+            status |= MSR_RI;
+        }
+        if mcr & MCR_OUT2 != 0 {
+            status |= MSR_DCD;
+        }
+        status
+    }
+
+    /// Read the Modem Status Register. In loopback the status inputs are driven
+    /// from the MCR outputs (high nibble) plus the accumulated delta bits, which
+    /// the read clears; otherwise the externally-set [`msr`](Self::msr) is
+    /// returned unchanged.
+    fn read_msr(&mut self) -> u8 {
+        if self.mcr & MCR_LOOP != 0 {
+            let value = Self::loop_modem_high(self.mcr) | self.msr_loop_delta;
+            self.msr_loop_delta = 0; // delta bits clear on read
+            value
+        } else {
+            self.msr
+        }
     }
 
     /// Handle a write to the Interrupt Enable Register.
@@ -1260,6 +1376,79 @@ mod tests {
         port.uart_mut().inject_input(b"!");
         assert!(port.interrupt_pending());
         assert_eq!(&*log.lock().unwrap(), &[true]);
+    }
+
+    // -- Loopback (MCR bit 4) tests --
+
+    #[test]
+    fn test_loopback_routes_tx_back_to_rx() {
+        let mut uart = null_uart();
+        // Without loopback, a TX byte goes to the sink, not the RX FIFO.
+        uart.write_register(DATA_REG, b'X');
+        assert!(!uart.has_input(), "no loopback: TX does not reach RX");
+
+        // Enable loopback; a TX byte now appears in the RX FIFO and reads back.
+        uart.write_register(MCR_REG, MCR_LOOP);
+        uart.write_register(DATA_REG, b'L');
+        assert!(uart.has_input(), "loopback: TX wired to RX");
+        assert_eq!(uart.read_register(DATA_REG), b'L');
+    }
+
+    #[test]
+    fn test_loopback_maps_mcr_outputs_to_msr_inputs() {
+        let mut uart = null_uart();
+        // Not in loopback: MSR reads the (default-zero) external lines.
+        assert_eq!(uart.read_register(MSR_REG), 0);
+
+        // The Linux 8250 autoconfig loopback probe: MCR = LOOP | OUT2 | RTS,
+        // then expects MSR & 0xF0 == DCD | CTS == 0x90.
+        uart.write_register(MCR_REG, MCR_LOOP | MCR_OUT2 | MCR_RTS);
+        let msr = uart.read_register(MSR_REG);
+        assert_eq!(msr & 0xF0, MSR_DCD | MSR_CTS, "RTS→CTS, OUT2→DCD");
+
+        // All four outputs map to all four inputs.
+        uart.write_register(MCR_REG, MCR_LOOP | MCR_DTR | MCR_RTS | MCR_OUT1 | MCR_OUT2);
+        let msr = uart.read_register(MSR_REG);
+        assert_eq!(
+            msr & 0xF0,
+            MSR_DSR | MSR_CTS | MSR_RI | MSR_DCD,
+            "DTR→DSR, RTS→CTS, OUT1→RI, OUT2→DCD"
+        );
+    }
+
+    #[test]
+    fn test_loopback_msr_delta_bits_set_and_clear_on_read() {
+        let mut uart = null_uart();
+        uart.write_register(MCR_REG, MCR_LOOP); // enter loopback, all inputs low
+        let _ = uart.read_register(MSR_REG); // clear any initial deltas
+
+        // Raise RTS (→CTS): DCTS delta latches; the read returns it and clears.
+        uart.write_register(MCR_REG, MCR_LOOP | MCR_RTS);
+        let msr = uart.read_register(MSR_REG);
+        assert_ne!(msr & MSR_DCTS, 0, "CTS change set the DCTS delta");
+        assert_ne!(msr & MSR_CTS, 0, "CTS input asserted");
+        // Delta is read-to-clear: a second read shows no delta, input still set.
+        let msr2 = uart.read_register(MSR_REG);
+        assert_eq!(msr2 & MSR_DCTS, 0, "delta cleared on read");
+        assert_ne!(msr2 & MSR_CTS, 0, "input level persists");
+
+        // Dropping RI (OUT1 1→0) latches the trailing-edge TERI delta.
+        uart.write_register(MCR_REG, MCR_LOOP | MCR_OUT1);
+        let _ = uart.read_register(MSR_REG);
+        uart.write_register(MCR_REG, MCR_LOOP); // OUT1 1→0
+        assert_ne!(uart.read_register(MSR_REG) & MSR_TERI, 0, "RI trailing edge");
+    }
+
+    #[test]
+    fn test_loopback_looped_byte_raises_rx_interrupt() {
+        let mut uart = null_uart();
+        uart.write_register(IER_REG, IER_RX_AVAILABLE);
+        uart.write_register(MCR_REG, MCR_LOOP);
+        assert!(!uart.interrupt_pending());
+        // A looped-back TX byte is RX data — it raises the RX-available IRQ.
+        uart.write_register(DATA_REG, b'!');
+        assert!(uart.interrupt_pending());
+        assert_eq!(uart.read_register(IIR_REG), IIR_RX_AVAILABLE);
     }
 
     #[test]
