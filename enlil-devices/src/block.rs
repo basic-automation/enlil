@@ -57,6 +57,19 @@ pub struct BlockConfig {
     pub sectors: u8,
     /// Block size (if `BLK_SIZE`).
     pub blk_size: u32,
+    /// Max discard size in 512-byte sectors (if `DISCARD`).
+    pub max_discard_sectors: u32,
+    /// Max number of discard segments per request (if `DISCARD`).
+    pub max_discard_seg: u32,
+    /// Discard alignment in 512-byte sectors (if `DISCARD`).
+    pub discard_sector_alignment: u32,
+    /// Max write-zeroes size in 512-byte sectors (if `WRITE_ZEROES`).
+    pub max_write_zeroes_sectors: u32,
+    /// Max number of write-zeroes segments per request (if `WRITE_ZEROES`).
+    pub max_write_zeroes_seg: u32,
+    /// Whether write-zeroes may deallocate (unmap) the range (if `WRITE_ZEROES`).
+    /// We always write real zeros, so this is 0.
+    pub write_zeroes_may_unmap: u8,
 }
 
 /// A `VirtIO` block request header (from guest memory).
@@ -143,6 +156,17 @@ impl VirtioBlockDevice {
             heads: 0,
             sectors: 0,
             blk_size: 512,
+            // Advertise usable limits for the DISCARD/WRITE_ZEROES features
+            // above: a guest reads these config fields and treats a zero limit
+            // as "feature present but unusable", so they must be non-zero. Our
+            // simplified request model carries one range per request, hence
+            // seg = 1; alignment 1 sector = no special alignment.
+            max_discard_sectors: 0x0040_0000, // 4M sectors (2 GiB) per request
+            max_discard_seg: 1,
+            discard_sector_alignment: 1,
+            max_write_zeroes_sectors: 0x0040_0000,
+            max_write_zeroes_seg: 1,
+            write_zeroes_may_unmap: 0, // we always write real zeros
         };
 
         let mut id_bytes = [0u8; 20];
@@ -221,14 +245,30 @@ impl VirtioBlockDevice {
 
     #[must_use]
     fn config_as_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(28);
-        bytes.extend_from_slice(&self.config.capacity.to_le_bytes());
-        bytes.extend_from_slice(&self.config.size_max.to_le_bytes());
-        bytes.extend_from_slice(&self.config.seg_max.to_le_bytes());
-        bytes.extend_from_slice(&self.config.cylinders.to_le_bytes());
-        bytes.push(self.config.heads);
-        bytes.push(self.config.sectors);
-        bytes.extend_from_slice(&self.config.blk_size.to_le_bytes());
+        // Lay the fields out at their fixed `struct virtio_blk_config` offsets.
+        // The discard/write-zeroes fields live at offsets 36..57, so the
+        // intervening topology (24..32), writeback (32), num_queues (34..36)
+        // are emitted as zeros to keep the later offsets correct even though we
+        // do not advertise those features.
+        let mut bytes = Vec::with_capacity(60);
+        bytes.extend_from_slice(&self.config.capacity.to_le_bytes()); // 0
+        bytes.extend_from_slice(&self.config.size_max.to_le_bytes()); // 8
+        bytes.extend_from_slice(&self.config.seg_max.to_le_bytes()); // 12
+        bytes.extend_from_slice(&self.config.cylinders.to_le_bytes()); // 16
+        bytes.push(self.config.heads); // 18
+        bytes.push(self.config.sectors); // 19
+        bytes.extend_from_slice(&self.config.blk_size.to_le_bytes()); // 20
+        bytes.extend_from_slice(&[0u8; 8]); // 24: topology (unadvertised)
+        bytes.push(0); // 32: writeback
+        bytes.push(0); // 33: unused0
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // 34: num_queues
+        bytes.extend_from_slice(&self.config.max_discard_sectors.to_le_bytes()); // 36
+        bytes.extend_from_slice(&self.config.max_discard_seg.to_le_bytes()); // 40
+        bytes.extend_from_slice(&self.config.discard_sector_alignment.to_le_bytes()); // 44
+        bytes.extend_from_slice(&self.config.max_write_zeroes_sectors.to_le_bytes()); // 48
+        bytes.extend_from_slice(&self.config.max_write_zeroes_seg.to_le_bytes()); // 52
+        bytes.push(self.config.write_zeroes_may_unmap); // 56
+        bytes.extend_from_slice(&[0u8; 3]); // 57: unused1[3]
         bytes
     }
 
@@ -504,6 +544,26 @@ mod tests {
         // blk_size at offset 20, 4 bytes
         let blk_size = dev.read_config(20, 4);
         assert_eq!(blk_size, 512);
+    }
+
+    #[test]
+    fn test_config_reports_discard_and_write_zeroes_limits() {
+        let dev = make_device();
+        // We advertise DISCARD + WRITE_ZEROES, so a guest reads their limits
+        // from the fixed config offsets; they must be non-zero or the guest
+        // treats the feature as unusable.
+        assert!(dev.features().contains(BlockFeatures::DISCARD));
+        assert!(dev.features().contains(BlockFeatures::WRITE_ZEROES));
+        // max_discard_sectors @ 36, max_discard_seg @ 40, alignment @ 44.
+        assert_eq!(dev.read_config(36, 4), 0x0040_0000);
+        assert_eq!(dev.read_config(40, 4), 1);
+        assert_eq!(dev.read_config(44, 4), 1);
+        // max_write_zeroes_sectors @ 48, seg @ 52, may_unmap @ 56.
+        assert_eq!(dev.read_config(48, 4), 0x0040_0000);
+        assert_eq!(dev.read_config(52, 4), 1);
+        assert_eq!(dev.read_config(56, 1), 0);
+        // Earlier fields are unmoved: blk_size still at 20.
+        assert_eq!(dev.read_config(20, 4), 512);
     }
 
     #[test]
