@@ -591,6 +591,114 @@ mod tests {
         );
     }
 
+    // Per-vCPU PMC isolation, live. APERF/MPERF live in the per-vCPU timing
+    // Arc vec; the PMC and LBR shadows instead live *inside* each router in the
+    // StealthBank — a distinct storage path that also must be per-vCPU. Seed
+    // each vCPU's AMD PerfCtr0 to a different value via stealth_msr_for_mut,
+    // run the same `rdmsr 0xC0010201` blob on each, and assert each reads its
+    // own seed: vCPU 1 programming its counters cannot leak into vCPU 0's view.
+    #[test]
+    fn smp_run_loop_isolates_per_vcpu_pmc() {
+        use enlil_devices::stealth::pmc::msr as pmc_msr;
+
+        if !is_kvm_available() {
+            eprintln!("skipping smp_run_loop_isolates_per_vcpu_pmc: no /dev/kvm");
+            return;
+        }
+
+        // rdmsr(0xC0010201 = AMD PerfMonV2 PerfCtr0); out 0x3F8, al; hlt.
+        #[rustfmt::skip]
+        let code: [u8; 13] = [
+            0x66, 0xB9, 0x01, 0x02, 0x01, 0xC0, // mov ecx, 0xC0010201
+            0x0F, 0x32,                         // rdmsr
+            0xBA, 0xF8, 0x03,                   // mov dx, 0x3F8
+            0xEE,                               // out dx, al
+            0xF4,                               // hlt
+        ];
+        const ENTRY: u64 = 0x1000;
+        const VCPU0_PERFCTR: u8 = 0x3A;
+        const VCPU1_PERFCTR: u8 = 0x5C;
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Shared(Arc::clone(&sink))),
+            0,
+            1,
+        )
+        .expect("build standard pc");
+        let backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        let mut run = match StealthRunLoop::install_smp(backend, pc, LbrPlatform::AmdSvm, 2) {
+            Ok(run) => run,
+            Err(e) => {
+                eprintln!("skipping smp_run_loop_isolates_per_vcpu_pmc: {e}");
+                return;
+            }
+        };
+
+        // Seed each vCPU's PerfCtr0 shadow distinctly, kept static (disabled —
+        // event_select[0] == 0 so advance() leaves it at its seed).
+        run.pc_mut()
+            .bus
+            .stealth_msr_for_mut(0)
+            .expect("vcpu 0 router")
+            .pmc
+            .gp_counters[0] = u64::from(VCPU0_PERFCTR);
+        run.pc_mut()
+            .bus
+            .stealth_msr_for_mut(1)
+            .expect("vcpu 1 router")
+            .pmc
+            .gp_counters[0] = u64::from(VCPU1_PERFCTR);
+
+        let mut ram = GuestRam::new(0x1000);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+        // SAFETY: `ram` outlives `run` within this test scope.
+        unsafe {
+            run.backend_mut()
+                .map_memory(ENTRY, host_addr, ram.len() as u64)
+        }
+        .expect("map guest memory");
+        run.create_vcpu(0).expect("create vcpu 0");
+        run.create_vcpu(1).expect("create vcpu 1");
+
+        for vcpu in 0..2usize {
+            run.backend_mut()
+                .prepare_real_mode_vcpu(vcpu, ENTRY)
+                .expect("set real-mode entry");
+            let (last, _) = run
+                .run_vcpu_until_event(vcpu, 100)
+                .expect("run until event");
+            assert_eq!(last.exit, GuestExit::Halted, "vcpu {vcpu} should reach HLT");
+        }
+
+        assert_eq!(
+            &*sink.lock().unwrap(),
+            &[VCPU0_PERFCTR, VCPU1_PERFCTR],
+            "each vCPU read its own AMD PerfCtr0 shadow through the SMP run loop"
+        );
+        // The shadows are still each their own seed afterwards (disabled), not
+        // collapsed to one shared value.
+        assert_eq!(
+            run.pc_mut()
+                .bus
+                .stealth_msr_for_mut(0)
+                .unwrap()
+                .pmc
+                .read_msr(pmc_msr::AMD_CORE_PERFCTR0),
+            Some(u64::from(VCPU0_PERFCTR))
+        );
+        assert_eq!(
+            run.pc_mut()
+                .bus
+                .stealth_msr_for_mut(1)
+                .unwrap()
+                .pmc
+                .read_msr(pmc_msr::AMD_CORE_PERFCTR0),
+            Some(u64::from(VCPU1_PERFCTR))
+        );
+    }
+
     // The production path forwards and serves the AMD PMC MSR surface: install
     // the run loop for an AMD platform (so filter_ranges emits the AMD blocks),
     // seed PerfCtr0's shadow and enable PerfCtr1, and a guest that `rdmsr
