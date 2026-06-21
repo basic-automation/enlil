@@ -1475,7 +1475,11 @@ mod tests {
         uart.write_register(MCR_REG, MCR_LOOP | MCR_OUT1);
         let _ = uart.read_register(MSR_REG);
         uart.write_register(MCR_REG, MCR_LOOP); // OUT1 1→0
-        assert_ne!(uart.read_register(MSR_REG) & MSR_TERI, 0, "RI trailing edge");
+        assert_ne!(
+            uart.read_register(MSR_REG) & MSR_TERI,
+            0,
+            "RI trailing edge"
+        );
     }
 
     #[test]

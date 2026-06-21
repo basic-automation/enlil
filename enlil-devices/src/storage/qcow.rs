@@ -220,7 +220,9 @@ impl QcowBackend {
             Box::new(Self::open(&resolved)?)
         } else {
             Box::new(RawFileBackend::open(
-                resolved.to_str().context("backing path is not valid UTF-8")?,
+                resolved
+                    .to_str()
+                    .context("backing path is not valid UTF-8")?,
                 true,
             )?)
         };
@@ -488,7 +490,10 @@ mod tests {
         // Cluster 1 is unallocated in BOTH layers → zeros.
         let mut buf2 = vec![0xFFu8; 256];
         backend.read_at(65536, &mut buf2).unwrap();
-        assert!(buf2.iter().all(|&b| b == 0), "absent in base+overlay → zeros");
+        assert!(
+            buf2.iter().all(|&b| b == 0),
+            "absent in base+overlay → zeros"
+        );
     }
 
     #[test]

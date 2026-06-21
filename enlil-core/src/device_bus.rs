@@ -3554,7 +3554,11 @@ mod tests {
         // Index == len and beyond are rejected; the prior selection stands.
         assert!(!bus.set_active_vcpu(2));
         assert!(!bus.set_active_vcpu(99));
-        assert_eq!(bus.active_vcpu(), Some(1), "rejected selection left active as-is");
+        assert_eq!(
+            bus.active_vcpu(),
+            Some(1),
+            "rejected selection left active as-is"
+        );
         // A specific vCPU's router is reachable regardless of the active one.
         assert!(bus.stealth_msr_for_mut(0).is_some());
         assert!(bus.stealth_msr_for_mut(1).is_some());

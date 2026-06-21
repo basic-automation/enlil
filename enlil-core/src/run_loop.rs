@@ -128,11 +128,7 @@ mod linux {
         /// (the `KVM_CAP_X86_USER_SPACE_MSR` capability) and
         /// [`forward_msrs_to_userspace`](KvmBackend::forward_msrs_to_userspace)
         /// (`KVM_X86_SET_MSR_FILTER`).
-        pub fn install(
-            backend: KvmBackend,
-            pc: StandardPc,
-            platform: LbrPlatform,
-        ) -> Result<Self> {
+        pub fn install(backend: KvmBackend, pc: StandardPc, platform: LbrPlatform) -> Result<Self> {
             Self::install_smp(backend, pc, platform, 1)
         }
 
@@ -1025,9 +1021,7 @@ mod tests {
         let table = CpuidStealthTable::build(&CpuidStealthConfig::from_host(GUEST_VCPUS, 1));
         // Only meaningful on an AMD-presented host (the leaf is AMD-only); skip
         // cleanly elsewhere rather than asserting on a leaf KVM does not expose.
-        if table.lookup(0x8000_001E, 0).eax == 0
-            && table.lookup(0x8000_0000, 0).eax < 0x8000_001E
-        {
+        if table.lookup(0x8000_001E, 0).eax == 0 && table.lookup(0x8000_0000, 0).eax < 0x8000_001E {
             eprintln!(
                 "skipping topology_stealth_gives_each_vcpu_its_own_amd_extended_apic_id: \
                  host does not expose leaf 0x8000_001E (non-AMD)"
