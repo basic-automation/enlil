@@ -94,12 +94,16 @@ mod linux {
     pub struct StealthRunLoop {
         backend: KvmBackend,
         pc: StandardPc,
-        /// Shared with the installed router; the run loop drives it inside
-        /// `run_vcpu_timed`.
-        timing: Arc<VcpuTimingState>,
+        /// One timing handle per vCPU, each shared with that vCPU's installed
+        /// router; `run_vcpu_once(index)` drives `timings[index]` inside
+        /// `run_vcpu_timed`. A single-vCPU [`install`](Self::install) is a bank
+        /// of one (`timings[0]`).
+        timings: Vec<Arc<VcpuTimingState>>,
         /// The single rate model both stealth surfaces advance by, copied out
         /// of the router at install so `run_vcpu_once` need not re-borrow the
-        /// bus to read it while it is borrowed as the exit handler.
+        /// bus to read it while it is borrowed as the exit handler. Every
+        /// vCPU's router shares the same model so the per-CPU APERF/MPERF and
+        /// RDPMC surfaces stay mutually consistent.
         model: PmcRateModel,
     }
 
@@ -126,17 +130,44 @@ mod linux {
         /// (`KVM_X86_SET_MSR_FILTER`).
         pub fn install(
             backend: KvmBackend,
-            mut pc: StandardPc,
+            pc: StandardPc,
             platform: LbrPlatform,
         ) -> Result<Self> {
-            let timing = pc.install_stealth_msr_router(platform);
-            // One borrow of the freshly-installed router: take both the model
-            // and the MSR ranges that must match it.
+            Self::install_smp(backend, pc, platform, 1)
+        }
+
+        /// Like [`install`](Self::install) but for an SMP guest: install
+        /// `vcpu_count` independent stealth routers (one per vCPU) so each vCPU
+        /// reads its *own* APERF/MPERF/PMC/LBR shadows, not a single shared
+        /// surface that two vCPUs reading the same MSR would expose as a tell.
+        ///
+        /// Every vCPU's router carries the same platform, rate model, and MSR
+        /// filter (the surfaces a guest can reach are identical across logical
+        /// CPUs; only the *values* are per-vCPU), so the KVM filter is set once
+        /// from vCPU 0's router. The returned loop expects exactly `vcpu_count`
+        /// vCPUs to be [`create_vcpu`](Self::create_vcpu)'d; `run_vcpu_once(i)`
+        /// selects vCPU `i`'s router before entry.
+        ///
+        /// # Errors
+        /// As [`install`](Self::install).
+        ///
+        /// # Panics
+        /// Panics if `vcpu_count` is 0.
+        pub fn install_smp(
+            backend: KvmBackend,
+            mut pc: StandardPc,
+            platform: LbrPlatform,
+            vcpu_count: usize,
+        ) -> Result<Self> {
+            let timings = pc.install_stealth_msr_routers(platform, vcpu_count);
+            // One borrow of vCPU 0's freshly-installed router: take both the
+            // model and the MSR ranges that must match it. All vCPUs share the
+            // platform, so the filter is identical for each.
             let (model, ranges) = {
                 let router = pc
                     .bus
                     .stealth_msr_mut()
-                    .expect("router installed by install_stealth_msr_router");
+                    .expect("routers installed by install_stealth_msr_routers");
                 (router.pmc.rate_model, router.filter_ranges())
             };
             backend.enable_userspace_msr_exits()?;
@@ -144,7 +175,7 @@ mod linux {
             Ok(Self {
                 backend,
                 pc,
-                timing,
+                timings,
                 model,
             })
         }
@@ -220,14 +251,28 @@ mod linux {
         /// surfaces never double-count.
         ///
         /// # Errors
-        /// Propagates [`KvmBackend::run_vcpu_timed`].
+        /// Propagates [`KvmBackend::run_vcpu_timed`]; returns [`Error::Vcpu`]
+        /// if `index` names no installed stealth router.
+        ///
+        /// [`Error::Vcpu`]: crate::Error::Vcpu
         pub fn run_vcpu_once(&mut self, index: usize) -> Result<RunStep> {
-            let (exit, guest_cycles) =
+            // Route this vCPU's forwarded MSR exits to its *own* shadow state,
+            // and drive its *own* timing handle around KVM_RUN — so a per-CPU
+            // counter read on vCPU `index` sees `index`'s monotonic surface.
+            if self.timings.get(index).is_none() || !self.pc.bus.set_active_vcpu(index) {
+                return Err(crate::Error::Vcpu(format!(
+                    "no stealth router/timing for vcpu {index}"
+                )));
+            }
+            let (exit, guest_cycles) = {
+                let timing = &self.timings[index];
                 self.backend
-                    .run_vcpu_timed(index, &mut self.pc.bus, &self.timing, &self.model)?;
+                    .run_vcpu_timed(index, &mut self.pc.bus, timing, &self.model)?
+            };
             // The timing shadows were advanced inside run_vcpu_timed via the
             // shared Arc; advance only the (non-shared) PMC counters by the same
-            // delta so RDPMC and APERF/MPERF stay consistent.
+            // delta so RDPMC and APERF/MPERF stay consistent. set_active_vcpu
+            // above makes stealth_msr_mut() the router for this vCPU.
             if let Some(router) = self.pc.bus.stealth_msr_mut() {
                 router.pmc.advance_counters(guest_cycles);
             }
@@ -325,11 +370,26 @@ mod linux {
             Ok(LoopOutcome::Exhausted)
         }
 
-        /// The shared timing handle the run loop drives — for a watchdog or test
-        /// to read the live APERF/MPERF shadows.
+        /// vCPU 0's shared timing handle — for a watchdog or test to read the
+        /// live APERF/MPERF shadows of the boot CPU. For an SMP loop use
+        /// [`timing_for`](Self::timing_for) to reach a specific vCPU.
         #[must_use]
         pub fn timing(&self) -> &Arc<VcpuTimingState> {
-            &self.timing
+            &self.timings[0]
+        }
+
+        /// vCPU `index`'s shared timing handle, or `None` if `index` names no
+        /// installed vCPU — so a watchdog or test can read a particular vCPU's
+        /// live APERF/MPERF shadows.
+        #[must_use]
+        pub fn timing_for(&self, index: usize) -> Option<&Arc<VcpuTimingState>> {
+            self.timings.get(index)
+        }
+
+        /// The number of per-vCPU stealth routers/timing handles installed.
+        #[must_use]
+        pub fn vcpu_count(&self) -> usize {
+            self.timings.len()
         }
 
         /// The rate model both stealth surfaces advance by.
@@ -439,6 +499,96 @@ mod tests {
         assert!(halted, "guest never reached HLT through the run loop");
         assert!(saw_aperf, "APERF was not forwarded through the run loop");
         assert_eq!(&*sink.lock().unwrap(), &[0xBE]);
+    }
+
+    // Per-vCPU stealth state, proven live through the SMP run loop: install two
+    // independent routers, seed each vCPU's APERF to a *different* value, and
+    // run the same `rdmsr APERF; out 0x3F8; hlt` blob on each vCPU. vCPU 0 must
+    // read its own seed and vCPU 1 its own — never one shared shadow. This is
+    // the isolation a real SMP guest requires (two logical CPUs reading the
+    // same APERF would be a detectable tell), exercised end-to-end on /dev/kvm.
+    #[test]
+    fn smp_run_loop_serves_each_vcpu_its_own_aperf() {
+        if !is_kvm_available() {
+            eprintln!("skipping smp_run_loop_serves_each_vcpu_its_own_aperf: no /dev/kvm");
+            return;
+        }
+
+        // rdmsr(IA32_APERF=0xE8); out 0x3F8, al; hlt.
+        #[rustfmt::skip]
+        let code: [u8; 13] = [
+            0x66, 0xB9, 0xE8, 0x00, 0x00, 0x00, // mov ecx, 0xE8
+            0x0F, 0x32,                         // rdmsr
+            0xBA, 0xF8, 0x03,                   // mov dx, 0x3F8
+            0xEE,                               // out dx, al
+            0xF4,                               // hlt
+        ];
+        const ENTRY: u64 = 0x1000;
+        const VCPU0_APERF: u8 = 0xBE;
+        const VCPU1_APERF: u8 = 0xED;
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Shared(Arc::clone(&sink))),
+            0,
+            1,
+        )
+        .expect("build standard pc");
+        let backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        let mut run = match StealthRunLoop::install_smp(backend, pc, LbrPlatform::AmdSvm, 2) {
+            Ok(run) => run,
+            Err(e) => {
+                eprintln!("skipping smp_run_loop_serves_each_vcpu_its_own_aperf: {e}");
+                return;
+            }
+        };
+        assert_eq!(run.vcpu_count(), 2, "two routers installed");
+
+        // Seed each vCPU's APERF shadow distinctly via its own timing handle.
+        run.timing_for(0)
+            .expect("vcpu 0 timing")
+            .write_aperf(u64::from(VCPU0_APERF));
+        run.timing_for(1)
+            .expect("vcpu 1 timing")
+            .write_aperf(u64::from(VCPU1_APERF));
+        // The two handles are genuinely distinct state.
+        assert!(
+            !Arc::ptr_eq(run.timing_for(0).unwrap(), run.timing_for(1).unwrap()),
+            "per-vCPU timing handles must not alias"
+        );
+
+        let mut ram = GuestRam::new(0x1000);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+        // SAFETY: `ram` outlives `run` within this test scope.
+        unsafe {
+            run.backend_mut()
+                .map_memory(ENTRY, host_addr, ram.len() as u64)
+        }
+        .expect("map guest memory");
+        run.create_vcpu(0).expect("create vcpu 0");
+        run.create_vcpu(1).expect("create vcpu 1");
+        run.apply_cpuid_stealth().expect("clear hypervisor bit");
+
+        // Run vCPU 0 to HLT: it reads its own seed (0xBE).
+        run.backend_mut()
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set vcpu 0 entry");
+        let (last0, _) = run.run_vcpu_until_event(0, 100).expect("run vcpu 0");
+        assert_eq!(last0.exit, GuestExit::Halted, "vcpu 0 halts");
+
+        // Run vCPU 1 to HLT: it reads its own seed (0xED), not vCPU 0's.
+        run.backend_mut()
+            .prepare_real_mode_vcpu(1, ENTRY)
+            .expect("set vcpu 1 entry");
+        let (last1, _) = run.run_vcpu_until_event(1, 100).expect("run vcpu 1");
+        assert_eq!(last1.exit, GuestExit::Halted, "vcpu 1 halts");
+
+        assert_eq!(
+            &*sink.lock().unwrap(),
+            &[VCPU0_APERF, VCPU1_APERF],
+            "each vCPU read its own APERF shadow through the SMP run loop"
+        );
     }
 
     // The production path forwards and serves the AMD PMC MSR surface: install
