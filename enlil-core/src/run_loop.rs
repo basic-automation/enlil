@@ -765,6 +765,96 @@ mod tests {
         );
     }
 
+    // Per-vCPU CPUID identity: leaf 0xB EDX is the *current* logical CPU's
+    // x2APIC ID, distinct per vCPU on real hardware. apply_topology_stealth
+    // installs the same CPUID array on every vCPU with EDX as a placeholder 0,
+    // relying on KVM to fill EDX per vCPU from its x2APIC ID. If that didn't
+    // hold, every vCPU would report APIC ID 0 — a blatant SMP tell. This runs
+    // the same `cpuid(0xB,0); out dl` blob on two vCPUs created with x2APIC IDs
+    // 0 and 1 and asserts each reads its own ID, locking in the per-vCPU
+    // topology identity the stealth installer's contract depends on.
+    #[test]
+    fn topology_stealth_gives_each_vcpu_its_own_x2apic_id() {
+        use enlil_devices::stealth::cpuid::{CpuidStealthConfig, CpuidStealthTable};
+
+        if !is_kvm_available() {
+            eprintln!("skipping topology_stealth_gives_each_vcpu_its_own_x2apic_id: no /dev/kvm");
+            return;
+        }
+
+        // 16-bit real-mode: cpuid(0xB, 0); out 0x3F8, dl; hlt. EDX of leaf 0xB
+        // subleaf 0 is the x2APIC ID of the logical CPU executing CPUID.
+        #[rustfmt::skip]
+        let code: [u8; 16] = [
+            0x66, 0xB8, 0x0B, 0x00, 0x00, 0x00, // mov eax, 0xB
+            0x66, 0xB9, 0x00, 0x00, 0x00, 0x00, // mov ecx, 0
+            0x0F, 0xA2,                         // cpuid
+            0x88, 0xD0,                         // mov al, dl
+            // (out + hlt appended below to keep the array readable)
+        ];
+        #[rustfmt::skip]
+        let tail: [u8; 3] = [0xBA, 0xF8, 0x03]; // mov dx, 0x3F8
+        const OUT_HLT: [u8; 2] = [0xEE, 0xF4]; // out dx, al ; hlt
+        const ENTRY: u64 = 0x1000;
+        const GUEST_VCPUS: u32 = 2;
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Shared(Arc::clone(&sink))),
+            0,
+            1,
+        )
+        .expect("build standard pc");
+        let backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        let mut run = match StealthRunLoop::install_smp(backend, pc, LbrPlatform::IntelVmx, 2) {
+            Ok(run) => run,
+            Err(e) => {
+                eprintln!("skipping topology_stealth_gives_each_vcpu_its_own_x2apic_id: {e}");
+                return;
+            }
+        };
+
+        let mut ram = GuestRam::new(0x1000);
+        {
+            let mem = ram.as_mut_slice();
+            let mut at = 0;
+            for chunk in [&code[..], &tail[..], &OUT_HLT[..]] {
+                mem[at..at + chunk.len()].copy_from_slice(chunk);
+                at += chunk.len();
+            }
+        }
+        let host_addr = ram.host_addr();
+        // SAFETY: `ram` outlives `run` within this test scope.
+        unsafe {
+            run.backend_mut()
+                .map_memory(ENTRY, host_addr, ram.len() as u64)
+        }
+        .expect("map guest memory");
+        // x2APIC IDs 0 and 1 — what KVM should report in leaf 0xB EDX per vCPU.
+        run.create_vcpu(0).expect("create vcpu 0");
+        run.create_vcpu(1).expect("create vcpu 1");
+        let table = CpuidStealthTable::build(&CpuidStealthConfig::from_host(GUEST_VCPUS, 1));
+        run.apply_topology_stealth(&table)
+            .expect("apply topology stealth");
+
+        for vcpu in 0..2usize {
+            run.backend_mut()
+                .prepare_real_mode_vcpu(vcpu, ENTRY)
+                .expect("set real-mode entry");
+            let (last, _) = run
+                .run_vcpu_until_event(vcpu, 100)
+                .expect("run until event");
+            assert_eq!(last.exit, GuestExit::Halted, "vcpu {vcpu} should reach HLT");
+        }
+
+        // Each vCPU reported its own x2APIC ID (0 then 1), not a shared 0.
+        assert_eq!(
+            &*sink.lock().unwrap(),
+            &[0u8, 1u8],
+            "leaf 0xB EDX must be each vCPU's own x2APIC ID through topology stealth"
+        );
+    }
+
     // The driver keeps both stealth surfaces in lockstep: after running a guest
     // that executes real cycles, the run-loop-driven RDPMC counters and the
     // shared APERF/MPERF shadows both advanced and both encode the model ratio —

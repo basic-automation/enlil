@@ -402,6 +402,14 @@ mod linux {
         kvm: Kvm,
         vm: VmFd,
         vcpus: Vec<VcpuFd>,
+        /// The x2APIC ID each vCPU was created with (`apic_ids[i]` is vCPU `i`'s),
+        /// the value [`create_vcpu`](Self::create_vcpu) passed to
+        /// `KVM_CREATE_VCPU`. Kept so [`apply_topology_stealth`](Self::apply_topology_stealth)
+        /// can stamp each vCPU's own initial/x2APIC ID into its CPUID — KVM only
+        /// fills those leaves per-vCPU when an in-kernel LAPIC exists, so without
+        /// this every vCPU would otherwise report the same APIC ID (an SMP tell)
+        /// under `new_without_irqchip` and on the future bare-metal backend.
+        apic_ids: Vec<u64>,
         slots: Vec<MemSlot>,
         next_slot: u32,
     }
@@ -481,6 +489,7 @@ mod linux {
                 kvm,
                 vm,
                 vcpus: Vec::new(),
+                apic_ids: Vec::new(),
                 slots: Vec::new(),
                 next_slot: 0,
             })
@@ -655,8 +664,13 @@ mod linux {
         /// (topology + hypervisor bit + PMU). The PMU fold is a no-op for an
         /// AMD-vendor table and effective for an Intel-presented one.
         ///
-        /// Leaf `0xB` `EDX` (the per-vCPU x2APIC ID) is left as KVM provides it:
-        /// KVM fills it per vCPU, and the table carries a placeholder `0`.
+        /// The per-vCPU APIC identity (leaf `1` `EBX[31:24]` initial APIC ID and
+        /// leaf `0xB`/`0x1F` `EDX` x2APIC ID) is stamped from each vCPU's own
+        /// creation id ([`create_vcpu`](Self::create_vcpu)), **not** left to KVM:
+        /// KVM only fills those leaves per vCPU when an in-kernel LAPIC is
+        /// present, so without this every vCPU under `new_without_irqchip` (and
+        /// on the bare-metal backend) would report the same APIC ID — an SMP
+        /// tell.
         ///
         /// Call after creating vCPUs and before running them.
         ///
@@ -701,8 +715,8 @@ mod linux {
             }
 
             // Overwrite or insert each leaf-0xB subleaf with the guest topology.
-            // EDX (the per-vCPU x2APIC ID) is left to KVM, which fills it per
-            // vCPU; the table carries a placeholder 0.
+            // EDX (the per-vCPU x2APIC ID) is stamped per vCPU in the set loop
+            // below; the shared template carries a placeholder 0 here.
             for sub in 0..TOPOLOGY_SUBLEAVES {
                 let r = table.lookup(0xB, sub);
                 if let Some(entry) = entries
@@ -791,9 +805,31 @@ mod linux {
             // (leaf 0xA reserved-zero there), effective for an Intel-presented one.
             Self::upsert_pmu_leaf(&mut entries, table);
 
-            let cpuid = CpuId::from_entries(&entries)
-                .map_err(|e| Error::Vcpu(format!("rebuild CpuId: {e:?}")))?;
+            // Per-vCPU APIC identity. Leaf 1 EBX[31:24] (initial APIC ID) and
+            // leaf 0xB/0x1F EDX (x2APIC ID) are the *current* logical CPU's ID
+            // — distinct per vCPU on real hardware. KVM only fills these per
+            // vCPU when an in-kernel LAPIC exists; without one (this run loop's
+            // `new_without_irqchip`, and the future bare-metal backend) every
+            // vCPU would read the *same* placeholder, so a detector reading the
+            // APIC ID on two vCPUs would find them identical — a blatant SMP
+            // tell. Stamp each vCPU's own `apic_ids[i]` into its CPUID before
+            // setting it, so the identity is correct regardless of irqchip.
+            const INITIAL_APIC_ID_MASK: u32 = 0xFF00_0000; // leaf 1 EBX[31:24]
             for (i, vcpu) in self.vcpus.iter().enumerate() {
+                let apic_id = self.apic_ids.get(i).copied().unwrap_or(i as u64);
+                let mut per_vcpu = entries.clone();
+                for entry in &mut per_vcpu {
+                    match entry.function {
+                        1 => {
+                            entry.ebx = (entry.ebx & !INITIAL_APIC_ID_MASK)
+                                | ((apic_id as u32) << 24);
+                        }
+                        0xB | 0x1F => entry.edx = apic_id as u32,
+                        _ => {}
+                    }
+                }
+                let cpuid = CpuId::from_entries(&per_vcpu)
+                    .map_err(|e| Error::Vcpu(format!("rebuild CpuId: {e:?}")))?;
                 vcpu.set_cpuid2(&cpuid)
                     .map_err(|e| Error::Vcpu(format!("KVM_SET_CPUID2 vcpu {i}: {e}")))?;
             }
@@ -955,6 +991,7 @@ mod linux {
                 .create_vcpu(id)
                 .map_err(|e| Error::Vcpu(format!("KVM_CREATE_VCPU {id}: {e}")))?;
             self.vcpus.push(vcpu);
+            self.apic_ids.push(id);
             Ok(self.vcpus.len() - 1)
         }
 
