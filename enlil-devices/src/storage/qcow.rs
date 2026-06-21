@@ -1,13 +1,16 @@
-//! Qcow2 disk image backend (read-only).
+//! Qcow2 disk image backend.
 //!
-//! Parses the qcow2 header and L1/L2 tables to resolve guest cluster
-//! offsets to host file offsets. Write support is deferred to a later phase.
+//! Parses the qcow2 header and L1/L2 tables to resolve guest cluster offsets
+//! to host file offsets. Opened read-only via [`QcowBackend::open`] or
+//! read-write via [`QcowBackend::open_rw`]; a read-write backend can overwrite
+//! data in **already-allocated** clusters (writes that land in an unallocated
+//! cluster still need cluster allocation — a separate step).
 
 use super::StorageBackend;
 use crate::truncate::usize_of;
 use anyhow::{Context, Result, bail};
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Mutex;
 
 /// Qcow2 magic number: "QFI\xfb"
@@ -79,26 +82,50 @@ impl QcowHeader {
     }
 }
 
-/// Read-only qcow2 backend.
+/// Qcow2 backend.
 ///
 /// Supports reading from qcow2 images by walking L1 → L2 → data cluster.
-/// Unallocated clusters return zeroes. No backing file chain support yet.
+/// Unallocated clusters return zeroes. No backing file chain support yet. When
+/// opened read-write ([`open_rw`](Self::open_rw)), overwrites of data in
+/// already-allocated clusters are persisted to the image.
 pub struct QcowBackend {
     file: Mutex<File>,
     header: QcowHeader,
     l1_table: Vec<u64>,
+    /// `true` if the underlying file was opened read-write; gates `write_at`.
+    writable: bool,
 }
 
 impl QcowBackend {
-    /// Open a qcow2 image file.
+    /// Open a qcow2 image file **read-only**.
     ///
     /// # Errors
     ///
     /// Returns an error if the file cannot be opened or contains invalid qcow2 data.
     pub fn open(path: &std::path::Path) -> Result<Self> {
-        let mut file = File::open(path)
+        let file = File::open(path)
             .with_context(|| format!("failed to open qcow2: {}", path.display()))?;
+        Self::from_file(file, false)
+    }
 
+    /// Open a qcow2 image file **read-write**, so overwrites of already-allocated
+    /// clusters are persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be opened read-write or contains
+    /// invalid qcow2 data.
+    pub fn open_rw(path: &std::path::Path) -> Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("failed to open qcow2 read-write: {}", path.display()))?;
+        Self::from_file(file, true)
+    }
+
+    /// Parse the header + L1 table from an already-opened file.
+    fn from_file(mut file: File, writable: bool) -> Result<Self> {
         // Read header
         let mut header_buf = [0u8; 104]; // v3 header is up to 104 bytes
         let n = file.read(&mut header_buf)?;
@@ -120,6 +147,7 @@ impl QcowBackend {
             file: Mutex::new(file),
             header,
             l1_table,
+            writable,
         })
     }
 
@@ -199,12 +227,55 @@ impl StorageBackend for QcowBackend {
         Ok(total_read)
     }
 
-    fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<usize> {
-        bail!("qcow2 backend is read-only (write support not yet implemented)")
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize> {
+        if !self.writable {
+            bail!("qcow2 backend opened read-only");
+        }
+        if offset >= self.header.size {
+            return Ok(0);
+        }
+        let mut file = self.file.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let cluster_size = self.header.cluster_size();
+        let writable_len = buf.len().min(usize_of(self.header.size - offset));
+
+        // Pass 1: resolve every target cluster up front. A write that lands in
+        // an unallocated cluster needs cluster allocation (L2/refcount updates)
+        // — not yet implemented — so bail *before* writing anything rather than
+        // leaving a torn, half-applied write.
+        let mut plan: Vec<(u64, usize, usize)> = Vec::new(); // (host_offset, buf_start, len)
+        let mut done = 0usize;
+        let mut current_offset = offset;
+        while done < writable_len {
+            let in_cluster = usize_of(current_offset % cluster_size);
+            let chunk = (writable_len - done).min(usize_of(cluster_size) - in_cluster);
+            match self.resolve_offset(current_offset, &mut file)? {
+                Some(host_offset) => plan.push((host_offset, done, chunk)),
+                None => bail!(
+                    "qcow2 write to unallocated cluster at guest offset {current_offset:#x} \
+                     (cluster allocation not yet implemented)"
+                ),
+            }
+            done += chunk;
+            current_offset += chunk as u64;
+        }
+
+        // Pass 2: every cluster is backed — apply the writes.
+        for (host_offset, buf_start, len) in plan {
+            file.seek(SeekFrom::Start(host_offset))?;
+            file.write_all(&buf[buf_start..buf_start + len])?;
+        }
+        drop(file);
+        Ok(writable_len)
     }
 
     fn flush(&self) -> Result<()> {
-        Ok(()) // read-only, nothing to flush
+        if !self.writable {
+            return Ok(()); // read-only, nothing to flush
+        }
+        let mut file = self.file.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        file.flush()?;
+        drop(file);
+        Ok(())
     }
 
     fn capacity(&self) -> u64 {
@@ -212,7 +283,7 @@ impl StorageBackend for QcowBackend {
     }
 
     fn is_readonly(&self) -> bool {
-        true
+        !self.writable
     }
 }
 
@@ -323,13 +394,66 @@ mod tests {
     }
 
     #[test]
-    fn write_rejected() {
+    fn write_rejected_when_opened_read_only() {
         let img = make_minimal_qcow2();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), &img).unwrap();
 
         let backend = QcowBackend::open(tmp.path()).unwrap();
+        assert!(backend.is_readonly());
         assert!(backend.write_at(0, &[1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn write_to_allocated_cluster_round_trips() {
+        let img = make_minimal_qcow2();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &img).unwrap();
+
+        let backend = QcowBackend::open_rw(tmp.path()).unwrap();
+        assert!(!backend.is_readonly());
+
+        // Cluster 0 (guest offset 0) is allocated in the minimal image; an
+        // overwrite there persists and reads back.
+        let payload: Vec<u8> = (0..512u32).map(|i| u8_of((i ^ 0xA5) as usize)).collect();
+        let n = backend.write_at(100, &payload).unwrap();
+        assert_eq!(n, payload.len());
+        backend.flush().unwrap();
+
+        let mut buf = vec![0u8; payload.len()];
+        backend.read_at(100, &mut buf).unwrap();
+        assert_eq!(buf, payload, "written bytes read back");
+
+        // Reopening the file proves the bytes hit disk, not just a cache.
+        drop(backend);
+        let reopened = QcowBackend::open(tmp.path()).unwrap();
+        let mut buf2 = vec![0u8; payload.len()];
+        reopened.read_at(100, &mut buf2).unwrap();
+        assert_eq!(buf2, payload, "written bytes persisted to the image file");
+    }
+
+    #[test]
+    fn write_spanning_into_unallocated_cluster_is_rejected_atomically() {
+        let img = make_minimal_qcow2();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &img).unwrap();
+
+        let backend = QcowBackend::open_rw(tmp.path()).unwrap();
+        // Cluster 0 (0..64KB) is allocated; cluster 1 (64KB..) is not. A write
+        // straddling the boundary must fail without partially applying — the
+        // allocated half must be unchanged afterward.
+        let cluster_size = 1usize << 16;
+        let start = cluster_size - 8;
+        let payload = [0xEEu8; 16];
+        assert!(backend.write_at(start as u64, &payload).is_err());
+
+        let mut buf = [0xFFu8; 16];
+        backend.read_at(start as u64, &mut buf).unwrap();
+        // Original cluster-0 data is the i&0xFF pattern; the last 8 bytes of
+        // cluster 0 are bytes (cluster_size-8 .. cluster_size).
+        for (k, b) in buf.iter().take(8).enumerate() {
+            assert_eq!(*b, u8_of((start + k) & 0xFF), "allocated half untouched");
+        }
     }
 
     #[test]
