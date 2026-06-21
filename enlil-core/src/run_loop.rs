@@ -963,6 +963,97 @@ mod tests {
         );
     }
 
+    // AMD per-vCPU identity: leaf 0x8000_001E EAX is the extended APIC ID of
+    // the current logical CPU (the AMD counterpart of leaf 0xB EDX), and KVM
+    // leaves it the same across vCPUs without an in-kernel LAPIC — the same gap
+    // that bit leaf 0xB. apply_topology_stealth now stamps it per vCPU. Run the
+    // `cpuid(0x8000_001E); out al` blob on two AMD-presented vCPUs and assert
+    // each reads its own extended APIC ID (0 then 1).
+    #[test]
+    fn topology_stealth_gives_each_vcpu_its_own_amd_extended_apic_id() {
+        use enlil_devices::stealth::cpuid::{CpuidStealthConfig, CpuidStealthTable};
+
+        if !is_kvm_available() {
+            eprintln!(
+                "skipping topology_stealth_gives_each_vcpu_its_own_amd_extended_apic_id: no /dev/kvm"
+            );
+            return;
+        }
+
+        // 16-bit real-mode: cpuid(0x8000001E); out 0x3F8, al; hlt. After CPUID,
+        // EAX (al = EAX[7:0]) is the extended APIC ID of the executing vCPU.
+        #[rustfmt::skip]
+        let code: [u8; 13] = [
+            0x66, 0xB8, 0x1E, 0x00, 0x00, 0x80, // mov eax, 0x8000001E
+            0x0F, 0xA2,                         // cpuid
+            0xBA, 0xF8, 0x03,                   // mov dx, 0x3F8
+            0xEE,                               // out dx, al
+            0xF4,                               // hlt
+        ];
+        const ENTRY: u64 = 0x1000;
+        const GUEST_VCPUS: u32 = 2;
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Shared(Arc::clone(&sink))),
+            0,
+            1,
+        )
+        .expect("build standard pc");
+        let backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        let mut run = match StealthRunLoop::install_smp(backend, pc, LbrPlatform::AmdSvm, 2) {
+            Ok(run) => run,
+            Err(e) => {
+                eprintln!(
+                    "skipping topology_stealth_gives_each_vcpu_its_own_amd_extended_apic_id: {e}"
+                );
+                return;
+            }
+        };
+
+        let mut ram = GuestRam::new(0x1000);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+        // SAFETY: `ram` outlives `run` within this test scope.
+        unsafe {
+            run.backend_mut()
+                .map_memory(ENTRY, host_addr, ram.len() as u64)
+        }
+        .expect("map guest memory");
+        run.create_vcpu(0).expect("create vcpu 0");
+        run.create_vcpu(1).expect("create vcpu 1");
+        let table = CpuidStealthTable::build(&CpuidStealthConfig::from_host(GUEST_VCPUS, 1));
+        // Only meaningful on an AMD-presented host (the leaf is AMD-only); skip
+        // cleanly elsewhere rather than asserting on a leaf KVM does not expose.
+        if table.lookup(0x8000_001E, 0).eax == 0
+            && table.lookup(0x8000_0000, 0).eax < 0x8000_001E
+        {
+            eprintln!(
+                "skipping topology_stealth_gives_each_vcpu_its_own_amd_extended_apic_id: \
+                 host does not expose leaf 0x8000_001E (non-AMD)"
+            );
+            return;
+        }
+        run.apply_topology_stealth(&table)
+            .expect("apply topology stealth");
+
+        for vcpu in 0..2usize {
+            run.backend_mut()
+                .prepare_real_mode_vcpu(vcpu, ENTRY)
+                .expect("set real-mode entry");
+            let (last, _) = run
+                .run_vcpu_until_event(vcpu, 100)
+                .expect("run until event");
+            assert_eq!(last.exit, GuestExit::Halted, "vcpu {vcpu} should reach HLT");
+        }
+
+        assert_eq!(
+            &*sink.lock().unwrap(),
+            &[0u8, 1u8],
+            "leaf 0x8000_001E EAX must be each vCPU's own extended APIC ID"
+        );
+    }
+
     // The driver keeps both stealth surfaces in lockstep: after running a guest
     // that executes real cycles, the run-loop-driven RDPMC counters and the
     // shared APERF/MPERF shadows both advanced and both encode the model ratio —

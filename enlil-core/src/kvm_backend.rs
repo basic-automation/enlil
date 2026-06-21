@@ -664,13 +664,14 @@ mod linux {
         /// (topology + hypervisor bit + PMU). The PMU fold is a no-op for an
         /// AMD-vendor table and effective for an Intel-presented one.
         ///
-        /// The per-vCPU APIC identity (leaf `1` `EBX[31:24]` initial APIC ID and
-        /// leaf `0xB`/`0x1F` `EDX` x2APIC ID) is stamped from each vCPU's own
-        /// creation id ([`create_vcpu`](Self::create_vcpu)), **not** left to KVM:
-        /// KVM only fills those leaves per vCPU when an in-kernel LAPIC is
-        /// present, so without this every vCPU under `new_without_irqchip` (and
-        /// on the bare-metal backend) would report the same APIC ID — an SMP
-        /// tell.
+        /// The per-vCPU APIC identity (leaf `1` `EBX[31:24]` initial APIC ID,
+        /// leaf `0xB`/`0x1F` `EDX` x2APIC ID, and on AMD leaf `0x8000_001E`
+        /// `EAX` extended APIC ID + `EBX[7:0]` core ID) is stamped from each
+        /// vCPU's own creation id ([`create_vcpu`](Self::create_vcpu)), **not**
+        /// left to KVM: KVM only fills those leaves per vCPU when an in-kernel
+        /// LAPIC is present, so without this every vCPU under
+        /// `new_without_irqchip` (and on the bare-metal backend) would report
+        /// the same APIC ID — an SMP tell.
         ///
         /// Call after creating vCPUs and before running them.
         ///
@@ -788,9 +789,11 @@ mod linux {
             // AMD leaf 0x8000_001E EBX[15:8] is ThreadsPerComputeUnit-1 (SMT
             // width); KVM mirrors the host, so an SMT-1 guest on an SMT-2 host
             // would read 1 here and contradict the single-thread topology in leaf
-            // 0xB / leaf-1 EBX. Patch only that sub-field from the table, leaving
-            // the per-vCPU EAX (extended APIC id) and EBX[7:0] (core/compute-unit
-            // id) — which KVM fills per vCPU — and ECX (node id) untouched.
+            // 0xB / leaf-1 EBX. Patch that sub-field from the table here in the
+            // shared template (ECX node id is left to KVM). The per-vCPU EAX
+            // (extended APIC id) and EBX[7:0] (core/compute-unit id) are stamped
+            // per vCPU in the set loop below — KVM only fills them per vCPU with
+            // an in-kernel LAPIC, the same gap that bit leaf 0xB EDX.
             // Reserved for an Intel table (no 0x8000_001E), so a no-op there.
             const SMT_WIDTH_MASK: u32 = 0x0000_FF00; // EBX[15:8]
             let ext1e_ebx = table.lookup(0x8000_001E, 0).ebx;
@@ -805,26 +808,40 @@ mod linux {
             // (leaf 0xA reserved-zero there), effective for an Intel-presented one.
             Self::upsert_pmu_leaf(&mut entries, table);
 
-            // Per-vCPU APIC identity. Leaf 1 EBX[31:24] (initial APIC ID) and
-            // leaf 0xB/0x1F EDX (x2APIC ID) are the *current* logical CPU's ID
-            // — distinct per vCPU on real hardware. KVM only fills these per
-            // vCPU when an in-kernel LAPIC exists; without one (this run loop's
-            // `new_without_irqchip`, and the future bare-metal backend) every
-            // vCPU would read the *same* placeholder, so a detector reading the
-            // APIC ID on two vCPUs would find them identical — a blatant SMP
-            // tell. Stamp each vCPU's own `apic_ids[i]` into its CPUID before
-            // setting it, so the identity is correct regardless of irqchip.
+            // Per-vCPU APIC identity. Several CPUID fields are the *current*
+            // logical CPU's ID — distinct per vCPU on real hardware — yet KVM
+            // only fills them per vCPU when an in-kernel LAPIC exists; without
+            // one (this run loop's `new_without_irqchip`, and the future
+            // bare-metal backend) every vCPU reads the *same* placeholder, so a
+            // detector comparing the APIC ID across two vCPUs finds them
+            // identical — a blatant SMP tell. Stamp each vCPU's own
+            // `apic_ids[i]` into its CPUID before setting it, so the identity is
+            // correct regardless of irqchip:
+            //   - leaf 1 EBX[31:24]    initial (xAPIC) ID
+            //   - leaf 0xB/0x1F EDX    x2APIC ID
+            //   - leaf 0x8000_001E EAX extended APIC ID (AMD)
+            //     and EBX[7:0]         core / compute-unit ID (AMD)
+            // The AMD core ID is the APIC ID with the SMT (thread) bits shifted
+            // out; leaf 0xB subleaf 0 EAX carries that shift width.
             const INITIAL_APIC_ID_MASK: u32 = 0xFF00_0000; // leaf 1 EBX[31:24]
+            const CORE_ID_MASK: u32 = 0x0000_00FF; // leaf 0x8000_001E EBX[7:0]
+            let smt_shift = table.lookup(0xB, 0).eax & 0x1F;
             for (i, vcpu) in self.vcpus.iter().enumerate() {
                 let apic_id = self.apic_ids.get(i).copied().unwrap_or(i as u64);
+                let apic_id = apic_id as u32;
+                let core_id = apic_id >> smt_shift;
                 let mut per_vcpu = entries.clone();
                 for entry in &mut per_vcpu {
                     match entry.function {
                         1 => {
-                            entry.ebx = (entry.ebx & !INITIAL_APIC_ID_MASK)
-                                | ((apic_id as u32) << 24);
+                            entry.ebx =
+                                (entry.ebx & !INITIAL_APIC_ID_MASK) | (apic_id << 24);
                         }
-                        0xB | 0x1F => entry.edx = apic_id as u32,
+                        0xB | 0x1F => entry.edx = apic_id,
+                        0x8000_001E => {
+                            entry.eax = apic_id;
+                            entry.ebx = (entry.ebx & !CORE_ID_MASK) | (core_id & CORE_ID_MASK);
+                        }
                         _ => {}
                     }
                 }
