@@ -823,34 +823,50 @@ mod linux {
             //     and EBX[7:0]         core / compute-unit ID (AMD)
             // The AMD core ID is the APIC ID with the SMT (thread) bits shifted
             // out; leaf 0xB subleaf 0 EAX carries that shift width.
-            const INITIAL_APIC_ID_MASK: u32 = 0xFF00_0000; // leaf 1 EBX[31:24]
-            const CORE_ID_MASK: u32 = 0x0000_00FF; // leaf 0x8000_001E EBX[7:0]
             let smt_shift = table.lookup(0xB, 0).eax & 0x1F;
             for (i, vcpu) in self.vcpus.iter().enumerate() {
-                let apic_id = self.apic_ids.get(i).copied().unwrap_or(i as u64);
-                let apic_id = apic_id as u32;
-                let core_id = apic_id >> smt_shift;
+                let apic_id = self.apic_ids.get(i).copied().unwrap_or(i as u64) as u32;
                 let mut per_vcpu = entries.clone();
-                for entry in &mut per_vcpu {
-                    match entry.function {
-                        1 => {
-                            entry.ebx =
-                                (entry.ebx & !INITIAL_APIC_ID_MASK) | (apic_id << 24);
-                        }
-                        0xB | 0x1F => entry.edx = apic_id,
-                        0x8000_001E => {
-                            entry.eax = apic_id;
-                            entry.ebx = (entry.ebx & !CORE_ID_MASK) | (core_id & CORE_ID_MASK);
-                        }
-                        _ => {}
-                    }
-                }
+                Self::stamp_apic_identity(&mut per_vcpu, apic_id, smt_shift);
                 let cpuid = CpuId::from_entries(&per_vcpu)
                     .map_err(|e| Error::Vcpu(format!("rebuild CpuId: {e:?}")))?;
                 vcpu.set_cpuid2(&cpuid)
                     .map_err(|e| Error::Vcpu(format!("KVM_SET_CPUID2 vcpu {i}: {e}")))?;
             }
             Ok(())
+        }
+
+        /// Stamp a single vCPU's APIC identity into its CPUID `entries` in place:
+        /// leaf 1 `EBX[31:24]` initial (xAPIC) ID, leaf `0xB`/`0x1F` `EDX` x2APIC
+        /// ID, and AMD leaf `0x8000_001E` `EAX` extended APIC ID + `EBX[7:0]`
+        /// core/compute-unit ID (the APIC ID with the SMT thread bits shifted
+        /// out by `smt_shift`). Pure over `entries` so it is unit-testable with a
+        /// synthetic supported-CPUID set (covering leaves an AMD host does not
+        /// expose, e.g. `0x1F`); see [`apply_topology_stealth`] for why KVM
+        /// cannot be trusted to fill these per vCPU.
+        ///
+        /// [`apply_topology_stealth`]: Self::apply_topology_stealth
+        pub(crate) fn stamp_apic_identity(
+            entries: &mut [kvm_bindings::kvm_cpuid_entry2],
+            apic_id: u32,
+            smt_shift: u32,
+        ) {
+            const INITIAL_APIC_ID_MASK: u32 = 0xFF00_0000; // leaf 1 EBX[31:24]
+            const CORE_ID_MASK: u32 = 0x0000_00FF; // leaf 0x8000_001E EBX[7:0]
+            let core_id = apic_id >> smt_shift;
+            for entry in entries {
+                match entry.function {
+                    1 => {
+                        entry.ebx = (entry.ebx & !INITIAL_APIC_ID_MASK) | (apic_id << 24);
+                    }
+                    0xB | 0x1F => entry.edx = apic_id,
+                    0x8000_001E => {
+                        entry.eax = apic_id;
+                        entry.ebx = (entry.ebx & !CORE_ID_MASK) | (core_id & CORE_ID_MASK);
+                    }
+                    _ => {}
+                }
+            }
         }
 
         /// Apply the [`CpuidStealthTable`]'s **architectural-PMU** view (leaf
@@ -1254,6 +1270,61 @@ pub use linux::{is_kvm_available, GuestMemory, GuestRam, KvmBackend, MemSlot, HO
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Deterministic coverage of the per-vCPU APIC-identity stamping (the fix in
+    // apply_topology_stealth). Unlike the live-KVM tests it can include an
+    // Intel-style leaf 0x1F that this AMD host never exposes, exercising every
+    // stamped leaf without hardware.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stamp_apic_identity_writes_each_per_vcpu_leaf() {
+        use kvm_bindings::kvm_cpuid_entry2;
+        let mut entries = vec![
+            kvm_cpuid_entry2 {
+                function: 1,
+                ebx: 0x0000_AB00, // low bytes (CLFLUSH size, etc.) must survive
+                ..Default::default()
+            },
+            kvm_cpuid_entry2 {
+                function: 0xB,
+                edx: 0,
+                ..Default::default()
+            },
+            kvm_cpuid_entry2 {
+                function: 0x1F, // Intel v2 topology — absent on this AMD host
+                edx: 0,
+                ..Default::default()
+            },
+            kvm_cpuid_entry2 {
+                function: 0x8000_001E,
+                eax: 0,
+                ebx: 0x0000_0100, // SMT-width field (EBX[15:8]) must survive
+                ..Default::default()
+            },
+            kvm_cpuid_entry2 {
+                function: 0x8000_0008, // unrelated leaf — must be untouched
+                eax: 0x3030,
+                ..Default::default()
+            },
+        ];
+
+        // APIC id 5, SMT shift 1 → core id = 5 >> 1 = 2.
+        KvmBackend::stamp_apic_identity(&mut entries, 5, 1);
+
+        // leaf 1: EBX[31:24] = initial APIC id; low 24 bits preserved.
+        assert_eq!(entries[0].ebx >> 24, 5);
+        assert_eq!(entries[0].ebx & 0x00FF_FFFF, 0x0000_AB00);
+        // leaf 0xB and 0x1F: EDX = x2APIC id.
+        assert_eq!(entries[1].edx, 5);
+        assert_eq!(entries[2].edx, 5);
+        // leaf 0x8000_001E: EAX = extended APIC id; EBX[7:0] = core id; EBX high
+        // (SMT width) preserved.
+        assert_eq!(entries[3].eax, 5);
+        assert_eq!(entries[3].ebx & 0xFF, 2);
+        assert_eq!(entries[3].ebx & 0xFF00, 0x0100);
+        // Unrelated leaf is left exactly as-is.
+        assert_eq!(entries[4].eax, 0x3030);
+    }
 
     #[test]
     fn terminal_exits_stop_the_loop() {
