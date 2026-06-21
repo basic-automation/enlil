@@ -1944,9 +1944,25 @@ Physical USB Devices
   `StealthRunLoop::run_real_mode` now also *acts on* the `RunStep` platform events
   the way hardware does — a `0x92`/`0xCF9` CPU reset reboots the vCPU to its reset
   vector, an ACPI `SLP_EN` commit returns `LoopOutcome::Shutdown(slp_typ)` (`_S5` =
-  power off) — both proven on `/dev/kvm`. **Remaining:** only a threaded-vCPU
+  power off) — both proven on `/dev/kvm`.
+  **Per-vCPU stealth state — DONE (2026-06-21):** the run loop previously shared one
+  router/timing/PMC/LBR across every vCPU, so an SMP guest's two logical CPUs would
+  read the *same* APERF/MPERF/PMC/LBR — itself a tell. The bus now holds a
+  `StealthBank` of one `StealthMsrRouter` per vCPU plus an active selector
+  (`set_active_vcpu`); `StealthRunLoop::install_smp(platform, vcpu_count)` seeds
+  `vcpu_count` independent routers (one timing `Arc` each) and `run_vcpu_once(i)`
+  routes vCPU `i`'s forwarded MSR exits to *its* shadow and advances *its* counters
+  — proven on `/dev/kvm` (two vCPUs each read their own seeded APERF). A real
+  per-vCPU bug fell out and was fixed: `apply_topology_stealth` left leaf 0xB EDX
+  (the x2APIC ID) as a placeholder, trusting "KVM fills it per vCPU" — a live probe
+  showed both vCPUs read an *identical* APIC ID under `new_without_irqchip` (KVM only
+  fills the APIC-ID leaves per vCPU with an in-kernel LAPIC). It now stamps each
+  vCPU's own initial (leaf 1 EBX[31:24]) and x2APIC (leaf 0xB/0x1F EDX) ID from its
+  creation id, correct regardless of irqchip — and so for the bare-metal backend too.
+  **Remaining:** only a threaded-vCPU
   watchdog (the synchronous `set_immediate_exit` primitive exists; the full version
-  needs a multi-threaded vCPU execution model + signal kick — architectural). LBR
+  needs a multi-threaded vCPU execution model + signal kick — architectural; per-vCPU
+  stealth state above is the prerequisite it was waiting on). LBR
   save/restore via the VMCS/VMCB controls is a bare-metal-backend (Phase 6) concern.
 
 ### 5.5 Virtual TPM 2.0

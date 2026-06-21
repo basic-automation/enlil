@@ -51,13 +51,57 @@ pub struct DeviceBus {
     pci_reset: Option<PciResetControl>,
     /// Per-vCPU stealth MSR shadows (APERF/MPERF, PMC, LBR). When present, the
     /// handler serves forwarded guest `RDMSR`/`WRMSR` for the modelled MSRs
-    /// from this router instead of `#GP`-ing them; `None` leaves all MSR exits
-    /// unhandled. This is the single-vCPU run loop's state — a multi-vCPU model
-    /// will hold one router per vCPU. `None` until [`set_stealth_msr_router`]
-    /// runs.
+    /// from the **active** vCPU's router instead of `#GP`-ing them; `None`
+    /// leaves all MSR exits unhandled.
+    ///
+    /// The bus is a single [`VmExitHandler`] shared by every vCPU, but each
+    /// vCPU must read its *own* counters — a real SMP guest sees independent
+    /// per-logical-CPU APERF/MPERF/PMC/LBR, and two vCPUs reading the *same*
+    /// shadow would be a detectable tell. The run loop selects which vCPU's
+    /// router serves the next MSR exit with [`set_active_vcpu`] before each
+    /// `KVM_RUN`. A single-vCPU install ([`set_stealth_msr_router`]) is just a
+    /// bank of one. `None` until a router is installed.
     ///
     /// [`set_stealth_msr_router`]: Self::set_stealth_msr_router
-    stealth_msr: Option<StealthMsrRouter>,
+    /// [`set_active_vcpu`]: Self::set_active_vcpu
+    /// [`VmExitHandler`]: crate::kvm_backend::VmExitHandler
+    stealth: Option<StealthBank>,
+}
+
+/// A bank of per-vCPU [`StealthMsrRouter`]s with an `active` selector.
+///
+/// One router per vCPU; `active` names the vCPU whose router currently serves
+/// MSR exits on the shared bus. The invariant `active < routers.len()` is
+/// upheld by the constructors and [`set_active`](Self::set_active) (which
+/// rejects out-of-range selections), and `routers` is never empty, so indexing
+/// `routers[active]` is always valid.
+struct StealthBank {
+    routers: Vec<StealthMsrRouter>,
+    active: usize,
+}
+
+impl StealthBank {
+    /// A bank of exactly the given routers (must be non-empty), active vCPU 0.
+    fn new(routers: Vec<StealthMsrRouter>) -> Self {
+        debug_assert!(!routers.is_empty(), "a stealth bank needs ≥1 router");
+        Self { routers, active: 0 }
+    }
+
+    /// The active vCPU's router.
+    fn active(&mut self) -> &mut StealthMsrRouter {
+        &mut self.routers[self.active]
+    }
+
+    /// Select the active vCPU. Returns `false` (leaving `active` unchanged) if
+    /// `index` names no router in the bank.
+    fn set_active(&mut self, index: usize) -> bool {
+        if index < self.routers.len() {
+            self.active = index;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl DeviceBus {
@@ -68,25 +112,74 @@ impl DeviceBus {
             pio: PioBus::new(),
             mmio: MmioBus::new(),
             pci_reset: None,
-            stealth_msr: None,
+            stealth: None,
         }
     }
 
-    /// Install the per-vCPU stealth MSR router so forwarded guest `RDMSR`/
-    /// `WRMSR` of the modelled MSRs (APERF/MPERF, the PMC counters, and the LBR
-    /// registers) are served from its shadows. Requires the backend to have
-    /// userspace MSR forwarding on
+    /// Install a single stealth MSR router (a one-vCPU bank) so forwarded guest
+    /// `RDMSR`/`WRMSR` of the modelled MSRs (APERF/MPERF, the PMC counters, and
+    /// the LBR registers) are served from its shadows. Requires the backend to
+    /// have userspace MSR forwarding on
     /// ([`KvmBackend::enable_userspace_msr_exits`](crate::kvm_backend::KvmBackend::enable_userspace_msr_exits)).
+    ///
+    /// For an SMP guest use [`set_stealth_msr_routers`](Self::set_stealth_msr_routers)
+    /// to install one router per vCPU.
     pub fn set_stealth_msr_router(&mut self, router: StealthMsrRouter) {
-        self.stealth_msr = Some(router);
+        self.stealth = Some(StealthBank::new(vec![router]));
     }
 
-    /// Mutable access to the installed stealth MSR router, if any — so the run
-    /// loop can advance its shadow counters (`PmcState::advance_counters`,
-    /// `VcpuTimingState::advance`) between guest entries.
+    /// Install one stealth MSR router per vCPU (a bank), so each vCPU's
+    /// forwarded MSR exits are served from its *own* APERF/MPERF/PMC/LBR
+    /// shadows. The run loop selects which one answers with
+    /// [`set_active_vcpu`](Self::set_active_vcpu) before each guest entry.
+    /// `routers[i]` serves vCPU `i`; the active vCPU starts at 0.
+    ///
+    /// # Panics
+    /// Panics if `routers` is empty — a bank must back at least one vCPU.
+    pub fn set_stealth_msr_routers(&mut self, routers: Vec<StealthMsrRouter>) {
+        assert!(!routers.is_empty(), "a stealth bank needs ≥1 router");
+        self.stealth = Some(StealthBank::new(routers));
+    }
+
+    /// Select which vCPU's router serves subsequent MSR exits. The run loop
+    /// calls this with the vCPU index before entering it, so a forwarded
+    /// `RDMSR`/`WRMSR` on vCPU `index` hits `index`'s shadow state.
+    ///
+    /// Returns `false` (leaving the selection unchanged) if no router is
+    /// installed or `index` names no vCPU in the bank.
+    pub fn set_active_vcpu(&mut self, index: usize) -> bool {
+        self.stealth.as_mut().is_some_and(|b| b.set_active(index))
+    }
+
+    /// The currently-active vCPU index (the one whose router serves MSR exits),
+    /// or `None` if no router is installed.
+    #[must_use]
+    pub fn active_vcpu(&self) -> Option<usize> {
+        self.stealth.as_ref().map(|b| b.active)
+    }
+
+    /// The number of per-vCPU routers installed, or 0 if none.
+    #[must_use]
+    pub fn stealth_vcpu_count(&self) -> usize {
+        self.stealth.as_ref().map_or(0, |b| b.routers.len())
+    }
+
+    /// Mutable access to the **active** vCPU's stealth MSR router, if any — so
+    /// the run loop can advance its shadow counters (`PmcState::advance_counters`,
+    /// `VcpuTimingState::advance`) between guest entries. To reach a specific
+    /// vCPU's router regardless of the active selection use
+    /// [`stealth_msr_for_mut`](Self::stealth_msr_for_mut).
     #[must_use]
     pub fn stealth_msr_mut(&mut self) -> Option<&mut StealthMsrRouter> {
-        self.stealth_msr.as_mut()
+        self.stealth.as_mut().map(StealthBank::active)
+    }
+
+    /// Mutable access to vCPU `index`'s stealth MSR router, if one is installed
+    /// for it — independent of which vCPU is active. Used to seed or inspect a
+    /// particular vCPU's shadows.
+    #[must_use]
+    pub fn stealth_msr_for_mut(&mut self, index: usize) -> Option<&mut StealthMsrRouter> {
+        self.stealth.as_mut().and_then(|b| b.routers.get_mut(index))
     }
 
     /// Register a port-I/O device over the range it declares.
@@ -1028,12 +1121,56 @@ impl StandardPc {
         &mut self,
         platform: enlil_devices::stealth::lbr::LbrPlatform,
     ) -> std::sync::Arc<crate::timing_stealth::VcpuTimingState> {
+        let (router, timing) = Self::seeded_stealth_router(platform);
+        self.bus.set_stealth_msr_router(router);
+        timing
+    }
+
+    /// Install `vcpu_count` independent stealth MSR routers on the device bus —
+    /// one per vCPU — and return the per-vCPU shared
+    /// [`VcpuTimingState`](crate::timing_stealth::VcpuTimingState) handles
+    /// (`handles[i]` drives vCPU `i`).
+    ///
+    /// Each router is an independent [`StealthMsrRouter`] (its own `PmcState`,
+    /// `LbrState`, and timing shadow) seeded exactly as
+    /// [`install_stealth_msr_router`](Self::install_stealth_msr_router) seeds the
+    /// single-vCPU case, so every vCPU's first APERF/MPERF read shows the model
+    /// ratio rather than the 1.0 identity. An SMP guest reading a per-CPU
+    /// counter on vCPU `i` then sees `i`'s own monotonic shadow, not a value
+    /// shared with (and racing) the other vCPUs. The run loop selects which one
+    /// answers with [`DeviceBus::set_active_vcpu`] before each entry.
+    ///
+    /// # Panics
+    /// Panics if `vcpu_count` is 0 — a bank must back at least one vCPU.
+    pub fn install_stealth_msr_routers(
+        &mut self,
+        platform: enlil_devices::stealth::lbr::LbrPlatform,
+        vcpu_count: usize,
+    ) -> Vec<std::sync::Arc<crate::timing_stealth::VcpuTimingState>> {
+        assert!(vcpu_count > 0, "a stealth bank needs ≥1 vCPU");
+        let (routers, handles): (Vec<_>, Vec<_>) = (0..vcpu_count)
+            .map(|_| Self::seeded_stealth_router(platform))
+            .unzip();
+        self.bus.set_stealth_msr_routers(routers);
+        handles
+    }
+
+    /// Build one stealth MSR router for `platform` over a fresh timing state,
+    /// seeded with a single [`STEALTH_SEED_REF_CYCLES`](Self::STEALTH_SEED_REF_CYCLES)
+    /// advance at the default [`PmcRateModel`] rate, and return it together with
+    /// a clone of its shared timing handle. Shared by the single- and
+    /// multi-vCPU install paths so they seed identically.
+    fn seeded_stealth_router(
+        platform: enlil_devices::stealth::lbr::LbrPlatform,
+    ) -> (
+        StealthMsrRouter,
+        std::sync::Arc<crate::timing_stealth::VcpuTimingState>,
+    ) {
         use enlil_devices::stealth::{lbr::LbrState, pmc::PmcRateModel};
         let timing = crate::timing_stealth::VcpuTimingState::new();
         timing.advance(Self::STEALTH_SEED_REF_CYCLES, &PmcRateModel::DEFAULT);
         let router = StealthMsrRouter::new(std::sync::Arc::clone(&timing), LbrState::new(platform));
-        self.bus.set_stealth_msr_router(router);
-        timing
+        (router, timing)
     }
 
     /// Drive a PCI device's level-triggered `INTx` line into the interrupt fabric,
@@ -1274,12 +1411,12 @@ impl VmExitHandler for DeviceBus {
         self.mmio.write(addr, data);
     }
     fn rdmsr(&mut self, msr: u32) -> Option<u64> {
-        self.stealth_msr.as_ref().and_then(|r| r.read_msr(msr))
+        self.stealth.as_mut().and_then(|b| b.active().read_msr(msr))
     }
     fn wrmsr(&mut self, msr: u32, value: u64) -> bool {
-        self.stealth_msr
+        self.stealth
             .as_mut()
-            .is_some_and(|r| r.write_msr(msr, value))
+            .is_some_and(|b| b.active().write_msr(msr, value))
     }
 }
 
@@ -3329,5 +3466,146 @@ mod tests {
         // visible through the bus's MSR read.
         timing.write_aperf(0x1_2345);
         assert_eq!(pc.bus.rdmsr(timing_msr::IA32_APERF), Some(0x1_2345));
+    }
+
+    // A per-vCPU bank serves the *active* vCPU's shadow: with two routers
+    // installed, the MSR a guest reads through the bus depends on which vCPU is
+    // active — independent state, never one shared counter. This is the core
+    // of per-vCPU stealth: an SMP guest sees each logical CPU's own APERF.
+    #[test]
+    fn stealth_bank_serves_the_active_vcpu_shadow() {
+        use crate::kvm_backend::VmExitHandler;
+        use crate::stealth_msr::StealthMsrRouter;
+        use crate::timing_stealth::VcpuTimingState;
+        use enlil_devices::stealth::lbr::{LbrPlatform, LbrState};
+        use enlil_devices::stealth::timing::msr as timing_msr;
+
+        // Two vCPUs, each APERF distinct so we can tell whose shadow answered.
+        let t0 = VcpuTimingState::new();
+        t0.write_aperf(0xAAAA);
+        let t1 = VcpuTimingState::new();
+        t1.write_aperf(0xBBBB);
+        let mut bus = DeviceBus::new();
+        bus.set_stealth_msr_routers(vec![
+            StealthMsrRouter::new(t0, LbrState::new(LbrPlatform::AmdSvm)),
+            StealthMsrRouter::new(t1, LbrState::new(LbrPlatform::AmdSvm)),
+        ]);
+        assert_eq!(bus.stealth_vcpu_count(), 2);
+        assert_eq!(bus.active_vcpu(), Some(0), "active starts at vCPU 0");
+
+        // vCPU 0 active → reads vCPU 0's shadow.
+        assert_eq!(bus.rdmsr(timing_msr::IA32_APERF), Some(0xAAAA));
+        // Select vCPU 1 → reads vCPU 1's shadow, not vCPU 0's.
+        assert!(bus.set_active_vcpu(1));
+        assert_eq!(bus.active_vcpu(), Some(1));
+        assert_eq!(bus.rdmsr(timing_msr::IA32_APERF), Some(0xBBBB));
+        // Back to vCPU 0.
+        assert!(bus.set_active_vcpu(0));
+        assert_eq!(bus.rdmsr(timing_msr::IA32_APERF), Some(0xAAAA));
+    }
+
+    // A WRMSR forwarded while vCPU 1 is active lands in vCPU 1's shadow only —
+    // vCPU 0's identical MSR is untouched. Proves writes are per-vCPU too, so
+    // one vCPU programming DEBUGCTL/LBR cannot leak into another's view.
+    #[test]
+    fn stealth_bank_writes_isolate_per_vcpu() {
+        use crate::kvm_backend::VmExitHandler;
+        use crate::stealth_msr::StealthMsrRouter;
+        use crate::timing_stealth::VcpuTimingState;
+        use enlil_devices::stealth::lbr::{intel_msr, LbrPlatform, LbrState};
+
+        let mut bus = DeviceBus::new();
+        bus.set_stealth_msr_routers(vec![
+            StealthMsrRouter::new(VcpuTimingState::new(), LbrState::new(LbrPlatform::IntelVmx)),
+            StealthMsrRouter::new(VcpuTimingState::new(), LbrState::new(LbrPlatform::IntelVmx)),
+        ]);
+
+        // Enable LBR (DEBUGCTL bit 0) on vCPU 1 only.
+        assert!(bus.set_active_vcpu(1));
+        assert!(bus.wrmsr(intel_msr::IA32_DEBUGCTL, 1));
+        assert!(bus.stealth_msr_for_mut(1).unwrap().lbr.lbr_enabled);
+        // vCPU 0 never saw the write.
+        assert!(!bus.stealth_msr_for_mut(0).unwrap().lbr.lbr_enabled);
+        assert!(bus.set_active_vcpu(0));
+        assert_eq!(bus.rdmsr(intel_msr::IA32_DEBUGCTL), Some(0));
+    }
+
+    // Out-of-range selections are rejected and leave the active vCPU unchanged;
+    // selecting on an empty bus is a no-op. The bank invariant (active always
+    // names a real router) is what makes the handler's `routers[active]`
+    // indexing infallible.
+    #[test]
+    fn stealth_bank_rejects_out_of_range_active() {
+        use crate::stealth_msr::StealthMsrRouter;
+        use crate::timing_stealth::VcpuTimingState;
+        use enlil_devices::stealth::lbr::{LbrPlatform, LbrState};
+
+        let mut bus = DeviceBus::new();
+        // No bank installed: selection fails, count is 0, active is None.
+        assert!(!bus.set_active_vcpu(0));
+        assert_eq!(bus.active_vcpu(), None);
+        assert_eq!(bus.stealth_vcpu_count(), 0);
+
+        bus.set_stealth_msr_routers(vec![
+            StealthMsrRouter::new(VcpuTimingState::new(), LbrState::new(LbrPlatform::AmdSvm)),
+            StealthMsrRouter::new(VcpuTimingState::new(), LbrState::new(LbrPlatform::AmdSvm)),
+        ]);
+        assert!(bus.set_active_vcpu(1));
+        // Index == len and beyond are rejected; the prior selection stands.
+        assert!(!bus.set_active_vcpu(2));
+        assert!(!bus.set_active_vcpu(99));
+        assert_eq!(
+            bus.active_vcpu(),
+            Some(1),
+            "rejected selection left active as-is"
+        );
+        // A specific vCPU's router is reachable regardless of the active one.
+        assert!(bus.stealth_msr_for_mut(0).is_some());
+        assert!(bus.stealth_msr_for_mut(1).is_some());
+        assert!(bus.stealth_msr_for_mut(2).is_none());
+    }
+
+    // The multi-vCPU install helper seeds every vCPU's shadows to the model
+    // ratio independently and hands back one timing handle per vCPU; driving
+    // handle[i] is visible only through vCPU i's MSR view.
+    #[test]
+    fn install_stealth_msr_routers_seeds_each_vcpu_independently() {
+        use crate::kvm_backend::VmExitHandler;
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::stealth::lbr::LbrPlatform;
+        use enlil_devices::stealth::pmc::PmcRateModel;
+        use enlil_devices::stealth::timing::msr as timing_msr;
+
+        let mut pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            0,
+            1,
+        )
+        .expect("build standard pc");
+
+        let handles = pc.install_stealth_msr_routers(LbrPlatform::IntelVmx, 3);
+        assert_eq!(handles.len(), 3);
+        assert_eq!(pc.bus.stealth_vcpu_count(), 3);
+
+        // Every vCPU is seeded to the model ratio (not the 1.0 tell).
+        for i in 0..3 {
+            assert!(pc.bus.set_active_vcpu(i));
+            let aperf = pc.bus.rdmsr(timing_msr::IA32_APERF).expect("APERF served");
+            let mperf = pc.bus.rdmsr(timing_msr::IA32_MPERF).expect("MPERF served");
+            assert!(aperf > 0 && mperf > 0, "vCPU {i} shadows seeded non-zero");
+            assert_eq!(
+                aperf * 1000 / mperf,
+                PmcRateModel::DEFAULT.core_per_kilo_ref,
+                "vCPU {i} APERF/MPERF encodes the model ratio"
+            );
+        }
+
+        // The handles are independent: writing handle[2] is visible only on
+        // vCPU 2, not vCPU 0.
+        handles[2].write_aperf(0xDEAD_BEEF);
+        pc.bus.set_active_vcpu(2);
+        assert_eq!(pc.bus.rdmsr(timing_msr::IA32_APERF), Some(0xDEAD_BEEF));
+        pc.bus.set_active_vcpu(0);
+        assert_ne!(pc.bus.rdmsr(timing_msr::IA32_APERF), Some(0xDEAD_BEEF));
     }
 }

@@ -6,6 +6,140 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-21 — Session: per-vCPU stealth state (Phase 5) + a broad device-fidelity sweep (Phase 3)
+
+**16 increments + 1 fmt-hygiene commit, each independently green and committed**
+(branch `routine/enlil-2026-06-21`, PR https://github.com/physics515/enlil/pull/35). Two threads: (1) finished the
+2026-06-20 next-step #1 — **per-vCPU stealth state** — and fixed **two real
+per-vCPU APIC-identity bugs** it surfaced, all proven live on `/dev/kvm`; then,
+once that and the rest of Phase 5's cleanly-tractable work was done, (2) a
+device-fidelity sweep that closed several genuine gaps real guests exercise
+(virtio-blk, qcow2 overlays, 16550 UART, RTC, virtio-net), each host-agnostic
+and built on **both** toolchains.
+
+### Increments (commit — what)
+1. `1e42d8c` — **per-vCPU `StealthBank` on the device bus.** The bus shared one
+   `StealthMsrRouter` across all vCPUs, so an SMP guest's logical CPUs would read
+   the *same* APERF/MPERF/PMC/LBR (a tell). Bus now holds one router per vCPU +
+   an active selector (`set_active_vcpu`); `rdmsr/wrmsr` route to `routers[active]`.
+   `set_stealth_msr_router` stays a one-vCPU bank (back-compat). +4 unit.
+2. `96219fc` — **SMP run loop wiring.** `StealthRunLoop::install_smp(platform, n)`
+   seeds `n` independent routers (one timing `Arc` each); `run_vcpu_once(i)` routes
+   vCPU `i`'s MSR exits to its shadow and advances its counters. +1 live KVM
+   (two vCPUs each read their own seeded APERF).
+3. `092ffa0` — **BUG FIX: stamp each vCPU's own APIC ID in topology stealth.**
+   `apply_topology_stealth` left leaf 0xB EDX (x2APIC ID) a placeholder, trusting
+   "KVM fills it per vCPU" — a live probe showed both vCPUs read an *identical*
+   APIC ID under `new_without_irqchip` (KVM only fills it with an in-kernel LAPIC).
+   Now stamps leaf 1 EBX[31:24] + leaf 0xB/0x1F EDX per vCPU from its creation id.
+   +1 live KVM (vCPUs read 0,1 — was 10,10).
+4. `2ead398` — **docs:** ROADMAP 5.4 marked per-vCPU stealth done.
+5. `e2ed3ae` — **per-vCPU PMC isolation, live.** PMC/LBR live inside each router
+   (a distinct path from the timing `Arc` vec); seeded each vCPU's AMD PerfCtr0
+   distinctly and proved each reads its own through the SMP loop. +1 live KVM.
+6. `3856f6a` — **BUG FIX: AMD per-vCPU extended APIC ID (leaf 0x8000_001E).** Same
+   trust-KVM gap on AMD's EAX (ext APIC id) + EBX[7:0] (core id); now stamped per
+   vCPU (core id = apic_id >> SMT shift). +1 live KVM (AMD leaf present this host).
+7. `a9eec27` — **qcow2 write-through to already-allocated clusters.** `open_rw` +
+   atomic-pre-check write path; was read-only. +3.
+8. `4f33836` — **virtio-blk WRITE_ZEROES** (type 13) + feature bit; was UNSUPP. +2.
+9. `3a73661` — **virtio-blk discard/write-zeroes config limits.** Config stopped at
+   offset 24, so the advertised DISCARD/WRITE_ZEROES read back zero limits
+   (unusable); emit the full layout through offset 60 with real limits. +1.
+10. `20f08cc` — **16550 UART diagnostic loopback (MCR bit 4):** TX→RX wiring + MCR→
+    MSR mapping + delta bits; guest serial autoconfig/POST use it. +4.
+11. `b50e460` — **16550 FCR + 16550A detection:** handle the FIFO control register
+    and report IIR bits 7:6 so autoconfig sees a 16550A, not an 8250. +2.
+12. `f25b84b` — **RTC periodic interrupt (Reg B PIE / Reg C PF):** rate decode from
+    Reg A RS + `tick_periodic`; was explicitly unmodelled. +4.
+13. `284617f` — **extract + unit-test per-vCPU APIC-identity stamping:** pure
+    `stamp_apic_identity` fn with a deterministic test covering a synthetic leaf
+    0x1F this AMD host never exposes. +1.
+14. `8c2d464` — **qcow2 backing-file (overlay) read support:** the basis for the
+    roadmap's non-destructive testing (read-only base + writable overlay); detects
+    qcow2/raw backing, honours the v3 zero flag. +2.
+15. `77b1f85` — **BUG FIX: virtio-net RX `num_buffers` ≥ 1 in merge mode.** RX used
+    `EMPTY` (num_buffers=0); a MRG_RXBUF guest needs ≥1. +2.
+16. `d793aca` — **cover qcow2 raw-backing + multi-level chain** (tests for the
+    untested branches of #14: qcow2-over-raw, 3-level chain). +2 tests.
+    `4571b78` — **fmt hygiene** (rustfmt the session's 4 files; formatting only).
+
+### Research (informed the build)
+No new external literature this session — the work was driven by the existing
+ROADMAP/PROGRESS next-steps (per-vCPU stealth was 2026-06-20's #1) and by reading
+the code against the relevant primary specs already cited in `RESEARCH.md` (Intel
+SDM CPUID topology leaves 0xB/0x1F + AMD APM leaf 0x8000_001E for the APIC-id
+fixes; the 8250/16550 datasheet for loopback/FCR; the MC146818 datasheet for the
+RTC periodic timer; the virtio 1.x spec for virtio-blk WRITE_ZEROES/config and
+virtio-net mergeable-rxbuf `num_buffers`; the qcow2 spec v3 for backing files +
+the zero flag). Nothing new to log.
+
+### Test results (exact)
+- **`/dev/kvm`: read-writable at start and at wrap (`KVM_RW_OK` both times).** The
+  per-vCPU/topology KVM tests **ran for real, none skipped** (verified with
+  `--nocapture`: no "skipping" lines): `smp_run_loop_serves_each_vcpu_its_own_aperf`,
+  `smp_run_loop_isolates_per_vcpu_pmc`, `topology_stealth_gives_each_vcpu_its_own_x2apic_id`
+  (read 0,1 — proved the bug + the fix), `topology_stealth_gives_each_vcpu_its_own_amd_extended_apic_id`,
+  plus the prior topology/run-loop KVM suite — all green.
+- **Full workspace CI-parity** (the `.github/workflows/ci.yml` commands):
+  `cargo fmt --all -- --check` → clean; `cargo clippy --all-targets --workspace -- -D warnings`
+  → exit 0; `cargo test --workspace` → **1137 passed, 0 failed, 1 ignored**
+  (**enlil-devices 806**, was 791; **enlil-core 211**, was 196; + the smaller
+  crates unchanged). The `acpi_iasl_validation` (3) and `smbios_dmidecode_validation`
+  (1) tests **self-skipped as pass — `iasl`/`dmidecode` are NOT installed on this
+  host**, so those AML/SMBIOS reference-compiler gates did not actually run.
+- **Toolchains:** every increment built/tested on **Linux/WSL** (nightly
+  `x86_64-unknown-linux-gnu`). The host-agnostic ones (all the Phase-3 device work
+  in `enlil-devices`, and the `enlil-core` `device_bus`/`serial` changes) were
+  **also built Windows-native** (`x86_64-pc-windows-msvc`, `cargo build -p
+  {enlil-core,enlil-devices}` against the WSL manifest with
+  `D:\Development\.enlil-win-target`): **exit 0** after each. The KVM-only changes
+  (`kvm_backend.rs`/`run_loop.rs`, all `mod linux`) are Linux/WSL-only by design and
+  were not built Windows-native (they don't compile off Linux — expected).
+
+### STOP REASON
+**No unblocked item left that can be finished and tested cleanly tonight without
+absent tooling, hardware, or a risky architectural/large refactor.** After
+finishing per-vCPU stealth (the top unblocked Phase-5 item) I swept the codebase
+for genuine, verifiable gaps and fixed every clear one (above); the core device
+emulation (PIT, i8042, HPET, 8259 PIC, LAPIC, DMA, ACPI PM timer, speaker) is
+otherwise complete. The remaining high-value work is genuinely blocked:
+(a) **needs absent tooling** — qcow2 cluster-allocation (COW) for writes into
+unallocated clusters needs two-level refcount management that should be validated
+with `qemu-img check` (not installed); adding AML/SMBIOS tables needs
+`iasl`/`dmidecode`; an OVMF/SeaBIOS smoke boot isn't set up; (b) **architectural**
+— the threaded-vCPU watchdog (per-vCPU stealth was its prerequisite, now done, but
+it still needs a multi-threaded vCPU model + signal kick), and wiring the virtio
+devices to a real guest-memory virtqueue transport (today's `Virtqueue` is a
+simplified in-memory model); (c) **speculative without a real guest / Intel host**
+— LAPIC timer-divide semantics (changing the tick contract risks the existing one),
+virtio-net multi-buffer RX, leaf 0x1F *topology-field* consistency (this AMD host
+never enumerates 0x1F, so it can't be live-verified). Per the guardrails I did not
+start-and-half-finish or ship-unvalidated any of these. Wall-clock ~70 min was
+spent efficiently on 16 complete, independently-green increments (incl. 3 real bug
+fixes) rather than padded with churn or a risky 2 a.m. refactor; `master` stays
+buildable (green per increment).
+
+### Recommended next step (tomorrow)
+1. **qcow2 cluster allocation (COW)** — the missing half of writable overlays
+   (the non-destructive-testing story, Phase 0.3): allocate a data cluster (+ an L2
+   table when needed) and **maintain the two-level refcount structure**, then drop
+   the "write to unallocated cluster" bail. **Do it in a session with `qemu-img`
+   installed** so `qemu-img check` validates the produced images — refcount bugs
+   are easy and hard to catch otherwise. Build refcount-bearing test images first.
+2. **Threaded-vCPU watchdog** (now unblocked by per-vCPU stealth): a multi-threaded
+   vCPU execution model + `set_immediate_exit` signal kick from a watchdog thread.
+   Needs `KvmBackend`/bus to be shareable across threads (the `RefCell` devices
+   aren't `Sync`) — a deliberate design, not a 1am refactor.
+3. **Install `qemu-img` + `acpica-tools` + `dmidecode` (and ideally OVMF/qemu) on
+   this WSL host** so the qcow2, AML, and SMBIOS gates can actually run and a smoke
+   boot becomes possible. One-time human/setup step.
+4. Lower priority / blocked: leaf 0x1F topology-field consistency (needs an Intel
+   host to live-verify); libusb USB forwarder (hardware); full vTPM 2.0 (large);
+   pin `nightly` in CI (own PR).
+
+---
+
 ## 2026-06-20 — Session: the complete ACPI `etc/table-loader` delivery path, proven end-to-end without OVMF (Phase 5)
 
 **9 increments (8 code/test + 1 docs), each independently green and committed**

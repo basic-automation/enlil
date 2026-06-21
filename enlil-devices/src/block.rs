@@ -13,6 +13,7 @@ pub const VIRTIO_BLK_T_OUT: u32 = 1; // Write
 pub const VIRTIO_BLK_T_FLUSH: u32 = 4; // Flush
 pub const VIRTIO_BLK_T_GET_ID: u32 = 8; // Get device ID
 pub const VIRTIO_BLK_T_DISCARD: u32 = 11; // Discard/trim
+pub const VIRTIO_BLK_T_WRITE_ZEROES: u32 = 13; // Write zeroes
 
 // VirtIO block status codes
 pub const VIRTIO_BLK_S_OK: u8 = 0;
@@ -32,6 +33,7 @@ bitflags::bitflags! {
         const TOPOLOGY    = 1 << 10;
         const CONFIG_WCE  = 1 << 11;
         const DISCARD     = 1 << 13;
+        const WRITE_ZEROES = 1 << 14;
         // VirtIO generic feature bits
         const RING_INDIRECT_DESC = 1 << 28;
         const RING_EVENT_IDX     = 1 << 29;
@@ -55,6 +57,19 @@ pub struct BlockConfig {
     pub sectors: u8,
     /// Block size (if `BLK_SIZE`).
     pub blk_size: u32,
+    /// Max discard size in 512-byte sectors (if `DISCARD`).
+    pub max_discard_sectors: u32,
+    /// Max number of discard segments per request (if `DISCARD`).
+    pub max_discard_seg: u32,
+    /// Discard alignment in 512-byte sectors (if `DISCARD`).
+    pub discard_sector_alignment: u32,
+    /// Max write-zeroes size in 512-byte sectors (if `WRITE_ZEROES`).
+    pub max_write_zeroes_sectors: u32,
+    /// Max number of write-zeroes segments per request (if `WRITE_ZEROES`).
+    pub max_write_zeroes_seg: u32,
+    /// Whether write-zeroes may deallocate (unmap) the range (if `WRITE_ZEROES`).
+    /// We always write real zeros, so this is 0.
+    pub write_zeroes_may_unmap: u8,
 }
 
 /// A `VirtIO` block request header (from guest memory).
@@ -109,6 +124,7 @@ pub struct BlockStats {
     pub writes: u64,
     pub flushes: u64,
     pub discards: u64,
+    pub write_zeroes: u64,
     pub read_bytes: u64,
     pub write_bytes: u64,
     pub errors: u64,
@@ -130,7 +146,7 @@ impl VirtioBlockDevice {
             features |= BlockFeatures::RO;
         }
 
-        features |= BlockFeatures::DISCARD;
+        features |= BlockFeatures::DISCARD | BlockFeatures::WRITE_ZEROES;
 
         let config = BlockConfig {
             capacity: capacity / 512,
@@ -140,6 +156,17 @@ impl VirtioBlockDevice {
             heads: 0,
             sectors: 0,
             blk_size: 512,
+            // Advertise usable limits for the DISCARD/WRITE_ZEROES features
+            // above: a guest reads these config fields and treats a zero limit
+            // as "feature present but unusable", so they must be non-zero. Our
+            // simplified request model carries one range per request, hence
+            // seg = 1; alignment 1 sector = no special alignment.
+            max_discard_sectors: 0x0040_0000, // 4M sectors (2 GiB) per request
+            max_discard_seg: 1,
+            discard_sector_alignment: 1,
+            max_write_zeroes_sectors: 0x0040_0000,
+            max_write_zeroes_seg: 1,
+            write_zeroes_may_unmap: 0, // we always write real zeros
         };
 
         let mut id_bytes = [0u8; 20];
@@ -218,14 +245,30 @@ impl VirtioBlockDevice {
 
     #[must_use]
     fn config_as_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(28);
-        bytes.extend_from_slice(&self.config.capacity.to_le_bytes());
-        bytes.extend_from_slice(&self.config.size_max.to_le_bytes());
-        bytes.extend_from_slice(&self.config.seg_max.to_le_bytes());
-        bytes.extend_from_slice(&self.config.cylinders.to_le_bytes());
-        bytes.push(self.config.heads);
-        bytes.push(self.config.sectors);
-        bytes.extend_from_slice(&self.config.blk_size.to_le_bytes());
+        // Lay the fields out at their fixed `struct virtio_blk_config` offsets.
+        // The discard/write-zeroes fields live at offsets 36..57, so the
+        // intervening topology (24..32), writeback (32), num_queues (34..36)
+        // are emitted as zeros to keep the later offsets correct even though we
+        // do not advertise those features.
+        let mut bytes = Vec::with_capacity(60);
+        bytes.extend_from_slice(&self.config.capacity.to_le_bytes()); // 0
+        bytes.extend_from_slice(&self.config.size_max.to_le_bytes()); // 8
+        bytes.extend_from_slice(&self.config.seg_max.to_le_bytes()); // 12
+        bytes.extend_from_slice(&self.config.cylinders.to_le_bytes()); // 16
+        bytes.push(self.config.heads); // 18
+        bytes.push(self.config.sectors); // 19
+        bytes.extend_from_slice(&self.config.blk_size.to_le_bytes()); // 20
+        bytes.extend_from_slice(&[0u8; 8]); // 24: topology (unadvertised)
+        bytes.push(0); // 32: writeback
+        bytes.push(0); // 33: unused0
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // 34: num_queues
+        bytes.extend_from_slice(&self.config.max_discard_sectors.to_le_bytes()); // 36
+        bytes.extend_from_slice(&self.config.max_discard_seg.to_le_bytes()); // 40
+        bytes.extend_from_slice(&self.config.discard_sector_alignment.to_le_bytes()); // 44
+        bytes.extend_from_slice(&self.config.max_write_zeroes_sectors.to_le_bytes()); // 48
+        bytes.extend_from_slice(&self.config.max_write_zeroes_seg.to_le_bytes()); // 52
+        bytes.push(self.config.write_zeroes_may_unmap); // 56
+        bytes.extend_from_slice(&[0u8; 3]); // 57: unused1[3]
         bytes
     }
 
@@ -250,6 +293,10 @@ impl VirtioBlockDevice {
             VIRTIO_BLK_T_FLUSH => self.handle_flush(),
             VIRTIO_BLK_T_GET_ID => self.handle_get_id(data_buf),
             VIRTIO_BLK_T_DISCARD => self.handle_discard(
+                header.sector,
+                u64::from(u32::try_from(data_buf.len()).unwrap_or(u32::MAX)),
+            ),
+            VIRTIO_BLK_T_WRITE_ZEROES => self.handle_write_zeroes(
                 header.sector,
                 u64::from(u32::try_from(data_buf.len()).unwrap_or(u32::MAX)),
             ),
@@ -313,6 +360,43 @@ impl VirtioBlockDevice {
             self.stats.errors += 1;
             (VIRTIO_BLK_S_IOERR, 0)
         }
+    }
+
+    /// Zero `len_bytes` of the backend starting at `sector`. A modern guest
+    /// issues `VIRTIO_BLK_T_WRITE_ZEROES` to clear a range (mkfs, partition
+    /// wipes, swap init) far more efficiently than streaming an all-zero write
+    /// payload. Bounded to the device capacity and written in capped chunks so
+    /// a large request does not allocate a huge buffer.
+    fn handle_write_zeroes(&mut self, sector: u64, len_bytes: u64) -> (u8, usize) {
+        if self.backend.is_readonly() {
+            self.stats.errors += 1;
+            return (VIRTIO_BLK_S_IOERR, 0);
+        }
+        let offset = sector * 512;
+        let capacity = self.backend.capacity();
+        if offset >= capacity {
+            self.stats.errors += 1;
+            return (VIRTIO_BLK_S_IOERR, 0);
+        }
+        // Clamp the range to the device so we never write past the end.
+        let mut remaining = len_bytes.min(capacity - offset);
+        let mut at = offset;
+        let chunk_size: u64 = 64 * 1024;
+        let zeros = vec![0u8; usize_of(chunk_size.min(remaining.max(1)))];
+        while remaining > 0 {
+            let this = usize_of(remaining.min(chunk_size));
+            match self.backend.write_at(at, &zeros[..this]) {
+                Ok(n) if n == this => {}
+                _ => {
+                    self.stats.errors += 1;
+                    return (VIRTIO_BLK_S_IOERR, 0);
+                }
+            }
+            at += this as u64;
+            remaining -= this as u64;
+        }
+        self.stats.write_zeroes += 1;
+        (VIRTIO_BLK_S_OK, 0)
     }
 }
 
@@ -393,6 +477,44 @@ mod tests {
     }
 
     #[test]
+    fn test_write_zeroes_clears_a_range() {
+        let mut dev = make_device();
+        assert!(dev.features().contains(BlockFeatures::WRITE_ZEROES));
+
+        // Fill sectors 0 and 1 (1KB) with 0xFF.
+        let header = make_header(VIRTIO_BLK_T_OUT, 0);
+        let mut data = vec![0xFF; 1024];
+        let (status, _) = dev.process_request(&header, &mut data);
+        assert_eq!(status, VIRTIO_BLK_S_OK);
+
+        // WRITE_ZEROES the 1KB starting at sector 0 (range = data_buf length).
+        let header = make_header(VIRTIO_BLK_T_WRITE_ZEROES, 0);
+        let mut buf = vec![0u8; 1024];
+        let (status, _) = dev.process_request(&header, &mut buf);
+        assert_eq!(status, VIRTIO_BLK_S_OK);
+        assert_eq!(dev.stats().write_zeroes, 1);
+
+        // The range now reads back as zeros.
+        let header = make_header(VIRTIO_BLK_T_IN, 0);
+        let mut readback = vec![0xAAu8; 1024];
+        let (status, n) = dev.process_request(&header, &mut readback);
+        assert_eq!(status, VIRTIO_BLK_S_OK);
+        assert_eq!(n, 1024);
+        assert!(readback.iter().all(|&b| b == 0), "range was zeroed");
+    }
+
+    #[test]
+    fn test_write_zeroes_rejected_on_readonly() {
+        let backend = Arc::new(MemoryBackend::new_readonly(vec![0xFFu8; 1_048_576]));
+        let mut dev = VirtioBlockDevice::new(backend, "ro-disk");
+        let header = make_header(VIRTIO_BLK_T_WRITE_ZEROES, 0);
+        let mut buf = vec![0u8; 512];
+        let (status, _) = dev.process_request(&header, &mut buf);
+        assert_eq!(status, VIRTIO_BLK_S_IOERR);
+        assert_eq!(dev.stats().write_zeroes, 0);
+    }
+
+    #[test]
     fn test_unsupported_request() {
         let mut dev = make_device();
         let header = make_header(255, 0);
@@ -422,6 +544,26 @@ mod tests {
         // blk_size at offset 20, 4 bytes
         let blk_size = dev.read_config(20, 4);
         assert_eq!(blk_size, 512);
+    }
+
+    #[test]
+    fn test_config_reports_discard_and_write_zeroes_limits() {
+        let dev = make_device();
+        // We advertise DISCARD + WRITE_ZEROES, so a guest reads their limits
+        // from the fixed config offsets; they must be non-zero or the guest
+        // treats the feature as unusable.
+        assert!(dev.features().contains(BlockFeatures::DISCARD));
+        assert!(dev.features().contains(BlockFeatures::WRITE_ZEROES));
+        // max_discard_sectors @ 36, max_discard_seg @ 40, alignment @ 44.
+        assert_eq!(dev.read_config(36, 4), 0x0040_0000);
+        assert_eq!(dev.read_config(40, 4), 1);
+        assert_eq!(dev.read_config(44, 4), 1);
+        // max_write_zeroes_sectors @ 48, seg @ 52, may_unmap @ 56.
+        assert_eq!(dev.read_config(48, 4), 0x0040_0000);
+        assert_eq!(dev.read_config(52, 4), 1);
+        assert_eq!(dev.read_config(56, 1), 0);
+        // Earlier fields are unmoved: blk_size still at 20.
+        assert_eq!(dev.read_config(20, 4), 512);
     }
 
     #[test]
