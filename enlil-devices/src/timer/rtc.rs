@@ -57,16 +57,16 @@ const REG_CENTURY: u8 = 0x32;
 
 // Register A bits.
 const REG_A_UIP: u8 = 0x80; // update in progress (read-only)
-// Register B bits. (Periodic-interrupt enable, bit 6, is not modelled yet —
-// only update-ended and alarm interrupts are generated.)
+// Register B bits.
 const REG_B_SET: u8 = 0x80; // halt updates while the OS sets the clock
+const REG_B_PIE: u8 = 0x40; // periodic interrupt enable
 const REG_B_AIE: u8 = 0x20; // alarm interrupt enable
 const REG_B_UIE: u8 = 0x10; // update-ended interrupt enable
 const REG_B_DM: u8 = 0x04; // data mode: 1 = binary, 0 = BCD
 const REG_B_24H: u8 = 0x02; // 1 = 24-hour, 0 = 12-hour
-// Register C bits (read-clears). (The periodic flag, bit 6, pairs with the
-// unmodelled periodic interrupt.)
+// Register C bits (read-clears).
 const REG_C_IRQF: u8 = 0x80; // any enabled flag is set
+const REG_C_PF: u8 = 0x40; // periodic flag
 const REG_C_AF: u8 = 0x20; // alarm flag
 const REG_C_UF: u8 = 0x10; // update-ended flag
 // Register D.
@@ -334,6 +334,44 @@ impl Rtc146818 {
         {
             c |= REG_C_IRQF;
             asserted = true;
+        }
+        self.ram[REG_C as usize] = c;
+        if asserted && let Some(irq) = &self.irq {
+            irq.set_level(true);
+        }
+        asserted
+    }
+
+    /// The periodic-interrupt frequency selected by Register A's rate-select
+    /// bits (RS, bits 3:0), or `None` when RS is 0 (periodic disabled). With the
+    /// standard 32.768 kHz time base: RS 1 = 256 Hz, RS 2 = 128 Hz, and RS 3..15
+    /// = `32768 >> (RS-1)` Hz (8192 Hz down to 2 Hz). A timer driver reads this
+    /// to decide how often to call [`tick_periodic`](Self::tick_periodic).
+    #[must_use]
+    pub const fn periodic_rate_hz(&self) -> Option<u32> {
+        match self.ram[REG_A as usize] & 0x0F {
+            0 => None,
+            1 => Some(256),
+            2 => Some(128),
+            n => Some(32768u32 >> (n - 1)),
+        }
+    }
+
+    /// Drive one periodic tick: latch Register C's periodic flag (PF) — which is
+    /// set at the RS rate regardless of the enable — and, when Register B's PIE
+    /// is set, also set IRQF and assert IRQ8. A timer driver calls this at
+    /// [`periodic_rate_hz`](Self::periodic_rate_hz); reading Register C clears
+    /// PF/IRQF and deasserts the line, exactly like the update/alarm sources.
+    /// A no-op (returns `false`) when no rate is selected. Returns whether the
+    /// interrupt line was asserted.
+    pub fn tick_periodic(&mut self) -> bool {
+        if self.periodic_rate_hz().is_none() {
+            return false; // RS = 0: periodic timer off
+        }
+        let asserted = self.reg_b() & REG_B_PIE != 0;
+        let mut c = self.ram[REG_C as usize] | REG_C_PF;
+        if asserted {
+            c |= REG_C_IRQF;
         }
         self.ram[REG_C as usize] = c;
         if asserted && let Some(irq) = &self.irq {
@@ -640,5 +678,70 @@ mod tests {
         assert_eq!((rtc.time().month, rtc.time().day), (2, 28));
         assert!(!rtc.tick_second());
         assert_eq!((rtc.time().month, rtc.time().day), (2, 29));
+    }
+
+    #[test]
+    fn periodic_rate_decodes_register_a_rate_select() {
+        let mut rtc = Rtc146818::new(sample());
+        // Default Register A is 0x26 -> RS = 6 -> 1024 Hz.
+        assert_eq!(rtc.periodic_rate_hz(), Some(1024));
+        // RS = 0 disables the periodic timer.
+        rtc.write_index(REG_A);
+        rtc.write_data(0x20);
+        assert_eq!(rtc.periodic_rate_hz(), None);
+        // The special low rates and a fast rate.
+        rtc.write_data(0x21); // RS=1
+        assert_eq!(rtc.periodic_rate_hz(), Some(256));
+        rtc.write_data(0x22); // RS=2
+        assert_eq!(rtc.periodic_rate_hz(), Some(128));
+        rtc.write_data(0x23); // RS=3
+        assert_eq!(rtc.periodic_rate_hz(), Some(8192));
+        rtc.write_data(0x2F); // RS=15
+        assert_eq!(rtc.periodic_rate_hz(), Some(2));
+    }
+
+    #[test]
+    fn periodic_flag_latches_without_pie_but_raises_no_irq() {
+        let mut rtc = Rtc146818::new(sample()); // RS=6, PIE off
+        // A tick latches PF in Register C but does not assert the interrupt.
+        assert!(!rtc.tick_periodic());
+        rtc.write_index(REG_C);
+        let c = rtc.read_data();
+        assert_ne!(c & REG_C_PF, 0, "periodic flag latches regardless of PIE");
+        assert_eq!(c & REG_C_IRQF, 0, "no IRQF without PIE");
+    }
+
+    #[test]
+    fn periodic_interrupt_pulses_irq8_and_clears_on_reg_c_read() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let log = Arc::clone(&log);
+            move |level: bool| log.lock().unwrap().push(level)
+        };
+        let mut rtc = Rtc146818::new(sample()); // RS=6 (1024 Hz) by default
+        rtc.attach_irq(Box::new(sink));
+
+        // Enable PIE: a tick asserts IRQ8; reading Register C clears PF/IRQF and
+        // deasserts the line.
+        rtc.write_index(REG_B);
+        rtc.write_data(REG_B_DM | REG_B_24H | REG_B_PIE);
+        assert!(rtc.tick_periodic(), "periodic interrupt fires with PIE set");
+        rtc.write_index(REG_C);
+        let c = rtc.read_data();
+        assert_ne!(c & REG_C_PF, 0);
+        assert_ne!(c & REG_C_IRQF, 0);
+        assert_eq!(&*log.lock().unwrap(), &[true, false]);
+    }
+
+    #[test]
+    fn periodic_tick_is_a_noop_when_rate_select_is_zero() {
+        let mut rtc = Rtc146818::new(sample());
+        rtc.write_index(REG_A);
+        rtc.write_data(0x20); // RS = 0: periodic off
+        rtc.write_index(REG_B);
+        rtc.write_data(REG_B_DM | REG_B_24H | REG_B_PIE);
+        assert!(!rtc.tick_periodic(), "no periodic tick when RS=0");
+        rtc.write_index(REG_C);
+        assert_eq!(rtc.read_data() & REG_C_PF, 0, "no PF latched when RS=0");
     }
 }
