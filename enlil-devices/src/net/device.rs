@@ -192,9 +192,8 @@ impl VirtioNetDevice {
             match self.backend.recv(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    // Prepend VirtIO net header
-                    let hdr = VirtioNetHeader::EMPTY;
-                    let mut frame = hdr.to_bytes(self.merge_rxbuf);
+                    // Prepend the VirtIO net header (num_buffers set for merge mode).
+                    let mut frame = self.rx_header().to_bytes(self.merge_rxbuf);
                     frame.extend_from_slice(&buf[..n]);
                     self.rx_pending.push_back(frame);
                     received += 1;
@@ -229,10 +228,22 @@ impl VirtioNetDevice {
         received
     }
 
+    /// The virtio-net header prepended to a received frame. When mergeable RX
+    /// buffers are negotiated (`VIRTIO_NET_F_MRG_RXBUF`), `num_buffers` must be
+    /// the count of descriptors the frame spans and is **≥1** — a guest reads it
+    /// to know how many buffers to consume, and 0 is invalid. This model places
+    /// each frame in a single RX buffer, so `num_buffers` is 1 in merge mode
+    /// (the field is not serialized at all without merge).
+    fn rx_header(&self) -> VirtioNetHeader {
+        VirtioNetHeader {
+            num_buffers: u16::from(self.merge_rxbuf),
+            ..VirtioNetHeader::EMPTY
+        }
+    }
+
     /// Inject a frame directly into the RX path (for testing or switch delivery).
     pub fn inject_rx(&mut self, frame: &[u8]) {
-        let hdr = VirtioNetHeader::EMPTY;
-        let mut data = hdr.to_bytes(self.merge_rxbuf);
+        let mut data = self.rx_header().to_bytes(self.merge_rxbuf);
         data.extend_from_slice(frame);
         self.rx_pending.push_back(data);
     }
@@ -328,6 +339,32 @@ mod tests {
         dev.process_rx();
         assert_eq!(dev.stats().rx_packets, 1);
         assert!(dev.has_rx_completions());
+    }
+
+    #[test]
+    fn rx_header_num_buffers_is_one_in_merge_mode() {
+        let mut dev = make_device();
+        // Negotiate mergeable RX buffers.
+        dev.activate(NetFeatures::from_bits(
+            NetFeatures::MAC | NetFeatures::MRG_RXBUF,
+        ));
+        dev.inject_rx(&[0xAA, 0xBB, 0xCC]);
+        let frame = dev.rx_pending.front().expect("one pending frame");
+        // The 12-byte (merge) header parses with num_buffers == 1, not the
+        // invalid 0 — a guest needs ≥1 to know how many buffers to consume.
+        let hdr = VirtioNetHeader::from_bytes(frame, true).expect("parse merge header");
+        let num_buffers = hdr.num_buffers; // copy out of the packed struct
+        assert_eq!(num_buffers, 1);
+    }
+
+    #[test]
+    fn rx_header_omits_num_buffers_without_merge() {
+        let mut dev = make_device();
+        dev.activate(NetFeatures::from_bits(NetFeatures::MAC));
+        dev.inject_rx(&[0xAA, 0xBB, 0xCC]);
+        let frame = dev.rx_pending.front().expect("one pending frame");
+        // Without merge the header is the 10-byte form: data starts right after.
+        assert_eq!(frame.len(), VirtioNetHeader::wire_size(false) + 3);
     }
 
     #[test]
