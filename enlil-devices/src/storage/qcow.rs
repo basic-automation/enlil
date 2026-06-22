@@ -799,6 +799,46 @@ impl QcowBackend {
         file.write_all(&(data_off | QCOW_OFLAG_COPIED).to_be_bytes())?;
         Ok(data_off)
     }
+
+    /// Discard one fully-covered guest cluster: free its data cluster (drop the
+    /// refcount, reclaiming the space) and mark the L2 entry zero-flagged, so the
+    /// region reads back as zeros and the image stays refcount-consistent.
+    /// Clusters that are unmapped or already zero-flagged are left untouched.
+    fn discard_cluster(&self, guest_offset: u64, file: &mut File) -> Result<()> {
+        let cluster_size = self.header.cluster_size();
+        let l2_entries = self.header.l2_entries();
+        let l1_index = guest_offset / (l2_entries * cluster_size);
+        let l2_table_offset = {
+            let l1 = self
+                .l1_table
+                .lock()
+                .map_err(|e| anyhow::anyhow!("l1 lock: {e}"))?;
+            if l1_index >= l1.len() as u64 {
+                return Ok(());
+            }
+            l1[usize_of(l1_index)] & L2_OFFSET_MASK
+        };
+        if l2_table_offset == 0 {
+            return Ok(()); // no L2 table → nothing mapped here
+        }
+        let l2_index = (guest_offset / cluster_size) % l2_entries;
+        let l2_entry_off = l2_table_offset + l2_index * 8;
+        file.seek(SeekFrom::Start(l2_entry_off))?;
+        let mut b = [0u8; 8];
+        file.read_exact(&mut b)?;
+        let entry = u64::from_be_bytes(b);
+        let data_off = entry & L2_OFFSET_MASK;
+        if entry & QCOW_OFLAG_ZERO != 0 || data_off == 0 {
+            return Ok(()); // already zero-flagged or unmapped
+        }
+        // Free the data cluster, then zero-flag the L2 entry.
+        let data_index = data_off / cluster_size;
+        let rc = self.read_refcount(data_index, file)?;
+        self.write_refcount(data_index, rc.saturating_sub(1), file)?;
+        file.seek(SeekFrom::Start(l2_entry_off))?;
+        file.write_all(&QCOW_OFLAG_ZERO.to_be_bytes())?;
+        Ok(())
+    }
 }
 
 impl StorageBackend for QcowBackend {
@@ -896,6 +936,26 @@ impl StorageBackend for QcowBackend {
         }
         let mut file = self.file.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         file.flush()?;
+        drop(file);
+        Ok(())
+    }
+
+    /// Discard (trim) a guest range: every cluster *fully* inside it is freed and
+    /// zero-flagged, reclaiming space and reading back as zeros. Partially
+    /// covered clusters at the ends are left intact (discard is advisory and must
+    /// not corrupt neighbouring data). A no-op on a read-only image.
+    fn trim(&self, offset: u64, len: u64) -> Result<()> {
+        if !self.writable || len == 0 || offset >= self.header.size {
+            return Ok(());
+        }
+        let cluster_size = self.header.cluster_size();
+        let end = offset.saturating_add(len).min(self.header.size);
+        let mut file = self.file.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let mut g = offset.div_ceil(cluster_size) * cluster_size;
+        while g + cluster_size <= end {
+            self.discard_cluster(g, &mut file)?;
+            g += cluster_size;
+        }
         drop(file);
         Ok(())
     }
@@ -1563,6 +1623,87 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), &img).unwrap();
         assert!(QcowBackend::open(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn trim_frees_clusters_reads_zero_and_stays_consistent() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        QcowBackend::create(tmp.path(), 4 * 1024 * 1024, None).unwrap();
+        let backend = QcowBackend::open_rw(tmp.path()).unwrap();
+
+        // Allocate two adjacent guest clusters (1 and 2), then trim both.
+        backend.write_at(65536, &vec![0xAA; 65536]).unwrap();
+        backend.write_at(131_072, &vec![0xBB; 65536]).unwrap();
+        backend.flush().unwrap();
+        backend.check_consistency().unwrap();
+
+        // The data clusters that were just allocated must be live before trim...
+        let data_indices: Vec<u64> = {
+            let mut f = backend.file.lock().unwrap();
+            (1..=2)
+                .map(|gc: u64| {
+                    let cs = 1u64 << 16;
+                    let l1 = backend.l1_table.lock().unwrap();
+                    let l2_off = l1[0] & L2_OFFSET_MASK;
+                    drop(l1);
+                    // guest cluster gc lives at L2 entry gc (single L1 slot).
+                    f.seek(SeekFrom::Start(l2_off + gc * 8)).unwrap();
+                    let mut b = [0u8; 8];
+                    f.read_exact(&mut b).unwrap();
+                    (u64::from_be_bytes(b) & L2_OFFSET_MASK) / cs
+                })
+                .collect()
+        };
+        {
+            let mut f = backend.file.lock().unwrap();
+            for &idx in &data_indices {
+                assert_eq!(
+                    backend.read_refcount(idx, &mut f).unwrap(),
+                    1,
+                    "live before trim"
+                );
+            }
+        }
+
+        backend.trim(65536, 2 * 65536).unwrap();
+        backend.flush().unwrap();
+
+        // ...and freed (refcount 0) after.
+        {
+            let mut f = backend.file.lock().unwrap();
+            for &idx in &data_indices {
+                assert_eq!(
+                    backend.read_refcount(idx, &mut f).unwrap(),
+                    0,
+                    "freed by trim"
+                );
+            }
+        }
+        // Trimmed region reads back as zeros, and the image stays consistent.
+        let mut buf = vec![0xFFu8; 2 * 65536];
+        backend.read_at(65536, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0), "trimmed region reads zero");
+        backend.check_consistency().unwrap();
+    }
+
+    #[test]
+    fn trim_leaves_partially_covered_clusters_intact() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        QcowBackend::create(tmp.path(), 4 * 1024 * 1024, None).unwrap();
+        let backend = QcowBackend::open_rw(tmp.path()).unwrap();
+        backend.write_at(65536, &vec![0xCD; 65536]).unwrap();
+        backend.flush().unwrap();
+
+        // Trim a sub-cluster window: no whole cluster is covered, so nothing is
+        // freed and the data survives.
+        backend.trim(65536 + 1000, 2000).unwrap();
+        let mut buf = vec![0u8; 65536];
+        backend.read_at(65536, &mut buf).unwrap();
+        assert!(
+            buf.iter().all(|&b| b == 0xCD),
+            "partial trim must not touch data"
+        );
+        backend.check_consistency().unwrap();
     }
 
     #[test]
