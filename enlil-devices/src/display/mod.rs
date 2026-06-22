@@ -515,6 +515,60 @@ impl InputRouter {
     pub fn get_focus(&self) -> Option<u32> {
         *self.focused_zone.lock().unwrap()
     }
+
+    /// Move focus to the next (`forward`) or previous visible zone, wrapping
+    /// around — the roadmap's "Ctrl+Ctrl cycles to the next guest". Zones are
+    /// visited in id order for a stable cycle, and hidden zones are skipped. With
+    /// no focus yet, focus lands on the first (or last) zone. Returns the newly
+    /// focused zone, or `None` when there are no visible zones.
+    ///
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
+    #[must_use]
+    pub fn cycle_focus(&self, forward: bool) -> Option<u32> {
+        let mut ids: Vec<u32> = {
+            let layout = self.zone_layout.read().unwrap();
+            layout
+                .zones
+                .iter()
+                .filter(|z| z.visible)
+                .map(|z| z.id)
+                .collect()
+        };
+        ids.sort_unstable();
+        let Some(&first) = ids.first() else {
+            *self.focused_zone.lock().unwrap() = None;
+            return None;
+        };
+        let n = ids.len();
+        let current = *self.focused_zone.lock().unwrap();
+        let next = match current.and_then(|c| ids.iter().position(|&id| id == c)) {
+            Some(pos) if forward => ids[(pos + 1) % n],
+            Some(pos) => ids[(pos + n - 1) % n],
+            None if forward => first,
+            None => ids[n - 1],
+        };
+        *self.focused_zone.lock().unwrap() = Some(next);
+        Some(next)
+    }
+
+    /// Cycle focus to the next visible zone (see [`cycle_focus`](Self::cycle_focus)).
+    ///
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
+    #[must_use]
+    pub fn focus_next(&self) -> Option<u32> {
+        self.cycle_focus(true)
+    }
+
+    /// Cycle focus to the previous visible zone.
+    ///
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
+    #[must_use]
+    pub fn focus_prev(&self) -> Option<u32> {
+        self.cycle_focus(false)
+    }
 }
 
 /// Picture-in-Picture configuration
@@ -920,6 +974,44 @@ mod tests {
         router.route_event(InputEvent::MouseMove { x: 100, y: 100 });
         let event = router.next_event();
         assert!(event.is_some());
+    }
+
+    #[test]
+    fn cycle_focus_walks_visible_zones_and_wraps() {
+        let layout = Arc::new(RwLock::new(ZoneLayout::new(1920, 1080)));
+        let zones: Vec<Zone> = (1..=3)
+            .map(|id| Zone::new(id, 0, 0, 100, 100, format!("z{id}")))
+            .collect();
+        {
+            let mut l = layout.write().unwrap();
+            for z in zones {
+                l.add_zone(z);
+            }
+        }
+        let router = InputRouter::new(layout.clone());
+
+        assert_eq!(router.get_focus(), None);
+        assert_eq!(router.focus_next(), Some(1)); // first when unfocused
+        assert_eq!(router.focus_next(), Some(2));
+        assert_eq!(router.focus_next(), Some(3));
+        assert_eq!(router.focus_next(), Some(1), "wraps around");
+        assert_eq!(router.focus_prev(), Some(3), "wraps backward");
+
+        // Hiding zone 3 removes it from the cycle.
+        {
+            let mut l = layout.write().unwrap();
+            l.find_zone_mut(3).unwrap().visible = false;
+        }
+        router.set_focus(Some(2));
+        assert_eq!(router.focus_next(), Some(1), "skips the hidden zone");
+    }
+
+    #[test]
+    fn cycle_focus_with_no_visible_zones_is_none() {
+        let layout = Arc::new(RwLock::new(ZoneLayout::new(800, 600)));
+        let router = InputRouter::new(layout);
+        assert_eq!(router.focus_next(), None);
+        assert_eq!(router.get_focus(), None);
     }
 
     #[test]
