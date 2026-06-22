@@ -364,6 +364,59 @@ impl ZoneLayoutEngine {
         }
     }
 
+    /// Replace the layout with a `rows` × `cols` grid of zones that exactly tile
+    /// the screen. Integer-division remainder is absorbed by the last column and
+    /// row, so the grid covers every pixel with no gaps or overlaps. Returns the
+    /// new zone ids in row-major order; `rows` or `cols` of 0 just clears the
+    /// layout. This backs the roadmap's predefined tiling layouts (Phase 3.6).
+    ///
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
+    #[must_use]
+    pub fn tile_grid(&self, rows: u32, cols: u32) -> Vec<u32> {
+        let (sw, sh) = {
+            let layout = self.layout.read().unwrap();
+            (layout.screen_width, layout.screen_height)
+        };
+        self.layout.write().unwrap().zones.clear();
+        if rows == 0 || cols == 0 {
+            return Vec::new();
+        }
+        let cell_w = sw / cols;
+        let cell_h = sh / rows;
+        let mut ids = Vec::with_capacity((rows * cols) as usize);
+        for r in 0..rows {
+            for c in 0..cols {
+                let x = c * cell_w;
+                let y = r * cell_h;
+                // The last column/row stretches to the screen edge so integer
+                // remainders never leave an uncovered strip.
+                let w = if c == cols - 1 { sw - x } else { cell_w };
+                let h = if r == rows - 1 { sh - y } else { cell_h };
+                ids.push(self.create_zone(x, y, w, h, format!("zone-{r}-{c}")));
+            }
+        }
+        ids
+    }
+
+    /// Tile the screen into `n` equal vertical columns (side by side).
+    ///
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
+    #[must_use]
+    pub fn split_columns(&self, n: u32) -> Vec<u32> {
+        self.tile_grid(1, n)
+    }
+
+    /// Tile the screen into `n` equal horizontal rows (stacked).
+    ///
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
+    #[must_use]
+    pub fn split_rows(&self, n: u32) -> Vec<u32> {
+        self.tile_grid(n, 1)
+    }
+
     #[must_use]
     /// # Panics
     /// Panics if an internal lock is poisoned.
@@ -796,6 +849,62 @@ mod tests {
 
         let layout = engine.get_layout();
         assert!(layout.find_zone_by_id(z1).is_some());
+    }
+
+    #[test]
+    fn tile_grid_covers_the_whole_screen_without_gaps() {
+        let engine = ZoneLayoutEngine::new(1920, 1080);
+        let ids = engine.tile_grid(2, 2);
+        assert_eq!(ids.len(), 4);
+        let layout = engine.get_layout();
+        // The four zones tile the screen exactly: areas sum to the screen area.
+        let area: u64 = layout
+            .zones
+            .iter()
+            .map(|z| u64::from(z.width) * u64::from(z.height))
+            .sum();
+        assert_eq!(area, 1920 * 1080);
+        // Every corner maps to exactly one zone.
+        for (x, y) in [(0, 0), (1919, 0), (0, 1079), (1919, 1079), (960, 540)] {
+            assert!(layout.find_zone_at(x, y).is_some(), "({x},{y}) covered");
+        }
+    }
+
+    #[test]
+    fn tile_grid_absorbs_the_remainder_at_the_edges() {
+        // 100x100 into a 3x3 grid: 100/3 = 33, so the last column/row must take
+        // 34 px to reach the edge — no uncovered strip.
+        let engine = ZoneLayoutEngine::new(100, 100);
+        let _ = engine.tile_grid(3, 3);
+        let layout = engine.get_layout();
+        let area: u64 = layout
+            .zones
+            .iter()
+            .map(|z| u64::from(z.width) * u64::from(z.height))
+            .sum();
+        assert_eq!(area, 100 * 100, "no gaps from integer division");
+        assert!(layout.find_zone_at(99, 99).is_some(), "far corner covered");
+    }
+
+    #[test]
+    fn split_helpers_and_clear() {
+        let engine = ZoneLayoutEngine::new(1200, 600);
+        assert_eq!(engine.split_columns(3).len(), 3);
+        let cols = engine.get_layout();
+        assert!(cols.zones.iter().all(|z| z.height == 600 && z.width == 400));
+
+        assert_eq!(engine.split_rows(2).len(), 2); // replaces the layout
+        let rows = engine.get_layout();
+        assert_eq!(rows.zones.len(), 2);
+        assert!(
+            rows.zones
+                .iter()
+                .all(|z| z.width == 1200 && z.height == 300)
+        );
+
+        // A zero dimension clears the layout.
+        assert!(engine.tile_grid(0, 4).is_empty());
+        assert!(engine.get_layout().zones.is_empty());
     }
 
     #[test]
