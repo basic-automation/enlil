@@ -24,6 +24,23 @@ pub enum DeviceStatus {
     Failed = 128,
 }
 
+/// The 16-bit one's-complement internet checksum (RFC 1071) over `data`.
+/// Used to complete TX checksum-offload requests.
+fn internet_checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut chunks = data.chunks_exact(2);
+    for c in &mut chunks {
+        sum += u32::from(u16::from_be_bytes([c[0], c[1]]));
+    }
+    if let [last] = chunks.remainder() {
+        sum += u32::from(u16::from_be_bytes([*last, 0]));
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !u16::try_from(sum & 0xFFFF).unwrap_or(0)
+}
+
 /// `virtio_net_config.status` bit: the link is up.
 pub const NET_S_LINK_UP: u16 = 1;
 /// `virtio_net_config.status` bit: the device wants the guest to re-announce
@@ -43,6 +60,8 @@ pub struct NetDeviceStats {
     pub ctrl_commands: u64,
     /// Control-virtqueue commands rejected (malformed or unsupported).
     pub ctrl_errors: u64,
+    /// TX frames whose checksum the device completed (CSUM offload).
+    pub tx_csum_offloads: u64,
 }
 
 /// A `VirtIO` network device.
@@ -392,8 +411,25 @@ impl VirtioNetDevice {
                 continue;
             }
 
-            let frame = &desc.data[hdr_size..];
-            match self.backend.send(frame) {
+            // Honour a checksum-offload request: when the guest sets NEEDS_CSUM
+            // it has only seeded the pseudo-header sum, so the device must finish
+            // the checksum before the frame goes on the wire.
+            let header = VirtioNetHeader::from_bytes(&desc.data, self.merge_rxbuf);
+            let result = match header {
+                Some(h) if h.needs_csum() => {
+                    let (start, offset) = ({ h.csum_start }, { h.csum_offset });
+                    let mut frame = desc.data[hdr_size..].to_vec();
+                    if Self::complete_checksum(&mut frame, start, offset).is_err() {
+                        self.stats.tx_errors += 1;
+                        self.tx_queue.push_used(desc);
+                        continue;
+                    }
+                    self.stats.tx_csum_offloads += 1;
+                    self.backend.send(&frame)
+                }
+                _ => self.backend.send(&desc.data[hdr_size..]),
+            };
+            match result {
                 Ok(n) => {
                     self.stats.tx_packets += 1;
                     self.stats.tx_bytes += n as u64;
@@ -405,6 +441,21 @@ impl VirtioNetDevice {
 
             self.tx_queue.push_used(desc);
         }
+    }
+
+    /// Complete a checksum-offload request: write the internet checksum over
+    /// `frame[csum_start..]` into the two bytes at `csum_start + csum_offset`,
+    /// where the guest has seeded the pseudo-header partial sum. Errors if the
+    /// offsets fall outside the frame.
+    fn complete_checksum(frame: &mut [u8], csum_start: u16, csum_offset: u16) -> Result<(), ()> {
+        let start = usize::from(csum_start);
+        let pos = start + usize::from(csum_offset);
+        if start > frame.len() || pos + 2 > frame.len() {
+            return Err(());
+        }
+        let csum = internet_checksum(&frame[start..]);
+        frame[pos..pos + 2].copy_from_slice(&csum.to_be_bytes());
+        Ok(())
     }
 
     /// Process pending RX: read from backend and queue frames.
@@ -802,6 +853,83 @@ mod tests {
     fn config_space_out_of_range_reads_zero() {
         let dev = make_device();
         assert_eq!(dev.read_config(100, 4), 0);
+    }
+
+    // A classic IPv4 header (checksum field zeroed) whose internet checksum is
+    // 0xB861 — the worked example from the IPv4 checksum literature.
+    fn ipv4_header_zeroed_csum() -> Vec<u8> {
+        vec![
+            0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00, 0x40, 0x11, 0x00, 0x00, 0xc0, 0xa8,
+            0x00, 0x01, 0xc0, 0xa8, 0x00, 0xc7,
+        ]
+    }
+
+    #[test]
+    fn internet_checksum_matches_known_vector() {
+        assert_eq!(internet_checksum(&ipv4_header_zeroed_csum()), 0xB861);
+        // A fully-formed (valid) header checksums to zero.
+        let mut hdr = ipv4_header_zeroed_csum();
+        hdr[10..12].copy_from_slice(&0xB861u16.to_be_bytes());
+        assert_eq!(internet_checksum(&hdr), 0);
+    }
+
+    #[test]
+    fn complete_checksum_fills_the_field() {
+        let mut frame = ipv4_header_zeroed_csum();
+        // csum_start = 0 (whole header), csum_offset = 10 (the checksum field).
+        VirtioNetDevice::complete_checksum(&mut frame, 0, 10).unwrap();
+        assert_eq!(&frame[10..12], &0xB861u16.to_be_bytes());
+        // Out-of-range offsets are rejected.
+        assert!(VirtioNetDevice::complete_checksum(&mut frame, 0, 100).is_err());
+    }
+
+    #[test]
+    fn process_tx_completes_a_needs_csum_frame() {
+        use std::sync::{Arc, Mutex};
+        // A backend that captures the last frame it was asked to send.
+        #[derive(Clone)]
+        struct CaptureBackend(Arc<Mutex<Vec<u8>>>);
+        impl super::super::backend::NetBackend for CaptureBackend {
+            fn send(&mut self, frame: &[u8]) -> std::io::Result<usize> {
+                *self.0.lock().unwrap() = frame.to_vec();
+                Ok(frame.len())
+            }
+            fn recv(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+            fn has_pending_rx(&self) -> bool {
+                false
+            }
+            fn backend_name(&self) -> &'static str {
+                "capture"
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let config = NetDeviceConfig::new("tx0", MacAddress([0x02, 0, 0, 0, 0, 0x01]));
+        let mut dev = VirtioNetDevice::new(&config, Box::new(CaptureBackend(captured.clone())));
+        dev.activate(NetFeatures::from_bits(NetFeatures::MAC)); // non-merge header
+
+        // Build [virtio header (NEEDS_CSUM)][IP header with zeroed checksum].
+        let hdr = VirtioNetHeader {
+            flags: super::super::header::flags::NEEDS_CSUM,
+            csum_start: 0,
+            csum_offset: 10,
+            ..VirtioNetHeader::EMPTY
+        };
+        let mut data = hdr.to_bytes(false);
+        data.extend_from_slice(&ipv4_header_zeroed_csum());
+        dev.tx_queue.push_available(data, false).unwrap();
+
+        dev.process_tx();
+        assert_eq!(dev.stats().tx_csum_offloads, 1);
+        assert_eq!(dev.stats().tx_packets, 1);
+        let sent = captured.lock().unwrap().clone();
+        assert_eq!(
+            &sent[10..12],
+            &0xB861u16.to_be_bytes(),
+            "checksum completed on the wire"
+        );
     }
 
     fn eth_frame(dest: [u8; 6]) -> Vec<u8> {
