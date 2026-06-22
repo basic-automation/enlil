@@ -7,6 +7,8 @@
 pub mod keyboard;
 pub mod mouse;
 
+use std::collections::VecDeque;
+
 /// i8042 controller ports
 pub const DATA_PORT: u16 = 0x60;
 pub const STATUS_CMD_PORT: u16 = 0x64;
@@ -49,8 +51,14 @@ pub struct I8042Controller {
     config: u8,
     /// Status register
     status: u8,
-    /// Output buffer (data to be read by guest)
+    /// The data register the guest reads at port 0x60 — the head of the output
+    /// FIFO (latched here so a read with the buffer empty returns the last byte,
+    /// as on real hardware).
     output_buffer: u8,
+    /// Pending device output bytes, each tagged with whether it came from the
+    /// mouse. The i8042 delivers one byte per 0x60 read, so multi-byte responses
+    /// (mouse packets, the 2-byte device id, reset sequences) must be queued.
+    output_queue: VecDeque<(u8, bool)>,
     /// Pending command (waiting for data byte)
     pending_command: Option<u8>,
     /// Keyboard device
@@ -61,8 +69,6 @@ pub struct I8042Controller {
     pub kbd_irq_pending: bool,
     /// Mouse IRQ pending
     pub mouse_irq_pending: bool,
-    /// Whether output is from mouse (for `STATUS_MOUSE_OUTPUT` bit)
-    output_is_mouse: bool,
 }
 
 impl I8042Controller {
@@ -72,23 +78,46 @@ impl I8042Controller {
             config: CFG_KBD_INTERRUPT | CFG_MOUSE_INTERRUPT | CFG_SYSTEM_FLAG | CFG_TRANSLATION,
             status: STATUS_SYSTEM_FLAG,
             output_buffer: 0,
+            output_queue: VecDeque::new(),
             pending_command: None,
             keyboard: keyboard::Ps2Keyboard::new(),
             mouse: mouse::Ps2Mouse::new(),
             kbd_irq_pending: false,
             mouse_irq_pending: false,
-            output_is_mouse: false,
         }
     }
 
-    /// Read from port 0x60 (data port)
+    /// Read from port 0x60 (data port). Consumes the head of the output FIFO and
+    /// re-arms the status / IRQ lines for whatever byte is next in the queue.
     #[must_use]
-    pub const fn read_data(&mut self) -> u8 {
-        self.status &= !STATUS_OUTPUT_FULL;
-        self.status &= !STATUS_MOUSE_OUTPUT;
-        self.kbd_irq_pending = false;
-        self.mouse_irq_pending = false;
+    pub fn read_data(&mut self) -> u8 {
+        if let Some((byte, _)) = self.output_queue.pop_front() {
+            self.output_buffer = byte;
+        }
+        self.refresh_output_status();
         self.output_buffer
+    }
+
+    /// Recompute the output-buffer-full / mouse-output status bits and the
+    /// pending-IRQ flags from the byte now at the head of the FIFO.
+    fn refresh_output_status(&mut self) {
+        if let Some(&(_, is_mouse)) = self.output_queue.front() {
+            self.status |= STATUS_OUTPUT_FULL;
+            if is_mouse {
+                self.status |= STATUS_MOUSE_OUTPUT;
+                self.mouse_irq_pending = (self.config & CFG_MOUSE_INTERRUPT) != 0;
+                self.kbd_irq_pending = false;
+            } else {
+                self.status &= !STATUS_MOUSE_OUTPUT;
+                self.kbd_irq_pending = (self.config & CFG_KBD_INTERRUPT) != 0;
+                self.mouse_irq_pending = false;
+            }
+        } else {
+            self.status &= !STATUS_OUTPUT_FULL;
+            self.status &= !STATUS_MOUSE_OUTPUT;
+            self.kbd_irq_pending = false;
+            self.mouse_irq_pending = false;
+        }
     }
 
     /// Read from port 0x64 (status register)
@@ -106,11 +135,12 @@ impl I8042Controller {
             if let Some(response) = self.keyboard.receive_command(data) {
                 self.queue_keyboard_output(response);
             }
+            self.drain_keyboard();
         }
     }
 
     /// Write to port 0x64 (command port)
-    pub const fn write_command(&mut self, cmd: u8) {
+    pub fn write_command(&mut self, cmd: u8) {
         match cmd {
             0x20 => {
                 // Read configuration byte
@@ -182,53 +212,62 @@ impl I8042Controller {
                 if let Some(response) = self.mouse.receive_command(data) {
                     self.queue_mouse_output(response);
                 }
+                self.drain_mouse();
             }
             // 0xD1 (write output port): bit 0 is system reset, which we ignore.
             _ => {}
         }
     }
 
-    /// Queue data from keyboard into output buffer
-    const fn queue_keyboard_output(&mut self, data: u8) {
-        self.output_buffer = data;
-        self.status |= STATUS_OUTPUT_FULL;
-        self.status &= !STATUS_MOUSE_OUTPUT;
-        self.output_is_mouse = false;
-        if (self.config & CFG_KBD_INTERRUPT) != 0 {
-            self.kbd_irq_pending = true;
+    /// Queue one keyboard byte into the output FIFO.
+    fn queue_keyboard_output(&mut self, data: u8) {
+        self.output_queue.push_back((data, false));
+        self.refresh_output_status();
+    }
+
+    /// Queue one mouse byte into the output FIFO.
+    fn queue_mouse_output(&mut self, data: u8) {
+        self.output_queue.push_back((data, true));
+        self.refresh_output_status();
+    }
+
+    /// Drain any bytes the keyboard queued (e.g. the 2-byte device id or the
+    /// reset self-test byte) into the controller FIFO.
+    fn drain_keyboard(&mut self) {
+        while let Some(sc) = self.keyboard.dequeue_scancode() {
+            self.queue_keyboard_output(sc);
         }
     }
 
-    /// Queue data from mouse into output buffer
-    const fn queue_mouse_output(&mut self, data: u8) {
-        self.output_buffer = data;
-        self.status |= STATUS_OUTPUT_FULL;
-        self.status |= STATUS_MOUSE_OUTPUT;
-        self.output_is_mouse = true;
-        if (self.config & CFG_MOUSE_INTERRUPT) != 0 {
-            self.mouse_irq_pending = true;
+    /// Drain any bytes the mouse queued (packet bytes, device id, reset
+    /// sequence) into the controller FIFO.
+    fn drain_mouse(&mut self) {
+        while let Some(b) = self.mouse.dequeue_byte() {
+            self.queue_mouse_output(b);
         }
     }
 
     /// Inject a keyboard scancode (from host input)
     pub fn inject_key(&mut self, scancode: u8) {
         self.keyboard.inject_scancode(scancode);
-        if let Some(sc) = self.keyboard.dequeue_scancode() {
-            self.queue_keyboard_output(sc);
-        }
+        self.drain_keyboard();
     }
 
     /// Inject mouse movement/button data
     pub fn inject_mouse_packet(&mut self, buttons: u8, dx: i16, dy: i16) {
         self.mouse.inject_movement(buttons, dx, dy);
-        if let Some(byte) = self.mouse.dequeue_byte() {
-            self.queue_mouse_output(byte);
-        }
+        self.drain_mouse();
+    }
+
+    /// Inject mouse movement plus a scroll-wheel delta ( mode).
+    pub fn inject_mouse_wheel(&mut self, buttons: u8, dx: i16, dy: i16, dz: i16) {
+        self.mouse.inject_movement_wheel(buttons, dx, dy, dz);
+        self.drain_mouse();
     }
 
     /// Handle PIO read
     #[must_use]
-    pub const fn pio_read(&mut self, port: u16) -> u8 {
+    pub fn pio_read(&mut self, port: u16) -> u8 {
         match port {
             DATA_PORT => self.read_data(),
             STATUS_CMD_PORT => self.read_status(),
@@ -348,6 +387,12 @@ impl SharedI8042 {
     /// Inject host mouse movement/buttons and reconcile the IRQ lines.
     pub fn inject_mouse_packet(&self, buttons: u8, dx: i16, dy: i16) {
         self.with(|c| c.inject_mouse_packet(buttons, dx, dy));
+    }
+
+    /// Inject host mouse movement plus a scroll-wheel delta ( mode)
+    /// and reconcile the IRQ lines.
+    pub fn inject_mouse_wheel(&self, buttons: u8, dx: i16, dy: i16, dz: i16) {
+        self.with(|c| c.inject_mouse_wheel(buttons, dx, dy, dz));
     }
 
     /// The data port (`0x60`) as a bus [`PioDevice`].
@@ -564,5 +609,70 @@ mod tests {
         });
         ps2.inject_mouse_packet(0, 4, -3);
         assert_eq!(log.lock().unwrap().last(), Some(&true));
+    }
+
+    #[test]
+    fn mouse_packet_delivers_all_three_bytes_through_the_controller() {
+        let mut c = I8042Controller::new();
+        // Enable mouse reporting (0xD4 routes the next data byte to the mouse).
+        c.write_command(0xD4);
+        c.write_data(0xF4);
+        assert_eq!(c.read_data(), 0xFA, "mouse ACK");
+        assert_eq!(c.read_status() & STATUS_OUTPUT_FULL, 0, "FIFO drained");
+
+        // A movement now yields a full 3-byte packet, one byte per read, each
+        // flagged as mouse output in the status register.
+        c.inject_mouse_packet(0x01, 5, -3);
+        for _ in 0..3 {
+            assert_ne!(c.read_status() & STATUS_OUTPUT_FULL, 0);
+            assert_ne!(
+                c.read_status() & STATUS_MOUSE_OUTPUT,
+                0,
+                "byte is mouse output"
+            );
+            let _ = c.read_data();
+        }
+        assert_eq!(
+            c.read_status() & STATUS_OUTPUT_FULL,
+            0,
+            "packet fully drained"
+        );
+    }
+
+    #[test]
+    fn keyboard_identify_returns_ack_then_two_id_bytes() {
+        let mut c = I8042Controller::new();
+        c.write_data(0xF2); // identify (routed to the keyboard)
+        assert_eq!(c.read_data(), 0xFA, "ACK");
+        assert_eq!(c.read_data(), 0xAB, "MF2 id byte 1");
+        assert_eq!(c.read_data(), 0x83, "MF2 id byte 2");
+        assert_eq!(c.read_status() & STATUS_OUTPUT_FULL, 0);
+    }
+
+    #[test]
+    fn mouse_reset_returns_ack_bat_and_id_through_the_controller() {
+        let mut c = I8042Controller::new();
+        c.write_command(0xD4);
+        c.write_data(0xFF); // reset mouse
+        assert_eq!(c.read_data(), 0xFA, "ACK");
+        assert_eq!(c.read_data(), 0xAA, "BAT passed");
+        assert_eq!(c.read_data(), 0x00, "device id");
+    }
+
+    #[test]
+    fn intellimouse_wheel_delivers_a_4th_byte_through_the_controller() {
+        let mut c = I8042Controller::new();
+        // Switch the mouse to IntelliMouse mode (magic 200/100/80) + enable.
+        for r in [0xF3u8, 200, 0xF3, 100, 0xF3, 80, 0xF4] {
+            c.write_command(0xD4);
+            c.write_data(r);
+            while c.read_status() & STATUS_OUTPUT_FULL != 0 {
+                let _ = c.read_data(); // drain ACKs
+            }
+        }
+        c.inject_mouse_wheel(0, 0, 0, -1);
+        let pkt = [c.read_data(), c.read_data(), c.read_data(), c.read_data()];
+        assert_eq!(c.read_status() & STATUS_OUTPUT_FULL, 0, "exactly 4 bytes");
+        assert_eq!(pkt[3], 0xFF, "wheel delta in the 4th byte");
     }
 }
