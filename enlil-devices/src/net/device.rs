@@ -9,6 +9,7 @@ use super::control::{self, NetControlState, RxFilterMode};
 use super::features::NetFeatures;
 use super::header::VirtioNetHeader;
 use super::virtqueue::Virtqueue;
+use crate::truncate::usize_of;
 
 use std::collections::VecDeque;
 
@@ -22,6 +23,12 @@ pub enum DeviceStatus {
     FeaturesOk = 8,
     Failed = 128,
 }
+
+/// `virtio_net_config.status` bit: the link is up.
+pub const NET_S_LINK_UP: u16 = 1;
+/// `virtio_net_config.status` bit: the device wants the guest to re-announce
+/// its presence (gratuitous ARP) — set after a migration/link change.
+pub const NET_S_ANNOUNCE: u16 = 2;
 
 /// Network device statistics.
 #[derive(Debug, Clone, Default)]
@@ -51,6 +58,8 @@ pub struct VirtioNetDevice {
     features: NetFeatures,
     /// Whether mergeable RX buffers are enabled.
     merge_rxbuf: bool,
+    /// Whether the virtual link is up (reported in the config-space status).
+    link_up: bool,
     /// Device status.
     status: u8,
     /// TX virtqueue (guest → host).
@@ -85,6 +94,7 @@ impl VirtioNetDevice {
             mac: config.mac,
             features: NetFeatures::from_bits(NetFeatures::DEFAULT),
             merge_rxbuf: false,
+            link_up: true,
             status: 0,
             tx_queue: Virtqueue::new(format!("{}-tx", config.name), queue_size),
             rx_queue: Virtqueue::new(format!("{}-rx", config.name), queue_size),
@@ -140,6 +150,7 @@ impl VirtioNetDevice {
         self.status = 0;
         self.features = NetFeatures::from_bits(NetFeatures::DEFAULT);
         self.merge_rxbuf = false;
+        self.link_up = true;
         self.tx_queue.reset();
         self.rx_queue.reset();
         self.rx_pending.clear();
@@ -152,6 +163,64 @@ impl VirtioNetDevice {
     #[must_use]
     pub const fn control_state(&self) -> &NetControlState {
         &self.control
+    }
+
+    /// Set the virtual link state. Dropping the link clears `LINK_UP` in the
+    /// config-space status the guest polls (when `VIRTIO_NET_F_STATUS` is on).
+    pub const fn set_link_up(&mut self, up: bool) {
+        self.link_up = up;
+    }
+
+    /// Whether the virtual link is currently up.
+    #[must_use]
+    pub const fn is_link_up(&self) -> bool {
+        self.link_up
+    }
+
+    /// Ask the guest to re-announce itself (gratuitous ARP) — sets the
+    /// `ANNOUNCE` status bit; the guest clears it via `VIRTIO_NET_CTRL_ANNOUNCE`.
+    pub const fn request_announce(&mut self) {
+        self.control.announce_needed = true;
+    }
+
+    /// The current `virtio_net_config.status` field (`LINK_UP` / `ANNOUNCE`).
+    #[must_use]
+    pub const fn config_status(&self) -> u16 {
+        let mut s: u16 = 0;
+        if self.link_up {
+            s |= NET_S_LINK_UP;
+        }
+        if self.control.announce_needed {
+            s |= NET_S_ANNOUNCE;
+        }
+        s
+    }
+
+    /// Serialize the `virtio_net_config` the guest reads: `mac[6]`, `status`,
+    /// `max_virtqueue_pairs`, `mtu` (we do not offer the MTU feature, so it is 0).
+    fn config_as_bytes(&self) -> [u8; 12] {
+        let mut b = [0u8; 12];
+        b[0..6].copy_from_slice(self.mac.as_bytes());
+        b[6..8].copy_from_slice(&self.config_status().to_le_bytes());
+        let pairs = self.control.vq_pairs.max(1);
+        b[8..10].copy_from_slice(&pairs.to_le_bytes());
+        // b[10..12] = mtu = 0 (VIRTIO_NET_F_MTU not offered).
+        b
+    }
+
+    /// Read the device config space at `offset` for `size` bytes (1/2/4), as the
+    /// virtio transport does on a guest config read. Out-of-range reads as 0.
+    #[must_use]
+    pub fn read_config(&self, offset: u64, size: u8) -> u64 {
+        let bytes = self.config_as_bytes();
+        let offset = usize_of(offset);
+        let mut val = 0u64;
+        for i in 0..usize::from(size) {
+            if let Some(&byte) = bytes.get(offset + i) {
+                val |= u64::from(byte) << (i * 8);
+            }
+        }
+        val
     }
 
     /// Process one `VIRTIO_NET_CTRL` command from the control virtqueue.
@@ -695,6 +764,44 @@ mod tests {
             1,
         ]);
         assert_eq!(ack, control::VIRTIO_NET_ERR);
+    }
+
+    #[test]
+    fn config_space_reports_mac_and_link_status() {
+        let mut dev = make_device();
+        // MAC at offset 0 (6 bytes).
+        for (i, &b) in [0x02u8, 0x00, 0x00, 0x00, 0x00, 0x01].iter().enumerate() {
+            assert_eq!(dev.read_config(i as u64, 1), u64::from(b), "mac byte {i}");
+        }
+        // status at offset 6: link up by default.
+        assert_eq!(dev.read_config(6, 2), u64::from(NET_S_LINK_UP));
+        // max_virtqueue_pairs at offset 8 defaults to 1.
+        assert_eq!(dev.read_config(8, 2), 1);
+
+        // Drop the link → status clears LINK_UP.
+        dev.set_link_up(false);
+        assert!(!dev.is_link_up());
+        assert_eq!(dev.read_config(6, 2), 0);
+
+        // Requesting an announce sets the ANNOUNCE bit alongside LINK_UP.
+        dev.set_link_up(true);
+        dev.request_announce();
+        assert_eq!(
+            dev.read_config(6, 2),
+            u64::from(NET_S_LINK_UP | NET_S_ANNOUNCE)
+        );
+        // The guest acks it through the control vq, clearing the bit.
+        dev.process_control(&[
+            control::VIRTIO_NET_CTRL_ANNOUNCE,
+            control::VIRTIO_NET_CTRL_ANNOUNCE_ACK,
+        ]);
+        assert_eq!(dev.read_config(6, 2), u64::from(NET_S_LINK_UP));
+    }
+
+    #[test]
+    fn config_space_out_of_range_reads_zero() {
+        let dev = make_device();
+        assert_eq!(dev.read_config(100, 4), 0);
     }
 
     fn eth_frame(dest: [u8; 6]) -> Vec<u8> {
