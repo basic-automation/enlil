@@ -62,6 +62,7 @@ impl NetFeatures {
     /// promiscuous mode, MAC filters, and VLAN filtering at runtime.
     pub const DEFAULT: u64 = Self::MAC
         | Self::STATUS
+        | Self::MTU
         | Self::MRG_RXBUF
         | Self::CSUM
         | Self::GUEST_CSUM

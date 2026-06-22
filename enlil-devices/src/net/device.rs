@@ -79,6 +79,8 @@ pub struct VirtioNetDevice {
     merge_rxbuf: bool,
     /// Whether the virtual link is up (reported in the config-space status).
     link_up: bool,
+    /// Link MTU reported in config space (`VIRTIO_NET_F_MTU`).
+    mtu: u16,
     /// Device status.
     status: u8,
     /// TX virtqueue (guest → host).
@@ -114,6 +116,7 @@ impl VirtioNetDevice {
             features: NetFeatures::from_bits(NetFeatures::DEFAULT),
             merge_rxbuf: false,
             link_up: true,
+            mtu: config.mtu,
             status: 0,
             tx_queue: Virtqueue::new(format!("{}-tx", config.name), queue_size),
             rx_queue: Virtqueue::new(format!("{}-rx", config.name), queue_size),
@@ -196,6 +199,12 @@ impl VirtioNetDevice {
         self.link_up
     }
 
+    /// The link MTU reported to the guest.
+    #[must_use]
+    pub const fn mtu(&self) -> u16 {
+        self.mtu
+    }
+
     /// Ask the guest to re-announce itself (gratuitous ARP) — sets the
     /// `ANNOUNCE` status bit; the guest clears it via `VIRTIO_NET_CTRL_ANNOUNCE`.
     pub const fn request_announce(&mut self) {
@@ -223,7 +232,7 @@ impl VirtioNetDevice {
         b[6..8].copy_from_slice(&self.config_status().to_le_bytes());
         let pairs = self.control.vq_pairs.max(1);
         b[8..10].copy_from_slice(&pairs.to_le_bytes());
-        // b[10..12] = mtu = 0 (VIRTIO_NET_F_MTU not offered).
+        b[10..12].copy_from_slice(&self.mtu.to_le_bytes());
         b
     }
 
@@ -853,6 +862,21 @@ mod tests {
     fn config_space_out_of_range_reads_zero() {
         let dev = make_device();
         assert_eq!(dev.read_config(100, 4), 0);
+    }
+
+    #[test]
+    fn config_space_reports_mtu() {
+        let dev = make_device(); // default config MTU = 1500
+        assert!(dev.features().contains(NetFeatures::MTU));
+        assert_eq!(dev.mtu(), 1500);
+        // mtu is at config offset 10 (after mac[6], status[2], pairs[2]).
+        assert_eq!(dev.read_config(10, 2), 1500);
+
+        // A jumbo-frame MTU is reported faithfully.
+        let mut config = NetDeviceConfig::new("j0", MacAddress([0x02, 0, 0, 0, 0, 0x01]));
+        config.mtu = 9000;
+        let jumbo = VirtioNetDevice::new(&config, Box::new(NullBackend::new()));
+        assert_eq!(jumbo.read_config(10, 2), 9000);
     }
 
     // A classic IPv4 header (checksum field zeroed) whose internet checksum is
