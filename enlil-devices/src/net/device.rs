@@ -5,6 +5,7 @@
 
 use super::backend::NetBackend;
 use super::config::{MacAddress, NetDeviceConfig};
+use super::control::{self, NetControlState, RxFilterMode};
 use super::features::NetFeatures;
 use super::header::VirtioNetHeader;
 use super::virtqueue::Virtqueue;
@@ -31,6 +32,10 @@ pub struct NetDeviceStats {
     pub rx_packets: u64,
     pub rx_bytes: u64,
     pub rx_drops: u64,
+    /// Control-virtqueue commands acknowledged OK.
+    pub ctrl_commands: u64,
+    /// Control-virtqueue commands rejected (malformed or unsupported).
+    pub ctrl_errors: u64,
 }
 
 /// A `VirtIO` network device.
@@ -58,6 +63,8 @@ pub struct VirtioNetDevice {
     backend: Box<dyn NetBackend>,
     /// Pending RX frames waiting for guest buffers.
     rx_pending: VecDeque<Vec<u8>>,
+    /// Control-virtqueue state (RX mode, MAC/VLAN filters, multiqueue).
+    control: NetControlState,
     /// Statistics.
     stats: NetDeviceStats,
 }
@@ -84,6 +91,7 @@ impl VirtioNetDevice {
             queue_size,
             backend,
             rx_pending: VecDeque::new(),
+            control: NetControlState::default(),
             stats: NetDeviceStats::default(),
         }
     }
@@ -135,7 +143,131 @@ impl VirtioNetDevice {
         self.tx_queue.reset();
         self.rx_queue.reset();
         self.rx_pending.clear();
+        self.control = NetControlState::default();
         self.stats = NetDeviceStats::default();
+    }
+
+    /// Read-only view of the control-virtqueue state (RX mode, MAC/VLAN
+    /// filters, multiqueue) as last programmed by the guest.
+    #[must_use]
+    pub const fn control_state(&self) -> &NetControlState {
+        &self.control
+    }
+
+    /// Process one `VIRTIO_NET_CTRL` command from the control virtqueue.
+    ///
+    /// `buf` is the command buffer `{ class, command, command-specific data… }`;
+    /// the returned byte is the ack the device writes back
+    /// ([`VIRTIO_NET_OK`](control::VIRTIO_NET_OK) /
+    /// [`VIRTIO_NET_ERR`](control::VIRTIO_NET_ERR)). A command is rejected if
+    /// the control virtqueue was not negotiated, the buffer is too short, or the
+    /// payload is malformed.
+    pub fn process_control(&mut self, buf: &[u8]) -> u8 {
+        if !self.features.contains(NetFeatures::CTRL_VQ) || buf.len() < 2 {
+            self.stats.ctrl_errors += 1;
+            return control::VIRTIO_NET_ERR;
+        }
+        let (class, command, data) = (buf[0], buf[1], &buf[2..]);
+        let ack = match class {
+            control::VIRTIO_NET_CTRL_RX => self.ctrl_rx(command, data),
+            control::VIRTIO_NET_CTRL_MAC => self.ctrl_mac(command, data),
+            control::VIRTIO_NET_CTRL_VLAN => self.ctrl_vlan(command, data),
+            control::VIRTIO_NET_CTRL_ANNOUNCE => {
+                if command == control::VIRTIO_NET_CTRL_ANNOUNCE_ACK {
+                    self.control.announce_needed = false;
+                    control::VIRTIO_NET_OK
+                } else {
+                    control::VIRTIO_NET_ERR
+                }
+            }
+            control::VIRTIO_NET_CTRL_MQ => self.ctrl_mq(command, data),
+            _ => control::VIRTIO_NET_ERR,
+        };
+        if ack == control::VIRTIO_NET_OK {
+            self.stats.ctrl_commands += 1;
+        } else {
+            self.stats.ctrl_errors += 1;
+        }
+        ack
+    }
+
+    /// `VIRTIO_NET_CTRL_RX`: toggle a receive-filter mode (1-byte on/off).
+    fn ctrl_rx(&mut self, command: u8, data: &[u8]) -> u8 {
+        let Some(&on) = data.first() else {
+            return control::VIRTIO_NET_ERR;
+        };
+        let flag = match command {
+            control::VIRTIO_NET_CTRL_RX_PROMISC => RxFilterMode::PROMISC,
+            control::VIRTIO_NET_CTRL_RX_ALLMULTI => RxFilterMode::ALLMULTI,
+            control::VIRTIO_NET_CTRL_RX_ALLUNI => RxFilterMode::ALLUNI,
+            control::VIRTIO_NET_CTRL_RX_NOMULTI => RxFilterMode::NOMULTI,
+            control::VIRTIO_NET_CTRL_RX_NOUNI => RxFilterMode::NOUNI,
+            control::VIRTIO_NET_CTRL_RX_NOBCAST => RxFilterMode::NOBCAST,
+            _ => return control::VIRTIO_NET_ERR,
+        };
+        self.control.rx_mode.set(flag, on != 0);
+        control::VIRTIO_NET_OK
+    }
+
+    /// `VIRTIO_NET_CTRL_MAC`: set the primary MAC, or program the filter tables.
+    fn ctrl_mac(&mut self, command: u8, data: &[u8]) -> u8 {
+        match command {
+            control::VIRTIO_NET_CTRL_MAC_ADDR_SET => {
+                if data.len() < 6 {
+                    return control::VIRTIO_NET_ERR;
+                }
+                let mut mac = [0u8; 6];
+                mac.copy_from_slice(&data[..6]);
+                self.mac = MacAddress(mac);
+                control::VIRTIO_NET_OK
+            }
+            control::VIRTIO_NET_CTRL_MAC_TABLE_SET => {
+                // Two consecutive virtio_net_ctrl_mac sub-tables: unicast, then
+                // multicast. Parse both before committing so a malformed second
+                // table does not leave a half-applied filter.
+                let Some((unicast, used)) = control::parse_mac_table(data) else {
+                    return control::VIRTIO_NET_ERR;
+                };
+                let Some((multicast, _)) = control::parse_mac_table(&data[used..]) else {
+                    return control::VIRTIO_NET_ERR;
+                };
+                self.control.unicast_table = unicast;
+                self.control.multicast_table = multicast;
+                control::VIRTIO_NET_OK
+            }
+            _ => control::VIRTIO_NET_ERR,
+        }
+    }
+
+    /// `VIRTIO_NET_CTRL_VLAN`: add or remove a VLAN id from the filter.
+    fn ctrl_vlan(&mut self, command: u8, data: &[u8]) -> u8 {
+        if data.len() < 2 {
+            return control::VIRTIO_NET_ERR;
+        }
+        let vid = u16::from_le_bytes([data[0], data[1]]);
+        if vid >= control::VLAN_VID_MAX {
+            return control::VIRTIO_NET_ERR;
+        }
+        match command {
+            control::VIRTIO_NET_CTRL_VLAN_ADD => {
+                self.control.vlan_filter.insert(vid);
+                control::VIRTIO_NET_OK
+            }
+            control::VIRTIO_NET_CTRL_VLAN_DEL => {
+                self.control.vlan_filter.remove(&vid);
+                control::VIRTIO_NET_OK
+            }
+            _ => control::VIRTIO_NET_ERR,
+        }
+    }
+
+    /// `VIRTIO_NET_CTRL_MQ`: set the number of active queue pairs.
+    const fn ctrl_mq(&mut self, command: u8, data: &[u8]) -> u8 {
+        if command != control::VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET || data.len() < 2 {
+            return control::VIRTIO_NET_ERR;
+        }
+        self.control.vq_pairs = u16::from_le_bytes([data[0], data[1]]);
+        control::VIRTIO_NET_OK
     }
 
     /// Process pending TX descriptors.
@@ -394,5 +526,153 @@ mod tests {
         assert_eq!(DeviceStatus::DriverOk as u8, 4);
         assert_eq!(DeviceStatus::FeaturesOk as u8, 8);
         assert_eq!(DeviceStatus::Failed as u8, 128);
+    }
+
+    #[test]
+    fn ctrl_vq_is_offered_by_default() {
+        let dev = make_device();
+        assert!(dev.features().contains(NetFeatures::CTRL_VQ));
+        assert!(dev.features().contains(NetFeatures::CTRL_RX));
+        assert!(dev.features().contains(NetFeatures::CTRL_VLAN));
+    }
+
+    #[test]
+    fn ctrl_rx_toggles_promiscuous_mode() {
+        let mut dev = make_device();
+        // class=RX cmd=PROMISC data=on.
+        let ack = dev.process_control(&[
+            control::VIRTIO_NET_CTRL_RX,
+            control::VIRTIO_NET_CTRL_RX_PROMISC,
+            1,
+        ]);
+        assert_eq!(ack, control::VIRTIO_NET_OK);
+        assert!(dev.control_state().rx_mode.contains(RxFilterMode::PROMISC));
+        // Turn it back off.
+        dev.process_control(&[
+            control::VIRTIO_NET_CTRL_RX,
+            control::VIRTIO_NET_CTRL_RX_PROMISC,
+            0,
+        ]);
+        assert!(!dev.control_state().rx_mode.contains(RxFilterMode::PROMISC));
+        assert_eq!(dev.stats().ctrl_commands, 2);
+    }
+
+    #[test]
+    fn ctrl_mac_addr_set_changes_the_mac() {
+        let mut dev = make_device();
+        let new = [0x52, 0x54, 0x00, 0xAB, 0xCD, 0xEF];
+        let mut cmd = vec![
+            control::VIRTIO_NET_CTRL_MAC,
+            control::VIRTIO_NET_CTRL_MAC_ADDR_SET,
+        ];
+        cmd.extend_from_slice(&new);
+        assert_eq!(dev.process_control(&cmd), control::VIRTIO_NET_OK);
+        assert_eq!(dev.mac(), MacAddress(new));
+    }
+
+    #[test]
+    fn ctrl_mac_table_set_programs_both_filters() {
+        let mut dev = make_device();
+        let mut cmd = vec![
+            control::VIRTIO_NET_CTRL_MAC,
+            control::VIRTIO_NET_CTRL_MAC_TABLE_SET,
+        ];
+        // Unicast table: 1 entry.
+        cmd.extend_from_slice(&1u32.to_le_bytes());
+        cmd.extend_from_slice(&[0x02, 0, 0, 0, 0, 0x10]);
+        // Multicast table: 2 entries.
+        cmd.extend_from_slice(&2u32.to_le_bytes());
+        cmd.extend_from_slice(&[0x33, 0x33, 0, 0, 0, 0x01]);
+        cmd.extend_from_slice(&[0x33, 0x33, 0, 0, 0, 0x02]);
+        assert_eq!(dev.process_control(&cmd), control::VIRTIO_NET_OK);
+        assert_eq!(dev.control_state().unicast_table.len(), 1);
+        assert_eq!(dev.control_state().multicast_table.len(), 2);
+    }
+
+    #[test]
+    fn ctrl_mac_table_set_rejects_a_truncated_table() {
+        let mut dev = make_device();
+        let mut cmd = vec![
+            control::VIRTIO_NET_CTRL_MAC,
+            control::VIRTIO_NET_CTRL_MAC_TABLE_SET,
+        ];
+        cmd.extend_from_slice(&5u32.to_le_bytes()); // claims 5 entries…
+        cmd.extend_from_slice(&[0x02, 0, 0, 0, 0, 0x10]); // …but supplies one
+        assert_eq!(dev.process_control(&cmd), control::VIRTIO_NET_ERR);
+        assert!(dev.control_state().unicast_table.is_empty(), "not applied");
+    }
+
+    #[test]
+    fn ctrl_vlan_add_and_remove() {
+        let mut dev = make_device();
+        let add = |vid: u16| {
+            let mut c = vec![
+                control::VIRTIO_NET_CTRL_VLAN,
+                control::VIRTIO_NET_CTRL_VLAN_ADD,
+            ];
+            c.extend_from_slice(&vid.to_le_bytes());
+            c
+        };
+        assert_eq!(dev.process_control(&add(42)), control::VIRTIO_NET_OK);
+        assert!(dev.control_state().vlan_filter.contains(&42));
+        // Out-of-range VLAN id is rejected.
+        assert_eq!(dev.process_control(&add(5000)), control::VIRTIO_NET_ERR);
+        // Remove it.
+        let mut del = vec![
+            control::VIRTIO_NET_CTRL_VLAN,
+            control::VIRTIO_NET_CTRL_VLAN_DEL,
+        ];
+        del.extend_from_slice(&42u16.to_le_bytes());
+        assert_eq!(dev.process_control(&del), control::VIRTIO_NET_OK);
+        assert!(!dev.control_state().vlan_filter.contains(&42));
+    }
+
+    #[test]
+    fn ctrl_mq_sets_queue_pairs() {
+        let mut dev = make_device();
+        let mut cmd = vec![
+            control::VIRTIO_NET_CTRL_MQ,
+            control::VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET,
+        ];
+        cmd.extend_from_slice(&4u16.to_le_bytes());
+        assert_eq!(dev.process_control(&cmd), control::VIRTIO_NET_OK);
+        assert_eq!(dev.control_state().vq_pairs, 4);
+    }
+
+    #[test]
+    fn ctrl_rejects_short_buffer_unknown_class_and_without_feature() {
+        let mut dev = make_device();
+        assert_eq!(
+            dev.process_control(&[control::VIRTIO_NET_CTRL_RX]),
+            control::VIRTIO_NET_ERR
+        );
+        assert_eq!(dev.process_control(&[0xFE, 0x00]), control::VIRTIO_NET_ERR);
+        assert!(dev.stats().ctrl_errors >= 2);
+
+        // Activating without CTRL_VQ disables the control path entirely.
+        dev.activate(NetFeatures::from_bits(NetFeatures::MAC));
+        let ack = dev.process_control(&[
+            control::VIRTIO_NET_CTRL_RX,
+            control::VIRTIO_NET_CTRL_RX_PROMISC,
+            1,
+        ]);
+        assert_eq!(ack, control::VIRTIO_NET_ERR);
+    }
+
+    #[test]
+    fn ctrl_announce_ack_clears_pending() {
+        let mut dev = make_device();
+        // Simulate a pending announcement, then ack it.
+        dev.process_control(&[
+            control::VIRTIO_NET_CTRL_RX,
+            control::VIRTIO_NET_CTRL_RX_PROMISC,
+            1,
+        ]);
+        let ack = dev.process_control(&[
+            control::VIRTIO_NET_CTRL_ANNOUNCE,
+            control::VIRTIO_NET_CTRL_ANNOUNCE_ACK,
+        ]);
+        assert_eq!(ack, control::VIRTIO_NET_OK);
+        assert!(!dev.control_state().announce_needed);
     }
 }
