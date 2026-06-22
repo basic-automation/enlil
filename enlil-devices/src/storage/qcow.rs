@@ -23,6 +23,16 @@ const L2_OFFSET_MASK: u64 = 0x00FF_FFFF_FFFF_FE00;
 /// L2 entry bit 0 (qcow2 v3): the cluster reads as all zeros.
 const QCOW_OFLAG_ZERO: u64 = 0x1;
 
+/// L1/L2 entry bit 63: the referenced cluster has refcount exactly 1 (a "copied"
+/// cluster the guest may write in place). Cleared when a cluster is shared (e.g.
+/// with a snapshot), set when a fresh single-owner cluster is allocated.
+const QCOW_OFLAG_COPIED: u64 = 1u64 << 63;
+
+/// Refcount-table entry mask for a refcount-block host offset (bits 9..63; bits
+/// 0..9 are reserved). Distinct from [`L2_OFFSET_MASK`], whose top byte is
+/// reserved for L2 flags.
+const REFT_OFFSET_MASK: u64 = 0xFFFF_FFFF_FFFF_FE00;
+
 /// Where a guest cluster's data lives.
 enum ClusterLoc {
     /// Present in this image at the given host file offset.
@@ -50,6 +60,9 @@ pub struct QcowHeader {
     pub refcount_table_clusters: u32,
     pub nb_snapshots: u32,
     pub snapshots_offset: u64,
+    /// `log2` of the refcount entry width in bits (v3 field at offset 96).
+    /// Always 4 (16-bit refcounts) for v2 and the qemu default for v3.
+    pub refcount_order: u32,
 }
 
 impl QcowHeader {
@@ -84,6 +97,13 @@ impl QcowHeader {
             refcount_table_clusters: u32::from_be_bytes(bytes[56..60].try_into()?),
             nb_snapshots: u32::from_be_bytes(bytes[60..64].try_into()?),
             snapshots_offset: u64::from_be_bytes(bytes[64..72].try_into()?),
+            // refcount_order is a v3-only field (offset 96). v2 is fixed at 16-bit
+            // refcounts (order 4); fall back to that if the field is absent.
+            refcount_order: if version >= 3 && bytes.len() >= 100 {
+                u32::from_be_bytes(bytes[96..100].try_into()?)
+            } else {
+                4
+            },
         })
     }
 
@@ -97,6 +117,24 @@ impl QcowHeader {
     #[must_use]
     pub const fn l2_entries(&self) -> u64 {
         self.cluster_size() / 8
+    }
+
+    /// Width of one refcount entry, in bits (`1 << refcount_order`).
+    #[must_use]
+    pub const fn refcount_bits(&self) -> u32 {
+        1u32 << self.refcount_order
+    }
+
+    /// Number of refcount entries one refcount block (a single cluster) holds.
+    #[must_use]
+    pub const fn refcount_block_entries(&self) -> u64 {
+        (self.cluster_size() * 8) / self.refcount_bits() as u64
+    }
+
+    /// Number of u64 entries the refcount *table* holds.
+    #[must_use]
+    pub const fn refcount_table_entries(&self) -> u64 {
+        (self.refcount_table_clusters as u64 * self.cluster_size()) / 8
     }
 }
 
@@ -272,6 +310,222 @@ impl QcowBackend {
         let in_cluster_offset = guest_offset & (cluster_size - 1);
         Ok(ClusterLoc::Mapped(host_cluster_offset + in_cluster_offset))
     }
+
+    /// Read the on-disk refcount of the host cluster at index `cluster_index`
+    /// (host-file offset `cluster_index * cluster_size`). Returns 0 when no
+    /// refcount block covers the cluster (i.e. it is free), mirroring qemu.
+    fn read_refcount(&self, cluster_index: u64, file: &mut File) -> Result<u64> {
+        let rb_entries = self.header.refcount_block_entries();
+        let rt_index = cluster_index / rb_entries;
+        if rt_index >= self.header.refcount_table_entries() {
+            return Ok(0); // beyond the refcount table → unmanaged → free
+        }
+
+        // Refcount table entry → refcount block offset.
+        file.seek(SeekFrom::Start(
+            self.header.refcount_table_offset + rt_index * 8,
+        ))?;
+        let mut buf = [0u8; 8];
+        file.read_exact(&mut buf)?;
+        let block_offset = u64::from_be_bytes(buf) & REFT_OFFSET_MASK;
+        if block_offset == 0 {
+            return Ok(0); // no block allocated for this range → free
+        }
+
+        // Read the entry within the block. Widths < 8 bits are packed
+        // big-endian-first within a byte (qcow2 spec §refcounts).
+        let block_index = cluster_index % rb_entries;
+        let refcount_bits = self.header.refcount_bits();
+        match refcount_bits {
+            1 | 2 | 4 => {
+                let per_byte = u64::from(8 / refcount_bits);
+                file.seek(SeekFrom::Start(block_offset + block_index / per_byte))?;
+                let mut b = [0u8; 1];
+                file.read_exact(&mut b)?;
+                let within = block_index % per_byte;
+                let shift = (per_byte - 1 - within) * u64::from(refcount_bits);
+                let mask = (1u64 << refcount_bits) - 1;
+                Ok((u64::from(b[0]) >> shift) & mask)
+            }
+            8 => {
+                file.seek(SeekFrom::Start(block_offset + block_index))?;
+                let mut b = [0u8; 1];
+                file.read_exact(&mut b)?;
+                Ok(u64::from(b[0]))
+            }
+            16 => {
+                file.seek(SeekFrom::Start(block_offset + block_index * 2))?;
+                let mut b = [0u8; 2];
+                file.read_exact(&mut b)?;
+                Ok(u64::from(u16::from_be_bytes(b)))
+            }
+            32 => {
+                file.seek(SeekFrom::Start(block_offset + block_index * 4))?;
+                let mut b = [0u8; 4];
+                file.read_exact(&mut b)?;
+                Ok(u64::from(u32::from_be_bytes(b)))
+            }
+            64 => {
+                file.seek(SeekFrom::Start(block_offset + block_index * 8))?;
+                let mut b = [0u8; 8];
+                file.read_exact(&mut b)?;
+                Ok(u64::from_be_bytes(b))
+            }
+            other => bail!("unsupported refcount width: {other} bits"),
+        }
+    }
+
+    /// Walk every metadata structure reachable from the header and tally how
+    /// many times each host cluster is referenced — the refcounts the image
+    /// *should* have. This is the model side of [`check_consistency`].
+    ///
+    /// Snapshots are not modelled; an image carrying any is rejected so we never
+    /// report a false "leak" for snapshot-owned clusters.
+    fn compute_expected_refcounts(&self, file: &mut File) -> Result<Vec<u64>> {
+        if self.header.nb_snapshots != 0 {
+            bail!(
+                "refcount check does not model snapshots ({} present)",
+                self.header.nb_snapshots
+            );
+        }
+        let cluster_size = self.header.cluster_size();
+        let file_len = file.seek(SeekFrom::End(0))?;
+        let total_clusters = file_len.div_ceil(cluster_size);
+        let mut expected = vec![0u64; usize_of(total_clusters)];
+
+        let mut bump = |host_offset: u64| -> Result<()> {
+            let idx = host_offset / cluster_size;
+            if !host_offset.is_multiple_of(cluster_size) {
+                bail!("metadata offset {host_offset:#x} is not cluster-aligned");
+            }
+            let idx = usize_of(idx);
+            if idx >= expected.len() {
+                bail!("metadata offset {host_offset:#x} points past end of file");
+            }
+            expected[idx] += 1;
+            Ok(())
+        };
+
+        // The header always lives in cluster 0.
+        bump(0)?;
+
+        // L1 table (may span several clusters).
+        let l1_bytes = u64::from(self.header.l1_size) * 8;
+        for c in 0..l1_bytes.div_ceil(cluster_size) {
+            bump(self.header.l1_table_offset + c * cluster_size)?;
+        }
+
+        // Each L2 table and the data clusters it maps.
+        let l2_entries = self.header.l2_entries();
+        for &l1_entry in &self.l1_table {
+            let l2_off = l1_entry & L2_OFFSET_MASK;
+            if l2_off == 0 {
+                continue;
+            }
+            bump(l2_off)?;
+            for i in 0..l2_entries {
+                file.seek(SeekFrom::Start(l2_off + i * 8))?;
+                let mut b = [0u8; 8];
+                file.read_exact(&mut b)?;
+                let l2_entry = u64::from_be_bytes(b);
+                // Zero-flagged or unmapped clusters own no host cluster.
+                if l2_entry & QCOW_OFLAG_ZERO != 0 {
+                    continue;
+                }
+                let data_off = l2_entry & L2_OFFSET_MASK;
+                if data_off != 0 {
+                    bump(data_off)?;
+                }
+            }
+        }
+
+        // Refcount table clusters and every refcount block they point at.
+        for c in 0..u64::from(self.header.refcount_table_clusters) {
+            bump(self.header.refcount_table_offset + c * cluster_size)?;
+        }
+        for i in 0..self.header.refcount_table_entries() {
+            file.seek(SeekFrom::Start(self.header.refcount_table_offset + i * 8))?;
+            let mut b = [0u8; 8];
+            file.read_exact(&mut b)?;
+            let block_off = u64::from_be_bytes(b) & REFT_OFFSET_MASK;
+            if block_off != 0 {
+                bump(block_off)?;
+            }
+        }
+
+        Ok(expected)
+    }
+
+    /// `qemu-img check`-style consistency check: every host cluster's stored
+    /// refcount must equal the number of times the metadata actually references
+    /// it. Catches refcount leaks (stored > reachable) and, more dangerously,
+    /// under-counts (stored < reachable, which lets a later allocation reuse a
+    /// live cluster). Read-only; intended for tests and diagnostics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error describing the first mismatch, or any I/O / structural
+    /// problem encountered while walking the image.
+    pub fn check_consistency(&self) -> Result<()> {
+        let mut file = self.file.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let expected = self.compute_expected_refcounts(&mut file)?;
+        for (idx, &want) in expected.iter().enumerate() {
+            let got = self.read_refcount(idx as u64, &mut file)?;
+            if got != want {
+                drop(file);
+                bail!(
+                    "refcount mismatch at cluster {idx} (host offset {:#x}): \
+                     stored {got}, reachable {want}",
+                    idx as u64 * self.header.cluster_size()
+                );
+            }
+        }
+        self.check_copied_flags(&mut file)?;
+        drop(file);
+        Ok(())
+    }
+
+    /// Verify the `OFLAG_COPIED` invariant qemu maintains: an L1/L2 entry has bit
+    /// 63 set **iff** the cluster it points at has refcount exactly 1. A wrong
+    /// COPIED flag is the bug that lets a guest write in place into a cluster
+    /// that is actually shared, so it is worth checking alongside the refcounts.
+    fn check_copied_flags(&self, file: &mut File) -> Result<()> {
+        let l2_entries = self.header.l2_entries();
+        for &l1_entry in &self.l1_table {
+            let l2_off = l1_entry & L2_OFFSET_MASK;
+            if l2_off == 0 {
+                continue;
+            }
+            self.verify_copied(l1_entry, l2_off, "L1 entry", file)?;
+            for i in 0..l2_entries {
+                file.seek(SeekFrom::Start(l2_off + i * 8))?;
+                let mut b = [0u8; 8];
+                file.read_exact(&mut b)?;
+                let l2_entry = u64::from_be_bytes(b);
+                if l2_entry & QCOW_OFLAG_ZERO != 0 {
+                    continue;
+                }
+                let data_off = l2_entry & L2_OFFSET_MASK;
+                if data_off != 0 {
+                    self.verify_copied(l2_entry, data_off, "L2 entry", file)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Assert one L1/L2 entry's `OFLAG_COPIED` bit matches the pointed-at
+    /// cluster's refcount (set iff refcount == 1).
+    fn verify_copied(&self, entry: u64, host_off: u64, what: &str, file: &mut File) -> Result<()> {
+        let refcount = self.read_refcount(host_off / self.header.cluster_size(), file)?;
+        let copied = entry & QCOW_OFLAG_COPIED != 0;
+        if copied != (refcount == 1) {
+            bail!(
+                "{what} at host offset {host_off:#x}: OFLAG_COPIED={copied} but refcount={refcount}"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl StorageBackend for QcowBackend {
@@ -381,6 +635,63 @@ impl StorageBackend for QcowBackend {
 mod tests {
     use super::*;
     use crate::truncate::u8_of;
+
+    /// Build a fully refcounted qcow2 v3 image (`cluster_bits`=16, 1MB virtual):
+    /// one guest cluster mapped, with a real refcount table + block so the image
+    /// passes [`QcowBackend::check_consistency`]. Cluster layout:
+    /// 0 header · 1 refcount table · 2 refcount block · 3 L1 · 4 L2 · 5 data.
+    /// `extra_clusters` zero clusters are appended so allocation tests have room
+    /// to grow the file in place without the builder caring how.
+    fn make_refcounted_qcow2(extra_clusters: usize) -> Vec<u8> {
+        let cluster_bits: u32 = 16;
+        let cs: usize = 1 << cluster_bits;
+        let virtual_size: u64 = 1024 * 1024;
+
+        let reftable_off = cs as u64; // cluster 1
+        let refblock_off = 2 * cs as u64; // cluster 2
+        let l1_off = 3 * cs as u64; // cluster 3
+        let l2_off = 4 * cs as u64; // cluster 4
+        let data_off = 5 * cs as u64; // cluster 5
+        let used_clusters = 6;
+
+        let mut img = vec![0u8; (used_clusters + extra_clusters) * cs];
+
+        // Header (v3, 104 bytes).
+        img[0..4].copy_from_slice(&QCOW2_MAGIC.to_be_bytes());
+        img[4..8].copy_from_slice(&3u32.to_be_bytes()); // version 3
+        img[20..24].copy_from_slice(&cluster_bits.to_be_bytes());
+        img[24..32].copy_from_slice(&virtual_size.to_be_bytes());
+        img[36..40].copy_from_slice(&1u32.to_be_bytes()); // l1_size = 1
+        img[40..48].copy_from_slice(&l1_off.to_be_bytes());
+        img[48..56].copy_from_slice(&reftable_off.to_be_bytes());
+        img[56..60].copy_from_slice(&1u32.to_be_bytes()); // refcount_table_clusters = 1
+        img[96..100].copy_from_slice(&4u32.to_be_bytes()); // refcount_order = 4 (16-bit)
+        img[100..104].copy_from_slice(&104u32.to_be_bytes()); // header_length
+
+        // Refcount table: entry 0 → refcount block.
+        let rt = usize_of(reftable_off);
+        img[rt..rt + 8].copy_from_slice(&refblock_off.to_be_bytes());
+
+        // Refcount block: 16-bit entries; clusters 0..6 each have refcount 1.
+        let rb = usize_of(refblock_off);
+        for c in 0..used_clusters {
+            img[rb + c * 2..rb + c * 2 + 2].copy_from_slice(&1u16.to_be_bytes());
+        }
+
+        // L1[0] → L2 table; L2[0] → data cluster (both COPIED, refcount==1).
+        let l1 = usize_of(l1_off);
+        img[l1..l1 + 8].copy_from_slice(&(l2_off | QCOW_OFLAG_COPIED).to_be_bytes());
+        let l2 = usize_of(l2_off);
+        img[l2..l2 + 8].copy_from_slice(&(data_off | QCOW_OFLAG_COPIED).to_be_bytes());
+
+        // Data cluster: i&0xFF pattern.
+        let d = usize_of(data_off);
+        for i in 0..cs {
+            img[d + i] = u8_of(i & 0xFF);
+        }
+
+        img
+    }
 
     fn make_minimal_qcow2() -> Vec<u8> {
         // Build a minimal valid qcow2 v2 image:
@@ -693,5 +1004,93 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), &img).unwrap();
         assert!(QcowBackend::open(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn parses_v3_refcount_order() {
+        let img = make_refcounted_qcow2(0);
+        let header = QcowHeader::from_bytes(&img).unwrap();
+        assert_eq!(header.version, 3);
+        assert_eq!(header.refcount_order, 4);
+        assert_eq!(header.refcount_bits(), 16);
+        assert_eq!(header.refcount_block_entries(), 65536 * 8 / 16);
+        assert_eq!(header.refcount_table_entries(), 65536 / 8);
+    }
+
+    #[test]
+    fn refcounted_image_passes_consistency_check() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), make_refcounted_qcow2(0)).unwrap();
+        let backend = QcowBackend::open(tmp.path()).unwrap();
+
+        // Reads still work through the refcounted layout.
+        let mut buf = vec![0u8; 256];
+        backend.read_at(0, &mut buf).unwrap();
+        for (i, &b) in buf.iter().enumerate() {
+            assert_eq!(b, u8_of(i & 0xFF), "byte {i}");
+        }
+
+        backend
+            .check_consistency()
+            .expect("hand-built image must be internally consistent");
+    }
+
+    #[test]
+    fn read_refcount_reports_used_and_free_clusters() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), make_refcounted_qcow2(0)).unwrap();
+        let backend = QcowBackend::open(tmp.path()).unwrap();
+        let mut file = backend.file.lock().unwrap();
+        // Clusters 0..6 (header, reftable, refblock, L1, L2, data) are used.
+        for c in 0..6 {
+            assert_eq!(
+                backend.read_refcount(c, &mut file).unwrap(),
+                1,
+                "cluster {c}"
+            );
+        }
+        // Cluster 6 onward has no reference (still inside the covered block range).
+        assert_eq!(backend.read_refcount(6, &mut file).unwrap(), 0);
+        assert_eq!(backend.read_refcount(100, &mut file).unwrap(), 0);
+    }
+
+    #[test]
+    fn consistency_check_detects_a_refcount_leak() {
+        // Bump the data cluster's stored refcount to 2 while only one reference
+        // exists — qemu-img would call this a leak; so must we.
+        let mut img = make_refcounted_qcow2(0);
+        let cs = 1usize << 16;
+        let refblock = 2 * cs;
+        let data_cluster_index = 5;
+        img[refblock + data_cluster_index * 2..refblock + data_cluster_index * 2 + 2]
+            .copy_from_slice(&2u16.to_be_bytes());
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &img).unwrap();
+        let backend = QcowBackend::open(tmp.path()).unwrap();
+        let err = backend.check_consistency().unwrap_err();
+        assert!(
+            err.to_string().contains("cluster 5"),
+            "leak should be reported at cluster 5, got: {err}"
+        );
+    }
+
+    #[test]
+    fn consistency_check_detects_an_undercount() {
+        // Drop a live cluster's refcount to 0 — the dangerous case: a later
+        // allocation could hand out a cluster that is still in use.
+        let mut img = make_refcounted_qcow2(0);
+        let cs = 1usize << 16;
+        let refblock = 2 * cs;
+        let l2_cluster_index = 4;
+        img[refblock + l2_cluster_index * 2..refblock + l2_cluster_index * 2 + 2]
+            .copy_from_slice(&0u16.to_be_bytes());
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &img).unwrap();
+        let backend = QcowBackend::open(tmp.path()).unwrap();
+        let err = backend.check_consistency().unwrap_err();
+        assert!(
+            err.to_string().contains("cluster 4"),
+            "undercount should be reported at cluster 4, got: {err}"
+        );
     }
 }
