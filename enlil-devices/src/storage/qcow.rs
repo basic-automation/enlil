@@ -7,7 +7,7 @@
 //! cluster still need cluster allocation — a separate step).
 
 use super::{RawFileBackend, StorageBackend};
-use crate::truncate::usize_of;
+use crate::truncate::{u8_of, u16_of, u32_of, usize_of};
 use anyhow::{Context, Result, bail};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -311,30 +311,35 @@ impl QcowBackend {
         Ok(ClusterLoc::Mapped(host_cluster_offset + in_cluster_offset))
     }
 
-    /// Read the on-disk refcount of the host cluster at index `cluster_index`
-    /// (host-file offset `cluster_index * cluster_size`). Returns 0 when no
-    /// refcount block covers the cluster (i.e. it is free), mirroring qemu.
-    fn read_refcount(&self, cluster_index: u64, file: &mut File) -> Result<u64> {
+    /// Locate the refcount block covering host cluster `cluster_index`, or
+    /// `None` when the refcount table has no block for it yet (the cluster is
+    /// free / unmanaged). Shared by the refcount read, write, and pre-check.
+    fn refcount_block_offset(&self, cluster_index: u64, file: &mut File) -> Result<Option<u64>> {
         let rb_entries = self.header.refcount_block_entries();
         let rt_index = cluster_index / rb_entries;
         if rt_index >= self.header.refcount_table_entries() {
-            return Ok(0); // beyond the refcount table → unmanaged → free
+            return Ok(None); // beyond the refcount table → unmanaged → free
         }
-
-        // Refcount table entry → refcount block offset.
         file.seek(SeekFrom::Start(
             self.header.refcount_table_offset + rt_index * 8,
         ))?;
         let mut buf = [0u8; 8];
         file.read_exact(&mut buf)?;
         let block_offset = u64::from_be_bytes(buf) & REFT_OFFSET_MASK;
-        if block_offset == 0 {
-            return Ok(0); // no block allocated for this range → free
-        }
+        Ok((block_offset != 0).then_some(block_offset))
+    }
+
+    /// Read the on-disk refcount of the host cluster at index `cluster_index`
+    /// (host-file offset `cluster_index * cluster_size`). Returns 0 when no
+    /// refcount block covers the cluster (i.e. it is free), mirroring qemu.
+    fn read_refcount(&self, cluster_index: u64, file: &mut File) -> Result<u64> {
+        let Some(block_offset) = self.refcount_block_offset(cluster_index, file)? else {
+            return Ok(0);
+        };
 
         // Read the entry within the block. Widths < 8 bits are packed
         // big-endian-first within a byte (qcow2 spec §refcounts).
-        let block_index = cluster_index % rb_entries;
+        let block_index = cluster_index % self.header.refcount_block_entries();
         let refcount_bits = self.header.refcount_bits();
         match refcount_bits {
             1 | 2 | 4 => {
@@ -526,6 +531,119 @@ impl QcowBackend {
         }
         Ok(())
     }
+
+    /// Write the on-disk refcount of host cluster `cluster_index`. Fails if no
+    /// refcount block covers the cluster yet (block / table growth are later
+    /// steps). Writing sub-byte refcounts is unsupported — every image we
+    /// produce uses 16-bit refcounts (`refcount_order` 4).
+    fn write_refcount(&self, cluster_index: u64, value: u64, file: &mut File) -> Result<()> {
+        let block_offset = self
+            .refcount_block_offset(cluster_index, file)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no refcount block for cluster {cluster_index} \
+                 (refcount block allocation not yet implemented)"
+                )
+            })?;
+        let block_index = cluster_index % self.header.refcount_block_entries();
+        match self.header.refcount_bits() {
+            8 => {
+                file.seek(SeekFrom::Start(block_offset + block_index))?;
+                file.write_all(&[u8_of(value)])?;
+            }
+            16 => {
+                file.seek(SeekFrom::Start(block_offset + block_index * 2))?;
+                file.write_all(&u16_of(value).to_be_bytes())?;
+            }
+            32 => {
+                file.seek(SeekFrom::Start(block_offset + block_index * 4))?;
+                file.write_all(&u32_of(value).to_be_bytes())?;
+            }
+            64 => {
+                file.seek(SeekFrom::Start(block_offset + block_index * 8))?;
+                file.write_all(&value.to_be_bytes())?;
+            }
+            other => bail!("writing {other}-bit refcounts is not supported"),
+        }
+        Ok(())
+    }
+
+    /// Append a fresh, zero-filled host cluster at the end of the image and give
+    /// it refcount 1. Returns its host file offset. The refcount slot is
+    /// validated *before* the file is grown, so a missing refcount block leaves
+    /// the image untouched rather than appending an orphan cluster.
+    fn allocate_host_cluster(&self, file: &mut File) -> Result<u64> {
+        let cluster_size = self.header.cluster_size();
+        let len = file.seek(SeekFrom::End(0))?;
+        let offset = len.next_multiple_of(cluster_size);
+        let index = offset / cluster_size;
+        // Pre-flight the refcount slot so we never grow the file then fail.
+        self.refcount_block_offset(index, file)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no refcount block for cluster {index} \
+                 (refcount block allocation not yet implemented)"
+            )
+        })?;
+        file.set_len(offset + cluster_size)?; // zero-extends in the new cluster
+        self.write_refcount(index, 1, file)?;
+        Ok(offset)
+    }
+
+    /// Allocate a data cluster for a write that lands in an unallocated (or
+    /// zero-flagged) cluster whose **L2 table already exists**, wiring up the L2
+    /// entry and refcounts. Copy-on-write from the backing image is honoured so
+    /// bytes the guest does not overwrite still read correctly. Returns the host
+    /// offset of the new data cluster.
+    ///
+    /// L2-table allocation (when the L1 entry is empty) is a separate step and
+    /// is reported as an error here.
+    fn allocate_data_cluster(&self, guest_offset: u64, file: &mut File) -> Result<u64> {
+        let cluster_size = self.header.cluster_size();
+        let l2_entries = self.header.l2_entries();
+        let l1_index = guest_offset / (l2_entries * cluster_size);
+        if l1_index >= self.l1_table.len() as u64 {
+            bail!("guest offset {guest_offset:#x} is beyond the L1 table");
+        }
+        let l2_table_offset = self.l1_table[usize_of(l1_index)] & L2_OFFSET_MASK;
+        if l2_table_offset == 0 {
+            bail!(
+                "L2 table for guest offset {guest_offset:#x} is not allocated \
+                 (L2 table allocation not yet implemented)"
+            );
+        }
+        let l2_index = (guest_offset / cluster_size) % l2_entries;
+        let l2_entry_off = l2_table_offset + l2_index * 8;
+
+        // Inspect the current L2 entry to decide whether we copy-on-write.
+        file.seek(SeekFrom::Start(l2_entry_off))?;
+        let mut b = [0u8; 8];
+        file.read_exact(&mut b)?;
+        let old = u64::from_be_bytes(b);
+        let was_zero = old & QCOW_OFLAG_ZERO != 0;
+        let had_data = old & L2_OFFSET_MASK != 0;
+
+        let data_off = self.allocate_host_cluster(file)?;
+
+        // Copy-on-write: a plain unallocated cluster (no zero flag, no prior
+        // data) backed by a lower layer must inherit that layer's contents, so
+        // bytes outside the guest's write still read through correctly. A
+        // zero-flagged cluster reads as zeros and the fresh cluster already is.
+        if !was_zero
+            && !had_data
+            && let Some(backing) = &self.backing
+        {
+            let cluster_start = guest_offset & !(cluster_size - 1);
+            let mut tmp = vec![0u8; usize_of(cluster_size)];
+            backing.read_at(cluster_start, &mut tmp)?;
+            file.seek(SeekFrom::Start(data_off))?;
+            file.write_all(&tmp)?;
+        }
+
+        // Point the L2 entry at the new cluster; COPIED because refcount is 1.
+        file.seek(SeekFrom::Start(l2_entry_off))?;
+        file.write_all(&(data_off | QCOW_OFLAG_COPIED).to_be_bytes())?;
+        Ok(data_off)
+    }
 }
 
 impl StorageBackend for QcowBackend {
@@ -582,10 +700,11 @@ impl StorageBackend for QcowBackend {
         let cluster_size = self.header.cluster_size();
         let writable_len = buf.len().min(usize_of(self.header.size - offset));
 
-        // Pass 1: resolve every target cluster up front. A write that lands in
-        // an unallocated cluster needs cluster allocation (L2/refcount updates)
-        // — not yet implemented — so bail *before* writing anything rather than
-        // leaving a torn, half-applied write.
+        // Pass 1: resolve every target cluster, allocating one (copy-on-write
+        // from any backing image) when the write lands in an unallocated or
+        // zero-flagged cluster whose L2 table already exists. Allocation that
+        // would need a new L2 table or refcount block is reported as an error
+        // by the helpers rather than half-applied.
         let mut plan: Vec<(u64, usize, usize)> = Vec::new(); // (host_offset, buf_start, len)
         let mut done = 0usize;
         let mut current_offset = offset;
@@ -594,10 +713,14 @@ impl StorageBackend for QcowBackend {
             let chunk = (writable_len - done).min(usize_of(cluster_size) - in_cluster);
             match self.resolve_cluster(current_offset, &mut file)? {
                 ClusterLoc::Mapped(host_offset) => plan.push((host_offset, done, chunk)),
-                ClusterLoc::Zero | ClusterLoc::Unallocated => bail!(
-                    "qcow2 write to unallocated cluster at guest offset {current_offset:#x} \
-                     (cluster allocation not yet implemented)"
-                ),
+                ClusterLoc::Zero | ClusterLoc::Unallocated => {
+                    let data_off = self.allocate_data_cluster(current_offset, &mut file)?;
+                    plan.push((
+                        data_off + (current_offset & (cluster_size - 1)),
+                        done,
+                        chunk,
+                    ));
+                }
             }
             done += chunk;
             current_offset += chunk as u64;
@@ -974,15 +1097,87 @@ mod tests {
     }
 
     #[test]
+    fn allocates_a_data_cluster_into_an_existing_l2_table() {
+        // Guest cluster 1 (offset 64KB) is unmapped but its L2 table exists in
+        // the refcounted image — a write there must allocate, persist, and keep
+        // the image refcount-consistent.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), make_refcounted_qcow2(0)).unwrap();
+        let backend = QcowBackend::open_rw(tmp.path()).unwrap();
+
+        let payload: Vec<u8> = (0..1024u32).map(|i| u8_of((i ^ 0x3C) as usize)).collect();
+        let n = backend.write_at(65536, &payload).unwrap();
+        assert_eq!(n, payload.len());
+        backend.flush().unwrap();
+
+        let mut buf = vec![0u8; payload.len()];
+        backend.read_at(65536, &mut buf).unwrap();
+        assert_eq!(buf, payload, "freshly allocated cluster reads back");
+
+        backend
+            .check_consistency()
+            .expect("allocation must keep refcounts consistent");
+
+        // Persisted across reopen, and still consistent.
+        drop(backend);
+        let reopened = QcowBackend::open(tmp.path()).unwrap();
+        let mut buf2 = vec![0u8; payload.len()];
+        reopened.read_at(65536, &mut buf2).unwrap();
+        assert_eq!(buf2, payload, "allocation persisted to disk");
+        reopened.check_consistency().unwrap();
+    }
+
+    #[test]
+    fn partial_write_to_a_fresh_cluster_zero_fills_the_rest() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), make_refcounted_qcow2(0)).unwrap();
+        let backend = QcowBackend::open_rw(tmp.path()).unwrap();
+
+        // Write 32 bytes near the middle of the (unallocated) guest cluster 1.
+        backend.write_at(65536 + 1000, &[0x7E; 32]).unwrap();
+        backend.flush().unwrap();
+
+        // The written window holds the payload; bytes on either side read zero.
+        let mut buf = vec![0xABu8; 64];
+        backend.read_at(65536 + 980, &mut buf).unwrap();
+        assert!(buf[..20].iter().all(|&b| b == 0), "pre-write bytes zeroed");
+        assert!(buf[20..52].iter().all(|&b| b == 0x7E), "payload present");
+        assert!(buf[52..].iter().all(|&b| b == 0), "post-write bytes zeroed");
+        backend.check_consistency().unwrap();
+    }
+
+    #[test]
+    fn multiple_allocations_stay_consistent() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), make_refcounted_qcow2(0)).unwrap();
+        let backend = QcowBackend::open_rw(tmp.path()).unwrap();
+
+        // Allocate guest clusters 1, 2 and 3 (all share the one existing L2).
+        for c in 1..=3u64 {
+            backend.write_at(c * 65536, &[u8_of(c); 256]).unwrap();
+        }
+        backend.flush().unwrap();
+        backend.check_consistency().unwrap();
+
+        for c in 1..=3u64 {
+            let mut buf = [0u8; 256];
+            backend.read_at(c * 65536, &mut buf).unwrap();
+            assert!(buf.iter().all(|&b| b == u8_of(c)), "cluster {c}");
+        }
+    }
+
+    #[test]
     fn write_spanning_into_unallocated_cluster_is_rejected_atomically() {
         let img = make_minimal_qcow2();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), &img).unwrap();
 
         let backend = QcowBackend::open_rw(tmp.path()).unwrap();
-        // Cluster 0 (0..64KB) is allocated; cluster 1 (64KB..) is not. A write
-        // straddling the boundary must fail without partially applying — the
-        // allocated half must be unchanged afterward.
+        // Cluster 0 (0..64KB) is allocated; cluster 1 (64KB..) is not. The
+        // minimal image carries no refcount table, so cluster 1 cannot be
+        // allocated — the straddling write must fail without partially applying,
+        // leaving the allocated half untouched (allocation pre-flights the
+        // refcount slot before growing the file).
         let cluster_size = 1usize << 16;
         let start = cluster_size - 8;
         let payload = [0xEEu8; 16];
