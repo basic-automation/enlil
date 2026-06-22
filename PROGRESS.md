@@ -9,7 +9,7 @@ the recommended next step so the next run (which has no memory) can resume.
 ## 2026-06-22 — Session: complete qcow2 writable-overlay/COW story (Phase 0.3) + a broad virtio/device-fidelity sweep (Phase 3)
 
 **18 increments + 1 roadmap commit, each independently green and committed**
-(branch `routine/enlil-2026-06-22`, PR: see end of entry). Wall-clock ~00:40→~02:30
+(branch `routine/enlil-2026-06-22`, PR https://github.com/physics515/enlil/pull/36). Wall-clock ~00:40→~02:30
 (~1h50m of building). Two threads: (1) finished the 2026-06-21 next-step #1 —
 **qcow2 cluster allocation (COW) and writable overlays** — building the whole
 allocator (data clusters, L2 tables, refcount blocks, image creation, trim) with
