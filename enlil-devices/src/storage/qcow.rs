@@ -190,6 +190,80 @@ impl QcowBackend {
         Self::from_file(file, true, path)
     }
 
+    /// Create a fresh qcow2 v3 image at `path` with the given virtual size,
+    /// optionally as an overlay over `backing` (the read-only base of a
+    /// non-destructive-test pair). The new image maps no clusters: reads fall
+    /// through to the backing (or read as zeros with none) and writes allocate
+    /// copy-on-write via [`open_rw`](Self::open_rw). 64 KiB clusters, 16-bit
+    /// refcounts; the image is written refcount-consistent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the geometry would exceed a single refcount block,
+    /// the backing path does not fit in the header cluster, or the file cannot
+    /// be written.
+    pub fn create(path: &Path, virtual_size: u64, backing: Option<&Path>) -> Result<()> {
+        const CLUSTER_BITS: u32 = 16;
+        let cluster_size: u64 = 1 << CLUSTER_BITS;
+        let l2_entries = cluster_size / 8;
+
+        // One L1 entry covers l2_entries * cluster_size of guest address space.
+        let bytes_per_l1 = l2_entries * cluster_size;
+        let l1_size = virtual_size.div_ceil(bytes_per_l1).max(1);
+        let l1_clusters = (l1_size * 8).div_ceil(cluster_size);
+
+        // Cluster layout: 0 header, [1..] L1 table, refcount table, refcount block.
+        let reftable_cluster = 1 + l1_clusters;
+        let refblock_cluster = reftable_cluster + 1;
+        let metadata_clusters = refblock_cluster + 1;
+        let refcount_block_entries = (cluster_size * 8) / 16; // 16-bit refcounts
+        if metadata_clusters > refcount_block_entries {
+            bail!("virtual size {virtual_size} needs more metadata than one refcount block holds");
+        }
+
+        let l1_offset = cluster_size;
+        let reftable_offset = reftable_cluster * cluster_size;
+        let refblock_offset = refblock_cluster * cluster_size;
+
+        let mut img = vec![0u8; usize_of(metadata_clusters * cluster_size)];
+        img[0..4].copy_from_slice(&QCOW2_MAGIC.to_be_bytes());
+        img[4..8].copy_from_slice(&3u32.to_be_bytes()); // version 3
+        if let Some(backing) = backing {
+            let name = backing.to_string_lossy();
+            let bytes = name.as_bytes();
+            let off: u64 = 0x200; // within cluster 0, past the 104-byte header
+            if usize_of(off) + bytes.len() > usize_of(cluster_size) {
+                bail!("backing path too long for the header cluster");
+            }
+            let len = u32::try_from(bytes.len()).context("backing path too long")?;
+            img[8..16].copy_from_slice(&off.to_be_bytes());
+            img[16..20].copy_from_slice(&len.to_be_bytes());
+            img[usize_of(off)..usize_of(off) + bytes.len()].copy_from_slice(bytes);
+        }
+        img[20..24].copy_from_slice(&CLUSTER_BITS.to_be_bytes());
+        img[24..32].copy_from_slice(&virtual_size.to_be_bytes());
+        img[36..40].copy_from_slice(&u32_of(l1_size).to_be_bytes());
+        img[40..48].copy_from_slice(&l1_offset.to_be_bytes());
+        img[48..56].copy_from_slice(&reftable_offset.to_be_bytes());
+        img[56..60].copy_from_slice(&1u32.to_be_bytes()); // refcount_table_clusters
+        img[96..100].copy_from_slice(&4u32.to_be_bytes()); // refcount_order = 4
+        img[100..104].copy_from_slice(&104u32.to_be_bytes()); // header_length
+
+        // Refcount table entry 0 → the first refcount block.
+        let rt = usize_of(reftable_offset);
+        img[rt..rt + 8].copy_from_slice(&refblock_offset.to_be_bytes());
+        // Refcount block: every metadata cluster has refcount 1.
+        let rb = usize_of(refblock_offset);
+        for c in 0..usize_of(metadata_clusters) {
+            img[rb + c * 2..rb + c * 2 + 2].copy_from_slice(&1u16.to_be_bytes());
+        }
+        // L1 table is left all-zero (nothing mapped yet).
+
+        std::fs::write(path, &img)
+            .with_context(|| format!("failed to write new qcow2: {}", path.display()))?;
+        Ok(())
+    }
+
     /// Parse the header + L1 table from an already-opened file, and open its
     /// backing image (read-only) if the header names one. `image_path` is used
     /// to resolve a relative backing-file path against the image's directory.
@@ -1489,6 +1563,70 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), &img).unwrap();
         assert!(QcowBackend::open(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn create_makes_a_consistent_standalone_image() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        QcowBackend::create(tmp.path(), 4 * 1024 * 1024, None).unwrap();
+
+        let backend = QcowBackend::open_rw(tmp.path()).unwrap();
+        assert_eq!(backend.capacity(), 4 * 1024 * 1024);
+        backend
+            .check_consistency()
+            .expect("a freshly created image must be consistent");
+
+        // Unwritten regions read as zeros; a write allocates and round-trips.
+        let mut zeros = vec![0xFFu8; 256];
+        backend.read_at(0, &mut zeros).unwrap();
+        assert!(zeros.iter().all(|&b| b == 0), "fresh image reads zero");
+
+        let payload: Vec<u8> = (0..4096u32).map(|i| u8_of((i ^ 0x2D) as usize)).collect();
+        backend.write_at(123_456, &payload).unwrap();
+        backend.flush().unwrap();
+        let mut buf = vec![0u8; payload.len()];
+        backend.read_at(123_456, &mut buf).unwrap();
+        assert_eq!(buf, payload, "write into a created image round-trips");
+        backend.check_consistency().unwrap();
+    }
+
+    #[test]
+    fn create_overlay_reads_through_and_writes_copy_on_write() {
+        // Read-only base with a known pattern in guest cluster 0.
+        let base = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(base.path(), make_minimal_qcow2()).unwrap();
+        let base_before = std::fs::read(base.path()).unwrap();
+
+        // Create an overlay over it — the non-destructive-test primitive.
+        let overlay = tempfile::NamedTempFile::new().unwrap();
+        QcowBackend::create(overlay.path(), 1024 * 1024, Some(base.path())).unwrap();
+        QcowBackend::open(overlay.path())
+            .unwrap()
+            .check_consistency()
+            .expect("created overlay must be consistent");
+
+        let backend = QcowBackend::open_rw(overlay.path()).unwrap();
+        // Reads fall through to the base.
+        let mut buf = vec![0u8; 256];
+        backend.read_at(0, &mut buf).unwrap();
+        for (i, &b) in buf.iter().enumerate() {
+            assert_eq!(b, u8_of(i & 0xFF), "byte {i} read through to base");
+        }
+        // A write copies-on-write into the overlay, base untouched.
+        backend.write_at(0, &[0x5C; 32]).unwrap();
+        backend.flush().unwrap();
+        let mut after = vec![0u8; 256];
+        backend.read_at(0, &mut after).unwrap();
+        assert!(after[..32].iter().all(|&b| b == 0x5C), "overlay write");
+        for (i, &b) in after.iter().enumerate().skip(32) {
+            assert_eq!(b, u8_of(i & 0xFF), "byte {i} still from base");
+        }
+        backend.check_consistency().unwrap();
+        assert_eq!(
+            std::fs::read(base.path()).unwrap(),
+            base_before,
+            "base untouched"
+        );
     }
 
     #[test]
