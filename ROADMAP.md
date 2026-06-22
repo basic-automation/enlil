@@ -540,6 +540,17 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 
 Enlil must be testable without modifying the user's existing system. This is the single most important usability feature for early adoption.
 
+**Writable qcow2 overlays — IMPLEMENTED (`enlil-devices` `storage::qcow`):** the
+read-only-base + writable-overlay primitive behind non-destructive testing is in
+place. `QcowBackend::create(path, virtual_size, Some(base))` writes a fresh
+overlay; reads fall through the backing chain (qcow2-over-qcow2 and qcow2-over-raw),
+and writes allocate copy-on-write (data clusters, L2 tables, and refcount blocks
+all allocated on demand). Image integrity is checked in-process by a
+`qemu-img check`-style refcount validator (`check_consistency`), so correctness is
+provable without `qemu-img` installed. *Remaining:* refcount-*table* growth (only
+reachable with sub-2 GB-coverage tiny-cluster images; the 64 KiB default covers
+16 TB in one table cluster).
+
 **USB Live Boot:**
 - Enlil boots from a USB flash drive as a standard UEFI application (`/EFI/BOOT/BOOTX64.EFI`)
 - User plugs in the USB, presses F12, selects it from the UEFI boot menu
