@@ -855,6 +855,50 @@ mod tests {
         img
     }
 
+    /// A fully refcounted qcow2 v3 overlay that maps *no* data clusters (its L2
+    /// table exists but is empty) and names `backing_path`. Reads fall through to
+    /// the backing image; a write triggers copy-on-write allocation. Cluster
+    /// layout: 0 header (+ backing path) · 1 refcount table · 2 refcount block ·
+    /// 3 L1 · 4 L2 (empty). Passes [`QcowBackend::check_consistency`] as built.
+    fn make_refcounted_overlay(backing_path: &str) -> Vec<u8> {
+        let cluster_bits: u32 = 16;
+        let cs: usize = 1 << cluster_bits;
+        let virtual_size: u64 = 1024 * 1024;
+        let reftable_off = cs as u64;
+        let refblock_off = 2 * cs as u64;
+        let l1_off = 3 * cs as u64;
+        let l2_off = 4 * cs as u64;
+        let used_clusters = 5; // no data cluster
+        let backing_off: u64 = 0x200; // past the v3 header, inside cluster 0
+        let path = backing_path.as_bytes();
+
+        let mut img = vec![0u8; used_clusters * cs];
+        img[0..4].copy_from_slice(&QCOW2_MAGIC.to_be_bytes());
+        img[4..8].copy_from_slice(&3u32.to_be_bytes());
+        img[8..16].copy_from_slice(&backing_off.to_be_bytes());
+        img[16..20].copy_from_slice(&u32::try_from(path.len()).unwrap().to_be_bytes());
+        img[20..24].copy_from_slice(&cluster_bits.to_be_bytes());
+        img[24..32].copy_from_slice(&virtual_size.to_be_bytes());
+        img[36..40].copy_from_slice(&1u32.to_be_bytes()); // l1_size = 1
+        img[40..48].copy_from_slice(&l1_off.to_be_bytes());
+        img[48..56].copy_from_slice(&reftable_off.to_be_bytes());
+        img[56..60].copy_from_slice(&1u32.to_be_bytes());
+        img[96..100].copy_from_slice(&4u32.to_be_bytes());
+        img[100..104].copy_from_slice(&104u32.to_be_bytes());
+        img[usize_of(backing_off)..usize_of(backing_off) + path.len()].copy_from_slice(path);
+
+        let rt = usize_of(reftable_off);
+        img[rt..rt + 8].copy_from_slice(&refblock_off.to_be_bytes());
+        let rb = usize_of(refblock_off);
+        for c in 0..used_clusters {
+            img[rb + c * 2..rb + c * 2 + 2].copy_from_slice(&1u16.to_be_bytes());
+        }
+        let l1 = usize_of(l1_off);
+        img[l1..l1 + 8].copy_from_slice(&(l2_off | QCOW_OFLAG_COPIED).to_be_bytes());
+        // L2 table (cluster 4) is left empty: no guest cluster mapped.
+        img
+    }
+
     fn make_minimal_qcow2() -> Vec<u8> {
         // Build a minimal valid qcow2 v2 image:
         // - 1MB virtual size
@@ -1236,6 +1280,65 @@ mod tests {
         reopened.read_at(off, &mut buf2).unwrap();
         assert_eq!(buf2, payload, "L2 table + data persisted");
         reopened.check_consistency().unwrap();
+    }
+
+    #[test]
+    fn allocating_over_a_backing_image_copies_on_write() {
+        // Base holds the i&0xFF pattern in guest cluster 0. The overlay maps
+        // nothing and names the base. A partial write to cluster 0 must allocate
+        // a cluster, pull the rest of the cluster in from the base (so untouched
+        // bytes still read the base pattern), and leave the base untouched.
+        let base = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(base.path(), make_minimal_qcow2()).unwrap();
+        let base_before = std::fs::read(base.path()).unwrap();
+
+        let overlay = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            overlay.path(),
+            make_refcounted_overlay(base.path().to_str().unwrap()),
+        )
+        .unwrap();
+
+        let backend = QcowBackend::open_rw(overlay.path()).unwrap();
+        // Before writing, cluster 0 reads straight from the base.
+        let mut pre = vec![0u8; 256];
+        backend.read_at(0, &mut pre).unwrap();
+        for (i, &b) in pre.iter().enumerate() {
+            assert_eq!(b, u8_of(i & 0xFF), "pre-write read falls through to base");
+        }
+
+        // Overwrite the first 64 bytes only.
+        backend.write_at(0, &[0xD7; 64]).unwrap();
+        backend.flush().unwrap();
+
+        let mut post = vec![0u8; 256];
+        backend.read_at(0, &mut post).unwrap();
+        assert!(post[..64].iter().all(|&b| b == 0xD7), "written window");
+        for (i, &b) in post.iter().enumerate().skip(64) {
+            assert_eq!(b, u8_of(i & 0xFF), "byte {i} copied-on-write from base");
+        }
+
+        backend
+            .check_consistency()
+            .expect("copy-on-write allocation stays consistent");
+        // The base image on disk is byte-for-byte unchanged.
+        assert_eq!(std::fs::read(base.path()).unwrap(), base_before);
+    }
+
+    #[test]
+    fn refcounted_overlay_is_consistent_as_built() {
+        let base = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(base.path(), make_minimal_qcow2()).unwrap();
+        let overlay = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            overlay.path(),
+            make_refcounted_overlay(base.path().to_str().unwrap()),
+        )
+        .unwrap();
+        QcowBackend::open(overlay.path())
+            .unwrap()
+            .check_consistency()
+            .expect("empty refcounted overlay must be consistent");
     }
 
     #[test]
