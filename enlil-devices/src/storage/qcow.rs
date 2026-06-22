@@ -586,24 +586,66 @@ impl QcowBackend {
     }
 
     /// Append a fresh, zero-filled host cluster at the end of the image and give
-    /// it refcount 1. Returns its host file offset. The refcount slot is
-    /// validated *before* the file is grown, so a missing refcount block leaves
-    /// the image untouched rather than appending an orphan cluster.
+    /// it refcount 1. Returns its host file offset. If the next slot is not yet
+    /// covered by a refcount block, one is allocated first (which itself appends
+    /// a cluster), so images can grow past a single block's reach.
     fn allocate_host_cluster(&self, file: &mut File) -> Result<u64> {
         let cluster_size = self.header.cluster_size();
+        loop {
+            let len = file.seek(SeekFrom::End(0))?;
+            let offset = len.next_multiple_of(cluster_size);
+            let index = offset / cluster_size;
+            if self.refcount_block_offset(index, file)?.is_some() {
+                file.set_len(offset + cluster_size)?; // zero-extends the new cluster
+                self.write_refcount(index, 1, file)?;
+                return Ok(offset);
+            }
+            // No block covers this slot yet — allocate one (it lands here and
+            // covers itself) and retry; the data cluster lands just after it.
+            self.allocate_refcount_block(index, file)?;
+        }
+    }
+
+    /// Allocate a new, zeroed refcount block covering host cluster
+    /// `cluster_index` and record it in the refcount table. The block is
+    /// appended at EOF, where it falls inside its own coverage, so it can record
+    /// its own refcount (1) inside itself. Returns the block's host offset.
+    ///
+    /// Growing the refcount *table* itself (more than `refcount_table_entries`
+    /// blocks) is a separate, larger step and is reported as an error here.
+    fn allocate_refcount_block(&self, cluster_index: u64, file: &mut File) -> Result<u64> {
+        let rb_entries = self.header.refcount_block_entries();
+        let rt_index = cluster_index / rb_entries;
+        if rt_index >= self.header.refcount_table_entries() {
+            bail!(
+                "refcount table too small for cluster {cluster_index} \
+                 (refcount table growth not yet implemented)"
+            );
+        }
+        if let Some(off) = self.refcount_block_offset(cluster_index, file)? {
+            return Ok(off); // already present
+        }
+
+        let cluster_size = self.header.cluster_size();
         let len = file.seek(SeekFrom::End(0))?;
-        let offset = len.next_multiple_of(cluster_size);
-        let index = offset / cluster_size;
-        // Pre-flight the refcount slot so we never grow the file then fail.
-        self.refcount_block_offset(index, file)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "no refcount block for cluster {index} \
-                 (refcount block allocation not yet implemented)"
-            )
-        })?;
-        file.set_len(offset + cluster_size)?; // zero-extends in the new cluster
-        self.write_refcount(index, 1, file)?;
-        Ok(offset)
+        let block_off = len.next_multiple_of(cluster_size);
+        file.set_len(block_off + cluster_size)?; // a fresh, all-zero block
+        let block_self_index = block_off / cluster_size;
+        // We rely on the new block falling inside its own coverage so it can
+        // hold its own refcount; assert it so a wrong call site fails loudly.
+        if block_self_index / rb_entries != rt_index {
+            bail!(
+                "refcount block self-coverage broken: block at cluster \
+                 {block_self_index} does not fall in table slot {rt_index}"
+            );
+        }
+        // Publish the block in the refcount table, then record its own refcount.
+        file.seek(SeekFrom::Start(
+            self.header.refcount_table_offset + rt_index * 8,
+        ))?;
+        file.write_all(&block_off.to_be_bytes())?;
+        self.write_refcount(block_self_index, 1, file)?;
+        Ok(block_off)
     }
 
     /// Allocate a new (zeroed) L2 table for L1 slot `l1_index`: refcount it,
@@ -896,6 +938,42 @@ mod tests {
         let l1 = usize_of(l1_off);
         img[l1..l1 + 8].copy_from_slice(&(l2_off | QCOW_OFLAG_COPIED).to_be_bytes());
         // L2 table (cluster 4) is left empty: no guest cluster mapped.
+        img
+    }
+
+    /// A standalone, empty (nothing mapped) refcounted qcow2 v3 image with tiny
+    /// 512-byte clusters, so one refcount block covers only 256 host clusters
+    /// (128 KiB) — a few hundred KiB of writes crosses that boundary and forces
+    /// a *second* refcount block to be allocated. Clusters: 0 header · 1 refcount
+    /// table · 2 refcount block · 3 L1 (all empty). 1 MiB virtual (32 L1 slots).
+    fn make_small_cluster_qcow2() -> Vec<u8> {
+        let cluster_bits: u32 = 9; // 512-byte clusters
+        let cs: usize = 1 << cluster_bits;
+        let virtual_size: u64 = 1024 * 1024; // 32 L1 slots of 32 KiB each
+        let reftable_off = cs as u64; // cluster 1
+        let refblock_off = 2 * cs as u64; // cluster 2
+        let l1_off = 3 * cs as u64; // cluster 3
+        let used_clusters = 4; // header, reftable, refblock, L1
+
+        let mut img = vec![0u8; used_clusters * cs];
+        img[0..4].copy_from_slice(&QCOW2_MAGIC.to_be_bytes());
+        img[4..8].copy_from_slice(&3u32.to_be_bytes());
+        img[20..24].copy_from_slice(&cluster_bits.to_be_bytes());
+        img[24..32].copy_from_slice(&virtual_size.to_be_bytes());
+        img[36..40].copy_from_slice(&32u32.to_be_bytes()); // l1_size = 32
+        img[40..48].copy_from_slice(&l1_off.to_be_bytes());
+        img[48..56].copy_from_slice(&reftable_off.to_be_bytes());
+        img[56..60].copy_from_slice(&1u32.to_be_bytes()); // refcount_table_clusters
+        img[96..100].copy_from_slice(&4u32.to_be_bytes()); // refcount_order = 4
+        img[100..104].copy_from_slice(&104u32.to_be_bytes());
+
+        let rt = usize_of(reftable_off);
+        img[rt..rt + 8].copy_from_slice(&refblock_off.to_be_bytes());
+        let rb = usize_of(refblock_off);
+        for c in 0..used_clusters {
+            img[rb + c * 2..rb + c * 2 + 2].copy_from_slice(&1u16.to_be_bytes());
+        }
+        // L1 table (cluster 3) left empty: every write allocates L2 + data.
         img
     }
 
@@ -1339,6 +1417,43 @@ mod tests {
             .unwrap()
             .check_consistency()
             .expect("empty refcounted overlay must be consistent");
+    }
+
+    #[test]
+    fn growing_past_one_refcount_block_allocates_another() {
+        // 512-byte clusters → one refcount block covers 256 clusters (128 KiB).
+        // A ~200 KiB write crosses that, forcing a second refcount block.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), make_small_cluster_qcow2()).unwrap();
+        let backend = QcowBackend::open_rw(tmp.path()).unwrap();
+
+        let payload: Vec<u8> = (0..204_800u32).map(|i| u8_of((i % 251) as usize)).collect();
+        backend.write_at(0, &payload).unwrap();
+        backend.flush().unwrap();
+
+        // Data reads back, and the image stays refcount-consistent through the
+        // newly allocated block(s) — the qemu-img-check substitute proving the
+        // self-referencing block was refcounted correctly.
+        let mut buf = vec![0u8; payload.len()];
+        backend.read_at(0, &mut buf).unwrap();
+        assert_eq!(buf, payload, "data spanning multiple refcount blocks");
+        backend.check_consistency().unwrap();
+        drop(backend);
+
+        // Prove a second refcount block really was allocated: the file grew past
+        // one block's 128 KiB reach and refcount-table entry 1 is now populated.
+        let raw = std::fs::read(tmp.path()).unwrap();
+        assert!(raw.len() > 256 * 512, "file crossed one block's coverage");
+        let rt_entry1 = u64::from_be_bytes(raw[512 + 8..512 + 16].try_into().unwrap());
+        assert_ne!(
+            rt_entry1 & REFT_OFFSET_MASK,
+            0,
+            "second refcount block allocated"
+        );
+
+        // Reopen and re-check, proving it all hit disk consistently.
+        let reopened = QcowBackend::open(tmp.path()).unwrap();
+        reopened.check_consistency().unwrap();
     }
 
     #[test]
