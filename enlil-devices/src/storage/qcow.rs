@@ -149,7 +149,10 @@ impl QcowHeader {
 pub struct QcowBackend {
     file: Mutex<File>,
     header: QcowHeader,
-    l1_table: Vec<u64>,
+    /// In-memory copy of the L1 table, kept in sync with the on-disk table when
+    /// allocation grows it (`Mutex` so a write can update it through `&self`).
+    /// Always lock `file` before `l1_table` to keep a consistent lock order.
+    l1_table: Mutex<Vec<u64>>,
     /// `true` if the underlying file was opened read-write; gates `write_at`.
     writable: bool,
     /// Read-only backing image: clusters not present in this (overlay) image are
@@ -213,7 +216,7 @@ impl QcowBackend {
         Ok(Self {
             file: Mutex::new(file),
             header,
-            l1_table,
+            l1_table: Mutex::new(l1_table),
             writable,
             backing,
         })
@@ -274,11 +277,15 @@ impl QcowBackend {
 
         // L1 index = guest_offset / (l2_entries * cluster_size)
         let l1_index = guest_offset / (l2_entries * cluster_size);
-        if l1_index >= self.l1_table.len() as u64 {
+        let l1 = self
+            .l1_table
+            .lock()
+            .map_err(|e| anyhow::anyhow!("l1 lock: {e}"))?;
+        if l1_index >= l1.len() as u64 {
             return Ok(ClusterLoc::Unallocated);
         }
-
-        let l1_entry = self.l1_table[usize_of(l1_index)];
+        let l1_entry = l1[usize_of(l1_index)];
+        drop(l1);
         // Bits 9..55 contain the offset of the L2 table
         let l2_table_offset = l1_entry & L2_OFFSET_MASK;
         if l2_table_offset == 0 {
@@ -422,7 +429,12 @@ impl QcowBackend {
 
         // Each L2 table and the data clusters it maps.
         let l2_entries = self.header.l2_entries();
-        for &l1_entry in &self.l1_table {
+        let l1_snapshot = self
+            .l1_table
+            .lock()
+            .map_err(|e| anyhow::anyhow!("l1 lock: {e}"))?
+            .clone();
+        for &l1_entry in &l1_snapshot {
             let l2_off = l1_entry & L2_OFFSET_MASK;
             if l2_off == 0 {
                 continue;
@@ -496,7 +508,12 @@ impl QcowBackend {
     /// that is actually shared, so it is worth checking alongside the refcounts.
     fn check_copied_flags(&self, file: &mut File) -> Result<()> {
         let l2_entries = self.header.l2_entries();
-        for &l1_entry in &self.l1_table {
+        let l1_snapshot = self
+            .l1_table
+            .lock()
+            .map_err(|e| anyhow::anyhow!("l1 lock: {e}"))?
+            .clone();
+        for &l1_entry in &l1_snapshot {
             let l2_off = l1_entry & L2_OFFSET_MASK;
             if l2_off == 0 {
                 continue;
@@ -589,28 +606,50 @@ impl QcowBackend {
         Ok(offset)
     }
 
+    /// Allocate a new (zeroed) L2 table for L1 slot `l1_index`: refcount it,
+    /// record it in the on-disk L1 table and the in-memory cache, and return its
+    /// host offset. The L1 entry is marked COPIED (the L2 table's refcount is 1).
+    fn allocate_l2_table(&self, l1_index: u64, file: &mut File) -> Result<u64> {
+        let l2_off = self.allocate_host_cluster(file)?;
+        let entry = l2_off | QCOW_OFLAG_COPIED;
+        file.seek(SeekFrom::Start(self.header.l1_table_offset + l1_index * 8))?;
+        file.write_all(&entry.to_be_bytes())?;
+        // Keep the in-memory cache coherent with what we just wrote to disk.
+        let mut l1 = self
+            .l1_table
+            .lock()
+            .map_err(|e| anyhow::anyhow!("l1 lock: {e}"))?;
+        l1[usize_of(l1_index)] = entry;
+        drop(l1);
+        Ok(l2_off)
+    }
+
     /// Allocate a data cluster for a write that lands in an unallocated (or
-    /// zero-flagged) cluster whose **L2 table already exists**, wiring up the L2
-    /// entry and refcounts. Copy-on-write from the backing image is honoured so
-    /// bytes the guest does not overwrite still read correctly. Returns the host
-    /// offset of the new data cluster.
-    ///
-    /// L2-table allocation (when the L1 entry is empty) is a separate step and
-    /// is reported as an error here.
+    /// zero-flagged) cluster, wiring up the L2 entry and refcounts — allocating
+    /// the L2 table first if the L1 slot is still empty. Copy-on-write from the
+    /// backing image is honoured so bytes the guest does not overwrite still
+    /// read correctly. Returns the host offset of the new data cluster.
     fn allocate_data_cluster(&self, guest_offset: u64, file: &mut File) -> Result<u64> {
         let cluster_size = self.header.cluster_size();
         let l2_entries = self.header.l2_entries();
         let l1_index = guest_offset / (l2_entries * cluster_size);
-        if l1_index >= self.l1_table.len() as u64 {
-            bail!("guest offset {guest_offset:#x} is beyond the L1 table");
-        }
-        let l2_table_offset = self.l1_table[usize_of(l1_index)] & L2_OFFSET_MASK;
-        if l2_table_offset == 0 {
-            bail!(
-                "L2 table for guest offset {guest_offset:#x} is not allocated \
-                 (L2 table allocation not yet implemented)"
-            );
-        }
+
+        // Find the L2 table for this L1 slot, allocating it if absent.
+        let existing = {
+            let l1 = self
+                .l1_table
+                .lock()
+                .map_err(|e| anyhow::anyhow!("l1 lock: {e}"))?;
+            if l1_index >= l1.len() as u64 {
+                bail!("guest offset {guest_offset:#x} is beyond the L1 table");
+            }
+            l1[usize_of(l1_index)] & L2_OFFSET_MASK
+        };
+        let l2_table_offset = if existing == 0 {
+            self.allocate_l2_table(l1_index, file)?
+        } else {
+            existing
+        };
         let l2_index = (guest_offset / cluster_size) % l2_entries;
         let l2_entry_off = l2_table_offset + l2_index * 8;
 
@@ -1164,6 +1203,39 @@ mod tests {
             backend.read_at(c * 65536, &mut buf).unwrap();
             assert!(buf.iter().all(|&b| b == u8_of(c)), "cluster {c}");
         }
+    }
+
+    #[test]
+    fn allocates_a_new_l2_table_when_the_l1_slot_is_empty() {
+        // Widen the refcounted image to two L1 entries (1 GiB virtual); L1[1] is
+        // still empty, so a write into its range must allocate the L2 table too.
+        let mut img = make_refcounted_qcow2(0);
+        img[36..40].copy_from_slice(&2u32.to_be_bytes()); // l1_size = 2
+        img[24..32].copy_from_slice(&(1024u64 * 1024 * 1024).to_be_bytes()); // 1 GiB
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &img).unwrap();
+        let backend = QcowBackend::open_rw(tmp.path()).unwrap();
+
+        // 512 MiB == the first guest byte covered by L1 entry 1.
+        let off = 8192u64 * 65536;
+        let payload: Vec<u8> = (0..2048u32).map(|i| u8_of((i ^ 0x99) as usize)).collect();
+        backend.write_at(off, &payload).unwrap();
+        backend.flush().unwrap();
+
+        let mut buf = vec![0u8; payload.len()];
+        backend.read_at(off, &mut buf).unwrap();
+        assert_eq!(buf, payload, "data through a freshly allocated L2 table");
+        backend
+            .check_consistency()
+            .expect("L2-table allocation must keep refcounts consistent");
+
+        // Persisted: reopen and confirm both data and consistency.
+        drop(backend);
+        let reopened = QcowBackend::open(tmp.path()).unwrap();
+        let mut buf2 = vec![0u8; payload.len()];
+        reopened.read_at(off, &mut buf2).unwrap();
+        assert_eq!(buf2, payload, "L2 table + data persisted");
+        reopened.check_consistency().unwrap();
     }
 
     #[test]
