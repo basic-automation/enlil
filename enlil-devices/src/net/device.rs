@@ -270,6 +270,38 @@ impl VirtioNetDevice {
         control::VIRTIO_NET_OK
     }
 
+    /// Decide whether an inbound Ethernet `frame` passes the receive filter the
+    /// guest programmed through the control virtqueue. Mirrors a real NIC:
+    /// promiscuous accepts everything; otherwise broadcast, multicast, and
+    /// unicast each have their own accept rule (all-modes, filter tables, the
+    /// device's own MAC) and explicit drop modes. A frame too short to carry a
+    /// destination MAC is dropped.
+    fn accepts_frame(&self, frame: &[u8]) -> bool {
+        let Some(dest) = frame.get(0..6) else {
+            return false;
+        };
+        let c = &self.control;
+        if c.rx_mode.contains(RxFilterMode::PROMISC) {
+            return true;
+        }
+        let is_broadcast = dest == [0xFF; 6];
+        let is_multicast = !is_broadcast && (dest[0] & 0x01) != 0;
+        if is_broadcast {
+            !c.rx_mode.contains(RxFilterMode::NOBCAST)
+        } else if is_multicast {
+            !c.rx_mode.contains(RxFilterMode::NOMULTI)
+                && (c.rx_mode.contains(RxFilterMode::ALLMULTI)
+                    || c.multicast_table.iter().any(|m| m.as_bytes() == dest))
+        } else {
+            // Unicast: our own MAC, an entry in the unicast filter table, or any
+            // unicast when alluni is set; nouni drops all unicast.
+            !c.rx_mode.contains(RxFilterMode::NOUNI)
+                && (c.rx_mode.contains(RxFilterMode::ALLUNI)
+                    || self.mac.as_bytes() == dest
+                    || c.unicast_table.iter().any(|m| m.as_bytes() == dest))
+        }
+    }
+
     /// Process pending TX descriptors.
     ///
     /// Reads frames from the TX virtqueue and sends them through the backend.
@@ -324,6 +356,12 @@ impl VirtioNetDevice {
             match self.backend.recv(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    // Apply the guest's receive filter to frames arriving off the
+                    // wire; a rejected frame is counted as a drop, not delivered.
+                    if !self.accepts_frame(&buf[..n]) {
+                        self.stats.rx_drops += 1;
+                        continue;
+                    }
                     // Prepend the VirtIO net header (num_buffers set for merge mode).
                     let mut frame = self.rx_header().to_bytes(self.merge_rxbuf);
                     frame.extend_from_slice(&buf[..n]);
@@ -657,6 +695,127 @@ mod tests {
             1,
         ]);
         assert_eq!(ack, control::VIRTIO_NET_ERR);
+    }
+
+    fn eth_frame(dest: [u8; 6]) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(&dest);
+        f.extend_from_slice(&[0x02, 0, 0, 0, 0, 0x99]); // src
+        f.extend_from_slice(&[0x08, 0x00]); // ethertype IPv4
+        f.resize(64, 0);
+        f
+    }
+
+    #[test]
+    fn rx_filter_accepts_own_mac_and_broadcast_drops_others() {
+        let dev = make_device(); // MAC 02:00:00:00:00:01, default filter
+        let own = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        assert!(dev.accepts_frame(&eth_frame(own)), "own unicast");
+        assert!(dev.accepts_frame(&eth_frame([0xFF; 6])), "broadcast");
+        assert!(
+            !dev.accepts_frame(&eth_frame([0x02, 0, 0, 0, 0, 0x02])),
+            "other unicast dropped by default"
+        );
+        assert!(
+            !dev.accepts_frame(&eth_frame([0x01, 0, 0x5E, 0, 0, 0x01])),
+            "multicast dropped by default"
+        );
+        assert!(!dev.accepts_frame(&[0x01, 0x02]), "runt frame dropped");
+    }
+
+    #[test]
+    fn rx_filter_promisc_accepts_everything() {
+        let mut dev = make_device();
+        dev.process_control(&[
+            control::VIRTIO_NET_CTRL_RX,
+            control::VIRTIO_NET_CTRL_RX_PROMISC,
+            1,
+        ]);
+        assert!(dev.accepts_frame(&eth_frame([0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01])));
+        assert!(dev.accepts_frame(&eth_frame([0x01, 0, 0x5E, 0, 0, 0x01])));
+    }
+
+    #[test]
+    fn rx_filter_honours_tables_and_drop_modes() {
+        let mut dev = make_device();
+        // Program a unicast and a multicast filter entry.
+        let mut cmd = vec![
+            control::VIRTIO_NET_CTRL_MAC,
+            control::VIRTIO_NET_CTRL_MAC_TABLE_SET,
+        ];
+        cmd.extend_from_slice(&1u32.to_le_bytes());
+        cmd.extend_from_slice(&[0x02, 0, 0, 0, 0, 0x42]); // extra unicast
+        cmd.extend_from_slice(&1u32.to_le_bytes());
+        cmd.extend_from_slice(&[0x01, 0, 0x5E, 0, 0, 0x07]); // joined multicast
+        dev.process_control(&cmd);
+        assert!(
+            dev.accepts_frame(&eth_frame([0x02, 0, 0, 0, 0, 0x42])),
+            "table unicast"
+        );
+        assert!(
+            dev.accepts_frame(&eth_frame([0x01, 0, 0x5E, 0, 0, 0x07])),
+            "joined mcast"
+        );
+        assert!(
+            !dev.accepts_frame(&eth_frame([0x01, 0, 0x5E, 0, 0, 0x08])),
+            "unjoined mcast"
+        );
+
+        // allmulti accepts any multicast; nobcast drops broadcast.
+        dev.process_control(&[
+            control::VIRTIO_NET_CTRL_RX,
+            control::VIRTIO_NET_CTRL_RX_ALLMULTI,
+            1,
+        ]);
+        assert!(
+            dev.accepts_frame(&eth_frame([0x01, 0, 0x5E, 0, 0, 0x08])),
+            "allmulti"
+        );
+        dev.process_control(&[
+            control::VIRTIO_NET_CTRL_RX,
+            control::VIRTIO_NET_CTRL_RX_NOBCAST,
+            1,
+        ]);
+        assert!(
+            !dev.accepts_frame(&eth_frame([0xFF; 6])),
+            "nobcast drops broadcast"
+        );
+    }
+
+    #[test]
+    fn process_rx_drops_frames_the_filter_rejects() {
+        // A backend that hands out two frames: one to our MAC, one to a stranger.
+        struct FeedBackend(VecDeque<Vec<u8>>);
+        impl super::super::backend::NetBackend for FeedBackend {
+            fn send(&mut self, frame: &[u8]) -> std::io::Result<usize> {
+                Ok(frame.len())
+            }
+            fn recv(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0.pop_front().map_or(Ok(0), |f| {
+                    buf[..f.len()].copy_from_slice(&f);
+                    Ok(f.len())
+                })
+            }
+            fn has_pending_rx(&self) -> bool {
+                !self.0.is_empty()
+            }
+            fn backend_name(&self) -> &'static str {
+                "feed"
+            }
+        }
+
+        let own = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let frames = VecDeque::from(vec![eth_frame(own), eth_frame([0x02, 0, 0, 0, 0, 0xFE])]);
+        let config = NetDeviceConfig::new("test0", MacAddress(own));
+        let mut dev = VirtioNetDevice::new(&config, Box::new(FeedBackend(frames)));
+        dev.activate(NetFeatures::from_bits(NetFeatures::MAC));
+        for _ in 0..2 {
+            dev.rx_queue.push_available(vec![0u8; 256], true).unwrap();
+        }
+        let received = dev.process_rx();
+        assert_eq!(received, 1, "only the frame to our MAC is accepted");
+        assert_eq!(dev.stats().rx_drops, 1, "the stranger frame was dropped");
+        assert_eq!(dev.stats().rx_packets, 1);
     }
 
     #[test]
