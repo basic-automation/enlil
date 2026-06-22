@@ -116,7 +116,7 @@ impl Ps2Mouse {
             }
             0xEB => {
                 // Read data — send current state
-                let packet = self.build_packet(self.buttons, 0, 0);
+                let packet = self.build_packet(self.buttons, 0, 0, 0);
                 for b in &packet {
                     self.output_queue.push_back(*b);
                 }
@@ -181,11 +181,19 @@ impl Ps2Mouse {
         0xFA
     }
 
-    /// Inject mouse movement from host input
+    /// Inject mouse movement from host input.
     pub fn inject_movement(&mut self, buttons: u8, dx: i16, dy: i16) {
+        self.inject_movement_wheel(buttons, dx, dy, 0);
+    }
+
+    /// Inject mouse movement plus a scroll-wheel delta (`dz`). The wheel delta
+    /// is only reported when the guest has switched the mouse into `IntelliMouse`
+    /// mode (device id 3); on a standard mouse it is ignored. Per the protocol
+    /// the wheel field is a signed 4-bit value, so `dz` is clamped to -8..=7.
+    pub fn inject_movement_wheel(&mut self, buttons: u8, dx: i16, dy: i16, dz: i16) {
         self.buttons = buttons;
         if self.reporting_enabled {
-            let packet = self.build_packet(buttons, dx, dy);
+            let packet = self.build_packet(buttons, dx, dy, dz);
             for b in &packet {
                 self.output_queue.push_back(*b);
             }
@@ -193,7 +201,7 @@ impl Ps2Mouse {
     }
 
     /// Build a PS/2 mouse packet
-    fn build_packet(&self, buttons: u8, dx: i16, dy: i16) -> Vec<u8> {
+    fn build_packet(&self, buttons: u8, dx: i16, dy: i16, dz: i16) -> Vec<u8> {
         let horiz = dx.clamp(-256, 255);
         let vert = dy.clamp(-256, 255);
 
@@ -214,9 +222,12 @@ impl Ps2Mouse {
 
         let mut packet = vec![byte0, horiz.to_le_bytes()[0], vert.to_le_bytes()[0]];
 
-        // Intellimouse: 4th byte for scroll wheel
+        // Intellimouse (id 3): 4th byte carries the signed wheel delta. The
+        // standard wheel field is a 4-bit signed value (-8..=7) sign-extended to
+        // the byte, which the guest driver reads as a signed quantity.
         if self.mouse_id == 3 {
-            packet.push(0); // No scroll (caller would need to pass scroll data)
+            let z = i8::try_from(dz.clamp(-8, 7)).unwrap_or(0);
+            packet.push(z.to_le_bytes()[0]);
         }
 
         packet
@@ -287,5 +298,46 @@ mod tests {
         assert_ne!(byte0 & 0x01, 0); // Left button
         assert_eq!(byte0 & 0x10, 0); // X positive
         assert_ne!(byte0 & 0x20, 0); // Y negative
+    }
+
+    fn to_intellimouse(mouse: &mut Ps2Mouse) {
+        for r in [200u8, 100, 80] {
+            mouse.receive_command(0xF3);
+            mouse.receive_command(r);
+        }
+        assert_eq!(mouse.mouse_id, 3);
+    }
+
+    #[test]
+    fn intellimouse_reports_scroll_in_a_4th_byte() {
+        let mut mouse = Ps2Mouse::new();
+        to_intellimouse(&mut mouse);
+        mouse.receive_command(0xF4); // enable reporting
+
+        // Scroll up one detent (dz = -1 in PS/2 convention is wheel-down; here we
+        // just check the signed value round-trips).
+        mouse.inject_movement_wheel(0, 0, 0, -1);
+        let pkt: Vec<u8> = std::iter::from_fn(|| mouse.dequeue_byte()).collect();
+        assert_eq!(pkt.len(), 4, "intellimouse emits a 4-byte packet");
+        assert_eq!(pkt[3], 0xFF, "wheel delta -1 sign-extends to 0xFF");
+
+        // Positive detent.
+        mouse.inject_movement_wheel(0, 0, 0, 3);
+        let pkt: Vec<u8> = std::iter::from_fn(|| mouse.dequeue_byte()).collect();
+        assert_eq!(pkt[3], 0x03);
+
+        // Out-of-range delta clamps to the 4-bit signed range.
+        mouse.inject_movement_wheel(0, 0, 0, 100);
+        let pkt: Vec<u8> = std::iter::from_fn(|| mouse.dequeue_byte()).collect();
+        assert_eq!(pkt[3], 0x07, "clamped to +7");
+    }
+
+    #[test]
+    fn standard_mouse_ignores_scroll() {
+        let mut mouse = Ps2Mouse::new(); // id 0
+        mouse.receive_command(0xF4);
+        mouse.inject_movement_wheel(0, 1, 1, 5);
+        let pkt: Vec<u8> = std::iter::from_fn(|| mouse.dequeue_byte()).collect();
+        assert_eq!(pkt.len(), 3, "no wheel byte without intellimouse mode");
     }
 }

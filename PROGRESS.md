@@ -6,6 +6,163 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-22 — Session: complete qcow2 writable-overlay/COW story (Phase 0.3) + a broad virtio/device-fidelity sweep (Phase 3)
+
+**18 increments + 1 roadmap commit, each independently green and committed**
+(branch `routine/enlil-2026-06-22`, PR https://github.com/physics515/enlil/pull/36). Wall-clock ~00:40→~02:30
+(~1h50m of building). Two threads: (1) finished the 2026-06-21 next-step #1 —
+**qcow2 cluster allocation (COW) and writable overlays** — building the whole
+allocator (data clusters, L2 tables, refcount blocks, image creation, trim) with
+an in-process `qemu-img check` substitute as the validator since `qemu-img` is not
+installed; then (2) a broad virtio/device-fidelity sweep that fixed **three real
+bugs** (virtio-blk discard range, i8042 single-byte output, plus the qcow allocator
+gap) and closed several genuine gaps real guests exercise. Every increment is
+host-agnostic and built on **both** toolchains.
+
+### Increments (commit — what)
+1. `9dd6b62` — **qcow2 refcount reader + `qemu-img check`-style consistency
+   validator.** Parse v3 `refcount_order`; add `read_refcount` (1/2/4/8/16/32/64-bit)
+   and `check_consistency` (recompute reachable refcounts vs stored; verify the
+   OFLAG_COPIED invariant). The validator the rest of the COW work is checked
+   against. +5 tests (incl. deliberate leak/undercount detection).
+2. `8f3f6b6` — **qcow2 cluster allocation into an existing L2 table (COW).** Replace
+   the "write to unallocated cluster" bail with real allocation; copy-on-write from
+   the backing image; partial writes zero-fill. Refcount slot pre-flighted before
+   the file grows. +3 tests.
+3. `37e9cd0` — **qcow2 L2-table allocation** on first write to an empty L1 slot
+   (cached L1 table moved behind a `Mutex`). +1 test.
+4. `ce09681` — **verify qcow2 copy-on-write from a backing image** (refcounted
+   empty-overlay builder + COW round-trip, base left byte-for-byte unchanged). +2.
+5. `703ca9d` — **qcow2 refcount-block allocation** for images past one block's reach
+   (64 KiB clusters → one block covers only 2 GiB; the new block self-refcounts).
+   Tested on a 512-byte-cluster image crossing the boundary. +1.
+6. `b90c9af` — **qcow2 image creation + overlay** (`QcowBackend::create`): the
+   Phase 0.3 non-destructive-testing primitive — a fresh refcount-consistent image,
+   optionally over a backing base. +2.
+7. `94fe51c` — **docs:** ROADMAP 0.3 marked qcow2 writable overlays implemented.
+8. `14376e3` — **qcow2 discard/trim** that frees clusters (refcount→0) and
+   zero-flags them; partial-cluster edges left intact. +2. (This retroactively made
+   the existing virtio-blk DISCARD path functional for qcow2.)
+9. `20bcc46` — **BUG FIX: virtio-blk DISCARD/WRITE_ZEROES read the range from the
+   descriptor.** They were using the request header sector + the data-buffer
+   *length* instead of the 16-byte `virtio_blk_discard_write_zeroes` segment(s) in
+   the data buffer — a real guest discard was a ~16-byte no-op (silent
+   non-reclamation). Now parses + validates each segment; multi-segment supported
+   (`max_*_seg` 1→256). +4 tests.
+10. `632f1c0` — **virtio-net control virtqueue (VIRTIO_NET_CTRL).** CTRL_VQ was
+    defined but unimplemented; add RX-mode/MAC/VLAN/announce/MQ command processing
+    (RX modes as an `RxFilterMode` bitflags set). DEFAULT now offers
+    CTRL_VQ|CTRL_RX|CTRL_VLAN. +11 tests.
+11. `d55c219` — **apply the virtio-net RX filter** to inbound frames in `process_rx`
+    (promisc/bcast/mcast/ucast + tables + drop modes; `inject_rx` stays unfiltered).
+    +4 tests.
+12. `aa69d4f` — **virtio-net config space** (`read_config`): MAC, link status
+    (LINK_UP/ANNOUNCE), max_virtqueue_pairs; `set_link_up`/`request_announce`. +2.
+13. `579f05e` — **virtio-net TX checksum offload completion** (RFC 1071 internet
+    checksum over `frame[csum_start..]` on NEEDS_CSUM). +3 (incl. the classic IPv4
+    0xB861 vector + end-to-end through a capture backend).
+14. `6daaf50` — **virtio-net MTU advertisement** (VIRTIO_NET_F_MTU; the existing
+    config `mtu` was ignored). +1.
+15. `da368e6` — **PS/2 IntelliMouse scroll-wheel reporting** (the 4th packet byte
+    was hardcoded 0). +2.
+16. `eb5317a` — **BUG FIX: i8042 output FIFO.** The controller had a single output
+    byte, truncating every multi-byte device response to one byte through port
+    0x60 (mouse packets, keyboard identify AB 83, reset sequences). Replaced with a
+    tagged output FIFO; status/IRQ re-armed per queued byte; command paths drain
+    the device queues. +`inject_mouse_wheel`. +4 tests.
+17. `9e7db2c` — **display zone tiling layouts** (`tile_grid`/`split_columns`/
+    `split_rows`): exact full-screen coverage, remainder absorbed at the edges
+    (Phase 3.6). +3.
+18. `264f46e` — **display focus cycling** (`cycle_focus`/`focus_next`/`focus_prev`):
+    the "Ctrl+Ctrl cycles to next guest" behaviour, wrapping + skipping hidden
+    zones. +2.
+19. `6f3bb10` — **PCI MSI capability (ID 0x05)** with capability-list chaining
+    (prepends to the list, composes with the PM cap); `msi_enabled()`. +2.
+
+### Research (informed the build)
+No new external literature this session — the work was driven by the existing
+ROADMAP/PROGRESS next-steps (qcow2 COW was 2026-06-21's #1) read against the
+relevant primary specs already cited in `RESEARCH.md`: the **qcow2 spec v3** (header
+`refcount_order`, refcount table/block geometry, L1/L2 entry COPIED/ZERO flags,
+backing files) for all the storage work; the **virtio 1.x spec** for
+`virtio_blk_discard_write_zeroes`, the virtio-net control virtqueue / RX filtering /
+config space / `VIRTIO_NET_HDR_F_NEEDS_CSUM` / MTU; **RFC 1071** for the internet
+checksum; the **8042/IntelliMouse** and **MC146818** datasheets; and the **PCI Local
+Bus spec §6.8** for the MSI capability layout. Nothing new to log in `RESEARCH.md`.
+
+### Test results (exact)
+- **`/dev/kvm`: read-writable at start and at wrap (`KVM_RW_OK` both times).** The
+  KVM/guest tests **ran for real, none skipped** — `cargo test -p enlil-core` →
+  **211 passed, 0 failed, 0 ignored**, and a `grep -c` for "skipping/no nested/not
+  available" over the run returned **0**. (My changes are storage/device-only and do
+  not touch the KVM backend; the suite was run to confirm no regression and that it
+  executes on real `/dev/kvm`.)
+- **Full workspace CI-parity** (the `.github/workflows/ci.yml` commands):
+  `cargo fmt --all -- --check` → clean; `cargo clippy --all-targets --workspace -- -D
+  warnings` → exit 0; `cargo test --workspace` → all green, **0 failures**.
+  **enlil-devices 857** (was 806; +51 across the 18 increments), **enlil-core 211**
+  (unchanged), plus the smaller crates. The `acpi_iasl_validation` (3) and
+  `smbios_dmidecode_validation` (1) reference-compiler gates **self-skip as pass —
+  `iasl`/`dmidecode` are NOT installed on this host**, so those AML/SMBIOS gates did
+  not actually run.
+- **qcow2 correctness** was validated **in-process** by the increment-1
+  `check_consistency` (a `qemu-img check` substitute) after every allocating
+  operation — `qemu-img` is **not installed**, so no external `qemu-img check` was
+  run; this is called out honestly rather than claimed.
+- **Toolchains:** every increment built/tested on **Linux/WSL** (nightly
+  `x86_64-unknown-linux-gnu`) AND built **Windows-native** (`x86_64-pc-windows-msvc`,
+  `cargo build -p enlil-devices` against the WSL manifest with
+  `D:\Development\.enlil-win-target`): **exit 0** after each. All 18 increments are in
+  the host-agnostic `enlil-devices` crate, so both toolchains apply; no KVM-only
+  (`target_os = "linux"`) code was touched.
+
+### STOP REASON
+**No unblocked item left that can be finished and tested cleanly tonight without
+absent tooling, hardware, or a risky architectural/large refactor.** After
+finishing the qcow2 COW story (the top unblocked item), I **swept the device
+subsystems** — storage, virtio-blk, virtio-net, i8042/PS2, display, HDA, the
+inter-guest bridge, serial (16550), RTC, the interrupt controllers
+(8259/IOAPIC/LAPIC/MSI), PCIe, the PIT, the HPET, DMA — plus the std tooling crates
+(`enlil-config`/`enlil-mgmt`/`enlil-setup`) and the host-agnostic `enlil-core`
+modules, and fixed every clear, cleanly-testable gap (above). The remaining
+high-value work is genuinely blocked or out-of-scope for a clean 2 a.m. increment:
+(a) **needs absent tooling** — qcow2 **refcount-*table* growth** (only reachable with
+sub-2 GB-coverage tiny-cluster images; the 64 KiB default covers 16 TB in one table
+cluster, so it is low-value and ideally validated with `qemu-img`); AML/SMBIOS table
+work needs `iasl`/`dmidecode`; an OVMF/SeaBIOS smoke boot is not set up; (b)
+**architectural** — the threaded-vCPU watchdog (multi-threaded vCPU model + signal
+kick; needs the bus to be `Sync`), and wiring the virtio devices to a real
+guest-memory virtqueue transport (today's `Virtqueue` is a simplified in-memory
+model); (c) **speculative / needs an Intel host or a time source** — leaf 0x1F
+topology-field consistency (this AMD host never enumerates 0x1F), the 16550 RX FIFO
+trigger level (unsafe without the companion character-timeout interrupt, which needs
+a time source). Per the guardrails I did not start-and-half-finish or ship-unvalidated
+any of these. `master` stays buildable (green per increment).
+
+### Recommended next step (tomorrow)
+1. **Install `qemu-img` + `acpica-tools` (iasl) + `dmidecode` (and ideally
+   OVMF/qemu-system-x86_64) on this WSL host** — the single highest-leverage step:
+   it unblocks external `qemu-img check` validation for qcow2 refcount-table growth,
+   the AML/SMBIOS reference-compiler gates, and an OVMF smoke boot. One-time
+   human/setup step.
+2. **qcow2 refcount-table growth** — the last `not yet implemented` in the qcow
+   allocator; doable in-process with the `check_consistency` validator, but best done
+   once `qemu-img check` is available to cross-check. Low priority (unreachable for
+   realistic 64 KiB-cluster images).
+3. **Threaded-vCPU watchdog** (still unblocked by per-vCPU stealth from 2026-06-21):
+   a multi-threaded vCPU execution model + `set_immediate_exit` signal kick. Needs
+   `KvmBackend`/bus to be shareable across threads — a deliberate design, not a 1 a.m.
+   refactor.
+4. **Real guest-memory virtqueue transport** for the virtio devices (replace the
+   simplified in-memory `Virtqueue`) — the largest single fidelity lever, and the
+   prerequisite for an actual guest exercising tonight's virtio-net/blk work.
+5. Lower priority / blocked: PCI **MSI-X** capability (table/PBA in a BAR — builds on
+   tonight's MSI cap); 16550 RX trigger + character-timeout (needs a time source);
+   leaf 0x1F topology consistency (needs an Intel host); libusb USB forwarder
+   (hardware); full vTPM 2.0 (large).
+
+---
+
 ## 2026-06-21 — Session: per-vCPU stealth state (Phase 5) + a broad device-fidelity sweep (Phase 3)
 
 **16 increments + 1 fmt-hygiene commit, each independently green and committed**

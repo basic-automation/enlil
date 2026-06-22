@@ -25,6 +25,7 @@
 
 mod backend;
 mod config;
+mod control;
 mod device;
 mod features;
 mod header;
@@ -36,6 +37,7 @@ mod tap;
 
 pub use backend::{LoopbackBackend, NetBackend, NullBackend, PipeBackend};
 pub use config::NetDeviceConfig;
+pub use control::{NetControlState, RxFilterMode, VIRTIO_NET_ERR, VIRTIO_NET_OK};
 pub use device::{DeviceStatus, VirtioNetDevice};
 pub use features::NetFeatures;
 pub use header::VirtioNetHeader;

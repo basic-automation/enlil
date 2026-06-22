@@ -57,9 +57,18 @@ impl NetFeatures {
     /// Indicates compliance with `VirtIO` 1.0+.
     pub const VERSION_1: u64 = 1 << 32;
 
-    /// Default features offered by our device.
-    pub const DEFAULT: u64 =
-        Self::MAC | Self::STATUS | Self::MRG_RXBUF | Self::CSUM | Self::GUEST_CSUM;
+    /// Default features offered by our device. The control virtqueue
+    /// (`CTRL_VQ`) plus the RX-mode and VLAN control classes let a guest manage
+    /// promiscuous mode, MAC filters, and VLAN filtering at runtime.
+    pub const DEFAULT: u64 = Self::MAC
+        | Self::STATUS
+        | Self::MTU
+        | Self::MRG_RXBUF
+        | Self::CSUM
+        | Self::GUEST_CSUM
+        | Self::CTRL_VQ
+        | Self::CTRL_RX
+        | Self::CTRL_VLAN;
 
     /// Create from raw bits.
     #[must_use]

@@ -33,6 +33,11 @@ pub const PM_CAP_OFFSET: u16 = 0x50;
 /// [`PM_CAP_OFFSET`] as the byte the capability pointer stores.
 const PM_CAP_OFFSET_BYTE: u8 = 0x50;
 
+/// Config-space offset where [`PciConfigSpace::add_msi_capability`] places the
+/// MSI capability structure (in the device-specific region, clear of the PM
+/// capability at [`PM_CAP_OFFSET`]).
+pub const MSI_CAP_OFFSET: u16 = 0x60;
+
 /// PCI configuration space header offsets
 pub mod cfg {
     pub const VENDOR_ID: u16 = 0x00;
@@ -286,6 +291,44 @@ impl PciConfigSpace {
         self.write_u8(cfg::CAPABILITY_PTR, PM_CAP_OFFSET_BYTE);
         let status = self.read_u16(cfg::STATUS) | 0x0010;
         self.write_u16(cfg::STATUS, status);
+    }
+
+    /// Add a 64-bit-capable MSI capability (Capability ID 0x05) and make it the
+    /// head of the capabilities list, chaining to whatever was previously the
+    /// head. Modern guests prefer MSI over legacy `INTx`, walking the list from
+    /// the capability pointer to find it. The capability starts disabled (Message
+    /// Control bit 0 clear) with one vector and a zeroed address/data the guest
+    /// programs; this pairs with the MSI delivery path.
+    ///
+    /// The structure (PCI Local Bus spec §6.8.1, 64-bit form) is laid out at
+    /// [`MSI_CAP_OFFSET`]: cap id, next ptr, Message Control, Message Address
+    /// (lo+hi), Message Data.
+    pub fn add_msi_capability(&mut self) {
+        // Chain: this capability points at the current list head, then becomes
+        // the new head — so it composes with add_power_management_capability in
+        // either order without orphaning an entry.
+        let prev_head = self.read_u8(cfg::CAPABILITY_PTR);
+        self.write_u8(MSI_CAP_OFFSET, 0x05); // Capability ID: MSI
+        self.write_u8(MSI_CAP_OFFSET + 1, prev_head); // next-capability pointer
+        // Message Control: 64-bit address capable (bit 7); MSI disabled (bit 0
+        // clear); Multiple Message Capable = 0 (one vector).
+        self.write_u16(MSI_CAP_OFFSET + 2, 0x0080);
+        self.write_u32(MSI_CAP_OFFSET + 4, 0x0000_0000); // Message Address (lo)
+        self.write_u32(MSI_CAP_OFFSET + 8, 0x0000_0000); // Message Address (hi)
+        self.write_u16(MSI_CAP_OFFSET + 12, 0x0000); // Message Data
+
+        // MSI is the new list head; assert the STATUS caps bit.
+        let head = u8::try_from(MSI_CAP_OFFSET).unwrap_or(0);
+        self.write_u8(cfg::CAPABILITY_PTR, head);
+        let status = self.read_u16(cfg::STATUS) | 0x0010;
+        self.write_u16(cfg::STATUS, status);
+    }
+
+    /// Whether the guest has enabled MSI (Message Control bit 0). Only meaningful
+    /// after [`add_msi_capability`](Self::add_msi_capability).
+    #[must_use]
+    pub fn msi_enabled(&self) -> bool {
+        self.read_u16(MSI_CAP_OFFSET + 2) & 0x0001 != 0
     }
 
     /// Handle a guest config-space write of `width` (1/2/4) bytes at `offset`,
@@ -1129,6 +1172,52 @@ mod tests {
         assert_eq!(mch.read_u8(PM_CAP_OFFSET + 1), 0x00);
         // PMCSR power state defaults to D0.
         assert_eq!(mch.read_u16(PM_CAP_OFFSET + 4) & 0x3, 0);
+    }
+
+    #[test]
+    fn msi_capability_is_walkable_and_chains_with_pm() {
+        let mut cs = PciConfigSpace::new(PciBdf::new(0, 6, 0), 0x8086, 0x1234);
+        cs.add_power_management_capability();
+        cs.add_msi_capability();
+
+        // Caps bit set; the list head is now MSI, chaining to PM, then ending.
+        assert_ne!(cs.read_u16(cfg::STATUS) & 0x0010, 0);
+        let head = cs.read_u8(cfg::CAPABILITY_PTR);
+        assert_eq!(u16::from(head), MSI_CAP_OFFSET);
+        assert_eq!(cs.read_u8(MSI_CAP_OFFSET), 0x05, "MSI cap id");
+        // MSI is 64-bit capable and disabled out of the box.
+        assert_ne!(
+            cs.read_u16(MSI_CAP_OFFSET + 2) & 0x0080,
+            0,
+            "64-bit capable"
+        );
+        assert!(!cs.msi_enabled());
+        // Next pointer -> PM -> null.
+        let next = cs.read_u8(MSI_CAP_OFFSET + 1);
+        assert_eq!(u16::from(next), PM_CAP_OFFSET);
+        assert_eq!(cs.read_u8(PM_CAP_OFFSET), 0x01);
+        assert_eq!(cs.read_u8(PM_CAP_OFFSET + 1), 0x00, "list terminates");
+    }
+
+    #[test]
+    fn guest_programs_msi_address_data_and_enable() {
+        let mut cs = PciConfigSpace::new(PciBdf::new(0, 7, 0), 0x8086, 0x1234);
+        cs.add_msi_capability();
+        assert_eq!(u16::from(cs.read_u8(cfg::CAPABILITY_PTR)), MSI_CAP_OFFSET);
+        assert_eq!(
+            cs.read_u8(MSI_CAP_OFFSET + 1),
+            0,
+            "lone cap terminates the list"
+        );
+
+        // Guest programs the MSI address/data and sets the enable bit.
+        cs.guest_write_u32(MSI_CAP_OFFSET + 4, 0xFEE0_0000);
+        cs.guest_write_u32(MSI_CAP_OFFSET + 8, 0x0000_0000);
+        cs.guest_write(MSI_CAP_OFFSET + 12, 2, 0x0041);
+        cs.guest_write(MSI_CAP_OFFSET + 2, 2, 0x0081); // 64-bit + enable
+        assert!(cs.msi_enabled());
+        assert_eq!(cs.read_u32(MSI_CAP_OFFSET + 4), 0xFEE0_0000);
+        assert_eq!(cs.read_u16(MSI_CAP_OFFSET + 12), 0x0041);
     }
 
     /// The device-identity registers are read-only to a guest: a guest write
