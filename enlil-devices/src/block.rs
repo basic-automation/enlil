@@ -103,6 +103,45 @@ impl BlockRequestHeader {
     }
 }
 
+/// Per-segment `unmap` flag in a discard / write-zeroes descriptor: the device
+/// may deallocate the range rather than write zeros. Reserved (must be 0) for
+/// discard requests.
+pub const VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP: u32 = 0x1;
+
+/// One `virtio_blk_discard_write_zeroes` segment (16 bytes, little-endian).
+///
+/// Carried in a discard or write-zeroes request's data buffer. The target range
+/// comes from *here*, not from the request header — the header `sector` field is
+/// unused for these commands.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct DiscardWriteZeroesSegment {
+    /// First sector of the range (512-byte units).
+    pub sector: u64,
+    /// Number of 512-byte sectors in the range.
+    pub num_sectors: u32,
+    /// Flags ([`VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP`]); other bits reserved 0.
+    pub flags: u32,
+}
+
+impl DiscardWriteZeroesSegment {
+    /// Size of one on-the-wire segment.
+    pub const SIZE: usize = 16;
+
+    /// Parse one segment from a 16-byte little-endian slice.
+    #[must_use]
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() < Self::SIZE {
+            return None;
+        }
+        Some(Self {
+            sector: u64::from_le_bytes(b[0..8].try_into().ok()?),
+            num_sectors: u32::from_le_bytes(b[8..12].try_into().ok()?),
+            flags: u32::from_le_bytes(b[12..16].try_into().ok()?),
+        })
+    }
+}
+
 /// `VirtIO` block device.
 pub struct VirtioBlockDevice {
     /// The storage backend.
@@ -158,14 +197,15 @@ impl VirtioBlockDevice {
             blk_size: 512,
             // Advertise usable limits for the DISCARD/WRITE_ZEROES features
             // above: a guest reads these config fields and treats a zero limit
-            // as "feature present but unusable", so they must be non-zero. Our
-            // simplified request model carries one range per request, hence
-            // seg = 1; alignment 1 sector = no special alignment.
+            // as "feature present but unusable", so they must be non-zero. We
+            // parse multiple per-request segment descriptors, so advertise a
+            // realistic multi-segment limit; alignment 1 sector = no special
+            // alignment.
             max_discard_sectors: 0x0040_0000, // 4M sectors (2 GiB) per request
-            max_discard_seg: 1,
+            max_discard_seg: 256,
             discard_sector_alignment: 1,
             max_write_zeroes_sectors: 0x0040_0000,
-            max_write_zeroes_seg: 1,
+            max_write_zeroes_seg: 256,
             write_zeroes_may_unmap: 0, // we always write real zeros
         };
 
@@ -292,14 +332,10 @@ impl VirtioBlockDevice {
             VIRTIO_BLK_T_OUT => self.handle_write(header.sector, data_buf),
             VIRTIO_BLK_T_FLUSH => self.handle_flush(),
             VIRTIO_BLK_T_GET_ID => self.handle_get_id(data_buf),
-            VIRTIO_BLK_T_DISCARD => self.handle_discard(
-                header.sector,
-                u64::from(u32::try_from(data_buf.len()).unwrap_or(u32::MAX)),
-            ),
-            VIRTIO_BLK_T_WRITE_ZEROES => self.handle_write_zeroes(
-                header.sector,
-                u64::from(u32::try_from(data_buf.len()).unwrap_or(u32::MAX)),
-            ),
+            // The range(s) for these come from segment descriptors in the data
+            // buffer, not the header — see `DiscardWriteZeroesSegment`.
+            VIRTIO_BLK_T_DISCARD => self.handle_discard(data_buf),
+            VIRTIO_BLK_T_WRITE_ZEROES => self.handle_write_zeroes(data_buf),
             _ => {
                 self.stats.errors += 1;
                 (VIRTIO_BLK_S_UNSUPP, 0)
@@ -351,49 +387,113 @@ impl VirtioBlockDevice {
         (VIRTIO_BLK_S_OK, len)
     }
 
-    fn handle_discard(&mut self, sector: u64, len_bytes: u64) -> (u8, usize) {
-        let offset = sector * 512;
-        if matches!(self.backend.trim(offset, len_bytes), Ok(())) {
-            self.stats.discards += 1;
-            (VIRTIO_BLK_S_OK, 0)
-        } else {
-            self.stats.errors += 1;
-            (VIRTIO_BLK_S_IOERR, 0)
+    /// Parse the segment descriptors carried in a discard / write-zeroes data
+    /// buffer. The buffer must be a non-empty whole number of 16-byte segments,
+    /// no more than `max_seg` of them. Returns `None` on a malformed buffer.
+    fn parse_dwz_segments(buf: &[u8], max_seg: u32) -> Option<Vec<DiscardWriteZeroesSegment>> {
+        let stride = DiscardWriteZeroesSegment::SIZE;
+        if buf.is_empty() || !buf.len().is_multiple_of(stride) {
+            return None;
         }
+        let count = buf.len() / stride;
+        if count > usize_of(max_seg) {
+            return None;
+        }
+        (0..count)
+            .map(|i| DiscardWriteZeroesSegment::from_bytes(&buf[i * stride..]))
+            .collect()
     }
 
-    /// Zero `len_bytes` of the backend starting at `sector`. A modern guest
-    /// issues `VIRTIO_BLK_T_WRITE_ZEROES` to clear a range (mkfs, partition
-    /// wipes, swap init) far more efficiently than streaming an all-zero write
-    /// payload. Bounded to the device capacity and written in capped chunks so
-    /// a large request does not allocate a huge buffer.
-    fn handle_write_zeroes(&mut self, sector: u64, len_bytes: u64) -> (u8, usize) {
+    /// Resolve and validate a segment to a byte range within the device.
+    /// `max_sectors` is the advertised per-segment cap. Returns `None` if the
+    /// range is out of bounds or too large.
+    fn dwz_range(&self, seg: DiscardWriteZeroesSegment, max_sectors: u32) -> Option<(u64, u64)> {
+        if seg.num_sectors == 0 || seg.num_sectors > max_sectors {
+            return None;
+        }
+        let offset = seg.sector.checked_mul(512)?;
+        let len = u64::from(seg.num_sectors).checked_mul(512)?;
+        let end = offset.checked_add(len)?;
+        if end > self.backend.capacity() {
+            return None;
+        }
+        Some((offset, len))
+    }
+
+    /// Discard (trim) the ranges named by the segment descriptors. Per the spec
+    /// the header `sector` is unused; each range comes from a
+    /// [`DiscardWriteZeroesSegment`]. The `unmap` flag is reserved for discard
+    /// and must be 0.
+    fn handle_discard(&mut self, seg_bytes: &[u8]) -> (u8, usize) {
         if self.backend.is_readonly() {
             self.stats.errors += 1;
             return (VIRTIO_BLK_S_IOERR, 0);
         }
-        let offset = sector * 512;
-        let capacity = self.backend.capacity();
-        if offset >= capacity {
+        let Some(segs) = Self::parse_dwz_segments(seg_bytes, self.config.max_discard_seg) else {
+            self.stats.errors += 1;
+            return (VIRTIO_BLK_S_IOERR, 0);
+        };
+        for seg in segs {
+            // `unmap` (and any other flag) is reserved 0 for discard.
+            let Some((offset, len)) = (seg.flags == 0)
+                .then(|| self.dwz_range(seg, self.config.max_discard_sectors))
+                .flatten()
+            else {
+                self.stats.errors += 1;
+                return (VIRTIO_BLK_S_IOERR, 0);
+            };
+            if self.backend.trim(offset, len).is_err() {
+                self.stats.errors += 1;
+                return (VIRTIO_BLK_S_IOERR, 0);
+            }
+        }
+        self.stats.discards += 1;
+        (VIRTIO_BLK_S_OK, 0)
+    }
+
+    /// Zero the ranges named by the segment descriptors. A modern guest issues
+    /// `VIRTIO_BLK_T_WRITE_ZEROES` to clear a range (mkfs, partition wipes, swap
+    /// init) far more efficiently than streaming an all-zero payload. We always
+    /// write real zeros (so it is correct for every backend), in capped chunks
+    /// so a large request never allocates a huge buffer. The only accepted flag
+    /// is `unmap`, which we honour by still producing zeros.
+    fn handle_write_zeroes(&mut self, seg_bytes: &[u8]) -> (u8, usize) {
+        if self.backend.is_readonly() {
             self.stats.errors += 1;
             return (VIRTIO_BLK_S_IOERR, 0);
         }
-        // Clamp the range to the device so we never write past the end.
-        let mut remaining = len_bytes.min(capacity - offset);
-        let mut at = offset;
+        let Some(segs) = Self::parse_dwz_segments(seg_bytes, self.config.max_write_zeroes_seg)
+        else {
+            self.stats.errors += 1;
+            return (VIRTIO_BLK_S_IOERR, 0);
+        };
         let chunk_size: u64 = 64 * 1024;
-        let zeros = vec![0u8; usize_of(chunk_size.min(remaining.max(1)))];
-        while remaining > 0 {
-            let this = usize_of(remaining.min(chunk_size));
-            match self.backend.write_at(at, &zeros[..this]) {
-                Ok(n) if n == this => {}
-                _ => {
-                    self.stats.errors += 1;
-                    return (VIRTIO_BLK_S_IOERR, 0);
-                }
+        let zeros = vec![0u8; usize_of(chunk_size)];
+        for seg in segs {
+            // Only the `unmap` bit is defined; reject any other reserved bits.
+            if seg.flags & !VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP != 0 {
+                self.stats.errors += 1;
+                return (VIRTIO_BLK_S_IOERR, 0);
             }
-            at += this as u64;
-            remaining -= this as u64;
+            let Some((offset, len)) = self.dwz_range(seg, self.config.max_write_zeroes_sectors)
+            else {
+                self.stats.errors += 1;
+                return (VIRTIO_BLK_S_IOERR, 0);
+            };
+            let mut at = offset;
+            let mut remaining = len;
+            while remaining > 0 {
+                let this = usize_of(remaining.min(chunk_size));
+                match self.backend.write_at(at, &zeros[..this]) {
+                    Ok(n) if n == this => {}
+                    _ => {
+                        self.stats.errors += 1;
+                        return (VIRTIO_BLK_S_IOERR, 0);
+                    }
+                }
+                at += this as u64;
+                remaining -= this as u64;
+            }
         }
         self.stats.write_zeroes += 1;
         (VIRTIO_BLK_S_OK, 0)
@@ -415,6 +515,17 @@ mod tests {
         bytes.extend_from_slice(&req_type.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes()); // reserved
         bytes.extend_from_slice(&sector.to_le_bytes());
+        bytes
+    }
+
+    /// Build a `virtio_blk_discard_write_zeroes` segment buffer (16 bytes each).
+    fn make_dwz(segments: &[(u64, u32, u32)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for &(sector, num_sectors, flags) in segments {
+            bytes.extend_from_slice(&sector.to_le_bytes());
+            bytes.extend_from_slice(&num_sectors.to_le_bytes());
+            bytes.extend_from_slice(&flags.to_le_bytes());
+        }
         bytes
     }
 
@@ -463,17 +574,38 @@ mod tests {
     #[test]
     fn test_discard() {
         let mut dev = make_device();
-        // Write data first
-        let header = make_header(VIRTIO_BLK_T_OUT, 0);
-        let mut data = vec![0xFF; 512];
-        let _ = dev.process_request(&header, &mut data);
-
-        // Discard sector 0
+        // The discard range comes from the data-buffer descriptor, not the
+        // header sector — discard sectors 0..2 (1 KiB).
         let header = make_header(VIRTIO_BLK_T_DISCARD, 0);
-        let mut buf = vec![0u8; 512];
+        let mut buf = make_dwz(&[(0, 2, 0)]);
         let (status, _) = dev.process_request(&header, &mut buf);
         assert_eq!(status, VIRTIO_BLK_S_OK);
         assert_eq!(dev.stats().discards, 1);
+    }
+
+    #[test]
+    fn test_discard_multiple_segments() {
+        let mut dev = make_device();
+        let header = make_header(VIRTIO_BLK_T_DISCARD, 0);
+        let mut buf = make_dwz(&[(0, 1, 0), (8, 1, 0), (16, 2, 0)]);
+        let (status, _) = dev.process_request(&header, &mut buf);
+        assert_eq!(status, VIRTIO_BLK_S_OK);
+        assert_eq!(dev.stats().discards, 1);
+    }
+
+    #[test]
+    fn test_discard_rejects_unmap_flag_and_bad_buffer() {
+        let mut dev = make_device();
+        let header = make_header(VIRTIO_BLK_T_DISCARD, 0);
+        // unmap is reserved for discard.
+        let mut buf = make_dwz(&[(0, 1, VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP)]);
+        assert_eq!(dev.process_request(&header, &mut buf).0, VIRTIO_BLK_S_IOERR);
+        // A buffer that is not a whole number of segments is malformed.
+        let mut bad = vec![0u8; 17];
+        assert_eq!(dev.process_request(&header, &mut bad).0, VIRTIO_BLK_S_IOERR);
+        // Out-of-range sector.
+        let mut oob = make_dwz(&[(1_000_000, 1, 0)]);
+        assert_eq!(dev.process_request(&header, &mut oob).0, VIRTIO_BLK_S_IOERR);
     }
 
     #[test]
@@ -481,15 +613,15 @@ mod tests {
         let mut dev = make_device();
         assert!(dev.features().contains(BlockFeatures::WRITE_ZEROES));
 
-        // Fill sectors 0 and 1 (1KB) with 0xFF.
+        // Fill sectors 0 and 1 (1 KiB) with 0xFF.
         let header = make_header(VIRTIO_BLK_T_OUT, 0);
         let mut data = vec![0xFF; 1024];
         let (status, _) = dev.process_request(&header, &mut data);
         assert_eq!(status, VIRTIO_BLK_S_OK);
 
-        // WRITE_ZEROES the 1KB starting at sector 0 (range = data_buf length).
+        // WRITE_ZEROES sectors 0..2 — the range comes from the descriptor.
         let header = make_header(VIRTIO_BLK_T_WRITE_ZEROES, 0);
-        let mut buf = vec![0u8; 1024];
+        let mut buf = make_dwz(&[(0, 2, 0)]);
         let (status, _) = dev.process_request(&header, &mut buf);
         assert_eq!(status, VIRTIO_BLK_S_OK);
         assert_eq!(dev.stats().write_zeroes, 1);
@@ -504,11 +636,35 @@ mod tests {
     }
 
     #[test]
+    fn test_write_zeroes_accepts_unmap_flag() {
+        let mut dev = make_device();
+        let header = make_header(VIRTIO_BLK_T_OUT, 0);
+        let mut data = vec![0xFF; 512];
+        let _ = dev.process_request(&header, &mut data);
+
+        // unmap is a valid flag for write-zeroes; we still produce zeros.
+        let header = make_header(VIRTIO_BLK_T_WRITE_ZEROES, 0);
+        let mut buf = make_dwz(&[(0, 1, VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP)]);
+        let (status, _) = dev.process_request(&header, &mut buf);
+        assert_eq!(status, VIRTIO_BLK_S_OK);
+
+        let header = make_header(VIRTIO_BLK_T_IN, 0);
+        let mut readback = vec![0xAAu8; 512];
+        dev.process_request(&header, &mut readback);
+        assert!(readback.iter().all(|&b| b == 0), "unmap range was zeroed");
+
+        // A reserved (non-unmap) flag bit is rejected.
+        let header = make_header(VIRTIO_BLK_T_WRITE_ZEROES, 0);
+        let mut bad = make_dwz(&[(0, 1, 0x2)]);
+        assert_eq!(dev.process_request(&header, &mut bad).0, VIRTIO_BLK_S_IOERR);
+    }
+
+    #[test]
     fn test_write_zeroes_rejected_on_readonly() {
         let backend = Arc::new(MemoryBackend::new_readonly(vec![0xFFu8; 1_048_576]));
         let mut dev = VirtioBlockDevice::new(backend, "ro-disk");
         let header = make_header(VIRTIO_BLK_T_WRITE_ZEROES, 0);
-        let mut buf = vec![0u8; 512];
+        let mut buf = make_dwz(&[(0, 1, 0)]);
         let (status, _) = dev.process_request(&header, &mut buf);
         assert_eq!(status, VIRTIO_BLK_S_IOERR);
         assert_eq!(dev.stats().write_zeroes, 0);
@@ -556,11 +712,11 @@ mod tests {
         assert!(dev.features().contains(BlockFeatures::WRITE_ZEROES));
         // max_discard_sectors @ 36, max_discard_seg @ 40, alignment @ 44.
         assert_eq!(dev.read_config(36, 4), 0x0040_0000);
-        assert_eq!(dev.read_config(40, 4), 1);
+        assert_eq!(dev.read_config(40, 4), 256);
         assert_eq!(dev.read_config(44, 4), 1);
         // max_write_zeroes_sectors @ 48, seg @ 52, may_unmap @ 56.
         assert_eq!(dev.read_config(48, 4), 0x0040_0000);
-        assert_eq!(dev.read_config(52, 4), 1);
+        assert_eq!(dev.read_config(52, 4), 256);
         assert_eq!(dev.read_config(56, 1), 0);
         // Earlier fields are unmoved: blk_size still at 20.
         assert_eq!(dev.read_config(20, 4), 512);
