@@ -12,6 +12,15 @@ pub const FW_CFG_PORT_SEL: u16 = 0x0510;
 pub const FW_CFG_PORT_DATA: u16 = 0x0511;
 pub const FW_CFG_PORT_DMA: u16 = 0x0514;
 
+/// `fw_cfg` feature bits returned by the `ID` selector (`FW_CFG_ID`).
+/// Bit 0 = traditional selector/data port I/O; bit 1 = the DMA interface at
+/// [`FW_CFG_PORT_DMA`].
+pub const FW_CFG_FEATURE_TRADITIONAL: u32 = 1 << 0;
+/// The DMA interface feature bit (`FW_CFG_VERSION_DMA`). Not advertised while
+/// the DMA port is unmodelled — a firmware that sees this bit set would try to
+/// drive [`FW_CFG_PORT_DMA`] and stall.
+pub const FW_CFG_FEATURE_DMA: u32 = 1 << 1;
+
 /// `fw_cfg` item selectors
 pub mod selector {
     pub const SIGNATURE: u16 = 0x0000;
@@ -163,8 +172,13 @@ impl FwCfgDevice {
         match self.current_selector {
             selector::SIGNATURE => b"QEMU".to_vec(),
             selector::ID => {
-                // Features: traditional I/O + DMA
-                vec![0x03, 0x00, 0x00, 0x00]
+                // Advertise only the features we actually implement: the
+                // traditional selector/data port path. The DMA interface
+                // (`FW_CFG_FEATURE_DMA`) is deliberately NOT set because the DMA
+                // port (0x514) is unmodelled — advertising it would make a
+                // DMA-capable firmware (OVMF/SeaBIOS) drive the DMA registers and
+                // stall instead of falling back to the working port-I/O path.
+                FW_CFG_FEATURE_TRADITIONAL.to_le_bytes().to_vec()
             }
             selector::FILE_DIR => self.build_file_directory(),
             sel => {
@@ -272,6 +286,26 @@ mod tests {
         assert_eq!(dev.read_data(), 0xBE);
         assert_eq!(dev.read_data(), 0xEF);
         assert_eq!(dev.read_data(), 0); // past end
+    }
+
+    #[test]
+    fn id_register_advertises_traditional_io_but_not_dma() {
+        let mut dev = FwCfgDevice::new();
+        dev.write_selector(selector::ID);
+        let features = u32::from_le_bytes([
+            dev.read_data(),
+            dev.read_data(),
+            dev.read_data(),
+            dev.read_data(),
+        ]);
+        // Traditional port I/O is implemented and advertised...
+        assert_eq!(
+            features & FW_CFG_FEATURE_TRADITIONAL,
+            FW_CFG_FEATURE_TRADITIONAL
+        );
+        // ...but the DMA interface is not modelled, so it must NOT be advertised,
+        // or a DMA-capable firmware would drive the unhandled DMA port and stall.
+        assert_eq!(features & FW_CFG_FEATURE_DMA, 0);
     }
 
     #[test]
