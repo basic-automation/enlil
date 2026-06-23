@@ -157,6 +157,31 @@ impl HdaCodec {
         }
     }
 
+    /// Root node (NID 0) `GET_PARAMETER` responses.
+    #[must_use]
+    const fn root_param(&self, param: u32) -> u32 {
+        match param {
+            0x00 => self.vendor_id,   // Vendor ID
+            0x02 => self.revision_id, // Revision ID
+            0x04 => 0x0001_0001,      // Subordinate node count
+            _ => 0,
+        }
+    }
+
+    /// Audio Function Group (NID 1) `GET_PARAMETER` responses.
+    #[must_use]
+    fn afg_param(&self, param: u32) -> u32 {
+        match param {
+            // Node count: start NID (0x02) in [23:16] and widget count in [7:0].
+            0x04 => (0x02 << 16) | u32_of(self.widgets.len()),
+            // Function group type (Audio), supported PCM sizes/rates, and
+            // supported stream formats all report 1 here.
+            0x05 | 0x08 | 0x09 => 0x01,
+            0x0A => 0x0001_0041, // Audio widget capabilities (for the group)
+            _ => 0,
+        }
+    }
+
     /// Process a codec verb and return the response
     #[must_use]
     pub fn process_verb(&mut self, verb: u32) -> u32 {
@@ -183,32 +208,9 @@ impl HdaCodec {
         };
 
         match (nid, verb_id) {
-            // Root node (NID 0): parameters
-            (0x00, 0xF00) => {
-                let param = payload & 0xFF;
-                match param {
-                    0x00 => self.vendor_id,   // Vendor ID
-                    0x02 => self.revision_id, // Revision ID
-                    0x04 => 0x0001_0001,      // Subordinate node count
-                    _ => 0,
-                }
-            }
-            // Audio Function Group (NID 1)
-            (0x01, 0xF00) => {
-                let param = payload & 0xFF;
-                match param {
-                    0x04 => {
-                        // Node count: start NID and count
-                        let count = u32_of(self.widgets.len());
-                        (0x02 << 16) | count
-                    }
-                    // Function group type (Audio), supported PCM sizes/rates, and
-                    // supported stream formats all report 1 here.
-                    0x05 | 0x08 | 0x09 => 0x01,
-                    0x0A => 0x0001_0041, // Audio widget capabilities (for the group)
-                    _ => 0,
-                }
-            }
+            // Root node (NID 0) and Audio Function Group (NID 1) parameters.
+            (0x00, 0xF00) => self.root_param(payload & 0xFF),
+            (0x01, 0xF00) => self.afg_param(payload & 0xFF),
             // Widget parameter query
             (nid, 0xF00) => {
                 let param = payload & 0xFF;
@@ -241,6 +243,20 @@ impl HdaCodec {
             (nid, 0x706) => {
                 if let Some(w) = self.widgets.iter_mut().find(|w| w.nid == nid) {
                     w.stream_channel = (payload & 0xFF) as u8;
+                }
+                0
+            }
+            // Get Converter Format (12-bit verb 0xA) — the 16-bit stream format
+            // the driver programs alongside the stream/channel on stream setup.
+            (nid, 0x00A) => self
+                .widgets
+                .iter()
+                .find(|w| w.nid == nid)
+                .map_or(0, |w| u32::from(w.format)),
+            // Set Converter Format (4-bit verb 0x2, 16-bit format payload).
+            (nid, 0x2) => {
+                if let Some(w) = self.widgets.iter_mut().find(|w| w.nid == nid) {
+                    w.format = (payload & 0xFFFF) as u16;
                 }
                 0
             }
@@ -366,5 +382,18 @@ mod tests {
         // The 4-bit Set Amp Gain verb (0x3) is still classified as 4-bit and
         // returns the codec's amp response rather than being treated as 12-bit.
         assert_eq!(codec.process_verb((nid << 20) | 0x0003_B000), 0x7F);
+    }
+
+    /// Set/Get Converter Format round-trips: the 4-bit Set verb (0x2) stores the
+    /// 16-bit stream format and the 12-bit Get verb (0xA) reads it back.
+    #[test]
+    fn converter_format_round_trips() {
+        let mut codec = HdaCodec::new_realtek();
+        let nid = 0x02u32; // a DAC, reset format 0x0011 (48 kHz/16-bit stereo)
+        // Get Converter Format (verb 0xA -> bits[19:8] = 0x00A).
+        assert_eq!(codec.process_verb((nid << 20) | 0x0000_0A00), 0x0011);
+        // Set Converter Format (4-bit verb 0x2, 16-bit payload) = 0x4031.
+        assert_eq!(codec.process_verb((nid << 20) | 0x0002_4031), 0);
+        assert_eq!(codec.process_verb((nid << 20) | 0x0000_0A00), 0x4031);
     }
 }
