@@ -364,6 +364,35 @@ impl PciConfigSpace {
         self.read_u16(MSI_CAP_OFFSET + 2) & 0x0001 != 0
     }
 
+    /// The MSI message the guest has programmed into the MSI capability, or
+    /// `None` if the capability is absent or MSI is disabled.
+    ///
+    /// This is the read side of MSI delivery: a device that wants to raise its
+    /// interrupt while the guest has enabled MSI builds this `(address, data)`
+    /// message and hands it to the interrupt path (the emulated
+    /// [`InterruptController::deliver_msi`](crate::interrupt::InterruptController::deliver_msi)
+    /// or, on the KVM backend, `KVM_SIGNAL_MSI`) instead of asserting `INTx`.
+    /// Both the 32-bit and 64-bit capability layouts are handled — the Message
+    /// Data lives at +8 or +12 depending on the 64-bit-capable bit.
+    #[must_use]
+    pub fn msi_message(&self) -> Option<crate::interrupt::MsiMessage> {
+        if self.read_u8(MSI_CAP_OFFSET) != 0x05 || !self.msi_enabled() {
+            return None;
+        }
+        let is_64bit = self.read_u16(MSI_CAP_OFFSET + 2) & 0x0080 != 0;
+        let addr_lo = u64::from(self.read_u32(MSI_CAP_OFFSET + 4));
+        let (address, data) = if is_64bit {
+            let addr_hi = u64::from(self.read_u32(MSI_CAP_OFFSET + 8));
+            (
+                addr_lo | (addr_hi << 32),
+                u32::from(self.read_u16(MSI_CAP_OFFSET + 12)),
+            )
+        } else {
+            (addr_lo, u32::from(self.read_u16(MSI_CAP_OFFSET + 8)))
+        };
+        Some(crate::interrupt::MsiMessage::new(address, data))
+    }
+
     /// Add an **MSI-X capability** (Capability ID 0x11) at the head of the
     /// capabilities list, chaining to whatever was previously the head.
     ///
@@ -1832,6 +1861,31 @@ mod tests {
         assert_eq!(cs.pci_express_device_type(), pcie_type::ENDPOINT);
         assert_eq!(cs.pci_express_version(), 2);
         assert!(!cs.msi_enabled(), "MSI present but disabled until programmed");
+    }
+
+    /// `msi_message` is the read side of MSI delivery: nothing until the guest
+    /// enables MSI, then the exact programmed 64-bit address + vector — the
+    /// message a device hands to the interrupt path instead of asserting `INTx`.
+    #[test]
+    fn msi_message_reflects_programmed_address_and_vector() {
+        let mut cs = PcieRootComplex::create_xhci_controller(PciBdf::new(0, 0x14, 0), 0xFE90_0000);
+        assert!(cs.msi_message().is_none(), "disabled MSI yields no message");
+
+        // Guest programs a 64-bit MSI to LAPIC 0, vector 0x42, then enables it.
+        cs.guest_write_u32(MSI_CAP_OFFSET + 4, 0xFEE0_0000); // address low
+        cs.guest_write_u32(MSI_CAP_OFFSET + 8, 0x0000_0000); // address high
+        cs.guest_write(MSI_CAP_OFFSET + 12, 2, 0x0042); // data: vector 0x42
+        cs.guest_write(MSI_CAP_OFFSET + 2, 2, 0x0081); // 64-bit + enable
+
+        let msg = cs.msi_message().expect("enabled MSI yields a message");
+        assert_eq!(msg.address, 0xFEE0_0000);
+        assert_eq!(msg.data, 0x42);
+        assert_eq!(msg.vector(), 0x42);
+        assert_eq!(msg.destination_id(), 0);
+
+        // Clearing the enable bit silences it again.
+        cs.guest_write(MSI_CAP_OFFSET + 2, 2, 0x0080);
+        assert!(cs.msi_message().is_none());
     }
 
     /// The device-identity registers are read-only to a guest: a guest write
