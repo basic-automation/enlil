@@ -5,7 +5,7 @@
 use super::StorageBackend;
 use anyhow::Result;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::sync::Mutex;
 
 /// A storage backend backed by a raw file on disk.
@@ -60,9 +60,23 @@ impl StorageBackend for RawFileBackend {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
         let mut file = self.file.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         file.seek(SeekFrom::Start(offset))?;
-        let n = file.read(buf)?;
+        // A single `read` may return fewer bytes than requested, which would
+        // leave part of a guest sector holding stale buffer data. Loop until the
+        // buffer is full or we hit EOF, then zero-fill the remainder: a read
+        // inside a fixed-capacity (possibly sparse) image returns zeros for any
+        // not-yet-written region, exactly like a real disk.
+        let mut total = 0;
+        while total < buf.len() {
+            match file.read(&mut buf[total..]) {
+                Ok(0) => break, // EOF (sparse/short image): the rest reads as 0.
+                Ok(n) => total += n,
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        buf[total..].fill(0);
         drop(file);
-        Ok(n)
+        Ok(buf.len())
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize> {
@@ -71,9 +85,11 @@ impl StorageBackend for RawFileBackend {
         }
         let mut file = self.file.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         file.seek(SeekFrom::Start(offset))?;
-        let n = file.write(buf)?;
+        // `write_all` loops over short writes so a whole sector is never left
+        // partially written.
+        file.write_all(buf)?;
         drop(file);
-        Ok(n)
+        Ok(buf.len())
     }
 
     fn flush(&self) -> Result<()> {
@@ -123,6 +139,26 @@ mod tests {
         let read = backend.read_at(0, &mut buf).unwrap();
         assert_eq!(read, data.len());
         assert_eq!(&buf, data);
+    }
+
+    #[test]
+    fn read_past_written_data_returns_zeros() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sparse.raw");
+        let backend = RawFileBackend::create(path.to_str().unwrap(), 4096).unwrap();
+        // Write a marker near the start; the rest of the image is a sparse hole.
+        backend.write_at(0, b"abcd").unwrap();
+
+        // A read of a never-written, in-capacity region returns all zeros and
+        // fills the whole buffer (not a short read of stale data).
+        let mut buf = [0xFFu8; 64];
+        assert_eq!(backend.read_at(2000, &mut buf).unwrap(), 64);
+        assert!(buf.iter().all(|&b| b == 0), "unwritten region reads as zeros");
+
+        // A read spanning the end of the image is zero-filled past EOF.
+        let mut tail = [0xFFu8; 256];
+        assert_eq!(backend.read_at(4000, &mut tail).unwrap(), 256); // 4000+256 > 4096
+        assert!(tail.iter().all(|&b| b == 0));
     }
 
     #[test]
