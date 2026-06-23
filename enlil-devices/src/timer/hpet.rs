@@ -64,8 +64,10 @@ pub struct HpetTimer {
     pub comparator: u64,
     /// FSB interrupt route register.
     pub fsb_route: u64,
-    /// Accumulated value for periodic mode.
-    accumulator: u64,
+    /// Period (the increment added to `comparator` after each fire) in periodic
+    /// mode. Programmed via a comparator write while `TN_VAL_SET_CNF` is set, or
+    /// any comparator write in periodic mode (per the IA-PC HPET spec §2.3.9.2.2).
+    period: u64,
     /// Timer index (0-based).
     index: usize,
 }
@@ -79,7 +81,7 @@ impl HpetTimer {
             config: cap,
             comparator: 0,
             fsb_route: 0,
-            accumulator: 0,
+            period: 0,
             index,
         }
     }
@@ -230,10 +232,20 @@ impl Hpet {
                                 (timer.config & read_only_mask) | (value & writable_mask);
                         }
                         0x08 => {
-                            timer.comparator = value;
-                            if timer.is_periodic() {
-                                timer.accumulator = value;
+                            // IA-PC HPET §2.3.9.2.2: the comparator (next-fire)
+                            // is written for a one-shot timer, or for a periodic
+                            // timer while TN_VAL_SET_CNF (bit 6) is set; a
+                            // periodic timer always (re)programs its period from
+                            // the same write so software can change the interval
+                            // without disturbing the current comparator. The
+                            // value-set bit auto-clears after the write.
+                            if !timer.is_periodic() || timer.config & (1 << 6) != 0 {
+                                timer.comparator = value;
                             }
+                            if timer.is_periodic() {
+                                timer.period = value;
+                            }
+                            timer.config &= !(1 << 6);
                         }
                         0x10 => timer.fsb_route = value,
                         _ => {}
@@ -262,9 +274,10 @@ impl Hpet {
             }
 
             let did_fire = if timer.is_periodic() {
-                // Periodic: check if counter crossed accumulator
-                if old_counter < timer.accumulator && self.counter >= timer.accumulator {
-                    timer.accumulator = timer.accumulator.wrapping_add(timer.comparator);
+                // Periodic: fire when the counter crosses the comparator, then
+                // advance the comparator by the programmed period.
+                if old_counter < timer.comparator && self.counter >= timer.comparator {
+                    timer.comparator = timer.comparator.wrapping_add(timer.period);
                     true
                 } else {
                     false
@@ -457,6 +470,46 @@ mod tests {
         let fired = hpet.tick(150);
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].0, 0); // timer index
+    }
+
+    #[test]
+    fn hpet_periodic_fires_each_period_with_setval_semantics() {
+        let mut hpet = Hpet::new();
+        // Timer 0: interrupt enable (bit 2), periodic (bit 3), value-set (bit 6).
+        hpet.write(0x100, (1 << 2) | (1 << 3) | (1 << 6));
+        // First comparator write while TN_VAL_SET is set: programs both the
+        // first-fire comparator (100) and the period (100); the bit auto-clears.
+        hpet.write(0x108, 100);
+        assert_eq!(
+            hpet.timer(0).unwrap().config & (1 << 6),
+            0,
+            "TN_VAL_SET_CNF auto-clears after the comparator write"
+        );
+        hpet.write(0x010, 1); // enable the main counter
+
+        // Crosses 100 -> fires; comparator advances by the period to 200.
+        assert_eq!(hpet.tick(150).len(), 1);
+        assert_eq!(hpet.timer(0).unwrap().comparator, 200);
+        // Crosses 200 (counter 250) -> fires; comparator -> 300.
+        assert_eq!(hpet.tick(100).len(), 1);
+        // No crossing yet (counter 290 < 300).
+        assert_eq!(hpet.tick(40).len(), 0);
+        // Crosses 300 (counter 310) -> fires; comparator -> 400.
+        assert_eq!(hpet.tick(20).len(), 1);
+        assert_eq!(hpet.timer(0).unwrap().comparator, 400);
+
+        // A comparator write WITHOUT setting TN_VAL_SET changes only the period,
+        // not the pending comparator.
+        hpet.write(0x108, 50);
+        assert_eq!(
+            hpet.timer(0).unwrap().comparator,
+            400,
+            "comparator unchanged when TN_VAL_SET is clear"
+        );
+        // Counter is 310; cross 400 -> fires; comparator advances by the NEW
+        // period (50) to 450.
+        assert_eq!(hpet.tick(100).len(), 1);
+        assert_eq!(hpet.timer(0).unwrap().comparator, 450);
     }
 
     #[test]

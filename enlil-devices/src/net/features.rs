@@ -66,6 +66,7 @@ impl NetFeatures {
         | Self::MRG_RXBUF
         | Self::CSUM
         | Self::GUEST_CSUM
+        | Self::CTRL_GUEST_OFFLOADS
         | Self::CTRL_VQ
         | Self::CTRL_RX
         | Self::CTRL_VLAN;

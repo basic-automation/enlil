@@ -57,6 +57,17 @@ pub struct BlockConfig {
     pub sectors: u8,
     /// Block size (if `BLK_SIZE`).
     pub blk_size: u32,
+    /// Topology (if `TOPOLOGY`): log2 of logical blocks per physical block.
+    /// `3` => 8 * 512 B = a 4096-byte physical block (advanced-format 512e).
+    pub physical_block_exp: u8,
+    /// Topology: offset of the first aligned logical block within a physical
+    /// block, in logical blocks (0 = aligned).
+    pub alignment_offset: u8,
+    /// Topology: minimum I/O size without a read-modify-write penalty, in
+    /// logical blocks (8 => 4096 B, matching the physical block).
+    pub min_io_size: u16,
+    /// Topology: optimal sustained I/O size in logical blocks (0 = unspecified).
+    pub opt_io_size: u32,
     /// Max discard size in 512-byte sectors (if `DISCARD`).
     pub max_discard_sectors: u32,
     /// Max number of discard segments per request (if `DISCARD`).
@@ -186,6 +197,10 @@ impl VirtioBlockDevice {
         }
 
         features |= BlockFeatures::DISCARD | BlockFeatures::WRITE_ZEROES;
+        // Advertise an advanced-format (512e) topology: 512-byte logical blocks
+        // over a 4096-byte physical block, so a guest aligns its I/O to 4K and
+        // avoids read-modify-write on the backing store.
+        features |= BlockFeatures::TOPOLOGY;
 
         let config = BlockConfig {
             capacity: capacity / 512,
@@ -195,6 +210,11 @@ impl VirtioBlockDevice {
             heads: 0,
             sectors: 0,
             blk_size: 512,
+            // Advanced-format 512e topology: 4096-byte physical block.
+            physical_block_exp: 3,
+            alignment_offset: 0,
+            min_io_size: 8, // 8 * 512 B = 4096 B
+            opt_io_size: 0,
             // Advertise usable limits for the DISCARD/WRITE_ZEROES features
             // above: a guest reads these config fields and treats a zero limit
             // as "feature present but unusable", so they must be non-zero. We
@@ -298,7 +318,11 @@ impl VirtioBlockDevice {
         bytes.push(self.config.heads); // 18
         bytes.push(self.config.sectors); // 19
         bytes.extend_from_slice(&self.config.blk_size.to_le_bytes()); // 20
-        bytes.extend_from_slice(&[0u8; 8]); // 24: topology (unadvertised)
+        // 24..32: topology (struct virtio_blk_topology).
+        bytes.push(self.config.physical_block_exp); // 24
+        bytes.push(self.config.alignment_offset); // 25
+        bytes.extend_from_slice(&self.config.min_io_size.to_le_bytes()); // 26
+        bytes.extend_from_slice(&self.config.opt_io_size.to_le_bytes()); // 28
         bytes.push(0); // 32: writeback
         bytes.push(0); // 33: unused0
         bytes.extend_from_slice(&0u16.to_le_bytes()); // 34: num_queues
@@ -700,6 +724,23 @@ mod tests {
         // blk_size at offset 20, 4 bytes
         let blk_size = dev.read_config(20, 4);
         assert_eq!(blk_size, 512);
+    }
+
+    #[test]
+    fn test_config_reports_advanced_format_topology() {
+        let dev = make_device();
+        // We advertise TOPOLOGY, so the guest reads the 512e topology fields.
+        assert!(dev.features().contains(BlockFeatures::TOPOLOGY));
+        // physical_block_exp @ 24 (1 byte) = 3 -> 4096-byte physical block.
+        assert_eq!(dev.read_config(24, 1), 3);
+        // alignment_offset @ 25 = 0.
+        assert_eq!(dev.read_config(25, 1), 0);
+        // min_io_size @ 26 (2 bytes) = 8 logical blocks (4096 B).
+        assert_eq!(dev.read_config(26, 2), 8);
+        // opt_io_size @ 28 (4 bytes) = 0 (unspecified).
+        assert_eq!(dev.read_config(28, 4), 0);
+        // The discard fields after the topology block are still at offset 36.
+        assert_eq!(dev.read_config(36, 4), 0x0040_0000);
     }
 
     #[test]

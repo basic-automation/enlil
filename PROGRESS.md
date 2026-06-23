@@ -6,6 +6,140 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-23 — Session: PCI MSI-X + PCIe-capability fidelity (Phase 3) and a broad device-correctness sweep (4 real bug fixes)
+
+**13 tested increments + 1 `cargo fmt` commit, each independently green and
+committed** (branch `routine/enlil-2026-06-23`, PR https://github.com/physics515/enlil/pull/37). Wall-clock
+~00:39→~01:50 (~70 min of building, builds overlapped in the background). Two
+threads: (1) finished the **PCI MSI-X capability** flagged as 2026-06-22's
+next-step #5 and built out the surrounding PCIe-endpoint capability fidelity;
+then (2) a broad device-correctness sweep that fixed **four real bugs** (HDA
+verb decoder, fw_cfg DMA advertisement, RawFileBackend short transfers, HPET
+periodic comparator/period). Every increment is host-agnostic
+(`enlil-devices`) and built on **both** toolchains.
+
+### Increments (commit — what)
+1. `41703eb` — **PCI MSI-X capability (cap ID 0x11) + BAR-backed `MsixTable`/PBA
+   model.** Cap at config 0x70 (Table Size / Table+PBA Offset+BIR per PCI Local
+   Bus §6.8.2); guest may toggle Enable/Function-Mask but not resize/relocate the
+   table (read-only geometry restored after each guest write). `MsixTable`: 16-byte
+   `MsixEntry` vectors + PBA; vectors reset masked; `signal()` returns the message
+   when deliverable or defers it into the PBA, `take_pending()` replays on unmask. +6.
+2. `fa3565b` — **PCI Express Capability (cap ID 0x10, v2).** The structure that
+   makes a function a *PCIe* function; advertises Device/Port Type, 256-B max
+   payload, 2.5 GT/s x1 link. `pci_express_version`/`_device_type`. +2.
+3. `26aa136` — **xHCI advertises PM + MSI + PCI-Express (Endpoint) caps** (was
+   PM-only), matching a real Renesas uPD720201 enumeration. +1.
+4. `b25d1e4` — **`PciConfigSpace::msi_message()`** extracts the programmed MSI
+   (address, data) — the read side of MSI delivery; handles 32- and 64-bit cap
+   layouts. +1.
+5. `d343448` — **BUG FIX: HDA verb decoder.** It classified top-nibble `0x1..=0x7`
+   as 4-bit verbs, but per HDA §7.3.3 only `0x2`/`0x3` are; every 0x4xx-0x7xx Set
+   verb (0x705 power, 0x706 stream/channel, 0x707 pin control) was collapsed to a
+   4-bit `0x7` and dropped — their handlers were unreachable dead code. Decode now
+   keys on `{0x2,0x3}`; pin-control + power-state round-trip on top. +4.
+6. `e09974f` — **HDA Set/Get Converter Format (0x2/0xA) round-trip** (the `format`
+   field existed but no verb touched it); extracted root/AFG param helpers. +1.
+7. `58566d0` — **virtio-net `CTRL_GUEST_OFFLOADS`** (class-5 control command +
+   feature) so a guest can toggle receive offloads at runtime; validates the
+   requested bitmap is a subset of the negotiated `GUEST_*` offloads. +1.
+8. `25c831b` — **xHCI PORTSC write fidelity** (xHCI §5.4.8): PED RW1CS (disable),
+   PLS only updates under LWS with PLC latched on U3→U0 resume, wake-enable bits
+   now RW. +2.
+9. `62ba1c6` — **virtio-blk `VIRTIO_BLK_F_TOPOLOGY`** (advanced-format 512e:
+   4096-B physical block) so a guest aligns I/O and avoids backing-store RMW. +1.
+10. `7cdbe39` — **BUG FIX: fw_cfg ID register** advertised `0x03` (port I/O **+
+    DMA**) but the DMA port (0x514) is unmodelled — a DMA-capable firmware would
+    drive the dead DMA registers and stall. Now advertises traditional I/O only. +1.
+11. `f4b2f91` — **virtio-net sets RX `VIRTIO_NET_HDR_F_DATA_VALID` for GUEST_CSUM**
+    (made the offload meaningful + gave `active_offloads` a consumer and a correct
+    "active by default" initialisation). +3.
+12. `6129618` — **BUG FIX: RawFileBackend short transfers.** `read_at`/`write_at`
+    used a single `read`/`write`, which can transfer fewer bytes than requested —
+    silent sector corruption. Now a read-loop (zero-filling past EOF like a sparse
+    disk) + `write_all`. +1.
+13. `2a1b6f5` — **BUG FIX: HPET periodic comparator/period.** It conflated the
+    comparator with the period and ignored `TN_VAL_SET_CNF`, so Linux/Windows
+    periodic programming clobbered the first-fire time and a comparator read
+    returned the period. Implemented IA-PC HPET §2.3.9.2.2 (QEMU-matching)
+    semantics. +1.
+14. `c2cd9e3` — **`cargo fmt --all`** (assert-wrapping in this session's tests;
+    formatting only).
+
+### Research (informed the build)
+No new external literature was logged — the work was driven by the existing
+ROADMAP/PROGRESS next-steps (MSI-X was 2026-06-22 #5) read against the relevant
+primary specs already cited in `RESEARCH.md`: **PCI Local Bus §6.8** (MSI/MSI-X
+capability + table/PBA), the **PCIe Base spec** (PCI Express Capability v2,
+PORTSC §5.4.8), the **Intel HD Audio spec §7.3** (verb encodings, pin/power/format
+verbs), the **virtio 1.x spec** (CTRL_GUEST_OFFLOADS, blk topology,
+`VIRTIO_NET_HDR_F_DATA_VALID`), the **QEMU `fw_cfg`/`hpet` models** (feature bits,
+periodic `TN_VAL_SET` semantics), and the **IA-PC HPET spec §2.3.9.2.2**. Nothing
+new to add to `RESEARCH.md`.
+
+### Test results (exact)
+- **`/dev/kvm`: read-writable at start and at wrap (`KVM_RW_OK` both times).** The
+  KVM/guest-boot tests **ran for real, none skipped** — full-workspace
+  `cargo test --workspace` shows **enlil-core 211 passed, 0 failed, 0 ignored**,
+  the `kvm_backend` suite (VM creation, MSR forward/round-trip, AMD topology
+  stealth leaves, PMU stealth, real-mode run-loop) executing on real `/dev/kvm`.
+  My changes are device-only (no KVM-backend code touched); the suite confirms no
+  regression and real execution.
+- **Full workspace CI-parity** (the `.github/workflows/ci.yml` commands):
+  `cargo fmt --all -- --check` → clean; `cargo clippy --all-targets --workspace -- -D
+  warnings` → exit 0; `cargo test --workspace` → all green, **0 failures, 0 skips**.
+  **enlil-devices 881** (was 857; +24 across the 13 increments), enlil-core 211,
+  plus the smaller crates. The `acpi_iasl_validation` / `smbios_dmidecode_validation`
+  reference-compiler gates **self-skip — `iasl`/`dmidecode` are NOT installed** on
+  this host (unchanged from prior runs).
+- **Toolchains:** every increment built/tested on **Linux/WSL** (nightly
+  `x86_64-unknown-linux-gnu`) AND built **Windows-native** (`x86_64-pc-windows-msvc`,
+  `cargo build -p enlil-devices` against the WSL manifest with the Windows
+  target-dir, run via PowerShell so the UNC path resolves) — **exit 0** after each.
+  All 13 increments are in the host-agnostic `enlil-devices` crate; no KVM-only
+  (`target_os = "linux"`) code was touched. (Note: the first run's Windows builds
+  were piped through `tail`, which masked cargo's exit code via Git-Bash UNC-path
+  mangling; switched to PowerShell with `$LASTEXITCODE` checks so a Windows pass is
+  never claimed without a real exit-0.)
+
+### STOP REASON
+**Diminishing clean, low-risk, unblocked increments in a mature codebase, plus
+wall-clock.** After landing the MSI-X/PCIe-capability work and sweeping the device
+subsystems for clear, cleanly-testable correctness gaps (PCIe, HDA, virtio-net,
+virtio-blk, xHCI registers, fw_cfg, storage backends, HPET — fixing the four bugs
+above), a broad survey of the remaining subsystems (SMBus, PIT, RTC, LAPIC, IOAPIC,
+DMA, the net switch, the chipset PM1a block, the inter-guest bridge channels) found
+them already complete and correct. The remaining high-value work is either
+**architectural / multi-session** — wiring MSI/MSI-X interrupt *delivery*
+end-to-end (the natural completion of tonight's cap+table; the KVM path needs
+`KVM_SIGNAL_MSI`, the emulated path the existing `InterruptController::deliver_msi`);
+a real guest-memory virtqueue transport; the threaded-vCPU watchdog — or **needs
+absent host tooling** (qemu-img / iasl / dmidecode / OVMF). Per the guardrails I did
+not start a risky late-night refactor (e.g. routing the `MsixTable` MMIO into the
+xHCI BAR on the live USB path, or qcow2 refcount-*table* growth) just to fill time.
+`master` stays buildable (green per increment).
+
+### Recommended next step (tomorrow)
+1. **Wire MSI/MSI-X interrupt *delivery*** — the highest-leverage continuation of
+   tonight's work. The read side exists (`PciConfigSpace::msi_message()`,
+   `MsixTable::signal/take_pending`); connect a device raising its interrupt while
+   the guest has MSI/MSI-X enabled to `InterruptController::deliver_msi` (emulated
+   path) and `KVM_SIGNAL_MSI` (KVM path) instead of asserting INTx. Start with the
+   xHCI (now MSI-capable). The two `interrupt::msi::{MsiCapability,MsixCapability}`
+   types are **orphaned scaffolding** (only re-exported + self-tested) overlapping
+   the new `pcie::MsixTable` — unify on the MMIO-faithful `MsixTable` as part of this.
+2. **Route the `MsixTable` MMIO into the xHCI BAR0** (table at a fixed offset, PBA
+   after it) so a guest can actually program the table — prerequisite for #1 on the
+   xHCI. Bounded but touches the USB MMIO dispatch; do it fresh, not at 2 a.m.
+3. **Install `qemu-img` + `acpica-tools` (iasl) + `dmidecode`** (one-time human
+   step) to unblock the qcow2 refcount-table-growth validation, the AML/SMBIOS
+   reference-compiler gates, and an OVMF smoke boot.
+4. Lower priority / unchanged: real guest-memory virtqueue transport (largest
+   fidelity lever); threaded-vCPU watchdog (needs the bus `Sync`); 16550 RX FIFO
+   trigger + character-timeout (needs a time source).
+
+---
+
 ## 2026-06-22 — Session: complete qcow2 writable-overlay/COW story (Phase 0.3) + a broad virtio/device-fidelity sweep (Phase 3)
 
 **18 increments + 1 roadmap commit, each independently green and committed**

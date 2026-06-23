@@ -13,6 +13,15 @@ use crate::truncate::usize_of;
 
 use std::collections::VecDeque;
 
+/// The guest receive offloads that `VIRTIO_NET_CTRL_GUEST_OFFLOADS` can toggle.
+/// A negotiated guest offload starts active and the control command may later
+/// disable it; the active subset is tracked in [`NetControlState::active_offloads`].
+const GUEST_OFFLOAD_MASK: u64 = NetFeatures::GUEST_CSUM
+    | NetFeatures::GUEST_TSO4
+    | NetFeatures::GUEST_TSO6
+    | NetFeatures::GUEST_ECN
+    | NetFeatures::GUEST_UFO;
+
 /// Device status bits (`VirtIO` 1.2, Section 2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceStatus {
@@ -123,7 +132,12 @@ impl VirtioNetDevice {
             queue_size,
             backend,
             rx_pending: VecDeque::new(),
-            control: NetControlState::default(),
+            control: NetControlState {
+                // Negotiated guest offloads start active (the control command
+                // may disable them); DEFAULT offers GUEST_CSUM.
+                active_offloads: NetFeatures::DEFAULT & GUEST_OFFLOAD_MASK,
+                ..NetControlState::default()
+            },
             stats: NetDeviceStats::default(),
         }
     }
@@ -162,6 +176,8 @@ impl VirtioNetDevice {
     pub const fn activate(&mut self, features: NetFeatures) {
         self.features = features;
         self.merge_rxbuf = features.contains(NetFeatures::MRG_RXBUF);
+        // The negotiated guest offloads start active.
+        self.control.active_offloads = features.bits() & GUEST_OFFLOAD_MASK;
         self.status = DeviceStatus::DriverOk as u8;
         self.tx_queue.enable();
         self.rx_queue.enable();
@@ -278,6 +294,7 @@ impl VirtioNetDevice {
                 }
             }
             control::VIRTIO_NET_CTRL_MQ => self.ctrl_mq(command, data),
+            control::VIRTIO_NET_CTRL_GUEST_OFFLOADS => self.ctrl_guest_offloads(command, data),
             _ => control::VIRTIO_NET_ERR,
         };
         if ack == control::VIRTIO_NET_OK {
@@ -364,6 +381,28 @@ impl VirtioNetDevice {
             return control::VIRTIO_NET_ERR;
         }
         self.control.vq_pairs = u16::from_le_bytes([data[0], data[1]]);
+        control::VIRTIO_NET_OK
+    }
+
+    /// `VIRTIO_NET_CTRL_GUEST_OFFLOADS`: enable/disable the guest receive
+    /// offloads at runtime. The 8-byte `le64` payload is a bitmap of
+    /// `VIRTIO_NET_F_*` positions; only offloads that were actually negotiated
+    /// (a subset of the controllable `GUEST_*` features) may be requested —
+    /// anything else is rejected, as a real device would NAK an unsupported
+    /// offload rather than silently accept it.
+    const fn ctrl_guest_offloads(&mut self, command: u8, data: &[u8]) -> u8 {
+        if command != control::VIRTIO_NET_CTRL_GUEST_OFFLOADS_SET || data.len() < 8 {
+            return control::VIRTIO_NET_ERR;
+        }
+        let requested = u64::from_le_bytes([
+            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+        ]);
+        // The offloads this command can toggle, gated by what was negotiated.
+        let supported = self.features.bits() & GUEST_OFFLOAD_MASK;
+        if requested & !supported != 0 {
+            return control::VIRTIO_NET_ERR;
+        }
+        self.control.active_offloads = requested;
         control::VIRTIO_NET_OK
     }
 
@@ -533,8 +572,19 @@ impl VirtioNetDevice {
     /// to know how many buffers to consume, and 0 is invalid. This model places
     /// each frame in a single RX buffer, so `num_buffers` is 1 in merge mode
     /// (the field is not serialized at all without merge).
+    ///
+    /// When the `GUEST_CSUM` receive offload is active, the header advertises
+    /// `VIRTIO_NET_HDR_F_DATA_VALID`: the frames this model delivers carry valid
+    /// checksums, so the guest may skip re-verifying them (the point of the
+    /// offload). The flag is dropped once the guest disables `GUEST_CSUM` via
+    /// `VIRTIO_NET_CTRL_GUEST_OFFLOADS`.
     fn rx_header(&self) -> VirtioNetHeader {
+        let mut flags = 0u8;
+        if self.control.active_offloads & NetFeatures::GUEST_CSUM != 0 {
+            flags |= super::header::flags::DATA_VALID;
+        }
         VirtioNetHeader {
+            flags,
             num_buffers: u16::from(self.merge_rxbuf),
             ..VirtioNetHeader::EMPTY
         }
@@ -657,6 +707,55 @@ mod tests {
     }
 
     #[test]
+    fn rx_header_sets_data_valid_when_guest_csum_active() {
+        let mut dev = make_device();
+        // Negotiating GUEST_CSUM makes the offload active by default.
+        dev.activate(NetFeatures::from_bits(
+            NetFeatures::MAC | NetFeatures::GUEST_CSUM,
+        ));
+        dev.inject_rx(&[0xAA, 0xBB, 0xCC]);
+        let frame = dev.rx_pending.front().expect("one pending frame");
+        let hdr = VirtioNetHeader::from_bytes(frame, false).expect("parse header");
+        assert!(hdr.data_valid(), "DATA_VALID set while GUEST_CSUM active");
+    }
+
+    #[test]
+    fn rx_header_omits_data_valid_without_guest_csum() {
+        let mut dev = make_device();
+        dev.activate(NetFeatures::from_bits(NetFeatures::MAC)); // no GUEST_CSUM
+        dev.inject_rx(&[0x01, 0x02]);
+        let frame = dev.rx_pending.front().expect("one pending frame");
+        let hdr = VirtioNetHeader::from_bytes(frame, false).expect("parse header");
+        assert!(!hdr.data_valid());
+    }
+
+    #[test]
+    fn rx_header_drops_data_valid_when_guest_disables_csum() {
+        let mut dev = make_device();
+        dev.activate(NetFeatures::from_bits(
+            NetFeatures::MAC
+                | NetFeatures::GUEST_CSUM
+                | NetFeatures::CTRL_VQ
+                | NetFeatures::CTRL_GUEST_OFFLOADS,
+        ));
+        // Guest turns off all guest offloads.
+        let mut cmd = vec![
+            control::VIRTIO_NET_CTRL_GUEST_OFFLOADS,
+            control::VIRTIO_NET_CTRL_GUEST_OFFLOADS_SET,
+        ];
+        cmd.extend_from_slice(&0u64.to_le_bytes());
+        assert_eq!(dev.process_control(&cmd), control::VIRTIO_NET_OK);
+
+        dev.inject_rx(&[0xDD, 0xEE]);
+        let frame = dev.rx_pending.front().expect("one pending frame");
+        let hdr = VirtioNetHeader::from_bytes(frame, false).expect("parse header");
+        assert!(
+            !hdr.data_valid(),
+            "DATA_VALID cleared after disabling GUEST_CSUM"
+        );
+    }
+
+    #[test]
     fn rx_header_omits_num_buffers_without_merge() {
         let mut dev = make_device();
         dev.activate(NetFeatures::from_bits(NetFeatures::MAC));
@@ -701,6 +800,52 @@ mod tests {
         assert!(dev.features().contains(NetFeatures::CTRL_VQ));
         assert!(dev.features().contains(NetFeatures::CTRL_RX));
         assert!(dev.features().contains(NetFeatures::CTRL_VLAN));
+    }
+
+    #[test]
+    fn ctrl_guest_offloads_set_accepts_negotiated_and_rejects_unsupported() {
+        let mut dev = make_device();
+        assert!(dev.features().contains(NetFeatures::CTRL_GUEST_OFFLOADS));
+
+        // Enabling the negotiated GUEST_CSUM offload is accepted and stored.
+        let mut ok = vec![
+            control::VIRTIO_NET_CTRL_GUEST_OFFLOADS,
+            control::VIRTIO_NET_CTRL_GUEST_OFFLOADS_SET,
+        ];
+        ok.extend_from_slice(&NetFeatures::GUEST_CSUM.to_le_bytes());
+        assert_eq!(dev.process_control(&ok), control::VIRTIO_NET_OK);
+        assert_eq!(dev.control_state().active_offloads, NetFeatures::GUEST_CSUM);
+
+        // Requesting an un-negotiated offload (GUEST_TSO4) is rejected and the
+        // stored set is left unchanged.
+        let mut bad = vec![
+            control::VIRTIO_NET_CTRL_GUEST_OFFLOADS,
+            control::VIRTIO_NET_CTRL_GUEST_OFFLOADS_SET,
+        ];
+        bad.extend_from_slice(&NetFeatures::GUEST_TSO4.to_le_bytes());
+        assert_eq!(dev.process_control(&bad), control::VIRTIO_NET_ERR);
+        assert_eq!(dev.control_state().active_offloads, NetFeatures::GUEST_CSUM);
+
+        // A truncated (<8-byte) payload is rejected.
+        assert_eq!(
+            dev.process_control(&[
+                control::VIRTIO_NET_CTRL_GUEST_OFFLOADS,
+                control::VIRTIO_NET_CTRL_GUEST_OFFLOADS_SET,
+                0,
+                0,
+                0,
+            ]),
+            control::VIRTIO_NET_ERR
+        );
+
+        // Disabling all offloads (empty bitmap) is accepted.
+        let mut off = vec![
+            control::VIRTIO_NET_CTRL_GUEST_OFFLOADS,
+            control::VIRTIO_NET_CTRL_GUEST_OFFLOADS_SET,
+        ];
+        off.extend_from_slice(&0u64.to_le_bytes());
+        assert_eq!(dev.process_control(&off), control::VIRTIO_NET_OK);
+        assert_eq!(dev.control_state().active_offloads, 0);
     }
 
     #[test]

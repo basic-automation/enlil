@@ -18,6 +18,9 @@ pub const VIRTIO_NET_CTRL_MAC: u8 = 1;
 pub const VIRTIO_NET_CTRL_VLAN: u8 = 2;
 pub const VIRTIO_NET_CTRL_ANNOUNCE: u8 = 3;
 pub const VIRTIO_NET_CTRL_MQ: u8 = 4;
+/// Class 5: dynamically enable/disable guest receive offloads (requires
+/// `VIRTIO_NET_F_CTRL_GUEST_OFFLOADS`).
+pub const VIRTIO_NET_CTRL_GUEST_OFFLOADS: u8 = 5;
 
 /// `VIRTIO_NET_CTRL_RX` commands (each takes a 1-byte on/off payload).
 pub const VIRTIO_NET_CTRL_RX_PROMISC: u8 = 0;
@@ -40,6 +43,10 @@ pub const VIRTIO_NET_CTRL_ANNOUNCE_ACK: u8 = 0;
 
 /// `VIRTIO_NET_CTRL_MQ` command (takes a 2-byte queue-pair count).
 pub const VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET: u8 = 0;
+
+/// `VIRTIO_NET_CTRL_GUEST_OFFLOADS` command (takes an 8-byte `le64` offload
+/// bitmap whose bits are `VIRTIO_NET_F_*` feature positions).
+pub const VIRTIO_NET_CTRL_GUEST_OFFLOADS_SET: u8 = 0;
 
 /// Acks returned in the command's status byte.
 pub const VIRTIO_NET_OK: u8 = 0;
@@ -82,6 +89,11 @@ pub struct NetControlState {
     pub announce_needed: bool,
     /// Negotiated number of active queue pairs (multiqueue).
     pub vq_pairs: u16,
+    /// Guest receive offloads currently active, as a `le64` bitmap of
+    /// `VIRTIO_NET_F_*` positions. Set via `VIRTIO_NET_CTRL_GUEST_OFFLOADS`;
+    /// the RX path consults it to decide whether to fill in
+    /// `VIRTIO_NET_HDR_F_DATA_VALID`/segmentation for the guest.
+    pub active_offloads: u64,
 }
 
 /// Parse one `virtio_net_ctrl_mac` sub-table (`le32 entries` followed by that

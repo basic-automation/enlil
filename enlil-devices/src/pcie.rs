@@ -38,6 +38,39 @@ const PM_CAP_OFFSET_BYTE: u8 = 0x50;
 /// capability at [`PM_CAP_OFFSET`]).
 pub const MSI_CAP_OFFSET: u16 = 0x60;
 
+/// Config-space offset of the MSI-X capability structure (12 bytes).
+///
+/// Placed clear of the MSI capability, which spans at most 14 bytes from
+/// [`MSI_CAP_OFFSET`] (`0x60..=0x6D`). See
+/// [`PciConfigSpace::add_msix_capability`].
+pub const MSIX_CAP_OFFSET: u16 = 0x70;
+
+/// Config-space offset of the PCI Express Capability structure (60 bytes, v2).
+///
+/// Placed clear of the MSI-X capability at [`MSIX_CAP_OFFSET`] (`0x70..=0x7B`);
+/// the v2 structure spans `0x90..=0xCB`, inside the 256-byte config window. See
+/// [`PciConfigSpace::add_pci_express_capability`].
+pub const PCIE_CAP_OFFSET: u16 = 0x90;
+
+/// PCI Express Capability **Device/Port Type** values (`PCIe` Base spec, the
+/// PCI Express Capabilities Register bits 7:4).
+pub mod pcie_type {
+    /// `PCIe` Endpoint.
+    pub const ENDPOINT: u8 = 0x0;
+    /// Legacy `PCIe` Endpoint.
+    pub const LEGACY_ENDPOINT: u8 = 0x1;
+    /// Root Port of a `PCIe` Root Complex.
+    pub const ROOT_PORT: u8 = 0x4;
+    /// Upstream Port of a `PCIe` Switch.
+    pub const UPSTREAM_PORT: u8 = 0x5;
+    /// Downstream Port of a `PCIe` Switch.
+    pub const DOWNSTREAM_PORT: u8 = 0x6;
+    /// `PCIe`-to-PCI/PCI-X Bridge.
+    pub const PCIE_TO_PCI_BRIDGE: u8 = 0x7;
+    /// Root Complex Integrated Endpoint.
+    pub const RC_INTEGRATED_ENDPOINT: u8 = 0x9;
+}
+
 /// PCI configuration space header offsets
 pub mod cfg {
     pub const VENDOR_ID: u16 = 0x00;
@@ -331,6 +364,172 @@ impl PciConfigSpace {
         self.read_u16(MSI_CAP_OFFSET + 2) & 0x0001 != 0
     }
 
+    /// The MSI message the guest has programmed into the MSI capability, or
+    /// `None` if the capability is absent or MSI is disabled.
+    ///
+    /// This is the read side of MSI delivery: a device that wants to raise its
+    /// interrupt while the guest has enabled MSI builds this `(address, data)`
+    /// message and hands it to the interrupt path (the emulated
+    /// [`InterruptController::deliver_msi`](crate::interrupt::InterruptController::deliver_msi)
+    /// or, on the KVM backend, `KVM_SIGNAL_MSI`) instead of asserting `INTx`.
+    /// Both the 32-bit and 64-bit capability layouts are handled — the Message
+    /// Data lives at +8 or +12 depending on the 64-bit-capable bit.
+    #[must_use]
+    pub fn msi_message(&self) -> Option<crate::interrupt::MsiMessage> {
+        if self.read_u8(MSI_CAP_OFFSET) != 0x05 || !self.msi_enabled() {
+            return None;
+        }
+        let is_64bit = self.read_u16(MSI_CAP_OFFSET + 2) & 0x0080 != 0;
+        let addr_lo = u64::from(self.read_u32(MSI_CAP_OFFSET + 4));
+        let (address, data) = if is_64bit {
+            let addr_hi = u64::from(self.read_u32(MSI_CAP_OFFSET + 8));
+            (
+                addr_lo | (addr_hi << 32),
+                u32::from(self.read_u16(MSI_CAP_OFFSET + 12)),
+            )
+        } else {
+            (addr_lo, u32::from(self.read_u16(MSI_CAP_OFFSET + 8)))
+        };
+        Some(crate::interrupt::MsiMessage::new(address, data))
+    }
+
+    /// Add an **MSI-X capability** (Capability ID 0x11) at the head of the
+    /// capabilities list, chaining to whatever was previously the head.
+    ///
+    /// MSI-X is what high-vector-count devices (`NVMe`, modern NICs,
+    /// `virtio-pci` with many queues) advertise: unlike MSI's single in-config
+    /// message, MSI-X keeps a *table* of up to 2048 independent vectors in
+    /// device MMIO (a BAR), each separately maskable, plus a Pending Bit Array.
+    /// The capability in config space only points at those structures and
+    /// carries the global Enable / Function Mask bits.
+    ///
+    /// `table_size` is the number of vectors (1..=2048); it is stored as
+    /// `N - 1` in Message Control bits 10:0 (PCI Local Bus spec §6.8.2). The
+    /// table and PBA each live at `*_offset` (8-byte aligned) within BAR
+    /// `*_bir`. The capability starts disabled (Enable bit 15 clear) and
+    /// function-unmasked (bit 14 clear); the guest sets Enable once it has
+    /// programmed the table. Pairs with [`MsixTable`] for the BAR-backed table.
+    pub fn add_msix_capability(
+        &mut self,
+        table_size: u16,
+        table_bir: u8,
+        table_offset: u32,
+        pba_bir: u8,
+        pba_offset: u32,
+    ) {
+        // Chain onto the current list head, then become the new head — composes
+        // with the PM/MSI caps in any order without orphaning an entry.
+        let prev_head = self.read_u8(cfg::CAPABILITY_PTR);
+        self.write_u8(MSIX_CAP_OFFSET, 0x11); // Capability ID: MSI-X
+        self.write_u8(MSIX_CAP_OFFSET + 1, prev_head); // next-capability pointer
+        // Message Control: Table Size = N-1 in bits 10:0; Enable (bit 15) and
+        // Function Mask (bit 14) clear out of the box.
+        let encoded_size = table_size.saturating_sub(1) & 0x07FF;
+        self.write_u16(MSIX_CAP_OFFSET + 2, encoded_size);
+        // Table Offset / Table BIR: BIR in bits 2:0, 8-byte-aligned offset above.
+        self.write_u32(
+            MSIX_CAP_OFFSET + 4,
+            (table_offset & !0x7) | u32::from(table_bir & 0x7),
+        );
+        // PBA Offset / PBA BIR: same encoding.
+        self.write_u32(
+            MSIX_CAP_OFFSET + 8,
+            (pba_offset & !0x7) | u32::from(pba_bir & 0x7),
+        );
+
+        // MSI-X is the new list head; assert the STATUS caps bit.
+        let head = u8::try_from(MSIX_CAP_OFFSET).unwrap_or(0);
+        self.write_u8(cfg::CAPABILITY_PTR, head);
+        let status = self.read_u16(cfg::STATUS) | 0x0010;
+        self.write_u16(cfg::STATUS, status);
+    }
+
+    /// Whether the guest has enabled MSI-X (Message Control bit 15). Only
+    /// meaningful after [`add_msix_capability`](Self::add_msix_capability).
+    #[must_use]
+    pub fn msix_enabled(&self) -> bool {
+        self.read_u16(MSIX_CAP_OFFSET + 2) & 0x8000 != 0
+    }
+
+    /// Whether the guest has set the MSI-X **Function Mask** (Message Control
+    /// bit 14) — a global mask over every vector regardless of per-entry masks.
+    #[must_use]
+    pub fn msix_function_masked(&self) -> bool {
+        self.read_u16(MSIX_CAP_OFFSET + 2) & 0x4000 != 0
+    }
+
+    /// The configured MSI-X table size (number of vectors) — Message Control
+    /// bits 10:0 decoded from the stored `N - 1`. Returns 0 if MSI-X is absent.
+    #[must_use]
+    pub fn msix_table_size(&self) -> u16 {
+        if self.read_u8(MSIX_CAP_OFFSET) != 0x11 {
+            return 0;
+        }
+        (self.read_u16(MSIX_CAP_OFFSET + 2) & 0x07FF) + 1
+    }
+
+    /// Add a version-2 **PCI Express Capability** (Capability ID 0x10) at the
+    /// head of the capabilities list, chaining to whatever was previously the
+    /// head.
+    ///
+    /// This is the structure that makes a function a *`PCIe`* function rather
+    /// than a plain PCI one: every native `PCIe` device exposes it, and a guest
+    /// that finds an ECAM-reachable device with no PCI Express Capability has
+    /// caught a tell. `device_port_type` is one of [`pcie_type`]. The capability
+    /// advertises a modest x1 / 2.5 GT/s link and 256-byte max payload, with the
+    /// guest-writable Device/Link Control registers left at their reset values.
+    pub fn add_pci_express_capability(&mut self, device_port_type: u8) {
+        let prev_head = self.read_u8(cfg::CAPABILITY_PTR);
+        self.write_u8(PCIE_CAP_OFFSET, 0x10); // Capability ID: PCI Express
+        self.write_u8(PCIE_CAP_OFFSET + 1, prev_head); // next-capability pointer
+        // PCI Express Capabilities Register: Capability Version = 2 (bits 3:0),
+        // Device/Port Type (bits 7:4); Slot Implemented and Interrupt Message
+        // Number stay 0 (an endpoint has no slot).
+        let caps_reg = 0x0002 | (u16::from(device_port_type & 0xF) << 4);
+        self.write_u16(PCIE_CAP_OFFSET + 2, caps_reg);
+        // Device Capabilities: Max_Payload_Size Supported = 256 bytes (001b).
+        self.write_u32(PCIE_CAP_OFFSET + 4, 0x0000_0001);
+        // Device Control / Status reset to 0.
+        self.write_u16(PCIE_CAP_OFFSET + 8, 0x0000);
+        self.write_u16(PCIE_CAP_OFFSET + 10, 0x0000);
+        // Link Capabilities: Max Link Speed = 2.5 GT/s (1), Max Link Width = x1
+        // (1 << 4) -> 0x11.
+        self.write_u32(PCIE_CAP_OFFSET + 12, 0x0000_0011);
+        // Link Control reset 0; Link Status: Current Link Speed 1, Width x1.
+        self.write_u16(PCIE_CAP_OFFSET + 16, 0x0000);
+        self.write_u16(PCIE_CAP_OFFSET + 18, 0x0011);
+        // v2 registers (Device/Link Capabilities/Control/Status 2) reset to 0;
+        // config space was zero-initialised, so they are already correct. The
+        // structure occupies PCIE_CAP_OFFSET..=+0x3B.
+
+        // PCI Express is the new list head; assert the STATUS caps bit.
+        let head = u8::try_from(PCIE_CAP_OFFSET).unwrap_or(0);
+        self.write_u8(cfg::CAPABILITY_PTR, head);
+        let status = self.read_u16(cfg::STATUS) | 0x0010;
+        self.write_u16(cfg::STATUS, status);
+    }
+
+    /// The PCI Express Capability **version** (PCI Express Capabilities Register
+    /// bits 3:0), or 0 if the capability is absent.
+    #[must_use]
+    pub fn pci_express_version(&self) -> u8 {
+        if self.read_u8(PCIE_CAP_OFFSET) != 0x10 {
+            return 0;
+        }
+        u8_of(usize::from(self.read_u16(PCIE_CAP_OFFSET + 2) & 0x000F))
+    }
+
+    /// The PCI Express **Device/Port Type** (Capabilities Register bits 7:4) —
+    /// one of [`pcie_type`]. Returns 0 (Endpoint) if the capability is absent;
+    /// pair with [`pci_express_version`](Self::pci_express_version) to tell
+    /// "absent" from "endpoint".
+    #[must_use]
+    pub fn pci_express_device_type(&self) -> u8 {
+        u8_of(usize::from(
+            (self.read_u16(PCIE_CAP_OFFSET + 2) >> 4) & 0x000F,
+        ))
+    }
+
     /// Handle a guest config-space write of `width` (1/2/4) bytes at `offset`,
     /// respecting both BAR size-detection masks and the **read-only header
     /// registers** a guest must not be able to change (Vendor/Device ID, Class
@@ -350,6 +549,23 @@ impl PciConfigSpace {
                 return;
             }
         }
+        // If this write overlaps an installed MSI-X capability, snapshot its
+        // read-only fields — Table Size (Message Control bits 10:0) and the
+        // Table/PBA Offset+BIR dwords describe the fixed hardware layout. Only
+        // the Enable (bit 15) and Function Mask (bit 14) control bits are
+        // guest-writable; a driver that could resize the table or relocate it
+        // into the wrong BAR would be both a correctness and a stealth bug.
+        let msix_ro = (offset < MSIX_CAP_OFFSET + 12)
+            && (offset + u16::from(width) > MSIX_CAP_OFFSET)
+            && self.read_u8(MSIX_CAP_OFFSET) == 0x11;
+        let saved = msix_ro.then(|| {
+            (
+                self.read_u16(MSIX_CAP_OFFSET + 2) & 0x07FF, // Table Size (RO)
+                self.read_u32(MSIX_CAP_OFFSET + 4),          // Table Offset/BIR (RO)
+                self.read_u32(MSIX_CAP_OFFSET + 8),          // PBA Offset/BIR (RO)
+            )
+        });
+
         // Everything else: write byte by byte, skipping read-only bytes.
         let bytes = value.to_le_bytes();
         for (i, &b) in bytes.iter().enumerate().take(usize::from(width)) {
@@ -357,6 +573,14 @@ impl PciConfigSpace {
             if !Self::byte_is_read_only(off) {
                 self.write_u8(off, b);
             }
+        }
+
+        // Restore the MSI-X read-only fields the generic write may have touched.
+        if let Some((table_size, table_off, pba_off)) = saved {
+            let ctrl = (self.read_u16(MSIX_CAP_OFFSET + 2) & !0x07FF) | table_size;
+            self.write_u16(MSIX_CAP_OFFSET + 2, ctrl);
+            self.write_u32(MSIX_CAP_OFFSET + 4, table_off);
+            self.write_u32(MSIX_CAP_OFFSET + 8, pba_off);
         }
     }
 
@@ -396,6 +620,200 @@ impl PciConfigSpace {
     #[must_use]
     pub fn is_present(&self) -> bool {
         self.vendor_id() != 0xFFFF
+    }
+}
+
+/// Size in bytes of one MSI-X table entry (PCI Local Bus spec §6.8.2.1).
+pub const MSIX_ENTRY_SIZE: u32 = 16;
+
+/// One 16-byte MSI-X table entry as the guest sees it in the table BAR: a full
+/// 64-bit Message Address, a 32-bit Message Data, and a Vector Control dword
+/// whose bit 0 is the per-vector Mask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MsixEntry {
+    /// Message Address, lower 32 bits (table offset +0).
+    pub addr_lo: u32,
+    /// Message Address, upper 32 bits (table offset +4).
+    pub addr_hi: u32,
+    /// Message Data (table offset +8).
+    pub data: u32,
+    /// Vector Control (table offset +12); bit 0 = Mask, the rest reserved.
+    pub vector_control: u32,
+}
+
+impl MsixEntry {
+    /// A reset entry: address/data zero, **masked** (Vector Control bit 0 set).
+    /// Real MSI-X tables come up masked so a half-programmed vector can't fire.
+    const RESET: Self = Self {
+        addr_lo: 0,
+        addr_hi: 0,
+        data: 0,
+        vector_control: 0x1,
+    };
+
+    /// Whether this vector is masked by its per-entry Mask bit.
+    #[must_use]
+    pub const fn masked(&self) -> bool {
+        self.vector_control & 0x1 != 0
+    }
+
+    /// The full 64-bit message address.
+    #[must_use]
+    pub const fn address(&self) -> u64 {
+        ((self.addr_hi as u64) << 32) | self.addr_lo as u64
+    }
+}
+
+/// A BAR-backed **MSI-X table + Pending Bit Array** — the structures the MSI-X
+/// capability (see [`PciConfigSpace::add_msix_capability`]) points at.
+///
+/// The table holds one [`MsixEntry`] per vector; the guest programs each entry's
+/// address/data and toggles its Mask bit through MMIO into the table BAR. When a
+/// device wants to raise an interrupt it calls [`signal`](Self::signal): if the
+/// vector is deliverable the (address, data) message is returned for injection;
+/// if it is masked (per-entry Mask, the capability Function Mask, or MSI-X
+/// disabled) the request is recorded in the PBA instead, and a later unmask
+/// replays it via [`take_pending`](Self::take_pending). This mirrors how a real
+/// MSI-X function defers a masked interrupt rather than dropping it.
+#[derive(Debug, Clone)]
+pub struct MsixTable {
+    entries: Vec<MsixEntry>,
+    /// One pending bit per vector (the PBA, exposed to the guest as read-only
+    /// MMIO qwords in the PBA BAR region).
+    pending: Vec<bool>,
+}
+
+impl MsixTable {
+    /// Create a table of `num_vectors` (clamped to 1..=2048) reset/masked entries.
+    #[must_use]
+    pub fn new(num_vectors: u16) -> Self {
+        let n = (num_vectors.clamp(1, 2048)) as usize;
+        Self {
+            entries: vec![MsixEntry::RESET; n],
+            pending: vec![false; n],
+        }
+    }
+
+    /// Number of vectors in the table (always >= 1).
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Always false — a table has at least one vector; present for lint parity.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Borrow a vector's entry, if `vec` is in range.
+    #[must_use]
+    pub fn entry(&self, vec: usize) -> Option<&MsixEntry> {
+        self.entries.get(vec)
+    }
+
+    /// Whether vector `vec` is masked by its per-entry Mask bit (out-of-range
+    /// vectors read as masked).
+    #[must_use]
+    pub fn is_masked(&self, vec: usize) -> bool {
+        self.entries.get(vec).is_none_or(MsixEntry::masked)
+    }
+
+    /// Whether vector `vec` has a pending (deferred-because-masked) interrupt.
+    #[must_use]
+    pub fn is_pending(&self, vec: usize) -> bool {
+        self.pending.get(vec).copied().unwrap_or(false)
+    }
+
+    /// Read a 4-byte-aligned dword from the **table** MMIO region at `offset`
+    /// (bytes from the start of the table BAR window). Out-of-range or
+    /// misaligned reads return all-ones, as a real controller's reserved space
+    /// would.
+    #[must_use]
+    pub fn read_table_u32(&self, offset: u32) -> u32 {
+        if !offset.is_multiple_of(4) {
+            return 0xFFFF_FFFF;
+        }
+        let vec = (offset / MSIX_ENTRY_SIZE) as usize;
+        let Some(e) = self.entries.get(vec) else {
+            return 0xFFFF_FFFF;
+        };
+        match offset % MSIX_ENTRY_SIZE {
+            0 => e.addr_lo,
+            4 => e.addr_hi,
+            8 => e.data,
+            _ => e.vector_control & 0x1, // reserved bits read 0
+        }
+    }
+
+    /// Write a 4-byte-aligned dword into the **table** MMIO region at `offset`.
+    /// Address/Data fields take as written; Vector Control keeps only the Mask
+    /// bit (reserved bits are RAZ). Misaligned/out-of-range writes are dropped.
+    pub fn write_table_u32(&mut self, offset: u32, value: u32) {
+        if !offset.is_multiple_of(4) {
+            return;
+        }
+        let vec = (offset / MSIX_ENTRY_SIZE) as usize;
+        let Some(e) = self.entries.get_mut(vec) else {
+            return;
+        };
+        match offset % MSIX_ENTRY_SIZE {
+            0 => e.addr_lo = value,
+            4 => e.addr_hi = value,
+            8 => e.data = value,
+            _ => e.vector_control = value & 0x1,
+        }
+    }
+
+    /// Read a PBA qword: bit `k` of qword `q` is the pending bit for vector
+    /// `q * 64 + k`. The PBA is read-only MMIO to the guest.
+    #[must_use]
+    pub fn read_pba_u64(&self, qword_index: usize) -> u64 {
+        let base = qword_index * 64;
+        let mut bits = 0u64;
+        for k in 0..64 {
+            if self.pending.get(base + k).copied().unwrap_or(false) {
+                bits |= 1u64 << k;
+            }
+        }
+        bits
+    }
+
+    /// Attempt to raise vector `vec`. `globally_masked` folds in MSI-X-disabled
+    /// and the capability Function Mask. Returns the `(address, data)` message
+    /// to inject when delivery is allowed; otherwise sets the vector's PBA bit
+    /// and returns `None` so the interrupt is replayed on a later unmask.
+    pub fn signal(&mut self, vec: usize, globally_masked: bool) -> Option<(u64, u32)> {
+        let entry = *self.entries.get(vec)?;
+        if globally_masked || entry.masked() {
+            if let Some(p) = self.pending.get_mut(vec) {
+                *p = true;
+            }
+            None
+        } else {
+            if let Some(p) = self.pending.get_mut(vec) {
+                *p = false;
+            }
+            Some((entry.address(), entry.data))
+        }
+    }
+
+    /// Drain every vector whose pending bit is set and is now deliverable
+    /// (per-entry unmasked and not globally masked), clearing each PBA bit and
+    /// returning its message. Call after a table unmask, a Function-Mask clear,
+    /// or an MSI-X enable to flush deferred interrupts in vector order.
+    pub fn take_pending(&mut self, globally_masked: bool) -> Vec<(u64, u32)> {
+        let mut out = Vec::new();
+        if globally_masked {
+            return out;
+        }
+        for vec in 0..self.entries.len() {
+            if self.pending[vec] && !self.entries[vec].masked() {
+                self.pending[vec] = false;
+                out.push((self.entries[vec].address(), self.entries[vec].data));
+            }
+        }
+        out
     }
 }
 
@@ -560,7 +978,13 @@ impl PcieRootComplex {
         let line = crate::interrupt::PirqRouter::default_device_isa_irq(bdf.device, 1)
             .expect("INTA# always swizzles to a PIRQ line");
         dev.set_interrupt(line, 1);
+        // A real Renesas uPD720201 xHCI enumerates Power Management, MSI, and a
+        // PCI Express (Endpoint) capability; advertise the same list so a guest
+        // sees a faithful discrete USB 3.0 controller rather than a bare PCI
+        // function with only legacy INTx (which modern xHCI drivers flag).
         dev.add_power_management_capability();
+        dev.add_msi_capability();
+        dev.add_pci_express_capability(pcie_type::ENDPOINT);
         dev
     }
 
@@ -1218,6 +1642,263 @@ mod tests {
         assert!(cs.msi_enabled());
         assert_eq!(cs.read_u32(MSI_CAP_OFFSET + 4), 0xFEE0_0000);
         assert_eq!(cs.read_u16(MSI_CAP_OFFSET + 12), 0x0041);
+    }
+
+    /// An MSI-X capability is a walkable cap-ID-0x11 entry that chains ahead of
+    /// the PM cap, decodes its Table Size and Table/PBA Offset+BIR exactly as
+    /// programmed, and starts disabled + function-unmasked.
+    #[test]
+    fn msix_capability_is_walkable_and_decodes_table_geometry() {
+        let mut cs = PciConfigSpace::new(PciBdf::new(0, 8, 0), 0x1AF4, 0x1041);
+        cs.add_power_management_capability();
+        // 8 vectors; table in BAR1 @ 0x2000, PBA in BAR1 @ 0x3000.
+        cs.add_msix_capability(8, 1, 0x2000, 1, 0x3000);
+
+        assert_ne!(cs.read_u16(cfg::STATUS) & 0x0010, 0, "caps bit");
+        let head = cs.read_u8(cfg::CAPABILITY_PTR);
+        assert_eq!(u16::from(head), MSIX_CAP_OFFSET);
+        assert_eq!(cs.read_u8(MSIX_CAP_OFFSET), 0x11, "MSI-X cap id");
+        // Chains to PM, which terminates.
+        assert_eq!(u16::from(cs.read_u8(MSIX_CAP_OFFSET + 1)), PM_CAP_OFFSET);
+        assert_eq!(cs.read_u8(PM_CAP_OFFSET + 1), 0x00, "list terminates");
+
+        // Geometry decodes exactly; Table Size stored as N-1.
+        assert_eq!(cs.read_u16(MSIX_CAP_OFFSET + 2) & 0x07FF, 7);
+        assert_eq!(cs.msix_table_size(), 8);
+        assert_eq!(
+            cs.read_u32(MSIX_CAP_OFFSET + 4),
+            0x2000 | 1,
+            "table off|bir"
+        );
+        assert_eq!(cs.read_u32(MSIX_CAP_OFFSET + 8), 0x3000 | 1, "pba off|bir");
+        // Disabled + unmasked out of the box.
+        assert!(!cs.msix_enabled());
+        assert!(!cs.msix_function_masked());
+        assert_eq!(cs.msix_table_size(), 8);
+    }
+
+    /// The guest may toggle MSI-X Enable / Function Mask, but Table Size and the
+    /// Table/PBA Offset+BIR dwords are read-only — a probe-write cannot resize
+    /// or relocate the table.
+    #[test]
+    fn guest_controls_msix_enable_but_not_table_geometry() {
+        let mut cs = PciConfigSpace::new(PciBdf::new(0, 9, 0), 0x1AF4, 0x1041);
+        cs.add_msix_capability(16, 2, 0x4000, 2, 0x5000);
+        assert_eq!(cs.msix_table_size(), 16);
+
+        // Guest enables MSI-X and sets the function mask (bits 15 + 14).
+        cs.guest_write(MSIX_CAP_OFFSET + 2, 2, 0xC000);
+        assert!(cs.msix_enabled());
+        assert!(cs.msix_function_masked());
+        // ...without disturbing the Table Size field.
+        assert_eq!(cs.msix_table_size(), 16);
+
+        // A driver that probe-writes the whole control word + offsets cannot
+        // shrink the table or move it into another BAR.
+        cs.guest_write(MSIX_CAP_OFFSET + 2, 2, 0xFFFF); // try to set Table Size
+        assert_eq!(cs.msix_table_size(), 16, "table size is read-only");
+        cs.guest_write_u32(MSIX_CAP_OFFSET + 4, 0xDEAD_BEEF); // try to move table
+        cs.guest_write_u32(MSIX_CAP_OFFSET + 8, 0xDEAD_BEEF); // try to move PBA
+        assert_eq!(cs.read_u32(MSIX_CAP_OFFSET + 4), 0x4000 | 2);
+        assert_eq!(cs.read_u32(MSIX_CAP_OFFSET + 8), 0x5000 | 2);
+        // Enable/mask still controllable after the probe.
+        assert!(cs.msix_enabled());
+
+        // Guest clears Enable.
+        cs.guest_write(MSIX_CAP_OFFSET + 2, 2, 0x0000);
+        assert!(!cs.msix_enabled());
+        assert!(!cs.msix_function_masked());
+        assert_eq!(cs.msix_table_size(), 16);
+    }
+
+    /// A fresh MSI-X table comes up with every vector masked (Vector Control
+    /// bit 0 set), no pending bits, and table MMIO reflecting the reset state.
+    #[test]
+    fn msix_table_resets_masked_with_empty_pba() {
+        let t = MsixTable::new(4);
+        assert_eq!(t.len(), 4);
+        assert!(!t.is_empty());
+        for v in 0..4usize {
+            assert!(t.is_masked(v), "vector {v} masked at reset");
+            assert!(!t.is_pending(v));
+            // Address/data read as zero; Vector Control reads back the Mask bit.
+            let base = u32::try_from(v).unwrap() * MSIX_ENTRY_SIZE;
+            assert_eq!(t.read_table_u32(base), 0);
+            assert_eq!(t.read_table_u32(base + 12), 1);
+        }
+        assert_eq!(t.read_pba_u64(0), 0);
+        // Size clamps to >= 1 and <= 2048.
+        assert_eq!(MsixTable::new(0).len(), 1);
+        assert_eq!(MsixTable::new(5000).len(), 2048);
+        // Misaligned reads report all-ones.
+        assert_eq!(t.read_table_u32(2), 0xFFFF_FFFF);
+    }
+
+    /// Programming a vector's address/data through table MMIO and clearing its
+    /// Mask bit makes `signal` return that exact message; reserved Vector
+    /// Control bits are dropped on write.
+    #[test]
+    fn msix_program_then_signal_delivers_message() {
+        let mut t = MsixTable::new(2);
+        // Program vector 1: addr 0xFEE0_1000, data 0x0031.
+        t.write_table_u32(MSIX_ENTRY_SIZE, 0xFEE0_1000); // addr_lo
+        t.write_table_u32(MSIX_ENTRY_SIZE + 4, 0x0000_0000); // addr_hi
+        t.write_table_u32(MSIX_ENTRY_SIZE + 8, 0x0000_0031); // data
+        t.write_table_u32(MSIX_ENTRY_SIZE + 12, 0xFFFF_FFFE); // unmask; reserved RAZ
+        assert_eq!(
+            t.read_table_u32(MSIX_ENTRY_SIZE + 12),
+            0,
+            "reserved bits dropped"
+        );
+        assert!(!t.is_masked(1));
+
+        let msg = t.signal(1, false).expect("deliverable");
+        assert_eq!(msg, (0xFEE0_1000u64, 0x0031));
+        assert!(!t.is_pending(1));
+    }
+
+    /// A masked vector defers the interrupt into the PBA; clearing the Mask bit
+    /// and replaying via `take_pending` delivers it exactly once.
+    #[test]
+    fn msix_masked_signal_is_deferred_then_replayed_on_unmask() {
+        let mut t = MsixTable::new(3);
+        t.write_table_u32(MSIX_ENTRY_SIZE * 2, 0xFEE0_2000); // vec 2 addr_lo
+        t.write_table_u32(MSIX_ENTRY_SIZE * 2 + 8, 0x00AA); // vec 2 data
+        // Vector 2 still masked (reset): signal is deferred, not delivered.
+        assert!(t.signal(2, false).is_none());
+        assert!(t.is_pending(2));
+        assert_eq!(t.read_pba_u64(0) & (1 << 2), 1 << 2, "PBA bit 2 set");
+
+        // Unmask vector 2 and replay.
+        t.write_table_u32(MSIX_ENTRY_SIZE * 2 + 12, 0);
+        let replayed = t.take_pending(false);
+        assert_eq!(replayed, vec![(0xFEE0_2000u64, 0x00AA)]);
+        assert!(!t.is_pending(2), "PBA cleared after replay");
+        assert!(t.take_pending(false).is_empty(), "replayed only once");
+    }
+
+    /// The global mask (MSI-X disabled or Function Mask set) defers every
+    /// vector regardless of its per-entry Mask, and blocks replay until lifted.
+    #[test]
+    fn msix_global_mask_defers_all_and_blocks_replay() {
+        let mut t = MsixTable::new(2);
+        // Unmask vector 0 per-entry, but raise it while globally masked.
+        t.write_table_u32(8, 0x0001); // vec 0 data
+        t.write_table_u32(12, 0); // vec 0 unmasked
+        assert!(t.signal(0, true).is_none(), "global mask defers");
+        assert!(t.is_pending(0));
+        // Replay while globally masked yields nothing...
+        assert!(t.take_pending(true).is_empty());
+        assert!(t.is_pending(0), "stays pending under global mask");
+        // ...and flushes once the global mask is lifted.
+        assert_eq!(t.take_pending(false), vec![(0u64, 0x0001)]);
+    }
+
+    /// A PCI Express Capability is a walkable cap-ID-0x10 v2 entry advertising
+    /// the requested Device/Port Type, chaining ahead of the other caps, and
+    /// describing a modest x1 link — what a guest needs to accept the function
+    /// as a native `PCIe` device.
+    #[test]
+    fn pci_express_capability_is_walkable_and_describes_a_pcie_endpoint() {
+        let mut cs = PciConfigSpace::new(PciBdf::new(0, 10, 0), 0x1AF4, 0x1041);
+        cs.add_power_management_capability();
+        cs.add_msix_capability(4, 1, 0x1000, 1, 0x2000);
+        cs.add_pci_express_capability(pcie_type::ENDPOINT);
+
+        // PCIe cap is the new list head, chaining MSI-X -> PM -> null.
+        assert_ne!(cs.read_u16(cfg::STATUS) & 0x0010, 0, "caps bit");
+        assert_eq!(u16::from(cs.read_u8(cfg::CAPABILITY_PTR)), PCIE_CAP_OFFSET);
+        assert_eq!(cs.read_u8(PCIE_CAP_OFFSET), 0x10, "PCIe cap id");
+        assert_eq!(u16::from(cs.read_u8(PCIE_CAP_OFFSET + 1)), MSIX_CAP_OFFSET);
+        assert_eq!(u16::from(cs.read_u8(MSIX_CAP_OFFSET + 1)), PM_CAP_OFFSET);
+        assert_eq!(cs.read_u8(PM_CAP_OFFSET + 1), 0x00, "list terminates");
+
+        // Version 2, Endpoint type.
+        assert_eq!(cs.pci_express_version(), 2);
+        assert_eq!(cs.pci_express_device_type(), pcie_type::ENDPOINT);
+        // Link Capabilities + Status both report 2.5 GT/s x1.
+        assert_eq!(cs.read_u32(PCIE_CAP_OFFSET + 12) & 0x3FF, 0x011);
+        assert_eq!(cs.read_u16(PCIE_CAP_OFFSET + 18) & 0x3FF, 0x011);
+        // Max payload supported = 256 bytes (001b).
+        assert_eq!(cs.read_u32(PCIE_CAP_OFFSET + 4) & 0x7, 0x1);
+    }
+
+    /// The Device/Port Type round-trips for a non-endpoint, and the version
+    /// accessor reports 0 when the capability is absent (vs. a real endpoint's
+    /// type 0).
+    #[test]
+    fn pci_express_device_type_round_trips_and_absent_reads_zero_version() {
+        let mut rc = PciConfigSpace::new(PciBdf::new(0, 0, 0), 0x8086, 0x29C0);
+        rc.add_pci_express_capability(pcie_type::ROOT_PORT);
+        assert_eq!(rc.pci_express_version(), 2);
+        assert_eq!(rc.pci_express_device_type(), pcie_type::ROOT_PORT);
+
+        // A function without the capability reports version 0.
+        let plain = PciConfigSpace::new(PciBdf::new(0, 1, 0), 0x8086, 0x1234);
+        assert_eq!(plain.pci_express_version(), 0);
+    }
+
+    /// The discrete xHCI controller enumerates a real uPD720201-style capability
+    /// list — PCI Express (Endpoint) -> MSI -> Power Management -> end — so a
+    /// guest USB 3.0 driver sees a faithful `PCIe` endpoint with MSI, not a
+    /// legacy-INTx-only PCI function.
+    #[test]
+    fn xhci_controller_advertises_pcie_endpoint_msi_and_pm_caps() {
+        let cs = PcieRootComplex::create_xhci_controller(PciBdf::new(0, 0x14, 0), 0xFE90_0000);
+        assert_ne!(cs.read_u16(cfg::STATUS) & 0x0010, 0, "caps bit set");
+
+        // Walk the capability list from the pointer, collecting (offset, id).
+        let mut off = cs.read_u8(cfg::CAPABILITY_PTR);
+        let mut walk = Vec::new();
+        // Bound the walk so a malformed loop can't hang the test.
+        for _ in 0..16 {
+            if off == 0 {
+                break;
+            }
+            let id = cs.read_u8(u16::from(off));
+            walk.push((off, id));
+            off = cs.read_u8(u16::from(off) + 1);
+        }
+        assert_eq!(
+            walk,
+            vec![
+                (0x90u8, 0x10u8), // PCI Express
+                (0x60, 0x05),     // MSI
+                (0x50, 0x01),     // Power Management
+            ],
+            "xHCI cap list: PCIe -> MSI -> PM -> end"
+        );
+        assert_eq!(cs.pci_express_device_type(), pcie_type::ENDPOINT);
+        assert_eq!(cs.pci_express_version(), 2);
+        assert!(
+            !cs.msi_enabled(),
+            "MSI present but disabled until programmed"
+        );
+    }
+
+    /// `msi_message` is the read side of MSI delivery: nothing until the guest
+    /// enables MSI, then the exact programmed 64-bit address + vector — the
+    /// message a device hands to the interrupt path instead of asserting `INTx`.
+    #[test]
+    fn msi_message_reflects_programmed_address_and_vector() {
+        let mut cs = PcieRootComplex::create_xhci_controller(PciBdf::new(0, 0x14, 0), 0xFE90_0000);
+        assert!(cs.msi_message().is_none(), "disabled MSI yields no message");
+
+        // Guest programs a 64-bit MSI to LAPIC 0, vector 0x42, then enables it.
+        cs.guest_write_u32(MSI_CAP_OFFSET + 4, 0xFEE0_0000); // address low
+        cs.guest_write_u32(MSI_CAP_OFFSET + 8, 0x0000_0000); // address high
+        cs.guest_write(MSI_CAP_OFFSET + 12, 2, 0x0042); // data: vector 0x42
+        cs.guest_write(MSI_CAP_OFFSET + 2, 2, 0x0081); // 64-bit + enable
+
+        let msg = cs.msi_message().expect("enabled MSI yields a message");
+        assert_eq!(msg.address, 0xFEE0_0000);
+        assert_eq!(msg.data, 0x42);
+        assert_eq!(msg.vector(), 0x42);
+        assert_eq!(msg.destination_id(), 0);
+
+        // Clearing the enable bit silences it again.
+        cs.guest_write(MSI_CAP_OFFSET + 2, 2, 0x0080);
+        assert!(cs.msi_message().is_none());
     }
 
     /// The device-identity registers are read-only to a guest: a guest write

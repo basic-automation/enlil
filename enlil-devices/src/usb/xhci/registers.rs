@@ -335,27 +335,53 @@ impl PortRegisterSet {
         }
     }
 
-    /// Write to PORTSC — handles write-1-to-clear and read-only bits.
+    /// Write to PORTSC — handles write-1-to-clear, RW1CS, link-state, and
+    /// read-only bits per xHCI §5.4.8.
     pub fn write_portsc(&mut self, value: u32) {
-        // Write-1-to-clear bits: CSC(17), PEC(18), WRC(19), OCC(20), PRC(21), PLC(22), CEC(23)
+        // Write-1-to-clear change bits: CSC(17), PEC(18), WRC(19), OCC(20),
+        // PRC(21), PLC(22), CEC(23).
         let w1c_mask: u32 = 0x00FE_0000;
-        let w1c_bits = value & w1c_mask;
-        self.portsc &= !w1c_bits;
+        self.portsc &= !(value & w1c_mask);
 
-        // PR (bit 4): if set, initiate port reset
+        // PED (bit 1) is RW1CS: writing 1 *disables* the port. Software can
+        // never set PED — only a successful reset enables a port — so a write
+        // of 1 clears it and the port falls back to the Disabled state.
+        if value & (1 << 1) != 0 {
+            self.portsc &= !(1 << 1);
+            self.state = PortState::Disabled;
+        }
+
+        // PR (bit 4): if set, initiate port reset. In a real implementation we'd
+        // schedule the reset completion; the virtual HC completes immediately.
         if value & (1 << 4) != 0 {
             self.state = PortState::Resetting;
-            // In a real implementation, we'd schedule the reset completion.
-            // For virtual controllers, complete immediately.
             self.complete_reset();
         }
 
-        // PP (bit 9): writable
+        // PLS (bits 8:5) is only updated when LWS (Link State Write Strobe,
+        // bit 16) is set — a software-directed link transition (selective
+        // suspend/resume). Resuming to U0 (0) from U3 (3) completes a link
+        // transition and latches PLC (bit 22) so the driver's resume handler
+        // runs; entering U3 (suspend) does not raise PLC.
+        if value & (1 << 16) != 0 {
+            let new_pls = (value >> 5) & 0xF;
+            let old_pls = (self.portsc >> 5) & 0xF;
+            self.portsc = (self.portsc & !(0xF << 5)) | (new_pls << 5);
+            if new_pls == 0 && old_pls == 3 {
+                self.portsc |= 1 << 22;
+            }
+        }
+
+        // PP (bit 9) is RW.
         if value & (1 << 9) != 0 {
             self.portsc |= 1 << 9;
         } else {
             self.portsc &= !(1 << 9);
         }
+
+        // Wake-on enables WCE(25)/WDE(26)/WOE(27) are RW.
+        let wake_mask: u32 = 0x0E00_0000;
+        self.portsc = (self.portsc & !wake_mask) | (value & wake_mask);
     }
 }
 
@@ -605,6 +631,48 @@ mod tests {
         // Write 1 to CSC bit to clear it
         port.write_portsc(1 << 17);
         assert!(!port.connect_status_change());
+    }
+
+    #[test]
+    fn portsc_ped_write_1_disables_the_port() {
+        let mut port = PortRegisterSet::new();
+        port.connect_device(4);
+        port.write_portsc(1 << 4); // reset -> enabled
+        assert!(port.is_enabled());
+        assert!(port.is_connected());
+
+        // PED is RW1CS: writing 1 disables the port but leaves it connected.
+        port.write_portsc(1 << 1);
+        assert!(!port.is_enabled(), "PED cleared");
+        assert!(port.is_connected(), "still connected");
+        assert_eq!(port.state(), PortState::Disabled);
+
+        // A device cannot *set* PED by writing 1 to an already-disabled port.
+        port.write_portsc(1 << 1);
+        assert!(!port.is_enabled());
+    }
+
+    #[test]
+    fn portsc_lws_directs_link_state_and_resume_latches_plc() {
+        let mut port = PortRegisterSet::new();
+        port.connect_device(4);
+        port.write_portsc(1 << 4); // enabled, PLS = U0
+        let pls = |p: &PortRegisterSet| (p.portsc >> 5) & 0xF;
+        assert_eq!(pls(&port), 0, "U0 after reset");
+
+        // PLS without LWS is ignored (no strobe).
+        port.write_portsc(3 << 5);
+        assert_eq!(pls(&port), 0, "PLS unchanged without LWS");
+
+        // Selective suspend: PLS = U3 with LWS. No PLC on suspend.
+        port.write_portsc((3 << 5) | (1 << 16));
+        assert_eq!(pls(&port), 3, "suspended to U3");
+        assert_eq!(port.portsc & (1 << 22), 0, "no PLC on suspend");
+
+        // Resume: PLS = U0 with LWS latches PLC (bit 22).
+        port.write_portsc((1 << 16) | (1 << 9)); // PLS field = 0 (U0)
+        assert_eq!(pls(&port), 0, "resumed to U0");
+        assert_ne!(port.portsc & (1 << 22), 0, "PLC latched on resume");
     }
 
     #[test]
