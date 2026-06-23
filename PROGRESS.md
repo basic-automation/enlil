@@ -9,7 +9,7 @@ the recommended next step so the next run (which has no memory) can resume.
 ## 2026-06-23 — Session: PCI MSI-X + PCIe-capability fidelity (Phase 3) and a broad device-correctness sweep (4 real bug fixes)
 
 **13 tested increments + 1 `cargo fmt` commit, each independently green and
-committed** (branch `routine/enlil-2026-06-23`, PR _added at end_). Wall-clock
+committed** (branch `routine/enlil-2026-06-23`, PR https://github.com/physics515/enlil/pull/37). Wall-clock
 ~00:39→~01:50 (~70 min of building, builds overlapped in the background). Two
 threads: (1) finished the **PCI MSI-X capability** flagged as 2026-06-22's
 next-step #5 and built out the surrounding PCIe-endpoint capability fidelity;
