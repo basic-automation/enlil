@@ -947,7 +947,13 @@ impl PcieRootComplex {
         let line = crate::interrupt::PirqRouter::default_device_isa_irq(bdf.device, 1)
             .expect("INTA# always swizzles to a PIRQ line");
         dev.set_interrupt(line, 1);
+        // A real Renesas uPD720201 xHCI enumerates Power Management, MSI, and a
+        // PCI Express (Endpoint) capability; advertise the same list so a guest
+        // sees a faithful discrete USB 3.0 controller rather than a bare PCI
+        // function with only legacy INTx (which modern xHCI drivers flag).
         dev.add_power_management_capability();
+        dev.add_msi_capability();
+        dev.add_pci_express_capability(pcie_type::ENDPOINT);
         dev
     }
 
@@ -1791,6 +1797,41 @@ mod tests {
         // A function without the capability reports version 0.
         let plain = PciConfigSpace::new(PciBdf::new(0, 1, 0), 0x8086, 0x1234);
         assert_eq!(plain.pci_express_version(), 0);
+    }
+
+    /// The discrete xHCI controller enumerates a real uPD720201-style capability
+    /// list — PCI Express (Endpoint) -> MSI -> Power Management -> end — so a
+    /// guest USB 3.0 driver sees a faithful `PCIe` endpoint with MSI, not a
+    /// legacy-INTx-only PCI function.
+    #[test]
+    fn xhci_controller_advertises_pcie_endpoint_msi_and_pm_caps() {
+        let cs = PcieRootComplex::create_xhci_controller(PciBdf::new(0, 0x14, 0), 0xFE90_0000);
+        assert_ne!(cs.read_u16(cfg::STATUS) & 0x0010, 0, "caps bit set");
+
+        // Walk the capability list from the pointer, collecting (offset, id).
+        let mut off = cs.read_u8(cfg::CAPABILITY_PTR);
+        let mut walk = Vec::new();
+        // Bound the walk so a malformed loop can't hang the test.
+        for _ in 0..16 {
+            if off == 0 {
+                break;
+            }
+            let id = cs.read_u8(u16::from(off));
+            walk.push((off, id));
+            off = cs.read_u8(u16::from(off) + 1);
+        }
+        assert_eq!(
+            walk,
+            vec![
+                (0x90u8, 0x10u8), // PCI Express
+                (0x60, 0x05),     // MSI
+                (0x50, 0x01),     // Power Management
+            ],
+            "xHCI cap list: PCIe -> MSI -> PM -> end"
+        );
+        assert_eq!(cs.pci_express_device_type(), pcie_type::ENDPOINT);
+        assert_eq!(cs.pci_express_version(), 2);
+        assert!(!cs.msi_enabled(), "MSI present but disabled until programmed");
     }
 
     /// The device-identity registers are read-only to a guest: a guest write
