@@ -525,7 +525,9 @@ impl PciConfigSpace {
     /// "absent" from "endpoint".
     #[must_use]
     pub fn pci_express_device_type(&self) -> u8 {
-        u8_of(usize::from((self.read_u16(PCIE_CAP_OFFSET + 2) >> 4) & 0x000F))
+        u8_of(usize::from(
+            (self.read_u16(PCIE_CAP_OFFSET + 2) >> 4) & 0x000F,
+        ))
     }
 
     /// Handle a guest config-space write of `width` (1/2/4) bytes at `offset`,
@@ -1663,7 +1665,11 @@ mod tests {
         // Geometry decodes exactly; Table Size stored as N-1.
         assert_eq!(cs.read_u16(MSIX_CAP_OFFSET + 2) & 0x07FF, 7);
         assert_eq!(cs.msix_table_size(), 8);
-        assert_eq!(cs.read_u32(MSIX_CAP_OFFSET + 4), 0x2000 | 1, "table off|bir");
+        assert_eq!(
+            cs.read_u32(MSIX_CAP_OFFSET + 4),
+            0x2000 | 1,
+            "table off|bir"
+        );
         assert_eq!(cs.read_u32(MSIX_CAP_OFFSET + 8), 0x3000 | 1, "pba off|bir");
         // Disabled + unmasked out of the box.
         assert!(!cs.msix_enabled());
@@ -1739,7 +1745,11 @@ mod tests {
         t.write_table_u32(MSIX_ENTRY_SIZE + 4, 0x0000_0000); // addr_hi
         t.write_table_u32(MSIX_ENTRY_SIZE + 8, 0x0000_0031); // data
         t.write_table_u32(MSIX_ENTRY_SIZE + 12, 0xFFFF_FFFE); // unmask; reserved RAZ
-        assert_eq!(t.read_table_u32(MSIX_ENTRY_SIZE + 12), 0, "reserved bits dropped");
+        assert_eq!(
+            t.read_table_u32(MSIX_ENTRY_SIZE + 12),
+            0,
+            "reserved bits dropped"
+        );
         assert!(!t.is_masked(1));
 
         let msg = t.signal(1, false).expect("deliverable");
@@ -1860,7 +1870,10 @@ mod tests {
         );
         assert_eq!(cs.pci_express_device_type(), pcie_type::ENDPOINT);
         assert_eq!(cs.pci_express_version(), 2);
-        assert!(!cs.msi_enabled(), "MSI present but disabled until programmed");
+        assert!(
+            !cs.msi_enabled(),
+            "MSI present but disabled until programmed"
+        );
     }
 
     /// `msi_message` is the read side of MSI delivery: nothing until the guest

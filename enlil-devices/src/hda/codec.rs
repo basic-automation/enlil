@@ -357,7 +357,11 @@ mod tests {
     fn power_state_round_trips() {
         let mut codec = HdaCodec::new_realtek();
         let nid = 0x02u32; // a DAC
-        assert_eq!(codec.process_verb((nid << 20) | 0x000F_0500), 0x00, "reset D0");
+        assert_eq!(
+            codec.process_verb((nid << 20) | 0x000F_0500),
+            0x00,
+            "reset D0"
+        );
         // Set Power State D3.
         assert_eq!(codec.process_verb((nid << 20) | 0x0007_0503), 0);
         // PS-Act and PS-Set both D3 -> 0x33.

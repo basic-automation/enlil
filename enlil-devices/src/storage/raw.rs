@@ -153,7 +153,10 @@ mod tests {
         // fills the whole buffer (not a short read of stale data).
         let mut buf = [0xFFu8; 64];
         assert_eq!(backend.read_at(2000, &mut buf).unwrap(), 64);
-        assert!(buf.iter().all(|&b| b == 0), "unwritten region reads as zeros");
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "unwritten region reads as zeros"
+        );
 
         // A read spanning the end of the image is zero-filled past EOF.
         let mut tail = [0xFFu8; 256];

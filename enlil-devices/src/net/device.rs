@@ -749,7 +749,10 @@ mod tests {
         dev.inject_rx(&[0xDD, 0xEE]);
         let frame = dev.rx_pending.front().expect("one pending frame");
         let hdr = VirtioNetHeader::from_bytes(frame, false).expect("parse header");
-        assert!(!hdr.data_valid(), "DATA_VALID cleared after disabling GUEST_CSUM");
+        assert!(
+            !hdr.data_valid(),
+            "DATA_VALID cleared after disabling GUEST_CSUM"
+        );
     }
 
     #[test]
