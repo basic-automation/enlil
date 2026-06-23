@@ -45,6 +45,32 @@ pub const MSI_CAP_OFFSET: u16 = 0x60;
 /// [`PciConfigSpace::add_msix_capability`].
 pub const MSIX_CAP_OFFSET: u16 = 0x70;
 
+/// Config-space offset of the PCI Express Capability structure (60 bytes, v2).
+///
+/// Placed clear of the MSI-X capability at [`MSIX_CAP_OFFSET`] (`0x70..=0x7B`);
+/// the v2 structure spans `0x90..=0xCB`, inside the 256-byte config window. See
+/// [`PciConfigSpace::add_pci_express_capability`].
+pub const PCIE_CAP_OFFSET: u16 = 0x90;
+
+/// PCI Express Capability **Device/Port Type** values (`PCIe` Base spec, the
+/// PCI Express Capabilities Register bits 7:4).
+pub mod pcie_type {
+    /// `PCIe` Endpoint.
+    pub const ENDPOINT: u8 = 0x0;
+    /// Legacy `PCIe` Endpoint.
+    pub const LEGACY_ENDPOINT: u8 = 0x1;
+    /// Root Port of a `PCIe` Root Complex.
+    pub const ROOT_PORT: u8 = 0x4;
+    /// Upstream Port of a `PCIe` Switch.
+    pub const UPSTREAM_PORT: u8 = 0x5;
+    /// Downstream Port of a `PCIe` Switch.
+    pub const DOWNSTREAM_PORT: u8 = 0x6;
+    /// `PCIe`-to-PCI/PCI-X Bridge.
+    pub const PCIE_TO_PCI_BRIDGE: u8 = 0x7;
+    /// Root Complex Integrated Endpoint.
+    pub const RC_INTEGRATED_ENDPOINT: u8 = 0x9;
+}
+
 /// PCI configuration space header offsets
 pub mod cfg {
     pub const VENDOR_ID: u16 = 0x00;
@@ -411,6 +437,66 @@ impl PciConfigSpace {
             return 0;
         }
         (self.read_u16(MSIX_CAP_OFFSET + 2) & 0x07FF) + 1
+    }
+
+    /// Add a version-2 **PCI Express Capability** (Capability ID 0x10) at the
+    /// head of the capabilities list, chaining to whatever was previously the
+    /// head.
+    ///
+    /// This is the structure that makes a function a *`PCIe`* function rather
+    /// than a plain PCI one: every native `PCIe` device exposes it, and a guest
+    /// that finds an ECAM-reachable device with no PCI Express Capability has
+    /// caught a tell. `device_port_type` is one of [`pcie_type`]. The capability
+    /// advertises a modest x1 / 2.5 GT/s link and 256-byte max payload, with the
+    /// guest-writable Device/Link Control registers left at their reset values.
+    pub fn add_pci_express_capability(&mut self, device_port_type: u8) {
+        let prev_head = self.read_u8(cfg::CAPABILITY_PTR);
+        self.write_u8(PCIE_CAP_OFFSET, 0x10); // Capability ID: PCI Express
+        self.write_u8(PCIE_CAP_OFFSET + 1, prev_head); // next-capability pointer
+        // PCI Express Capabilities Register: Capability Version = 2 (bits 3:0),
+        // Device/Port Type (bits 7:4); Slot Implemented and Interrupt Message
+        // Number stay 0 (an endpoint has no slot).
+        let caps_reg = 0x0002 | (u16::from(device_port_type & 0xF) << 4);
+        self.write_u16(PCIE_CAP_OFFSET + 2, caps_reg);
+        // Device Capabilities: Max_Payload_Size Supported = 256 bytes (001b).
+        self.write_u32(PCIE_CAP_OFFSET + 4, 0x0000_0001);
+        // Device Control / Status reset to 0.
+        self.write_u16(PCIE_CAP_OFFSET + 8, 0x0000);
+        self.write_u16(PCIE_CAP_OFFSET + 10, 0x0000);
+        // Link Capabilities: Max Link Speed = 2.5 GT/s (1), Max Link Width = x1
+        // (1 << 4) -> 0x11.
+        self.write_u32(PCIE_CAP_OFFSET + 12, 0x0000_0011);
+        // Link Control reset 0; Link Status: Current Link Speed 1, Width x1.
+        self.write_u16(PCIE_CAP_OFFSET + 16, 0x0000);
+        self.write_u16(PCIE_CAP_OFFSET + 18, 0x0011);
+        // v2 registers (Device/Link Capabilities/Control/Status 2) reset to 0;
+        // config space was zero-initialised, so they are already correct. The
+        // structure occupies PCIE_CAP_OFFSET..=+0x3B.
+
+        // PCI Express is the new list head; assert the STATUS caps bit.
+        let head = u8::try_from(PCIE_CAP_OFFSET).unwrap_or(0);
+        self.write_u8(cfg::CAPABILITY_PTR, head);
+        let status = self.read_u16(cfg::STATUS) | 0x0010;
+        self.write_u16(cfg::STATUS, status);
+    }
+
+    /// The PCI Express Capability **version** (PCI Express Capabilities Register
+    /// bits 3:0), or 0 if the capability is absent.
+    #[must_use]
+    pub fn pci_express_version(&self) -> u8 {
+        if self.read_u8(PCIE_CAP_OFFSET) != 0x10 {
+            return 0;
+        }
+        u8_of(usize::from(self.read_u16(PCIE_CAP_OFFSET + 2) & 0x000F))
+    }
+
+    /// The PCI Express **Device/Port Type** (Capabilities Register bits 7:4) —
+    /// one of [`pcie_type`]. Returns 0 (Endpoint) if the capability is absent;
+    /// pair with [`pci_express_version`](Self::pci_express_version) to tell
+    /// "absent" from "endpoint".
+    #[must_use]
+    pub fn pci_express_device_type(&self) -> u8 {
+        u8_of(usize::from((self.read_u16(PCIE_CAP_OFFSET + 2) >> 4) & 0x000F))
     }
 
     /// Handle a guest config-space write of `width` (1/2/4) bytes at `offset`,
@@ -1661,6 +1747,50 @@ mod tests {
         assert!(t.is_pending(0), "stays pending under global mask");
         // ...and flushes once the global mask is lifted.
         assert_eq!(t.take_pending(false), vec![(0u64, 0x0001)]);
+    }
+
+    /// A PCI Express Capability is a walkable cap-ID-0x10 v2 entry advertising
+    /// the requested Device/Port Type, chaining ahead of the other caps, and
+    /// describing a modest x1 link — what a guest needs to accept the function
+    /// as a native `PCIe` device.
+    #[test]
+    fn pci_express_capability_is_walkable_and_describes_a_pcie_endpoint() {
+        let mut cs = PciConfigSpace::new(PciBdf::new(0, 10, 0), 0x1AF4, 0x1041);
+        cs.add_power_management_capability();
+        cs.add_msix_capability(4, 1, 0x1000, 1, 0x2000);
+        cs.add_pci_express_capability(pcie_type::ENDPOINT);
+
+        // PCIe cap is the new list head, chaining MSI-X -> PM -> null.
+        assert_ne!(cs.read_u16(cfg::STATUS) & 0x0010, 0, "caps bit");
+        assert_eq!(u16::from(cs.read_u8(cfg::CAPABILITY_PTR)), PCIE_CAP_OFFSET);
+        assert_eq!(cs.read_u8(PCIE_CAP_OFFSET), 0x10, "PCIe cap id");
+        assert_eq!(u16::from(cs.read_u8(PCIE_CAP_OFFSET + 1)), MSIX_CAP_OFFSET);
+        assert_eq!(u16::from(cs.read_u8(MSIX_CAP_OFFSET + 1)), PM_CAP_OFFSET);
+        assert_eq!(cs.read_u8(PM_CAP_OFFSET + 1), 0x00, "list terminates");
+
+        // Version 2, Endpoint type.
+        assert_eq!(cs.pci_express_version(), 2);
+        assert_eq!(cs.pci_express_device_type(), pcie_type::ENDPOINT);
+        // Link Capabilities + Status both report 2.5 GT/s x1.
+        assert_eq!(cs.read_u32(PCIE_CAP_OFFSET + 12) & 0x3FF, 0x011);
+        assert_eq!(cs.read_u16(PCIE_CAP_OFFSET + 18) & 0x3FF, 0x011);
+        // Max payload supported = 256 bytes (001b).
+        assert_eq!(cs.read_u32(PCIE_CAP_OFFSET + 4) & 0x7, 0x1);
+    }
+
+    /// The Device/Port Type round-trips for a non-endpoint, and the version
+    /// accessor reports 0 when the capability is absent (vs. a real endpoint's
+    /// type 0).
+    #[test]
+    fn pci_express_device_type_round_trips_and_absent_reads_zero_version() {
+        let mut rc = PciConfigSpace::new(PciBdf::new(0, 0, 0), 0x8086, 0x29C0);
+        rc.add_pci_express_capability(pcie_type::ROOT_PORT);
+        assert_eq!(rc.pci_express_version(), 2);
+        assert_eq!(rc.pci_express_device_type(), pcie_type::ROOT_PORT);
+
+        // A function without the capability reports version 0.
+        let plain = PciConfigSpace::new(PciBdf::new(0, 1, 0), 0x8086, 0x1234);
+        assert_eq!(plain.pci_express_version(), 0);
     }
 
     /// The device-identity registers are read-only to a guest: a guest write
