@@ -922,6 +922,20 @@ impl DeviceBus {
                 route_pci_intx(&pcie, &pic, &ioapic, XHCI_BDF.device, 1, level);
             });
         }
+        // MSI-X delivery: once the guest enables MSI-X on the function, the
+        // adapter delivers the programmed message straight to the LAPICs
+        // (via deliver_msi) instead of asserting INTx. The state probe reads the
+        // function's config-space MSI-X Enable / Function Mask so the adapter
+        // knows which interrupt mode is live and whether a vector is gated.
+        xhci_mmio.set_msi_sink(ioapic.msi_sink());
+        {
+            let pcie = pcie.clone();
+            xhci_mmio.set_msix_state(move || {
+                pcie.borrow()
+                    .find_device(&XHCI_BDF)
+                    .and_then(|dev| dev.msix_enabled().then(|| dev.msix_function_masked()))
+            });
+        }
         bus.add_mmio(Box::new(xhci_mmio))?;
 
         Ok(StandardPc {
@@ -1617,6 +1631,60 @@ mod tests {
         assert_eq!(u64::from_le_bytes(rsdp[24..32].try_into().unwrap()), 0);
         let loader_head = read_file(&mut pc.bus, 0x22, 4);
         assert_eq!(u32::from_le_bytes(loader_head.try_into().unwrap()), 0x1);
+    }
+
+    #[test]
+    fn msix_enabled_xhci_event_delivers_an_msi_to_the_lapic() {
+        use super::{XHCI_BDF, XHCI_MMIO_BASE};
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::interrupt::LAPIC_SVR;
+        use enlil_devices::pcie::MSIX_CAP_OFFSET;
+        use enlil_devices::usb::MSIX_TABLE_BAR_OFFSET;
+
+        let mut pc =
+            DeviceBus::standard_pc_complete(SerialOutput::new("guest", SerialOutputMode::Null), 0, 1)
+                .expect("assemble standard PC");
+
+        // Software-enable LAPIC 0 so it can accept a delivered interrupt.
+        pc.ioapic
+            .with(|c| c.lapics[0].write_register(LAPIC_SVR, 0x1FF));
+
+        // Enable MSI-X on the xHCI function in config space (Message Control
+        // bit 15) — this is what flips the adapter into MSI-X mode.
+        pc.pcie
+            .borrow_mut()
+            .find_device_mut(&XHCI_BDF)
+            .expect("xHCI function present")
+            .guest_write(MSIX_CAP_OFFSET + 2, 2, 0x8000);
+
+        let base = u64::from(XHCI_MMIO_BASE);
+        let table = base + u64::from(MSIX_TABLE_BAR_OFFSET);
+        let rtsoff = u64::from(pc.xhci.borrow().caps.rtsoff);
+        let iman = base + rtsoff + 0x20;
+        let wr = |bus: &mut DeviceBus, addr: u64, val: u32| {
+            VmExitHandler::mmio_write(bus, addr, &val.to_le_bytes());
+        };
+
+        // Program MSI-X vector 0 through the BAR table window: dest LAPIC 0
+        // (physical), vector 0x60, then unmask it; then enable the interrupter.
+        wr(&mut pc.bus, table, 0xFEE0_0000); // address lo
+        wr(&mut pc.bus, table + 8, 0x0000_0060); // data: vector 0x60
+        wr(&mut pc.bus, table + 12, 0); // unmask
+        wr(&mut pc.bus, iman, 2); // IMAN.IE
+        assert!(
+            !pc.ioapic.with(|c| c.has_pending(0)),
+            "no interrupt before any event"
+        );
+
+        // Post an xHCI event (port status change sets IP), then a register write
+        // drives the adapter dispatch that delivers the MSI-X message.
+        assert!(pc.xhci.borrow_mut().connect_device(0, 3));
+        wr(&mut pc.bus, iman, 2);
+
+        // The message-signalled interrupt reached LAPIC 0 with the programmed
+        // vector — no I/O APIC redirection entry involved.
+        assert!(pc.ioapic.with(|c| c.has_pending(0)), "MSI-X delivered");
+        assert_eq!(pc.ioapic.with(|c| c.pending_vector(0)), Some(0x60));
     }
 
     #[test]
