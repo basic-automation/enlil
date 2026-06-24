@@ -1805,14 +1805,17 @@ pub type SharedXhci = std::rc::Rc<std::cell::RefCell<VirtualXhciController>>;
 /// xHCI registers are 32-bit (64-bit registers are two dword halves, which
 /// the controller's window already models), so accesses are dispatched as
 /// dwords; a 64-bit access is split into two. After every write the adapter
-/// drives the function's interrupt: if the guest has put the function in MSI-X
-/// mode (config-space probe via [`set_msix_state`](Self::set_msix_state)) it
-/// delivers an edge-triggered MSI-X message through the
-/// [`set_msi_sink`](Self::set_msi_sink) sink on the rising edge of a pending,
-/// enabled interrupter and keeps legacy `INTx` deasserted; otherwise it pushes
-/// the controller's [`intx_level`](VirtualXhciController::intx_level) into the
-/// wired `INTx` sink (level-triggered: asserted while IP&IE, withdrawn when the
-/// guest clears IP through `IMAN`).
+/// drives the function's interrupt in whichever mode the guest has selected, in
+/// priority order: **MSI-X** (config-space probe via
+/// [`set_msix_state`](Self::set_msix_state)) delivers an edge-triggered
+/// per-vector message from the BAR table through the
+/// [`set_msi_sink`](Self::set_msi_sink) sink; **MSI**
+/// ([`set_msi_message`](Self::set_msi_message)) delivers the single config-space
+/// message on the same rising edge through that sink; both keep legacy `INTx`
+/// deasserted. With neither enabled it falls back to pushing the controller's
+/// [`intx_level`](VirtualXhciController::intx_level) into the wired `INTx` sink
+/// (level-triggered: asserted while IP&IE, withdrawn when the guest clears IP
+/// through `IMAN`).
 pub struct XhciMmio {
     controller: SharedXhci,
     base: u64,
@@ -1823,8 +1826,13 @@ pub struct XhciMmio {
     msi_sink: Option<Box<dyn Fn(crate::interrupt::MsiMessage)>>,
     /// Probes the function's config-space MSI-X state: `Some(globally_masked)`
     /// when MSI-X is enabled (route via the table; the bool is the Function
-    /// Mask), `None` when MSI-X is disabled (fall back to `INTx`).
+    /// Mask), `None` when MSI-X is disabled (try MSI, then `INTx`).
     msix_state: Option<Box<dyn Fn() -> Option<bool>>>,
+    /// Probes the function's config-space MSI message: `Some(message)` when
+    /// plain MSI is the active mode (MSI enabled, MSI-X not), `None` otherwise.
+    /// Checked only when `msix_state` reports MSI-X disabled, so MSI-X wins when
+    /// a guest somehow enables both (PCI spec: a device uses one at a time).
+    msi_message: Option<Box<dyn Fn() -> Option<crate::interrupt::MsiMessage>>>,
     /// Last sampled interrupter level (IP&IE), for edge-triggered MSI-X: a
     /// message is delivered only on the false→true transition, once per IP
     /// assertion, not on every write while IP stays set.
@@ -1843,6 +1851,7 @@ impl XhciMmio {
             interrupt_line: None,
             msi_sink: None,
             msix_state: None,
+            msi_message: None,
             last_int_level: false,
         }
     }
@@ -1870,6 +1879,18 @@ impl XhciMmio {
         self.msix_state = Some(Box::new(state));
     }
 
+    /// Wire the config-space MSI message probe. The closure returns
+    /// `Some(message)` while plain MSI is the active interrupt mode (MSI enabled,
+    /// MSI-X not) and `None` otherwise. The platform builds it from the xHCI
+    /// function's [`PciConfigSpace`](crate::pcie::PciConfigSpace):
+    /// `(!cfg.msix_enabled()).then(|| cfg.msi_message()).flatten()`.
+    pub fn set_msi_message(
+        &mut self,
+        probe: impl Fn() -> Option<crate::interrupt::MsiMessage> + 'static,
+    ) {
+        self.msi_message = Some(Box::new(probe));
+    }
+
     fn sync_interrupt_line(&self) {
         if let Some(line) = &self.interrupt_line {
             line(self.controller.borrow().intx_level());
@@ -1881,14 +1902,20 @@ impl XhciMmio {
     /// just made deliverable) while holding `INTx` low; otherwise drive the
     /// level-triggered `INTx` pin.
     fn dispatch_interrupt(&mut self) {
-        let Some(globally_masked) = self.msix_state.as_ref().and_then(|probe| probe()) else {
-            // MSI-X disabled: legacy level-triggered INTx.
+        if let Some(globally_masked) = self.msix_state.as_ref().and_then(|probe| probe()) {
+            self.dispatch_msix(globally_masked);
+        } else if let Some(message) = self.msi_message.as_ref().and_then(|probe| probe()) {
+            self.dispatch_msi(message);
+        } else {
+            // Neither MSI-X nor MSI: legacy level-triggered INTx.
             self.last_int_level = self.controller.borrow().intx_level();
             self.sync_interrupt_line();
-            return;
-        };
+        }
+    }
 
-        // MSI-X mode: a function using MSI-X never asserts INTx (PCI spec).
+    /// MSI-X mode: deliver per-vector table messages, hold `INTx` low.
+    fn dispatch_msix(&mut self, globally_masked: bool) {
+        // A function using MSI-X never asserts INTx (PCI spec).
         if let Some(line) = &self.interrupt_line {
             line(false);
         }
@@ -1910,6 +1937,23 @@ impl XhciMmio {
                 sink(msg);
             }
         }
+    }
+
+    /// MSI mode: deliver the single config-space message on the rising edge of a
+    /// pending, enabled interrupter, holding `INTx` low. MSI has no per-vector
+    /// table or PBA — there is one message and no deferral.
+    fn dispatch_msi(&mut self, message: crate::interrupt::MsiMessage) {
+        if let Some(line) = &self.interrupt_line {
+            line(false);
+        }
+        let level = self.controller.borrow().intx_level();
+        if level
+            && !self.last_int_level
+            && let Some(sink) = &self.msi_sink
+        {
+            sink(message);
+        }
+        self.last_int_level = level;
     }
 }
 
@@ -2113,6 +2157,38 @@ mod tests {
 
         assert!(msgs.borrow().is_empty(), "no MSI-X when MSI-X disabled");
         assert_eq!(intx.borrow().last(), Some(&true), "INTx asserted (IP&IE)");
+    }
+
+    #[test]
+    fn mmio_adapter_delivers_plain_msi_when_msi_enabled_not_msix() {
+        use crate::bus::MmioDevice as _;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let shared: SharedXhci = Rc::new(RefCell::new(VirtualXhciController::new(4)));
+        let mut mmio = XhciMmio::new(Rc::clone(&shared), 0xFE90_0000, 0x1_0000);
+        let msgs = Rc::new(RefCell::new(Vec::<crate::interrupt::MsiMessage>::new()));
+        let intx = Rc::new(RefCell::new(Vec::<bool>::new()));
+        let m = Rc::clone(&msgs);
+        mmio.set_msi_sink(move |msg| m.borrow_mut().push(msg));
+        let i = Rc::clone(&intx);
+        mmio.set_interrupt_line(move |lvl| i.borrow_mut().push(lvl));
+        // MSI-X disabled (probe yields None); plain MSI enabled with a message.
+        mmio.set_msix_state(|| None);
+        mmio.set_msi_message(|| Some(crate::interrupt::MsiMessage::new(0xFEE0_0000, 0x0070)));
+
+        let iman = u64::from(shared.borrow().caps.rtsoff + 0x20);
+        mmio.mmio_write(iman, 4, 2); // IMAN.IE
+        assert!(msgs.borrow().is_empty(), "no event yet → no MSI");
+
+        assert!(shared.borrow_mut().connect_device(0, 3)); // posts event, sets IP
+        mmio.mmio_write(iman, 4, 2); // drive dispatch
+        assert_eq!(msgs.borrow().len(), 1, "MSI delivered on the rising edge");
+        assert_eq!(msgs.borrow()[0].vector(), 0x70);
+
+        mmio.mmio_write(iman, 4, 2); // IP still set → no re-delivery
+        assert_eq!(msgs.borrow().len(), 1, "no re-delivery while IP stays set");
+        assert!(intx.borrow().iter().all(|&l| !l), "INTx held low under MSI");
     }
 
     #[test]

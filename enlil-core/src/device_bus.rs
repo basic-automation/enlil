@@ -936,6 +936,20 @@ impl DeviceBus {
                     .and_then(|dev| dev.msix_enabled().then(|| dev.msix_function_masked()))
             });
         }
+        {
+            // MSI fallback: a guest that enables plain MSI (not MSI-X) still gets
+            // a message-signalled interrupt rather than INTx. MSI-X takes
+            // priority — the probe yields nothing while MSI-X is enabled.
+            let pcie = pcie.clone();
+            xhci_mmio.set_msi_message(move || {
+                let rc = pcie.borrow();
+                let dev = rc.find_device(&XHCI_BDF)?;
+                if dev.msix_enabled() {
+                    return None;
+                }
+                dev.msi_message()
+            });
+        }
         bus.add_mmio(Box::new(xhci_mmio))?;
 
         Ok(StandardPc {
@@ -1685,6 +1699,47 @@ mod tests {
         // vector — no I/O APIC redirection entry involved.
         assert!(pc.ioapic.with(|c| c.has_pending(0)), "MSI-X delivered");
         assert_eq!(pc.ioapic.with(|c| c.pending_vector(0)), Some(0x60));
+    }
+
+    #[test]
+    fn msi_enabled_xhci_event_delivers_an_msi_to_the_lapic() {
+        use super::{XHCI_BDF, XHCI_MMIO_BASE};
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::interrupt::LAPIC_SVR;
+        use enlil_devices::pcie::MSI_CAP_OFFSET;
+
+        let mut pc =
+            DeviceBus::standard_pc_complete(SerialOutput::new("guest", SerialOutputMode::Null), 0, 1)
+                .expect("assemble standard PC");
+        pc.ioapic
+            .with(|c| c.lapics[0].write_register(LAPIC_SVR, 0x1FF));
+
+        // Enable plain MSI (not MSI-X) in the function's config space: a 64-bit
+        // message to LAPIC 0, vector 0x61.
+        {
+            let mut rc = pc.pcie.borrow_mut();
+            let dev = rc.find_device_mut(&XHCI_BDF).expect("xHCI function present");
+            dev.guest_write_u32(MSI_CAP_OFFSET + 4, 0xFEE0_0000); // address lo
+            dev.guest_write_u32(MSI_CAP_OFFSET + 8, 0); // address hi
+            dev.guest_write(MSI_CAP_OFFSET + 12, 2, 0x0061); // data: vector 0x61
+            dev.guest_write(MSI_CAP_OFFSET + 2, 2, 0x0081); // 64-bit + enable
+        }
+
+        let base = u64::from(XHCI_MMIO_BASE);
+        let rtsoff = u64::from(pc.xhci.borrow().caps.rtsoff);
+        let iman = base + rtsoff + 0x20;
+        let wr = |bus: &mut DeviceBus, addr: u64, val: u32| {
+            VmExitHandler::mmio_write(bus, addr, &val.to_le_bytes());
+        };
+        wr(&mut pc.bus, iman, 2); // IMAN.IE
+
+        // Post an event and drive the dispatch.
+        assert!(pc.xhci.borrow_mut().connect_device(0, 3));
+        wr(&mut pc.bus, iman, 2);
+
+        // The single MSI message reached LAPIC 0 with the programmed vector.
+        assert!(pc.ioapic.with(|c| c.has_pending(0)), "MSI delivered");
+        assert_eq!(pc.ioapic.with(|c| c.pending_vector(0)), Some(0x61));
     }
 
     #[test]
