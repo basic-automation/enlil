@@ -61,6 +61,32 @@ const COMMAND_BURST_LIMIT: usize = 256;
 /// of [`COMMAND_BURST_LIMIT`]).
 const TRANSFER_BURST_LIMIT: usize = 256;
 
+/// Number of MSI-X vectors the xHCI function advertises and backs with a table.
+///
+/// The controller models a single interrupter (interrupter 0), so one MSI-X
+/// vector is the faithful count: interrupter `i` maps to MSI-X vector `i`. Both
+/// the PCI MSI-X capability (in
+/// [`create_xhci_controller`](crate::pcie::PcieRootComplex::create_xhci_controller))
+/// and the BAR-backed table (in [`VirtualXhciController::new`]) are sized from
+/// this constant, so config space and the MMIO table never disagree.
+pub const XHCI_MSIX_VECTORS: u16 = 1;
+
+/// xHCI BAR0 offset of the MSI-X **table** region.
+///
+/// Placed in its own 4 KiB page, clear of every register block (caps/op/runtime/
+/// doorbells end at `DBOFF` 0x2000) and the Extended Capabilities list (at
+/// [`XECP_OFFSET`] 0x3000), so the MSI-X capability's Table Offset/BIR can point
+/// a guest at a real table the MMIO window decodes. BAR0 is a 64 KiB window, so
+/// this table and the PBA below both fit.
+pub const MSIX_TABLE_BAR_OFFSET: u32 = 0x8000;
+
+/// xHCI BAR0 offset of the MSI-X **Pending Bit Array**.
+///
+/// One 4 KiB page above the table — a real controller keeps the PBA in a
+/// separate page so the guest can map it read-only, independently of the
+/// (read/write) table.
+pub const MSIX_PBA_BAR_OFFSET: u32 = 0x9000;
+
 /// The per-guest virtual xHCI controller.
 ///
 /// One instance per guest; the routing engine attaches the physical devices
@@ -115,6 +141,12 @@ pub struct VirtualXhciController {
     /// re-established whenever that pointer changes (Configure Endpoint, Set TR
     /// Dequeue Pointer) or the endpoint is torn down (Reset/Disable).
     guest_transfer_rings: BTreeMap<(u8, u8), GuestRingCursor>,
+    /// The BAR-backed MSI-X table + PBA the function's MSI-X capability points at.
+    ///
+    /// The guest programs each vector's address/data/mask through MMIO into the
+    /// [`MSIX_TABLE_BAR_OFFSET`] window; a posted event consults it to deliver an
+    /// MSI-X message instead of asserting legacy `INTx`.
+    msix: crate::pcie::MsixTable,
 }
 
 /// Where slot's EP0 is within the Setup → Data → Status sequence.
@@ -160,6 +192,7 @@ impl VirtualXhciController {
             slot_ports: BTreeMap::new(),
             guest_resident_transfers: false,
             guest_transfer_rings: BTreeMap::new(),
+            msix: crate::pcie::MsixTable::new(XHCI_MSIX_VECTORS),
         }
     }
 
@@ -180,6 +213,11 @@ impl VirtualXhciController {
             o if o < op_base => self.caps.read(o),
             o if o < self.caps.rtsoff => self.op.read(o - op_base),
             o if o < self.caps.dboff => self.read_runtime(o - self.caps.rtsoff),
+            // MSI-X table / PBA windows (above the doorbells, below or beside the
+            // xECP list); decoded before the catch-all xECP arm since both sit
+            // past XECP_OFFSET.
+            o if self.in_msix_table(o) => self.msix.read_table_u32(o - MSIX_TABLE_BAR_OFFSET),
+            o if self.in_msix_pba(o) => self.read_msix_pba(o - MSIX_PBA_BAR_OFFSET),
             // The Extended Capabilities region (Supported Protocol caps) that
             // HCCPARAMS1's xECP points at.
             o if o >= XECP_OFFSET => self.caps.read_extended(o),
@@ -198,6 +236,12 @@ impl VirtualXhciController {
             o if o < op_base => {}
             o if o < self.caps.rtsoff => self.write_operational(o - op_base, value),
             o if o < self.caps.dboff => self.write_runtime(o - self.caps.rtsoff, value),
+            // MSI-X table: the guest programs each vector's address/data/mask.
+            o if self.in_msix_table(o) => {
+                self.msix.write_table_u32(o - MSIX_TABLE_BAR_OFFSET, value);
+            }
+            // The PBA is read-only to the guest; ignore writes (xHCI §5.2.8.3).
+            o if self.in_msix_pba(o) => {}
             o => {
                 let index = u8::try_from((o - self.caps.dboff) / 4).unwrap_or(u8::MAX);
                 // Every doorbell latches pending — including doorbell 0:
@@ -271,6 +315,39 @@ impl VirtualXhciController {
             0x3C => self.interrupter.write_erdp(hi(self.interrupter.erdp)),
             _ => {}
         }
+    }
+
+    /// Whether `offset` (window-relative) lands in the MSI-X **table** region —
+    /// `MSIX_ENTRY_SIZE` bytes per vector starting at [`MSIX_TABLE_BAR_OFFSET`].
+    fn in_msix_table(&self, offset: u32) -> bool {
+        let start = MSIX_TABLE_BAR_OFFSET as usize;
+        let end = start + self.msix.len() * crate::pcie::MSIX_ENTRY_SIZE as usize;
+        (start..end).contains(&(offset as usize))
+    }
+
+    /// Whether `offset` (window-relative) lands in the MSI-X **PBA** region —
+    /// one bit per vector, rounded up to 8-byte qwords, at [`MSIX_PBA_BAR_OFFSET`].
+    fn in_msix_pba(&self, offset: u32) -> bool {
+        let start = MSIX_PBA_BAR_OFFSET as usize;
+        let end = start + self.msix.len().div_ceil(64) * 8;
+        (start..end).contains(&(offset as usize))
+    }
+
+    /// Read a dword from the MSI-X PBA at `rel` (bytes from the PBA region base):
+    /// the low or high half of the qword the guest is sampling.
+    fn read_msix_pba(&self, rel: u32) -> u32 {
+        let qword = self.msix.read_pba_u64((rel / 8) as usize);
+        if rel.is_multiple_of(8) {
+            u32_of(qword)
+        } else {
+            u32_of(qword >> 32)
+        }
+    }
+
+    /// Borrow the function's MSI-X table (the BAR-backed vectors + PBA).
+    #[must_use]
+    pub const fn msix(&self) -> &crate::pcie::MsixTable {
+        &self.msix
     }
 
     /// Model the guest enqueueing a command on the command ring (until rings
@@ -1800,6 +1877,39 @@ mod tests {
         // MFINDEX at RTSOFF; doorbells are write-only zeros.
         assert_eq!(c.read_register(c.caps.rtsoff), 0);
         assert_eq!(c.read_register(c.caps.dboff), 0);
+    }
+
+    #[test]
+    fn msix_table_is_programmable_through_the_bar_window() {
+        let mut c = VirtualXhciController::new(4);
+        // The table is sized from XHCI_MSIX_VECTORS and comes up masked.
+        assert_eq!(c.msix().len(), usize::from(XHCI_MSIX_VECTORS));
+        assert!(c.msix().is_masked(0));
+
+        // Program vector 0 through the BAR window: address lo/hi, data, then
+        // clear the Vector Control mask bit.
+        let t = MSIX_TABLE_BAR_OFFSET;
+        c.write_register(t, 0xFEE0_1000); // Message Address lo
+        c.write_register(t + 4, 0x0000_0000); // Message Address hi
+        c.write_register(t + 8, 0x0000_0041); // Message Data (vector 0x41)
+        c.write_register(t + 12, 0x0000_0000); // Vector Control: unmask
+
+        // Reads come back through the same window.
+        assert_eq!(c.read_register(t), 0xFEE0_1000);
+        assert_eq!(c.read_register(t + 8), 0x41);
+        assert!(!c.msix().is_masked(0));
+        let entry = c.msix().entry(0).expect("vector 0 exists");
+        assert_eq!(entry.address(), 0xFEE0_1000);
+        assert_eq!(entry.data, 0x41);
+    }
+
+    #[test]
+    fn msix_pba_is_read_only_zero_at_reset() {
+        let mut c = VirtualXhciController::new(4);
+        // No pending interrupts → PBA reads zero, and guest writes are ignored.
+        assert_eq!(c.read_register(MSIX_PBA_BAR_OFFSET), 0);
+        c.write_register(MSIX_PBA_BAR_OFFSET, 0xFFFF_FFFF);
+        assert_eq!(c.read_register(MSIX_PBA_BAR_OFFSET), 0);
     }
 
     #[test]

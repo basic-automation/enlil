@@ -38,7 +38,10 @@ pub mod routing;
 pub mod types;
 pub mod xhci;
 
-pub use controller::{SharedXhci, VirtualXhciController, XhciMmio};
+pub use controller::{
+    MSIX_PBA_BAR_OFFSET, MSIX_TABLE_BAR_OFFSET, SharedXhci, VirtualXhciController, XHCI_MSIX_VECTORS,
+    XhciMmio,
+};
 pub use device::{UsbClass, UsbDevice, UsbDeviceId, UsbDeviceState, UsbSpeed};
 pub use emulated::{
     EmulatedKeyboard, KEYBOARD_INTERRUPT_ENDPOINT, LoopbackDevice, UsbDeviceModel,
