@@ -100,15 +100,19 @@ impl InterruptController {
         }
     }
 
-    /// Deliver to LAPICs matching logical destination.
-    fn deliver_logical(&mut self, _dest: u8, entry: InterruptEntry) {
+    /// Deliver to the LAPICs that are members of the logical destination `dest`
+    /// (matched via [`LocalApic::matches_logical`] against each LAPIC's
+    /// `DFR`/`LDR`), not every enabled LAPIC. For Fixed/NMI/etc. every matching
+    /// member accepts; for Lowest-Priority only the matching member with the
+    /// lowest TPR does.
+    fn deliver_logical(&mut self, dest: u8, entry: InterruptEntry) {
         match entry.delivery_mode {
             DeliveryMode::LowestPriority => {
                 let target = self
                     .lapics
                     .iter()
                     .enumerate()
-                    .filter(|(_, l)| l.is_enabled())
+                    .filter(|(_, l)| l.is_enabled() && l.matches_logical(dest))
                     .min_by_key(|(_, l)| l.get_tpr());
                 if let Some((idx, _)) = target {
                     let _ = self.lapics[idx].accept_interrupt(&entry);
@@ -116,7 +120,7 @@ impl InterruptController {
             }
             _ => {
                 for lapic in &mut self.lapics {
-                    if lapic.is_enabled() {
+                    if lapic.is_enabled() && lapic.matches_logical(dest) {
                         let _ = lapic.accept_interrupt(&entry);
                     }
                 }
@@ -164,7 +168,7 @@ impl InterruptController {
 
 #[cfg(test)]
 mod tests {
-    use super::super::lapic::LAPIC_SVR;
+    use super::super::lapic::{LAPIC_DFR, LAPIC_LDR, LAPIC_SVR};
     use super::*;
 
     fn make_controller(n: u8) -> InterruptController {
@@ -192,6 +196,39 @@ mod tests {
         ctrl.deliver_msi(&msg);
         assert!(ctrl.has_pending(0));
         assert_eq!(ctrl.pending_vector(0), Some(0x30));
+    }
+
+    #[test]
+    fn logical_msi_targets_only_matching_lapics() {
+        let mut ctrl = make_controller(4);
+        // Flat model; LAPIC 1 owns logical bit 0x02, LAPIC 2 owns 0x04.
+        ctrl.lapics[1].write_register(LAPIC_DFR, 0xFFFF_FFFF);
+        ctrl.lapics[1].write_register(LAPIC_LDR, 0x02 << 24);
+        ctrl.lapics[2].write_register(LAPIC_DFR, 0xFFFF_FFFF);
+        ctrl.lapics[2].write_register(LAPIC_LDR, 0x04 << 24);
+
+        // Logical MSI to destination bitmask 0x02 (address bit 2 set), vector 0x33.
+        ctrl.deliver_msi(&MsiMessage::new(0xFEE0_2004, 0x33));
+        assert!(ctrl.has_pending(1), "LAPIC 1 (logical 0x02) is targeted");
+        assert!(!ctrl.has_pending(2), "LAPIC 2 (logical 0x04) is not");
+        assert!(!ctrl.has_pending(0), "unprogrammed LAPIC 0 is not");
+        assert_eq!(ctrl.pending_vector(1), Some(0x33));
+    }
+
+    #[test]
+    fn logical_broadcast_reaches_every_member_but_unprogrammed_lapics_are_dropped() {
+        let mut ctrl = make_controller(3);
+        ctrl.lapics[0].write_register(LAPIC_DFR, 0xFFFF_FFFF);
+        ctrl.lapics[0].write_register(LAPIC_LDR, 0x01 << 24);
+        ctrl.lapics[1].write_register(LAPIC_DFR, 0xFFFF_FFFF);
+        ctrl.lapics[1].write_register(LAPIC_LDR, 0x02 << 24);
+        // LAPIC 2 left at LDR=0 (reset): a logical interrupt must not reach it.
+
+        // Destination 0xFF (all bits) reaches every LAPIC with a programmed LDR.
+        ctrl.deliver_msi(&MsiMessage::new(0xFEE0_FF04, 0x44));
+        assert!(ctrl.has_pending(0));
+        assert!(ctrl.has_pending(1));
+        assert!(!ctrl.has_pending(2), "LAPIC with LDR=0 matches nothing");
     }
 
     #[test]
