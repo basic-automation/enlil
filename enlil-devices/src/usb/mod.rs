@@ -39,8 +39,8 @@ pub mod types;
 pub mod xhci;
 
 pub use controller::{
-    MSIX_PBA_BAR_OFFSET, MSIX_TABLE_BAR_OFFSET, SharedXhci, VirtualXhciController, XHCI_MSIX_VECTORS,
-    XhciMmio,
+    MSIX_PBA_BAR_OFFSET, MSIX_TABLE_BAR_OFFSET, SharedXhci, VirtualXhciController,
+    XHCI_MSIX_VECTORS, XhciMmio,
 };
 pub use device::{UsbClass, UsbDevice, UsbDeviceId, UsbDeviceState, UsbSpeed};
 pub use emulated::{

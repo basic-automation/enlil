@@ -511,7 +511,10 @@ mod tests {
         // intra-cluster bitmask. LDR cluster 2, mask bit 0x1.
         lapic.write_register(LAPIC_DFR, 0x0FFF_FFFF);
         lapic.write_register(LAPIC_LDR, 0x21 << 24);
-        assert!(lapic.matches_logical(0x21), "same cluster, overlapping mask");
+        assert!(
+            lapic.matches_logical(0x21),
+            "same cluster, overlapping mask"
+        );
         assert!(!lapic.matches_logical(0x11), "different cluster");
         assert!(!lapic.matches_logical(0x22), "same cluster, disjoint mask");
     }

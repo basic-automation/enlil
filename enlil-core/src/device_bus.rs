@@ -1655,9 +1655,12 @@ mod tests {
         use enlil_devices::pcie::MSIX_CAP_OFFSET;
         use enlil_devices::usb::MSIX_TABLE_BAR_OFFSET;
 
-        let mut pc =
-            DeviceBus::standard_pc_complete(SerialOutput::new("guest", SerialOutputMode::Null), 0, 1)
-                .expect("assemble standard PC");
+        let mut pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            0,
+            1,
+        )
+        .expect("assemble standard PC");
 
         // Software-enable LAPIC 0 so it can accept a delivered interrupt.
         pc.ioapic
@@ -1708,9 +1711,12 @@ mod tests {
         use enlil_devices::interrupt::LAPIC_SVR;
         use enlil_devices::pcie::MSI_CAP_OFFSET;
 
-        let mut pc =
-            DeviceBus::standard_pc_complete(SerialOutput::new("guest", SerialOutputMode::Null), 0, 1)
-                .expect("assemble standard PC");
+        let mut pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            0,
+            1,
+        )
+        .expect("assemble standard PC");
         pc.ioapic
             .with(|c| c.lapics[0].write_register(LAPIC_SVR, 0x1FF));
 
@@ -1718,7 +1724,9 @@ mod tests {
         // message to LAPIC 0, vector 0x61.
         {
             let mut rc = pc.pcie.borrow_mut();
-            let dev = rc.find_device_mut(&XHCI_BDF).expect("xHCI function present");
+            let dev = rc
+                .find_device_mut(&XHCI_BDF)
+                .expect("xHCI function present");
             dev.guest_write_u32(MSI_CAP_OFFSET + 4, 0xFEE0_0000); // address lo
             dev.guest_write_u32(MSI_CAP_OFFSET + 8, 0); // address hi
             dev.guest_write(MSI_CAP_OFFSET + 12, 2, 0x0061); // data: vector 0x61

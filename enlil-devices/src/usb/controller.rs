@@ -1762,7 +1762,10 @@ impl VirtualXhciController {
     /// deliverable (per-entry unmasked and not globally masked), returning each
     /// as an injectable message. Call after the guest unmasks a table vector or
     /// clears the Function Mask so a deferred interrupt is not lost.
-    pub fn take_pending_msix(&mut self, globally_masked: bool) -> Vec<crate::interrupt::MsiMessage> {
+    pub fn take_pending_msix(
+        &mut self,
+        globally_masked: bool,
+    ) -> Vec<crate::interrupt::MsiMessage> {
         self.msix
             .take_pending(globally_masked)
             .into_iter()
