@@ -9,7 +9,7 @@ the recommended next step so the next run (which has no memory) can resume.
 ## 2026-06-24 — Session: complete the xHCI MSI/MSI-X interrupt-delivery arc (Phase 3) + 2 real interrupt bug fixes + scaffolding cleanup
 
 **7 tested increments + 1 `cargo fmt` commit, each independently green and
-committed** (branch `routine/enlil-2026-06-24`, PR <FILL_PR_URL>). Wall-clock
+committed** (branch `routine/enlil-2026-06-24`, PR https://github.com/physics515/enlil/pull/38). Wall-clock
 ~00:40→~01:26 (~46 min; builds were warm/cached and overlapped in the
 background). This finished the two explicit 2026-06-23 next-steps — **wire
 MSI/MSI-X interrupt delivery** (#1) and **route the MSI-X table into the xHCI
