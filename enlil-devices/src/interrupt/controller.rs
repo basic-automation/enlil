@@ -128,12 +128,27 @@ impl InterruptController {
         }
     }
 
-    /// Signal EOI from a vCPU.
+    /// Signal EOI from a vCPU. Clears the LAPIC's in-service bit and broadcasts
+    /// the EOI to the I/O APIC; any level-triggered line still asserted after the
+    /// EOI is re-delivered (the level-triggered re-arm), routed to its
+    /// destination LAPIC(s) exactly as the original assertion was.
     pub fn eoi(&mut self, vcpu_id: u8, vector: u8) {
         if let Some(lapic) = self.lapics.iter_mut().find(|l| l.id() == vcpu_id) {
             lapic.signal_eoi();
         }
-        self.ioapic.eoi_broadcast(vector);
+        for route in self.ioapic.eoi_broadcast(vector) {
+            let entry = InterruptEntry {
+                vector: route.vector,
+                delivery_mode: route.delivery_mode,
+                trigger_mode: TriggerMode::Level,
+                level: true,
+            };
+            if route.dest_logical {
+                self.deliver_logical(route.destination, entry);
+            } else {
+                self.deliver_physical(route.destination, entry);
+            }
+        }
     }
 
     /// Check if a vCPU has a pending interrupt.
@@ -229,6 +244,43 @@ mod tests {
         assert!(ctrl.has_pending(0));
         assert!(ctrl.has_pending(1));
         assert!(!ctrl.has_pending(2), "LAPIC with LDR=0 matches nothing");
+    }
+
+    #[test]
+    fn level_triggered_line_redelivers_on_eoi_until_deasserted() {
+        let mut ctrl = make_controller(1);
+        // Program IRQ 7 as a level-triggered RTE to LAPIC 0, vector 0x50.
+        {
+            let rte = ctrl.ioapic.get_rte_mut(7);
+            rte.set_vector(0x50);
+            rte.set_destination(0);
+            rte.set_masked(false);
+            rte.level_triggered = true;
+        }
+
+        // Device asserts the line → delivered to LAPIC 0.
+        ctrl.deliver_irq(7);
+        assert_eq!(ctrl.pending_vector(0), Some(0x50));
+
+        // Guest services and EOIs while the line is STILL asserted: the
+        // level-triggered interrupt re-arms and is delivered again.
+        ctrl.lapics[0].start_servicing(0x50);
+        ctrl.eoi(0, 0x50);
+        assert_eq!(
+            ctrl.pending_vector(0),
+            Some(0x50),
+            "still-asserted level line re-fires on EOI"
+        );
+
+        // The ISR cleared the device condition (line deasserts); now service +
+        // EOI leaves nothing pending.
+        ctrl.clear_irq(7);
+        ctrl.lapics[0].start_servicing(0x50);
+        ctrl.eoi(0, 0x50);
+        assert!(
+            !ctrl.has_pending(0),
+            "a deasserted line does not re-fire on EOI"
+        );
     }
 
     #[test]
