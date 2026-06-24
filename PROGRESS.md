@@ -6,6 +6,135 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-24 — Session: complete the xHCI MSI/MSI-X interrupt-delivery arc (Phase 3) + 2 real interrupt bug fixes + scaffolding cleanup
+
+**7 tested increments + 1 `cargo fmt` commit, each independently green and
+committed** (branch `routine/enlil-2026-06-24`, PR <FILL_PR_URL>). Wall-clock
+~00:40→~01:26 (~46 min; builds were warm/cached and overlapped in the
+background). This finished the two explicit 2026-06-23 next-steps — **wire
+MSI/MSI-X interrupt delivery** (#1) and **route the MSI-X table into the xHCI
+BAR0** (#2) — end-to-end at both the device-adapter and the platform level,
+then fixed **two real interrupt-delivery bugs** found along the way and removed
+the orphaned MSI/MSI-X scaffolding 2026-06-23 #1 flagged.
+
+### Increments (commit — what)
+1. `e96fb05` — **Route an MSI-X Table (BAR0 @ 0x8000) + PBA (@ 0x9000) into the
+   xHCI MMIO window**, backed by a real `pcie::MsixTable` on
+   `VirtualXhciController`. `read/write_register` decode those regions before the
+   xECP catch-all; `create_xhci_controller` adds the MSI-X capability (cap 0x11)
+   to the Renesas uPD720201 cap list (PCIe→MSI-X→MSI→PM), Table/PBA in BIR 0 at
+   those offsets. Sized from `XHCI_MSIX_VECTORS` (1 = one modelled interrupter). +2.
+2. `a365f68` — **MSI-X delivery through the xHCI adapter.** `signal_msix` raises
+   the interrupter's vector (message from the table when deliverable, PBA defer
+   when masked) and `take_pending_msix` replays on unmask; `XhciMmio` gains an MSI
+   sink + a config-space MSI-X state probe and, after each write, delivers an
+   edge-triggered message on the IP&IE rising edge while holding INTx low. +3.
+3. `1270785` — **Wire it into the platform** (`standard_pc_complete`):
+   `SharedInterruptController::msi_sink()` injects via `deliver_msi`; the adapter's
+   probe reads the function's config-space MSI-X Enable/Function-Mask. Exported
+   `LAPIC_SVR`. New platform integration test delivers an MSI-X end-to-end to
+   LAPIC 0. +1 (+1 controller export).
+4. `d16ca6c` — **Plain-MSI delivery too**: a guest that enables MSI (not MSI-X)
+   now gets a message-signalled interrupt instead of INTx. Dispatch resolves the
+   mode in PCI priority order MSI-X → MSI → INTx. +2 (adapter + platform tests).
+5. `9ce6dce` — **BUG FIX: honor the logical destination in MSI/IOAPIC delivery.**
+   `deliver_logical` ignored its `dest` arg and sprayed *every* enabled LAPIC;
+   added `LocalApic::matches_logical` (flat + cluster models, Intel SDM Vol.3A
+   §10.6.2.2) and filtered both Fixed and Lowest-Priority paths. A reset (LDR=0)
+   LAPIC now matches nothing, as real hardware drops a logical interrupt until the
+   OS programs LDR. +3.
+6. `1579031` — **Remove orphaned `msi::{MsiCapability,MsixCapability,
+   MsixTableEntry}`** (only re-exported + self-tested, superseded by `MsixTable` +
+   `PciConfigSpace` MSI/MSI-X) — 2026-06-23 next-step #1. Kept `MsiMessage`. −6 tests.
+7. `fff27f2` — **BUG FIX: re-deliver a still-asserted level-triggered IRQ on EOI.**
+   `IoApic::eoi` cleared Remote IRR but only set a read-only `delivery_pending`
+   status bit that nothing consumed, so a level-triggered PCI INTx (xHCI, SMBus)
+   whose condition outlived the ISR went silent. `eoi`/`eoi_broadcast` now return
+   the still-asserted routes (re-arming Remote IRR) and `InterruptController::eoi`
+   re-injects them (Intel I/O APIC datasheet §3.4.2). The common deassert-before-EOI
+   case re-delivers nothing. +1. (The legacy 8259 PIC was already correct — its
+   `acknowledge` re-arms level lines; the gap was IOAPIC-only.)
+8. `7164102` — **`cargo fmt --all`** over this session's new code (formatting only).
+
+### Research (informed the build)
+No new external literature logged — the work was driven by the existing
+ROADMAP/PROGRESS next-steps read against primary specs already cited in
+`RESEARCH.md`: **PCI Local Bus spec §6.8.2** (MSI-X capability + Table/PBA
+offset/BIR encoding, per-vector mask, masked-defer-to-PBA), the **Intel SDM
+Vol. 3A §10.6.2.2** (logical destination — flat vs cluster LDR/DFR matching),
+and the **Intel 82093AA I/O APIC datasheet §3.4.2** (level-triggered Remote IRR
+set on delivery, cleared on EOI, re-fire while the input stays asserted).
+Nothing new to add to `RESEARCH.md`.
+
+### Test results (exact)
+- **`/dev/kvm`: read-writable at start and at wrap (`KVM_RW_OK` both times).** The
+  KVM/guest-boot tests **ran for real, none skipped**: `enlil-core` lib
+  **213 passed, 0 failed, 0 ignored**, including the `kvm_backend` suite
+  **(29 passed)** — VM creation, MSR forward/round-trip, AMD/Intel topology &
+  PMU stealth leaves, the real-mode run loop — executing on real `/dev/kvm`. My
+  changes are device-/controller-side (no KVM-backend code touched); the suite
+  confirms no regression and real execution.
+- **Full workspace CI-parity** (the `.github/workflows/ci.yml` commands):
+  `cargo fmt --all -- --check` → clean; `cargo clippy --all-targets --workspace
+  -- -D warnings` → exit 0; `cargo test --workspace` → all green, **0 failures,
+  0 skips**. **enlil-devices 886** (881 at session start, +5 net: +14 new across
+  the arc, −6 from removed scaffolding, −3 reconciled), **enlil-core 213** (+2),
+  plus the smaller crates. The `acpi_iasl_validation` (3) and
+  `smbios_dmidecode_validation` (1) reference-compiler gates now **run and pass —
+  `iasl`/`dmidecode` are installed on this host** (they self-skipped on every
+  prior run; a real environment improvement noted for future ACPI/SMBIOS work).
+- **Toolchains:** every increment built/tested on **Linux/WSL** (nightly
+  `x86_64-unknown-linux-gnu`) AND built **Windows-native**
+  (`x86_64-pc-windows-msvc`, `cargo build` against the WSL manifest with a Windows
+  target-dir, via PowerShell with `$LASTEXITCODE` checks) — **exit 0** each time.
+  Increments touching only `enlil-devices` were Windows-built as `-p enlil-devices`;
+  the `enlil-core`-touching increments (3, 4) and the final tip were Windows-built
+  as `-p enlil-core` (which compiles `enlil-devices` too) — the host-agnostic
+  `device_bus`/`StandardPc` assembly is not `target_os="linux"`-gated, so it must
+  stay Windows-buildable, and does (KVM deps are Linux-gated and compile out).
+
+### STOP REASON
+**Genuine lack of clean, low-risk, unblocked increments — a mature codebase.**
+After completing the prioritized MSI/MSI-X arc and the two bug fixes it surfaced,
+an independent survey of adjacent subsystems found them already correct: the
+**8259 PIC** EOI/ELCR path re-arms level lines correctly in `acknowledge`; the
+**MC146818 RTC** models UF/AF/PF flags, IRQF, REG_C read-to-clear, and line
+deassert; the **8254 PIT** models all modes, access latches, read-back status,
+null-count, BCD; the **LAPIC** `pending_interrupt` already respects TPR/PPR; the
+**HDA codec** verb handling is complete post the 2026-06-23 fix. This corroborates
+2026-06-23's own comprehensive-sweep finding. The remaining high-value work is
+**architectural / multi-session** — a real guest-memory virtqueue transport (the
+largest fidelity lever), a threaded-vCPU watchdog (needs the bus `Sync`), and a
+shared **time-source abstraction** that gates several deferred features (LAPIC
+timer, 16550 RX-FIFO character-timeout) — and per the guardrails I did **not**
+start a risky late-night refactor (e.g. multi-interrupter xHCI MSI-X, or the bus
+`Sync` rework) just to consume clock. The one loose end from tonight's own work —
+flushing the MSI-X PBA when the guest clears the **Function Mask via a
+config-space write** (no MMIO touch to trigger an adapter dispatch) — is a
+documented follow-up; in practice a guest that clears the mask to receive
+interrupts immediately touches the BAR (event-ring/ERDP/doorbell), which flushes
+it, so it is not a real-world stall and a config-write→device bridge would add
+coupling for a non-occurring scenario. `master` stays buildable (green per
+increment).
+
+### Recommended next step (tomorrow)
+1. **Multi-interrupter xHCI MSI-X** (fresh, not at 2 a.m.): model >1
+   `InterrupterRegisterSet` and size `XHCI_MSIX_VECTORS` to match, so a guest can
+   spread queues across vectors — the natural extension of tonight's 1-vector table.
+2. **A shared time-source abstraction** wired into the existing run-loop/timer-thread
+   tick: it unblocks the **LAPIC timer** (per-CPU scheduler tick) and the **16550
+   RX-FIFO trigger + character-timeout** (the latter must land *with* the trigger
+   level, or interactive single-keystroke input regresses). This is the highest-
+   leverage unblock for several deferred features.
+3. **Bridge config-space MSI/MSI-X control writes to the device** so a Function-Mask
+   clear (or MSI-X enable) flushes the PBA immediately — closes tonight's documented
+   follow-up cleanly if a low-coupling observer hook is designed.
+4. Unchanged from prior runs: real guest-memory virtqueue transport (largest
+   fidelity lever); install `qemu-img` + OVMF to unblock the qcow2 refcount-table
+   validation and an OVMF smoke boot (`iasl`/`dmidecode` are now present).
+
+---
+
 ## 2026-06-23 — Session: PCI MSI-X + PCIe-capability fidelity (Phase 3) and a broad device-correctness sweep (4 real bug fixes)
 
 **13 tested increments + 1 `cargo fmt` commit, each independently green and
