@@ -138,6 +138,36 @@ impl LocalApic {
         self.enabled
     }
 
+    /// Whether this LAPIC is a member of the given logical destination.
+    ///
+    /// Interprets the 8-bit message destination address (MDA) against this
+    /// LAPIC's `LDR`/`DFR` per Intel SDM Vol.3 §10.6.2:
+    /// - **Flat model** (`DFR[31:28] = 0xF`): `LDR[31:24]` is an 8-bit bitmask
+    ///   of logical IDs; addressed if any bit overlaps the MDA. Up to 8 CPUs.
+    /// - **Cluster model** (`DFR[31:28] = 0x0`): `LDR[31:24]` splits into a
+    ///   4-bit cluster address (bits 31:28) and a 4-bit intra-cluster bitmask
+    ///   (bits 27:24); addressed if the cluster matches and a logical-ID bit
+    ///   overlaps the MDA's low nibble.
+    ///
+    /// MDA `0xFF` is the logical broadcast and always matches.
+    #[must_use]
+    pub const fn matches_logical(&self, mda: u8) -> bool {
+        if mda == 0xFF {
+            return true;
+        }
+        let ldr_id = (self.ldr >> 24) as u8;
+        if (self.dfr >> 28) == 0xF {
+            // Flat model: LDR is a direct bitmask of logical IDs.
+            (ldr_id & mda) != 0
+        } else {
+            // Cluster model: high nibble selects the cluster, low nibble is a
+            // 4-bit bitmask of LAPICs within that cluster.
+            let cluster = ldr_id >> 4;
+            let mask = ldr_id & 0x0F;
+            cluster == (mda >> 4) && (mask & (mda & 0x0F)) != 0
+        }
+    }
+
     /// Get the Task Priority Register value.
     #[must_use]
     pub const fn get_tpr(&self) -> u8 {
@@ -466,6 +496,34 @@ mod tests {
         let lapic = LocalApic::new(42);
         assert_eq!(lapic.id(), 42);
         assert!(!lapic.is_enabled());
+    }
+
+    #[test]
+    fn test_matches_logical_flat_model() {
+        // Default DFR is flat (0xFFFF_FFFF); LDR top byte is the logical-id mask.
+        let mut lapic = LocalApic::new(0);
+        lapic.write_register(LAPIC_LDR, 0x0400_0000); // logical id bit 2
+        assert!(lapic.matches_logical(0x04));
+        assert!(lapic.matches_logical(0x06)); // 0x02 | 0x04 — overlaps
+        assert!(!lapic.matches_logical(0x02));
+        assert!(lapic.matches_logical(0xFF)); // broadcast
+        // A LAPIC that never programmed its LDR matches nothing but broadcast.
+        let blank = LocalApic::new(1);
+        assert!(!blank.matches_logical(0x01));
+        assert!(blank.matches_logical(0xFF));
+    }
+
+    #[test]
+    fn test_matches_logical_cluster_model() {
+        // Cluster model: DFR[31:28] = 0x0. LDR high nibble = cluster, low
+        // nibble = intra-cluster bitmask.
+        let mut lapic = LocalApic::new(0);
+        lapic.write_register(LAPIC_DFR, 0x0FFF_FFFF); // cluster model
+        lapic.write_register(LAPIC_LDR, 0x2100_0000); // cluster 2, member bit 0
+        assert!(lapic.matches_logical(0x21)); // same cluster, overlapping member
+        assert!(!lapic.matches_logical(0x22)); // same cluster, different member
+        assert!(!lapic.matches_logical(0x11)); // different cluster
+        assert!(lapic.matches_logical(0xFF)); // broadcast still matches
     }
 
     #[test]

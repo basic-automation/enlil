@@ -100,15 +100,20 @@ impl InterruptController {
         }
     }
 
-    /// Deliver to LAPICs matching logical destination.
-    fn deliver_logical(&mut self, _dest: u8, entry: InterruptEntry) {
+    /// Deliver to LAPICs matching the logical destination (MDA).
+    ///
+    /// Each LAPIC decides membership from its own `LDR`/`DFR`
+    /// ([`LocalApic::matches_logical`]); only enabled, addressed LAPICs are
+    /// considered. For lowest-priority delivery the one with the lowest TPR
+    /// among the matching set wins; otherwise every matching LAPIC accepts.
+    fn deliver_logical(&mut self, dest: u8, entry: InterruptEntry) {
         match entry.delivery_mode {
             DeliveryMode::LowestPriority => {
                 let target = self
                     .lapics
                     .iter()
                     .enumerate()
-                    .filter(|(_, l)| l.is_enabled())
+                    .filter(|(_, l)| l.is_enabled() && l.matches_logical(dest))
                     .min_by_key(|(_, l)| l.get_tpr());
                 if let Some((idx, _)) = target {
                     let _ = self.lapics[idx].accept_interrupt(&entry);
@@ -116,7 +121,7 @@ impl InterruptController {
             }
             _ => {
                 for lapic in &mut self.lapics {
-                    if lapic.is_enabled() {
+                    if lapic.is_enabled() && lapic.matches_logical(dest) {
                         let _ = lapic.accept_interrupt(&entry);
                     }
                 }
@@ -164,7 +169,7 @@ impl InterruptController {
 
 #[cfg(test)]
 mod tests {
-    use super::super::lapic::LAPIC_SVR;
+    use super::super::lapic::{LAPIC_LDR, LAPIC_SVR};
     use super::*;
 
     fn make_controller(n: u8) -> InterruptController {
@@ -192,6 +197,59 @@ mod tests {
         ctrl.deliver_msi(&msg);
         assert!(ctrl.has_pending(0));
         assert_eq!(ctrl.pending_vector(0), Some(0x30));
+    }
+
+    #[test]
+    fn test_deliver_msi_logical_flat_targets_only_addressed_lapics() {
+        // Flat model (default DFR): give LAPIC 0 logical id bit 0, LAPIC 1 bit 1.
+        let mut ctrl = make_controller(2);
+        ctrl.lapics[0].write_register(LAPIC_LDR, 0x0100_0000);
+        ctrl.lapics[1].write_register(LAPIC_LDR, 0x0200_0000);
+
+        // Logical MSI (address bit 2 set) to logical id 0x02 — only LAPIC 1.
+        let msg = MsiMessage {
+            address: 0xFEE0_2004,
+            data: 0x50,
+            delivery_mode: DeliveryMode::Fixed,
+        };
+        ctrl.deliver_msi(&msg);
+        assert!(!ctrl.has_pending(0), "LAPIC 0 not in the logical destination");
+        assert_eq!(ctrl.pending_vector(1), Some(0x50));
+    }
+
+    #[test]
+    fn test_deliver_msi_logical_flat_multicast() {
+        // A logical MDA with two bits set fans out to both members (Fixed).
+        let mut ctrl = make_controller(2);
+        ctrl.lapics[0].write_register(LAPIC_LDR, 0x0100_0000);
+        ctrl.lapics[1].write_register(LAPIC_LDR, 0x0200_0000);
+        let msg = MsiMessage {
+            address: 0xFEE0_3004, // logical, MDA = 0x03
+            data: 0x61,
+            delivery_mode: DeliveryMode::Fixed,
+        };
+        ctrl.deliver_msi(&msg);
+        assert_eq!(ctrl.pending_vector(0), Some(0x61));
+        assert_eq!(ctrl.pending_vector(1), Some(0x61));
+    }
+
+    #[test]
+    fn test_deliver_msi_logical_lowest_priority_picks_lowest_tpr() {
+        // Both LAPICs are addressed; lowest-priority delivery picks the one
+        // with the lower TPR (LAPIC 1 here).
+        let mut ctrl = make_controller(2);
+        ctrl.lapics[0].write_register(LAPIC_LDR, 0x0100_0000);
+        ctrl.lapics[1].write_register(LAPIC_LDR, 0x0200_0000);
+        ctrl.lapics[0].set_tpr(0x40);
+        ctrl.lapics[1].set_tpr(0x10);
+        let msg = MsiMessage {
+            address: 0xFEE0_3004, // logical, MDA = 0x03 (both members)
+            data: 0x71,
+            delivery_mode: DeliveryMode::LowestPriority,
+        };
+        ctrl.deliver_msi(&msg);
+        assert!(!ctrl.has_pending(0));
+        assert_eq!(ctrl.pending_vector(1), Some(0x71));
     }
 
     #[test]
