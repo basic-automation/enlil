@@ -27,12 +27,12 @@ impl InterruptController {
     /// Deliver an IOAPIC interrupt (from a device IRQ line).
     pub fn deliver_irq(&mut self, irq: u8) {
         if let Some(route) = self.ioapic.set_irq(irq as usize) {
-            self.deliver_route(route);
+            self.deliver_route(&route);
         }
     }
 
     /// Resolve an I/O APIC [`InterruptRoute`] to the addressed LAPIC(s).
-    fn deliver_route(&mut self, route: InterruptRoute) {
+    fn deliver_route(&mut self, route: &InterruptRoute) {
         let entry = InterruptEntry {
             vector: route.vector,
             delivery_mode: route.delivery_mode,
@@ -243,14 +243,14 @@ impl InterruptController {
     /// Clears the LAPIC's in-service bit, then broadcasts the EOI to the I/O
     /// APIC. Any level-triggered RTE whose input line is still asserted is
     /// re-sent immediately (the standard level-triggered retrigger-after-EOI
-    /// path), so a held PCI INTx line keeps interrupting until the device
+    /// path), so a held PCI `INTx` line keeps interrupting until the device
     /// deasserts it.
     pub fn eoi(&mut self, vcpu_id: u8, vector: u8) {
         if let Some(lapic) = self.lapics.iter_mut().find(|l| l.id() == vcpu_id) {
             lapic.signal_eoi();
         }
         for route in self.ioapic.eoi_broadcast(vector) {
-            self.deliver_route(route);
+            self.deliver_route(&route);
         }
     }
 
@@ -351,7 +351,10 @@ mod tests {
             delivery_mode: DeliveryMode::Fixed,
         };
         ctrl.deliver_msi(&msg);
-        assert!(!ctrl.has_pending(0), "LAPIC 0 not in the logical destination");
+        assert!(
+            !ctrl.has_pending(0),
+            "LAPIC 0 not in the logical destination"
+        );
         assert_eq!(ctrl.pending_vector(1), Some(0x50));
     }
 

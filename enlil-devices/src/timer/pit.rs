@@ -631,8 +631,16 @@ mod tests {
             }
             n
         };
-        assert_eq!(count_to_edge(&mut pit), 5, "first edge after `reload` clocks");
-        assert_eq!(count_to_edge(&mut pit), 5, "steady-state period == `reload`");
+        assert_eq!(
+            count_to_edge(&mut pit),
+            5,
+            "first edge after `reload` clocks"
+        );
+        assert_eq!(
+            count_to_edge(&mut pit),
+            5,
+            "steady-state period == `reload`"
+        );
     }
 
     #[test]
