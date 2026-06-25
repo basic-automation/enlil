@@ -1,7 +1,7 @@
 //! Unified interrupt controller — coordinates LAPIC, IOAPIC, and MSI delivery.
 
 use super::ioapic::{InterruptRoute, IoApic};
-use super::lapic::{LAPIC_ICR_LOW, LocalApic};
+use super::lapic::{LAPIC_EOI, LAPIC_ICR_LOW, LocalApic};
 use super::msi::MsiMessage;
 use super::{DeliveryMode, InterruptEntry, TriggerMode};
 
@@ -91,6 +91,17 @@ impl InterruptController {
     /// the programmed IPI via [`send_ipi`](Self::send_ipi). Unknown vCPU IDs
     /// are ignored.
     pub fn write_lapic(&mut self, vcpu_id: u8, offset: u32, value: u32) {
+        // An EOI register write retires the highest in-service vector and must
+        // also broadcast to the I/O APIC (clearing remote_IRR / retriggering a
+        // still-asserted level line), so route it through the full EOI path
+        // rather than the bare register store.
+        if offset == LAPIC_EOI {
+            if let Some(vector) = self.lapic(vcpu_id).and_then(LocalApic::in_service_vector) {
+                self.eoi(vcpu_id, vector);
+            }
+            return;
+        }
+
         let trigger = {
             let Some(lapic) = self.lapic_mut(vcpu_id) else {
                 return;

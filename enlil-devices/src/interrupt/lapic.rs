@@ -10,6 +10,10 @@
 use super::{DeliveryMode, InterruptEntry, TriggerMode};
 use crate::truncate::{u8_of, u32_of};
 
+/// Default xAPIC MMIO base (the reset value of the `IA32_APIC_BASE` MSR's
+/// frame). All vCPUs see their own LAPIC at this physical address.
+pub const LAPIC_BASE: u64 = 0xFEE0_0000;
+
 // LAPIC register offsets (byte offsets from base 0xFEE00000)
 pub const LAPIC_ID: u32 = 0x020;
 pub const LAPIC_VERSION: u32 = 0x030;
@@ -136,6 +140,16 @@ impl LocalApic {
     #[must_use]
     pub const fn icr(&self) -> u64 {
         self.icr
+    }
+
+    /// Highest-priority in-service vector (the highest set `ISR` bit), if any.
+    ///
+    /// This is the vector a bare `EOI` register write retires, so the
+    /// controller can resolve which line to broadcast the EOI to before the
+    /// `ISR` bit is cleared.
+    #[must_use]
+    pub fn in_service_vector(&self) -> Option<u8> {
+        Self::highest_bit_in_register(&self.isr)
     }
 
     /// Whether the `LocalApic` is software-enabled (bit 8 of `SVR`).

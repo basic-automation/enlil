@@ -23,11 +23,15 @@ use std::sync::{Arc, Mutex};
 
 use super::controller::InterruptController;
 use super::ioapic::IOAPIC_BASE;
+use super::lapic::LAPIC_BASE;
 use crate::bus::MmioDevice;
 use crate::truncate::u32_of;
 
 /// Size of the I/O APIC MMIO aperture (one 4 KiB page at [`IOAPIC_BASE`]).
 const IOAPIC_MMIO_SIZE: u64 = 0x1000;
+
+/// Size of a LAPIC MMIO aperture (one 4 KiB page at [`LAPIC_BASE`]).
+const LAPIC_MMIO_SIZE: u64 = 0x1000;
 
 /// Standard-PC ACPI interrupt-source overrides that change the *Global System
 /// Interrupt* (I/O APIC pin) number an ISA IRQ is delivered on.
@@ -172,6 +176,56 @@ impl MmioDevice for IoApicMmio {
     }
 }
 
+/// One vCPU's LAPIC MMIO aperture as a bus [`MmioDevice`].
+///
+/// In xAPIC mode every CPU accesses *its own* LAPIC through the same physical
+/// page ([`LAPIC_BASE`], `0xFEE0_0000`), so the trap must be attributed to the
+/// vCPU that took it. Each vCPU therefore mounts its own `LapicMmio` bound to
+/// its APIC ID; reads/writes route to that vCPU's [`LocalApic`] in the shared
+/// [`InterruptController`]. Writes go through
+/// [`InterruptController::write_lapic`], so an `ICR` write actually dispatches
+/// the IPI and an `EOI` write runs the full LAPIC + I/O APIC EOI path. Without
+/// this front-end the software LAPIC is reachable only from host code, and a
+/// guest could neither EOI nor send IPIs through memory.
+///
+/// Register accesses are 32-bit dwords, so the access size is ignored.
+///
+/// [`LocalApic`]: super::lapic::LocalApic
+pub struct LapicMmio {
+    controller: SharedInterruptController,
+    vcpu_id: u8,
+}
+
+impl LapicMmio {
+    /// Mount the LAPIC aperture for vCPU `vcpu_id` over the shared controller.
+    #[must_use]
+    pub const fn new(controller: SharedInterruptController, vcpu_id: u8) -> Self {
+        Self {
+            controller,
+            vcpu_id,
+        }
+    }
+}
+
+impl MmioDevice for LapicMmio {
+    fn mmio_read(&mut self, offset: u64, _size: u8) -> u64 {
+        let reg = u32_of(offset);
+        self.controller.with(|c| {
+            c.lapic(self.vcpu_id)
+                .map_or(0, |l| u64::from(l.read_register(reg)))
+        })
+    }
+
+    fn mmio_write(&mut self, offset: u64, _size: u8, data: u64) {
+        self.controller
+            .with(|c| c.write_lapic(self.vcpu_id, u32_of(offset), u32_of(data)));
+    }
+
+    fn mmio_range(&self) -> (u64, u64) {
+        (LAPIC_BASE, LAPIC_BASE + LAPIC_MMIO_SIZE)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +343,60 @@ mod tests {
     fn mmio_aperture_covers_the_ioapic_page() {
         let mmio = IoApicMmio::new(SharedInterruptController::new(1));
         assert_eq!(mmio.mmio_range(), (0xFEC0_0000, 0xFEC0_1000));
+    }
+
+    #[test]
+    fn lapic_mmio_aperture_covers_the_lapic_page() {
+        let mmio = LapicMmio::new(SharedInterruptController::new(1), 0);
+        assert_eq!(mmio.mmio_range(), (0xFEE0_0000, 0xFEE0_1000));
+    }
+
+    #[test]
+    fn lapic_mmio_ipi_routes_from_one_vcpu_to_another() {
+        use crate::interrupt::lapic::{LAPIC_ICR_HIGH, LAPIC_ICR_LOW};
+
+        let pic = SharedInterruptController::new(2);
+        pic.with(|c| {
+            c.lapics[0].write_register(LAPIC_SVR, 0x1FF);
+            c.lapics[1].write_register(LAPIC_SVR, 0x1FF);
+        });
+        // vCPU 0's own LAPIC aperture.
+        let mut mmio = LapicMmio::new(pic.clone(), 0);
+
+        // Program and fire a Fixed IPI at APIC ID 1 the way a guest would:
+        // ICR_HIGH (destination), then ICR_LOW (vector + trigger).
+        mmio.mmio_write(u64::from(LAPIC_ICR_HIGH), 4, 1 << 24);
+        mmio.mmio_write(u64::from(LAPIC_ICR_LOW), 4, 0x90);
+
+        assert!(!pic.with(|c| c.has_pending(0)));
+        assert_eq!(pic.with(|c| c.pending_vector(1)), Some(0x90));
+    }
+
+    #[test]
+    fn lapic_mmio_eoi_retriggers_a_held_level_line() {
+        use crate::interrupt::lapic::LAPIC_EOI;
+
+        let pic = SharedInterruptController::new(1);
+        pic.with(|c| {
+            c.lapics[0].write_register(LAPIC_SVR, 0x1FF);
+            let rte = c.ioapic.get_rte_mut(5);
+            rte.set_vector(0x50);
+            rte.set_destination(0);
+            rte.set_masked(false);
+            rte.level_triggered = true;
+        });
+
+        // Device asserts the level line; vCPU services it.
+        pic.line(5)(true);
+        assert_eq!(pic.with(|c| c.pending_vector(0)), Some(0x50));
+        pic.with(|c| c.lapics[0].start_servicing(0x50));
+        assert!(!pic.with(|c| c.has_pending(0)));
+
+        // Guest writes the LAPIC EOI register through MMIO; with the line still
+        // asserted the interrupt is re-delivered (full LAPIC + I/O APIC path).
+        let mut mmio = LapicMmio::new(pic.clone(), 0);
+        mmio.mmio_write(u64::from(LAPIC_EOI), 4, 0);
+        assert_eq!(pic.with(|c| c.pending_vector(0)), Some(0x50));
     }
 
     #[test]

@@ -62,8 +62,8 @@ pub struct InterruptEntry {
 pub use controller::InterruptController;
 pub use ioapic::IOAPIC_BASE;
 pub use ioapic::{IoApic, RedirectionEntry};
-pub use lapic::LocalApic;
-pub use line::{IoApicMmio, SharedInterruptController, isa_to_gsi};
+pub use lapic::{LAPIC_BASE, LocalApic};
+pub use line::{IoApicMmio, LapicMmio, SharedInterruptController, isa_to_gsi};
 pub use msi::{MsiCapability, MsiMessage, MsixCapability, MsixTableEntry};
 pub use pic::{
     DualPic, ELCR_MASTER, ELCR_SLAVE, ElcrPort, MASTER_CMD, MASTER_DATA, Pic8259, PicMasterPort,
