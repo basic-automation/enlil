@@ -245,14 +245,14 @@ impl PitChannel {
                 false
             }
             ChannelMode::RateGenerator => {
-                if self.count == 0 {
-                    self.count = self.reload;
-                    return false;
-                }
                 self.count = self.count.wrapping_sub(1);
-                if self.count == 1 {
-                    self.status.output = false;
+                if self.count == 0 {
+                    // Terminal count: OUT pulses low for one clock, then the
+                    // counter reloads and OUT returns high. The period is
+                    // exactly `reload` input clocks (a reload of 0 = 65536),
+                    // matching the divisor `irq_frequency` advertises.
                     self.count = self.reload;
+                    self.status.output = false;
                     return true;
                 }
                 self.status.output = true;
@@ -613,6 +613,26 @@ mod tests {
         pit.write_port(0x40, ((0x4A9 >> 8) & 0xFF) as u8);
         let freq = pit.channel0_frequency();
         assert!((999..=1001).contains(&freq));
+    }
+
+    #[test]
+    fn rate_generator_period_equals_reload() {
+        let mut pit = Pit::new();
+        pit.write_port(0x43, 0x34); // ch0, lo/hi, mode 2 (rate generator)
+        pit.write_port(0x40, 5); // reload low = 5
+        pit.write_port(0x40, 0); // reload high -> reload = 5, count loaded
+
+        // A mode-2 channel divides the input clock by exactly `reload`: the
+        // terminal-count edge lands every `reload` channel ticks, not reload-1.
+        let count_to_edge = |pit: &mut Pit| {
+            let mut n = 1;
+            while !pit.channels[0].tick() {
+                n += 1;
+            }
+            n
+        };
+        assert_eq!(count_to_edge(&mut pit), 5, "first edge after `reload` clocks");
+        assert_eq!(count_to_edge(&mut pit), 5, "steady-state period == `reload`");
     }
 
     #[test]
