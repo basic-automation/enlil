@@ -480,6 +480,7 @@ mod tests {
         let redeliver = ioapic.eoi(0x33);
         assert_eq!(redeliver.len(), 1);
         assert_eq!(redeliver[0].vector, 0x33);
+        assert!(redeliver[0].level_triggered);
         assert!(ioapic.entries[3].remote_irr, "re-armed while line is high");
 
         // Once the device deasserts the line, EOI clears Remote IRR for good
@@ -488,6 +489,22 @@ mod tests {
         let redeliver = ioapic.eoi(0x33);
         assert!(redeliver.is_empty());
         assert!(!ioapic.entries[3].remote_irr);
+    }
+
+    #[test]
+    fn ioapic_eoi_does_not_resend_a_masked_line() {
+        // A guest may mask the RTE before EOI; a masked line must not re-send
+        // even while the input is asserted.
+        let mut ioapic = IoApic::new(0);
+        ioapic.entries[7].masked = false;
+        ioapic.entries[7].vector = 0x44;
+        ioapic.entries[7].level_triggered = true;
+        assert!(ioapic.set_irq(7).is_some());
+
+        ioapic.entries[7].masked = true;
+        let resend = ioapic.eoi(0x44);
+        assert!(resend.is_empty());
+        assert!(!ioapic.entries[7].remote_irr);
     }
 
     #[test]

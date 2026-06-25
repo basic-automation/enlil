@@ -6,6 +6,126 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-25 — Session: guest-facing interrupt-delivery path made correct (Phase 3) — LAPIC/IOAPIC/IPI delivery + 2 timer bug fixes
+
+**7 tested increments, each independently green and committed** (branch
+`routine/enlil-2026-06-25`, PR https://github.com/physics515/enlil/pull/39). Wall-clock ~00:40→~02:50
+(~1h of building; the WSL test/clippy and the Windows-native build overlapped
+in the background for every increment). One coherent thread: take the software
+interrupt subsystem from "modeled in isolation" to a **correct, guest-reachable
+delivery path** — destination decoding (logical LDR/DFR + physical broadcast),
+level-triggered EOI retrigger, inter-processor interrupts via the ICR, a
+per-vCPU LAPIC MMIO front-end — then two real timer bugs the survey surfaced
+along the way (LAPIC timer divisor, PIT mode-2 period). Every increment is in
+the host-agnostic `enlil-devices` crate and built on **both** toolchains.
+
+### Increments (commit — what)
+1. `4d5741c` — **LAPIC logical-destination matching (LDR/DFR).**
+   `InterruptController::deliver_logical` ignored the message destination and
+   broadcast every logical interrupt to all enabled LAPICs. Added
+   `LocalApic::matches_logical` (flat model `DFR[31:28]=0xF` → LDR bitmask;
+   cluster model → 4-bit cluster + 4-bit member mask, Intel SDM Vol.3 §10.6.2)
+   and routed both the MSI and IOAPIC logical paths through it; lowest-priority
+   now arbitrates only among addressed LAPICs. +5 tests.
+2. `ea7592d` — **Physical-destination broadcast (0xFF).** `deliver_physical`
+   matched a single APIC ID, so the physical broadcast shorthand reached no
+   one; both Fixed and LowestPriority now treat 0xFF as all LAPICs. +1 test.
+3. `a63b4d6` — **BUG FIX: I/O APIC re-sends a held level line after EOI.** An
+   EOI that cleared `remote_irr` on a still-asserted level RTE only set the
+   status bit and dropped the interrupt; real hardware re-sends (this is what
+   keeps a shared/level PCI INTx line interrupting until the device deasserts).
+   `IoApic::eoi` now returns the re-send routes (re-arming `remote_irr`,
+   skipping masked lines) and the controller re-delivers them via a new shared
+   `deliver_route` helper. +3 tests.
+4. `e4bb24c` — **IPI delivery via the LAPIC ICR.** Writing `ICR_LOW` was
+   documented as "triggers IPI delivery" but only stored the value, so a guest
+   IPI (reschedule, TLB shootdown, call-function) never reached its target.
+   Added `InterruptController::send_ipi` (decodes vector / delivery mode /
+   dest mode / the self · all-incl · all-excl · use-dest shorthands, Intel SDM
+   Vol.3 §10.6.1; injects only the vectored modes — SMI/NMI/INIT/SIPI are
+   decoded but not injected as IRR) and `write_lapic` as the guest-write entry
+   point that fires the IPI on the `ICR_LOW` write. +5 tests.
+5. `09a4eda` — **Per-vCPU LAPIC MMIO front-end + correct EOI routing.** Added
+   `LapicMmio`: one bus `MmioDevice` per vCPU bound to its APIC ID, mapped over
+   the LAPIC page (`LAPIC_BASE`, 0xFEE0_0000) — xAPIC has every CPU reach its
+   own LAPIC at the same physical address, so the trap is attributed to the
+   owning vCPU. Writes go through `write_lapic`, which now special-cases the
+   `EOI` register to run the full LAPIC + I/O APIC EOI path (level retrigger)
+   instead of a bare store. Added `LocalApic::in_service_vector`. +4 tests.
+6. `0dc9002` — **BUG FIX: LAPIC timer Divide Configuration Register.**
+   `timer_tick` consumed input clocks 1:1 and ignored the DCR, so a guest that
+   programmed a divisor got a timer firing N× too fast (a timing tell). Decode
+   the DCR (Intel SDM Vol.3 §10.5.4, divide by 1/2/…/128) and scale input
+   clocks, carrying sub-divisor remainders so small tick batches divide exactly
+   like one large batch. +2 tests.
+7. `4c943be` — **BUG FIX: PIT rate-generator (mode 2) period off-by-one.** The
+   mode-2 tick fired the terminal edge at counter==1 and reloaded there, so
+   reload N divided by N-1 — contradicting the divide-by-N divisor
+   `irq_frequency()` advertises. The edge now lands at terminal count 0; period
+   is exactly `reload` input clocks (reload 0 = 65536). +1 test.
+
+### Research (informed the build)
+No new external literature logged — the work was driven by the existing
+ROADMAP/PROGRESS next-step (2026-06-23 flagged "wire MSI/MSI-X interrupt
+*delivery* end-to-end" as the natural follow-on to that session's cap+table
+work) read against the **primary specs already cited in `RESEARCH.md`**: Intel
+SDM Vol.3 — §10.6.1 (ICR / IPI + destination shorthands), §10.6.2 (logical
+LDR/DFR + physical broadcast), §10.5.4 (timer Divide Configuration Register);
+the Intel 82093AA I/O APIC datasheet (level `remote_IRR` / EOI retrigger); and
+the Intel 8254 datasheet (mode-2 rate-generator divisor). Nothing new to add to
+`RESEARCH.md`.
+
+### Test results (exact)
+- **`/dev/kvm`: read-writable at start AND at wrap (`KVM_RW_OK` / `KVM_RW_OK_AT_WRAP`).**
+  The KVM / guest-boot tests **ran for real, none skipped** — `cargo test -p
+  enlil-core` shows **211 passed, 0 failed, 0 ignored**, the `kvm_backend` /
+  `run_loop` suites (VM creation, MSR round-trip, AMD topology stealth, x2APIC
+  id, PMU isolation, real-mode run-loop + CF9 reset) executing on real
+  `/dev/kvm`. My changes are device-only (no KVM-backend code touched); the
+  suite confirms no regression and real execution.
+- **Full workspace CI-parity** (the `.github/workflows/ci.yml` commands):
+  `cargo fmt --all -- --check` → clean (exit 0); `cargo clippy --all-targets
+  --workspace -- -D warnings` → exit 0; `cargo test --workspace` → all green,
+  **0 failures, 0 skips**. **enlil-devices lib 900 passed** (was 881; +19 net
+  across the 7 increments), enlil-core 211, plus the smaller crates. The
+  `acpi_iasl_validation` / `smbios_dmidecode_validation` reference-compiler
+  gates **self-skip — `iasl`/`dmidecode` are NOT installed** on this host
+  (unchanged from prior runs).
+- **Toolchains:** every increment built/tested on **Linux/WSL** (nightly
+  `x86_64-unknown-linux-gnu`) AND built **Windows-native** (`x86_64-pc-windows-msvc`,
+  `cargo build -p enlil-devices` against the WSL manifest with a Windows
+  target-dir, run from PowerShell with `$LASTEXITCODE` checks) — **exit 0** after
+  each. All 7 increments are in the host-agnostic `enlil-devices` crate; no
+  KVM-only (`target_os = "linux"`) code was touched, so no UEFI/`x86_64-unknown-enlil`
+  payload build was required this session.
+
+### STOP REASON
+**Diminishing clean, low-risk, unblocked increments + the next high-value work
+is architectural.** After making the interrupt-delivery path correct and
+sweeping the adjacent timer/PIC/RTC subsystems (RTC RS rate table, PIC
+special-mask / poll / OCW2 EOI all verified already correct; fixed the two
+timer bugs found), the remaining high-value items are **multi-session /
+architectural**, not late-night-safe:
+  1. **Wire `LapicMmio` into the VM bus assembly** (`enlil-core/device_bus.rs`,
+     next to `add_ioapic`). The shared `DeviceBus` is one `VmExitHandler` for
+     all vCPUs with an *active-vCPU* selector (`set_active_vcpu`, used today for
+     the stealth-MSR bank). xAPIC LAPIC MMIO is per-CPU at one address, so a
+     single shared `LapicMmio` must read the active vCPU at dispatch time —
+     needs an active-vCPU cell threaded into the LAPIC dispatch (e.g. an
+     `active_vcpu` field on `InterruptController` set by `set_active_vcpu`), not
+     a fixed `vcpu_id`. The `LapicMmio` built tonight is correct for a
+     per-vCPU-bus model; the shared-bus integration is the real design step.
+  2. **Wire MSI/MSI-X *device* delivery** end-to-end: a device that raises
+     MSI/MSI-X (`PciConfigSpace::msi_message` / the `MsixTable`) → the
+     controller's `deliver_msi` (and on the KVM backend `KVM_SIGNAL_MSI`).
+  3. **Real guest-memory virtqueue transport** (still the simplified model).
+Per the guardrails I did not start any of these just to fill the clock. `master`
+stays buildable (green per increment). **Next step:** item 1 (active-vCPU-aware
+LAPIC MMIO dispatch + mount it in `standard_pc_with_interrupts`), which makes
+tonight's IPI/EOI path reachable by a real guest.
+
+---
+
 ## 2026-06-24 — Session: complete the xHCI MSI/MSI-X interrupt-delivery arc (Phase 3) + 2 real interrupt bug fixes + scaffolding cleanup
 
 **7 tested increments + 1 `cargo fmt` commit, each independently green and
