@@ -1,6 +1,6 @@
 //! Unified interrupt controller — coordinates LAPIC, IOAPIC, and MSI delivery.
 
-use super::ioapic::IoApic;
+use super::ioapic::{InterruptRoute, IoApic};
 use super::lapic::LocalApic;
 use super::msi::MsiMessage;
 use super::{DeliveryMode, InterruptEntry, TriggerMode};
@@ -27,22 +27,27 @@ impl InterruptController {
     /// Deliver an IOAPIC interrupt (from a device IRQ line).
     pub fn deliver_irq(&mut self, irq: u8) {
         if let Some(route) = self.ioapic.set_irq(irq as usize) {
-            let entry = InterruptEntry {
-                vector: route.vector,
-                delivery_mode: route.delivery_mode,
-                trigger_mode: if route.level_triggered {
-                    TriggerMode::Level
-                } else {
-                    TriggerMode::Edge
-                },
-                level: true,
-            };
+            self.deliver_route(route);
+        }
+    }
 
-            if route.dest_logical {
-                self.deliver_logical(route.destination, entry);
+    /// Resolve an I/O APIC [`InterruptRoute`] to the addressed LAPIC(s).
+    fn deliver_route(&mut self, route: InterruptRoute) {
+        let entry = InterruptEntry {
+            vector: route.vector,
+            delivery_mode: route.delivery_mode,
+            trigger_mode: if route.level_triggered {
+                TriggerMode::Level
             } else {
-                self.deliver_physical(route.destination, entry);
-            }
+                TriggerMode::Edge
+            },
+            level: true,
+        };
+
+        if route.dest_logical {
+            self.deliver_logical(route.destination, entry);
+        } else {
+            self.deliver_physical(route.destination, entry);
         }
     }
 
@@ -135,11 +140,19 @@ impl InterruptController {
     }
 
     /// Signal EOI from a vCPU.
+    ///
+    /// Clears the LAPIC's in-service bit, then broadcasts the EOI to the I/O
+    /// APIC. Any level-triggered RTE whose input line is still asserted is
+    /// re-sent immediately (the standard level-triggered retrigger-after-EOI
+    /// path), so a held PCI INTx line keeps interrupting until the device
+    /// deasserts it.
     pub fn eoi(&mut self, vcpu_id: u8, vector: u8) {
         if let Some(lapic) = self.lapics.iter_mut().find(|l| l.id() == vcpu_id) {
             lapic.signal_eoi();
         }
-        self.ioapic.eoi_broadcast(vector);
+        for route in self.ioapic.eoi_broadcast(vector) {
+            self.deliver_route(route);
+        }
     }
 
     /// Check if a vCPU has a pending interrupt.
@@ -276,6 +289,28 @@ mod tests {
         ctrl.deliver_msi(&msg);
         assert!(!ctrl.has_pending(0));
         assert_eq!(ctrl.pending_vector(1), Some(0x71));
+    }
+
+    #[test]
+    fn test_eoi_retriggers_held_level_line() {
+        let mut ctrl = make_controller(1);
+        // Program I/O APIC pin 9 as a level-triggered RTE: vector 0x55, dest 0.
+        {
+            let rte = ctrl.ioapic.get_rte_mut(9);
+            rte.set_masked(false);
+            rte.set_vector(0x55);
+            rte.level_triggered = true;
+            rte.set_destination(0);
+        }
+        // Device asserts the level line.
+        ctrl.deliver_irq(9);
+        assert_eq!(ctrl.pending_vector(0), Some(0x55));
+        // vCPU services it.
+        ctrl.lapics[0].start_servicing(0x55);
+        assert!(!ctrl.has_pending(0));
+        // EOI with the line STILL asserted re-delivers the interrupt.
+        ctrl.eoi(0, 0x55);
+        assert_eq!(ctrl.pending_vector(0), Some(0x55));
     }
 
     #[test]

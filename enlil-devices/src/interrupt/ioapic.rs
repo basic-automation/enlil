@@ -315,22 +315,38 @@ impl IoApic {
     }
 
     /// Handle EOI broadcast for a given vector.
-    /// Clears `remote_irr` on matching level-triggered entries.
-    pub fn eoi(&mut self, vector: u8) {
+    ///
+    /// Clears `remote_irr` on matching level-triggered entries. For any whose
+    /// input line is still asserted (and not masked), a real I/O APIC
+    /// immediately re-sends the interrupt — `remote_irr` is set again and the
+    /// route is returned so the caller can re-deliver it. Edge-triggered
+    /// entries never set `remote_irr`, so they are untouched.
+    pub fn eoi(&mut self, vector: u8) -> Vec<InterruptRoute> {
+        let mut resend = Vec::new();
         for (i, entry) in self.entries.iter_mut().enumerate() {
             if entry.level_triggered && entry.remote_irr && entry.vector == vector {
                 entry.remote_irr = false;
-                // If the IRQ line is still asserted, re-trigger
-                if self.irq_level[i] {
-                    entry.flags.delivery_pending = true;
+                entry.flags.delivery_pending = false;
+                // Line still held high and unmasked → re-assert and re-deliver,
+                // exactly as the hardware retriggers a level-sensitive line.
+                if self.irq_level[i] && !entry.masked {
+                    entry.remote_irr = true;
+                    resend.push(InterruptRoute {
+                        vector: entry.vector,
+                        delivery_mode: entry.delivery_mode,
+                        dest_logical: entry.flags.dest_logical,
+                        destination: entry.destination,
+                        level_triggered: true,
+                    });
                 }
             }
         }
+        resend
     }
 
     /// Handle EOI broadcast (alias used by controller).
-    pub fn eoi_broadcast(&mut self, vector: u8) {
-        self.eoi(vector);
+    pub fn eoi_broadcast(&mut self, vector: u8) -> Vec<InterruptRoute> {
+        self.eoi(vector)
     }
 
     /// Get a copy of a redirection table entry by IRQ number.
@@ -453,9 +469,36 @@ mod tests {
         // Second assertion while remote_irr set does NOT deliver
         assert!(ioapic.set_irq(3).is_none());
 
-        // EOI clears remote_irr
-        ioapic.eoi(0x33);
+        // EOI with the line STILL asserted re-sends: remote_irr is set again
+        // and the caller gets a route to re-deliver.
+        let resend = ioapic.eoi(0x33);
+        assert_eq!(resend.len(), 1);
+        assert_eq!(resend[0].vector, 0x33);
+        assert!(resend[0].level_triggered);
+        assert!(ioapic.entries[3].remote_irr);
+
+        // Once the device deasserts the line, EOI clears remote_irr and does
+        // NOT re-send.
+        ioapic.clear_irq(3);
+        let resend = ioapic.eoi(0x33);
+        assert!(resend.is_empty());
         assert!(!ioapic.entries[3].remote_irr);
+    }
+
+    #[test]
+    fn ioapic_eoi_does_not_resend_a_masked_line() {
+        // A guest may mask the RTE before EOI; a masked line must not re-send
+        // even while the input is asserted.
+        let mut ioapic = IoApic::new(0);
+        ioapic.entries[7].masked = false;
+        ioapic.entries[7].vector = 0x44;
+        ioapic.entries[7].level_triggered = true;
+        assert!(ioapic.set_irq(7).is_some());
+
+        ioapic.entries[7].masked = true;
+        let resend = ioapic.eoi(0x44);
+        assert!(resend.is_empty());
+        assert!(!ioapic.entries[7].remote_irr);
     }
 
     #[test]
