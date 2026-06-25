@@ -978,12 +978,22 @@ impl PcieRootComplex {
         let line = crate::interrupt::PirqRouter::default_device_isa_irq(bdf.device, 1)
             .expect("INTA# always swizzles to a PIRQ line");
         dev.set_interrupt(line, 1);
-        // A real Renesas uPD720201 xHCI enumerates Power Management, MSI, and a
-        // PCI Express (Endpoint) capability; advertise the same list so a guest
-        // sees a faithful discrete USB 3.0 controller rather than a bare PCI
-        // function with only legacy INTx (which modern xHCI drivers flag).
+        // A real Renesas uPD720201 xHCI enumerates Power Management, MSI, MSI-X,
+        // and a PCI Express (Endpoint) capability; advertise the same list so a
+        // guest sees a faithful discrete USB 3.0 controller rather than a bare
+        // PCI function with only legacy INTx (which modern xHCI drivers flag).
+        // The MSI-X table and PBA live in BAR0 (BIR 0) at the fixed offsets the
+        // controller's register window decodes, so a guest that programs the
+        // table through MMIO reaches the real [`MsixTable`].
         dev.add_power_management_capability();
         dev.add_msi_capability();
+        dev.add_msix_capability(
+            crate::usb::XHCI_MSIX_VECTORS,
+            0,
+            crate::usb::MSIX_TABLE_BAR_OFFSET,
+            0,
+            crate::usb::MSIX_PBA_BAR_OFFSET,
+        );
         dev.add_pci_express_capability(pcie_type::ENDPOINT);
         dev
     }
@@ -1839,9 +1849,11 @@ mod tests {
     }
 
     /// The discrete xHCI controller enumerates a real uPD720201-style capability
-    /// list — PCI Express (Endpoint) -> MSI -> Power Management -> end — so a
-    /// guest USB 3.0 driver sees a faithful `PCIe` endpoint with MSI, not a
-    /// legacy-INTx-only PCI function.
+    /// list — PCI Express (Endpoint) -> MSI-X -> MSI -> Power Management -> end —
+    /// so a guest USB 3.0 driver sees a faithful `PCIe` endpoint with both MSI
+    /// and MSI-X, not a legacy-INTx-only PCI function. The MSI-X table and PBA
+    /// are advertised in BAR0 at the offsets the controller's MMIO window
+    /// decodes ([`crate::usb::MSIX_TABLE_BAR_OFFSET`] / `MSIX_PBA_BAR_OFFSET`).
     #[test]
     fn xhci_controller_advertises_pcie_endpoint_msi_and_pm_caps() {
         let cs = PcieRootComplex::create_xhci_controller(PciBdf::new(0, 0x14, 0), 0xFE90_0000);
@@ -1863,10 +1875,11 @@ mod tests {
             walk,
             vec![
                 (0x90u8, 0x10u8), // PCI Express
+                (0x70, 0x11),     // MSI-X
                 (0x60, 0x05),     // MSI
                 (0x50, 0x01),     // Power Management
             ],
-            "xHCI cap list: PCIe -> MSI -> PM -> end"
+            "xHCI cap list: PCIe -> MSI-X -> MSI -> PM -> end"
         );
         assert_eq!(cs.pci_express_device_type(), pcie_type::ENDPOINT);
         assert_eq!(cs.pci_express_version(), 2);
@@ -1874,6 +1887,22 @@ mod tests {
             !cs.msi_enabled(),
             "MSI present but disabled until programmed"
         );
+
+        // MSI-X geometry: sized from XHCI_MSIX_VECTORS, table + PBA in BAR0 at
+        // the fixed MMIO offsets, disabled + function-unmasked out of reset.
+        assert_eq!(cs.msix_table_size(), crate::usb::XHCI_MSIX_VECTORS);
+        assert_eq!(
+            cs.read_u32(MSIX_CAP_OFFSET + 4),
+            crate::usb::MSIX_TABLE_BAR_OFFSET, // BIR 0, offset in low bits = 0
+            "MSI-X table in BAR0 at the MMIO offset"
+        );
+        assert_eq!(
+            cs.read_u32(MSIX_CAP_OFFSET + 8),
+            crate::usb::MSIX_PBA_BAR_OFFSET,
+            "MSI-X PBA in BAR0 at the MMIO offset"
+        );
+        assert!(!cs.msix_enabled(), "MSI-X present but disabled until set");
+        assert!(!cs.msix_function_masked());
     }
 
     /// `msi_message` is the read side of MSI delivery: nothing until the guest

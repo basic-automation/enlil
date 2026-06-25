@@ -286,7 +286,7 @@ impl InterruptController {
 
 #[cfg(test)]
 mod tests {
-    use super::super::lapic::{LAPIC_ICR_HIGH, LAPIC_ICR_LOW, LAPIC_LDR, LAPIC_SVR};
+    use super::super::lapic::{LAPIC_DFR, LAPIC_ICR_HIGH, LAPIC_ICR_LOW, LAPIC_LDR, LAPIC_SVR};
     use super::*;
 
     fn make_controller(n: u8) -> InterruptController {
@@ -460,6 +460,76 @@ mod tests {
         // EOI with the line STILL asserted re-delivers the interrupt.
         ctrl.eoi(0, 0x55);
         assert_eq!(ctrl.pending_vector(0), Some(0x55));
+    }
+
+    #[test]
+    fn logical_msi_targets_only_matching_lapics() {
+        let mut ctrl = make_controller(4);
+        // Flat model; LAPIC 1 owns logical bit 0x02, LAPIC 2 owns 0x04.
+        ctrl.lapics[1].write_register(LAPIC_DFR, 0xFFFF_FFFF);
+        ctrl.lapics[1].write_register(LAPIC_LDR, 0x02 << 24);
+        ctrl.lapics[2].write_register(LAPIC_DFR, 0xFFFF_FFFF);
+        ctrl.lapics[2].write_register(LAPIC_LDR, 0x04 << 24);
+
+        // Logical MSI to destination bitmask 0x02 (address bit 2 set), vector 0x33.
+        ctrl.deliver_msi(&MsiMessage::new(0xFEE0_2004, 0x33));
+        assert!(ctrl.has_pending(1), "LAPIC 1 (logical 0x02) is targeted");
+        assert!(!ctrl.has_pending(2), "LAPIC 2 (logical 0x04) is not");
+        assert!(!ctrl.has_pending(0), "unprogrammed LAPIC 0 is not");
+        assert_eq!(ctrl.pending_vector(1), Some(0x33));
+    }
+
+    #[test]
+    fn logical_broadcast_reaches_every_member_but_unprogrammed_lapics_are_dropped() {
+        let mut ctrl = make_controller(3);
+        ctrl.lapics[0].write_register(LAPIC_DFR, 0xFFFF_FFFF);
+        ctrl.lapics[0].write_register(LAPIC_LDR, 0x01 << 24);
+        ctrl.lapics[1].write_register(LAPIC_DFR, 0xFFFF_FFFF);
+        ctrl.lapics[1].write_register(LAPIC_LDR, 0x02 << 24);
+        // LAPIC 2 left at LDR=0 (reset): a logical interrupt must not reach it.
+
+        // Destination 0xFF (all bits) reaches every LAPIC with a programmed LDR.
+        ctrl.deliver_msi(&MsiMessage::new(0xFEE0_FF04, 0x44));
+        assert!(ctrl.has_pending(0));
+        assert!(ctrl.has_pending(1));
+        assert!(!ctrl.has_pending(2), "LAPIC with LDR=0 matches nothing");
+    }
+
+    #[test]
+    fn level_triggered_line_redelivers_on_eoi_until_deasserted() {
+        let mut ctrl = make_controller(1);
+        // Program IRQ 7 as a level-triggered RTE to LAPIC 0, vector 0x50.
+        {
+            let rte = ctrl.ioapic.get_rte_mut(7);
+            rte.set_vector(0x50);
+            rte.set_destination(0);
+            rte.set_masked(false);
+            rte.level_triggered = true;
+        }
+
+        // Device asserts the line → delivered to LAPIC 0.
+        ctrl.deliver_irq(7);
+        assert_eq!(ctrl.pending_vector(0), Some(0x50));
+
+        // Guest services and EOIs while the line is STILL asserted: the
+        // level-triggered interrupt re-arms and is delivered again.
+        ctrl.lapics[0].start_servicing(0x50);
+        ctrl.eoi(0, 0x50);
+        assert_eq!(
+            ctrl.pending_vector(0),
+            Some(0x50),
+            "still-asserted level line re-fires on EOI"
+        );
+
+        // The ISR cleared the device condition (line deasserts); now service +
+        // EOI leaves nothing pending.
+        ctrl.clear_irq(7);
+        ctrl.lapics[0].start_servicing(0x50);
+        ctrl.eoi(0, 0x50);
+        assert!(
+            !ctrl.has_pending(0),
+            "a deasserted line does not re-fire on EOI"
+        );
     }
 
     #[test]

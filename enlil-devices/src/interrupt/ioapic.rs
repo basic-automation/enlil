@@ -314,24 +314,29 @@ impl IoApic {
         }
     }
 
-    /// Handle EOI broadcast for a given vector.
+    /// Handle EOI broadcast for a given vector: clear `remote_irr` on matching
+    /// level-triggered entries, and **re-deliver** any whose input line is still
+    /// asserted.
     ///
-    /// Clears `remote_irr` on matching level-triggered entries. For any whose
-    /// input line is still asserted (and not masked), a real I/O APIC
-    /// immediately re-sends the interrupt — `remote_irr` is set again and the
-    /// route is returned so the caller can re-deliver it. Edge-triggered
-    /// entries never set `remote_irr`, so they are untouched.
+    /// This is the defining property of a level-triggered interrupt: while the
+    /// device keeps its line asserted, each EOI re-arms the interrupt (Intel I/O
+    /// APIC datasheet §3.4.2). A guest's ISR clears the device condition — which
+    /// deasserts the line via [`clear_irq`](Self::clear_irq) — *before* EOI, so
+    /// re-delivery stops naturally; a line still high at EOI means the condition
+    /// persists and the interrupt must fire again. Returns the routes that need
+    /// re-injection (empty in the common deasserted-before-EOI case), with
+    /// `remote_irr` set again for each so a fresh assertion is still gated.
     pub fn eoi(&mut self, vector: u8) -> Vec<InterruptRoute> {
-        let mut resend = Vec::new();
+        let mut redeliver = Vec::new();
         for (i, entry) in self.entries.iter_mut().enumerate() {
             if entry.level_triggered && entry.remote_irr && entry.vector == vector {
                 entry.remote_irr = false;
                 entry.flags.delivery_pending = false;
-                // Line still held high and unmasked → re-assert and re-deliver,
-                // exactly as the hardware retriggers a level-sensitive line.
+                // Line still asserted (and unmasked) → the condition persists;
+                // re-arm Remote IRR and re-deliver.
                 if self.irq_level[i] && !entry.masked {
                     entry.remote_irr = true;
-                    resend.push(InterruptRoute {
+                    redeliver.push(InterruptRoute {
                         vector: entry.vector,
                         delivery_mode: entry.delivery_mode,
                         dest_logical: entry.flags.dest_logical,
@@ -341,10 +346,11 @@ impl IoApic {
                 }
             }
         }
-        resend
+        redeliver
     }
 
-    /// Handle EOI broadcast (alias used by controller).
+    /// Handle EOI broadcast (alias used by the controller), returning the
+    /// level-triggered routes whose still-asserted line needs re-injection.
     pub fn eoi_broadcast(&mut self, vector: u8) -> Vec<InterruptRoute> {
         self.eoi(vector)
     }
@@ -469,19 +475,19 @@ mod tests {
         // Second assertion while remote_irr set does NOT deliver
         assert!(ioapic.set_irq(3).is_none());
 
-        // EOI with the line STILL asserted re-sends: remote_irr is set again
-        // and the caller gets a route to re-deliver.
-        let resend = ioapic.eoi(0x33);
-        assert_eq!(resend.len(), 1);
-        assert_eq!(resend[0].vector, 0x33);
-        assert!(resend[0].level_triggered);
-        assert!(ioapic.entries[3].remote_irr);
+        // EOI with the line still asserted re-delivers (level-triggered re-arm):
+        // a route comes back and Remote IRR is set again.
+        let redeliver = ioapic.eoi(0x33);
+        assert_eq!(redeliver.len(), 1);
+        assert_eq!(redeliver[0].vector, 0x33);
+        assert!(redeliver[0].level_triggered);
+        assert!(ioapic.entries[3].remote_irr, "re-armed while line is high");
 
-        // Once the device deasserts the line, EOI clears remote_irr and does
-        // NOT re-send.
+        // Once the device deasserts the line, EOI clears Remote IRR for good
+        // and re-delivers nothing.
         ioapic.clear_irq(3);
-        let resend = ioapic.eoi(0x33);
-        assert!(resend.is_empty());
+        let redeliver = ioapic.eoi(0x33);
+        assert!(redeliver.is_empty());
         assert!(!ioapic.entries[3].remote_irr);
     }
 

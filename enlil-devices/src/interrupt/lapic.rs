@@ -163,33 +163,28 @@ impl LocalApic {
         self.enabled
     }
 
-    /// Whether this LAPIC is a member of the given logical destination.
+    /// Whether this LAPIC is a member of the logical destination `dest` (an
+    /// 8-bit Message Destination Address) under its current `DFR`/`LDR`.
     ///
-    /// Interprets the 8-bit message destination address (MDA) against this
-    /// LAPIC's `LDR`/`DFR` per Intel SDM Vol.3 §10.6.2:
-    /// - **Flat model** (`DFR[31:28] = 0xF`): `LDR[31:24]` is an 8-bit bitmask
-    ///   of logical IDs; addressed if any bit overlaps the MDA. Up to 8 CPUs.
-    /// - **Cluster model** (`DFR[31:28] = 0x0`): `LDR[31:24]` splits into a
-    ///   4-bit cluster address (bits 31:28) and a 4-bit intra-cluster bitmask
-    ///   (bits 27:24); addressed if the cluster matches and a logical-ID bit
-    ///   overlaps the MDA's low nibble.
-    ///
-    /// MDA `0xFF` is the logical broadcast and always matches.
+    /// Intel SDM Vol. 3A §10.6.2.2: the **flat** model (`DFR[31:28] = 0xF`)
+    /// treats `LDR[31:24]` as an 8-bit bitmask of logical APIC IDs — a LAPIC is
+    /// addressed when any bit it owns is set in `dest`. The **cluster** model
+    /// (`DFR[31:28] = 0x0`) splits both `dest` and `LDR[31:24]` into a 4-bit
+    /// cluster ID (high nibble) and a 4-bit intra-cluster bitmask (low nibble),
+    /// matching when the clusters are equal and the bitmasks overlap. A LAPIC
+    /// whose `LDR` is still 0 (reset) matches no logical destination, exactly as
+    /// real hardware drops a logical interrupt until the OS programs `LDR`.
     #[must_use]
-    pub const fn matches_logical(&self, mda: u8) -> bool {
-        if mda == 0xFF {
-            return true;
-        }
-        let ldr_id = (self.ldr >> 24) as u8;
+    pub const fn matches_logical(&self, dest: u8) -> bool {
+        let logical_id = (self.ldr >> 24) as u8;
         if (self.dfr >> 28) == 0xF {
-            // Flat model: LDR is a direct bitmask of logical IDs.
-            (ldr_id & mda) != 0
+            // Flat model: 8-bit bitmask intersection.
+            logical_id & dest != 0
         } else {
-            // Cluster model: high nibble selects the cluster, low nibble is a
-            // 4-bit bitmask of LAPICs within that cluster.
-            let cluster = ldr_id >> 4;
-            let mask = ldr_id & 0x0F;
-            cluster == (mda >> 4) && (mask & (mda & 0x0F)) != 0
+            // Cluster model: equal cluster (high nibble) + overlapping mask.
+            let cluster_match = logical_id & 0xF0 == dest & 0xF0;
+            let mask_overlap = logical_id & dest & 0x0F != 0;
+            cluster_match && mask_overlap
         }
     }
 
@@ -570,11 +565,12 @@ mod tests {
         assert!(lapic.matches_logical(0x04));
         assert!(lapic.matches_logical(0x06)); // 0x02 | 0x04 — overlaps
         assert!(!lapic.matches_logical(0x02));
-        assert!(lapic.matches_logical(0xFF)); // broadcast
-        // A LAPIC that never programmed its LDR matches nothing but broadcast.
+        assert!(lapic.matches_logical(0xFF)); // broadcast reaches a programmed LDR
+        // A LAPIC that never programmed its LDR matches nothing — not even the
+        // all-ones broadcast (0 & 0xFF == 0), exactly like real hardware.
         let blank = LocalApic::new(1);
         assert!(!blank.matches_logical(0x01));
-        assert!(blank.matches_logical(0xFF));
+        assert!(!blank.matches_logical(0xFF));
     }
 
     #[test]
@@ -587,7 +583,34 @@ mod tests {
         assert!(lapic.matches_logical(0x21)); // same cluster, overlapping member
         assert!(!lapic.matches_logical(0x22)); // same cluster, different member
         assert!(!lapic.matches_logical(0x11)); // different cluster
-        assert!(lapic.matches_logical(0xFF)); // broadcast still matches
+        // All-ones is cluster 0xF / mask 0xF — it does not cross into cluster 2.
+        assert!(!lapic.matches_logical(0xFF));
+    }
+
+    #[test]
+    fn matches_logical_flat_and_cluster_models() {
+        let mut lapic = LocalApic::new(0);
+        // Reset LDR (0) matches no logical destination in either model.
+        assert!(!lapic.matches_logical(0xFF));
+
+        // Flat model: LDR[31:24] is an 8-bit bitmask. Owning bit 0x02 matches
+        // any destination with that bit set, and nothing without it.
+        lapic.write_register(LAPIC_DFR, 0xFFFF_FFFF);
+        lapic.write_register(LAPIC_LDR, 0x02 << 24);
+        assert!(lapic.matches_logical(0x02));
+        assert!(lapic.matches_logical(0xFF));
+        assert!(!lapic.matches_logical(0x04));
+
+        // Cluster model (DFR[31:28] = 0): high nibble = cluster, low nibble =
+        // intra-cluster bitmask. LDR cluster 2, mask bit 0x1.
+        lapic.write_register(LAPIC_DFR, 0x0FFF_FFFF);
+        lapic.write_register(LAPIC_LDR, 0x21 << 24);
+        assert!(
+            lapic.matches_logical(0x21),
+            "same cluster, overlapping mask"
+        );
+        assert!(!lapic.matches_logical(0x11), "different cluster");
+        assert!(!lapic.matches_logical(0x22), "same cluster, disjoint mask");
     }
 
     #[test]
