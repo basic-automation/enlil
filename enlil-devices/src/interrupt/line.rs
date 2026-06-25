@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use super::controller::InterruptController;
 use super::ioapic::IOAPIC_BASE;
+use super::msi::MsiMessage;
 use crate::bus::MmioDevice;
 use crate::truncate::u32_of;
 
@@ -110,6 +111,22 @@ impl SharedInterruptController {
                     c.clear_irq(irq);
                 }
             });
+        }
+    }
+
+    /// Build an MSI/MSI-X message sink: a `Send` closure that injects each
+    /// message via [`InterruptController::deliver_msi`].
+    ///
+    /// This is the message-signalled counterpart to [`line`](Self::line) — a PCI
+    /// function in MSI/MSI-X mode hands a fully-formed `(address, data)` message
+    /// straight to the LAPICs (decoded for destination/vector) rather than
+    /// asserting a wired `INTx` pin into the I/O APIC. The xHCI MMIO adapter
+    /// (`set_msi_sink`) drives it on the emulated backend; the KVM backend uses
+    /// `KVM_SIGNAL_MSI` instead. The closure owns a clone of this handle.
+    pub fn msi_sink(&self) -> impl Fn(MsiMessage) + Send + use<> {
+        let controller = self.clone();
+        move |msg: MsiMessage| {
+            controller.with(|c| c.deliver_msi(&msg));
         }
     }
 
@@ -214,6 +231,21 @@ mod tests {
         line(false);
 
         assert_eq!(pic.with(|c| c.pending_vector(0)), Some(0x20));
+    }
+
+    #[test]
+    fn msi_sink_delivers_message_to_lapic() {
+        // The message-signalled path: a fully-formed MSI message reaches the
+        // destination LAPIC's IRR without any I/O APIC redirection entry.
+        let pic = SharedInterruptController::new(1);
+        pic.with(|c| c.lapics[0].write_register(LAPIC_SVR, 0x1FF));
+
+        let sink = pic.msi_sink();
+        // Address: dest LAPIC 0, physical; Data: vector 0x55, fixed delivery.
+        sink(MsiMessage::new(0xFEE0_0000, 0x55));
+
+        assert!(pic.with(|c| c.has_pending(0)));
+        assert_eq!(pic.with(|c| c.pending_vector(0)), Some(0x55));
     }
 
     #[test]

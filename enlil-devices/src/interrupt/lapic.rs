@@ -138,6 +138,31 @@ impl LocalApic {
         self.enabled
     }
 
+    /// Whether this LAPIC is a member of the logical destination `dest` (an
+    /// 8-bit Message Destination Address) under its current `DFR`/`LDR`.
+    ///
+    /// Intel SDM Vol. 3A §10.6.2.2: the **flat** model (`DFR[31:28] = 0xF`)
+    /// treats `LDR[31:24]` as an 8-bit bitmask of logical APIC IDs — a LAPIC is
+    /// addressed when any bit it owns is set in `dest`. The **cluster** model
+    /// (`DFR[31:28] = 0x0`) splits both `dest` and `LDR[31:24]` into a 4-bit
+    /// cluster ID (high nibble) and a 4-bit intra-cluster bitmask (low nibble),
+    /// matching when the clusters are equal and the bitmasks overlap. A LAPIC
+    /// whose `LDR` is still 0 (reset) matches no logical destination, exactly as
+    /// real hardware drops a logical interrupt until the OS programs `LDR`.
+    #[must_use]
+    pub const fn matches_logical(&self, dest: u8) -> bool {
+        let logical_id = (self.ldr >> 24) as u8;
+        if (self.dfr >> 28) == 0xF {
+            // Flat model: 8-bit bitmask intersection.
+            logical_id & dest != 0
+        } else {
+            // Cluster model: equal cluster (high nibble) + overlapping mask.
+            let cluster_match = logical_id & 0xF0 == dest & 0xF0;
+            let mask_overlap = logical_id & dest & 0x0F != 0;
+            cluster_match && mask_overlap
+        }
+    }
+
     /// Get the Task Priority Register value.
     #[must_use]
     pub const fn get_tpr(&self) -> u8 {
@@ -466,6 +491,32 @@ mod tests {
         let lapic = LocalApic::new(42);
         assert_eq!(lapic.id(), 42);
         assert!(!lapic.is_enabled());
+    }
+
+    #[test]
+    fn matches_logical_flat_and_cluster_models() {
+        let mut lapic = LocalApic::new(0);
+        // Reset LDR (0) matches no logical destination in either model.
+        assert!(!lapic.matches_logical(0xFF));
+
+        // Flat model: LDR[31:24] is an 8-bit bitmask. Owning bit 0x02 matches
+        // any destination with that bit set, and nothing without it.
+        lapic.write_register(LAPIC_DFR, 0xFFFF_FFFF);
+        lapic.write_register(LAPIC_LDR, 0x02 << 24);
+        assert!(lapic.matches_logical(0x02));
+        assert!(lapic.matches_logical(0xFF));
+        assert!(!lapic.matches_logical(0x04));
+
+        // Cluster model (DFR[31:28] = 0): high nibble = cluster, low nibble =
+        // intra-cluster bitmask. LDR cluster 2, mask bit 0x1.
+        lapic.write_register(LAPIC_DFR, 0x0FFF_FFFF);
+        lapic.write_register(LAPIC_LDR, 0x21 << 24);
+        assert!(
+            lapic.matches_logical(0x21),
+            "same cluster, overlapping mask"
+        );
+        assert!(!lapic.matches_logical(0x11), "different cluster");
+        assert!(!lapic.matches_logical(0x22), "same cluster, disjoint mask");
     }
 
     #[test]
