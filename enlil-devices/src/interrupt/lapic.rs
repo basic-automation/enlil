@@ -132,6 +132,12 @@ impl LocalApic {
         self.id
     }
 
+    /// Current Interrupt Command Register value (the full 64-bit ICR).
+    #[must_use]
+    pub const fn icr(&self) -> u64 {
+        self.icr
+    }
+
     /// Whether the `LocalApic` is software-enabled (bit 8 of `SVR`).
     #[must_use]
     pub const fn is_enabled(&self) -> bool {

@@ -1,7 +1,7 @@
 //! Unified interrupt controller — coordinates LAPIC, IOAPIC, and MSI delivery.
 
 use super::ioapic::{InterruptRoute, IoApic};
-use super::lapic::LocalApic;
+use super::lapic::{LAPIC_ICR_LOW, LocalApic};
 use super::msi::MsiMessage;
 use super::{DeliveryMode, InterruptEntry, TriggerMode};
 
@@ -79,6 +79,94 @@ impl InterruptController {
             self.deliver_logical(dest_id, entry);
         } else {
             self.deliver_physical(dest_id, entry);
+        }
+    }
+
+    /// Apply a guest LAPIC register write for `vcpu_id`, dispatching the side
+    /// effects a bare register store cannot express.
+    ///
+    /// This is the entry point a LAPIC MMIO / x2APIC front-end uses for guest
+    /// writes: it stores the register, and when the guest writes `ICR_LOW`
+    /// (the trigger on real hardware, after `ICR_HIGH` is set up) it dispatches
+    /// the programmed IPI via [`send_ipi`](Self::send_ipi). Unknown vCPU IDs
+    /// are ignored.
+    pub fn write_lapic(&mut self, vcpu_id: u8, offset: u32, value: u32) {
+        let trigger = {
+            let Some(lapic) = self.lapic_mut(vcpu_id) else {
+                return;
+            };
+            lapic.write_register(offset, value);
+            (offset == LAPIC_ICR_LOW).then(|| (lapic.id(), lapic.icr()))
+        };
+        if let Some((source, icr)) = trigger {
+            self.send_ipi(source, icr);
+        }
+    }
+
+    /// Deliver an inter-processor interrupt programmed into a source LAPIC's
+    /// Interrupt Command Register.
+    ///
+    /// Decodes the 64-bit ICR (Intel SDM Vol.3 §10.6.1): vector, delivery
+    /// mode, destination mode, and the destination shorthand — `00` use the
+    /// destination field, `01` self, `10` all-including-self, `11`
+    /// all-excluding-self. Only the *vectored* delivery modes (Fixed, Lowest
+    /// Priority) are injected into the target LAPIC(s)' IRR; SMI/NMI/INIT/SIPI
+    /// drive vCPU-state transitions (SMM entry, AP bring-up) that this software
+    /// LAPIC model does not represent as IRR vectors, so they are decoded but
+    /// not injected here. `source_id` is the APIC ID of the LAPIC that wrote
+    /// the ICR (needed for the self / all-excluding-self shorthands).
+    pub fn send_ipi(&mut self, source_id: u8, icr: u64) {
+        let delivery_mode = DeliveryMode::from_bits(((icr >> 8) & 0x7) as u8);
+        if !matches!(
+            delivery_mode,
+            DeliveryMode::Fixed | DeliveryMode::LowestPriority
+        ) {
+            return;
+        }
+
+        let entry = InterruptEntry {
+            vector: (icr & 0xFF) as u8,
+            delivery_mode,
+            trigger_mode: TriggerMode::Edge,
+            level: true,
+        };
+        let dest_logical = (icr >> 11) & 1 != 0;
+        let shorthand = (icr >> 18) & 0x3;
+        let dest = ((icr >> 56) & 0xFF) as u8;
+
+        match shorthand {
+            0b01 => {
+                // Self IPI.
+                if let Some(lapic) = self.lapics.iter_mut().find(|l| l.id() == source_id) {
+                    let _ = lapic.accept_interrupt(&entry);
+                }
+            }
+            // All including self — identical to a physical broadcast (0xFF),
+            // which also honours lowest-priority arbitration.
+            0b10 => self.deliver_physical(0xFF, entry),
+            0b11 => {
+                // All excluding self.
+                if delivery_mode == DeliveryMode::LowestPriority {
+                    let target = self
+                        .lapics
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, l)| l.id() != source_id && l.is_enabled())
+                        .min_by_key(|(_, l)| l.get_tpr());
+                    if let Some((idx, _)) = target {
+                        let _ = self.lapics[idx].accept_interrupt(&entry);
+                    }
+                } else {
+                    for lapic in &mut self.lapics {
+                        if lapic.id() != source_id {
+                            let _ = lapic.accept_interrupt(&entry);
+                        }
+                    }
+                }
+            }
+            // No shorthand: route by the destination field + mode.
+            _ if dest_logical => self.deliver_logical(dest, entry),
+            _ => self.deliver_physical(dest, entry),
         }
     }
 
@@ -187,7 +275,7 @@ impl InterruptController {
 
 #[cfg(test)]
 mod tests {
-    use super::super::lapic::{LAPIC_LDR, LAPIC_SVR};
+    use super::super::lapic::{LAPIC_ICR_HIGH, LAPIC_ICR_LOW, LAPIC_LDR, LAPIC_SVR};
     use super::*;
 
     fn make_controller(n: u8) -> InterruptController {
@@ -289,6 +377,56 @@ mod tests {
         ctrl.deliver_msi(&msg);
         assert!(!ctrl.has_pending(0));
         assert_eq!(ctrl.pending_vector(1), Some(0x71));
+    }
+
+    #[test]
+    fn test_send_ipi_directed_physical() {
+        // vCPU 0 sends a Fixed IPI directed at APIC ID 1 (no shorthand).
+        let mut ctrl = make_controller(2);
+        ctrl.write_lapic(0, LAPIC_ICR_HIGH, 1 << 24); // destination = 1
+        ctrl.write_lapic(0, LAPIC_ICR_LOW, 0x90); // vector 0x90, Fixed, physical
+        assert!(!ctrl.has_pending(0));
+        assert_eq!(ctrl.pending_vector(1), Some(0x90));
+    }
+
+    #[test]
+    fn test_send_ipi_self_shorthand() {
+        let mut ctrl = make_controller(2);
+        // Shorthand 0b01 = self.
+        ctrl.write_lapic(0, LAPIC_ICR_LOW, 0x91 | (0b01 << 18));
+        assert_eq!(ctrl.pending_vector(0), Some(0x91));
+        assert!(!ctrl.has_pending(1));
+    }
+
+    #[test]
+    fn test_send_ipi_all_excluding_self() {
+        let mut ctrl = make_controller(3);
+        // Shorthand 0b11 = all-excluding-self, from source 0.
+        ctrl.write_lapic(0, LAPIC_ICR_LOW, 0x92 | (0b11 << 18));
+        assert!(!ctrl.has_pending(0));
+        assert_eq!(ctrl.pending_vector(1), Some(0x92));
+        assert_eq!(ctrl.pending_vector(2), Some(0x92));
+    }
+
+    #[test]
+    fn test_send_ipi_all_including_self() {
+        let mut ctrl = make_controller(2);
+        // Shorthand 0b10 = all-including-self.
+        ctrl.write_lapic(0, LAPIC_ICR_LOW, 0x93 | (0b10 << 18));
+        assert_eq!(ctrl.pending_vector(0), Some(0x93));
+        assert_eq!(ctrl.pending_vector(1), Some(0x93));
+    }
+
+    #[test]
+    fn test_send_ipi_init_is_decoded_but_not_injected() {
+        // INIT (delivery mode 5) drives AP state, not the IRR — even with a
+        // valid vector field it must not be injected here.
+        let mut ctrl = make_controller(2);
+        ctrl.write_lapic(0, LAPIC_ICR_HIGH, 1 << 24);
+        ctrl.write_lapic(0, LAPIC_ICR_LOW, 0x90 | (5 << 8)); // INIT
+        assert!(!ctrl.has_pending(1));
+        // The ICR value is still stored (read side intact).
+        assert_eq!(ctrl.lapic(0).unwrap().icr() & 0xFF, 0x90);
     }
 
     #[test]
