@@ -9,7 +9,7 @@ the recommended next step so the next run (which has no memory) can resume.
 ## 2026-06-25 — Session: guest-facing interrupt-delivery path made correct (Phase 3) — LAPIC/IOAPIC/IPI delivery + 2 timer bug fixes
 
 **7 tested increments, each independently green and committed** (branch
-`routine/enlil-2026-06-25`, PR <!--PR_URL-->). Wall-clock ~00:40→~02:50
+`routine/enlil-2026-06-25`, PR https://github.com/physics515/enlil/pull/39). Wall-clock ~00:40→~02:50
 (~1h of building; the WSL test/clippy and the Windows-native build overlapped
 in the background for every increment). One coherent thread: take the software
 interrupt subsystem from "modeled in isolation" to a **correct, guest-reachable
