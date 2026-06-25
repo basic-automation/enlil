@@ -79,6 +79,9 @@ impl InterruptController {
 
     /// Deliver to a specific LAPIC by physical APIC ID.
     fn deliver_physical(&mut self, dest: u8, entry: InterruptEntry) {
+        // In physical destination mode, APIC ID 0xFF is the broadcast shorthand
+        // (Intel SDM Vol.3 §10.6.2.1) — it addresses every LAPIC.
+        let broadcast = dest == 0xFF;
         match entry.delivery_mode {
             DeliveryMode::LowestPriority => {
                 // Find the LAPIC with the lowest TPR among matching destinations
@@ -86,15 +89,17 @@ impl InterruptController {
                     .lapics
                     .iter()
                     .enumerate()
-                    .filter(|(_, l)| l.id() == dest && l.is_enabled())
+                    .filter(|(_, l)| (broadcast || l.id() == dest) && l.is_enabled())
                     .min_by_key(|(_, l)| l.get_tpr());
                 if let Some((idx, _)) = target {
                     let _ = self.lapics[idx].accept_interrupt(&entry);
                 }
             }
             _ => {
-                if let Some(lapic) = self.lapics.iter_mut().find(|l| l.id() == dest) {
-                    let _ = lapic.accept_interrupt(&entry);
+                for lapic in &mut self.lapics {
+                    if broadcast || lapic.id() == dest {
+                        let _ = lapic.accept_interrupt(&entry);
+                    }
                 }
             }
         }
@@ -197,6 +202,27 @@ mod tests {
         ctrl.deliver_msi(&msg);
         assert!(ctrl.has_pending(0));
         assert_eq!(ctrl.pending_vector(0), Some(0x30));
+    }
+
+    #[test]
+    fn test_deliver_msi_physical_broadcast() {
+        // Physical-mode destination 0xFF is the broadcast shorthand: every
+        // enabled LAPIC receives the interrupt.
+        let mut ctrl = make_controller(3);
+        ctrl.lapics[0].write_register(super::super::lapic::LAPIC_ID, 0u32);
+        ctrl.lapics[1].write_register(super::super::lapic::LAPIC_ID, 1 << 24);
+        ctrl.lapics[2].write_register(super::super::lapic::LAPIC_ID, 2 << 24);
+        let msg = MsiMessage {
+            address: 0xFEEF_F000, // physical (bit 2 clear), dest id 0xFF
+            data: 0x80,
+            delivery_mode: DeliveryMode::Fixed,
+        };
+        assert!(!msg.destination_mode_logical());
+        assert_eq!(msg.destination_id(), 0xFF);
+        ctrl.deliver_msi(&msg);
+        assert_eq!(ctrl.pending_vector(0), Some(0x80));
+        assert_eq!(ctrl.pending_vector(1), Some(0x80));
+        assert_eq!(ctrl.pending_vector(2), Some(0x80));
     }
 
     #[test]
