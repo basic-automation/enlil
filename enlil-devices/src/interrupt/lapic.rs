@@ -89,8 +89,12 @@ pub struct LocalApic {
     timer_initial: u32,
     /// Timer current count.
     timer_current: u32,
-    /// Timer divide configuration.
+    /// Timer divide configuration (DCR).
     timer_divide: u32,
+    /// Accumulated input ticks not yet consumed by the divide configuration —
+    /// lets the divisor apply correctly across `timer_tick` batches smaller
+    /// than the divisor.
+    timer_divide_residual: u32,
     /// Timer mode.
     timer_mode: TimerMode,
     /// TSC deadline value.
@@ -124,6 +128,7 @@ impl LocalApic {
             timer_initial: 0,
             timer_current: 0,
             timer_divide: 0,
+            timer_divide_residual: 0,
             timer_mode: TimerMode::OneShot,
             tsc_deadline: 0,
             pending_injection: None,
@@ -311,8 +316,12 @@ impl LocalApic {
             LAPIC_TIMER_INIT => {
                 self.timer_initial = value;
                 self.timer_current = value;
+                self.timer_divide_residual = 0;
             }
-            LAPIC_TIMER_DIVIDE => self.timer_divide = value,
+            LAPIC_TIMER_DIVIDE => {
+                self.timer_divide = value;
+                self.timer_divide_residual = 0;
+            }
             LAPIC_SELF_IPI => {
                 // x2APIC self-IPI: inject vector to self
                 let vector = (value & 0xFF) as u8;
@@ -455,11 +464,46 @@ impl LocalApic {
         None
     }
 
+    /// The LAPIC timer's divisor, decoded from the Divide Configuration
+    /// Register (Intel SDM Vol.3 §10.5.4).
+    ///
+    /// The divisor is encoded in bits 0, 1, and 3 (bit 2 is reserved): those
+    /// three bits form a value whose `0b111` encoding means divide-by-1 and
+    /// every other encoding `n` means divide-by-`2^(n+1)` — i.e. 1, 2, 4, 8,
+    /// 16, 32, 64, 128.
+    #[must_use]
+    const fn timer_divisor(&self) -> u32 {
+        let b3 = (self.timer_divide >> 3) & 1;
+        let b1 = (self.timer_divide >> 1) & 1;
+        let b0 = self.timer_divide & 1;
+        let combined = (b3 << 2) | (b1 << 1) | b0;
+        if combined == 0b111 {
+            1
+        } else {
+            1u32 << (combined + 1)
+        }
+    }
+
     /// Timer tick — decrement current count and fire interrupt if needed.
     /// Returns `true` if a timer interrupt was generated.
+    ///
+    /// `ticks` is in input (bus) clocks; the Divide Configuration Register
+    /// scales them down before they decrement the counter, with sub-divisor
+    /// remainders carried in `timer_divide_residual` so a long run of small
+    /// batches divides exactly like one large batch.
     #[must_use]
     pub fn timer_tick(&mut self, ticks: u32) -> bool {
         if self.timer_initial == 0 || self.timer_mode == TimerMode::TscDeadline {
+            return false;
+        }
+
+        // Apply the divide configuration: only every `divisor` input clocks
+        // advances the counter by one.
+        let divisor = self.timer_divisor();
+        let total = self.timer_divide_residual.saturating_add(ticks);
+        let ticks = total / divisor;
+        self.timer_divide_residual = total % divisor;
+        if ticks == 0 {
             return false;
         }
 
@@ -659,6 +703,7 @@ mod tests {
         lapic.write_register(LAPIC_SVR, 0x1FF);
 
         lapic.write_register(LAPIC_LVT_TIMER, 0x20040); // Vector 0x40, one-shot
+        lapic.write_register(LAPIC_TIMER_DIVIDE, 0b1011); // divide by 1
         lapic.write_register(LAPIC_TIMER_INIT, 10);
 
         assert!(!lapic.timer_tick(5));
@@ -667,5 +712,42 @@ mod tests {
         assert!(lapic.timer_tick(10)); // Remaining 5 < 10
         assert!(lapic.has_pending_interrupt());
         assert_eq!(lapic.pending_vector(), Some(0x40));
+    }
+
+    #[test]
+    fn test_timer_divide_configuration_scales_input_clocks() {
+        let mut lapic = LocalApic::new(1);
+        lapic.write_register(LAPIC_SVR, 0x1FF);
+        lapic.write_register(LAPIC_LVT_TIMER, 0x20040); // vector 0x40, one-shot
+        lapic.write_register(LAPIC_TIMER_DIVIDE, 0b0011); // divide by 16
+        lapic.write_register(LAPIC_TIMER_INIT, 4);
+
+        // 16 input clocks = one counter tick; 63 clocks = 3 counter ticks with
+        // 15 carried over — counter 4 -> 1, not yet fired.
+        assert!(!lapic.timer_tick(63));
+        assert!(!lapic.has_pending_interrupt());
+
+        // One more clock completes the 4th divided tick (15 + 1 = 16) and the
+        // counter (1) reaches it, firing.
+        assert!(lapic.timer_tick(1));
+        assert_eq!(lapic.pending_vector(), Some(0x40));
+    }
+
+    #[test]
+    fn test_timer_divisor_decoding() {
+        let mut lapic = LocalApic::new(0);
+        for (dcr, divisor) in [
+            (0b0000u32, 2u32),
+            (0b0001, 4),
+            (0b0010, 8),
+            (0b0011, 16),
+            (0b1000, 32),
+            (0b1001, 64),
+            (0b1010, 128),
+            (0b1011, 1),
+        ] {
+            lapic.write_register(LAPIC_TIMER_DIVIDE, dcr);
+            assert_eq!(lapic.timer_divisor(), divisor, "DCR {dcr:#06b}");
+        }
     }
 }
