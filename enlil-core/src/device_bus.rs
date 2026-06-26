@@ -1408,10 +1408,9 @@ impl StandardPc {
         // software-disabled APIC (SVR bit 8 clear) masks all LVT entries, so it
         // must not tick — modern Linux/Windows use this timer as the primary
         // per-CPU clock event source, so without this it never fired at all.
-        let lapic_clocks = u32::try_from(
-            u128::from(ns) * u128::from(LAPIC_TIMER_INPUT_HZ) / 1_000_000_000,
-        )
-        .unwrap_or(u32::MAX);
+        let lapic_clocks =
+            u32::try_from(u128::from(ns) * u128::from(LAPIC_TIMER_INPUT_HZ) / 1_000_000_000)
+                .unwrap_or(u32::MAX);
         if lapic_clocks > 0 {
             self.ioapic.with(|c| {
                 for lapic in &mut c.lapics {
@@ -2167,7 +2166,11 @@ mod tests {
         // With vCPU 0 selected, the shared aperture's EOI targets vCPU 0 — which
         // has nothing in service — so vCPU 1's held line is not retriggered.
         bus.set_active_vcpu(0);
-        VmExitHandler::mmio_write(&mut bus, 0xFEE0_0000 + LAPIC_EOI_OFFSET, &0u32.to_le_bytes());
+        VmExitHandler::mmio_write(
+            &mut bus,
+            0xFEE0_0000 + LAPIC_EOI_OFFSET,
+            &0u32.to_le_bytes(),
+        );
         assert!(
             !pic.with(|c| c.has_pending(1)),
             "an EOI attributed to vCPU 0 must not service vCPU 1's line"
@@ -2177,7 +2180,11 @@ mod tests {
         // aperture EOI now runs vCPU 1's path and the still-asserted level line
         // is re-delivered.
         bus.set_active_vcpu(1);
-        VmExitHandler::mmio_write(&mut bus, 0xFEE0_0000 + LAPIC_EOI_OFFSET, &0u32.to_le_bytes());
+        VmExitHandler::mmio_write(
+            &mut bus,
+            0xFEE0_0000 + LAPIC_EOI_OFFSET,
+            &0u32.to_le_bytes(),
+        );
         assert_eq!(pic.with(|c| c.pending_vector(1)), Some(0x55));
     }
 
