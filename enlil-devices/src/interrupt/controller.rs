@@ -11,6 +11,16 @@ pub struct InterruptController {
     pub lapics: Vec<LocalApic>,
     /// I/O APIC.
     pub ioapic: IoApic,
+    /// APIC ID of the vCPU currently executing on the shared device bus.
+    ///
+    /// In xAPIC mode every CPU reaches *its own* LAPIC through the one physical
+    /// page at `0xFEE0_0000`, so a single shared LAPIC MMIO aperture must
+    /// attribute each trap to the vCPU that took it. The run loop selects the
+    /// entering vCPU with [`set_active_lapic`](Self::set_active_lapic) before
+    /// each guest entry; the shared aperture
+    /// ([`SharedLapicMmio`](super::line::SharedLapicMmio)) then routes the
+    /// access to this LAPIC. Starts at vCPU 0.
+    active_lapic: u8,
 }
 
 impl InterruptController {
@@ -21,7 +31,25 @@ impl InterruptController {
         Self {
             lapics,
             ioapic: IoApic::new(0),
+            active_lapic: 0,
         }
+    }
+
+    /// Select which vCPU's LAPIC the shared LAPIC MMIO aperture serves.
+    ///
+    /// The run loop calls this with the APIC ID of the vCPU it is about to enter
+    /// so that a subsequent trap into the per-CPU LAPIC page is attributed to
+    /// the right [`LocalApic`] — an `EOI`, `ICR` (IPI), or timer-register access
+    /// on vCPU `vcpu_id` then hits `vcpu_id`'s state. Mirrors the active-vCPU
+    /// selection the stealth-MSR bank already uses on the bus.
+    pub const fn set_active_lapic(&mut self, vcpu_id: u8) {
+        self.active_lapic = vcpu_id;
+    }
+
+    /// The APIC ID of the vCPU the shared LAPIC aperture currently serves.
+    #[must_use]
+    pub const fn active_lapic_id(&self) -> u8 {
+        self.active_lapic
     }
 
     /// Deliver an IOAPIC interrupt (from a device IRQ line).

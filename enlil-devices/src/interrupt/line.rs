@@ -243,6 +243,56 @@ impl MmioDevice for LapicMmio {
     }
 }
 
+/// The shared LAPIC MMIO aperture for a single-bus, multi-vCPU VM.
+///
+/// Where [`LapicMmio`] is bound to one fixed vCPU (correct when each vCPU owns
+/// its own bus), `SharedLapicMmio` is mounted **once** on a [`Bus`] that every
+/// vCPU shares and routes each access to whichever vCPU is currently running.
+/// xAPIC puts every CPU's LAPIC at the same physical page ([`LAPIC_BASE`],
+/// `0xFEE0_0000`), so the bus cannot tell the LAPICs apart by address — it must
+/// read the *active* vCPU the run loop selected (via
+/// [`InterruptController::set_active_lapic`]) at dispatch time. An `EOI`, `ICR`
+/// (IPI), or timer-register access therefore lands on the LAPIC of the vCPU that
+/// actually trapped, exactly as on hardware.
+///
+/// Register accesses are 32-bit dwords, so the access size is ignored.
+///
+/// [`Bus`]: crate::bus::Bus
+/// [`InterruptController::set_active_lapic`]: super::controller::InterruptController::set_active_lapic
+pub struct SharedLapicMmio {
+    controller: SharedInterruptController,
+}
+
+impl SharedLapicMmio {
+    /// Mount the shared LAPIC aperture over `controller`. Each access is routed
+    /// to the controller's currently-active vCPU.
+    #[must_use]
+    pub const fn new(controller: SharedInterruptController) -> Self {
+        Self { controller }
+    }
+}
+
+impl MmioDevice for SharedLapicMmio {
+    fn mmio_read(&mut self, offset: u64, _size: u8) -> u64 {
+        let reg = u32_of(offset);
+        self.controller.with(|c| {
+            let vcpu = c.active_lapic_id();
+            c.lapic(vcpu).map_or(0, |l| u64::from(l.read_register(reg)))
+        })
+    }
+
+    fn mmio_write(&mut self, offset: u64, _size: u8, data: u64) {
+        self.controller.with(|c| {
+            let vcpu = c.active_lapic_id();
+            c.write_lapic(vcpu, u32_of(offset), u32_of(data));
+        });
+    }
+
+    fn mmio_range(&self) -> (u64, u64) {
+        (LAPIC_BASE, LAPIC_BASE + LAPIC_MMIO_SIZE)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,6 +479,81 @@ mod tests {
         let mut mmio = LapicMmio::new(pic.clone(), 0);
         mmio.mmio_write(u64::from(LAPIC_EOI), 4, 0);
         assert_eq!(pic.with(|c| c.pending_vector(0)), Some(0x50));
+    }
+
+    #[test]
+    fn shared_lapic_mmio_aperture_covers_the_lapic_page() {
+        let mmio = SharedLapicMmio::new(SharedInterruptController::new(2));
+        assert_eq!(mmio.mmio_range(), (0xFEE0_0000, 0xFEE0_1000));
+    }
+
+    #[test]
+    fn shared_lapic_mmio_eoi_follows_the_active_vcpu() {
+        use crate::interrupt::lapic::LAPIC_EOI;
+
+        // Two vCPUs sharing one bus; a held level line is routed to vCPU 1 and
+        // serviced there, so only vCPU 1 has the vector in-service.
+        let pic = SharedInterruptController::new(2);
+        pic.with(|c| {
+            c.lapics[0].write_register(LAPIC_SVR, 0x1FF);
+            c.lapics[1].write_register(LAPIC_SVR, 0x1FF);
+            let rte = c.ioapic.get_rte_mut(5);
+            rte.set_vector(0x50);
+            rte.set_destination(1);
+            rte.set_masked(false);
+            rte.level_triggered = true;
+        });
+        pic.line(5)(true);
+        assert_eq!(pic.with(|c| c.pending_vector(1)), Some(0x50));
+        pic.with(|c| c.lapics[1].start_servicing(0x50));
+        assert!(!pic.with(|c| c.has_pending(1)));
+
+        let mut mmio = SharedLapicMmio::new(pic.clone());
+
+        // With vCPU 0 active, the shared aperture's EOI targets vCPU 0 — which
+        // has nothing in service — so the held line on vCPU 1 is NOT retriggered.
+        pic.with(|c| c.set_active_lapic(0));
+        mmio.mmio_write(u64::from(LAPIC_EOI), 4, 0);
+        assert!(
+            !pic.with(|c| c.has_pending(1)),
+            "an EOI attributed to vCPU 0 must not service vCPU 1's line"
+        );
+
+        // Select vCPU 1 (the run loop does this before entering it); now the
+        // same aperture's EOI runs vCPU 1's EOI path and the still-asserted level
+        // line is re-delivered.
+        pic.with(|c| c.set_active_lapic(1));
+        mmio.mmio_write(u64::from(LAPIC_EOI), 4, 0);
+        assert_eq!(pic.with(|c| c.pending_vector(1)), Some(0x50));
+    }
+
+    #[test]
+    fn shared_lapic_mmio_ipi_source_is_the_active_vcpu() {
+        use crate::interrupt::lapic::LAPIC_ICR_LOW;
+
+        // A "self" IPI shorthand resolves its target from the *source* LAPIC, so
+        // it lands on whichever vCPU the bus says is active.
+        let pic = SharedInterruptController::new(2);
+        pic.with(|c| {
+            c.lapics[0].write_register(LAPIC_SVR, 0x1FF);
+            c.lapics[1].write_register(LAPIC_SVR, 0x1FF);
+        });
+        let mut mmio = SharedLapicMmio::new(pic.clone());
+
+        // Fixed vector 0x91, destination shorthand "self" (bits 19:18 = 0b01).
+        let self_ipi = 0x91 | (0b01 << 18);
+        pic.with(|c| c.set_active_lapic(1));
+        mmio.mmio_write(u64::from(LAPIC_ICR_LOW), 4, self_ipi);
+
+        assert_eq!(
+            pic.with(|c| c.pending_vector(1)),
+            Some(0x91),
+            "self IPI must land on the active vCPU (1)"
+        );
+        assert!(
+            !pic.with(|c| c.has_pending(0)),
+            "the inactive vCPU 0 must not receive the self IPI"
+        );
     }
 
     #[test]
