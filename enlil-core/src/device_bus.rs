@@ -1399,6 +1399,29 @@ impl StandardPc {
                 line(false);
             }
         }
+
+        // LAPIC timer: drive every vCPU's local-APIC timer from the same ns
+        // base. The APIC bus runs at LAPIC_TIMER_INPUT_HZ; the Divide
+        // Configuration Register scales those input clocks down before the count
+        // decrements, and an expiring count self-injects the LVT timer vector
+        // into that LAPIC's own IRR (handled inside timer_tick). A
+        // software-disabled APIC (SVR bit 8 clear) masks all LVT entries, so it
+        // must not tick — modern Linux/Windows use this timer as the primary
+        // per-CPU clock event source, so without this it never fired at all.
+        let lapic_clocks = u32::try_from(
+            u128::from(ns) * u128::from(LAPIC_TIMER_INPUT_HZ) / 1_000_000_000,
+        )
+        .unwrap_or(u32::MAX);
+        if lapic_clocks > 0 {
+            self.ioapic.with(|c| {
+                for lapic in &mut c.lapics {
+                    if lapic.is_enabled() {
+                        let _ = lapic.timer_tick(lapic_clocks);
+                    }
+                }
+            });
+        }
+
         fired
     }
 }
@@ -1449,6 +1472,18 @@ fn route_pci_intx(
 pub const IRQ_PIT: u8 = 0;
 /// Legacy ISA IRQ line for the COM1 16550 UART.
 pub const IRQ_COM1: u8 = 4;
+
+/// Input-clock frequency of the per-vCPU local-APIC timer, in Hz.
+///
+/// The LAPIC timer counts down a divided "bus" clock; we model that clock at
+/// 1 GHz, matching QEMU's APIC bus period (1 ns) — a defensible, common value.
+/// The absolute rate is not itself observable: a guest always *calibrates* the
+/// APIC timer against an independent clock (the PIT, the ACPI PM timer, or the
+/// TSC) before relying on it, so what matters for transparency is that the
+/// LAPIC timer advances from the **same** nanosecond base as those reference
+/// clocks (see [`DeviceBus::advance_clocks`]). At 1 GHz one input clock is one
+/// nanosecond, so the conversion is exact.
+pub const LAPIC_TIMER_INPUT_HZ: u64 = 1_000_000_000;
 
 /// BDF of the ICH9 LPC bridge / PCI interrupt router (`00:1F.0`) seeded by
 /// [`DeviceBus::standard_pc_complete`]; its config space holds the
@@ -2963,6 +2998,73 @@ mod tests {
             }) => assert_eq!(completion_code as u8, TrbCompletionCode::Success as u8),
             other => panic!("expected a transfer completion from the guest ring, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn advance_clocks_fires_the_lapic_timer_into_the_local_irr() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            0,
+            1,
+        )
+        .unwrap();
+        let ioapic = pc.ioapic.clone();
+
+        // Program LAPIC 0's timer the way a guest does: software-enable the APIC
+        // (SVR), a one-shot LVT timer on vector 0x40 unmasked, divide-by-1, and
+        // an initial count of 1000 input clocks.
+        ioapic.with(|c| {
+            let l = &mut c.lapics[0];
+            l.write_register(0x0F0, 0x1FF); // SVR: software-enable
+            l.write_register(0x320, 0x40); // LVT timer: vector 0x40, one-shot, unmasked
+            l.write_register(0x3E0, 0x0B); // divide config: divide by 1
+            l.write_register(0x380, 1000); // initial count
+        });
+
+        // At 1 GHz, 500 ns is 500 input clocks — not enough to expire 1000.
+        let _ = pc.advance_clocks(500);
+        assert!(
+            !ioapic.with(|c| c.has_pending(0)),
+            "the LAPIC timer must not fire before the count expires"
+        );
+
+        // The remaining 500 ns crosses the count; the LVT vector self-injects.
+        let _ = pc.advance_clocks(500);
+        assert_eq!(
+            ioapic.with(|c| c.pending_vector(0)),
+            Some(0x40),
+            "the expired LAPIC timer must inject its LVT vector into the local IRR"
+        );
+    }
+
+    #[test]
+    fn advance_clocks_does_not_tick_a_software_disabled_lapic_timer() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            0,
+            1,
+        )
+        .unwrap();
+        let ioapic = pc.ioapic.clone();
+
+        // Program the timer but leave the APIC software-DISABLED (no SVR enable):
+        // hardware forces every LVT mask bit set, so the timer must not deliver.
+        ioapic.with(|c| {
+            let l = &mut c.lapics[0];
+            l.write_register(0x320, 0x40);
+            l.write_register(0x3E0, 0x0B);
+            l.write_register(0x380, 1000);
+        });
+
+        let _ = pc.advance_clocks(5000);
+        assert!(
+            !ioapic.with(|c| c.has_pending(0)),
+            "a software-disabled APIC must not deliver a timer interrupt"
+        );
     }
 
     #[test]
