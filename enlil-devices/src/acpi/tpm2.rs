@@ -180,6 +180,26 @@ mod tests {
     }
 
     #[test]
+    fn tpm2_control_area_falls_in_the_crb_aperture_at_the_control_block() {
+        use crate::tpm::{TPM_MMIO_BASE, TPM_MMIO_SIZE, crb_regs};
+
+        // The control-area address the ACPI TPM2 table advertises must point at
+        // the control register block of the CRB MMIO aperture the platform
+        // actually mounts (DeviceBus::add_tpm), or a guest that reads the table
+        // would drive the TPM at the wrong address. It is the CRB control block
+        // (CTRL_REQ) at TPM_MMIO_BASE + 0x40, inside the mounted page.
+        assert!(
+            (TPM_MMIO_BASE..TPM_MMIO_BASE + TPM_MMIO_SIZE).contains(&TPM2_CONTROL_AREA_ADDRESS),
+            "the advertised control area must lie within the mounted CRB aperture"
+        );
+        assert_eq!(
+            TPM2_CONTROL_AREA_ADDRESS,
+            TPM_MMIO_BASE + crb_regs::CTRL_REQ,
+            "the control area must be the CRB control block (CTRL_REQ)"
+        );
+    }
+
+    #[test]
     fn tpm2_custom_control_area() {
         let tpm2 = Tpm2Builder::new().control_area_address(0xFED4_0000).build();
         let addr = u64::from_le_bytes(tpm2[40..48].try_into().unwrap());

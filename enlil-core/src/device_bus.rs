@@ -20,7 +20,8 @@ use enlil_devices::bus::{MmioBus, MmioDevice, PioBus, PioDevice};
 use enlil_devices::chipset::{Gpe0Block, SharedAcpiPm1Block, SharedSystemControlPortA};
 use enlil_devices::dma::{Dma8237, DmaPageRegisters};
 use enlil_devices::interrupt::{
-    IoApicMmio, PirqRouter, SharedInterruptController, SharedPic, PIRQ_DEFAULT_IRQS,
+    IoApicMmio, PirqRouter, SharedInterruptController, SharedLapicMmio, SharedPic,
+    PIRQ_DEFAULT_IRQS,
 };
 use enlil_devices::pcie::{
     vendors, EcamSpace, PciBdf, PciConfigIo, PciResetControl, PcieRootComplex, SharedRootComplex,
@@ -33,6 +34,7 @@ use enlil_devices::timer::{
     AcpiPmTimer, Pit, RtcTime, SharedAcpiPmTimer, SharedHpet, SharedPit, SharedRtc,
     SystemControlPortB, HPET_TICK_NS, RTC_IRQ,
 };
+use enlil_devices::tpm::{SharedTpm, TpmMmio};
 use enlil_devices::usb::xhci::transfer::DmaMemory;
 use enlil_devices::usb::{SharedXhci, UsbSpeed, VirtualXhciController, XhciMmio};
 use std::cell::RefCell;
@@ -66,6 +68,12 @@ pub struct DeviceBus {
     /// [`set_active_vcpu`]: Self::set_active_vcpu
     /// [`VmExitHandler`]: crate::kvm_backend::VmExitHandler
     stealth: Option<StealthBank>,
+    /// A clone of the shared interrupt controller, captured when
+    /// [`add_lapic_mmio`](Self::add_lapic_mmio) mounts the shared LAPIC
+    /// aperture, so [`set_active_vcpu`](Self::set_active_vcpu) can tell the
+    /// controller which vCPU's LAPIC the one shared aperture is now serving.
+    /// `None` until the aperture is mounted.
+    interrupts: Option<SharedInterruptController>,
 }
 
 /// A bank of per-vCPU [`StealthMsrRouter`]s with an `active` selector.
@@ -113,6 +121,7 @@ impl DeviceBus {
             mmio: MmioBus::new(),
             pci_reset: None,
             stealth: None,
+            interrupts: None,
         }
     }
 
@@ -145,9 +154,22 @@ impl DeviceBus {
     /// calls this with the vCPU index before entering it, so a forwarded
     /// `RDMSR`/`WRMSR` on vCPU `index` hits `index`'s shadow state.
     ///
-    /// Returns `false` (leaving the selection unchanged) if no router is
-    /// installed or `index` names no vCPU in the bank.
+    /// It also tells the shared interrupt controller which vCPU's LAPIC the one
+    /// [`SharedLapicMmio`] aperture serves (when [`add_lapic_mmio`] mounted it),
+    /// so a guest LAPIC access — `EOI`, `ICR` (IPI), timer registers — on this
+    /// vCPU lands on its own [`LocalApic`]. APIC ID is the vCPU index here.
+    ///
+    /// Returns `false` (leaving the *stealth* selection unchanged) if no router
+    /// is installed or `index` names no vCPU in the bank — the LAPIC selection,
+    /// which is independent of the stealth bank, is still applied. The run loop
+    /// reads this return value to validate the stealth/timing install.
+    ///
+    /// [`add_lapic_mmio`]: Self::add_lapic_mmio
+    /// [`LocalApic`]: enlil_devices::interrupt::LocalApic
     pub fn set_active_vcpu(&mut self, index: usize) -> bool {
+        if let (Some(pic), Ok(id)) = (self.interrupts.as_ref(), u8::try_from(index)) {
+            pic.with(|c| c.set_active_lapic(id));
+        }
         self.stealth.as_mut().is_some_and(|b| b.set_active(index))
     }
 
@@ -386,6 +408,7 @@ impl DeviceBus {
         bus.add_pit(pit)?;
 
         bus.add_ioapic(pic)?;
+        bus.add_lapic_mmio(pic)?;
 
         let pcie = bus.add_pcie(PcieRootComplex::new(DEFAULT_ECAM_BASE))?;
         Ok((bus, pcie))
@@ -404,6 +427,44 @@ impl DeviceBus {
         pic: &SharedInterruptController,
     ) -> Result<(), enlil_devices::bus::BusError> {
         self.add_mmio(Box::new(IoApicMmio::new(pic.clone())))
+    }
+
+    /// Mount the **shared** LAPIC MMIO aperture ([`SharedLapicMmio`]) at the
+    /// per-CPU LAPIC page (`0xFEE0_0000`) over `pic`, and remember `pic` so
+    /// [`set_active_vcpu`](Self::set_active_vcpu) can steer the aperture to the
+    /// running vCPU's [`LocalApic`](enlil_devices::interrupt::LocalApic).
+    ///
+    /// xAPIC reaches every CPU's LAPIC through this one physical page, so on a
+    /// VM where all vCPUs share one [`DeviceBus`] a single aperture must be
+    /// attributed to whichever vCPU trapped — the run loop selects it with
+    /// `set_active_vcpu` before each entry. Without this aperture a guest's
+    /// LAPIC `EOI`/`ICR`/timer accesses reach open-bus and it can neither EOI
+    /// nor send IPIs through memory. Mount it alongside [`add_ioapic`].
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if the aperture overlaps an
+    /// already-registered MMIO device.
+    pub fn add_lapic_mmio(
+        &mut self,
+        pic: &SharedInterruptController,
+    ) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_mmio(Box::new(SharedLapicMmio::new(pic.clone())))?;
+        self.interrupts = Some(pic.clone());
+        Ok(())
+    }
+
+    /// Mount the TPM 2.0 CRB MMIO aperture ([`TpmMmio`]) at `0xFED4_0000` over
+    /// `tpm`, so a guest can discover and drive the virtual TPM. Windows 11
+    /// refuses to install without a TPM 2.0, and Linux's `tpm_crb` driver binds
+    /// to this same window; without it the CRB page reads back open-bus and the
+    /// guest sees no TPM. The caller owns `tpm` (it clones a handle into the
+    /// aperture) so the host can seed or inspect the device.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if the aperture overlaps an
+    /// already-registered MMIO device.
+    pub fn add_tpm(&mut self, tpm: &SharedTpm) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_mmio(Box::new(TpmMmio::new(tpm.clone())))
     }
 
     /// Mount the legacy dual-8259 [`SharedPic`] front-end on the PIO bus: the
@@ -702,6 +763,7 @@ impl DeviceBus {
 
         bus.add_pic(pic)?;
         bus.add_ioapic(ioapic)?;
+        bus.add_lapic_mmio(ioapic)?;
 
         let pcie = bus.add_pcie(PcieRootComplex::new(DEFAULT_ECAM_BASE))?;
         Ok((bus, pcie))
@@ -780,9 +842,13 @@ impl DeviceBus {
         ps2.attach_mouse_irq(Box::new(dual_irq_line(&pic, &ioapic, PS2_MOUSE_IRQ)));
         bus.add_ps2(&ps2)?;
 
-        // Both interrupt-controller front-ends.
+        // Both interrupt-controller front-ends, plus the per-CPU LAPIC aperture
+        // so a guest can EOI / send IPIs / program its LAPIC timer over memory.
+        // The run loop steers the one shared aperture to the running vCPU via
+        // set_active_vcpu before each entry.
         bus.add_pic(&pic)?;
         bus.add_ioapic(&ioapic)?;
+        bus.add_lapic_mmio(&ioapic)?;
 
         // HPET register block (0xFED0_0000) — Windows requires it, Linux uses it
         // as a clocksource. Shared so the run loop can advance the counter.
@@ -952,6 +1018,11 @@ impl DeviceBus {
         }
         bus.add_mmio(Box::new(xhci_mmio))?;
 
+        // TPM 2.0 CRB at 0xFED4_0000 — Windows 11 requires it; Linux's tpm_crb
+        // driver binds it too. Shared so the host can seed/inspect the device.
+        let tpm = SharedTpm::new(enlil_devices::tpm::TpmInterface::Crb);
+        bus.add_tpm(&tpm)?;
+
         Ok(StandardPc {
             bus,
             pcie,
@@ -966,6 +1037,7 @@ impl DeviceBus {
             sysctl_a,
             pci_reset,
             xhci,
+            tpm,
         })
     }
 }
@@ -1041,6 +1113,9 @@ pub struct StandardPc {
     /// [`connect_usb_device`](Self::connect_usb_device), not this handle, so
     /// the port-status interrupt is delivered too.
     pub xhci: SharedXhci,
+    /// The virtual TPM 2.0 (CRB at `0xFED4_0000`) — seed or inspect PCRs / NV
+    /// from here. Mounted so a Windows 11 guest's TPM presence check passes.
+    pub tpm: SharedTpm,
 }
 
 impl StandardPc {
@@ -1348,6 +1423,28 @@ impl StandardPc {
                 line(false);
             }
         }
+
+        // LAPIC timer: drive every vCPU's local-APIC timer from the same ns
+        // base. The APIC bus runs at LAPIC_TIMER_INPUT_HZ; the Divide
+        // Configuration Register scales those input clocks down before the count
+        // decrements, and an expiring count self-injects the LVT timer vector
+        // into that LAPIC's own IRR (handled inside timer_tick). A
+        // software-disabled APIC (SVR bit 8 clear) masks all LVT entries, so it
+        // must not tick — modern Linux/Windows use this timer as the primary
+        // per-CPU clock event source, so without this it never fired at all.
+        let lapic_clocks =
+            u32::try_from(u128::from(ns) * u128::from(LAPIC_TIMER_INPUT_HZ) / 1_000_000_000)
+                .unwrap_or(u32::MAX);
+        if lapic_clocks > 0 {
+            self.ioapic.with(|c| {
+                for lapic in &mut c.lapics {
+                    if lapic.is_enabled() {
+                        let _ = lapic.timer_tick(lapic_clocks);
+                    }
+                }
+            });
+        }
+
         fired
     }
 }
@@ -1398,6 +1495,18 @@ fn route_pci_intx(
 pub const IRQ_PIT: u8 = 0;
 /// Legacy ISA IRQ line for the COM1 16550 UART.
 pub const IRQ_COM1: u8 = 4;
+
+/// Input-clock frequency of the per-vCPU local-APIC timer, in Hz.
+///
+/// The LAPIC timer counts down a divided "bus" clock; we model that clock at
+/// 1 GHz, matching QEMU's APIC bus period (1 ns) — a defensible, common value.
+/// The absolute rate is not itself observable: a guest always *calibrates* the
+/// APIC timer against an independent clock (the PIT, the ACPI PM timer, or the
+/// TSC) before relying on it, so what matters for transparency is that the
+/// LAPIC timer advances from the **same** nanosecond base as those reference
+/// clocks (see [`DeviceBus::advance_clocks`]). At 1 GHz one input clock is one
+/// nanosecond, so the conversion is exact.
+pub const LAPIC_TIMER_INPUT_HZ: u64 = 1_000_000_000;
 
 /// BDF of the ICH9 LPC bridge / PCI interrupt router (`00:1F.0`) seeded by
 /// [`DeviceBus::standard_pc_complete`]; its config space holds the
@@ -2041,6 +2150,69 @@ mod tests {
     }
 
     #[test]
+    fn standard_pc_lapic_aperture_eoi_follows_the_active_vcpu() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::interrupt::SharedInterruptController;
+        use std::sync::{Arc, Mutex};
+
+        // Two vCPUs sharing one bus; enable both LAPICs (SVR bit 8). LAPIC_EOI is
+        // at offset 0x0B0; LAPIC_SVR at 0x0F0 — neither is re-exported, so the
+        // literals are used here as the routing tests do.
+        const LAPIC_EOI_OFFSET: u64 = 0x0B0;
+        let pic = SharedInterruptController::new(2);
+        pic.with(|c| {
+            c.lapics[0].write_register(0x0F0, 0x1FF);
+            c.lapics[1].write_register(0x0F0, 0x1FF);
+            // A held level line (IRQ5 -> GSI5) routed to LAPIC 1.
+            let rte = c.ioapic.get_rte_mut(5);
+            rte.set_vector(0x55);
+            rte.set_destination(1);
+            rte.set_masked(false);
+            rte.level_triggered = true;
+        });
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let (mut bus, _pcie) = DeviceBus::standard_pc_with_interrupts(
+            SerialOutput::new("guest", SerialOutputMode::Shared(Arc::clone(&sink))),
+            &pic,
+        )
+        .unwrap();
+
+        // standard_pc_with_interrupts mounts the shared LAPIC aperture.
+        assert!(bus.mmio.is_mapped(0xFEE0_0000));
+
+        // The device asserts the level line; vCPU 1 services it.
+        pic.line(5)(true);
+        assert_eq!(pic.with(|c| c.pending_vector(1)), Some(0x55));
+        pic.with(|c| c.lapics[1].start_servicing(0x55));
+        assert!(!pic.with(|c| c.has_pending(1)));
+
+        // With vCPU 0 selected, the shared aperture's EOI targets vCPU 0 — which
+        // has nothing in service — so vCPU 1's held line is not retriggered.
+        bus.set_active_vcpu(0);
+        VmExitHandler::mmio_write(
+            &mut bus,
+            0xFEE0_0000 + LAPIC_EOI_OFFSET,
+            &0u32.to_le_bytes(),
+        );
+        assert!(
+            !pic.with(|c| c.has_pending(1)),
+            "an EOI attributed to vCPU 0 must not service vCPU 1's line"
+        );
+
+        // Select vCPU 1 (as the run loop does before entering it); the same
+        // aperture EOI now runs vCPU 1's path and the still-asserted level line
+        // is re-delivered.
+        bus.set_active_vcpu(1);
+        VmExitHandler::mmio_write(
+            &mut bus,
+            0xFEE0_0000 + LAPIC_EOI_OFFSET,
+            &0u32.to_le_bytes(),
+        );
+        assert_eq!(pic.with(|c| c.pending_vector(1)), Some(0x55));
+    }
+
+    #[test]
     fn standard_pc_with_pic_routes_uart_irq_through_the_legacy_8259() {
         use crate::serial::{SerialOutput, SerialOutputMode, COM1, IER_REG};
         use enlil_devices::interrupt::{SharedPic, MASTER_CMD, MASTER_DATA, SLAVE_CMD, SLAVE_DATA};
@@ -2337,8 +2509,16 @@ mod tests {
             "I/O APIC page should be mapped"
         );
         assert!(
+            bus.mmio.is_mapped(0xFEE0_0000),
+            "per-CPU LAPIC page should be mapped"
+        );
+        assert!(
             bus.mmio.is_mapped(0xFED0_0000),
             "HPET register block should be mapped"
+        );
+        assert!(
+            bus.mmio.is_mapped(0xFED4_0000),
+            "TPM 2.0 CRB page should be mapped"
         );
 
         // Bring up LAPIC 0 and program the PC/AT 8259 layout (master base 0x20),
@@ -2853,6 +3033,73 @@ mod tests {
             }) => assert_eq!(completion_code as u8, TrbCompletionCode::Success as u8),
             other => panic!("expected a transfer completion from the guest ring, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn advance_clocks_fires_the_lapic_timer_into_the_local_irr() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            0,
+            1,
+        )
+        .unwrap();
+        let ioapic = pc.ioapic.clone();
+
+        // Program LAPIC 0's timer the way a guest does: software-enable the APIC
+        // (SVR), a one-shot LVT timer on vector 0x40 unmasked, divide-by-1, and
+        // an initial count of 1000 input clocks.
+        ioapic.with(|c| {
+            let l = &mut c.lapics[0];
+            l.write_register(0x0F0, 0x1FF); // SVR: software-enable
+            l.write_register(0x320, 0x40); // LVT timer: vector 0x40, one-shot, unmasked
+            l.write_register(0x3E0, 0x0B); // divide config: divide by 1
+            l.write_register(0x380, 1000); // initial count
+        });
+
+        // At 1 GHz, 500 ns is 500 input clocks — not enough to expire 1000.
+        let _ = pc.advance_clocks(500);
+        assert!(
+            !ioapic.with(|c| c.has_pending(0)),
+            "the LAPIC timer must not fire before the count expires"
+        );
+
+        // The remaining 500 ns crosses the count; the LVT vector self-injects.
+        let _ = pc.advance_clocks(500);
+        assert_eq!(
+            ioapic.with(|c| c.pending_vector(0)),
+            Some(0x40),
+            "the expired LAPIC timer must inject its LVT vector into the local IRR"
+        );
+    }
+
+    #[test]
+    fn advance_clocks_does_not_tick_a_software_disabled_lapic_timer() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            0,
+            1,
+        )
+        .unwrap();
+        let ioapic = pc.ioapic.clone();
+
+        // Program the timer but leave the APIC software-DISABLED (no SVR enable):
+        // hardware forces every LVT mask bit set, so the timer must not deliver.
+        ioapic.with(|c| {
+            let l = &mut c.lapics[0];
+            l.write_register(0x320, 0x40);
+            l.write_register(0x3E0, 0x0B);
+            l.write_register(0x380, 1000);
+        });
+
+        let _ = pc.advance_clocks(5000);
+        assert!(
+            !ioapic.with(|c| c.has_pending(0)),
+            "a software-disabled APIC must not deliver a timer interrupt"
+        );
     }
 
     #[test]

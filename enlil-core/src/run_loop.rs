@@ -497,6 +497,365 @@ mod tests {
         assert_eq!(&*sink.lock().unwrap(), &[0xBE]);
     }
 
+    // End-to-end on /dev/kvm: a guest EOIs a real interrupt through the LAPIC
+    // MMIO aperture. A held, level-triggered line is routed to LAPIC 0 and
+    // serviced; a protected-mode guest then writes the LAPIC EOI register at
+    // 0xFEE000B0. The store takes an MMIO exit, the run loop dispatches it
+    // through the shared bus to the active vCPU's SharedLapicMmio, which runs
+    // the full LAPIC + I/O APIC EOI path — re-delivering the still-asserted
+    // level line. This exercises tonight's entire wiring (active-vCPU LAPIC
+    // dispatch, the aperture mounted in standard_pc_complete, protected-mode
+    // boot) against real hardware.
+    #[test]
+    fn run_loop_guest_eoi_retriggers_a_held_level_line_through_the_lapic_aperture() {
+        if !is_kvm_available() {
+            eprintln!("skipping run_loop_guest_eoi_...: no /dev/kvm");
+            return;
+        }
+
+        // mov eax, 0 ; mov [0xFEE000B0], eax ; hlt  — a LAPIC EOI write.
+        #[rustfmt::skip]
+        let code: [u8; 11] = [
+            0xB8, 0x00, 0x00, 0x00, 0x00,
+            0xA3, 0xB0, 0x00, 0xE0, 0xFE,
+            0xF4,
+        ];
+        const ENTRY: u64 = 0x1000;
+
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            0,
+            1,
+        )
+        .expect("build standard pc");
+        // A shared handle to the same controller the bus holds, so we can
+        // program/observe it across the move into the run loop.
+        let ioapic = pc.ioapic.clone();
+
+        // Hold a level line on IRQ5 (GSI5) routed to LAPIC 0, and service it so
+        // an EOI with the line still asserted re-delivers (the level-retrigger).
+        ioapic.with(|c| {
+            c.lapics[0].write_register(0x0F0, 0x1FF); // SVR: enable LAPIC 0
+            let rte = c.ioapic.get_rte_mut(5);
+            rte.set_vector(0x50);
+            rte.set_destination(0);
+            rte.set_masked(false);
+            rte.level_triggered = true;
+        });
+        ioapic.line(5)(true);
+        assert_eq!(ioapic.with(|c| c.pending_vector(0)), Some(0x50));
+        ioapic.with(|c| c.lapics[0].start_servicing(0x50));
+        assert!(!ioapic.with(|c| c.has_pending(0)));
+
+        let backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        let mut run = match StealthRunLoop::install(backend, pc, LbrPlatform::AmdSvm) {
+            Ok(run) => run,
+            Err(e) => {
+                eprintln!("skipping run_loop_guest_eoi_...: {e}");
+                return;
+            }
+        };
+
+        let mut ram = GuestRam::new(0x1000);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+        // SAFETY: `ram` outlives `run` within this test scope.
+        unsafe {
+            run.backend_mut()
+                .map_memory(ENTRY, host_addr, ram.len() as u64)
+        }
+        .expect("map guest memory");
+        run.create_vcpu(0).expect("create vcpu");
+        run.apply_cpuid_stealth().expect("clear hypervisor bit");
+        run.backend_mut()
+            .prepare_protected_mode_vcpu(0, ENTRY)
+            .expect("set protected-mode entry");
+
+        let mut halted = false;
+        for _ in 0..100 {
+            let step = run.run_vcpu_once(0).expect("run vcpu once");
+            if step.exit == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT through the run loop");
+
+        // The guest's EOI ran the full LAPIC + I/O APIC path through the shared
+        // aperture: the still-asserted level line is back in LAPIC 0's IRR.
+        assert_eq!(
+            ioapic.with(|c| c.pending_vector(0)),
+            Some(0x50),
+            "EOI through the LAPIC aperture must retrigger the held level line"
+        );
+    }
+
+    // End-to-end on /dev/kvm: a guest programs its LAPIC timer through the
+    // aperture, then the platform clock advance fires it. A protected-mode guest
+    // software-enables its APIC and writes the LVT timer / divide / initial-count
+    // registers over the LAPIC MMIO page — real MMIO exits routed through the
+    // shared bus to the active vCPU's SharedLapicMmio. After it HLTs, advancing
+    // the platform clocks (pc_mut().advance_clocks, the surface a driver uses)
+    // expires the count and self-injects the LVT vector into LAPIC 0's IRR.
+    #[test]
+    fn run_loop_guest_programs_and_fires_its_lapic_timer_through_the_aperture() {
+        if !is_kvm_available() {
+            eprintln!("skipping run_loop_guest_programs_..._lapic_timer: no /dev/kvm");
+            return;
+        }
+
+        // Protected-mode blob (mov eax,imm ; mov [moffs32],eax), four LAPIC regs:
+        //   SVR(0x0F0)=0x1FF software-enable; LVT timer(0x320)=0x40 one-shot,
+        //   unmasked; divide(0x3E0)=0x0B divide-by-1; init(0x380)=1000 ; hlt.
+        #[rustfmt::skip]
+        let code: [u8; 41] = [
+            0xB8, 0xFF, 0x01, 0x00, 0x00, // mov eax, 0x1FF
+            0xA3, 0xF0, 0x00, 0xE0, 0xFE, // mov [0xFEE000F0], eax  (SVR)
+            0xB8, 0x40, 0x00, 0x00, 0x00, // mov eax, 0x40
+            0xA3, 0x20, 0x03, 0xE0, 0xFE, // mov [0xFEE00320], eax  (LVT timer)
+            0xB8, 0x0B, 0x00, 0x00, 0x00, // mov eax, 0x0B
+            0xA3, 0xE0, 0x03, 0xE0, 0xFE, // mov [0xFEE003E0], eax  (divide)
+            0xB8, 0xE8, 0x03, 0x00, 0x00, // mov eax, 1000
+            0xA3, 0x80, 0x03, 0xE0, 0xFE, // mov [0xFEE00380], eax  (initial count)
+            0xF4,                         // hlt
+        ];
+        const ENTRY: u64 = 0x1000;
+
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            0,
+            1,
+        )
+        .expect("build standard pc");
+        let ioapic = pc.ioapic.clone();
+
+        let backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        let mut run = match StealthRunLoop::install(backend, pc, LbrPlatform::AmdSvm) {
+            Ok(run) => run,
+            Err(e) => {
+                eprintln!("skipping run_loop_guest_programs_..._lapic_timer: {e}");
+                return;
+            }
+        };
+
+        let mut ram = GuestRam::new(0x1000);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+        // SAFETY: `ram` outlives `run` within this test scope.
+        unsafe {
+            run.backend_mut()
+                .map_memory(ENTRY, host_addr, ram.len() as u64)
+        }
+        .expect("map guest memory");
+        run.create_vcpu(0).expect("create vcpu");
+        run.apply_cpuid_stealth().expect("clear hypervisor bit");
+        run.backend_mut()
+            .prepare_protected_mode_vcpu(0, ENTRY)
+            .expect("set protected-mode entry");
+
+        let mut halted = false;
+        for _ in 0..100 {
+            let step = run.run_vcpu_once(0).expect("run vcpu once");
+            if step.exit == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT through the run loop");
+
+        // The guest only programmed the timer; no platform time has passed yet.
+        assert!(
+            !ioapic.with(|c| c.has_pending(0)),
+            "the LAPIC timer must not have fired before any clock advance"
+        );
+
+        // Advance the platform clocks past the 1000-clock count (1 GHz bus →
+        // 1000 ns). The expired count self-injects the LVT vector.
+        let _ = run.pc_mut().advance_clocks(1000);
+        assert_eq!(
+            ioapic.with(|c| c.pending_vector(0)),
+            Some(0x40),
+            "the guest-programmed LAPIC timer must fire its LVT vector into the IRR"
+        );
+    }
+
+    // End-to-end on /dev/kvm: a guest programs the I/O APIC redirection table
+    // through its MMIO aperture, then a device IRQ routes through it. A
+    // protected-mode guest software-enables its APIC and writes IRQ5's RTE
+    // (vector 0x50 -> LAPIC 0, unmasked) over the I/O APIC page at 0xFEC0_0000 —
+    // real MMIO exits dispatched through the shared bus to IoApicMmio. After it
+    // HLTs, a host-side device asserts the IRQ5 line and it delivers the
+    // guest-programmed vector into LAPIC 0's IRR. Complements the LAPIC-aperture
+    // tests: the *other* high-MMIO interrupt aperture is guest-reachable too.
+    #[test]
+    fn run_loop_guest_programs_the_ioapic_rte_through_the_aperture() {
+        if !is_kvm_available() {
+            eprintln!("skipping run_loop_guest_programs_the_ioapic_rte: no /dev/kvm");
+            return;
+        }
+
+        // Protected-mode blob: SVR(0x0F0)=0x1FF enable; then program RTE5 the
+        // way a guest does — IOREGSEL(0xFEC00000)=0x1A (REDTBL 0x10 + 2*5) /
+        // IOWIN(0xFEC00010)=0x50 (vector, unmasked), then IOREGSEL=0x1B /
+        // IOWIN=0 (destination APIC 0); hlt.
+        #[rustfmt::skip]
+        let code: [u8; 51] = [
+            0xB8, 0xFF, 0x01, 0x00, 0x00, // mov eax, 0x1FF
+            0xA3, 0xF0, 0x00, 0xE0, 0xFE, // mov [0xFEE000F0], eax  (SVR enable)
+            0xB8, 0x1A, 0x00, 0x00, 0x00, // mov eax, 0x1A
+            0xA3, 0x00, 0x00, 0xC0, 0xFE, // mov [0xFEC00000], eax  (IOREGSEL RTE5 low)
+            0xB8, 0x50, 0x00, 0x00, 0x00, // mov eax, 0x50
+            0xA3, 0x10, 0x00, 0xC0, 0xFE, // mov [0xFEC00010], eax  (IOWIN vec 0x50)
+            0xB8, 0x1B, 0x00, 0x00, 0x00, // mov eax, 0x1B
+            0xA3, 0x00, 0x00, 0xC0, 0xFE, // mov [0xFEC00000], eax  (IOREGSEL RTE5 high)
+            0xB8, 0x00, 0x00, 0x00, 0x00, // mov eax, 0
+            0xA3, 0x10, 0x00, 0xC0, 0xFE, // mov [0xFEC00010], eax  (IOWIN dest 0)
+            0xF4,                         // hlt
+        ];
+        const ENTRY: u64 = 0x1000;
+
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            0,
+            1,
+        )
+        .expect("build standard pc");
+        let ioapic = pc.ioapic.clone();
+
+        let backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        let mut run = match StealthRunLoop::install(backend, pc, LbrPlatform::AmdSvm) {
+            Ok(run) => run,
+            Err(e) => {
+                eprintln!("skipping run_loop_guest_programs_the_ioapic_rte: {e}");
+                return;
+            }
+        };
+
+        let mut ram = GuestRam::new(0x1000);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+        // SAFETY: `ram` outlives `run` within this test scope.
+        unsafe {
+            run.backend_mut()
+                .map_memory(ENTRY, host_addr, ram.len() as u64)
+        }
+        .expect("map guest memory");
+        run.create_vcpu(0).expect("create vcpu");
+        run.apply_cpuid_stealth().expect("clear hypervisor bit");
+        run.backend_mut()
+            .prepare_protected_mode_vcpu(0, ENTRY)
+            .expect("set protected-mode entry");
+
+        let mut halted = false;
+        for _ in 0..100 {
+            let step = run.run_vcpu_once(0).expect("run vcpu once");
+            if step.exit == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT through the run loop");
+
+        // Nothing has asserted IRQ5 yet.
+        assert!(
+            !ioapic.with(|c| c.has_pending(0)),
+            "no interrupt should be pending before the device asserts its line"
+        );
+
+        // A host-side device pulses IRQ5; the guest-programmed RTE routes it to
+        // LAPIC 0 with the vector the guest wrote over the aperture.
+        ioapic.line(5)(true);
+        assert_eq!(
+            ioapic.with(|c| c.pending_vector(0)),
+            Some(0x50),
+            "the guest-programmed I/O APIC RTE must route IRQ5 to LAPIC 0 as vector 0x50"
+        );
+    }
+
+    // End-to-end on /dev/kvm: a guest sends an inter-processor interrupt through
+    // the LAPIC ICR. vCPU 0 (active) writes ICR_HIGH (destination APIC 1) then
+    // ICR_LOW (Fixed vector 0x91) over its LAPIC aperture; the ICR_LOW write
+    // dispatches the IPI through the shared bus to SharedLapicMmio, whose
+    // write_lapic uses the active vCPU as the source and delivers the vector to
+    // the *other* vCPU's LAPIC IRR. Completes the aperture trilogy (EOI, timer,
+    // and now IPI) on real hardware via the active-vCPU dispatch.
+    #[test]
+    fn run_loop_guest_sends_an_ipi_to_another_vcpu_through_the_aperture() {
+        if !is_kvm_available() {
+            eprintln!("skipping run_loop_guest_sends_an_ipi: no /dev/kvm");
+            return;
+        }
+
+        // Protected-mode blob: ICR_HIGH(0x310)=0x0100_0000 (dest APIC 1, bits
+        // 24-31), then ICR_LOW(0x300)=0x91 (Fixed vector 0x91, physical, no
+        // shorthand) — the ICR_LOW write triggers delivery; hlt.
+        #[rustfmt::skip]
+        let code: [u8; 21] = [
+            0xB8, 0x00, 0x00, 0x00, 0x01, // mov eax, 0x01000000
+            0xA3, 0x10, 0x03, 0xE0, 0xFE, // mov [0xFEE00310], eax  (ICR_HIGH: dest 1)
+            0xB8, 0x91, 0x00, 0x00, 0x00, // mov eax, 0x91
+            0xA3, 0x00, 0x03, 0xE0, 0xFE, // mov [0xFEE00300], eax  (ICR_LOW: fire)
+            0xF4,                         // hlt
+        ];
+        const ENTRY: u64 = 0x1000;
+
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            0,
+            2,
+        )
+        .expect("build standard pc");
+        let ioapic = pc.ioapic.clone();
+        // Both target LAPICs software-enabled, as a booted SMP guest would have.
+        ioapic.with(|c| {
+            c.lapics[0].write_register(0x0F0, 0x1FF);
+            c.lapics[1].write_register(0x0F0, 0x1FF);
+        });
+
+        let backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        let mut run = match StealthRunLoop::install_smp(backend, pc, LbrPlatform::AmdSvm, 2) {
+            Ok(run) => run,
+            Err(e) => {
+                eprintln!("skipping run_loop_guest_sends_an_ipi: {e}");
+                return;
+            }
+        };
+
+        let mut ram = GuestRam::new(0x1000);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+        // SAFETY: `ram` outlives `run` within this test scope.
+        unsafe {
+            run.backend_mut()
+                .map_memory(ENTRY, host_addr, ram.len() as u64)
+        }
+        .expect("map guest memory");
+        run.create_vcpu(0).expect("create vcpu 0");
+        run.create_vcpu(1).expect("create vcpu 1");
+        run.apply_cpuid_stealth().expect("clear hypervisor bit");
+        run.backend_mut()
+            .prepare_protected_mode_vcpu(0, ENTRY)
+            .expect("set vcpu 0 protected-mode entry");
+
+        let (last, _) = run.run_vcpu_until_event(0, 100).expect("run vcpu 0");
+        assert_eq!(
+            last.exit,
+            GuestExit::Halted,
+            "vcpu 0 halts after sending the IPI"
+        );
+
+        // The IPI from vCPU 0 landed in vCPU 1's LAPIC IRR — not vCPU 0's.
+        assert_eq!(
+            ioapic.with(|c| c.pending_vector(1)),
+            Some(0x91),
+            "the guest IPI must be delivered to the target vCPU 1's LAPIC"
+        );
+        assert!(
+            !ioapic.with(|c| c.has_pending(0)),
+            "a directed IPI must not also land on the sending vCPU 0"
+        );
+    }
+
     // Per-vCPU stealth state, proven live through the SMP run loop: install two
     // independent routers, seed each vCPU's APERF to a *different* value, and
     // run the same `rdmsr APERF; out 0x3F8; hlt` blob on each vCPU. vCPU 0 must

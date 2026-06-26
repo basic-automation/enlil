@@ -1034,6 +1034,29 @@ mod linux {
             self.vcpus.len()
         }
 
+        /// The host TSC frequency in kHz that KVM reports for vCPU 0
+        /// (`KVM_GET_TSC_KHZ`) — the reference rate the guest's TSC runs at.
+        ///
+        /// This is the missing primitive for two things the platform currently
+        /// hard-codes or omits: advancing the platform timers in lockstep with
+        /// *guest execution time* (converting the per-entry guest reference-cycle
+        /// delta from [`run_vcpu_timed`](Self::run_vcpu_timed) to nanoseconds),
+        /// and advertising the core-crystal / TSC frequency through CPUID leaves
+        /// `0x15`/`0x16` so a guest reads a self-consistent rate. Reads vCPU 0,
+        /// so at least one vCPU must already exist.
+        ///
+        /// # Errors
+        /// Returns [`Error::Vcpu`] if no vCPU has been created or
+        /// `KVM_GET_TSC_KHZ` is unavailable on the host.
+        pub fn tsc_khz(&self) -> Result<u32> {
+            let vcpu = self
+                .vcpus
+                .first()
+                .ok_or_else(|| Error::Vcpu("no vcpu created; cannot read TSC frequency".into()))?;
+            vcpu.get_tsc_khz()
+                .map_err(|e| Error::Vcpu(format!("KVM_GET_TSC_KHZ: {e}")))
+        }
+
         /// Point vCPU `index` at a flat 16-bit real-mode entry: every segment
         /// gets base 0 (so `rip` is a direct guest-physical offset), `rip` is
         /// set to `entry`, and `rflags` to the reserved-bit-only `0x2`.
@@ -1065,6 +1088,84 @@ mod linux {
                 seg.base = 0;
                 seg.selector = 0;
             }
+            vcpu.set_sregs(&sregs)
+                .map_err(|e| Error::Vcpu(format!("KVM_SET_SREGS: {e}")))?;
+
+            let mut regs = vcpu
+                .get_regs()
+                .map_err(|e| Error::Vcpu(format!("KVM_GET_REGS: {e}")))?;
+            regs.rip = entry;
+            regs.rflags = 0x2;
+            vcpu.set_regs(&regs)
+                .map_err(|e| Error::Vcpu(format!("KVM_SET_REGS: {e}")))?;
+            Ok(())
+        }
+
+        /// Prepare vCPU `index` to start executing a 32-bit **protected-mode**
+        /// code blob at `entry`, with paging off and flat segments.
+        ///
+        /// Real mode can only address the low 1 MiB, so a real-mode blob cannot
+        /// reach the platform's high MMIO apertures (the LAPIC page at
+        /// `0xFEE0_0000`, the I/O APIC at `0xFEC0_0000`, the HPET at
+        /// `0xFED0_0000`). This sets `CR0.PE` and loads flat 4 GiB code/data
+        /// segments straight into the cached descriptors via `KVM_SET_SREGS` —
+        /// the same descriptor-cache trick kvmtool/Firecracker use to enter
+        /// protected mode without a GDT in guest memory — so a blob can issue a
+        /// 32-bit `mov` to an absolute high address and take a real MMIO exit.
+        /// Paging stays off (`CR0.PG = 0`), so linear == physical.
+        ///
+        /// `CS` is a flat execute/read segment (selector `0x08`), the data
+        /// segments a flat read/write segment (selector `0x10`); both are 32-bit
+        /// (`db = 1`), page-granular (`g = 1`), present, ring 0.
+        ///
+        /// # Errors
+        /// Returns [`Error::Vcpu`] if `index` is out of range or any of the
+        /// `KVM_{GET,SET}_{SREGS,REGS}` ioctls fail.
+        pub fn prepare_protected_mode_vcpu(&self, index: usize, entry: u64) -> Result<()> {
+            let vcpu = self
+                .vcpus
+                .get(index)
+                .ok_or_else(|| Error::Vcpu(format!("no vcpu at index {index}")))?;
+
+            let mut sregs = vcpu
+                .get_sregs()
+                .map_err(|e| Error::Vcpu(format!("KVM_GET_SREGS: {e}")))?;
+
+            // Flat 32-bit code segment (selector 0x08): execute/read, accessed.
+            sregs.cs.base = 0;
+            sregs.cs.limit = 0xFFFF_FFFF;
+            sregs.cs.selector = 0x08;
+            sregs.cs.type_ = 0b1011; // code, execute/read, accessed
+            sregs.cs.s = 1; // code/data (not system)
+            sregs.cs.dpl = 0;
+            sregs.cs.present = 1;
+            sregs.cs.db = 1; // 32-bit default operand/address size
+            sregs.cs.l = 0; // not 64-bit
+            sregs.cs.g = 1; // 4 KiB granularity -> limit is in pages
+
+            // Flat 32-bit data segments (selector 0x10): read/write, accessed.
+            for seg in [
+                &mut sregs.ds,
+                &mut sregs.es,
+                &mut sregs.fs,
+                &mut sregs.gs,
+                &mut sregs.ss,
+            ] {
+                seg.base = 0;
+                seg.limit = 0xFFFF_FFFF;
+                seg.selector = 0x10;
+                seg.type_ = 0b0011; // data, read/write, accessed
+                seg.s = 1;
+                seg.dpl = 0;
+                seg.present = 1;
+                seg.db = 1;
+                seg.l = 0;
+                seg.g = 1;
+            }
+
+            // Enter protected mode (CR0.PE), paging off (CR0.PG clear).
+            sregs.cr0 = (sregs.cr0 | 0x1) & !(1 << 31);
+
             vcpu.set_sregs(&sregs)
                 .map_err(|e| Error::Vcpu(format!("KVM_SET_SREGS: {e}")))?;
 
@@ -1434,6 +1535,82 @@ mod tests {
         let idx = backend.create_vcpu(0).expect("create vcpu");
         assert_eq!(idx, 0);
         assert_eq!(backend.vcpu_count(), 1);
+    }
+
+    #[test]
+    fn tsc_khz_reports_a_plausible_host_frequency() {
+        if !is_kvm_available() {
+            eprintln!("skipping: /dev/kvm not available (no nested virt)");
+            return;
+        }
+
+        let mut backend = KvmBackend::new().expect("create KVM VM");
+        // No vCPU yet → the frequency cannot be read.
+        assert!(
+            backend.tsc_khz().is_err(),
+            "tsc_khz must require a vCPU to query"
+        );
+
+        backend.create_vcpu(0).expect("create vcpu");
+        let khz = backend.tsc_khz().expect("KVM_GET_TSC_KHZ");
+        // Any real x86-64 host TSC runs well above 100 MHz; sanity-bound it
+        // rather than pin an exact value (it is host-specific).
+        assert!(khz > 100_000, "implausible host TSC frequency: {khz} kHz");
+    }
+
+    #[test]
+    fn protected_mode_guest_writes_the_high_lapic_mmio_page() {
+        if !is_kvm_available() {
+            eprintln!("skipping: /dev/kvm not available (no nested virt)");
+            return;
+        }
+
+        // A 32-bit protected-mode blob that real mode could not run: store a
+        // 32-bit value to the absolute LAPIC EOI register at 0xFEE000B0 (above
+        // 1 MiB, unreachable from real mode), then HLT.
+        //   B8 78 56 34 12   mov eax, 0x12345678
+        //   A3 B0 00 E0 FE   mov [0xFEE000B0], eax   (mov moffs32, eax)
+        //   F4               hlt
+        #[rustfmt::skip]
+        let code: [u8; 11] = [
+            0xB8, 0x78, 0x56, 0x34, 0x12,
+            0xA3, 0xB0, 0x00, 0xE0, 0xFE,
+            0xF4,
+        ];
+        const ENTRY: u64 = 0x1000;
+        const LAPIC_EOI_ADDR: u64 = 0xFEE0_00B0;
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+
+        let mut ram = GuestRam::new(0x1000);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu");
+        backend
+            .prepare_protected_mode_vcpu(0, ENTRY)
+            .expect("set protected-mode entry");
+
+        let mut handler = RecordingHandler::default();
+        let mut halted = false;
+        for _ in 0..16 {
+            match backend.run_vcpu(0, &mut handler).expect("run vcpu") {
+                GuestExit::Halted => {
+                    halted = true;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+
+        assert!(halted, "protected-mode guest never reached HLT");
+        assert_eq!(
+            handler.mmio_write,
+            vec![(LAPIC_EOI_ADDR, 0x1234_5678u32.to_le_bytes().to_vec())],
+            "the high LAPIC MMIO store must reach the handler as a single 4-byte write"
+        );
     }
 
     // -- page-aligned guest RAM (no KVM required) ---------------------------
