@@ -1034,6 +1034,29 @@ mod linux {
             self.vcpus.len()
         }
 
+        /// The host TSC frequency in kHz that KVM reports for vCPU 0
+        /// (`KVM_GET_TSC_KHZ`) — the reference rate the guest's TSC runs at.
+        ///
+        /// This is the missing primitive for two things the platform currently
+        /// hard-codes or omits: advancing the platform timers in lockstep with
+        /// *guest execution time* (converting the per-entry guest reference-cycle
+        /// delta from [`run_vcpu_timed`](Self::run_vcpu_timed) to nanoseconds),
+        /// and advertising the core-crystal / TSC frequency through CPUID leaves
+        /// `0x15`/`0x16` so a guest reads a self-consistent rate. Reads vCPU 0,
+        /// so at least one vCPU must already exist.
+        ///
+        /// # Errors
+        /// Returns [`Error::Vcpu`] if no vCPU has been created or
+        /// `KVM_GET_TSC_KHZ` is unavailable on the host.
+        pub fn tsc_khz(&self) -> Result<u32> {
+            let vcpu = self
+                .vcpus
+                .first()
+                .ok_or_else(|| Error::Vcpu("no vcpu created; cannot read TSC frequency".into()))?;
+            vcpu.get_tsc_khz()
+                .map_err(|e| Error::Vcpu(format!("KVM_GET_TSC_KHZ: {e}")))
+        }
+
         /// Point vCPU `index` at a flat 16-bit real-mode entry: every segment
         /// gets base 0 (so `rip` is a direct guest-physical offset), `rip` is
         /// set to `entry`, and `rflags` to the reserved-bit-only `0x2`.
@@ -1512,6 +1535,27 @@ mod tests {
         let idx = backend.create_vcpu(0).expect("create vcpu");
         assert_eq!(idx, 0);
         assert_eq!(backend.vcpu_count(), 1);
+    }
+
+    #[test]
+    fn tsc_khz_reports_a_plausible_host_frequency() {
+        if !is_kvm_available() {
+            eprintln!("skipping: /dev/kvm not available (no nested virt)");
+            return;
+        }
+
+        let mut backend = KvmBackend::new().expect("create KVM VM");
+        // No vCPU yet → the frequency cannot be read.
+        assert!(
+            backend.tsc_khz().is_err(),
+            "tsc_khz must require a vCPU to query"
+        );
+
+        backend.create_vcpu(0).expect("create vcpu");
+        let khz = backend.tsc_khz().expect("KVM_GET_TSC_KHZ");
+        // Any real x86-64 host TSC runs well above 100 MHz; sanity-bound it
+        // rather than pin an exact value (it is host-specific).
+        assert!(khz > 100_000, "implausible host TSC frequency: {khz} kHz");
     }
 
     #[test]
