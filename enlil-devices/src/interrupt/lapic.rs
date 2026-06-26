@@ -516,7 +516,16 @@ impl LocalApic {
             }
 
             if self.timer_mode == TimerMode::Periodic {
-                self.timer_current = self.timer_initial;
+                // Carry the ticks beyond this expiry into the next period so a
+                // large batch divides exactly like a sequence of small ones —
+                // the phase never drifts. (timer_initial != 0 here: the count==0
+                // early-return above rules it out.) The IRR coalesces the
+                // multiple expiries a single batch may span into one pending
+                // interrupt, exactly as hardware does when the guest has not yet
+                // serviced the vector.
+                let beyond = ticks - self.timer_current;
+                let into_period = beyond % self.timer_initial;
+                self.timer_current = self.timer_initial - into_period;
             } else {
                 self.timer_current = 0;
             }
@@ -735,6 +744,32 @@ mod tests {
         assert!(lapic.timer_tick(10)); // Remaining 5 < 10
         assert!(lapic.has_pending_interrupt());
         assert_eq!(lapic.pending_vector(), Some(0x40));
+    }
+
+    #[test]
+    fn test_timer_periodic_carries_phase_across_a_multi_period_batch() {
+        let mut lapic = LocalApic::new(1);
+        lapic.write_register(LAPIC_SVR, 0x1FF);
+        // Periodic mode (LVT bit 17 set), vector 0x40, divide-by-1, period 100.
+        lapic.write_register(LAPIC_LVT_TIMER, 0x2_0040);
+        lapic.write_register(LAPIC_TIMER_DIVIDE, 0b1011);
+        lapic.write_register(LAPIC_TIMER_INIT, 100);
+
+        // A batch covering 2.5 periods fires and leaves the counter at exactly
+        // half a period — the remainder is carried, not reset to a full 100, so
+        // the periodic phase does not drift when advance_clocks passes a large ns
+        // delta. (The IRR coalesces the multiple expiries into one pending int.)
+        assert!(lapic.timer_tick(250));
+        assert_eq!(
+            lapic.read_register(LAPIC_TIMER_CURRENT),
+            50,
+            "periodic reload must carry the 50-tick remainder into the next period"
+        );
+
+        // 50 ticks finish this period, the next 50 start the following one: the
+        // phase stays aligned at 50 rather than snapping back to a full period.
+        assert!(lapic.timer_tick(100));
+        assert_eq!(lapic.read_register(LAPIC_TIMER_CURRENT), 50);
     }
 
     #[test]
