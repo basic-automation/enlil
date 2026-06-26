@@ -6,6 +6,161 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-26 — Session: make the interrupt/timer apertures guest-reachable + a protected-mode boot harness + enable the vTPM (Phases 3 & 5)
+
+**14 tested increments + 1 `cargo fmt` commit, each independently green and
+committed** (branch `routine/enlil-2026-06-26`, PR <!--PR_URL-->). Wall-clock
+~00:39→~01:34 CDT (~55 min; the builds were warm/fast on this workstation and
+the WSL test/clippy + Windows-native build overlapped in the background for every
+increment). Two coherent threads. **(A)** Take the interrupt subsystem from
+"correct in isolation" (2026-06-25) to **actually reachable by a real guest over
+memory**: a single shared LAPIC aperture steered to the running vCPU, mounted in
+every platform builder, the LAPIC timer finally ticked, plus a 32-bit
+**protected-mode guest-boot harness** that — unlike real mode — can touch the
+high MMIO apertures (LAPIC/IOAPIC at `0xFEC/E0_0000`), proven by four real
+`/dev/kvm` guest-boot tests (EOI, LAPIC timer, IOAPIC RTE, cross-vCPU IPI).
+**(B)** Make the **TPM 2.0 reachable** so a Windows 11 guest's presence check
+passes: a `SharedTpm`/`TpmMmio` CRB front-end mounted in the complete platform,
+cross-checked against the ACPI TPM2 table. Plus the `tsc_khz` primitive the
+deferred clock-cadence/CPUID-frequency work needs.
+
+### Increments (commit — what)
+1. `3802514` — **Active-vCPU-aware shared LAPIC MMIO aperture.** xAPIC reaches
+   every CPU's LAPIC through the one page at `0xFEE0_0000`, so a single aperture
+   on the shared multi-vCPU bus must attribute each trap to the running vCPU.
+   Added `InterruptController::{set_active_lapic, active_lapic_id}` and a
+   `SharedLapicMmio` that dispatches `read`/`write_lapic` to the active vCPU.
+   +3 tests. (enlil-devices)
+2. `c97971a` — **Mount + steer it in `standard_pc_with_interrupts`.**
+   `DeviceBus::add_lapic_mmio` mounts the aperture and stores the controller;
+   `set_active_vcpu` (already called by the run loop before each entry for the
+   stealth-MSR bank) now also selects the LAPIC, keeping its return contract.
+   +1 integration test. (enlil-core)
+3. `3a1dd71` — **Mount the LAPIC aperture in `standard_pc_complete` +
+   `standard_pc_with_dual_irq`** (the full platforms the run loop binds), so a
+   booted guest can EOI / send IPIs / program its LAPIC timer over memory.
+4. `43de1e0` — **`KvmBackend::prepare_protected_mode_vcpu` + real-KVM high-MMIO
+   guest-boot test.** Flat 32-bit segments via `KVM_SET_SREGS` (the
+   kvmtool/Firecracker descriptor-cache trick, paging off) so a blob can store
+   to an absolute address above 1 MiB. Test boots a blob writing the LAPIC EOI
+   register at `0xFEE000B0`; the MMIO write reaches the handler. **Ran on real
+   `/dev/kvm`.** (enlil-core)
+5. `3c0eced` — **End-to-end real-KVM test: guest EOI via the LAPIC aperture.** A
+   held level line serviced on LAPIC 0, then a protected-mode guest's EOI write
+   runs the full LAPIC+IOAPIC EOI path through the run loop → shared bus →
+   `SharedLapicMmio` and re-delivers the line. **Ran on real `/dev/kvm`.**
+6. `f47769b` — **Tick the per-vCPU LAPIC timer from `advance_clocks`.** It was
+   only ticked in tests, so a guest using the LAPIC timer (the primary per-CPU
+   clock on modern Linux/Windows) got no interrupts. Drive every vCPU's timer
+   from the same ns base at a documented 1 GHz APIC bus rate; a software-disabled
+   APIC is skipped. +2 tests. (enlil-devices→core)
+7. `16aa406` — **Real-KVM test: guest programs + fires its LAPIC timer via the
+   aperture.** Protected-mode blob writes SVR/LVT/divide/init over the page;
+   `pc_mut().advance_clocks` then fires it. **Ran on real `/dev/kvm`.**
+8. `d5e9c42` — **Real-KVM test: guest programs the I/O APIC RTE via the
+   aperture** (the *other* high-MMIO interrupt aperture). **Ran on `/dev/kvm`.**
+9. `c1e7d61` — `cargo fmt` (this session's new code; formatting only).
+10. `f623880` — **Real-KVM test: guest sends an IPI to another vCPU via the
+    aperture** — completes the aperture trilogy (EOI · timer · IPI); uses
+    `install_smp` + multi-vCPU protected-mode boot. **Ran on `/dev/kvm`.**
+11. `44d6c17` — **`SharedTpm` + `TpmMmio` CRB aperture** so the existing,
+    never-mounted `VirtualTpm` (TPM 2.0) is guest-reachable at `0xFED4_0000`.
+    +2 tests (aperture; a TPM2_Startup round-trips to `TPM_RC_SUCCESS`).
+    (enlil-devices)
+12. `e022897` — **Mount the TPM in `standard_pc_complete`** via `add_tpm`,
+    returned in the `StandardPc` bundle. Windows 11's TPM 2.0 check now sees a
+    device. (enlil-core)
+13. `c3af63f` — **Cross-check the ACPI TPM2 control area against the mounted CRB
+    aperture** (the "cannot drift" discipline) — it equals `TPM_MMIO_BASE +
+    CTRL_REQ` and lies inside the page. (enlil-devices)
+14. `3ab7d25` — **`KvmBackend::tsc_khz`** reads the host TSC frequency
+    (`KVM_GET_TSC_KHZ`) — the primitive the deferred clock-cadence and CPUID
+    `0x15/0x16` work needs. +1 real-KVM test. (enlil-core, Linux/KVM-only)
+15. `1971716` — **Carry the LAPIC periodic-timer phase across a multi-period
+    batch.** A large `advance_clocks` ns delta spanning several periods reset the
+    counter to a full period (phase drift); now the remainder is carried so a big
+    batch divides exactly like small ones. +1 test. (enlil-devices)
+
+### Research (informed the build)
+No new external literature logged — the work was driven by the existing
+ROADMAP/PROGRESS next-step (2026-06-25 flagged item 1: "active-vCPU-aware LAPIC
+MMIO dispatch + mount it in `standard_pc_with_interrupts`, which makes tonight's
+IPI/EOI path reachable by a real guest") read against the **primary specs already
+in `RESEARCH.md`**: Intel SDM Vol.3 §10.4–10.6 (xAPIC per-CPU LAPIC at
+`0xFEE0_0000`, ICR/IPI, LVT timer, SVR software-enable), §10.5.4 (timer divide);
+the Intel SDM real-vs-protected addressing limits (the 1 MiB real-mode wall that
+motivated `prepare_protected_mode_vcpu`); the kvmtool/Firecracker boot-vCPU
+SREGS descriptor-cache convention; the TCG PC Client CRB spec (control area at
+base+0x40, start method 6) and ACPI TPM2 table. Nothing new to add.
+
+### Test results (exact)
+- **`/dev/kvm`: read-writable at start AND at wrap (`KVM_RW_OK` /
+  `KVM_RW_OK_AT_WRAP`).** The KVM / guest-boot tests **ran for real, none
+  skipped.** New real-`/dev/kvm` guest-boot tests this session, all passing:
+  `protected_mode_guest_writes_the_high_lapic_mmio_page`,
+  `run_loop_guest_eoi_retriggers_a_held_level_line_through_the_lapic_aperture`,
+  `run_loop_guest_programs_and_fires_its_lapic_timer_through_the_aperture`,
+  `run_loop_guest_programs_the_ioapic_rte_through_the_aperture`,
+  `run_loop_guest_sends_an_ipi_to_another_vcpu_through_the_aperture`,
+  `tsc_khz_reports_a_plausible_host_frequency` — plus the pre-existing
+  kvm_backend/run_loop suites (VM creation, MSR round-trip, AMD topology stealth,
+  real-mode CF9 reset, SMP per-vCPU APERF/PMC) still green on real hardware.
+- **Full workspace CI-parity** (the `.github/workflows/ci.yml` commands):
+  `cargo fmt --all -- --check` → clean (exit 0); `cargo clippy --all-targets
+  --workspace` → exit 0, **no warnings**; `cargo test --workspace` → all green,
+  **0 failures**. **enlil-core 222 passed** (was 211; +11), **enlil-devices 912
+  passed** (was 900; +12), plus the smaller crates. The only ignored item is the
+  pre-existing `interrupt::line` doc-test (1 ignored). The
+  `acpi_iasl_validation` / `smbios_dmidecode_validation` reference gates
+  **self-skip — `iasl`/`dmidecode` are NOT installed** on this host (unchanged
+  from prior runs).
+- **Toolchains.** Every host-agnostic increment (the enlil-devices ones and the
+  enlil-core platform/run-loop ones) built on **Linux/WSL** (nightly
+  `x86_64-unknown-linux-gnu`) AND **Windows-native** (`x86_64-pc-windows-msvc`,
+  `cargo build -p <crate>` against the WSL manifest with a Windows target-dir,
+  run from PowerShell with `$LASTEXITCODE` checks) — **exit 0** each. The one
+  exception is `3ab7d25` (`tsc_khz`), which is in the Linux/KVM-only
+  `kvm_backend` (`target_os = "linux"`); per the BUILD MATRIX it was built/tested
+  on **WSL only** and is correctly absent from the Windows build. No
+  `x86_64-unknown-enlil` / UEFI payload build was required (no `no_std` crate was
+  touched).
+
+### STOP REASON
+**The clean, low-risk, unblocked wells in the reachable subsystems are tapped;
+the remaining high-value work is architectural or invasive and not safe to land
+cleanly as an unattended late-night increment.** Wall-clock budget was not the
+limiter (~55 min). After completing the guest-reachable interrupt/timer aperture
+path end-to-end on real `/dev/kvm` and enabling the vTPM, the next high-value
+items each need a deliberate, awake design session — committing one half-done
+would risk a subtle transparency/correctness regression, which the guardrails
+forbid:
+  1. **Production platform-clock cadence.** `advance_clocks` still has **no
+     production caller** — the run loop never advances wall time, so a booted
+     guest's PIT/HPET/PM/LAPIC timers are frozen. The right ns source is *guest
+     execution time* (per-entry `guest_ref_cycles` ÷ the now-available
+     `tsc_khz`), but to stay consistent with the **stealthed** guest TSC it must
+     interlock with the timing-stealth TSC-offset management (`timing_stealth.rs`
+     `tsc_offset`) — advancing by wall-clock instead would make RDTSC and the PIT
+     disagree (a detectable tell). This is THE next step and needs care.
+  2. **CPUID `0x16` (and `0x15`) frequency leaves** using `tsc_khz`, threaded
+     through the existing CPUID stealth (`apply_topology_stealth`) without
+     disturbing the topology leaves.
+  3. **LAPIC TSC-deadline timer mode** (`timer_tick` returns false for it today)
+     — modern Linux's default; needs the guest TSC + the `IA32_TSC_DEADLINE` MSR
+     wired through the run loop.
+  4. **qcow2 refcount-table growth** (`storage/qcow.rs`) — the one remaining
+     allocation gap, but it requires making `QcowHeader` interior-mutable (every
+     `self.header.*` read changes), an invasive refactor with image-corruption
+     risk; not late-night-safe.
+Per the guardrails I did not start any of these just to fill the clock. `master`
+stays buildable (green per increment).
+**Next step:** item 1 — wire `advance_clocks` into the run loop, driving ns from
+`guest_ref_cycles ÷ tsc_khz` and reconciling it with the timing-stealth TSC
+offset so the platform timers and the guest RDTSC stay in lockstep. That makes
+tonight's LAPIC-timer/PIT/HPET work actually advance during a real guest run.
+
+---
+
 ## 2026-06-25 — Session: guest-facing interrupt-delivery path made correct (Phase 3) — LAPIC/IOAPIC/IPI delivery + 2 timer bug fixes
 
 **7 tested increments, each independently green and committed** (branch
