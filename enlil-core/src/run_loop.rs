@@ -497,6 +497,99 @@ mod tests {
         assert_eq!(&*sink.lock().unwrap(), &[0xBE]);
     }
 
+    // End-to-end on /dev/kvm: a guest EOIs a real interrupt through the LAPIC
+    // MMIO aperture. A held, level-triggered line is routed to LAPIC 0 and
+    // serviced; a protected-mode guest then writes the LAPIC EOI register at
+    // 0xFEE000B0. The store takes an MMIO exit, the run loop dispatches it
+    // through the shared bus to the active vCPU's SharedLapicMmio, which runs
+    // the full LAPIC + I/O APIC EOI path — re-delivering the still-asserted
+    // level line. This exercises tonight's entire wiring (active-vCPU LAPIC
+    // dispatch, the aperture mounted in standard_pc_complete, protected-mode
+    // boot) against real hardware.
+    #[test]
+    fn run_loop_guest_eoi_retriggers_a_held_level_line_through_the_lapic_aperture() {
+        if !is_kvm_available() {
+            eprintln!("skipping run_loop_guest_eoi_...: no /dev/kvm");
+            return;
+        }
+
+        // mov eax, 0 ; mov [0xFEE000B0], eax ; hlt  — a LAPIC EOI write.
+        #[rustfmt::skip]
+        let code: [u8; 11] = [
+            0xB8, 0x00, 0x00, 0x00, 0x00,
+            0xA3, 0xB0, 0x00, 0xE0, 0xFE,
+            0xF4,
+        ];
+        const ENTRY: u64 = 0x1000;
+
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            0,
+            1,
+        )
+        .expect("build standard pc");
+        // A shared handle to the same controller the bus holds, so we can
+        // program/observe it across the move into the run loop.
+        let ioapic = pc.ioapic.clone();
+
+        // Hold a level line on IRQ5 (GSI5) routed to LAPIC 0, and service it so
+        // an EOI with the line still asserted re-delivers (the level-retrigger).
+        ioapic.with(|c| {
+            c.lapics[0].write_register(0x0F0, 0x1FF); // SVR: enable LAPIC 0
+            let rte = c.ioapic.get_rte_mut(5);
+            rte.set_vector(0x50);
+            rte.set_destination(0);
+            rte.set_masked(false);
+            rte.level_triggered = true;
+        });
+        ioapic.line(5)(true);
+        assert_eq!(ioapic.with(|c| c.pending_vector(0)), Some(0x50));
+        ioapic.with(|c| c.lapics[0].start_servicing(0x50));
+        assert!(!ioapic.with(|c| c.has_pending(0)));
+
+        let backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        let mut run = match StealthRunLoop::install(backend, pc, LbrPlatform::AmdSvm) {
+            Ok(run) => run,
+            Err(e) => {
+                eprintln!("skipping run_loop_guest_eoi_...: {e}");
+                return;
+            }
+        };
+
+        let mut ram = GuestRam::new(0x1000);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+        // SAFETY: `ram` outlives `run` within this test scope.
+        unsafe {
+            run.backend_mut()
+                .map_memory(ENTRY, host_addr, ram.len() as u64)
+        }
+        .expect("map guest memory");
+        run.create_vcpu(0).expect("create vcpu");
+        run.apply_cpuid_stealth().expect("clear hypervisor bit");
+        run.backend_mut()
+            .prepare_protected_mode_vcpu(0, ENTRY)
+            .expect("set protected-mode entry");
+
+        let mut halted = false;
+        for _ in 0..100 {
+            let step = run.run_vcpu_once(0).expect("run vcpu once");
+            if step.exit == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT through the run loop");
+
+        // The guest's EOI ran the full LAPIC + I/O APIC path through the shared
+        // aperture: the still-asserted level line is back in LAPIC 0's IRR.
+        assert_eq!(
+            ioapic.with(|c| c.pending_vector(0)),
+            Some(0x50),
+            "EOI through the LAPIC aperture must retrigger the held level line"
+        );
+    }
+
     // Per-vCPU stealth state, proven live through the SMP run loop: install two
     // independent routers, seed each vCPU's APERF to a *different* value, and
     // run the same `rdmsr APERF; out 0x3F8; hlt` blob on each vCPU. vCPU 0 must
