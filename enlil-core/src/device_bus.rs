@@ -20,7 +20,8 @@ use enlil_devices::bus::{MmioBus, MmioDevice, PioBus, PioDevice};
 use enlil_devices::chipset::{Gpe0Block, SharedAcpiPm1Block, SharedSystemControlPortA};
 use enlil_devices::dma::{Dma8237, DmaPageRegisters};
 use enlil_devices::interrupt::{
-    IoApicMmio, PirqRouter, SharedInterruptController, SharedPic, PIRQ_DEFAULT_IRQS,
+    IoApicMmio, PirqRouter, SharedInterruptController, SharedLapicMmio, SharedPic,
+    PIRQ_DEFAULT_IRQS,
 };
 use enlil_devices::pcie::{
     vendors, EcamSpace, PciBdf, PciConfigIo, PciResetControl, PcieRootComplex, SharedRootComplex,
@@ -66,6 +67,12 @@ pub struct DeviceBus {
     /// [`set_active_vcpu`]: Self::set_active_vcpu
     /// [`VmExitHandler`]: crate::kvm_backend::VmExitHandler
     stealth: Option<StealthBank>,
+    /// A clone of the shared interrupt controller, captured when
+    /// [`add_lapic_mmio`](Self::add_lapic_mmio) mounts the shared LAPIC
+    /// aperture, so [`set_active_vcpu`](Self::set_active_vcpu) can tell the
+    /// controller which vCPU's LAPIC the one shared aperture is now serving.
+    /// `None` until the aperture is mounted.
+    interrupts: Option<SharedInterruptController>,
 }
 
 /// A bank of per-vCPU [`StealthMsrRouter`]s with an `active` selector.
@@ -113,6 +120,7 @@ impl DeviceBus {
             mmio: MmioBus::new(),
             pci_reset: None,
             stealth: None,
+            interrupts: None,
         }
     }
 
@@ -145,9 +153,22 @@ impl DeviceBus {
     /// calls this with the vCPU index before entering it, so a forwarded
     /// `RDMSR`/`WRMSR` on vCPU `index` hits `index`'s shadow state.
     ///
-    /// Returns `false` (leaving the selection unchanged) if no router is
-    /// installed or `index` names no vCPU in the bank.
+    /// It also tells the shared interrupt controller which vCPU's LAPIC the one
+    /// [`SharedLapicMmio`] aperture serves (when [`add_lapic_mmio`] mounted it),
+    /// so a guest LAPIC access — `EOI`, `ICR` (IPI), timer registers — on this
+    /// vCPU lands on its own [`LocalApic`]. APIC ID is the vCPU index here.
+    ///
+    /// Returns `false` (leaving the *stealth* selection unchanged) if no router
+    /// is installed or `index` names no vCPU in the bank — the LAPIC selection,
+    /// which is independent of the stealth bank, is still applied. The run loop
+    /// reads this return value to validate the stealth/timing install.
+    ///
+    /// [`add_lapic_mmio`]: Self::add_lapic_mmio
+    /// [`LocalApic`]: enlil_devices::interrupt::LocalApic
     pub fn set_active_vcpu(&mut self, index: usize) -> bool {
+        if let (Some(pic), Ok(id)) = (self.interrupts.as_ref(), u8::try_from(index)) {
+            pic.with(|c| c.set_active_lapic(id));
+        }
         self.stealth.as_mut().is_some_and(|b| b.set_active(index))
     }
 
@@ -386,6 +407,7 @@ impl DeviceBus {
         bus.add_pit(pit)?;
 
         bus.add_ioapic(pic)?;
+        bus.add_lapic_mmio(pic)?;
 
         let pcie = bus.add_pcie(PcieRootComplex::new(DEFAULT_ECAM_BASE))?;
         Ok((bus, pcie))
@@ -404,6 +426,30 @@ impl DeviceBus {
         pic: &SharedInterruptController,
     ) -> Result<(), enlil_devices::bus::BusError> {
         self.add_mmio(Box::new(IoApicMmio::new(pic.clone())))
+    }
+
+    /// Mount the **shared** LAPIC MMIO aperture ([`SharedLapicMmio`]) at the
+    /// per-CPU LAPIC page (`0xFEE0_0000`) over `pic`, and remember `pic` so
+    /// [`set_active_vcpu`](Self::set_active_vcpu) can steer the aperture to the
+    /// running vCPU's [`LocalApic`](enlil_devices::interrupt::LocalApic).
+    ///
+    /// xAPIC reaches every CPU's LAPIC through this one physical page, so on a
+    /// VM where all vCPUs share one [`DeviceBus`] a single aperture must be
+    /// attributed to whichever vCPU trapped — the run loop selects it with
+    /// `set_active_vcpu` before each entry. Without this aperture a guest's
+    /// LAPIC `EOI`/`ICR`/timer accesses reach open-bus and it can neither EOI
+    /// nor send IPIs through memory. Mount it alongside [`add_ioapic`].
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if the aperture overlaps an
+    /// already-registered MMIO device.
+    pub fn add_lapic_mmio(
+        &mut self,
+        pic: &SharedInterruptController,
+    ) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_mmio(Box::new(SharedLapicMmio::new(pic.clone())))?;
+        self.interrupts = Some(pic.clone());
+        Ok(())
     }
 
     /// Mount the legacy dual-8259 [`SharedPic`] front-end on the PIO bus: the
@@ -2038,6 +2084,61 @@ mod tests {
         // The line drove IRQ4 through the I/O APIC RTE into LAPIC 0's IRR.
         assert!(pic.with(|c| c.has_pending(0)));
         assert_eq!(pic.with(|c| c.pending_vector(0)), Some(0x24));
+    }
+
+    #[test]
+    fn standard_pc_lapic_aperture_eoi_follows_the_active_vcpu() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::interrupt::SharedInterruptController;
+        use std::sync::{Arc, Mutex};
+
+        // Two vCPUs sharing one bus; enable both LAPICs (SVR bit 8). LAPIC_EOI is
+        // at offset 0x0B0; LAPIC_SVR at 0x0F0 — neither is re-exported, so the
+        // literals are used here as the routing tests do.
+        const LAPIC_EOI_OFFSET: u64 = 0x0B0;
+        let pic = SharedInterruptController::new(2);
+        pic.with(|c| {
+            c.lapics[0].write_register(0x0F0, 0x1FF);
+            c.lapics[1].write_register(0x0F0, 0x1FF);
+            // A held level line (IRQ5 -> GSI5) routed to LAPIC 1.
+            let rte = c.ioapic.get_rte_mut(5);
+            rte.set_vector(0x55);
+            rte.set_destination(1);
+            rte.set_masked(false);
+            rte.level_triggered = true;
+        });
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let (mut bus, _pcie) = DeviceBus::standard_pc_with_interrupts(
+            SerialOutput::new("guest", SerialOutputMode::Shared(Arc::clone(&sink))),
+            &pic,
+        )
+        .unwrap();
+
+        // standard_pc_with_interrupts mounts the shared LAPIC aperture.
+        assert!(bus.mmio.is_mapped(0xFEE0_0000));
+
+        // The device asserts the level line; vCPU 1 services it.
+        pic.line(5)(true);
+        assert_eq!(pic.with(|c| c.pending_vector(1)), Some(0x55));
+        pic.with(|c| c.lapics[1].start_servicing(0x55));
+        assert!(!pic.with(|c| c.has_pending(1)));
+
+        // With vCPU 0 selected, the shared aperture's EOI targets vCPU 0 — which
+        // has nothing in service — so vCPU 1's held line is not retriggered.
+        bus.set_active_vcpu(0);
+        VmExitHandler::mmio_write(&mut bus, 0xFEE0_0000 + LAPIC_EOI_OFFSET, &0u32.to_le_bytes());
+        assert!(
+            !pic.with(|c| c.has_pending(1)),
+            "an EOI attributed to vCPU 0 must not service vCPU 1's line"
+        );
+
+        // Select vCPU 1 (as the run loop does before entering it); the same
+        // aperture EOI now runs vCPU 1's path and the still-asserted level line
+        // is re-delivered.
+        bus.set_active_vcpu(1);
+        VmExitHandler::mmio_write(&mut bus, 0xFEE0_0000 + LAPIC_EOI_OFFSET, &0u32.to_le_bytes());
+        assert_eq!(pic.with(|c| c.pending_vector(1)), Some(0x55));
     }
 
     #[test]
