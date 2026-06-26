@@ -9,7 +9,8 @@ the recommended next step so the next run (which has no memory) can resume.
 ## 2026-06-26 — Session: make the interrupt/timer apertures guest-reachable + a protected-mode boot harness + enable the vTPM (Phases 3 & 5)
 
 **14 tested increments + 1 `cargo fmt` commit, each independently green and
-committed** (branch `routine/enlil-2026-06-26`, PR <!--PR_URL-->). Wall-clock
+committed** (branch `routine/enlil-2026-06-26`, PR
+https://github.com/physics515/enlil/pull/40). Wall-clock
 ~00:39→~01:34 CDT (~55 min; the builds were warm/fast on this workstation and
 the WSL test/clippy + Windows-native build overlapped in the background for every
 increment). Two coherent threads. **(A)** Take the interrupt subsystem from
