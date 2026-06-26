@@ -544,6 +544,79 @@ impl Default for VirtualTpm {
     }
 }
 
+/// A thread-safe, shareable handle to one [`VirtualTpm`].
+///
+/// A guest accesses its TPM from whichever vCPU thread traps the CRB MMIO page,
+/// and the host may want to seed or inspect it, so the device is guarded by a
+/// `Mutex` (matching the shape of [`SharedInterruptController`] and the other
+/// shared device handles). Cloning shares the same TPM.
+///
+/// [`SharedInterruptController`]: crate::interrupt::SharedInterruptController
+#[derive(Clone)]
+pub struct SharedTpm(std::sync::Arc<std::sync::Mutex<VirtualTpm>>);
+
+impl SharedTpm {
+    /// Wrap a fresh TPM with the given interface (use [`TpmInterface::Crb`] for
+    /// a Windows 11 guest).
+    #[must_use]
+    pub fn new(interface: TpmInterface) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(VirtualTpm::new(
+            interface,
+        ))))
+    }
+
+    /// Run `f` with exclusive access to the TPM — to drive a command, read a
+    /// PCR, or inspect state.
+    ///
+    /// # Panics
+    /// Panics if the TPM mutex has been poisoned by a prior panic while the
+    /// lock was held.
+    pub fn with<R>(&self, f: impl FnOnce(&mut VirtualTpm) -> R) -> R {
+        f(&mut self.0.lock().expect("tpm mutex poisoned"))
+    }
+}
+
+impl Default for SharedTpm {
+    fn default() -> Self {
+        Self::new(TpmInterface::Crb)
+    }
+}
+
+/// The TPM CRB MMIO aperture as a bus [`MmioDevice`](crate::bus::MmioDevice).
+///
+/// Mounted at [`TPM_MMIO_BASE`] (`0xFED4_0000`), it forwards the CRB
+/// register/buffer window into the shared [`VirtualTpm`]. This is the front-end
+/// that makes the TPM reachable by a guest at all — without it the CRB page
+/// reads back open-bus and Windows 11's TPM 2.0 presence check fails, so the
+/// installer refuses to proceed. The bus passes offsets relative to the device
+/// base, which is exactly what [`VirtualTpm::read_register`] /
+/// [`VirtualTpm::write_register`] expect (offsets from `TPM_MMIO_BASE`).
+pub struct TpmMmio {
+    tpm: SharedTpm,
+}
+
+impl TpmMmio {
+    /// Mount the CRB aperture over `tpm`.
+    #[must_use]
+    pub const fn new(tpm: SharedTpm) -> Self {
+        Self { tpm }
+    }
+}
+
+impl crate::bus::MmioDevice for TpmMmio {
+    fn mmio_read(&mut self, offset: u64, size: u8) -> u64 {
+        self.tpm.with(|t| t.read_register(offset, size))
+    }
+
+    fn mmio_write(&mut self, offset: u64, size: u8, data: u64) {
+        self.tpm.with(|t| t.write_register(offset, data, size));
+    }
+
+    fn mmio_range(&self) -> (u64, u64) {
+        (TPM_MMIO_BASE, TPM_MMIO_BASE + TPM_MMIO_SIZE)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,6 +645,53 @@ mod tests {
         // Check response is success
         let rc = u32::from_be_bytes(tpm.rsp_buffer[6..10].try_into().unwrap());
         assert_eq!(rc, 0);
+    }
+
+    #[test]
+    fn tpm_mmio_aperture_covers_the_crb_window() {
+        use crate::bus::MmioDevice;
+        let mmio = TpmMmio::new(SharedTpm::new(TpmInterface::Crb));
+        assert_eq!(mmio.mmio_range(), (0xFED4_0000, 0xFED4_5000));
+    }
+
+    #[test]
+    fn tpm_mmio_round_trips_a_startup_command() {
+        use crate::bus::MmioDevice;
+        use crb_regs::{CTRL_START, DATA_BUFFER};
+
+        let tpm = SharedTpm::new(TpmInterface::Crb);
+        let mut mmio = TpmMmio::new(tpm.clone());
+
+        // A guest writes the TPM2_Startup command into the CRB data buffer one
+        // byte at a time, then sets CTRL_START to execute it — the path Windows
+        // and the Linux tpm_crb driver take.
+        let cmd: [u8; 12] = [
+            0x80, 0x01, // TPM_ST_NO_SESSIONS
+            0x00, 0x00, 0x00, 0x0C, // size = 12
+            0x00, 0x00, 0x01, 0x44, // TPM_CC_Startup
+            0x00, 0x00, // startup type: Clear
+        ];
+        for (&b, off) in cmd.iter().zip(DATA_BUFFER..) {
+            mmio.mmio_write(off, 1, u64::from(b));
+        }
+        assert!(
+            !tpm.with(|t| t.started),
+            "the TPM must not start until CTRL_START executes the command"
+        );
+
+        mmio.mmio_write(CTRL_START, 4, 1);
+
+        // The command executed through the aperture: the TPM is started and the
+        // response code in the buffer is TPM_RC_SUCCESS (0).
+        assert!(
+            tpm.with(|t| t.started),
+            "CTRL_START through the aperture must execute the queued command"
+        );
+        assert_eq!(
+            mmio.mmio_read(DATA_BUFFER + 6, 4),
+            0,
+            "TPM2_Startup must return success through the aperture"
+        );
     }
 
     #[test]
