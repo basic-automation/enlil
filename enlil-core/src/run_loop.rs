@@ -590,6 +590,95 @@ mod tests {
         );
     }
 
+    // End-to-end on /dev/kvm: a guest programs its LAPIC timer through the
+    // aperture, then the platform clock advance fires it. A protected-mode guest
+    // software-enables its APIC and writes the LVT timer / divide / initial-count
+    // registers over the LAPIC MMIO page — real MMIO exits routed through the
+    // shared bus to the active vCPU's SharedLapicMmio. After it HLTs, advancing
+    // the platform clocks (pc_mut().advance_clocks, the surface a driver uses)
+    // expires the count and self-injects the LVT vector into LAPIC 0's IRR.
+    #[test]
+    fn run_loop_guest_programs_and_fires_its_lapic_timer_through_the_aperture() {
+        if !is_kvm_available() {
+            eprintln!("skipping run_loop_guest_programs_..._lapic_timer: no /dev/kvm");
+            return;
+        }
+
+        // Protected-mode blob (mov eax,imm ; mov [moffs32],eax), four LAPIC regs:
+        //   SVR(0x0F0)=0x1FF software-enable; LVT timer(0x320)=0x40 one-shot,
+        //   unmasked; divide(0x3E0)=0x0B divide-by-1; init(0x380)=1000 ; hlt.
+        #[rustfmt::skip]
+        let code: [u8; 41] = [
+            0xB8, 0xFF, 0x01, 0x00, 0x00, // mov eax, 0x1FF
+            0xA3, 0xF0, 0x00, 0xE0, 0xFE, // mov [0xFEE000F0], eax  (SVR)
+            0xB8, 0x40, 0x00, 0x00, 0x00, // mov eax, 0x40
+            0xA3, 0x20, 0x03, 0xE0, 0xFE, // mov [0xFEE00320], eax  (LVT timer)
+            0xB8, 0x0B, 0x00, 0x00, 0x00, // mov eax, 0x0B
+            0xA3, 0xE0, 0x03, 0xE0, 0xFE, // mov [0xFEE003E0], eax  (divide)
+            0xB8, 0xE8, 0x03, 0x00, 0x00, // mov eax, 1000
+            0xA3, 0x80, 0x03, 0xE0, 0xFE, // mov [0xFEE00380], eax  (initial count)
+            0xF4,                         // hlt
+        ];
+        const ENTRY: u64 = 0x1000;
+
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            0,
+            1,
+        )
+        .expect("build standard pc");
+        let ioapic = pc.ioapic.clone();
+
+        let backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        let mut run = match StealthRunLoop::install(backend, pc, LbrPlatform::AmdSvm) {
+            Ok(run) => run,
+            Err(e) => {
+                eprintln!("skipping run_loop_guest_programs_..._lapic_timer: {e}");
+                return;
+            }
+        };
+
+        let mut ram = GuestRam::new(0x1000);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+        // SAFETY: `ram` outlives `run` within this test scope.
+        unsafe {
+            run.backend_mut()
+                .map_memory(ENTRY, host_addr, ram.len() as u64)
+        }
+        .expect("map guest memory");
+        run.create_vcpu(0).expect("create vcpu");
+        run.apply_cpuid_stealth().expect("clear hypervisor bit");
+        run.backend_mut()
+            .prepare_protected_mode_vcpu(0, ENTRY)
+            .expect("set protected-mode entry");
+
+        let mut halted = false;
+        for _ in 0..100 {
+            let step = run.run_vcpu_once(0).expect("run vcpu once");
+            if step.exit == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT through the run loop");
+
+        // The guest only programmed the timer; no platform time has passed yet.
+        assert!(
+            !ioapic.with(|c| c.has_pending(0)),
+            "the LAPIC timer must not have fired before any clock advance"
+        );
+
+        // Advance the platform clocks past the 1000-clock count (1 GHz bus →
+        // 1000 ns). The expired count self-injects the LVT vector.
+        let _ = run.pc_mut().advance_clocks(1000);
+        assert_eq!(
+            ioapic.with(|c| c.pending_vector(0)),
+            Some(0x40),
+            "the guest-programmed LAPIC timer must fire its LVT vector into the IRR"
+        );
+    }
+
     // Per-vCPU stealth state, proven live through the SMP run loop: install two
     // independent routers, seed each vCPU's APERF to a *different* value, and
     // run the same `rdmsr APERF; out 0x3F8; hlt` blob on each vCPU. vCPU 0 must
