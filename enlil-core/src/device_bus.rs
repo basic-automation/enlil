@@ -34,6 +34,7 @@ use enlil_devices::timer::{
     AcpiPmTimer, Pit, RtcTime, SharedAcpiPmTimer, SharedHpet, SharedPit, SharedRtc,
     SystemControlPortB, HPET_TICK_NS, RTC_IRQ,
 };
+use enlil_devices::tpm::{SharedTpm, TpmMmio};
 use enlil_devices::usb::xhci::transfer::DmaMemory;
 use enlil_devices::usb::{SharedXhci, UsbSpeed, VirtualXhciController, XhciMmio};
 use std::cell::RefCell;
@@ -450,6 +451,20 @@ impl DeviceBus {
         self.add_mmio(Box::new(SharedLapicMmio::new(pic.clone())))?;
         self.interrupts = Some(pic.clone());
         Ok(())
+    }
+
+    /// Mount the TPM 2.0 CRB MMIO aperture ([`TpmMmio`]) at `0xFED4_0000` over
+    /// `tpm`, so a guest can discover and drive the virtual TPM. Windows 11
+    /// refuses to install without a TPM 2.0, and Linux's `tpm_crb` driver binds
+    /// to this same window; without it the CRB page reads back open-bus and the
+    /// guest sees no TPM. The caller owns `tpm` (it clones a handle into the
+    /// aperture) so the host can seed or inspect the device.
+    ///
+    /// # Errors
+    /// Propagates [`enlil_devices::bus::BusError`] if the aperture overlaps an
+    /// already-registered MMIO device.
+    pub fn add_tpm(&mut self, tpm: &SharedTpm) -> Result<(), enlil_devices::bus::BusError> {
+        self.add_mmio(Box::new(TpmMmio::new(tpm.clone())))
     }
 
     /// Mount the legacy dual-8259 [`SharedPic`] front-end on the PIO bus: the
@@ -1003,6 +1018,11 @@ impl DeviceBus {
         }
         bus.add_mmio(Box::new(xhci_mmio))?;
 
+        // TPM 2.0 CRB at 0xFED4_0000 — Windows 11 requires it; Linux's tpm_crb
+        // driver binds it too. Shared so the host can seed/inspect the device.
+        let tpm = SharedTpm::new(enlil_devices::tpm::TpmInterface::Crb);
+        bus.add_tpm(&tpm)?;
+
         Ok(StandardPc {
             bus,
             pcie,
@@ -1017,6 +1037,7 @@ impl DeviceBus {
             sysctl_a,
             pci_reset,
             xhci,
+            tpm,
         })
     }
 }
@@ -1092,6 +1113,9 @@ pub struct StandardPc {
     /// [`connect_usb_device`](Self::connect_usb_device), not this handle, so
     /// the port-status interrupt is delivered too.
     pub xhci: SharedXhci,
+    /// The virtual TPM 2.0 (CRB at `0xFED4_0000`) — seed or inspect PCRs / NV
+    /// from here. Mounted so a Windows 11 guest's TPM presence check passes.
+    pub tpm: SharedTpm,
 }
 
 impl StandardPc {
@@ -2491,6 +2515,10 @@ mod tests {
         assert!(
             bus.mmio.is_mapped(0xFED0_0000),
             "HPET register block should be mapped"
+        );
+        assert!(
+            bus.mmio.is_mapped(0xFED4_0000),
+            "TPM 2.0 CRB page should be mapped"
         );
 
         // Bring up LAPIC 0 and program the PC/AT 8259 layout (master base 0x20),
