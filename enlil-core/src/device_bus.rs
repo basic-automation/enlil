@@ -748,6 +748,7 @@ impl DeviceBus {
 
         bus.add_pic(pic)?;
         bus.add_ioapic(ioapic)?;
+        bus.add_lapic_mmio(ioapic)?;
 
         let pcie = bus.add_pcie(PcieRootComplex::new(DEFAULT_ECAM_BASE))?;
         Ok((bus, pcie))
@@ -826,9 +827,13 @@ impl DeviceBus {
         ps2.attach_mouse_irq(Box::new(dual_irq_line(&pic, &ioapic, PS2_MOUSE_IRQ)));
         bus.add_ps2(&ps2)?;
 
-        // Both interrupt-controller front-ends.
+        // Both interrupt-controller front-ends, plus the per-CPU LAPIC aperture
+        // so a guest can EOI / send IPIs / program its LAPIC timer over memory.
+        // The run loop steers the one shared aperture to the running vCPU via
+        // set_active_vcpu before each entry.
         bus.add_pic(&pic)?;
         bus.add_ioapic(&ioapic)?;
+        bus.add_lapic_mmio(&ioapic)?;
 
         // HPET register block (0xFED0_0000) — Windows requires it, Linux uses it
         // as a clocksource. Shared so the run loop can advance the counter.
@@ -2436,6 +2441,10 @@ mod tests {
         assert!(
             bus.mmio.is_mapped(0xFEC0_0000),
             "I/O APIC page should be mapped"
+        );
+        assert!(
+            bus.mmio.is_mapped(0xFEE0_0000),
+            "per-CPU LAPIC page should be mapped"
         );
         assert!(
             bus.mmio.is_mapped(0xFED0_0000),
