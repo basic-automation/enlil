@@ -142,7 +142,7 @@ of tonight's `check_tsc_deadline` / `check_lapic_tsc_deadlines`, alongside item 
 clock source.
 
 ### PR
-<!-- PR_URL -->
+https://github.com/physics515/enlil/pull/41
 
 ---
 
