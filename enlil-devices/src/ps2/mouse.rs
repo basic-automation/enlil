@@ -59,12 +59,20 @@ impl Ps2Mouse {
 
         match data {
             0xFF => {
-                // Reset
+                // Reset: restore the full power-on factory state. The old handler
+                // left `scaling_2to1` (and any in-progress command / queued bytes)
+                // untouched, yet set-defaults (0xF6) clears scaling — so a guest
+                // that set 2:1 scaling, reset, then read status (0xE9) saw the
+                // stale 2:1 bit, an observable divergence. Reset is a superset of
+                // set-defaults, so clear scaling too and flush the buffer.
                 self.mouse_id = 0;
                 self.sample_rate = 100;
                 self.resolution = 2;
+                self.scaling_2to1 = false;
                 self.reporting_enabled = false;
                 self.intellimouse_seq = 0;
+                self.expecting_data = None;
+                self.output_queue.clear();
                 // Queue: ACK + BAT completion + mouse ID
                 self.output_queue.push_back(0xAA); // BAT OK
                 self.output_queue.push_back(self.mouse_id);
@@ -256,6 +264,29 @@ mod tests {
         assert_eq!(ack, Some(0xFA));
         assert_eq!(mouse.dequeue_byte(), Some(0xAA)); // BAT OK
         assert_eq!(mouse.dequeue_byte(), Some(0x00)); // Mouse ID
+    }
+
+    #[test]
+    fn reset_clears_scaling_to_factory_default() {
+        let mut mouse = Ps2Mouse::new();
+        // Enable 2:1 scaling (0xE7) and confirm the status request reflects it.
+        assert_eq!(mouse.receive_command(0xE7), Some(0xFA));
+        assert!(mouse.scaling_2to1);
+        assert_eq!(mouse.receive_command(0xE9), Some(0xFA)); // status request
+        let status = mouse.dequeue_byte().unwrap();
+        assert_eq!(status & 0x10, 0x10, "2:1 scaling bit set before reset");
+
+        // Reset restores factory defaults, including scaling 1:1, and flushes
+        // the buffer so 0xAA (BAT OK) is the next byte read.
+        assert_eq!(mouse.receive_command(0xFF), Some(0xFA));
+        assert!(!mouse.scaling_2to1, "reset must clear 2:1 scaling");
+        assert_eq!(mouse.dequeue_byte(), Some(0xAA));
+        assert_eq!(mouse.dequeue_byte(), Some(0x00)); // mouse ID
+
+        // The status request now reports 1:1 scaling.
+        assert_eq!(mouse.receive_command(0xE9), Some(0xFA));
+        let status = mouse.dequeue_byte().unwrap();
+        assert_eq!(status & 0x10, 0, "1:1 scaling after reset");
     }
 
     #[test]
