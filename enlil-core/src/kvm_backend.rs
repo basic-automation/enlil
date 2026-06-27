@@ -808,6 +808,13 @@ mod linux {
             // (leaf 0xA reserved-zero there), effective for an Intel-presented one.
             Self::upsert_pmu_leaf(&mut entries, table);
 
+            // Fold in the Intel TSC/processor-frequency leaves (0x15/0x16) in the
+            // same rebuild, pinned to the measured effective guest TSC rate when
+            // KVM can report it, so an Intel-presented guest reads a
+            // self-consistent frequency instead of an in-range zero / a stale
+            // host-passthrough rate. No-op for an AMD-vendor table.
+            Self::upsert_frequency_leaves(&mut entries, table, self.tsc_khz().ok());
+
             // Per-vCPU APIC identity. Several CPUID fields are the *current*
             // logical CPU's ID — distinct per vCPU on real hardware — yet KVM
             // only fills them per vCPU when an in-kernel LAPIC exists; without
@@ -966,6 +973,78 @@ mod linux {
                     edx: r.edx,
                     padding: [0; 3],
                 });
+            }
+        }
+
+        /// Upsert the Intel TSC/processor-frequency leaves (`0x15`, `0x16`) into
+        /// `entries` from the stealth `table`.
+        ///
+        /// [`apply_topology_stealth`](Self::apply_topology_stealth) rebuilds CPUID
+        /// from KVM's supported set, which on a non-Intel host omits these leaves
+        /// entirely (and even on an Intel host passes through the *host's* base
+        /// frequency rather than the rate the guest's TSC actually runs at).
+        /// Without this an Intel-presented guest reads leaf `0x15` as "no TSC rate
+        /// enumerated" and falls back to noisy PIT/HPET calibration whose result
+        /// then has to agree with our virtual timers — a calibration tell.
+        ///
+        /// When `measured_tsc_khz` is `Some` (from `KVM_GET_TSC_KHZ`) the
+        /// enumerated base frequency is pinned to the *effective guest* TSC rate so
+        /// the frequency a guest derives from leaf `0x15` (`crystal × EBX/EAX`)
+        /// equals the rate its RDTSC observes. enlil offsets the guest TSC (its
+        /// start value) but does not scale its rate, so this measured kHz is stable
+        /// across the run; the table keeps a 24 MHz crystal in ECX and `EAX = 24`
+        /// so `EBX = base_mhz` makes the derived TSC exactly `base_mhz × 1e6`.
+        ///
+        /// No-op for an AMD-vendor table: AMD does not define `0x15`/`0x16`, so the
+        /// table leaves them out-of-range reserved-zero (leaf `0x16` EAX `== 0`),
+        /// matching bare metal — synthesising them would itself be an Intel tell on
+        /// an AMD guest. Like the other CPUID upserts, single-subleaf (index 0).
+        /// `pub(crate)` so it is unit-testable with a synthetic entry set, like
+        /// [`stamp_apic_identity`](Self::stamp_apic_identity).
+        pub(crate) fn upsert_frequency_leaves(
+            entries: &mut Vec<kvm_bindings::kvm_cpuid_entry2>,
+            table: &enlil_devices::stealth::cpuid::CpuidStealthTable,
+            measured_tsc_khz: Option<u32>,
+        ) {
+            let mut r15 = table.lookup(0x15, 0);
+            let mut r16 = table.lookup(0x16, 0);
+            // AMD-vendor table: 0x15/0x16 are reserved-zero / out of range. Leave
+            // them so an AMD guest stays consistent with bare metal.
+            if r16.eax == 0 {
+                return;
+            }
+            if let Some(khz) = measured_tsc_khz {
+                let base_mhz = (khz + 500) / 1000; // kHz → MHz, round to nearest
+                if base_mhz != 0 {
+                    // Keep the table's 24 MHz crystal (ECX) and EAX denominator so
+                    // TSC = crystal × EBX/EAX = base_mhz × 1e6 with EBX = base_mhz.
+                    r15.ebx = base_mhz;
+                    r16.eax = base_mhz;
+                    // Max-turbo (leaf 0x16 EBX) must never read below base.
+                    if r16.ebx < base_mhz {
+                        r16.ebx = base_mhz;
+                    }
+                }
+            }
+            for (function, r) in [(0x15u32, r15), (0x16u32, r16)] {
+                if let Some(entry) = entries.iter_mut().find(|e| e.function == function) {
+                    entry.index = 0;
+                    entry.eax = r.eax;
+                    entry.ebx = r.ebx;
+                    entry.ecx = r.ecx;
+                    entry.edx = r.edx;
+                } else {
+                    entries.push(kvm_bindings::kvm_cpuid_entry2 {
+                        function,
+                        index: 0,
+                        flags: 0,
+                        eax: r.eax,
+                        ebx: r.ebx,
+                        ecx: r.ecx,
+                        edx: r.edx,
+                        padding: [0; 3],
+                    });
+                }
             }
         }
 
@@ -1425,6 +1504,106 @@ mod tests {
         assert_eq!(entries[3].ebx & 0xFF00, 0x0100);
         // Unrelated leaf is left exactly as-is.
         assert_eq!(entries[4].eax, 0x3030);
+    }
+
+    // upsert_frequency_leaves folds the Intel TSC/processor-frequency leaves
+    // (0x15/0x16) into a CPUID entry set, pinning the rate to the measured
+    // effective guest TSC kHz, and is a no-op for an AMD-vendor table. Pure over
+    // `entries`, so it is unit-testable without /dev/kvm.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn upsert_frequency_leaves_pins_intel_tsc_rate_and_skips_amd() {
+        use enlil_devices::stealth::cpuid::{CpuVendor, CpuidStealthConfig, CpuidStealthTable};
+        use kvm_bindings::kvm_cpuid_entry2;
+
+        // Intel-vendor table populates leaf 0x16 (EAX != 0).
+        let mut intel_cfg = CpuidStealthConfig::from_host(1, 1);
+        intel_cfg.vendor = CpuVendor::Intel;
+        let intel = CpuidStealthTable::build(&intel_cfg);
+        assert_ne!(
+            intel.lookup(0x16, 0).eax,
+            0,
+            "Intel table must enumerate 0x16"
+        );
+
+        // Start from a set lacking 0x15/0x16 but with an unrelated leaf that must
+        // survive untouched.
+        let mut entries = vec![kvm_cpuid_entry2 {
+            function: 1,
+            eax: 0xDEAD,
+            ..Default::default()
+        }];
+
+        // Pin to a measured 3_000_001 kHz -> 3000 MHz (round to nearest).
+        KvmBackend::upsert_frequency_leaves(&mut entries, &intel, Some(3_000_001));
+
+        let l15 = entries
+            .iter()
+            .find(|e| e.function == 0x15)
+            .expect("0x15 inserted");
+        let l16 = entries
+            .iter()
+            .find(|e| e.function == 0x16)
+            .expect("0x16 inserted");
+        // leaf 0x15: TSC = crystal(ECX) * EBX / EAX must equal 3000 MHz exactly.
+        assert_eq!(l15.eax, 24, "EAX denominator = table's 24");
+        assert_eq!(l15.ebx, 3000, "EBX = base MHz pinned to measured rate");
+        assert_eq!(l15.ecx, 24_000_000, "ECX = 24 MHz crystal");
+        assert_eq!(
+            u64::from(l15.ecx) * u64::from(l15.ebx) / u64::from(l15.eax),
+            3_000_000_000,
+            "derived TSC rate must equal 3000 MHz"
+        );
+        // leaf 0x16: EAX = base MHz; EBX (max turbo) must never read below base.
+        assert_eq!(l16.eax, 3000, "0x16 EAX = base MHz");
+        assert!(l16.ebx >= 3000, "max turbo must not be below base");
+        assert_eq!(l16.index, 0, "single-subleaf leaf");
+        // Unrelated leaf is untouched.
+        assert_eq!(
+            entries.iter().find(|e| e.function == 1).unwrap().eax,
+            0xDEAD
+        );
+
+        // Without a measured rate, the table's static base (non-zero) is used.
+        let mut entries2 = Vec::new();
+        KvmBackend::upsert_frequency_leaves(&mut entries2, &intel, None);
+        let l16b = entries2.iter().find(|e| e.function == 0x16).unwrap();
+        assert_eq!(
+            l16b.eax,
+            intel.lookup(0x16, 0).eax,
+            "no measured rate -> table's static base frequency"
+        );
+
+        // An existing 0x15 entry is overwritten in place (upsert, not duplicate).
+        let mut entries3 = vec![kvm_cpuid_entry2 {
+            function: 0x15,
+            ebx: 9999,
+            ..Default::default()
+        }];
+        KvmBackend::upsert_frequency_leaves(&mut entries3, &intel, Some(2_500_000));
+        assert_eq!(
+            entries3.iter().filter(|e| e.function == 0x15).count(),
+            1,
+            "no duplicate 0x15 entry"
+        );
+        assert_eq!(
+            entries3.iter().find(|e| e.function == 0x15).unwrap().ebx,
+            2500
+        );
+
+        // AMD-vendor table: 0x15/0x16 stay out of range, so this is a no-op.
+        let amd_cfg = CpuidStealthConfig::from_host(1, 1);
+        let amd = {
+            let mut c = amd_cfg;
+            c.vendor = CpuVendor::Amd;
+            CpuidStealthTable::build(&c)
+        };
+        let mut amd_entries: Vec<kvm_cpuid_entry2> = Vec::new();
+        KvmBackend::upsert_frequency_leaves(&mut amd_entries, &amd, Some(3_000_000));
+        assert!(
+            amd_entries.is_empty(),
+            "AMD table must not synthesise 0x15/0x16"
+        );
     }
 
     #[test]
