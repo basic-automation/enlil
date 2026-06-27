@@ -1447,6 +1447,33 @@ impl StandardPc {
 
         fired
     }
+
+    /// Fire any armed **LAPIC TSC-deadline** timers whose deadline the guest TSC
+    /// `current_tsc` has reached, across every software-enabled vCPU LAPIC.
+    ///
+    /// This is the companion to [`advance_clocks`](Self::advance_clocks) for the
+    /// one LAPIC timer mode that is *not* bus-clock-driven: a TSC-deadline timer
+    /// is armed by a guest write to `IA32_TSC_DEADLINE` and fires when the TSC
+    /// reaches that absolute value, so it must be checked against the guest TSC
+    /// rather than an ns delta. Each LAPIC that fires self-injects its LVT timer
+    /// vector into its own IRR (handled in [`LocalApic::check_tsc_deadline`]) and
+    /// auto-disarms; the indices of the LAPICs that fired are returned for
+    /// observability. A software-disabled APIC (SVR bit 8 clear) is skipped,
+    /// exactly like the bus-clock timer path in `advance_clocks`.
+    ///
+    /// [`LocalApic::check_tsc_deadline`]: enlil_devices::interrupt::LocalApic::check_tsc_deadline
+    #[must_use]
+    pub fn check_lapic_tsc_deadlines(&self, current_tsc: u64) -> Vec<usize> {
+        let mut fired = Vec::new();
+        self.ioapic.with(|c| {
+            for (idx, lapic) in c.lapics.iter_mut().enumerate() {
+                if lapic.is_enabled() && lapic.check_tsc_deadline(current_tsc) {
+                    fired.push(idx);
+                }
+            }
+        });
+        fired
+    }
 }
 
 /// Drive a PCI device's level-triggered `INTx` line into the interrupt fabric
@@ -3099,6 +3126,71 @@ mod tests {
         assert!(
             !ioapic.with(|c| c.has_pending(0)),
             "a software-disabled APIC must not deliver a timer interrupt"
+        );
+    }
+
+    #[test]
+    fn check_lapic_tsc_deadlines_fires_only_the_armed_enabled_lapic() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            0,
+            2,
+        )
+        .unwrap();
+        let ioapic = pc.ioapic.clone();
+
+        // LAPIC 0: software-enabled, LVT timer in TSC-deadline mode (bits[18:17]
+        // = 0b10) on vector 0x40 unmasked, deadline armed at TSC 1000. LAPIC 1 is
+        // left untouched (disabled, no deadline) so only LAPIC 0 should fire.
+        ioapic.with(|c| {
+            let l = &mut c.lapics[0];
+            l.write_register(0x0F0, 0x1FF); // SVR: software-enable
+            l.write_register(0x320, 0x40 | (2 << 17)); // LVT timer: TSC-deadline, vector 0x40
+            l.set_tsc_deadline(1000);
+        });
+
+        // Before the deadline: nothing fires, the deadline stays armed.
+        assert!(pc.check_lapic_tsc_deadlines(999).is_empty());
+        assert!(!ioapic.with(|c| c.has_pending(0)));
+
+        // Reaching the deadline fires LAPIC 0 only and self-injects its vector.
+        assert_eq!(pc.check_lapic_tsc_deadlines(1000), vec![0]);
+        assert_eq!(ioapic.with(|c| c.pending_vector(0)), Some(0x40));
+        assert!(
+            !ioapic.with(|c| c.has_pending(1)),
+            "the unarmed LAPIC must not fire"
+        );
+
+        // Auto-disarmed: a later TSC does not re-fire until the guest re-arms.
+        assert!(pc.check_lapic_tsc_deadlines(2_000_000).is_empty());
+    }
+
+    #[test]
+    fn check_lapic_tsc_deadlines_skips_a_software_disabled_lapic() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            0,
+            1,
+        )
+        .unwrap();
+        let ioapic = pc.ioapic.clone();
+
+        // Arm a TSC-deadline timer but leave the APIC software-DISABLED (no SVR
+        // enable): like the bus-clock timer path it must not deliver.
+        ioapic.with(|c| {
+            let l = &mut c.lapics[0];
+            l.write_register(0x320, 0x40 | (2 << 17));
+            l.set_tsc_deadline(500);
+        });
+
+        assert!(pc.check_lapic_tsc_deadlines(1_000_000).is_empty());
+        assert!(
+            !ioapic.with(|c| c.has_pending(0)),
+            "a software-disabled APIC must not deliver a TSC-deadline interrupt"
         );
     }
 

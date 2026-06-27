@@ -1844,6 +1844,18 @@ Physical USB Devices
   **Remaining:** the vendor/brand leaves (0x0, 0x80000002–4) — currently
   vacuous to merge on a host whose KVM-supported brand already matches; only
   needed once Enlil spoofs a *different* CPU identity than the host's.
+- **TSC/processor-frequency leaves `0x15`/`0x16` applied to the live guest
+  (2026-06-27):** `apply_topology_stealth` now folds the Intel frequency leaves
+  into the same `CpuId::from_entries` rebuild (`upsert_frequency_leaves`). KVM's
+  supported set omits them on a non-Intel host (and passes through the *host's*
+  base on Intel rather than the rate the guest TSC actually runs at), so an
+  Intel-presented guest had read leaf `0x15` as an in-range zero — "no TSC rate
+  enumerated" — and fallen back to noisy PIT/HPET calibration. The enumerated
+  base frequency is now pinned to the measured effective guest TSC rate
+  (`KVM_GET_TSC_KHZ`) so leaf-`0x15`-derived TSC (`crystal × EBX/EAX`) equals
+  what RDTSC observes; enlil offsets the TSC start value but does not scale its
+  rate, so the measured kHz is stable. No-op for an AMD-vendor table (`0x15`/
+  `0x16` are out-of-range reserved-zero on AMD).
 
 ### 5.4 Timing Stealth (Expanded — from 2024–2025 anti-cheat research)
 

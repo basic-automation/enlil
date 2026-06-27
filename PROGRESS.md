@@ -6,6 +6,146 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-27 — Session: CPUID frequency-leaf stealth + the LAPIC TSC-deadline timer path + PS/2 reset transparency fixes (Phases 3 & 5)
+
+**8 commits (7 tested code increments + 1 doc), each independently green and
+committed** (branch `routine/enlil-2026-06-27`). Wall-clock ~00:40→~02:35 CDT
+(~1h55m); WSL test/clippy and the Windows-native build overlapped in the
+background for every increment. Two threads. **(A)** Complete two of the four
+items the 2026-06-26 run deferred as "needs an awake session" — the contained
+ones turned out to be cleanly tractable: the **CPUID `0x15`/`0x16` frequency
+leaves** are now applied to the live guest (deferred item 2), and the **LAPIC
+TSC-deadline timer** can now actually fire — its device layer, bus layer, and the
+SDM-mandated register/mode-change corner cases (deferred item 3's safe half).
+**(B)** Two real **PS/2 reset transparency bugs** found via a focused survey: the
+keyboard and mouse `0xFF` reset did not restore full factory defaults.
+
+### Increments (commit — what)
+1. `ab03256` — **CPUID `0x15`/`0x16` frequency leaves threaded through
+   `apply_topology_stealth`** (deferred item 2). KVM's supported set omits them on
+   a non-Intel host (and passes through the *host's* base on Intel rather than the
+   rate the guest TSC runs at), so an Intel-presented guest read leaf `0x15` as an
+   in-range zero → noisy PIT/HPET calibration. New `upsert_frequency_leaves`,
+   folded into the same `CpuId::from_entries` rebuild after the PMU leaf, pins the
+   enumerated base to the measured effective guest TSC rate (`KVM_GET_TSC_KHZ`) so
+   leaf-`0x15`-derived TSC = RDTSC's rate (enlil offsets the TSC start value but
+   does not scale its rate). No-op for an AMD-vendor table. +1 pure unit test.
+   (enlil-core, Linux/KVM impl)
+2. `63d835a` — **`LocalApic::check_tsc_deadline`** (deferred item 3, device layer).
+   The LAPIC stored `tsc_deadline`/`timer_mode` but nothing fired the interrupt
+   when the guest TSC crossed the deadline (`timer_tick` correctly ignores
+   TSC-deadline mode). Fire the LVT vector (unless masked) and auto-disarm
+   (one-shot), mirroring the `timer_tick` path. +3 tests. (enlil-devices)
+3. `e0ea632` — **`DeviceBus::check_lapic_tsc_deadlines`** (item 3, bus layer) —
+   companion to `advance_clocks` for the TSC-driven mode: fires every
+   software-enabled vCPU LAPIC whose armed deadline the guest TSC reached, returns
+   the fired indices. +2 tests. (enlil-core)
+4. `2a0ddd7` — **Disarm a pending TSC deadline on LVT timer-mode change** (SDM
+   §10.5.4.1): a deadline armed before a switch to one-shot/periodic could still
+   fire; clear it only when the mode actually changes. +1 test. (enlil-devices)
+5. `6ea4a78` — **doc:** note the live `0x15`/`0x16` frequency-leaf stealth under
+   ROADMAP Phase 5.3.
+6. `e4eaa19` — **TSC-deadline-mode initial/current-count register semantics** (SDM
+   §10.5.4): in that mode the `TIMER_INIT` write is ignored and `TIMER_CURRENT`
+   reads 0; the model had stored/returned stale values. +1 test. (enlil-devices)
+7. `3be5ed4` — **PS/2 keyboard `0xFF` reset → full factory defaults.** Reset only
+   cleared `scanning_enabled`, leaving the LED state, scancode set and pending-data
+   command stale and the buffer unflushed; a guest that reset then queried its
+   scancode set (`0xF0 0x00`) read the *previous* set, not the default 2. Restore
+   the full power-on state (Set 2, LEDs off, scanning on) + flush so `0xAA` is
+   next; reset ⊇ set-defaults (`0xF6`). +1 test. (enlil-devices)
+8. `a500126` — **PS/2 mouse `0xFF` reset → clears scaling + flushes.** Reset left
+   `scaling_2to1` set while set-defaults clears it, so a status request (`0xE9`)
+   after reset read the stale 2:1 bit. Also clear the in-progress command and flush
+   the buffer. +1 test. (enlil-devices)
+
+### Research (informed the build)
+No new external literature logged — the work was driven by the 2026-06-26 STOP
+REASON's deferred-item list read against the **primary specs already in
+`RESEARCH.md`**: Intel SDM Vol.2A (CPUID leaf `0x15` TSC = crystal × EBX/EAX,
+leaf `0x16` base/max/bus MHz) and Vol.3 §10.5.4/§10.5.4.1 (LAPIC TSC-deadline
+mode: MSR-armed one-shot, mode-change disarm, initial/current-count semantics);
+the 8042/PS-2 keyboard & mouse command sets (`0xFF` reset = BAT + factory
+defaults; `0xF6` set-defaults) and the IA-PC HPET spec (used to *verify* a flagged
+HPET capability-register finding was already implemented — `LEG_RT_CAP` bit 15,
+`COUNT_SIZE_CAP` bit 13, Intel vendor ID all already present; no change). Nothing
+new to add to `RESEARCH.md`.
+
+### Test results (exact)
+- **`/dev/kvm`: read-writable at start, mid-run AND at wrap (`KVM_RW_OK` /
+  `KVM_RW_OK_MIDRUN` / `KVM_RW_OK_AT_WRAP`).** The KVM / guest-boot tests **ran
+  for real, none skipped.** Confirmed passing on real `/dev/kvm` this session:
+  `kvm_create_vm_and_map_memory`, `tsc_khz_reports_a_plausible_host_frequency`,
+  `protected_mode_guest_writes_the_high_lapic_mmio_page`,
+  `run_loop_guest_eoi_retriggers_a_held_level_line_through_the_lapic_aperture`,
+  `run_loop_guest_programs_and_fires_its_lapic_timer_through_the_aperture`,
+  `run_loop_guest_programs_the_ioapic_rte_through_the_aperture`,
+  `run_loop_guest_sends_an_ipi_to_another_vcpu_through_the_aperture`,
+  `run_real_mode_reboots_on_a_cf9_reset`, plus the SMP per-vCPU APERF/PMC suites.
+- **Full workspace CI-parity** (the `.github/workflows/ci.yml` commands):
+  `cargo fmt --all -- --check` → clean; `cargo clippy --all-targets --workspace
+  -- -D warnings` → clean, no warnings; `cargo test --workspace` → exit 0, **0
+  failures**. **enlil-core lib 225 passed** (was 222; +3: `upsert_frequency_leaves`,
+  `check_lapic_tsc_deadlines` ×2), **enlil-devices lib 919 passed** (was 912; +7:
+  `check_tsc_deadline` ×3, mode-change disarm, init/current-count, keyboard reset,
+  mouse reset). 1 ignored (the pre-existing `interrupt::line` doc-test). The
+  `acpi_iasl_validation` / `smbios_dmidecode_validation` reference gates **self-skip
+  — `iasl`/`dmidecode` are NOT installed** on this host (unchanged from prior runs).
+- **Toolchains.** Host-agnostic increments — #2,#3,#4,#6,#7,#8 (the enlil-devices
+  ones and the enlil-core `device_bus` one) — built on **Linux/WSL** (nightly
+  `x86_64-unknown-linux-gnu`) AND **Windows-native** (`x86_64-pc-windows-msvc`,
+  `cargo build -p <crate>` against the WSL manifest with a Windows target-dir, run
+  from PowerShell with `$LASTEXITCODE` checks) — **exit 0** each. #1
+  (`upsert_frequency_leaves`) lives in the Linux/KVM-only `kvm_backend`
+  (`target_os = "linux"`); per the BUILD MATRIX its logic + test built/ran on **WSL
+  only**, and the **Windows-native `enlil-core` build still compiled exit 0**
+  (confirming the new linux-cfg code did not break the non-linux build). #5 is
+  doc-only. No `x86_64-unknown-enlil` / UEFI payload build was required (no `no_std`
+  crate touched).
+
+### STOP REASON
+**Genuine lack of cleanly-tractable, unattended-safe, high-confidence unblocked
+work — not the wall-clock budget (~1h55m of the 3–4 h window).** This session
+cleared the *contained* half of the 2026-06-26 deferred list (frequency leaves +
+the TSC-deadline device/bus layers and register corner-cases) and two real PS/2
+reset bugs, then **surveyed the untouched device subsystems** (PIT, HPET, RTC,
+SMBIOS, ACPI, fw_cfg, chipset PM, i8042) by inspection and a focused agent: no
+remaining high-confidence, self-contained, pure gaps were found (the one flagged
+HPET capability-register issue was **already implemented** — verified, so no
+change). The remaining high-value work is architectural and needs a deliberate
+awake design session; starting any half-done would risk a transparency/correctness
+regression the guardrails forbid:
+  1. **Run-loop platform-clock cadence** (the 2026-06-26 item 1) — `advance_clocks`
+     still has no production caller; drive ns from `guest_ref_cycles ÷ tsc_khz` and
+     **interlock with the timing-stealth TSC offset** so RDTSC and the PIT/HPET/PM/
+     LAPIC timers stay in lockstep. THE next step; needs care.
+  2. **`IA32_TSC_DEADLINE` (MSR `0x6E0`) → LAPIC run-loop wiring** — completes item
+     3: on WRMSR call the active LAPIC's `set_tsc_deadline`, on RDMSR return it, and
+     call `DeviceBus::check_lapic_tsc_deadlines(guest_tsc)` per entry. Depends on
+     #1's guest-TSC source AND needs the `StealthMsrRouter` to reach the interrupt
+     controller (an architectural decision — route via the router or a dedicated
+     run-loop intercept).
+  3. **CPUID leaf-0 max-basic-leaf** on an Intel-presented-on-AMD guest — the
+     `0x16` upsert installs the entry but `apply_topology_stealth` does not raise
+     leaf-0 EAX on an AMD host, so a guest's max-leaf check wouldn't reach `0x16`
+     (the entry is still returned on a direct CPUID; the gap is the advertised max).
+  4. **qcow2 refcount-table growth** (`storage/qcow.rs`) — invasive
+     `QcowHeader` interior-mutability refactor with image-corruption risk; not
+     late-night-safe.
+**Declined low-confidence device tweaks** per the guardrails: the 8254 PIT
+read-flip-flop reset on a counter-latch command (8254 references conflict on
+whether latch resets the lo/hi flip-flop), and the i8042 self-test/SYS-flag
+side-effects (firmware re-writes the command byte anyway). `master` stays
+buildable (green per increment).
+**Next step:** item 2 above — wire `IA32_TSC_DEADLINE` through the run loop on top
+of tonight's `check_tsc_deadline` / `check_lapic_tsc_deadlines`, alongside item 1's
+clock source.
+
+### PR
+https://github.com/physics515/enlil/pull/41
+
+---
+
 ## 2026-06-26 — Session: make the interrupt/timer apertures guest-reachable + a protected-mode boot harness + enable the vTPM (Phases 3 & 5)
 
 **14 tested increments + 1 `cargo fmt` commit, each independently green and
