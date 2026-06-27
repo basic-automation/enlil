@@ -117,8 +117,21 @@ impl Ps2Keyboard {
                 Some(ACK)
             }
             0xFF => {
-                // Reset
-                self.scanning_enabled = false;
+                // Reset: a real keyboard performs its Basic Assurance Test and
+                // returns to the power-on factory state — scan code set 2, LEDs
+                // off, typematic/in-progress command state cleared, output buffer
+                // flushed, scanning enabled — then reports 0xAA (self-test pass).
+                // The old handler only cleared `scanning_enabled` and left the LED
+                // state, scancode set and any pending-data command stale, so a
+                // guest that reset the keyboard and then queried its scancode set
+                // (0xF0 0x00) read the *previous* set instead of the default 2 —
+                // an observable divergence from real hardware. Restore the full
+                // default state (matching `new`) so reset ⊇ set-defaults (0xF6).
+                self.scanning_enabled = true;
+                self.scancode_set = 2;
+                self.led_state = 0;
+                self.awaiting_data_for = None;
+                self.output_queue.clear();
                 self.output_queue.push_back(SELF_TEST_PASSED);
                 Some(ACK)
             }
@@ -185,6 +198,35 @@ mod tests {
         let ack = kb.receive_command(0xFF);
         assert_eq!(ack, Some(ACK));
         assert_eq!(kb.dequeue_scancode(), Some(SELF_TEST_PASSED));
+    }
+
+    #[test]
+    fn reset_restores_factory_defaults() {
+        let mut kb = Ps2Keyboard::new();
+        // Drive the state away from the power-on defaults.
+        assert_eq!(kb.receive_command(0xED), Some(ACK)); // set LEDs...
+        assert_eq!(kb.receive_command(0x07), Some(ACK)); // ...all on
+        assert_eq!(kb.receive_command(0xF0), Some(ACK)); // set scancode set...
+        assert_eq!(kb.receive_command(0x01), Some(ACK)); // ...to set 1
+        kb.receive_command(0xF5); // disable scanning
+        assert_eq!(kb.led_state, 0x07);
+        assert_eq!(kb.scancode_set, 1);
+        assert!(!kb.scanning_enabled);
+
+        // Reset returns ACK then the BAT self-test pass, with the buffer flushed
+        // so 0xAA is the very next byte the guest reads.
+        assert_eq!(kb.receive_command(0xFF), Some(ACK));
+        assert_eq!(kb.dequeue_scancode(), Some(SELF_TEST_PASSED));
+
+        // Factory defaults restored.
+        assert_eq!(kb.led_state, 0, "reset clears the LEDs");
+        assert_eq!(kb.scancode_set, 2, "reset restores scancode set 2");
+        assert!(kb.scanning_enabled, "reset re-enables scanning");
+
+        // Querying the scancode set now returns the default 2, not the stale 1.
+        assert_eq!(kb.receive_command(0xF0), Some(ACK));
+        assert_eq!(kb.receive_command(0x00), Some(ACK));
+        assert_eq!(kb.dequeue_scancode(), Some(2));
     }
 
     #[test]
