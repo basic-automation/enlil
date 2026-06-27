@@ -262,7 +262,15 @@ impl LocalApic {
             LAPIC_LVT_LINT1 => self.lvt_lint1,
             LAPIC_LVT_ERROR => self.lvt_error,
             LAPIC_TIMER_INIT => self.timer_initial,
-            LAPIC_TIMER_CURRENT => self.timer_current,
+            // Intel SDM Vol.3 §10.5.4: in TSC-deadline mode the current-count
+            // register always reads 0 (the count is not used in that mode).
+            LAPIC_TIMER_CURRENT => {
+                if self.timer_mode == TimerMode::TscDeadline {
+                    0
+                } else {
+                    self.timer_current
+                }
+            }
             LAPIC_TIMER_DIVIDE => self.timer_divide,
             _ => 0,
         }
@@ -317,9 +325,14 @@ impl LocalApic {
                 _ => unreachable!(),
             },
             LAPIC_TIMER_INIT => {
-                self.timer_initial = value;
-                self.timer_current = value;
-                self.timer_divide_residual = 0;
+                // Intel SDM Vol.3 §10.5.4: in TSC-deadline mode writes to the
+                // initial-count register are ignored (the timer is armed via the
+                // IA32_TSC_DEADLINE MSR instead).
+                if self.timer_mode != TimerMode::TscDeadline {
+                    self.timer_initial = value;
+                    self.timer_current = value;
+                    self.timer_divide_residual = 0;
+                }
             }
             LAPIC_TIMER_DIVIDE => {
                 self.timer_divide = value;
@@ -857,6 +870,37 @@ mod tests {
             100,
             "non-deadline mode leaves it untouched"
         );
+    }
+
+    #[test]
+    fn test_tsc_deadline_mode_ignores_the_initial_count_register() {
+        let mut lapic = LocalApic::new(1);
+        lapic.write_register(LAPIC_SVR, 0x1FF);
+
+        // One-shot first: the initial/current count behave normally.
+        lapic.write_register(LAPIC_LVT_TIMER, 0x40); // one-shot
+        lapic.write_register(LAPIC_TIMER_INIT, 500);
+        assert_eq!(lapic.read_register(LAPIC_TIMER_CURRENT), 500);
+
+        // Switch to TSC-deadline mode: current-count reads 0 (SDM §10.5.4)...
+        lapic.write_register(LAPIC_LVT_TIMER, 0x40 | (2 << 17));
+        assert_eq!(
+            lapic.read_register(LAPIC_TIMER_CURRENT),
+            0,
+            "TSC-deadline mode: current count reads 0"
+        );
+        // ...and a write to the initial-count register is ignored.
+        lapic.write_register(LAPIC_TIMER_INIT, 999);
+        assert_eq!(
+            lapic.read_register(LAPIC_TIMER_CURRENT),
+            0,
+            "TSC-deadline mode: initial-count write is ignored"
+        );
+
+        // Returning to one-shot, the count machinery works again.
+        lapic.write_register(LAPIC_LVT_TIMER, 0x40);
+        lapic.write_register(LAPIC_TIMER_INIT, 250);
+        assert_eq!(lapic.read_register(LAPIC_TIMER_CURRENT), 250);
     }
 
     #[test]
