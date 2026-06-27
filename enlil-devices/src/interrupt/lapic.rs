@@ -553,6 +553,47 @@ impl LocalApic {
     pub const fn set_tsc_deadline(&mut self, value: u64) {
         self.tsc_deadline = value;
     }
+
+    /// Advance the **TSC-deadline** timer against the guest's current TSC and
+    /// fire the timer interrupt if the armed deadline has been reached.
+    ///
+    /// TSC-deadline mode (Intel SDM Vol.3 §10.5.4) is *not* driven by the
+    /// bus-clock [`timer_tick`](Self::timer_tick) path — that method returns
+    /// early for it. Instead the guest arms a one-shot interrupt by writing an
+    /// absolute TSC value to the `IA32_TSC_DEADLINE` MSR, and the LAPIC fires
+    /// once when the TSC reaches that value. A non-zero `tsc_deadline` is
+    /// "armed"; writing 0 disarms it. On reaching the deadline the timer
+    /// auto-disarms (resets to 0) — the guest re-arms for the next tick by
+    /// writing the MSR again, exactly like hardware. The disarm happens whether
+    /// or not the LVT is masked (the mask gates *delivery*, not the expiry).
+    ///
+    /// Returns `true` iff the deadline was reached this call (an interrupt was
+    /// injected unless the LVT timer was masked, matching the bus-clock path).
+    /// No-op returning `false` unless the LVT timer is in TSC-deadline mode with
+    /// a non-zero deadline that `current_tsc` has reached.
+    #[must_use]
+    pub fn check_tsc_deadline(&mut self, current_tsc: u64) -> bool {
+        if self.timer_mode != TimerMode::TscDeadline || self.tsc_deadline == 0 {
+            return false;
+        }
+        if current_tsc < self.tsc_deadline {
+            return false;
+        }
+
+        // Deadline reached: auto-disarm (one-shot), then inject unless masked.
+        self.tsc_deadline = 0;
+        let masked = (self.lvt_timer & 0x0001_0000) != 0;
+        if !masked {
+            let vector = (self.lvt_timer & 0xFF) as u8;
+            let _ = self.accept_interrupt(&InterruptEntry {
+                vector,
+                delivery_mode: DeliveryMode::Fixed,
+                trigger_mode: TriggerMode::Edge,
+                level: true,
+            });
+        }
+        true
+    }
 }
 
 #[cfg(test)]
@@ -744,6 +785,70 @@ mod tests {
         assert!(lapic.timer_tick(10)); // Remaining 5 < 10
         assert!(lapic.has_pending_interrupt());
         assert_eq!(lapic.pending_vector(), Some(0x40));
+    }
+
+    #[test]
+    fn test_timer_tsc_deadline_fires_once_and_auto_disarms() {
+        let mut lapic = LocalApic::new(1);
+        lapic.write_register(LAPIC_SVR, 0x1FF);
+        // LVT timer: vector 0x40, TSC-deadline mode (bits[18:17] = 0b10).
+        lapic.write_register(LAPIC_LVT_TIMER, 0x40 | (2 << 17));
+
+        // Disarmed (deadline 0): never fires regardless of the TSC.
+        assert!(!lapic.check_tsc_deadline(1_000_000));
+
+        // Arm the deadline; before it is reached nothing fires and it stays armed.
+        lapic.set_tsc_deadline(1_000);
+        assert!(!lapic.check_tsc_deadline(999));
+        assert!(!lapic.has_pending_interrupt());
+        assert_eq!(lapic.tsc_deadline(), 1_000, "must stay armed before expiry");
+
+        // Reaching the deadline fires exactly once and auto-disarms (one-shot).
+        assert!(lapic.check_tsc_deadline(1_000));
+        assert!(lapic.has_pending_interrupt());
+        assert_eq!(lapic.pending_vector(), Some(0x40));
+        assert_eq!(
+            lapic.tsc_deadline(),
+            0,
+            "deadline must auto-disarm on firing"
+        );
+
+        // A later TSC does not re-fire until the guest re-arms by writing the MSR.
+        assert!(!lapic.check_tsc_deadline(2_000_000));
+    }
+
+    #[test]
+    fn test_timer_tsc_deadline_masked_disarms_without_injecting() {
+        let mut lapic = LocalApic::new(1);
+        lapic.write_register(LAPIC_SVR, 0x1FF);
+        // TSC-deadline mode, masked (LVT bit 16 set): expiry disarms but the
+        // interrupt is not delivered — the mask gates delivery, not the expiry.
+        lapic.write_register(LAPIC_LVT_TIMER, 0x40 | (2 << 17) | 0x1_0000);
+        lapic.set_tsc_deadline(500);
+
+        assert!(
+            lapic.check_tsc_deadline(500),
+            "deadline reached -> reports expiry"
+        );
+        assert!(!lapic.has_pending_interrupt(), "masked LVT injects nothing");
+        assert_eq!(lapic.tsc_deadline(), 0, "still auto-disarms while masked");
+    }
+
+    #[test]
+    fn test_timer_tsc_deadline_ignored_in_oneshot_mode() {
+        let mut lapic = LocalApic::new(1);
+        lapic.write_register(LAPIC_SVR, 0x1FF);
+        // One-shot mode (default): the TSC-deadline path is inert even if a
+        // deadline value happens to be set.
+        lapic.write_register(LAPIC_LVT_TIMER, 0x40); // one-shot
+        lapic.set_tsc_deadline(100);
+        assert!(!lapic.check_tsc_deadline(1_000_000));
+        assert!(!lapic.has_pending_interrupt());
+        assert_eq!(
+            lapic.tsc_deadline(),
+            100,
+            "non-deadline mode leaves it untouched"
+        );
     }
 
     #[test]
