@@ -293,11 +293,19 @@ impl LocalApic {
             }
             LAPIC_LVT_TIMER => {
                 self.lvt_timer = value;
-                self.timer_mode = match (value >> 17) & 0x3 {
+                let new_mode = match (value >> 17) & 0x3 {
                     1 => TimerMode::Periodic,
                     2 => TimerMode::TscDeadline,
                     _ => TimerMode::OneShot,
                 };
+                // Intel SDM Vol.3 §10.5.4.1: changing the timer mode disarms a
+                // pending TSC deadline (the IA32_TSC_DEADLINE MSR resets to 0).
+                // Without this, a stale deadline armed before the switch could
+                // still fire after the guest moved the timer to one-shot/periodic.
+                if new_mode != self.timer_mode {
+                    self.tsc_deadline = 0;
+                }
+                self.timer_mode = new_mode;
             }
             LAPIC_LVT_THERMAL | LAPIC_LVT_PERF | LAPIC_LVT_LINT0 | LAPIC_LVT_LINT1
             | LAPIC_LVT_ERROR => match offset {
@@ -848,6 +856,40 @@ mod tests {
             lapic.tsc_deadline(),
             100,
             "non-deadline mode leaves it untouched"
+        );
+    }
+
+    #[test]
+    fn test_timer_mode_change_disarms_a_pending_tsc_deadline() {
+        let mut lapic = LocalApic::new(1);
+        lapic.write_register(LAPIC_SVR, 0x1FF);
+        // Arm a deadline in TSC-deadline mode.
+        lapic.write_register(LAPIC_LVT_TIMER, 0x40 | (2 << 17));
+        lapic.set_tsc_deadline(1000);
+        assert_eq!(lapic.tsc_deadline(), 1000);
+
+        // Switching the timer to one-shot must disarm the deadline (SDM §10.5.4.1).
+        lapic.write_register(LAPIC_LVT_TIMER, 0x40); // one-shot
+        assert_eq!(
+            lapic.tsc_deadline(),
+            0,
+            "mode change must disarm the deadline"
+        );
+
+        // And a subsequent deadline check must not fire the stale value.
+        lapic.write_register(LAPIC_LVT_TIMER, 0x40 | (2 << 17)); // back to TSC-deadline
+        assert!(
+            !lapic.check_tsc_deadline(1_000_000),
+            "no stale deadline survives the mode round-trip"
+        );
+
+        // A rewrite that keeps the same mode must NOT disarm an armed deadline.
+        lapic.set_tsc_deadline(2000);
+        lapic.write_register(LAPIC_LVT_TIMER, 0x41 | (2 << 17)); // same mode, new vector
+        assert_eq!(
+            lapic.tsc_deadline(),
+            2000,
+            "a same-mode LVT rewrite must leave the deadline armed"
         );
     }
 
