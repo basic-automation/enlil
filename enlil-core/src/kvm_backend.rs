@@ -1136,6 +1136,42 @@ mod linux {
                 .map_err(|e| Error::Vcpu(format!("KVM_GET_TSC_KHZ: {e}")))
         }
 
+        /// The guest's current Time-Stamp Counter (`IA32_TSC`, MSR `0x10`) on
+        /// vCPU `index`, read via `KVM_GET_MSRS`.
+        ///
+        /// This is the guest-visible TSC the LAPIC TSC-deadline timer is armed
+        /// against: a guest arms a one-shot interrupt by writing an *absolute*
+        /// TSC value to `IA32_TSC_DEADLINE`, so to fire it the run loop must
+        /// compare against the guest TSC — not the host TSC or an ns delta. Read
+        /// it after a guest entry and hand it to
+        /// [`StandardPc::check_lapic_tsc_deadlines`](crate::device_bus::StandardPc::check_lapic_tsc_deadlines).
+        ///
+        /// # Errors
+        /// Returns [`Error::Vcpu`] if `index` names no vCPU, `KVM_GET_MSRS`
+        /// fails, or it does not return the single requested entry.
+        pub fn read_guest_tsc(&self, index: usize) -> Result<u64> {
+            use kvm_bindings::{kvm_msr_entry, Msrs};
+            let vcpu = self
+                .vcpus
+                .get(index)
+                .ok_or_else(|| Error::Vcpu(format!("no vcpu at index {index}")))?;
+            // IA32_TSC is MSR 0x10.
+            let mut msrs = Msrs::from_entries(&[kvm_msr_entry {
+                index: 0x10,
+                ..Default::default()
+            }])
+            .map_err(|e| Error::Vcpu(format!("Msrs alloc: {e:?}")))?;
+            let n = vcpu
+                .get_msrs(&mut msrs)
+                .map_err(|e| Error::Vcpu(format!("KVM_GET_MSRS(IA32_TSC): {e}")))?;
+            if n != 1 {
+                return Err(Error::Vcpu(format!(
+                    "KVM_GET_MSRS(IA32_TSC) returned {n} entries, expected 1"
+                )));
+            }
+            Ok(msrs.as_slice()[0].data)
+        }
+
         /// Point vCPU `index` at a flat 16-bit real-mode entry: every segment
         /// gets base 0 (so `rip` is a direct guest-physical offset), `rip` is
         /// set to `entry`, and `rflags` to the reserved-bit-only `0x2`.
@@ -1735,6 +1771,31 @@ mod tests {
         // Any real x86-64 host TSC runs well above 100 MHz; sanity-bound it
         // rather than pin an exact value (it is host-specific).
         assert!(khz > 100_000, "implausible host TSC frequency: {khz} kHz");
+    }
+
+    #[test]
+    fn read_guest_tsc_reports_a_running_counter() {
+        if !is_kvm_available() {
+            eprintln!("skipping: /dev/kvm not available (no nested virt)");
+            return;
+        }
+
+        let mut backend = KvmBackend::new().expect("create KVM VM");
+        // No vCPU yet → there is no guest TSC to read.
+        assert!(
+            backend.read_guest_tsc(0).is_err(),
+            "read_guest_tsc must require a vCPU"
+        );
+
+        backend.create_vcpu(0).expect("create vcpu");
+        let first = backend.read_guest_tsc(0).expect("KVM_GET_MSRS(IA32_TSC)");
+        // The TSC is monotonic and free-running: a second read is never earlier
+        // than the first (wall time only moves forward between the two ioctls).
+        let second = backend.read_guest_tsc(0).expect("KVM_GET_MSRS(IA32_TSC)");
+        assert!(
+            second >= first,
+            "guest TSC went backwards: {first} -> {second}"
+        );
     }
 
     #[test]
