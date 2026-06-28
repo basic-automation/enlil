@@ -6,6 +6,127 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-28 — Session: complete the IA32_TSC_DEADLINE run-loop path end-to-end + the platform-clock cadence + CPUID/LAPIC/HPET capability-consistency fixes (Phases 3 & 5)
+
+**7 tested code increments + 1 docs + 1 `cargo fmt`, each independently green and
+committed** (branch `routine/enlil-2026-06-28`). Wall-clock ~00:40→~01:30 CDT
+(~50 min; builds were warm/fast on this workstation and the WSL test/clippy +
+Windows-native builds overlapped in the background for every increment). This
+session **cleared the entire 2026-06-27 deferred list** (items 1–3: the
+TSC-deadline run-loop wiring, the clock cadence, the CPUID leaf-0 max-basic-leaf)
+and added two new device-model capability-consistency fixes (LAPIC CMCI/version,
+HPET per-timer caps).
+
+### Increments (commit — what)
+1. `4e5ff1b` — **`IA32_TSC_DEADLINE` (MSR `0x6E0`) → active vCPU LAPIC.** Was
+   unhandled (#GP). Added SDM-faithful `LocalApic::{read,write}_tsc_deadline_msr`
+   (read 0 / writes ignored unless the LVT timer is in TSC-deadline mode, SDM
+   §10.5.4.1) and routed `0x6E0` through `DeviceBus::{rdmsr,wrmsr}` to the
+   *active* vCPU LAPIC (follows `set_active_vcpu`). +3 lapic + 1 DeviceBus tests.
+   (enlil-devices + enlil-core)
+2. `2123452` — **`KvmBackend::read_guest_tsc`** — guest `IA32_TSC` (MSR `0x10`)
+   via `KVM_GET_MSRS`; the guest-visible TSC the deadline timer is armed against.
+   +1 real-`/dev/kvm` test (monotonic free-running counter). (enlil-core, linux)
+3. `a9b3d7f` — **Fire TSC-deadline timers from the run loop.** `install()` now
+   forwards `0x6E0` to userspace (a LAPIC reg served by the bus, added alongside
+   `filter_ranges`); new `StealthRunLoop::fire_due_tsc_deadlines(index)` reads the
+   guest TSC and calls `check_lapic_tsc_deadlines`, kept *separate* from
+   `run_vcpu_once`. +1 real-`/dev/kvm` guest-boot test (a protected-mode guest
+   arms the deadline by WRMSR; the run loop fires it, vector lands in the IRR).
+   (enlil-core, linux)
+4. `4425068` — **CPUID leaf-0 max-basic-leaf raised to `0x16`** when the Intel
+   frequency leaves are installed (a guest only queries leaves ≤ leaf-0 EAX; an
+   AMD host's range can end below `0x16`, leaving the installed leaf unreachable);
+   never lowers a higher value. +1 unit test. (enlil-core, linux)
+5. `10e5e54` — **`StealthRunLoop::advance_platform_clocks(guest_ref_cycles)`** —
+   the production caller of `advance_clocks`: converts a guest entry's cycle delta
+   to ns at the cached `tsc_khz` (new pure `cycles_to_ns`) and drives PIT/HPET/PM/
+   bus-clock-LAPIC; lockstep with RDTSC (rate is not scaled). Kept separate from
+   `run_vcpu_once`. +1 pure + 1 real-`/dev/kvm` test (a large cycle delta expires
+   a guest one-shot LAPIC timer). (enlil-core, linux)
+6. `cb7e519` — **LAPIC CMCI LVT (`0x2F0`) + Nehalem version.** The version reg
+   reported Max-LVT-Entry = 5 (no CMCI) under a modern-Intel CPUID; added the CMCI
+   LVT register (SDM §10.5.1) and bumped the version to 6 (7 entries). +2 tests.
+   (enlil-devices)
+7. `65e2da9` — **HPET per-timer `Tn_PER_INT_CAP` + `Tn_SIZE_CAP`.** Each timer
+   implements periodic mode and a 64-bit comparator/counter but advertised neither
+   capability bit (the write path already masked them read-only — they were just
+   never set at construction). +2 tests. (enlil-devices)
+8. `5a406aa` — **docs:** RESEARCH.md dated SDM-findings entry; ROADMAP.md Phase 5.3
+   notes (max-basic-leaf, CMCI LVT, and the cross-vendor-identity gap flagged for
+   an awake-design pass).
+9. `96805b6` — **`cargo fmt`** (wrap long assert lines in the new tests).
+
+### Research (informed the build)
+No new external literature — primary-spec checks logged in RESEARCH.md under
+2026-06-28: Intel SDM Vol.3 §10.5.4.1 (`IA32_TSC_DEADLINE` reads-0/writes-ignored
+outside TSC-deadline mode, arm/disarm, self-clear on fire — verified against the
+[SDM page](https://xem.github.io/minix86/manual/intel-x86-and-64-manual-vol3/o_fe12b1e2a880e0ce-379.html)),
+Vol.2A (CPUID max-basic-leaf gating), and §10.4.8/§10.5.1 (LAPIC version
+Max-LVT-Entry; CMCI LVT at `0x2F0`, Nehalem → 6) plus IA-PC HPET §2.3.8 (`Tn_*`
+capability bits).
+
+### Test results (exact)
+- **`/dev/kvm`: read-writable at start, mid-run, AND at wrap (`KVM_RW_OK` /
+  `KVM_RW_OK_AT_WRAP`).** The KVM / guest-boot tests **ran for real, none
+  skipped.** New real-`/dev/kvm` tests confirmed passing this session:
+  `read_guest_tsc_reports_a_running_counter`,
+  `run_loop_guest_arms_and_fires_a_tsc_deadline_timer_via_the_msr`,
+  `run_loop_advance_platform_clocks_drives_the_lapic_timer_from_cycles`; the
+  existing guest-boot suite (protected-mode LAPIC/IOAPIC/IPI/timer apertures,
+  cf9-reset, SMP APERF/PMC) all still pass under `cargo test --workspace`.
+- **Full workspace CI-parity** (the `.github/workflows/ci.yml` commands):
+  `cargo fmt --all -- --check` → clean; `cargo clippy --all-targets --workspace
+  -- -D warnings` → clean, no warnings; `cargo test --workspace` → **0 failures**.
+  **enlil-core lib 231 passed** (was 225; +6), **enlil-devices lib 926 passed**
+  (was 919; +7). 1 ignored (the pre-existing `interrupt::line` doc-test). The
+  `acpi_iasl` / `smbios_dmidecode` reference gates self-skip (`iasl`/`dmidecode`
+  not installed — unchanged from prior runs).
+- **Toolchains.** Host-agnostic increments — #1 (the enlil-devices LAPIC MSR
+  accessors + the enlil-core DeviceBus routing), #6, #7 — built on **Linux/WSL**
+  (nightly `x86_64-unknown-linux-gnu`) AND **Windows-native**
+  (`x86_64-pc-windows-msvc`, `cargo build -p <crate>` against the WSL manifest
+  with a Windows target-dir) — **exit 0** each. The KVM-only increments #2,#3,#4,#5
+  (`kvm_backend` / `run_loop`, `target_os = "linux"`) built/ran on **WSL** and the
+  **Windows-native `enlil-core` build still compiled exit 0** each time (the new
+  linux-cfg code did not break the non-linux build). No `x86_64-unknown-enlil` /
+  UEFI payload build was required (no `no_std` crate touched).
+
+### STOP REASON
+**Genuine lack of cleanly-tractable, unattended-safe, high-confidence unblocked
+work — not the wall-clock budget (~50 min of the 3–4 h window).** This session
+cleared the *entire* 2026-06-27 deferred list (TSC-deadline run-loop wiring + the
+guest-TSC source + the clock-cadence production caller + the CPUID max-basic-leaf)
+and then **surveyed the device subsystems by inspection** — PM timer, LAPIC,
+I/O APIC, RTC (MC146818), HPET, PIT (8254), PIC (8259), 16550 UART, ICH9 chipset
+PM — finding them mature; the two genuine gaps found (LAPIC CMCI/version, HPET
+capability bits) were fixed. The remaining high-value work is all architectural /
+not unattended-safe per the guardrails:
+  1. **Cross-vendor CPUID identity** — `apply_topology_stealth` installs the
+     table's Intel topology/PMU/frequency leaves but NOT the leaf-0 vendor string,
+     leaf-1 family-model, or brand leaves (`0x8000_0002`–`4`). Vacuous for the
+     current same-vendor (`from_host`) path; presenting a *different* vendor
+     (Intel-on-AMD) needs the full identity **plus a feature-flag mask** done
+     coherently — a half-done version is worse than none. Awake-design.
+  2. **HPET per-timer `Tn_32MODE_CNF` (32-bit mode)** — now that timers advertise
+     `Tn_SIZE_CAP` = 1, a guest *may* set 32-bit mode; honoring it needs 32-bit
+     wrap-edge crossing logic in `tick()` (and the periodic-advance path), subtle
+     enough to risk a wrong-fire — leave for an awake session with exhaustive
+     wrap tests. The common 64-bit path is correct.
+  3. **A "driven" run-loop** that calls `advance_platform_clocks` +
+     `fire_due_tsc_deadlines` per entry automatically — needs the immediate-exit
+     watchdog (for never-halting guests) and guest-side interrupt delivery (IDT)
+     to test meaningfully; both are design work, not a late-night wrapper.
+  4. **qcow2 refcount-table growth** (`storage/qcow.rs`) — invasive
+     interior-mutability refactor with image-corruption risk (already declined by
+     the 2026-06-26 run as not late-night-safe).
+`master` stays buildable (green per increment).
+**Next step:** the cross-vendor CPUID identity pass (item 1) — install the table's
+vendor string / FMS / brand leaves in `apply_topology_stealth` *together with* a
+feature-flag reconciliation, so an Intel-presented-on-AMD guest is fully coherent;
+it is the last piece before Enlil can spoof a CPU identity different from the host.
+
+
 ## 2026-06-27 — Session: CPUID frequency-leaf stealth + the LAPIC TSC-deadline timer path + PS/2 reset transparency fixes (Phases 3 & 5)
 
 **8 commits (7 tested code increments + 1 doc), each independently green and
