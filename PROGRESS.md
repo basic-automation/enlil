@@ -126,6 +126,9 @@ vendor string / FMS / brand leaves in `apply_topology_stealth` *together with* a
 feature-flag reconciliation, so an Intel-presented-on-AMD guest is fully coherent;
 it is the last piece before Enlil can spoof a CPU identity different from the host.
 
+### PR
+https://github.com/physics515/enlil/pull/42
+
 
 ## 2026-06-27 — Session: CPUID frequency-leaf stealth + the LAPIC TSC-deadline timer path + PS/2 reset transparency fixes (Phases 3 & 5)
 
