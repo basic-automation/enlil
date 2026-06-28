@@ -2301,7 +2301,11 @@ mod tests {
         // and a RDMSR reads it back — the value reaches the per-vCPU LAPIC, not
         // a #GP.
         bus.set_active_vcpu(0);
-        assert!(VmExitHandler::wrmsr(&mut bus, IA32_TSC_DEADLINE, 0x1234_5678));
+        assert!(VmExitHandler::wrmsr(
+            &mut bus,
+            IA32_TSC_DEADLINE,
+            0x1234_5678
+        ));
         assert_eq!(
             VmExitHandler::rdmsr(&mut bus, IA32_TSC_DEADLINE),
             Some(0x1234_5678)
@@ -2314,7 +2318,11 @@ mod tests {
         // write is ignored and the read returns 0, even though vCPU 0 still has
         // an armed deadline — the routing follows the active vCPU.
         bus.set_active_vcpu(1);
-        assert!(VmExitHandler::wrmsr(&mut bus, IA32_TSC_DEADLINE, 0xDEAD_BEEF));
+        assert!(VmExitHandler::wrmsr(
+            &mut bus,
+            IA32_TSC_DEADLINE,
+            0xDEAD_BEEF
+        ));
         assert_eq!(VmExitHandler::rdmsr(&mut bus, IA32_TSC_DEADLINE), Some(0));
         assert_eq!(
             pic.with(|c| c.lapics[1].tsc_deadline()),

@@ -877,7 +877,10 @@ mod tests {
         let again = run
             .fire_due_tsc_deadlines(0)
             .expect("read guest tsc + check deadlines");
-        assert!(again.is_empty(), "a fired TSC-deadline timer must not re-fire");
+        assert!(
+            again.is_empty(),
+            "a fired TSC-deadline timer must not re-fire"
+        );
     }
 
     #[test]
@@ -891,7 +894,10 @@ mod tests {
         // A zero rate (unknown) yields zero rather than dividing by zero.
         assert_eq!(cycles_to_ns(10_000, 0), 0);
         // A large cycle count does not overflow (computed in u128).
-        assert_eq!(cycles_to_ns(u64::MAX, 1_000_000), (u128::from(u64::MAX)) as u64);
+        assert_eq!(
+            cycles_to_ns(u64::MAX, 1_000_000),
+            (u128::from(u64::MAX)) as u64
+        );
     }
 
     // End-to-end on /dev/kvm: advance_platform_clocks is the production caller of

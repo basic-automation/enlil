@@ -1029,7 +1029,11 @@ mod tests {
         // A non-zero MSR write arms the timer; reading the MSR back returns it.
         lapic.write_tsc_deadline_msr(5_000);
         assert_eq!(lapic.read_tsc_deadline_msr(), 5_000);
-        assert_eq!(lapic.tsc_deadline(), 5_000, "MSR write reaches the deadline");
+        assert_eq!(
+            lapic.tsc_deadline(),
+            5_000,
+            "MSR write reaches the deadline"
+        );
 
         // Writing 0 disarms (SDM §10.5.4.1).
         lapic.write_tsc_deadline_msr(0);
@@ -1047,7 +1051,11 @@ mod tests {
         // reads zero and writes are ignored").
         lapic.write_register(LAPIC_LVT_TIMER, 0x40); // one-shot
         lapic.write_tsc_deadline_msr(7_777);
-        assert_eq!(lapic.read_tsc_deadline_msr(), 0, "non-deadline mode reads 0");
+        assert_eq!(
+            lapic.read_tsc_deadline_msr(),
+            0,
+            "non-deadline mode reads 0"
+        );
         assert_eq!(
             lapic.tsc_deadline(),
             0,
