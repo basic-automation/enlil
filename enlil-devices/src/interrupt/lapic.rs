@@ -28,6 +28,10 @@ pub const LAPIC_ISR_BASE: u32 = 0x100; // 0x100-0x170 (8 regs)
 pub const LAPIC_TMR_BASE: u32 = 0x180; // 0x180-0x1F0 (8 regs)
 pub const LAPIC_IRR_BASE: u32 = 0x200; // 0x200-0x270 (8 regs)
 pub const LAPIC_ESR: u32 = 0x280;
+/// LVT Corrected Machine-Check Interrupt register (Intel SDM Vol.3 §10.5.1).
+/// Introduced with Nehalem (Xeon 5500); its presence is what makes the
+/// version register's Max-LVT-Entry field read 6 on a modern Intel CPU.
+pub const LAPIC_LVT_CMCI: u32 = 0x2F0;
 pub const LAPIC_ICR_LOW: u32 = 0x300;
 pub const LAPIC_ICR_HIGH: u32 = 0x310;
 pub const LAPIC_LVT_TIMER: u32 = 0x320;
@@ -92,6 +96,11 @@ pub struct LocalApic {
     lvt_lint1: u32,
     /// `LVT` Error.
     lvt_error: u32,
+    /// `LVT` Corrected Machine-Check Interrupt (CMCI), at offset `0x2F0`.
+    /// Present on Nehalem+ Intel; modelled (masked at reset, read/write) so the
+    /// version register can advertise the modern 7-entry LVT the CPUID stealth
+    /// implies, with the register actually addressable.
+    lvt_cmci: u32,
     /// Timer initial count.
     timer_initial: u32,
     /// Timer current count.
@@ -132,6 +141,7 @@ impl LocalApic {
             lvt_lint0: 0x0001_0000,
             lvt_lint1: 0x0001_0000,
             lvt_error: 0x0001_0000,
+            lvt_cmci: 0x0001_0000,
             timer_initial: 0,
             timer_current: 0,
             timer_divide: 0,
@@ -238,8 +248,11 @@ impl LocalApic {
         match offset {
             LAPIC_ID => u32::from(self.id) << 24,
             LAPIC_VERSION => {
-                // Version 0x14 (Pentium 4+), max LVT entry = 5 (6 entries: 0-5)
-                0x14 | (5 << 16)
+                // Version 0x14 (P4+); Max-LVT-Entry = 6 (7 LVT entries 0-6,
+                // including the CMCI LVT at 0x2F0) — the value a Nehalem+ Intel
+                // LAPIC reports, matching the modern-Intel CPUID the stealth
+                // table presents (Intel SDM Vol.3 §10.4.8).
+                0x14 | (6 << 16)
             }
             LAPIC_TPR => self.tpr,
             LAPIC_APR => self.compute_apr(),
@@ -268,6 +281,7 @@ impl LocalApic {
             LAPIC_LVT_LINT0 => self.lvt_lint0,
             LAPIC_LVT_LINT1 => self.lvt_lint1,
             LAPIC_LVT_ERROR => self.lvt_error,
+            LAPIC_LVT_CMCI => self.lvt_cmci,
             LAPIC_TIMER_INIT => self.timer_initial,
             // Intel SDM Vol.3 §10.5.4: in TSC-deadline mode the current-count
             // register always reads 0 (the count is not used in that mode).
@@ -323,12 +337,13 @@ impl LocalApic {
                 self.timer_mode = new_mode;
             }
             LAPIC_LVT_THERMAL | LAPIC_LVT_PERF | LAPIC_LVT_LINT0 | LAPIC_LVT_LINT1
-            | LAPIC_LVT_ERROR => match offset {
+            | LAPIC_LVT_ERROR | LAPIC_LVT_CMCI => match offset {
                 LAPIC_LVT_THERMAL => self.lvt_thermal = value,
                 LAPIC_LVT_PERF => self.lvt_perf = value,
                 LAPIC_LVT_LINT0 => self.lvt_lint0 = value,
                 LAPIC_LVT_LINT1 => self.lvt_lint1 = value,
                 LAPIC_LVT_ERROR => self.lvt_error = value,
+                LAPIC_LVT_CMCI => self.lvt_cmci = value,
                 _ => unreachable!(),
             },
             LAPIC_TIMER_INIT => {
@@ -667,6 +682,32 @@ mod tests {
         let lapic = LocalApic::new(42);
         assert_eq!(lapic.id(), 42);
         assert!(!lapic.is_enabled());
+    }
+
+    #[test]
+    fn test_version_advertises_a_modern_seven_entry_lvt() {
+        let lapic = LocalApic::new(0);
+        let version = lapic.read_register(LAPIC_VERSION);
+        assert_eq!(version & 0xFF, 0x14, "version 0x14 (P4+)");
+        // Max-LVT-Entry (bits 23:16) = 6 -> 7 LVT entries, the Nehalem+ value
+        // matching the modern-Intel CPUID the stealth table presents.
+        assert_eq!((version >> 16) & 0xFF, 6, "Max LVT Entry = 6");
+    }
+
+    #[test]
+    fn test_cmci_lvt_is_addressable_and_resets_masked() {
+        let mut lapic = LocalApic::new(0);
+        // Resets masked (bit 16 set), like every other LVT entry.
+        assert_eq!(
+            lapic.read_register(LAPIC_LVT_CMCI),
+            0x0001_0000,
+            "CMCI LVT resets masked"
+        );
+        // It is a real read/write register at 0x2F0.
+        lapic.write_register(LAPIC_LVT_CMCI, 0xF1); // vector 0xF1, unmasked
+        assert_eq!(lapic.read_register(LAPIC_LVT_CMCI), 0xF1);
+        // Writing it must not disturb the neighbouring timer LVT.
+        assert_eq!(lapic.read_register(LAPIC_LVT_TIMER), 0x0001_0000);
     }
 
     #[test]
