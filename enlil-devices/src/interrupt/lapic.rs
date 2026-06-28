@@ -41,6 +41,13 @@ pub const LAPIC_TIMER_CURRENT: u32 = 0x390;
 pub const LAPIC_TIMER_DIVIDE: u32 = 0x3E0;
 pub const LAPIC_SELF_IPI: u32 = 0x3F0;
 
+/// MSR number of `IA32_TSC_DEADLINE` (Intel SDM Vol.3 §10.5.4.1).
+///
+/// The per-logical-processor register a guest writes to arm the LAPIC
+/// TSC-deadline timer. Served through [`LocalApic::read_tsc_deadline_msr`] /
+/// [`LocalApic::write_tsc_deadline_msr`].
+pub const IA32_TSC_DEADLINE: u32 = 0x6E0;
+
 /// LAPIC timer modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimerMode {
@@ -575,6 +582,40 @@ impl LocalApic {
         self.tsc_deadline = value;
     }
 
+    /// Serve a guest `RDMSR` of `IA32_TSC_DEADLINE` (MSR `0x6E0`).
+    ///
+    /// Intel SDM Vol.3 §10.5.4.1: the MSR is meaningful only in TSC-deadline
+    /// mode (LVT timer bit 18 set). **In any other timer mode it reads zero** —
+    /// so a guest that reads the MSR while the timer is one-shot/periodic must
+    /// not observe a stale armed deadline (a one-shot/periodic guest that
+    /// happened to leave a value here would otherwise read non-zero, a tell that
+    /// no real LAPIC exhibits). In TSC-deadline mode it returns the currently
+    /// armed absolute TSC value (0 once disarmed, or after the timer fired and
+    /// [`check_tsc_deadline`](Self::check_tsc_deadline) cleared it).
+    #[must_use]
+    pub const fn read_tsc_deadline_msr(&self) -> u64 {
+        if matches!(self.timer_mode, TimerMode::TscDeadline) {
+            self.tsc_deadline
+        } else {
+            0
+        }
+    }
+
+    /// Serve a guest `WRMSR` of `IA32_TSC_DEADLINE` (MSR `0x6E0`).
+    ///
+    /// Intel SDM Vol.3 §10.5.4.1: writing a non-zero value arms the timer to
+    /// fire when the guest TSC reaches it; writing 0 disarms it. The MSR is
+    /// honored **only in TSC-deadline mode** — in any other timer mode the
+    /// write is **ignored**, so arming the timer requires first putting the LVT
+    /// timer in TSC-deadline mode, exactly like hardware. (The companion
+    /// [`check_tsc_deadline`](Self::check_tsc_deadline) is what later fires and
+    /// clears the armed value against the guest TSC.)
+    pub const fn write_tsc_deadline_msr(&mut self, value: u64) {
+        if matches!(self.timer_mode, TimerMode::TscDeadline) {
+            self.tsc_deadline = value;
+        }
+    }
+
     /// Advance the **TSC-deadline** timer against the guest's current TSC and
     /// fire the timer interrupt if the armed deadline has been reached.
     ///
@@ -934,6 +975,65 @@ mod tests {
             lapic.tsc_deadline(),
             2000,
             "a same-mode LVT rewrite must leave the deadline armed"
+        );
+    }
+
+    #[test]
+    fn test_tsc_deadline_msr_arms_and_disarms_only_in_deadline_mode() {
+        let mut lapic = LocalApic::new(1);
+        lapic.write_register(LAPIC_SVR, 0x1FF);
+        // TSC-deadline mode, vector 0x40.
+        lapic.write_register(LAPIC_LVT_TIMER, 0x40 | (2 << 17));
+
+        // A non-zero MSR write arms the timer; reading the MSR back returns it.
+        lapic.write_tsc_deadline_msr(5_000);
+        assert_eq!(lapic.read_tsc_deadline_msr(), 5_000);
+        assert_eq!(lapic.tsc_deadline(), 5_000, "MSR write reaches the deadline");
+
+        // Writing 0 disarms (SDM §10.5.4.1).
+        lapic.write_tsc_deadline_msr(0);
+        assert_eq!(lapic.read_tsc_deadline_msr(), 0);
+        assert_eq!(lapic.tsc_deadline(), 0);
+    }
+
+    #[test]
+    fn test_tsc_deadline_msr_reads_zero_and_ignores_writes_outside_deadline_mode() {
+        let mut lapic = LocalApic::new(1);
+        lapic.write_register(LAPIC_SVR, 0x1FF);
+
+        // One-shot mode: the MSR reads 0 and writes to it are ignored
+        // (SDM §10.5.4.1 — "In other timer modes the IA32_TSC_DEADLINE MSR
+        // reads zero and writes are ignored").
+        lapic.write_register(LAPIC_LVT_TIMER, 0x40); // one-shot
+        lapic.write_tsc_deadline_msr(7_777);
+        assert_eq!(lapic.read_tsc_deadline_msr(), 0, "non-deadline mode reads 0");
+        assert_eq!(
+            lapic.tsc_deadline(),
+            0,
+            "non-deadline mode must ignore the MSR write"
+        );
+
+        // Periodic mode behaves identically.
+        lapic.write_register(LAPIC_LVT_TIMER, 0x40 | (1 << 17)); // periodic
+        lapic.write_tsc_deadline_msr(1_234);
+        assert_eq!(lapic.read_tsc_deadline_msr(), 0);
+        assert_eq!(lapic.tsc_deadline(), 0);
+    }
+
+    #[test]
+    fn test_tsc_deadline_msr_read_masks_a_stale_value_outside_deadline_mode() {
+        let mut lapic = LocalApic::new(1);
+        lapic.write_register(LAPIC_SVR, 0x1FF);
+        // Force a residual internal deadline value, then leave the timer in
+        // one-shot mode: the MSR must still read 0 (it never exposes the stored
+        // value outside TSC-deadline mode), even though the internal field holds
+        // it. This is the read-side guarantee the run-loop wiring relies on.
+        lapic.write_register(LAPIC_LVT_TIMER, 0x40); // one-shot
+        lapic.set_tsc_deadline(9_999); // internal back-door (not the MSR path)
+        assert_eq!(
+            lapic.read_tsc_deadline_msr(),
+            0,
+            "one-shot mode masks the stored deadline from the MSR read"
         );
     }
 

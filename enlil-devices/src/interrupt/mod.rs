@@ -62,7 +62,7 @@ pub struct InterruptEntry {
 pub use controller::InterruptController;
 pub use ioapic::IOAPIC_BASE;
 pub use ioapic::{IoApic, RedirectionEntry};
-pub use lapic::{LAPIC_BASE, LAPIC_SVR, LocalApic};
+pub use lapic::{IA32_TSC_DEADLINE, LAPIC_BASE, LAPIC_SVR, LocalApic};
 pub use line::{IoApicMmio, LapicMmio, SharedInterruptController, SharedLapicMmio, isa_to_gsi};
 pub use msi::MsiMessage;
 pub use pic::{
