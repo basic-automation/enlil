@@ -1046,6 +1046,20 @@ mod linux {
                     });
                 }
             }
+
+            // The 0x15/0x16 leaves are only reachable if leaf 0's max-basic-leaf
+            // (EAX) advertises them: a guest reads leaf 0 first and queries only
+            // leaves with function <= that EAX. KVM's host leaf-0 EAX can be below
+            // 0x16 (e.g. an AMD host whose basic range ends at 0x10/0x0D), so an
+            // Intel-presented guest there would install 0x16 yet never read it.
+            // Raise leaf 0 EAX to cover the highest leaf we just inserted; never
+            // lower it (legitimately-higher leaves like 0x1F must survive).
+            const HIGHEST_FREQ_LEAF: u32 = 0x16;
+            if let Some(leaf0) = entries.iter_mut().find(|e| e.function == 0) {
+                if leaf0.eax < HIGHEST_FREQ_LEAF {
+                    leaf0.eax = HIGHEST_FREQ_LEAF;
+                }
+            }
         }
 
         /// Map a host buffer into the guest's physical address space.
@@ -1639,6 +1653,69 @@ mod tests {
         assert!(
             amd_entries.is_empty(),
             "AMD table must not synthesise 0x15/0x16"
+        );
+    }
+
+    // The Intel frequency leaves are only reachable if leaf 0's max-basic-leaf
+    // (EAX) advertises them, so upsert_frequency_leaves must raise a too-low
+    // leaf-0 EAX to 0x16 (and never lower a higher one), and never touch leaf 0
+    // for an AMD table (which installs nothing).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn upsert_frequency_leaves_advertises_0x16_in_the_max_basic_leaf() {
+        use enlil_devices::stealth::cpuid::{CpuVendor, CpuidStealthConfig, CpuidStealthTable};
+        use kvm_bindings::kvm_cpuid_entry2;
+
+        let intel = {
+            let mut c = CpuidStealthConfig::from_host(1, 1);
+            c.vendor = CpuVendor::Intel;
+            CpuidStealthTable::build(&c)
+        };
+
+        // An AMD-host-style leaf 0 whose basic range ends at 0x10 (< 0x16): it
+        // must be raised so the guest reaches the installed 0x16.
+        let mut entries = vec![kvm_cpuid_entry2 {
+            function: 0,
+            eax: 0x10,
+            ..Default::default()
+        }];
+        KvmBackend::upsert_frequency_leaves(&mut entries, &intel, Some(3_000_000));
+        assert_eq!(
+            entries.iter().find(|e| e.function == 0).unwrap().eax,
+            0x16,
+            "max-basic-leaf must be raised to cover 0x16"
+        );
+
+        // A leaf 0 already advertising a higher max (e.g. 0x1F) must NOT be
+        // lowered.
+        let mut high = vec![kvm_cpuid_entry2 {
+            function: 0,
+            eax: 0x1F,
+            ..Default::default()
+        }];
+        KvmBackend::upsert_frequency_leaves(&mut high, &intel, Some(3_000_000));
+        assert_eq!(
+            high.iter().find(|e| e.function == 0).unwrap().eax,
+            0x1F,
+            "a higher max-basic-leaf must survive"
+        );
+
+        // AMD table installs nothing, so leaf 0 is left exactly as-is.
+        let amd = {
+            let mut c = CpuidStealthConfig::from_host(1, 1);
+            c.vendor = CpuVendor::Amd;
+            CpuidStealthTable::build(&c)
+        };
+        let mut amd_entries = vec![kvm_cpuid_entry2 {
+            function: 0,
+            eax: 0x10,
+            ..Default::default()
+        }];
+        KvmBackend::upsert_frequency_leaves(&mut amd_entries, &amd, Some(3_000_000));
+        assert_eq!(
+            amd_entries.iter().find(|e| e.function == 0).unwrap().eax,
+            0x10,
+            "AMD table must not touch the max-basic-leaf"
         );
     }
 
