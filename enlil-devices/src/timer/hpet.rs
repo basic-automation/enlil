@@ -74,10 +74,19 @@ pub struct HpetTimer {
 
 impl HpetTimer {
     const fn new(index: usize) -> Self {
-        // Set the interrupt routing capability in bits 32-63.
-        let cap = (TIMER_ROUTE_CAP as u64) << 32;
+        // Read-only capability bits (IA-PC HPET §2.3.8): the interrupt-routing
+        // capability (bits 32-63), Tn_PER_INT_CAP (bit 4 — this model implements
+        // periodic mode in `tick`), and Tn_SIZE_CAP (bit 5 — the main counter
+        // and comparator are 64-bit). The config write path already *preserves*
+        // bits 4/5 as read-only, but they must be set here to advertise what the
+        // model actually supports: otherwise a guest that checks Tn_PER_INT_CAP
+        // would never use periodic mode, and one that checks Tn_SIZE_CAP would
+        // treat a 64-bit timer as 32-bit — both contradicting the behaviour the
+        // model and the COUNT_SIZE_CAP capability register present.
+        let cap = ((TIMER_ROUTE_CAP as u64) << 32) | (1 << 4) | (1 << 5);
         Self {
-            // Capabilities in upper 32 bits, timer starts masked (bit 14 clear = no interrupt).
+            // Capabilities set above; the timer starts masked (bit 14 clear = no
+            // interrupt) and edge-triggered.
             config: cap,
             comparator: 0,
             fsb_route: 0,
@@ -455,6 +464,38 @@ mod tests {
         hpet.write(0x100, 0x04);
         let timer = hpet.timer(0).unwrap();
         assert!(timer.interrupt_enabled());
+    }
+
+    #[test]
+    fn hpet_timers_advertise_periodic_and_64bit_capability() {
+        let hpet = Hpet::new();
+        for idx in 0..NUM_TIMERS {
+            let cfg = hpet.read(0x100 + (idx as u64) * 0x20);
+            // Tn_PER_INT_CAP (bit 4): the model implements periodic mode.
+            assert_ne!(
+                cfg & (1 << 4),
+                0,
+                "timer {idx} must advertise periodic-capable"
+            );
+            // Tn_SIZE_CAP (bit 5): the comparator + main counter are 64-bit
+            // (consistent with the COUNT_SIZE_CAP main-capability bit).
+            assert_ne!(
+                cfg & (1 << 5),
+                0,
+                "timer {idx} must advertise 64-bit-capable"
+            );
+        }
+    }
+
+    #[test]
+    fn hpet_capability_bits_survive_a_guest_config_write() {
+        let mut hpet = Hpet::new();
+        // A guest writes the config trying to clear every bit; the read-only
+        // capability bits (4 = periodic, 5 = 64-bit) must persist.
+        hpet.write(0x100, 0);
+        let cfg = hpet.read(0x100);
+        assert_ne!(cfg & (1 << 4), 0, "periodic-capable is read-only");
+        assert_ne!(cfg & (1 << 5), 0, "64-bit-capable is read-only");
     }
 
     #[test]

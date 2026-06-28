@@ -1856,6 +1856,25 @@ Physical USB Devices
   what RDTSC observes; enlil offsets the TSC start value but does not scale its
   rate, so the measured kHz is stable. No-op for an AMD-vendor table (`0x15`/
   `0x16` are out-of-range reserved-zero on AMD).
+- **Max-basic-leaf advertises the frequency leaves (2026-06-28):** installing
+  `0x15`/`0x16` is useless if leaf 0 EAX (the max basic leaf) is below `0x16` —
+  a guest reads leaf 0 first and queries only leaves ≤ that EAX. On an AMD host
+  whose basic range ends below `0x16`, an Intel-presented guest never reached the
+  installed `0x16`. `upsert_frequency_leaves` now raises leaf 0 EAX to ≥ `0x16`
+  when it inserts those leaves (never lowering a higher value, e.g. `0x1F`).
+- **LAPIC CMCI LVT + Nehalem version (2026-06-28):** the LAPIC version register
+  reported Max-LVT-Entry = 5 (pre-Nehalem, no CMCI) while the CPUID table presents
+  a modern Intel CPU. Added the **CMCI LVT register at `0xFEE0_02F0`** (SDM Vol.3
+  §10.5.1) and bumped the version to Max-LVT-Entry = 6 (7 entries), so a guest
+  cross-checking the LAPIC version against CPUID no longer sees an old, CMCI-less
+  APIC under a modern CPU.
+- **Remaining (cross-vendor identity, awake-design):** `apply_topology_stealth`
+  still does not install the table's leaf-0 vendor string / leaf-1 family-model /
+  brand leaves (`0x8000_0002`–`4`), so presenting a *different* vendor than the
+  host (Intel-on-AMD) would be inconsistent — the frequency/PMU/topology leaves
+  are Intel-shaped but leaf 0 still reads the host vendor. Wiring the full vendor
+  identity (vendor string + FMS + brand + a feature-flag mask) is a deliberate
+  cross-vendor masquerade pass, not a piecemeal change.
 
 ### 5.4 Timing Stealth (Expanded — from 2024–2025 anti-cheat research)
 

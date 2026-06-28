@@ -1046,6 +1046,20 @@ mod linux {
                     });
                 }
             }
+
+            // The 0x15/0x16 leaves are only reachable if leaf 0's max-basic-leaf
+            // (EAX) advertises them: a guest reads leaf 0 first and queries only
+            // leaves with function <= that EAX. KVM's host leaf-0 EAX can be below
+            // 0x16 (e.g. an AMD host whose basic range ends at 0x10/0x0D), so an
+            // Intel-presented guest there would install 0x16 yet never read it.
+            // Raise leaf 0 EAX to cover the highest leaf we just inserted; never
+            // lower it (legitimately-higher leaves like 0x1F must survive).
+            const HIGHEST_FREQ_LEAF: u32 = 0x16;
+            if let Some(leaf0) = entries.iter_mut().find(|e| e.function == 0) {
+                if leaf0.eax < HIGHEST_FREQ_LEAF {
+                    leaf0.eax = HIGHEST_FREQ_LEAF;
+                }
+            }
         }
 
         /// Map a host buffer into the guest's physical address space.
@@ -1134,6 +1148,42 @@ mod linux {
                 .ok_or_else(|| Error::Vcpu("no vcpu created; cannot read TSC frequency".into()))?;
             vcpu.get_tsc_khz()
                 .map_err(|e| Error::Vcpu(format!("KVM_GET_TSC_KHZ: {e}")))
+        }
+
+        /// The guest's current Time-Stamp Counter (`IA32_TSC`, MSR `0x10`) on
+        /// vCPU `index`, read via `KVM_GET_MSRS`.
+        ///
+        /// This is the guest-visible TSC the LAPIC TSC-deadline timer is armed
+        /// against: a guest arms a one-shot interrupt by writing an *absolute*
+        /// TSC value to `IA32_TSC_DEADLINE`, so to fire it the run loop must
+        /// compare against the guest TSC — not the host TSC or an ns delta. Read
+        /// it after a guest entry and hand it to
+        /// [`StandardPc::check_lapic_tsc_deadlines`](crate::device_bus::StandardPc::check_lapic_tsc_deadlines).
+        ///
+        /// # Errors
+        /// Returns [`Error::Vcpu`] if `index` names no vCPU, `KVM_GET_MSRS`
+        /// fails, or it does not return the single requested entry.
+        pub fn read_guest_tsc(&self, index: usize) -> Result<u64> {
+            use kvm_bindings::{kvm_msr_entry, Msrs};
+            let vcpu = self
+                .vcpus
+                .get(index)
+                .ok_or_else(|| Error::Vcpu(format!("no vcpu at index {index}")))?;
+            // IA32_TSC is MSR 0x10.
+            let mut msrs = Msrs::from_entries(&[kvm_msr_entry {
+                index: 0x10,
+                ..Default::default()
+            }])
+            .map_err(|e| Error::Vcpu(format!("Msrs alloc: {e:?}")))?;
+            let n = vcpu
+                .get_msrs(&mut msrs)
+                .map_err(|e| Error::Vcpu(format!("KVM_GET_MSRS(IA32_TSC): {e}")))?;
+            if n != 1 {
+                return Err(Error::Vcpu(format!(
+                    "KVM_GET_MSRS(IA32_TSC) returned {n} entries, expected 1"
+                )));
+            }
+            Ok(msrs.as_slice()[0].data)
         }
 
         /// Point vCPU `index` at a flat 16-bit real-mode entry: every segment
@@ -1606,6 +1656,69 @@ mod tests {
         );
     }
 
+    // The Intel frequency leaves are only reachable if leaf 0's max-basic-leaf
+    // (EAX) advertises them, so upsert_frequency_leaves must raise a too-low
+    // leaf-0 EAX to 0x16 (and never lower a higher one), and never touch leaf 0
+    // for an AMD table (which installs nothing).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn upsert_frequency_leaves_advertises_0x16_in_the_max_basic_leaf() {
+        use enlil_devices::stealth::cpuid::{CpuVendor, CpuidStealthConfig, CpuidStealthTable};
+        use kvm_bindings::kvm_cpuid_entry2;
+
+        let intel = {
+            let mut c = CpuidStealthConfig::from_host(1, 1);
+            c.vendor = CpuVendor::Intel;
+            CpuidStealthTable::build(&c)
+        };
+
+        // An AMD-host-style leaf 0 whose basic range ends at 0x10 (< 0x16): it
+        // must be raised so the guest reaches the installed 0x16.
+        let mut entries = vec![kvm_cpuid_entry2 {
+            function: 0,
+            eax: 0x10,
+            ..Default::default()
+        }];
+        KvmBackend::upsert_frequency_leaves(&mut entries, &intel, Some(3_000_000));
+        assert_eq!(
+            entries.iter().find(|e| e.function == 0).unwrap().eax,
+            0x16,
+            "max-basic-leaf must be raised to cover 0x16"
+        );
+
+        // A leaf 0 already advertising a higher max (e.g. 0x1F) must NOT be
+        // lowered.
+        let mut high = vec![kvm_cpuid_entry2 {
+            function: 0,
+            eax: 0x1F,
+            ..Default::default()
+        }];
+        KvmBackend::upsert_frequency_leaves(&mut high, &intel, Some(3_000_000));
+        assert_eq!(
+            high.iter().find(|e| e.function == 0).unwrap().eax,
+            0x1F,
+            "a higher max-basic-leaf must survive"
+        );
+
+        // AMD table installs nothing, so leaf 0 is left exactly as-is.
+        let amd = {
+            let mut c = CpuidStealthConfig::from_host(1, 1);
+            c.vendor = CpuVendor::Amd;
+            CpuidStealthTable::build(&c)
+        };
+        let mut amd_entries = vec![kvm_cpuid_entry2 {
+            function: 0,
+            eax: 0x10,
+            ..Default::default()
+        }];
+        KvmBackend::upsert_frequency_leaves(&mut amd_entries, &amd, Some(3_000_000));
+        assert_eq!(
+            amd_entries.iter().find(|e| e.function == 0).unwrap().eax,
+            0x10,
+            "AMD table must not touch the max-basic-leaf"
+        );
+    }
+
     #[test]
     fn terminal_exits_stop_the_loop() {
         assert_eq!(GuestExit::Halted.outcome(), RunOutcome::Stopped);
@@ -1735,6 +1848,31 @@ mod tests {
         // Any real x86-64 host TSC runs well above 100 MHz; sanity-bound it
         // rather than pin an exact value (it is host-specific).
         assert!(khz > 100_000, "implausible host TSC frequency: {khz} kHz");
+    }
+
+    #[test]
+    fn read_guest_tsc_reports_a_running_counter() {
+        if !is_kvm_available() {
+            eprintln!("skipping: /dev/kvm not available (no nested virt)");
+            return;
+        }
+
+        let mut backend = KvmBackend::new().expect("create KVM VM");
+        // No vCPU yet → there is no guest TSC to read.
+        assert!(
+            backend.read_guest_tsc(0).is_err(),
+            "read_guest_tsc must require a vCPU"
+        );
+
+        backend.create_vcpu(0).expect("create vcpu");
+        let first = backend.read_guest_tsc(0).expect("KVM_GET_MSRS(IA32_TSC)");
+        // The TSC is monotonic and free-running: a second read is never earlier
+        // than the first (wall time only moves forward between the two ioctls).
+        let second = backend.read_guest_tsc(0).expect("KVM_GET_MSRS(IA32_TSC)");
+        assert!(
+            second >= first,
+            "guest TSC went backwards: {first} -> {second}"
+        );
     }
 
     #[test]

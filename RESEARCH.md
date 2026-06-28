@@ -1582,3 +1582,32 @@ OVMF's `SmbiosPlatformDxe` reads `etc/smbios/smbios-{anchor,tables}` and
 re-installs the structures via the EFI SMBIOS protocol itself (the anchor's
 `structure_table_address` is recomputed by firmware, not patched), so QEMU emits
 no SMBIOS bios-linker-loader commands and neither do we.
+
+---
+
+## 2026-06-28 — LAPIC TSC-deadline MSR, max-basic-leaf, and the Nehalem LVT (Intel SDM)
+
+Primary-source checks driving this session's Phase 3/5 increments (Intel SDM
+Vol.3 §10.4.8, §10.5.1, §10.5.4.1 and Vol.2A CPUID); no new external literature.
+
+- **`IA32_TSC_DEADLINE` (MSR `0x6E0`) semantics** — SDM Vol.3 §10.5.4.1
+  ([SDM §10.5.4.1](https://xem.github.io/minix86/manual/intel-x86-and-64-manual-vol3/o_fe12b1e2a880e0ce-379.html)):
+  "In other timer modes (LVT bit 18 = 0), the IA32_TSC_DEADLINE MSR reads zero
+  and writes are ignored"; "writing a non-zero value arms the timer", "writing 0
+  disarms it"; "when the timer generates an interrupt, it disarms itself and
+  clears the IA32_TSC_DEADLINE MSR." **Changed what we build:** the LAPIC now
+  serves the MSR with these exact gates (`read/write_tsc_deadline_msr`), the
+  DeviceBus routes `0x6E0` to the active vCPU LAPIC, and the run loop forwards
+  it to userspace and fires due deadlines against the guest TSC.
+- **CPUID max-basic-leaf** — Vol.2A: a guest reads leaf 0 first and only queries
+  leaves whose function ≤ leaf-0 EAX. **Changed what we build:** when the Intel
+  frequency leaves `0x15`/`0x16` are installed, leaf 0 EAX is raised to ≥ `0x16`
+  (an AMD host's basic range can end below that), else the installed leaf is
+  unreachable.
+- **LAPIC version / CMCI LVT** — the version register's Max-LVT-Entry field is
+  (#LVT entries − 1); Nehalem+ (Xeon 5500) added the **CMCI LVT at offset
+  `0x2F0`** for 7 entries → Max-LVT-Entry = 6 (SDM Vol.3 §10.4.8, §10.5.1).
+  **Changed what we build:** modelled the CMCI LVT register and bumped the
+  version to advertise 6, matching the modern-Intel CPUID the stealth table
+  presents (a guest could otherwise cross-check version vs CPUID and see an old,
+  CMCI-less APIC under a modern CPU).

@@ -21,7 +21,7 @@ use enlil_devices::chipset::{Gpe0Block, SharedAcpiPm1Block, SharedSystemControlP
 use enlil_devices::dma::{Dma8237, DmaPageRegisters};
 use enlil_devices::interrupt::{
     IoApicMmio, PirqRouter, SharedInterruptController, SharedLapicMmio, SharedPic,
-    PIRQ_DEFAULT_IRQS,
+    IA32_TSC_DEADLINE, PIRQ_DEFAULT_IRQS,
 };
 use enlil_devices::pcie::{
     vendors, EcamSpace, PciBdf, PciConfigIo, PciResetControl, PcieRootComplex, SharedRootComplex,
@@ -1575,9 +1575,38 @@ impl VmExitHandler for DeviceBus {
         self.mmio.write(addr, data);
     }
     fn rdmsr(&mut self, msr: u32) -> Option<u64> {
+        // IA32_TSC_DEADLINE (0x6E0) is a LAPIC register, not a stealth-shadow
+        // MSR — route it to the *active* vCPU's LAPIC (the one steered by
+        // set_active_vcpu), which applies the SDM §10.5.4.1 semantics (reads 0
+        // unless in TSC-deadline mode). A guest reads the armed absolute TSC
+        // value, or 0 once it has fired/disarmed.
+        if msr == IA32_TSC_DEADLINE {
+            return self.interrupts.as_ref().map(|pic| {
+                pic.with(|c| {
+                    let id = c.active_lapic_id();
+                    c.lapic_mut(id).map_or(0, |l| l.read_tsc_deadline_msr())
+                })
+            });
+        }
         self.stealth.as_mut().and_then(|b| b.active().read_msr(msr))
     }
     fn wrmsr(&mut self, msr: u32, value: u64) -> bool {
+        // IA32_TSC_DEADLINE write → arm/disarm the active vCPU's LAPIC
+        // TSC-deadline timer (ignored unless that LVT timer is in TSC-deadline
+        // mode, per SDM §10.5.4.1). check_lapic_tsc_deadlines later fires it
+        // against the guest TSC.
+        if msr == IA32_TSC_DEADLINE {
+            if let Some(pic) = self.interrupts.as_ref() {
+                pic.with(|c| {
+                    let id = c.active_lapic_id();
+                    if let Some(l) = c.lapic_mut(id) {
+                        l.write_tsc_deadline_msr(value);
+                    }
+                });
+                return true;
+            }
+            return false;
+        }
         self.stealth
             .as_mut()
             .is_some_and(|b| b.active().write_msr(msr, value))
@@ -2237,6 +2266,75 @@ mod tests {
             &0u32.to_le_bytes(),
         );
         assert_eq!(pic.with(|c| c.pending_vector(1)), Some(0x55));
+    }
+
+    #[test]
+    fn tsc_deadline_msr_routes_to_the_active_vcpus_lapic() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::interrupt::{SharedInterruptController, IA32_TSC_DEADLINE};
+        use std::sync::{Arc, Mutex};
+
+        // LAPIC register offsets used as literals (not all re-exported): SVR
+        // 0x0F0, LVT timer 0x320. TSC-deadline mode is LVT bits[18:17] = 0b10.
+        const LAPIC_SVR_OFF: u32 = 0x0F0;
+        const LAPIC_LVT_TIMER_OFF: u32 = 0x320;
+        const TSC_DEADLINE_MODE: u32 = 2 << 17;
+
+        // Two vCPUs; enable both LAPICs and put vCPU 0's timer in TSC-deadline
+        // mode (so the MSR is honored there) and leave vCPU 1's in one-shot.
+        let pic = SharedInterruptController::new(2);
+        pic.with(|c| {
+            c.lapics[0].write_register(LAPIC_SVR_OFF, 0x1FF);
+            c.lapics[1].write_register(LAPIC_SVR_OFF, 0x1FF);
+            c.lapics[0].write_register(LAPIC_LVT_TIMER_OFF, 0x40 | TSC_DEADLINE_MODE);
+            c.lapics[1].write_register(LAPIC_LVT_TIMER_OFF, 0x40); // one-shot
+        });
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let (mut bus, _pcie) = DeviceBus::standard_pc_with_interrupts(
+            SerialOutput::new("guest", SerialOutputMode::Shared(Arc::clone(&sink))),
+            &pic,
+        )
+        .unwrap();
+
+        // With vCPU 0 active and in TSC-deadline mode, a WRMSR arms *its* LAPIC
+        // and a RDMSR reads it back — the value reaches the per-vCPU LAPIC, not
+        // a #GP.
+        bus.set_active_vcpu(0);
+        assert!(VmExitHandler::wrmsr(
+            &mut bus,
+            IA32_TSC_DEADLINE,
+            0x1234_5678
+        ));
+        assert_eq!(
+            VmExitHandler::rdmsr(&mut bus, IA32_TSC_DEADLINE),
+            Some(0x1234_5678)
+        );
+        assert_eq!(pic.with(|c| c.lapics[0].tsc_deadline()), 0x1234_5678);
+        // vCPU 1's LAPIC must be untouched by a write attributed to vCPU 0.
+        assert_eq!(pic.with(|c| c.lapics[1].tsc_deadline()), 0);
+
+        // Switch the active vCPU to 1 (one-shot mode): per SDM §10.5.4.1 the MSR
+        // write is ignored and the read returns 0, even though vCPU 0 still has
+        // an armed deadline — the routing follows the active vCPU.
+        bus.set_active_vcpu(1);
+        assert!(VmExitHandler::wrmsr(
+            &mut bus,
+            IA32_TSC_DEADLINE,
+            0xDEAD_BEEF
+        ));
+        assert_eq!(VmExitHandler::rdmsr(&mut bus, IA32_TSC_DEADLINE), Some(0));
+        assert_eq!(
+            pic.with(|c| c.lapics[1].tsc_deadline()),
+            0,
+            "one-shot mode must ignore the IA32_TSC_DEADLINE write"
+        );
+
+        // Disarm vCPU 0's deadline by writing 0 while it is active again.
+        bus.set_active_vcpu(0);
+        assert!(VmExitHandler::wrmsr(&mut bus, IA32_TSC_DEADLINE, 0));
+        assert_eq!(VmExitHandler::rdmsr(&mut bus, IA32_TSC_DEADLINE), Some(0));
+        assert_eq!(pic.with(|c| c.lapics[0].tsc_deadline()), 0);
     }
 
     #[test]
