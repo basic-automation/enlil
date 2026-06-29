@@ -1,6 +1,10 @@
 use crate::EnlilConfig;
 use std::collections::HashSet;
 
+/// The log levels the hypervisor accepts (matched case-insensitively), per
+/// `HypervisorConfig::log_level`.
+const VALID_LOG_LEVELS: [&str; 5] = ["trace", "debug", "info", "warn", "error"];
+
 /// Validate an Enlil configuration. Returns a list of errors (empty = valid).
 #[must_use]
 pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
@@ -74,6 +78,30 @@ pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
     for (id, guest) in &config.guest {
         if guest.name.trim().is_empty() {
             errors.push(format!("Guest '{id}': name cannot be empty"));
+        }
+    }
+
+    // The hypervisor log level must be one of the documented levels (matched
+    // case-insensitively, like the `log` crate's own filter parser).
+    let level = config.hypervisor.log_level.trim();
+    if !VALID_LOG_LEVELS.iter().any(|v| level.eq_ignore_ascii_case(v)) {
+        errors.push(format!(
+            "Hypervisor log_level '{level}' is not one of trace, debug, info, warn, error"
+        ));
+    }
+
+    // Each guest's serial output must name a supported sink: stdout, pty, null,
+    // or file:<non-empty path> (see SerialPortConfig::output).
+    for (id, guest) in &config.guest {
+        let out = guest.serial.output.trim();
+        let valid = matches!(out, "stdout" | "pty" | "null")
+            || out
+                .strip_prefix("file:")
+                .is_some_and(|path| !path.trim().is_empty());
+        if !valid {
+            errors.push(format!(
+                "Guest '{id}': serial output '{out}' must be stdout, pty, null, or file:<path>"
+            ));
         }
     }
 
@@ -176,5 +204,57 @@ mod tests {
         config.hypervisor.total_memory_mb = 4096;
         let errors = validate_config(&config);
         assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+    }
+
+    #[test]
+    fn detects_invalid_log_level() {
+        let mut config = minimal_config();
+        config.hypervisor.log_level = "verbose".into();
+        let errors = validate_config(&config);
+        assert!(errors.iter().any(|e| e.contains("log_level")), "{errors:?}");
+    }
+
+    #[test]
+    fn accepts_log_levels_case_insensitively() {
+        let mut config = minimal_config();
+        config.hypervisor.log_level = "WARN".into();
+        let errors = validate_config(&config);
+        assert!(
+            !errors.iter().any(|e| e.contains("log_level")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn detects_invalid_serial_output() {
+        let mut config = minimal_config();
+        config.guest.get_mut("vm1").unwrap().serial.output = "serialport".into();
+        let errors = validate_config(&config);
+        assert!(
+            errors.iter().any(|e| e.contains("serial output")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn detects_empty_file_serial_output() {
+        let mut config = minimal_config();
+        config.guest.get_mut("vm1").unwrap().serial.output = "file:".into();
+        let errors = validate_config(&config);
+        assert!(
+            errors.iter().any(|e| e.contains("serial output")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_file_serial_output_with_a_path() {
+        let mut config = minimal_config();
+        config.guest.get_mut("vm1").unwrap().serial.output = "file:/var/log/vm1.log".into();
+        let errors = validate_config(&config);
+        assert!(
+            !errors.iter().any(|e| e.contains("serial output")),
+            "{errors:?}"
+        );
     }
 }
