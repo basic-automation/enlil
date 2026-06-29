@@ -241,7 +241,8 @@ impl VirtioNetDevice {
     }
 
     /// Serialize the `virtio_net_config` the guest reads: `mac[6]`, `status`,
-    /// `max_virtqueue_pairs`, `mtu` (we do not offer the MTU feature, so it is 0).
+    /// `max_virtqueue_pairs`, `mtu`. We offer `VIRTIO_NET_F_MTU`, so the `mtu`
+    /// field carries the configured value (default 1500), not 0.
     fn config_as_bytes(&self) -> [u8; 12] {
         let mut b = [0u8; 12];
         b[0..6].copy_from_slice(self.mac.as_bytes());
