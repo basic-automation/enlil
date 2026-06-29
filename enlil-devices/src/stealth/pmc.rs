@@ -10,6 +10,28 @@ pub const MAX_GP_PMCS: usize = 8;
 /// Maximum number of fixed-function PMCs
 pub const MAX_FIXED_PMCS: usize = 4;
 
+/// Writable bits of `IA32_PERF_GLOBAL_CTRL` (MSR 0x38F): `EN_PMCn` for the
+/// implemented GP counters (bits `[MAX_GP_PMCS-1 : 0]`) and `EN_FIXEDn` for the
+/// fixed counters (bits `[32 + MAX_FIXED_PMCS - 1 : 32]`). These exactly match
+/// the counter counts CPUID leaf 0xA advertises (`CpuidStealthTable::build_leaf_a`).
+/// Every other bit is reserved — real hardware `#GP`s a write that sets one, so
+/// they must read back 0 rather than store the guest's value (a guest writing
+/// all-ones and reading it back unchanged would catch a hypervisor that
+/// stored the reserved bits verbatim).
+const GLOBAL_CTRL_MASK: u64 = ((1u64 << MAX_GP_PMCS) - 1) | (((1u64 << MAX_FIXED_PMCS) - 1) << 32);
+
+/// Writable bits of `IA32_FIXED_CTR_CTRL` (MSR 0x38D): a 4-bit control field
+/// (`EN`/`AnyThread`/`PMI`) per fixed counter, bits `[4*MAX_FIXED_PMCS - 1 : 0]`;
+/// the rest are reserved (same reserved-bit-writeback tell as `GLOBAL_CTRL`).
+const FIXED_CTR_CTRL_MASK: u64 = (1u64 << (4 * MAX_FIXED_PMCS)) - 1;
+
+/// Writable bits of the AMD `PerfMonV2` `PerfCntrGlobalCtl` (MSR `0xC000_0301`):
+/// one `PerfCtrEn` bit per implemented core PMC (bits `[AMD_CORE_PMCS-1 : 0]`).
+/// Higher bits are reserved — the AMD-side counterpart of `GLOBAL_CTRL_MASK`,
+/// on the path an AMD-presented guest (the same-vendor case on this AMD host)
+/// actually exercises.
+const AMD_GLOBAL_CTRL_MASK: u64 = (1u64 << msr::AMD_CORE_PMCS) - 1;
+
 /// Rates at which the fixed-function counters advance per unit of guest time.
 ///
 /// `advance_counters` receives a **TSC delta** (reference cycles). On bare
@@ -248,8 +270,8 @@ impl PmcState {
                 let idx = (m - msr::IA32_FIXED_CTR0) as usize;
                 self.fixed_counters[idx] = value;
             }
-            msr::IA32_FIXED_CTR_CTRL => self.fixed_ctr_ctrl = value,
-            msr::IA32_PERF_GLOBAL_CTRL => self.global_ctrl = value,
+            msr::IA32_FIXED_CTR_CTRL => self.fixed_ctr_ctrl = value & FIXED_CTR_CTRL_MASK,
+            msr::IA32_PERF_GLOBAL_CTRL => self.global_ctrl = value & GLOBAL_CTRL_MASK,
             msr::IA32_PERF_GLOBAL_STATUS_RESET => {
                 self.global_status &= !value;
             }
@@ -263,7 +285,7 @@ impl PmcState {
         match amd_pmc_target(msr) {
             Some(AmdPmcTarget::Counter(i)) if i < MAX_GP_PMCS => self.gp_counters[i] = value,
             Some(AmdPmcTarget::EventSelect(i)) if i < MAX_GP_PMCS => self.event_select[i] = value,
-            Some(AmdPmcTarget::GlobalCtrl) => self.global_ctrl = value,
+            Some(AmdPmcTarget::GlobalCtrl) => self.global_ctrl = value & AMD_GLOBAL_CTRL_MASK,
             // Writing the clear MSR clears the set status bits (write-1-to-clear),
             // matching the Intel `GLOBAL_STATUS_RESET` semantics above.
             Some(AmdPmcTarget::GlobalStatusClr) => self.global_status &= !value,
@@ -387,6 +409,44 @@ mod tests {
         let mut pmc = PmcState::new();
         pmc.write_msr(msr::IA32_PMC0, 42);
         assert_eq!(pmc.read_msr(msr::IA32_PMC0), Some(42));
+    }
+
+    #[test]
+    fn pmu_control_msrs_mask_reserved_bits() {
+        let mut pmc = PmcState::new();
+
+        // A guest writes all-ones. The implemented enable bits take; every
+        // reserved bit must read back 0 (real hardware #GPs the reserved write).
+        pmc.write_msr(msr::IA32_PERF_GLOBAL_CTRL, u64::MAX);
+        assert_eq!(
+            pmc.read_msr(msr::IA32_PERF_GLOBAL_CTRL),
+            Some(0x0000_000F_0000_00FF), // 8 GP enables [7:0] + 4 fixed enables [35:32]
+            "PERF_GLOBAL_CTRL reserved bits must read back 0"
+        );
+
+        pmc.write_msr(msr::IA32_FIXED_CTR_CTRL, u64::MAX);
+        assert_eq!(
+            pmc.read_msr(msr::IA32_FIXED_CTR_CTRL),
+            Some(0x0000_FFFF), // 4 fixed counters × 4-bit control field
+            "FIXED_CTR_CTRL reserved bits must read back 0"
+        );
+
+        // Legitimate enable values are unaffected.
+        pmc.write_msr(msr::IA32_PERF_GLOBAL_CTRL, 0x07);
+        assert_eq!(pmc.read_msr(msr::IA32_PERF_GLOBAL_CTRL), Some(0x07));
+    }
+
+    #[test]
+    fn amd_global_ctrl_masks_reserved_bits() {
+        let mut pmc = PmcState::new();
+        // All-ones to the AMD PerfCntrGlobalCtl: only the 6 core-PMC enables
+        // (bits [5:0]) take; the reserved bits read back 0.
+        pmc.write_msr(msr::AMD_PERF_CNTR_GLOBAL_CTL, u64::MAX);
+        assert_eq!(
+            pmc.read_msr(msr::AMD_PERF_CNTR_GLOBAL_CTL),
+            Some(0x3F),
+            "AMD PerfCntrGlobalCtl reserved bits must read back 0"
+        );
     }
 
     #[test]

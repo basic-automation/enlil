@@ -290,9 +290,7 @@ impl VcpuManager {
 
     /// Stop all vCPUs.
     pub fn stop_all(&mut self) {
-        for state in &mut self.states {
-            *state = VcpuState::Stopped;
-        }
+        self.states.fill(VcpuState::Stopped);
     }
 
     /// Get the set of physical cores this guest uses.

@@ -585,7 +585,9 @@ mod tests {
         };
         let le32 = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
         bytes
-            .chunks_exact(128)
+            .as_chunks::<128>()
+            .0
+            .iter()
             .map(|e| Cmd {
                 command: le32(e, 0),
                 dest: name(e, 0x04),
@@ -793,8 +795,8 @@ mod tests {
         // Each 8-byte XSDT entry points to a valid table; one of them is the FADT.
         let xsdt_len = u32::from_le_bytes(xsdt[4..8].try_into().unwrap()) as usize;
         let mut saw_fadt = false;
-        for entry in xsdt[36..xsdt_len].chunks_exact(8) {
-            let gpa = u64::from_le_bytes(entry.try_into().unwrap());
+        for entry in xsdt[36..xsdt_len].as_chunks::<8>().0 {
+            let gpa = u64::from_le_bytes(*entry);
             let tbl = &ts.tables[to_off(gpa)..];
             assert!(
                 valid_table(tbl),

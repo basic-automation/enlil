@@ -45,6 +45,41 @@ pub const LAPIC_TIMER_CURRENT: u32 = 0x390;
 pub const LAPIC_TIMER_DIVIDE: u32 = 0x3E0;
 pub const LAPIC_SELF_IPI: u32 = 0x3F0;
 
+// Writable-bit masks for the LVT registers (Intel SDM Vol.3 §10.5.1, Figure
+// 10-8). The Delivery Status bit (12) and the LINT Remote IRR bit (14) are
+// read-only status the LAPIC maintains, and the unlisted bits are reserved;
+// real hardware reads them back as 0, so a guest write must not be able to set
+// them (a reserved/RO-bit-writeback tell, and letting a guest forge Remote IRR
+// would also corrupt level-interrupt bookkeeping).
+//
+/// LVT Timer (`0x320`): Vector [7:0], Mask [16], Timer Mode [18:17].
+const LVT_TIMER_WRITE_MASK: u32 = 0x0007_00FF;
+/// LVT Thermal / Perf / CMCI: Vector [7:0], Delivery Mode [10:8], Mask [16].
+const LVT_DELIVERY_WRITE_MASK: u32 = 0x0001_07FF;
+/// LVT LINT0/LINT1: Vector [7:0], Delivery Mode [10:8], Pin Polarity [13],
+/// Trigger Mode [15], Mask [16].
+const LVT_LINT_WRITE_MASK: u32 = 0x0001_A7FF;
+/// LVT Error (`0x370`): Vector [7:0], Mask [16] (delivery mode is fixed).
+const LVT_ERROR_WRITE_MASK: u32 = 0x0001_00FF;
+
+/// Writable bits of the Spurious-Interrupt-Vector Register (`0x0F0`, Intel SDM
+/// Vol.3 Figure 10-23): Spurious Vector [7:0], APIC Software Enable [8], and
+/// Focus Processor Checking [9]. Bit 12 (EOI-Broadcast Suppression) is reserved
+/// here because the version register does not advertise it (bit 24 clear); the
+/// remaining bits are reserved and must read back 0.
+const SVR_WRITE_MASK: u32 = 0x0000_03FF;
+
+/// Writable bits of `ICR_LOW` (`0x300`, Intel SDM Vol.3 Figure 10-12): Vector
+/// [7:0], Delivery Mode [10:8], Destination Mode [11], Level [14], Trigger Mode
+/// [15], Destination Shorthand [19:18]. Delivery Status [12] is read-only (the
+/// model is always idle) and the rest are reserved.
+const ICR_LOW_WRITE_MASK: u32 = 0x000C_CFFF;
+
+/// Writable bits of `ICR_HIGH` (`0x310`): the 8-bit Destination field, which
+/// occupies bits [63:56] of the 64-bit ICR — i.e. the top byte of the high
+/// dword. Bits [55:32] are reserved.
+const ICR_HIGH_WRITE_MASK: u32 = 0xFF00_0000;
+
 /// MSR number of `IA32_TSC_DEADLINE` (Intel SDM Vol.3 §10.5.4.1).
 ///
 /// The per-logical-processor register a guest writes to arm the LAPIC
@@ -305,7 +340,7 @@ impl LocalApic {
             LAPIC_LDR => self.ldr = value & 0xFF00_0000,
             LAPIC_DFR => self.dfr = value | 0x0FFF_FFFF,
             LAPIC_SVR => {
-                self.svr = value;
+                self.svr = value & SVR_WRITE_MASK;
                 self.enabled = (value & 0x100) != 0;
             }
             LAPIC_EOI => self.handle_eoi(),
@@ -314,14 +349,16 @@ impl LocalApic {
                 self.esr = 0;
             }
             LAPIC_ICR_LOW => {
-                self.icr = (self.icr & 0xFFFF_FFFF_0000_0000) | u64::from(value);
+                self.icr =
+                    (self.icr & 0xFFFF_FFFF_0000_0000) | u64::from(value & ICR_LOW_WRITE_MASK);
                 // Writing `ICR_LOW` triggers IPI delivery
             }
             LAPIC_ICR_HIGH => {
-                self.icr = (self.icr & 0x0000_0000_FFFF_FFFF) | (u64::from(value) << 32);
+                self.icr = (self.icr & 0x0000_0000_FFFF_FFFF)
+                    | (u64::from(value & ICR_HIGH_WRITE_MASK) << 32);
             }
             LAPIC_LVT_TIMER => {
-                self.lvt_timer = value;
+                self.lvt_timer = value & LVT_TIMER_WRITE_MASK;
                 let new_mode = match (value >> 17) & 0x3 {
                     1 => TimerMode::Periodic,
                     2 => TimerMode::TscDeadline,
@@ -338,12 +375,12 @@ impl LocalApic {
             }
             LAPIC_LVT_THERMAL | LAPIC_LVT_PERF | LAPIC_LVT_LINT0 | LAPIC_LVT_LINT1
             | LAPIC_LVT_ERROR | LAPIC_LVT_CMCI => match offset {
-                LAPIC_LVT_THERMAL => self.lvt_thermal = value,
-                LAPIC_LVT_PERF => self.lvt_perf = value,
-                LAPIC_LVT_LINT0 => self.lvt_lint0 = value,
-                LAPIC_LVT_LINT1 => self.lvt_lint1 = value,
-                LAPIC_LVT_ERROR => self.lvt_error = value,
-                LAPIC_LVT_CMCI => self.lvt_cmci = value,
+                LAPIC_LVT_THERMAL => self.lvt_thermal = value & LVT_DELIVERY_WRITE_MASK,
+                LAPIC_LVT_PERF => self.lvt_perf = value & LVT_DELIVERY_WRITE_MASK,
+                LAPIC_LVT_LINT0 => self.lvt_lint0 = value & LVT_LINT_WRITE_MASK,
+                LAPIC_LVT_LINT1 => self.lvt_lint1 = value & LVT_LINT_WRITE_MASK,
+                LAPIC_LVT_ERROR => self.lvt_error = value & LVT_ERROR_WRITE_MASK,
+                LAPIC_LVT_CMCI => self.lvt_cmci = value & LVT_DELIVERY_WRITE_MASK,
                 _ => unreachable!(),
             },
             LAPIC_TIMER_INIT => {
@@ -708,6 +745,71 @@ mod tests {
         assert_eq!(lapic.read_register(LAPIC_LVT_CMCI), 0xF1);
         // Writing it must not disturb the neighbouring timer LVT.
         assert_eq!(lapic.read_register(LAPIC_LVT_TIMER), 0x0001_0000);
+    }
+
+    #[test]
+    fn lvt_writes_mask_reserved_and_read_only_bits() {
+        let mut lapic = LocalApic::new(0);
+
+        // A guest writes all-ones to each LVT. Only the SDM-writable bits take;
+        // reserved bits and the read-only Delivery Status (12) / Remote IRR (14)
+        // must read back 0.
+        lapic.write_register(LAPIC_LVT_TIMER, 0xFFFF_FFFF);
+        assert_eq!(
+            lapic.read_register(LAPIC_LVT_TIMER),
+            0x0007_00FF,
+            "timer: vector + mask + timer-mode only"
+        );
+
+        lapic.write_register(LAPIC_LVT_LINT0, 0xFFFF_FFFF);
+        assert_eq!(
+            lapic.read_register(LAPIC_LVT_LINT0),
+            0x0001_A7FF,
+            "LINT0: no Delivery Status (12) or Remote IRR (14)"
+        );
+
+        lapic.write_register(LAPIC_LVT_PERF, 0xFFFF_FFFF);
+        assert_eq!(lapic.read_register(LAPIC_LVT_PERF), 0x0001_07FF);
+
+        lapic.write_register(LAPIC_LVT_ERROR, 0xFFFF_FFFF);
+        assert_eq!(
+            lapic.read_register(LAPIC_LVT_ERROR),
+            0x0001_00FF,
+            "error LVT has no programmable delivery mode"
+        );
+
+        // A normal programming (vector 0x40, periodic, unmasked) is untouched.
+        lapic.write_register(LAPIC_LVT_TIMER, 0x40 | (1 << 17));
+        assert_eq!(lapic.read_register(LAPIC_LVT_TIMER), 0x40 | (1 << 17));
+    }
+
+    #[test]
+    fn icr_write_masks_reserved_bits() {
+        let mut lapic = LocalApic::new(0);
+        // All-ones to both halves: only the SDM-writable command fields and the
+        // destination byte take; Delivery Status (12) and the reserved bits read
+        // back 0.
+        lapic.write_register(LAPIC_ICR_HIGH, 0xFFFF_FFFF);
+        lapic.write_register(LAPIC_ICR_LOW, 0xFFFF_FFFF);
+        assert_eq!(lapic.read_register(LAPIC_ICR_LOW), 0x000C_CFFF);
+        assert_eq!(lapic.read_register(LAPIC_ICR_HIGH), 0xFF00_0000);
+
+        // A normal fixed IPI to vector 0x30, physical, assert/edge is untouched.
+        lapic.write_register(LAPIC_ICR_HIGH, 0x0100_0000); // dest APIC ID 1
+        lapic.write_register(LAPIC_ICR_LOW, 0x4030); // vector 0x30, level=assert
+        assert_eq!(lapic.read_register(LAPIC_ICR_LOW), 0x4030);
+        assert_eq!(lapic.read_register(LAPIC_ICR_HIGH), 0x0100_0000);
+    }
+
+    #[test]
+    fn svr_write_masks_reserved_bits() {
+        let mut lapic = LocalApic::new(0);
+        // All-ones: vector + APIC-enable + focus-checking take; the rest
+        // (incl. EOI-broadcast-suppression, unadvertised in the version reg)
+        // read back 0.
+        lapic.write_register(LAPIC_SVR, 0xFFFF_FFFF);
+        assert_eq!(lapic.read_register(LAPIC_SVR), 0x0000_03FF);
+        assert!(lapic.is_enabled(), "APIC software-enable bit still took");
     }
 
     #[test]

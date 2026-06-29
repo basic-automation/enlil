@@ -161,7 +161,13 @@ impl LbrState {
 
     /// Handle WRMSR for `IA32_DEBUGCTL`
     pub const fn write_debug_ctl(&mut self, value: u64) {
-        self.debug_ctl = value;
+        // The high 48 bits [63:16] of IA32_DEBUGCTL are reserved on both Intel
+        // (SDM Vol.3 §18.4.1) and AMD (APM Vol.2) — every defined control bit
+        // lives in [15:0] (and which of those are valid differs by vendor, so we
+        // keep them all). Storing a guest's reserved bits verbatim and reading
+        // them back is a reserved-bit-writeback tell on a register anti-cheat
+        // reads to probe for LBR/BTF tampering; real hardware reads them as 0.
+        self.debug_ctl = value & 0x0000_0000_0000_FFFF;
         // LBR is enabled when bit 0 is set
         self.lbr_enabled = (value & 1) != 0;
     }
@@ -225,6 +231,16 @@ mod tests {
         assert!(lbr.lbr_enabled);
         lbr.write_debug_ctl(0x00);
         assert!(!lbr.lbr_enabled);
+    }
+
+    #[test]
+    fn debug_ctl_masks_reserved_high_bits() {
+        let mut lbr = LbrState::new(LbrPlatform::IntelVmx);
+        // A guest writes all-ones: the defined low-16 bits take (LBR enabled),
+        // but the reserved bits [63:16] read back 0 as on real hardware.
+        lbr.write_debug_ctl(u64::MAX);
+        assert_eq!(lbr.read_debug_ctl(), 0x0000_0000_0000_FFFF);
+        assert!(lbr.lbr_enabled);
     }
 
     #[test]

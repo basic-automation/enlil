@@ -566,11 +566,49 @@ impl PciConfigSpace {
             )
         });
 
-        // Everything else: write byte by byte, skipping read-only bytes.
+        // Likewise the MSI Message Control register (MSI_CAP_OFFSET + 2, 16-bit)
+        // carries read-only capability descriptors a guest must not change:
+        // Multiple Message Capable (bits 3:1), 64-bit Address Capable (bit 7),
+        // Per-Vector Masking Capable (bit 8), and the reserved bits (15:9). Only
+        // MSI Enable (bit 0) and Multiple Message Enable (bits 6:4) are guest-
+        // writable (PCI Local Bus spec §6.8.1). This matters for stealth *and*
+        // correctness: msi_message() reads the 64-bit-capable bit to locate the
+        // Message Data word, so a guest clearing it would misdirect the decode,
+        // and inflating Multiple Message Capable spoofs a vector count the device
+        // doesn't have.
+        let msi_ctrl_ro = (offset < MSI_CAP_OFFSET + 4)
+            && (offset + u16::from(width) > MSI_CAP_OFFSET + 2)
+            && self.read_u8(MSI_CAP_OFFSET) == 0x05;
+        let saved_msi_ctrl = msi_ctrl_ro.then(|| self.read_u16(MSI_CAP_OFFSET + 2));
+
+        // The PM Capabilities register (PMC, PM_CAP_OFFSET + 2) is a wholly
+        // read-only 16-bit descriptor — PM spec version, PME support, the D1/D2
+        // and AUX-current fields are fixed hardware properties (PCI PM spec
+        // §3.2.3). Only the PMCSR power-state register (+4) is guest-writable
+        // (D0..D3 transitions), so it is left alone. Snapshot the whole PMC.
+        let pmc_ro = (offset < PM_CAP_OFFSET + 4)
+            && (offset + u16::from(width) > PM_CAP_OFFSET + 2)
+            && self.read_u8(PM_CAP_OFFSET) == 0x01;
+        let saved_pmc = pmc_ro.then(|| self.read_u16(PM_CAP_OFFSET + 2));
+
+        // The PCI Express Capabilities register (PCIE_CAP_OFFSET + 2) is also a
+        // wholly read-only descriptor: Capability Version (bits 3:0), Device/Port
+        // Type (7:4), Slot Implemented (8), and Interrupt Message Number (13:9)
+        // are all fixed (PCIe Base spec §7.5.3.2). pci_express_version() and
+        // pci_express_device_type() read it, so a guest must not be able to
+        // masquerade as a different version or port type.
+        let pcie_cap_ro = (offset < PCIE_CAP_OFFSET + 4)
+            && (offset + u16::from(width) > PCIE_CAP_OFFSET + 2)
+            && self.read_u8(PCIE_CAP_OFFSET) == 0x10;
+        let saved_pcie_cap = pcie_cap_ro.then(|| self.read_u16(PCIE_CAP_OFFSET + 2));
+
+        // Everything else: write byte by byte, skipping read-only bytes — both
+        // the fixed header registers and each capability's read-only structural
+        // header (ID + next-pointer).
         let bytes = value.to_le_bytes();
         for (i, &b) in bytes.iter().enumerate().take(usize::from(width)) {
             let off = offset + u16::try_from(i).unwrap_or(0);
-            if !Self::byte_is_read_only(off) {
+            if !Self::byte_is_read_only(off) && !self.capability_header_byte_is_read_only(off) {
                 self.write_u8(off, b);
             }
         }
@@ -581,6 +619,25 @@ impl PciConfigSpace {
             self.write_u16(MSIX_CAP_OFFSET + 2, ctrl);
             self.write_u32(MSIX_CAP_OFFSET + 4, table_off);
             self.write_u32(MSIX_CAP_OFFSET + 8, pba_off);
+        }
+
+        // Restore the MSI Message Control read-only bits, keeping only the
+        // guest-writable Enable (bit 0) and Multiple Message Enable (bits 6:4).
+        if let Some(saved_ctrl) = saved_msi_ctrl {
+            const MSI_CTRL_RW: u16 = 0x0071; // bit 0 (Enable) | bits 6:4 (MME)
+            let written = self.read_u16(MSI_CAP_OFFSET + 2);
+            self.write_u16(
+                MSI_CAP_OFFSET + 2,
+                (written & MSI_CTRL_RW) | (saved_ctrl & !MSI_CTRL_RW),
+            );
+        }
+
+        // Restore the wholly-read-only PM PMC and PCIe Capabilities registers.
+        if let Some(pmc) = saved_pmc {
+            self.write_u16(PM_CAP_OFFSET + 2, pmc);
+        }
+        if let Some(pcie_cap) = saved_pcie_cap {
+            self.write_u16(PCIE_CAP_OFFSET + 2, pcie_cap);
         }
     }
 
@@ -602,6 +659,36 @@ impl PciConfigSpace {
             | cfg::REVISION_ID..=cfg::CLASS_CODE   // Revision, ProgIF, Subclass, Class
             | cfg::HEADER_TYPE
             | cfg::SUBSYSTEM_VENDOR_ID..=0x2F) // Subsystem Vendor + Device ID
+    }
+
+    /// Whether `offset` lands on a capability's read-only structural header —
+    /// its Capability ID byte (`+0`) or next-capability pointer (`+1`). Those
+    /// two bytes of every standard capability are fixed: a guest that rewrote
+    /// them would corrupt the very capabilities list its own driver walks (and a
+    /// broken list is itself anomalous). The control/data registers *inside* a
+    /// capability stay writable (and have their own read-only-bit handling).
+    ///
+    /// Walks the list from the capabilities pointer, bounded against a malformed
+    /// or looping list; a no-op when the STATUS capabilities bit is clear.
+    #[must_use]
+    fn capability_header_byte_is_read_only(&self, offset: u16) -> bool {
+        if self.read_u16(cfg::STATUS) & 0x0010 == 0 {
+            return false; // no capabilities list advertised
+        }
+        let mut ptr = self.read_u8(cfg::CAPABILITY_PTR);
+        // At most ~48 capabilities fit in the 0x40..0x100 device region; the
+        // bound also guarantees termination on a looping next-pointer chain.
+        for _ in 0..48 {
+            if ptr < 0x40 {
+                break; // 0 terminates the list; anything below 0x40 is invalid
+            }
+            let cap = u16::from(ptr);
+            if offset == cap || offset == cap + 1 {
+                return true;
+            }
+            ptr = self.read_u8(cap + 1); // follow the next-capability pointer
+        }
+        false
     }
 
     /// Get vendor ID
@@ -1631,6 +1718,104 @@ mod tests {
         assert_eq!(u16::from(next), PM_CAP_OFFSET);
         assert_eq!(cs.read_u8(PM_CAP_OFFSET), 0x01);
         assert_eq!(cs.read_u8(PM_CAP_OFFSET + 1), 0x00, "list terminates");
+    }
+
+    #[test]
+    fn guest_writes_cannot_change_msi_message_control_readonly_bits() {
+        let mut cs = PciConfigSpace::new(PciBdf::new(0, 6, 0), 0x8086, 0x1234);
+        cs.add_msi_capability(); // Message Control = 0x0080 (64-bit cap, MMC=0, disabled)
+
+        // A driver probe-writes all-ones to Message Control. Only Enable (bit 0)
+        // and Multiple Message Enable (bits 6:4) may take; the read-only
+        // descriptors must hold: Multiple Message Capable (bits 3:1) stays 0,
+        // the 64-bit-capable bit (7) stays 1, Per-Vector-Masking (8) stays 0,
+        // and the reserved bits (15:9) stay 0.
+        cs.guest_write(MSI_CAP_OFFSET + 2, 2, 0xFFFF);
+        let ctrl = cs.read_u16(MSI_CAP_OFFSET + 2);
+        assert_eq!(ctrl & 0x0001, 0x0001, "Enable (RW) took");
+        assert_eq!(ctrl & 0x0070, 0x0070, "Multiple Message Enable (RW) took");
+        assert_eq!(ctrl & 0x000E, 0, "Multiple Message Capable (RO) held at 0");
+        assert_eq!(ctrl & 0x0080, 0x0080, "64-bit Address Capable (RO) held");
+        assert_eq!(
+            ctrl & 0xFF00,
+            0,
+            "PVM-capable + reserved bits (RO) held at 0"
+        );
+
+        // The 64-bit decode the message path relies on is therefore unchanged:
+        // a guest cannot clear the 64-bit-capable bit to misdirect msi_message().
+        cs.guest_write(MSI_CAP_OFFSET + 2, 2, 0x0001); // try enable-only, clearing bit 7
+        assert_ne!(
+            cs.read_u16(MSI_CAP_OFFSET + 2) & 0x0080,
+            0,
+            "64-bit-capable bit cannot be cleared by the guest"
+        );
+    }
+
+    #[test]
+    fn guest_writes_cannot_corrupt_the_capability_list_structure() {
+        let mut cs = PciConfigSpace::new(PciBdf::new(0, 6, 0), 0x8086, 0x1234);
+        cs.add_power_management_capability();
+        cs.add_msi_capability(); // head -> MSI(0x60) -> PM(0x50) -> null
+
+        let head = cs.read_u8(cfg::CAPABILITY_PTR);
+        let msi_next = cs.read_u8(MSI_CAP_OFFSET + 1);
+
+        // A guest tries to scribble over both capability headers (ID + next ptr).
+        cs.guest_write(MSI_CAP_OFFSET, 2, 0xFFFF); // MSI cap ID + next ptr
+        cs.guest_write(PM_CAP_OFFSET, 2, 0xFFFF); // PM cap ID + next ptr
+
+        assert_eq!(cs.read_u8(MSI_CAP_OFFSET), 0x05, "MSI cap ID held");
+        assert_eq!(
+            cs.read_u8(MSI_CAP_OFFSET + 1),
+            msi_next,
+            "MSI next ptr held"
+        );
+        assert_eq!(cs.read_u8(PM_CAP_OFFSET), 0x01, "PM cap ID held");
+        assert_eq!(
+            cs.read_u8(PM_CAP_OFFSET + 1),
+            0x00,
+            "PM list still terminates"
+        );
+        // The list is still walkable end to end.
+        assert_eq!(u16::from(head), MSI_CAP_OFFSET);
+        assert_eq!(u16::from(cs.read_u8(MSI_CAP_OFFSET + 1)), PM_CAP_OFFSET);
+    }
+
+    #[test]
+    fn guest_writes_cannot_change_pm_or_pcie_capability_descriptors() {
+        let mut cs = PciConfigSpace::new(PciBdf::new(0, 6, 0), 0x8086, 0x1234);
+        cs.add_power_management_capability(); // PMC = 0x0003 (PM v1.2, no PME)
+        cs.add_pci_express_capability(pcie_type::ROOT_PORT);
+
+        let pmc0 = cs.read_u16(PM_CAP_OFFSET + 2);
+        let pcie0 = cs.read_u16(PCIE_CAP_OFFSET + 2);
+        assert_eq!(pmc0, 0x0003, "PMC default");
+        assert_eq!(cs.pci_express_version(), 2);
+        assert_eq!(cs.pci_express_device_type(), pcie_type::ROOT_PORT);
+
+        // A guest probe-writes all-ones to both read-only descriptor registers.
+        cs.guest_write(PM_CAP_OFFSET + 2, 2, 0xFFFF);
+        cs.guest_write(PCIE_CAP_OFFSET + 2, 2, 0xFFFF);
+
+        assert_eq!(cs.read_u16(PM_CAP_OFFSET + 2), pmc0, "PMC held read-only");
+        assert_eq!(
+            cs.read_u16(PCIE_CAP_OFFSET + 2),
+            pcie0,
+            "PCIe Capabilities register held read-only"
+        );
+        // The version and port type the topology walk reads are unchanged: a
+        // guest cannot masquerade a root port as an endpoint.
+        assert_eq!(cs.pci_express_version(), 2);
+        assert_eq!(cs.pci_express_device_type(), pcie_type::ROOT_PORT);
+
+        // The PMCSR power-state register stays guest-writable (D3hot).
+        cs.guest_write(PM_CAP_OFFSET + 4, 2, 0x0003);
+        assert_eq!(
+            cs.read_u16(PM_CAP_OFFSET + 4) & 0x3,
+            0x3,
+            "D-state writable"
+        );
     }
 
     #[test]

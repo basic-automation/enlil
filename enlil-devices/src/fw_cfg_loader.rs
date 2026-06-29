@@ -289,7 +289,7 @@ impl LoaderExecutor {
         if !stream.len().is_multiple_of(ENTRY_SIZE) {
             return Err(LoaderError::TruncatedStream(stream.len()));
         }
-        for e in stream.chunks_exact(ENTRY_SIZE) {
+        for e in stream.as_chunks::<ENTRY_SIZE>().0 {
             match read_u32(e, 0x00) {
                 COMMAND_ALLOCATE => {
                     // The caller models allocation by pre-placing files; just

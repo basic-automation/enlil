@@ -37,11 +37,11 @@ pub enum DeviceStatus {
 /// Used to complete TX checksum-offload requests.
 fn internet_checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
-    let mut chunks = data.chunks_exact(2);
-    for c in &mut chunks {
+    let (chunks, remainder) = data.as_chunks::<2>();
+    for c in chunks {
         sum += u32::from(u16::from_be_bytes([c[0], c[1]]));
     }
-    if let [last] = chunks.remainder() {
+    if let [last] = remainder {
         sum += u32::from(u16::from_be_bytes([*last, 0]));
     }
     while sum >> 16 != 0 {
