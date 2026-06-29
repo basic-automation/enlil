@@ -1736,7 +1736,11 @@ mod tests {
         assert_eq!(ctrl & 0x0070, 0x0070, "Multiple Message Enable (RW) took");
         assert_eq!(ctrl & 0x000E, 0, "Multiple Message Capable (RO) held at 0");
         assert_eq!(ctrl & 0x0080, 0x0080, "64-bit Address Capable (RO) held");
-        assert_eq!(ctrl & 0xFF00, 0, "PVM-capable + reserved bits (RO) held at 0");
+        assert_eq!(
+            ctrl & 0xFF00,
+            0,
+            "PVM-capable + reserved bits (RO) held at 0"
+        );
 
         // The 64-bit decode the message path relies on is therefore unchanged:
         // a guest cannot clear the 64-bit-capable bit to misdirect msi_message().
@@ -1762,9 +1766,17 @@ mod tests {
         cs.guest_write(PM_CAP_OFFSET, 2, 0xFFFF); // PM cap ID + next ptr
 
         assert_eq!(cs.read_u8(MSI_CAP_OFFSET), 0x05, "MSI cap ID held");
-        assert_eq!(cs.read_u8(MSI_CAP_OFFSET + 1), msi_next, "MSI next ptr held");
+        assert_eq!(
+            cs.read_u8(MSI_CAP_OFFSET + 1),
+            msi_next,
+            "MSI next ptr held"
+        );
         assert_eq!(cs.read_u8(PM_CAP_OFFSET), 0x01, "PM cap ID held");
-        assert_eq!(cs.read_u8(PM_CAP_OFFSET + 1), 0x00, "PM list still terminates");
+        assert_eq!(
+            cs.read_u8(PM_CAP_OFFSET + 1),
+            0x00,
+            "PM list still terminates"
+        );
         // The list is still walkable end to end.
         assert_eq!(u16::from(head), MSI_CAP_OFFSET);
         assert_eq!(u16::from(cs.read_u8(MSI_CAP_OFFSET + 1)), PM_CAP_OFFSET);
@@ -1799,7 +1811,11 @@ mod tests {
 
         // The PMCSR power-state register stays guest-writable (D3hot).
         cs.guest_write(PM_CAP_OFFSET + 4, 2, 0x0003);
-        assert_eq!(cs.read_u16(PM_CAP_OFFSET + 4) & 0x3, 0x3, "D-state writable");
+        assert_eq!(
+            cs.read_u16(PM_CAP_OFFSET + 4) & 0x3,
+            0x3,
+            "D-state writable"
+        );
     }
 
     #[test]

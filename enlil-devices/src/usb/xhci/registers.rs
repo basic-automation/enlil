@@ -722,7 +722,11 @@ mod tests {
         // control bits (R/S, INTE, HSEE, EWE, EU3S, CME) persist; the RW1S
         // command bits (LHCRST/CSS/CRS) and the reserved bits read back 0.
         ops.write_usbcmd(0xFFFF_FFFD); // all bits except HCRST (bit 1)
-        assert_eq!(ops.read(0x00), 0x0000_2C0D, "only sticky control bits persist");
+        assert_eq!(
+            ops.read(0x00),
+            0x0000_2C0D,
+            "only sticky control bits persist"
+        );
         assert!(ops.is_running(), "R/S took");
     }
 
