@@ -602,11 +602,13 @@ impl PciConfigSpace {
             && self.read_u8(PCIE_CAP_OFFSET) == 0x10;
         let saved_pcie_cap = pcie_cap_ro.then(|| self.read_u16(PCIE_CAP_OFFSET + 2));
 
-        // Everything else: write byte by byte, skipping read-only bytes.
+        // Everything else: write byte by byte, skipping read-only bytes — both
+        // the fixed header registers and each capability's read-only structural
+        // header (ID + next-pointer).
         let bytes = value.to_le_bytes();
         for (i, &b) in bytes.iter().enumerate().take(usize::from(width)) {
             let off = offset + u16::try_from(i).unwrap_or(0);
-            if !Self::byte_is_read_only(off) {
+            if !Self::byte_is_read_only(off) && !self.capability_header_byte_is_read_only(off) {
                 self.write_u8(off, b);
             }
         }
@@ -657,6 +659,36 @@ impl PciConfigSpace {
             | cfg::REVISION_ID..=cfg::CLASS_CODE   // Revision, ProgIF, Subclass, Class
             | cfg::HEADER_TYPE
             | cfg::SUBSYSTEM_VENDOR_ID..=0x2F) // Subsystem Vendor + Device ID
+    }
+
+    /// Whether `offset` lands on a capability's read-only structural header —
+    /// its Capability ID byte (`+0`) or next-capability pointer (`+1`). Those
+    /// two bytes of every standard capability are fixed: a guest that rewrote
+    /// them would corrupt the very capabilities list its own driver walks (and a
+    /// broken list is itself anomalous). The control/data registers *inside* a
+    /// capability stay writable (and have their own read-only-bit handling).
+    ///
+    /// Walks the list from the capabilities pointer, bounded against a malformed
+    /// or looping list; a no-op when the STATUS capabilities bit is clear.
+    #[must_use]
+    fn capability_header_byte_is_read_only(&self, offset: u16) -> bool {
+        if self.read_u16(cfg::STATUS) & 0x0010 == 0 {
+            return false; // no capabilities list advertised
+        }
+        let mut ptr = self.read_u8(cfg::CAPABILITY_PTR);
+        // At most ~48 capabilities fit in the 0x40..0x100 device region; the
+        // bound also guarantees termination on a looping next-pointer chain.
+        for _ in 0..48 {
+            if ptr < 0x40 {
+                break; // 0 terminates the list; anything below 0x40 is invalid
+            }
+            let cap = u16::from(ptr);
+            if offset == cap || offset == cap + 1 {
+                return true;
+            }
+            ptr = self.read_u8(cap + 1); // follow the next-capability pointer
+        }
+        false
     }
 
     /// Get vendor ID
@@ -1714,6 +1746,28 @@ mod tests {
             0,
             "64-bit-capable bit cannot be cleared by the guest"
         );
+    }
+
+    #[test]
+    fn guest_writes_cannot_corrupt_the_capability_list_structure() {
+        let mut cs = PciConfigSpace::new(PciBdf::new(0, 6, 0), 0x8086, 0x1234);
+        cs.add_power_management_capability();
+        cs.add_msi_capability(); // head -> MSI(0x60) -> PM(0x50) -> null
+
+        let head = cs.read_u8(cfg::CAPABILITY_PTR);
+        let msi_next = cs.read_u8(MSI_CAP_OFFSET + 1);
+
+        // A guest tries to scribble over both capability headers (ID + next ptr).
+        cs.guest_write(MSI_CAP_OFFSET, 2, 0xFFFF); // MSI cap ID + next ptr
+        cs.guest_write(PM_CAP_OFFSET, 2, 0xFFFF); // PM cap ID + next ptr
+
+        assert_eq!(cs.read_u8(MSI_CAP_OFFSET), 0x05, "MSI cap ID held");
+        assert_eq!(cs.read_u8(MSI_CAP_OFFSET + 1), msi_next, "MSI next ptr held");
+        assert_eq!(cs.read_u8(PM_CAP_OFFSET), 0x01, "PM cap ID held");
+        assert_eq!(cs.read_u8(PM_CAP_OFFSET + 1), 0x00, "PM list still terminates");
+        // The list is still walkable end to end.
+        assert_eq!(u16::from(head), MSI_CAP_OFFSET);
+        assert_eq!(u16::from(cs.read_u8(MSI_CAP_OFFSET + 1)), PM_CAP_OFFSET);
     }
 
     #[test]
