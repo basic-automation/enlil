@@ -3,6 +3,7 @@
 //! Provides direct file I/O for raw disk images (.img, .raw).
 
 use super::StorageBackend;
+use crate::truncate::{Widen, usize_of};
 use anyhow::Result;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
@@ -83,13 +84,22 @@ impl StorageBackend for RawFileBackend {
         if self.readonly {
             anyhow::bail!("backend is read-only");
         }
+        // A fixed-capacity image must not grow. A write at or past the end of the
+        // image writes nothing, and a write spanning the end is clamped to the
+        // bytes that fit — mirroring `MemoryBackend` and a real fixed-size disk,
+        // where an out-of-range sector simply does not exist. Without the clamp,
+        // `write_all` would extend the backing file past the declared capacity.
+        if offset >= self.capacity {
+            return Ok(0);
+        }
+        let to_write = usize_of((self.capacity - offset).min(buf.len().to_u64()));
         let mut file = self.file.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         file.seek(SeekFrom::Start(offset))?;
         // `write_all` loops over short writes so a whole sector is never left
         // partially written.
-        file.write_all(buf)?;
+        file.write_all(&buf[..to_write])?;
         drop(file);
-        Ok(buf.len())
+        Ok(to_write)
     }
 
     fn flush(&self) -> Result<()> {
@@ -162,6 +172,38 @@ mod tests {
         let mut tail = [0xFFu8; 256];
         assert_eq!(backend.read_at(4000, &mut tail).unwrap(), 256); // 4000+256 > 4096
         assert!(tail.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn write_past_capacity_does_not_grow_the_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixed.raw");
+        let path_str = path.to_str().unwrap();
+        let backend = RawFileBackend::create(path_str, 4096).unwrap();
+
+        // A write entirely past the end writes nothing.
+        assert_eq!(backend.write_at(4096, b"oops").unwrap(), 0);
+        // A write spanning the end is clamped to the bytes that fit (4096 - 4000).
+        let data = [0xABu8; 256];
+        assert_eq!(backend.write_at(4000, &data).unwrap(), 96);
+        backend.flush().unwrap();
+
+        // The backing file is still exactly the declared capacity — not grown.
+        let len = std::fs::metadata(path_str).unwrap().len();
+        assert_eq!(len, 4096, "a fixed-capacity image must not grow");
+        assert_eq!(backend.capacity(), 4096);
+    }
+
+    #[test]
+    fn clamped_write_persists_the_bytes_that_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clamp.raw");
+        let backend = RawFileBackend::create(path.to_str().unwrap(), 16).unwrap();
+        let data = [0x5Au8; 32];
+        assert_eq!(backend.write_at(8, &data).unwrap(), 8); // only 8 fit
+        let mut buf = [0u8; 8];
+        assert_eq!(backend.read_at(8, &mut buf).unwrap(), 8);
+        assert!(buf.iter().all(|&b| b == 0x5A), "the fitting bytes persist");
     }
 
     #[test]
