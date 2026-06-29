@@ -150,7 +150,7 @@ high-confidence-unattended-safe:
    go (a partial version is worse than none).
 
 ### PR
-(filled in below once opened)
+https://github.com/physics515/enlil/pull/44
 
 ## 2026-06-28 — Session: complete the IA32_TSC_DEADLINE run-loop path end-to-end + the platform-clock cadence + CPUID/LAPIC/HPET capability-consistency fixes (Phases 3 & 5)
 
