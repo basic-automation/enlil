@@ -127,7 +127,7 @@ PCI/sysfs enumeration, and add the remaining config validations (duplicate guest
 `management_port` sanity).
 
 ### PR
-_(to be filled in after the PR is opened)_
+https://github.com/physics515/enlil/pull/43
 
 
 ## 2026-06-28 — Session: complete the IA32_TSC_DEADLINE run-loop path end-to-end + the platform-clock cadence + CPUID/LAPIC/HPET capability-consistency fixes (Phases 3 & 5)
