@@ -60,6 +60,13 @@ impl NetFeatures {
     /// Default features offered by our device. The control virtqueue
     /// (`CTRL_VQ`) plus the RX-mode and VLAN control classes let a guest manage
     /// promiscuous mode, MAC filters, and VLAN filtering at runtime.
+    ///
+    /// `VERSION_1` is mandatory: the virtio transport advertises modern
+    /// `virtio-mmio` (VERSION = 2), and the `VirtIO` 1.2 spec (§6.1) requires a
+    /// modern device to offer `VIRTIO_F_VERSION_1`. The Linux `virtio-mmio`
+    /// driver enforces this — a version-2 device that does not provide the bit
+    /// fails `FEATURES_OK` with `-EINVAL`, so without it the NIC never comes up
+    /// in a modern guest.
     pub const DEFAULT: u64 = Self::MAC
         | Self::STATUS
         | Self::MTU
@@ -69,7 +76,8 @@ impl NetFeatures {
         | Self::CTRL_GUEST_OFFLOADS
         | Self::CTRL_VQ
         | Self::CTRL_RX
-        | Self::CTRL_VLAN;
+        | Self::CTRL_VLAN
+        | Self::VERSION_1;
 
     /// Create from raw bits.
     #[must_use]
@@ -158,6 +166,16 @@ mod tests {
         assert!(f.contains(NetFeatures::CSUM));
         assert!(f.contains(NetFeatures::GUEST_CSUM));
         assert!(!f.contains(NetFeatures::HOST_TSO4));
+    }
+
+    #[test]
+    fn default_offers_virtio_version_1() {
+        // A modern virtio-mmio (VERSION 2) device must offer VIRTIO_F_VERSION_1,
+        // or the Linux driver rejects it at FEATURES_OK. It lives in the upper
+        // 32-bit feature word (bit 32), so confirm it survives the high-word split.
+        let f = NetFeatures::default();
+        assert!(f.contains(NetFeatures::VERSION_1));
+        assert_ne!(f.bits() >> 32, 0, "VERSION_1 must be set in the high word");
     }
 
     #[test]

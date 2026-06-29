@@ -6,6 +6,130 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-28 (second run, `-2`) — Session: device-model conformance/transparency fixes + config-validation hardening + real host hardware detection (Phases 0, 1, 3, 5)
+
+**8 tested code increments + 1 doc-accuracy fix + 1 `cargo fmt`, each independently
+green and committed** (branch `routine/enlil-2026-06-28-2`). Wall-clock ~20:32→~23:25
+CDT (~2h50m; WSL test/clippy and the Windows-native build overlapped in the
+background for every increment).
+
+**SAME-DAY RERUN, NOT A COLLISION.** This is the *second* routine run of 2026-06-28.
+The first run's PR (#42) had already **merged to `master`** before this run started;
+I branched off the merged `master`, so this is the documented `-2` same-day rerun, not
+an in-flight collision. None of tonight's increments touch the KVM/run-loop code that
+PR #42 landed.
+
+### Increments (commit — what)
+1. `06f820f` — **SMBIOS Type 2 contained-handle-count byte (offset `0x0E`).** The
+   Baseboard structure declared `Length=15` but emitted only 14 formatted bytes, so a
+   DMI parser read the first string byte as the count and shifted the whole string set
+   (baseboard manufacturer parsed as "SUSTeK …" not "ASUSTeK …"). Same defect class
+   already fixed for Type 3/Type 4. +1 test (extends `smbios_structure_lengths_match…`).
+   (enlil-devices)
+2. `8a0578c` — **Persist `PM1_CNT` `SLP_TYP` read/write (ACPI conformance).** The PM1
+   Control register masked `SLP_TYP` (bits 10-12) out of storage, so a guest that
+   programmed and read it back saw 0 — a guest-visible non-conformance/tell. ACPI marks
+   `SLP_TYP` R/W; ICH9/QEMU retain it. Drop it from the exclusion mask (keep only the
+   write-only `SLP_EN` masked); the one-shot sleep capture is unchanged. +1 test (renamed
+   `sci_en_and_slp_typ_persist_but_slp_en_is_write_only`). (enlil-devices)
+3. `acc9092` — **Config: validate guest memory against the pinned host total.**
+   `total_memory_mb` (0 = auto-detect) was only checked against a 256GB cap, never
+   against itself; flag a config whose guests + reserve exceed it. +3 tests. (enlil-config)
+4. `0b26f38` — **Config: validate `log_level` and serial `output`.** Both fields
+   enumerate valid values in the schema docs but nothing enforced them; reject anything
+   outside `{trace,debug,info,warn,error}` (case-insensitive) and
+   `{stdout,pty,null,file:<path>}`. +5 tests. (enlil-config)
+5. `0cc9b9e` — **Config: reject a writable disk image shared by multiple mounts.** Same
+   path mounted ≥2× (across guests or twice in one guest) with any writable handle
+   corrupts; read-only sharing stays allowed. +3 tests. (enlil-config)
+6. `f20afe7` — **virtio-net: offer `VIRTIO_F_VERSION_1`.** The transport advertises
+   modern `virtio-mmio` (VERSION=2), but `NetFeatures::DEFAULT` never set bit 32. VirtIO
+   1.2 §6.1 + Linux `vm_finalize_features` require it — a version-2 device without it
+   fails `FEATURES_OK` (`-EINVAL`) and the NIC never comes up. +1 test. (enlil-devices)
+7. `8c52fb4` — **doc:** fix a stale `virtio_net_config` comment claiming MTU isn't
+   offered (it is; `self.mtu` is serialized). Doc-only; behavior already tested.
+   (enlil-devices)
+8. `371eaf3` — **storage: clamp `RawFileBackend` writes to capacity.** A write past the
+   end silently grew a fixed-capacity raw image; `MemoryBackend`/`QcowBackend` already
+   clamp. Write at/past end → `Ok(0)`; spanning the end → clamp to what fits. +2 tests.
+   (enlil-devices)
+9. `ad4054b` — **setup: detect real CPU count + RAM on Linux.** `detect_hardware_linux`
+   was a TODO returning the dev stub; now reads `/proc/cpuinfo` (logical CPUs) and
+   `/proc/meminfo` (`MemTotal`), falling back to the stub on any error. Device lists
+   (GPU/NVMe/USB/IOMMU) still need PCI/sysfs walking and stay stubbed. Verified
+   end-to-end on WSL (reports the host 12 CPUs / 64307 MB, matching `/proc`). +2 pure-
+   parser tests; decoupled `wizard_allocations_fit_hardware` from the live host.
+   (enlil-setup)
+10. `2d0fe6b` — **`cargo fmt`** (wrap long lines in the new validate/chipset/smbios code).
+
+### Research (informed the build)
+Primary specs only — no new external literature (conformance/transparency + tooling):
+SMBIOS 3.x (Type 2 min length `0x0F`, offset `0x0E` = Number of Contained Object
+Handles); ACPI PM1 Control (`SLP_TYPx` read/write — cross-checked QEMU `hw/acpi`, which
+masks only `SLP_EN`, and the ICH9 datasheet); VirtIO 1.2 §6.1 + Linux
+`drivers/virtio/virtio_mmio.c` `vm_finalize_features` (version-2 mmio must provide
+`VIRTIO_F_VERSION_1`); the `StorageBackend` capacity contract (Memory/Qcow backends
+clamp, Raw was the outlier); and the enlil-config schema doc strings (valid log levels /
+serial sinks). Survey-only (found mature, no change): RTC MC146818 (UIP genuinely not
+cleanly modelable without sub-second time; VRT already set), ACPI table builders, PM
+timer, SMBus i801, 8259 PIC, PC speaker port 0x61, stealth CPUID, mgmt protocol codec,
+qcow backend, platform time layer.
+
+### Test results (exact)
+- **`/dev/kvm`: read-writable at start and throughout (`KVM_RW_OK`).** The KVM /
+  guest-boot tests **ran for real, none skipped** — verified with `cargo test -p
+  enlil-core -- --nocapture` (`KVM_SKIP_LINES=0`). Confirmed-passing guest-boot tests
+  include `protected_mode_guest_writes_the_high_lapic_mmio_page`,
+  `run_loop_guest_programs_and_fires_its_lapic_timer_through_the_aperture`,
+  `run_loop_guest_programs_the_ioapic_rte_through_the_aperture`,
+  `run_loop_guest_sends_an_ipi_to_another_vcpu_through_the_aperture`,
+  `run_loop_guest_eoi_retriggers_a_held_level_line_through_the_lapic_aperture`,
+  `run_loop_guest_arms_and_fires_a_tsc_deadline_timer_via_the_msr`,
+  `run_loop_advance_platform_clocks_drives_the_lapic_timer_from_cycles`,
+  `run_real_mode_reboots_on_a_cf9_reset`, the SMP per-vCPU PMC/APERF tests, and the
+  `kvm_backend` MSR/TSC/PMU/LBR forwarding tests. **No increment this session touched
+  the KVM/run-loop code** (changes were in device-model, config, and setup crates), so
+  the guest-boot path is unchanged from PR #42 — these confirm no regression.
+- **Full workspace CI-parity** (the `.github/workflows/ci.yml` commands):
+  `cargo fmt --all -- --check` → clean; `cargo clippy --all-targets --workspace -- -D
+  warnings` → clean; `cargo test --workspace` → **0 failures**. **enlil-core lib 231**,
+  **enlil-devices lib 929** (was 926; +3), **enlil-config 14** (was 3; +11),
+  **enlil-setup 9** (was 7; +2), enlil-mgmt 12, others unchanged. 1 ignored (the
+  pre-existing `interrupt::line` doc-test).
+- **Toolchains.** Every increment built on **Linux/WSL** (nightly
+  `x86_64-unknown-linux-gnu`) AND **Windows-native** (`x86_64-pc-windows-msvc`,
+  `cargo build -p <crate>` against the WSL manifest with a Windows target-dir) — **exit
+  0** each. enlil-setup's real-detection code is `target_os = "linux"`-gated; the Windows
+  build exercised its stub path (exit 0). No `no_std`/UEFI crate was touched, so no
+  `x86_64-unknown-enlil` / UEFI payload build was required.
+
+### STOP REASON
+**Genuine scarcity of cleanly-tractable, unattended-safe, high-confidence work — not the
+wall-clock budget (~2h50m of the 3–4h window).** After landing every well-specified gap
+I found across the device-emulation layer (SMBIOS, chipset/ACPI-PM, RTC, SMBus, 8259
+PIC, PC speaker, stealth CPUID, virtio-net, the three storage backends, PM timer) and
+the std tooling crates (config, mgmt protocol, setup), the remaining high-value work is
+architectural / not late-night-safe — the same items the prior 2026-06-28 (PR #42)
+session flagged: **cross-vendor CPUID identity** (vendor string + FMS + brand leaves +
+feature-flag mask must land together; a half-done version is worse than none), a
+**driven run-loop** (needs the immediate-exit watchdog + guest IDT), **qcow2
+refcount-table growth** (image-corruption risk), and **HPET per-timer 32-bit mode**
+(wrap-edge logic). Stopping on real scarcity after a broad survey, not on a hunch.
+`master` stays buildable (green per increment).
+
+### Next step
+Carry over PR #42's recommendation: the **cross-vendor CPUID identity** pass — install
+the table's leaf-0 vendor string, leaf-1 family/model/stepping, and brand leaves
+`0x8000_0002`–`4` in `apply_topology_stealth` *together with* a coherent feature-flag
+mask, so an Intel-presented-on-AMD guest is fully consistent (awake-design). Lower-risk
+nightly alternatives: extend tonight's enlil-setup detection to GPUs/NVMe/IOMMU via
+PCI/sysfs enumeration, and add the remaining config validations (duplicate guest names,
+`management_port` sanity).
+
+### PR
+https://github.com/physics515/enlil/pull/43
+
+
 ## 2026-06-28 — Session: complete the IA32_TSC_DEADLINE run-loop path end-to-end + the platform-clock cadence + CPUID/LAPIC/HPET capability-consistency fixes (Phases 3 & 5)
 
 **7 tested code increments + 1 docs + 1 `cargo fmt`, each independently green and
