@@ -44,6 +44,18 @@ pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
             "Total memory {total_with_hypervisor}MB exceeds 256GB sanity limit"
         ));
     }
+    // When the host total is pinned (non-zero; 0 means auto-detect), the guests
+    // plus the hypervisor reservation must actually fit in it — otherwise the
+    // configuration overcommits RAM the host does not have and a guest is starved
+    // or fails to map its memory at start.
+    let host_total = config.hypervisor.total_memory_mb;
+    if host_total > 0 && total_with_hypervisor > host_total {
+        errors.push(format!(
+            "Total memory {total_with_hypervisor}MB (guests {total_guest_memory}MB + \
+             hypervisor reserve {}MB) exceeds host total_memory_mb={host_total}MB",
+            config.hypervisor.reserved_memory_mb
+        ));
+    }
 
     // Check each guest has at least some memory
     for (id, guest) in &config.guest {
@@ -130,5 +142,39 @@ mod tests {
         config.guest.get_mut("vm1").unwrap().memory_mb = 0;
         let errors = validate_config(&config);
         assert!(errors.iter().any(|e| e.contains("cannot be 0")));
+    }
+
+    #[test]
+    fn detects_memory_overcommit_against_pinned_host_total() {
+        let mut config = minimal_config();
+        // vm1 needs 2048MB; with the 512MB default reserve that is 2560MB. Pin the
+        // host total below that so the guests no longer fit.
+        config.hypervisor.total_memory_mb = 2048;
+        let errors = validate_config(&config);
+        assert!(
+            errors.iter().any(|e| e.contains("exceeds host total_memory_mb")),
+            "expected an overcommit error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn host_total_zero_means_auto_detect_and_does_not_overcommit() {
+        let mut config = minimal_config();
+        // 0 is the auto-detect sentinel: no overcommit check should fire.
+        config.hypervisor.total_memory_mb = 0;
+        let errors = validate_config(&config);
+        assert!(
+            !errors.iter().any(|e| e.contains("exceeds host total_memory_mb")),
+            "auto-detect host total must not trigger an overcommit error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn guests_that_fit_the_pinned_host_total_pass() {
+        let mut config = minimal_config();
+        // 2048 (guest) + 512 (reserve) = 2560; a 4096MB host has room.
+        config.hypervisor.total_memory_mb = 4096;
+        let errors = validate_config(&config);
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
     }
 }
