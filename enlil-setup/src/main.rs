@@ -66,8 +66,45 @@ pub fn detect_hardware() -> HardwareInfo {
 
 #[cfg(target_os = "linux")]
 fn detect_hardware_linux() -> HardwareInfo {
-    // TODO: read /proc/cpuinfo, /proc/meminfo, /sys/class/drm, etc.
-    detect_hardware_stub()
+    // Start from the stub and overlay whatever we can read for real. CPU count
+    // and RAM come straight from procfs; the device lists (GPU/NVMe/USB/IOMMU)
+    // still need PCI/sysfs walking and stay stubbed for now.
+    let mut hw = detect_hardware_stub();
+    if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo")
+        && let Some(n) = count_cpus_from_cpuinfo(&cpuinfo)
+    {
+        hw.cpus = n;
+    }
+    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo")
+        && let Some(mb) = parse_meminfo_total_mb(&meminfo)
+    {
+        hw.ram_mb = mb;
+    }
+    hw
+}
+
+/// Total RAM in MB parsed from the contents of `/proc/meminfo`. The `MemTotal`
+/// line reports kibibytes; returns `None` if the line is absent or unparsable.
+#[cfg(any(target_os = "linux", test))]
+fn parse_meminfo_total_mb(meminfo: &str) -> Option<u64> {
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb / 1024);
+        }
+    }
+    None
+}
+
+/// Count logical CPUs from the contents of `/proc/cpuinfo` — one `processor`
+/// line per logical CPU. Returns `None` when no such line is present.
+#[cfg(any(target_os = "linux", test))]
+fn count_cpus_from_cpuinfo(cpuinfo: &str) -> Option<usize> {
+    let n = cpuinfo
+        .lines()
+        .filter(|l| l.starts_with("processor") && l.contains(':'))
+        .count();
+    (n > 0).then_some(n)
 }
 
 fn detect_hardware_stub() -> HardwareInfo {
@@ -219,12 +256,38 @@ mod tests {
 
     #[test]
     fn wizard_allocations_fit_hardware() {
-        let hw = detect_hardware();
+        // The Phase-0 wizard returns a fixed example sized for a 16-CPU / 64 GB
+        // box, so check its allocations against that inventory rather than the
+        // live host — detect_hardware now returns the real CPU/RAM on Linux,
+        // which need not be that large.
+        let hw = HardwareInfo {
+            cpus: 16,
+            ram_mb: 65536,
+            gpus: vec![],
+            nvme_drives: vec![],
+            usb_controllers: vec![],
+            iommu_groups: vec![],
+        };
         let config = run_wizard(&hw);
         let guest_cpus: usize = config.guests.iter().map(|g| g.cpus).sum();
         let guest_ram: u64 = config.guests.iter().map(|g| g.ram_mb).sum();
         assert!(config.host_cpus + guest_cpus <= hw.cpus);
         assert!(config.host_ram_mb + guest_ram <= hw.ram_mb);
+    }
+
+    #[test]
+    fn parses_memtotal_from_meminfo() {
+        let sample = "MemTotal:       65536000 kB\nMemFree:         1000 kB\n";
+        assert_eq!(parse_meminfo_total_mb(sample), Some(64000));
+        // No MemTotal line → None.
+        assert_eq!(parse_meminfo_total_mb("MemFree: 10 kB"), None);
+    }
+
+    #[test]
+    fn counts_logical_cpus_from_cpuinfo() {
+        let sample = "processor\t: 0\nvendor_id\t: X\n\nprocessor\t: 1\nvendor_id\t: X\n";
+        assert_eq!(count_cpus_from_cpuinfo(sample), Some(2));
+        assert_eq!(count_cpus_from_cpuinfo("no cpus here"), None);
     }
 
     #[test]
