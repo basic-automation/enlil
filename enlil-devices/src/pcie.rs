@@ -566,6 +566,21 @@ impl PciConfigSpace {
             )
         });
 
+        // Likewise the MSI Message Control register (MSI_CAP_OFFSET + 2, 16-bit)
+        // carries read-only capability descriptors a guest must not change:
+        // Multiple Message Capable (bits 3:1), 64-bit Address Capable (bit 7),
+        // Per-Vector Masking Capable (bit 8), and the reserved bits (15:9). Only
+        // MSI Enable (bit 0) and Multiple Message Enable (bits 6:4) are guest-
+        // writable (PCI Local Bus spec §6.8.1). This matters for stealth *and*
+        // correctness: msi_message() reads the 64-bit-capable bit to locate the
+        // Message Data word, so a guest clearing it would misdirect the decode,
+        // and inflating Multiple Message Capable spoofs a vector count the device
+        // doesn't have.
+        let msi_ctrl_ro = (offset < MSI_CAP_OFFSET + 4)
+            && (offset + u16::from(width) > MSI_CAP_OFFSET + 2)
+            && self.read_u8(MSI_CAP_OFFSET) == 0x05;
+        let saved_msi_ctrl = msi_ctrl_ro.then(|| self.read_u16(MSI_CAP_OFFSET + 2));
+
         // Everything else: write byte by byte, skipping read-only bytes.
         let bytes = value.to_le_bytes();
         for (i, &b) in bytes.iter().enumerate().take(usize::from(width)) {
@@ -581,6 +596,17 @@ impl PciConfigSpace {
             self.write_u16(MSIX_CAP_OFFSET + 2, ctrl);
             self.write_u32(MSIX_CAP_OFFSET + 4, table_off);
             self.write_u32(MSIX_CAP_OFFSET + 8, pba_off);
+        }
+
+        // Restore the MSI Message Control read-only bits, keeping only the
+        // guest-writable Enable (bit 0) and Multiple Message Enable (bits 6:4).
+        if let Some(saved_ctrl) = saved_msi_ctrl {
+            const MSI_CTRL_RW: u16 = 0x0071; // bit 0 (Enable) | bits 6:4 (MME)
+            let written = self.read_u16(MSI_CAP_OFFSET + 2);
+            self.write_u16(
+                MSI_CAP_OFFSET + 2,
+                (written & MSI_CTRL_RW) | (saved_ctrl & !MSI_CTRL_RW),
+            );
         }
     }
 
@@ -1631,6 +1657,34 @@ mod tests {
         assert_eq!(u16::from(next), PM_CAP_OFFSET);
         assert_eq!(cs.read_u8(PM_CAP_OFFSET), 0x01);
         assert_eq!(cs.read_u8(PM_CAP_OFFSET + 1), 0x00, "list terminates");
+    }
+
+    #[test]
+    fn guest_writes_cannot_change_msi_message_control_readonly_bits() {
+        let mut cs = PciConfigSpace::new(PciBdf::new(0, 6, 0), 0x8086, 0x1234);
+        cs.add_msi_capability(); // Message Control = 0x0080 (64-bit cap, MMC=0, disabled)
+
+        // A driver probe-writes all-ones to Message Control. Only Enable (bit 0)
+        // and Multiple Message Enable (bits 6:4) may take; the read-only
+        // descriptors must hold: Multiple Message Capable (bits 3:1) stays 0,
+        // the 64-bit-capable bit (7) stays 1, Per-Vector-Masking (8) stays 0,
+        // and the reserved bits (15:9) stay 0.
+        cs.guest_write(MSI_CAP_OFFSET + 2, 2, 0xFFFF);
+        let ctrl = cs.read_u16(MSI_CAP_OFFSET + 2);
+        assert_eq!(ctrl & 0x0001, 0x0001, "Enable (RW) took");
+        assert_eq!(ctrl & 0x0070, 0x0070, "Multiple Message Enable (RW) took");
+        assert_eq!(ctrl & 0x000E, 0, "Multiple Message Capable (RO) held at 0");
+        assert_eq!(ctrl & 0x0080, 0x0080, "64-bit Address Capable (RO) held");
+        assert_eq!(ctrl & 0xFF00, 0, "PVM-capable + reserved bits (RO) held at 0");
+
+        // The 64-bit decode the message path relies on is therefore unchanged:
+        // a guest cannot clear the 64-bit-capable bit to misdirect msi_message().
+        cs.guest_write(MSI_CAP_OFFSET + 2, 2, 0x0001); // try enable-only, clearing bit 7
+        assert_ne!(
+            cs.read_u16(MSI_CAP_OFFSET + 2) & 0x0080,
+            0,
+            "64-bit-capable bit cannot be cleared by the guest"
+        );
     }
 
     #[test]
