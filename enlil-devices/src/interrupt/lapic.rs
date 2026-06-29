@@ -62,6 +62,13 @@ const LVT_LINT_WRITE_MASK: u32 = 0x0001_A7FF;
 /// LVT Error (`0x370`): Vector [7:0], Mask [16] (delivery mode is fixed).
 const LVT_ERROR_WRITE_MASK: u32 = 0x0001_00FF;
 
+/// Writable bits of the Spurious-Interrupt-Vector Register (`0x0F0`, Intel SDM
+/// Vol.3 Figure 10-23): Spurious Vector [7:0], APIC Software Enable [8], and
+/// Focus Processor Checking [9]. Bit 12 (EOI-Broadcast Suppression) is reserved
+/// here because the version register does not advertise it (bit 24 clear); the
+/// remaining bits are reserved and must read back 0.
+const SVR_WRITE_MASK: u32 = 0x0000_03FF;
+
 /// MSR number of `IA32_TSC_DEADLINE` (Intel SDM Vol.3 §10.5.4.1).
 ///
 /// The per-logical-processor register a guest writes to arm the LAPIC
@@ -322,7 +329,7 @@ impl LocalApic {
             LAPIC_LDR => self.ldr = value & 0xFF00_0000,
             LAPIC_DFR => self.dfr = value | 0x0FFF_FFFF,
             LAPIC_SVR => {
-                self.svr = value;
+                self.svr = value & SVR_WRITE_MASK;
                 self.enabled = (value & 0x100) != 0;
             }
             LAPIC_EOI => self.handle_eoi(),
@@ -761,6 +768,17 @@ mod tests {
         // A normal programming (vector 0x40, periodic, unmasked) is untouched.
         lapic.write_register(LAPIC_LVT_TIMER, 0x40 | (1 << 17));
         assert_eq!(lapic.read_register(LAPIC_LVT_TIMER), 0x40 | (1 << 17));
+    }
+
+    #[test]
+    fn svr_write_masks_reserved_bits() {
+        let mut lapic = LocalApic::new(0);
+        // All-ones: vector + APIC-enable + focus-checking take; the rest
+        // (incl. EOI-broadcast-suppression, unadvertised in the version reg)
+        // read back 0.
+        lapic.write_register(LAPIC_SVR, 0xFFFF_FFFF);
+        assert_eq!(lapic.read_register(LAPIC_SVR), 0x0000_03FF);
+        assert!(lapic.is_enabled(), "APIC software-enable bit still took");
     }
 
     #[test]
