@@ -458,10 +458,18 @@ impl OperationalRegisters {
 
     /// Write to USBCMD. Handles Run/Stop and HCRST.
     pub fn write_usbcmd(&mut self, value: u32) {
+        // Persist only the writable control bits that stick (xHCI 1.2 §5.4.1):
+        // R/S [0], INTE [2], HSEE [3], EWE [10], EU3S [11], CME [13]. The
+        // command bits HCRST [1] / LHCRST [7] / CSS [8] / CRS [9] are RW1S that
+        // the controller clears once the action completes (instantaneous in this
+        // model, so they read back 0); bits [6:4], [12] and [31:14] are
+        // reserved. Storing the raw value let a guest read back reserved bits
+        // and latched command bits that never clear -- both tells.
+        const USBCMD_PERSIST_MASK: u32 = 0x0000_2C0D;
         let was_running = self.is_running();
-        self.usbcmd = value;
+        self.usbcmd = value & USBCMD_PERSIST_MASK;
 
-        // HCRST (bit 1): host controller reset
+        // HCRST (bit 1): host controller reset (decoded from the raw write).
         if value & 2 != 0 {
             self.reset();
             return;
@@ -705,6 +713,17 @@ mod tests {
         assert_eq!(ops.config, 0);
         assert_eq!(ops.dcbaap, 0);
         assert!(ops.is_halted());
+    }
+
+    #[test]
+    fn usbcmd_persists_only_sticky_control_bits() {
+        let mut ops = OperationalRegisters::new(4);
+        // A guest writes all-ones (but not HCRST, tested separately): the sticky
+        // control bits (R/S, INTE, HSEE, EWE, EU3S, CME) persist; the RW1S
+        // command bits (LHCRST/CSS/CRS) and the reserved bits read back 0.
+        ops.write_usbcmd(0xFFFF_FFFD); // all bits except HCRST (bit 1)
+        assert_eq!(ops.read(0x00), 0x0000_2C0D, "only sticky control bits persist");
+        assert!(ops.is_running(), "R/S took");
     }
 
     #[test]
