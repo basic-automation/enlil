@@ -413,6 +413,14 @@ impl SmbiosBuilder {
         header.extend_from_slice(&3u16.to_le_bytes()); // Type 3 handle
         // Board Type: Motherboard
         header.push(0x0A);
+        // Number of Contained Object Handles (offset 0x0E). SMBIOS 2.x defines the
+        // Type 2 formatted area through this byte (minimum Length 0x0F = 15); the
+        // variable-length contained-handle list follows it. With no contained
+        // objects this is 0 — but the byte itself is mandatory, so omitting it left
+        // the formatted area one byte short of the declared Length=15 and shifted
+        // the string set (a DMI parser would read the first string's first byte as
+        // this count). Same defect class as the old Type 3 / Type 4 short-area bugs.
+        header.push(0);
 
         append_strings(
             &mut header,
@@ -861,6 +869,22 @@ mod tests {
         // the same end-to-end check dmidecode performs.
         let data = SmbiosBuilder::new(SmbiosConfig::default()).build_structures();
         let structs = walk(&data);
+
+        // Type 2 (Baseboard): the formatted area runs through the mandatory
+        // "Number of Contained Object Handles" byte at offset 0x0E, so Length is 15
+        // and string #1 is the full baseboard manufacturer. Omitting that byte left
+        // Length=15 over a 14-byte area, so the manufacturer parsed one char short
+        // ("SUSTeK …" instead of "ASUSTeK …").
+        let t2 = structs
+            .iter()
+            .find(|(t, ..)| *t == 2)
+            .expect("Type 2 present");
+        assert_eq!(t2.1, 15, "Type 2 Length is 15 (includes the contained-handle-count byte)");
+        assert_eq!(
+            t2.2.first().map(String::as_str),
+            Some("ASUSTeK COMPUTER INC."),
+            "Type 2 string table must not be shifted by a short formatted area"
+        );
 
         // Type 3 (System Enclosure): first string is the manufacturer "Default
         // string" — a one-byte-short formatted area used to yield "efault string".
