@@ -879,7 +879,10 @@ mod tests {
             .iter()
             .find(|(t, ..)| *t == 2)
             .expect("Type 2 present");
-        assert_eq!(t2.1, 15, "Type 2 Length is 15 (includes the contained-handle-count byte)");
+        assert_eq!(
+            t2.1, 15,
+            "Type 2 Length is 15 (includes the contained-handle-count byte)"
+        );
         assert_eq!(
             t2.2.first().map(String::as_str),
             Some("ASUSTeK COMPUTER INC."),

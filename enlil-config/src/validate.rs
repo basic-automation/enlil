@@ -85,7 +85,10 @@ pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
     // The hypervisor log level must be one of the documented levels (matched
     // case-insensitively, like the `log` crate's own filter parser).
     let level = config.hypervisor.log_level.trim();
-    if !VALID_LOG_LEVELS.iter().any(|v| level.eq_ignore_ascii_case(v)) {
+    if !VALID_LOG_LEVELS
+        .iter()
+        .any(|v| level.eq_ignore_ascii_case(v))
+    {
         errors.push(format!(
             "Hypervisor log_level '{level}' is not one of trace, debug, info, warn, error"
         ));
@@ -114,7 +117,9 @@ pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
     let mut mounts: HashMap<&Path, (usize, bool, Vec<&str>)> = HashMap::new();
     for (id, guest) in &config.guest {
         for disk in &guest.disks {
-            let entry = mounts.entry(disk.path.as_path()).or_insert((0, false, Vec::new()));
+            let entry = mounts
+                .entry(disk.path.as_path())
+                .or_insert((0, false, Vec::new()));
             entry.0 += 1;
             entry.1 |= !disk.readonly;
             entry.2.push(id.as_str());
@@ -208,7 +213,9 @@ mod tests {
         config.hypervisor.total_memory_mb = 2048;
         let errors = validate_config(&config);
         assert!(
-            errors.iter().any(|e| e.contains("exceeds host total_memory_mb")),
+            errors
+                .iter()
+                .any(|e| e.contains("exceeds host total_memory_mb")),
             "expected an overcommit error, got: {errors:?}"
         );
     }
@@ -220,7 +227,9 @@ mod tests {
         config.hypervisor.total_memory_mb = 0;
         let errors = validate_config(&config);
         assert!(
-            !errors.iter().any(|e| e.contains("exceeds host total_memory_mb")),
+            !errors
+                .iter()
+                .any(|e| e.contains("exceeds host total_memory_mb")),
             "auto-detect host total must not trigger an overcommit error: {errors:?}"
         );
     }
@@ -308,9 +317,10 @@ mod tests {
             readonly: false,
         };
         config.guest.get_mut("vm1").unwrap().disks = vec![shared.clone()];
-        config
-            .guest
-            .insert("vm2".into(), guest_with_disks("VM2", vec![2, 3], vec![shared]));
+        config.guest.insert(
+            "vm2".into(),
+            guest_with_disks("VM2", vec![2, 3], vec![shared]),
+        );
         let errors = validate_config(&config);
         assert!(
             errors.iter().any(|e| e.contains("writable handle")),
@@ -326,9 +336,10 @@ mod tests {
             readonly: true,
         };
         config.guest.get_mut("vm1").unwrap().disks = vec![shared.clone()];
-        config
-            .guest
-            .insert("vm2".into(), guest_with_disks("VM2", vec![2, 3], vec![shared]));
+        config.guest.insert(
+            "vm2".into(),
+            guest_with_disks("VM2", vec![2, 3], vec![shared]),
+        );
         let errors = validate_config(&config);
         assert!(
             !errors.iter().any(|e| e.contains("writable handle")),

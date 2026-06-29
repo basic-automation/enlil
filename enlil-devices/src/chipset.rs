@@ -652,7 +652,11 @@ mod tests {
         pm1.pio_write(PM1_CNT_PORT, 2, (5 << 10) | 1);
         assert_eq!(pm1.take_sleep(), None, "no SLP_EN, no transition");
         let cnt = pm1.pio_read(PM1_CNT_PORT, 2);
-        assert_eq!((cnt >> 10) & 0x7, 5, "SLP_TYP reads back the programmed value");
+        assert_eq!(
+            (cnt >> 10) & 0x7,
+            5,
+            "SLP_TYP reads back the programmed value"
+        );
         assert_eq!(cnt & 1, 1, "SCI_EN still set");
         assert_eq!(cnt & (1 << 13), 0, "SLP_EN is write-only and reads 0");
     }
