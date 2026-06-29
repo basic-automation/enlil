@@ -58,6 +58,15 @@ pub struct SmbiosConfig {
     pub baseboard_serial: String,
     /// Processor brand string (from CPUID leaf 0x80000002-4)
     pub cpu_brand: String,
+    /// Processor signature — CPUID leaf 1 `EAX` (family/model/stepping). Emitted
+    /// as the first DWORD of the Type 4 "Processor ID" field. Real x86 silicon
+    /// always reports a non-zero signature here; an all-zero Processor ID is a
+    /// blatant VM tell that Windows and `dmidecode` both surface.
+    pub cpu_signature: u32,
+    /// Processor feature flags — CPUID leaf 1 `EDX`. Emitted as the second DWORD
+    /// of the Type 4 "Processor ID" field, exactly as the SMBIOS spec (§7.5.3,
+    /// x86-class) prescribes.
+    pub cpu_feature_flags: u32,
     /// Number of CPU cores
     pub cpu_cores: u8,
     /// Number of CPU threads
@@ -100,6 +109,12 @@ impl Default for SmbiosConfig {
             baseboard_product: "ROG STRIX B650E-E GAMING WIFI".to_string(),
             baseboard_serial: "000000000000".to_string(),
             cpu_brand: "AMD Ryzen 9 7950X 16-Core Processor".to_string(),
+            // AMD Zen 4 (Raphael) CPUID leaf-1 signature: family 0x19, model
+            // 0x61, stepping 2 → EAX 0x00A6_0F12, matching the default brand.
+            cpu_signature: 0x00A6_0F12,
+            // Standard AMD64 leaf-1 EDX feature set (FPU…SSE2/HTT) — the value
+            // dmidecode shows for modern AMD parts.
+            cpu_feature_flags: 0x178B_FBFF,
             cpu_cores: 16,
             cpu_threads: 32,
             cpu_max_speed: 5700,
@@ -144,6 +159,12 @@ impl SmbiosConfig {
         #[cfg(target_arch = "x86_64")]
         if let Some(brand) = host_cpu_brand() {
             config.cpu_brand = brand;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let (sig, flags) = host_cpu_signature();
+            config.cpu_signature = sig;
+            config.cpu_feature_flags = flags;
         }
         config
     }
@@ -222,6 +243,16 @@ fn host_cpu_brand() -> Option<String> {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     let brand = String::from_utf8_lossy(&bytes[..end]).trim().to_string();
     if brand.is_empty() { None } else { Some(brand) }
+}
+
+/// The host CPU's leaf-1 signature (`EAX`, family/model/stepping) and feature
+/// flags (`EDX`), used to fill the SMBIOS Type 4 "Processor ID" with the
+/// physical machine's real CPUID identity rather than an all-zero VM tell.
+#[cfg(target_arch = "x86_64")]
+fn host_cpu_signature() -> (u32, u32) {
+    use core::arch::x86_64::__cpuid;
+    let r = __cpuid(1);
+    (r.eax, r.edx)
 }
 
 /// SMBIOS table builder
@@ -498,8 +529,12 @@ impl SmbiosBuilder {
         header.push(0xFE);
         // Processor Manufacturer
         header.push(2);
-        // Processor ID (8 bytes - CPUID signature)
-        header.extend_from_slice(&0u64.to_le_bytes());
+        // Processor ID (8 bytes): CPUID leaf-1 EAX (signature) in the first
+        // DWORD, EDX (feature flags) in the second, little-endian — the SMBIOS
+        // §7.5.3 x86 encoding `dmidecode` decodes back into Family/Model/
+        // Stepping + Flags. Never all-zero (that is itself a VM tell).
+        header.extend_from_slice(&self.config.cpu_signature.to_le_bytes());
+        header.extend_from_slice(&self.config.cpu_feature_flags.to_le_bytes());
         // Processor Version
         header.push(3);
         // Voltage: 1.1V
@@ -887,6 +922,31 @@ mod tests {
             t4.2.get(1).map(String::as_str),
             Some("Advanced Micro Devices, Inc."),
             "Type 4 string table must not be shifted by a short formatted area"
+        );
+    }
+
+    #[test]
+    fn type4_processor_id_carries_the_cpuid_signature_not_zero() {
+        // The Type 4 "Processor ID" (formatted-area offset 0x08, 8 bytes) must
+        // be the CPUID leaf-1 EAX/EDX, little-endian — never all-zero, which is
+        // a VM tell dmidecode surfaces as "Family 0, Model 0, Stepping 0".
+        let config = SmbiosConfig {
+            cpu_signature: 0x00A6_0F12,
+            cpu_feature_flags: 0x178B_FBFF,
+            ..SmbiosConfig::default()
+        };
+        let data = SmbiosBuilder::new(config).build_structures();
+        // Match the full Type 4 header: type=4, length=48, handle=0x0004.
+        let t4_off = data
+            .windows(4)
+            .position(|w| w == [4, 48, 4, 0])
+            .expect("Type 4 header present");
+        let id = &data[t4_off + 8..t4_off + 16];
+        assert_ne!(id, [0u8; 8], "Processor ID must not be all-zero");
+        assert_eq!(
+            id,
+            [0x12, 0x0F, 0xA6, 0x00, 0xFF, 0xFB, 0x8B, 0x17],
+            "EAX (signature) then EDX (features), little-endian"
         );
     }
 
