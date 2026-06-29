@@ -1,5 +1,6 @@
 use crate::EnlilConfig;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 /// The log levels the hypervisor accepts (matched case-insensitively), per
 /// `HypervisorConfig::log_level`.
@@ -101,6 +102,33 @@ pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
         if !valid {
             errors.push(format!(
                 "Guest '{id}': serial output '{out}' must be stdout, pty, null, or file:<path>"
+            ));
+        }
+    }
+
+    // A writable disk image must not be shared. If the same path is mounted by
+    // more than one disk entry (across guests or twice in one guest) and any of
+    // those mounts is writable, the holders race each other and corrupt the
+    // image. Read-only sharing is fine. (Exact-path comparison; symlink/relative
+    // aliasing is out of scope for a static check that never touches the disk.)
+    let mut mounts: HashMap<&Path, (usize, bool, Vec<&str>)> = HashMap::new();
+    for (id, guest) in &config.guest {
+        for disk in &guest.disks {
+            let entry = mounts.entry(disk.path.as_path()).or_insert((0, false, Vec::new()));
+            entry.0 += 1;
+            entry.1 |= !disk.readonly;
+            entry.2.push(id.as_str());
+        }
+    }
+    for (path, (count, writable, ids)) in mounts {
+        if count >= 2 && writable {
+            let mut who = ids;
+            who.sort_unstable();
+            errors.push(format!(
+                "Disk '{}' is mounted {count} times (by {}) with a writable handle; \
+                 a shared writable image corrupts",
+                path.display(),
+                who.join(", ")
             ));
         }
     }
@@ -254,6 +282,76 @@ mod tests {
         let errors = validate_config(&config);
         assert!(
             !errors.iter().any(|e| e.contains("serial output")),
+            "{errors:?}"
+        );
+    }
+
+    fn guest_with_disks(name: &str, cpus: Vec<u32>, disks: Vec<DiskConfig>) -> GuestConfig {
+        GuestConfig {
+            name: name.into(),
+            cpus,
+            memory_mb: 2048,
+            kernel: None,
+            initrd: None,
+            cmdline: "console=ttyS0".into(),
+            scheduling: SchedulingMode::Dedicated,
+            disks,
+            serial: SerialPortConfig::default(),
+        }
+    }
+
+    #[test]
+    fn detects_a_writable_disk_shared_across_guests() {
+        let mut config = minimal_config();
+        let shared = DiskConfig {
+            path: "/images/shared.qcow2".into(),
+            readonly: false,
+        };
+        config.guest.get_mut("vm1").unwrap().disks = vec![shared.clone()];
+        config
+            .guest
+            .insert("vm2".into(), guest_with_disks("VM2", vec![2, 3], vec![shared]));
+        let errors = validate_config(&config);
+        assert!(
+            errors.iter().any(|e| e.contains("writable handle")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn read_only_disk_sharing_is_allowed() {
+        let mut config = minimal_config();
+        let shared = DiskConfig {
+            path: "/images/golden.qcow2".into(),
+            readonly: true,
+        };
+        config.guest.get_mut("vm1").unwrap().disks = vec![shared.clone()];
+        config
+            .guest
+            .insert("vm2".into(), guest_with_disks("VM2", vec![2, 3], vec![shared]));
+        let errors = validate_config(&config);
+        assert!(
+            !errors.iter().any(|e| e.contains("writable handle")),
+            "read-only sharing must be permitted: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn detects_the_same_writable_disk_mounted_twice_in_one_guest() {
+        let mut config = minimal_config();
+        config.guest.get_mut("vm1").unwrap().disks = vec![
+            DiskConfig {
+                path: "/images/d.raw".into(),
+                readonly: false,
+            },
+            DiskConfig {
+                path: "/images/d.raw".into(),
+                readonly: false,
+            },
+        ];
+        let errors = validate_config(&config);
+        assert!(
+            errors.iter().any(|e| e.contains("writable handle")),
             "{errors:?}"
         );
     }
