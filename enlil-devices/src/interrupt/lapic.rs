@@ -69,6 +69,17 @@ const LVT_ERROR_WRITE_MASK: u32 = 0x0001_00FF;
 /// remaining bits are reserved and must read back 0.
 const SVR_WRITE_MASK: u32 = 0x0000_03FF;
 
+/// Writable bits of `ICR_LOW` (`0x300`, Intel SDM Vol.3 Figure 10-12): Vector
+/// [7:0], Delivery Mode [10:8], Destination Mode [11], Level [14], Trigger Mode
+/// [15], Destination Shorthand [19:18]. Delivery Status [12] is read-only (the
+/// model is always idle) and the rest are reserved.
+const ICR_LOW_WRITE_MASK: u32 = 0x000C_CFFF;
+
+/// Writable bits of `ICR_HIGH` (`0x310`): the 8-bit Destination field, which
+/// occupies bits [63:56] of the 64-bit ICR — i.e. the top byte of the high
+/// dword. Bits [55:32] are reserved.
+const ICR_HIGH_WRITE_MASK: u32 = 0xFF00_0000;
+
 /// MSR number of `IA32_TSC_DEADLINE` (Intel SDM Vol.3 §10.5.4.1).
 ///
 /// The per-logical-processor register a guest writes to arm the LAPIC
@@ -338,11 +349,13 @@ impl LocalApic {
                 self.esr = 0;
             }
             LAPIC_ICR_LOW => {
-                self.icr = (self.icr & 0xFFFF_FFFF_0000_0000) | u64::from(value);
+                self.icr =
+                    (self.icr & 0xFFFF_FFFF_0000_0000) | u64::from(value & ICR_LOW_WRITE_MASK);
                 // Writing `ICR_LOW` triggers IPI delivery
             }
             LAPIC_ICR_HIGH => {
-                self.icr = (self.icr & 0x0000_0000_FFFF_FFFF) | (u64::from(value) << 32);
+                self.icr = (self.icr & 0x0000_0000_FFFF_FFFF)
+                    | (u64::from(value & ICR_HIGH_WRITE_MASK) << 32);
             }
             LAPIC_LVT_TIMER => {
                 self.lvt_timer = value & LVT_TIMER_WRITE_MASK;
@@ -768,6 +781,24 @@ mod tests {
         // A normal programming (vector 0x40, periodic, unmasked) is untouched.
         lapic.write_register(LAPIC_LVT_TIMER, 0x40 | (1 << 17));
         assert_eq!(lapic.read_register(LAPIC_LVT_TIMER), 0x40 | (1 << 17));
+    }
+
+    #[test]
+    fn icr_write_masks_reserved_bits() {
+        let mut lapic = LocalApic::new(0);
+        // All-ones to both halves: only the SDM-writable command fields and the
+        // destination byte take; Delivery Status (12) and the reserved bits read
+        // back 0.
+        lapic.write_register(LAPIC_ICR_HIGH, 0xFFFF_FFFF);
+        lapic.write_register(LAPIC_ICR_LOW, 0xFFFF_FFFF);
+        assert_eq!(lapic.read_register(LAPIC_ICR_LOW), 0x000C_CFFF);
+        assert_eq!(lapic.read_register(LAPIC_ICR_HIGH), 0xFF00_0000);
+
+        // A normal fixed IPI to vector 0x30, physical, assert/edge is untouched.
+        lapic.write_register(LAPIC_ICR_HIGH, 0x0100_0000); // dest APIC ID 1
+        lapic.write_register(LAPIC_ICR_LOW, 0x4030); // vector 0x30, level=assert
+        assert_eq!(lapic.read_register(LAPIC_ICR_LOW), 0x4030);
+        assert_eq!(lapic.read_register(LAPIC_ICR_HIGH), 0x0100_0000);
     }
 
     #[test]
