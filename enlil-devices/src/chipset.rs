@@ -194,9 +194,14 @@ const PM1_CNT_SLP_EN: u16 = 1 << 13;
 const PM1_CNT_SLP_TYP_MASK: u16 = 0x7 << 10;
 /// `SLP_TYP` field shift.
 const PM1_CNT_SLP_TYP_SHIFT: u16 = 10;
-/// Bits the guest can store in the control register (everything but the
-/// write-only `SLP_EN` edge and the `SLP_TYP` selector, which we capture).
-const PM1_CNT_STORED_MASK: u16 = !(PM1_CNT_SLP_EN | PM1_CNT_SLP_TYP_MASK);
+/// Bits the guest can store in the control register. Only `SLP_EN` (bit 13) is
+/// excluded: it is a write-only trigger that always reads back 0. `SLP_TYP`
+/// (bits 10-12) IS a read/write field per the ACPI spec (PM1 Control) and on
+/// real hardware (ICH9) / QEMU retains the last value written, so a guest that
+/// programs `SLP_TYP` and reads it back sees what it wrote — masking it to 0
+/// here was a guest-visible non-conformance (and a transparency tell). We still
+/// capture the value into a one-shot sleep request when `SLP_EN` commits it.
+const PM1_CNT_STORED_MASK: u16 = !PM1_CNT_SLP_EN;
 
 /// The **ACPI `PM1a` event + control block** as a bus [`PioDevice`].
 ///
@@ -223,7 +228,8 @@ pub struct AcpiPm1Block {
     status: u16,
     /// `PM1a_EN` (interrupt-enable bits).
     enable: u16,
-    /// `PM1a_CNT` stored bits (`SCI_EN`, `BM_RLD`, …; not `SLP_EN`/`SLP_TYP`).
+    /// `PM1a_CNT` stored bits (`SCI_EN`, `BM_RLD`, `SLP_TYP`, …); not the
+    /// write-only `SLP_EN`, which always reads back 0.
     control: u16,
     /// The `SLP_TYP` captured when the guest last committed a sleep transition
     /// (`SLP_EN` written 1), pending consumption by the run loop.
@@ -633,15 +639,22 @@ mod tests {
     }
 
     #[test]
-    fn sci_enable_sticks_but_sleep_bits_do_not() {
+    fn sci_en_and_slp_typ_persist_but_slp_en_is_write_only() {
         let mut pm1 = AcpiPm1Block::new();
         // Entering ACPI mode sets SCI_EN (bit 0); it persists and reads back.
         pm1.pio_write(PM1_CNT_PORT, 2, 1);
         assert!(pm1.sci_enabled());
         assert_eq!(pm1.pio_read(PM1_CNT_PORT, 2) & 1, 1);
-        // A later S5 write must not capture a sleep unless SLP_EN is set.
+        // SLP_TYP (bits 10-12) is a read/write field (ACPI PM1 Control); writing
+        // it *without* SLP_EN must not trigger a sleep, but it must read back —
+        // real hardware (ICH9) and QEMU retain the value, so masking it to 0 would
+        // be a guest-visible tell.
         pm1.pio_write(PM1_CNT_PORT, 2, (5 << 10) | 1);
         assert_eq!(pm1.take_sleep(), None, "no SLP_EN, no transition");
+        let cnt = pm1.pio_read(PM1_CNT_PORT, 2);
+        assert_eq!((cnt >> 10) & 0x7, 5, "SLP_TYP reads back the programmed value");
+        assert_eq!(cnt & 1, 1, "SCI_EN still set");
+        assert_eq!(cnt & (1 << 13), 0, "SLP_EN is write-only and reads 0");
     }
 
     #[test]
