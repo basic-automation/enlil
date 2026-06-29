@@ -25,6 +25,13 @@ const GLOBAL_CTRL_MASK: u64 = ((1u64 << MAX_GP_PMCS) - 1) | (((1u64 << MAX_FIXED
 /// the rest are reserved (same reserved-bit-writeback tell as `GLOBAL_CTRL`).
 const FIXED_CTR_CTRL_MASK: u64 = (1u64 << (4 * MAX_FIXED_PMCS)) - 1;
 
+/// Writable bits of the AMD `PerfMonV2` `PerfCntrGlobalCtl` (MSR `0xC000_0301`):
+/// one `PerfCtrEn` bit per implemented core PMC (bits `[AMD_CORE_PMCS-1 : 0]`).
+/// Higher bits are reserved — the AMD-side counterpart of `GLOBAL_CTRL_MASK`,
+/// on the path an AMD-presented guest (the same-vendor case on this AMD host)
+/// actually exercises.
+const AMD_GLOBAL_CTRL_MASK: u64 = (1u64 << msr::AMD_CORE_PMCS) - 1;
+
 /// Rates at which the fixed-function counters advance per unit of guest time.
 ///
 /// `advance_counters` receives a **TSC delta** (reference cycles). On bare
@@ -278,7 +285,7 @@ impl PmcState {
         match amd_pmc_target(msr) {
             Some(AmdPmcTarget::Counter(i)) if i < MAX_GP_PMCS => self.gp_counters[i] = value,
             Some(AmdPmcTarget::EventSelect(i)) if i < MAX_GP_PMCS => self.event_select[i] = value,
-            Some(AmdPmcTarget::GlobalCtrl) => self.global_ctrl = value,
+            Some(AmdPmcTarget::GlobalCtrl) => self.global_ctrl = value & AMD_GLOBAL_CTRL_MASK,
             // Writing the clear MSR clears the set status bits (write-1-to-clear),
             // matching the Intel `GLOBAL_STATUS_RESET` semantics above.
             Some(AmdPmcTarget::GlobalStatusClr) => self.global_status &= !value,
@@ -427,6 +434,19 @@ mod tests {
         // Legitimate enable values are unaffected.
         pmc.write_msr(msr::IA32_PERF_GLOBAL_CTRL, 0x07);
         assert_eq!(pmc.read_msr(msr::IA32_PERF_GLOBAL_CTRL), Some(0x07));
+    }
+
+    #[test]
+    fn amd_global_ctrl_masks_reserved_bits() {
+        let mut pmc = PmcState::new();
+        // All-ones to the AMD PerfCntrGlobalCtl: only the 6 core-PMC enables
+        // (bits [5:0]) take; the reserved bits read back 0.
+        pmc.write_msr(msr::AMD_PERF_CNTR_GLOBAL_CTL, u64::MAX);
+        assert_eq!(
+            pmc.read_msr(msr::AMD_PERF_CNTR_GLOBAL_CTL),
+            Some(0x3F),
+            "AMD PerfCntrGlobalCtl reserved bits must read back 0"
+        );
     }
 
     #[test]
