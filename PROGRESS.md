@@ -150,7 +150,7 @@ deliberately left because they are **not** high-confidence-unattended-safe:
    gap, not awake-design.
 
 ### PR
-<!-- PR_URL -->
+https://github.com/physics515/enlil/pull/45
 
 ## 2026-06-29 — Session: systematic guest-write reserved-bit / read-only-field hardening across the device transparency surface (Phases 4 & 5)
 
