@@ -207,6 +207,14 @@ const PM1_CNT_BM_RLD: u16 = 1 << 1;
 /// `SLP_TYP` into a one-shot sleep request when it commits.
 const PM1_CNT_STORED_MASK: u16 = PM1_CNT_SCI_EN | PM1_CNT_BM_RLD | PM1_CNT_SLP_TYP_MASK;
 
+/// Defined bits of the `PM1a_EN` (PM1 Enable) register: `TMR_EN` [0],
+/// `GBL_EN` [5], `PWRBTN_EN` [8], `SLPBTN_EN` [9], `RTC_EN` [10] (ACPI spec
+/// §4.8.3.1.2). The remaining bits ([4:1], [7:6], [15:11]) are reserved and
+/// read back 0 — storing the guest's raw value let a guest write all-ones and
+/// read the reserved bits back unchanged, a non-conformance and transparency
+/// tell.
+const PM1_EN_MASK: u16 = 0x0721;
+
 /// The **ACPI `PM1a` event + control block** as a bus [`PioDevice`].
 ///
 /// This is the register set an ACPI OS drives to change the system power state
@@ -335,11 +343,11 @@ impl PioDevice for AcpiPm1Block {
             PM1_EVT_PORT => {
                 self.write_status(u16_of(data));
                 if size >= 4 {
-                    self.enable = u16_of(data >> 16);
+                    self.enable = u16_of(data >> 16) & PM1_EN_MASK;
                 }
             }
             // Enable register (0x602).
-            0x602 => self.enable = u16_of(data),
+            0x602 => self.enable = u16_of(data) & PM1_EN_MASK,
             // Control register (0x604).
             PM1_CNT_PORT => self.write_control(u16_of(data)),
             _ => {}
@@ -676,6 +684,17 @@ mod tests {
         assert_eq!(cnt, 0x1C03, "only SCI_EN | BM_RLD | SLP_TYP persist");
         // SLP_TYP = 0b111 committed a sleep request (SLP_EN was in the write).
         assert_eq!(pm1.take_sleep(), Some(0x7), "all-ones set SLP_EN + SLP_TYP=7");
+    }
+
+    #[test]
+    fn pm1_enable_reserved_bits_read_back_zero() {
+        let mut pm1 = AcpiPm1Block::new();
+        // A guest writes all-ones to PM1a_EN (0x602). Only the defined enables
+        // (TMR_EN/GBL_EN/PWRBTN_EN/SLPBTN_EN/RTC_EN) persist; the rest read 0.
+        pm1.pio_write(0x602, 2, 0xFFFF);
+        // PM1a_EN reads back in the high half of the 32-bit event-block window.
+        let enable = pm1.pio_read(PM1_EVT_PORT, 4) >> 16;
+        assert_eq!(enable, 0x0721, "PM1 Enable reserved bits read 0");
     }
 
     #[test]
