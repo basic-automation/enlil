@@ -228,7 +228,13 @@ impl HdaController {
     pub fn write(&mut self, offset: u32, value: u64, _size: u8) {
         match offset {
             regs::GCTL => {
-                let val = u32_of(value);
+                // Intel HD Audio §3.3.7: only CRST# [0], FCNTRL [1] and
+                // Accept-Unsolicited-Response-Enable [8] are writable; bits
+                // [7:2] and [31:9] are reserved and read 0. Masking keeps a
+                // guest from storing reserved bits and reading them back (a
+                // hypervisor tell — real hardware reads them 0).
+                const GCTL_WRITE_MASK: u32 = 0x0000_0103;
+                let val = u32_of(value) & GCTL_WRITE_MASK;
                 // Bit 0: Controller Reset (CRST)
                 if val & 1 != 0 && self.gctl & 1 == 0 {
                     // Coming out of reset
@@ -417,6 +423,15 @@ mod tests {
         ctrl.write(regs::GCTL, 1, 4); // Come out of reset
         assert_eq!(ctrl.gctl & 1, 1);
         assert_eq!(ctrl.statests, 0x01); // Codec 0 detected
+    }
+
+    #[test]
+    fn gctl_reserved_bits_read_back_zero() {
+        let mut ctrl = HdaController::new();
+        // A guest writes all-ones; only CRST [0], FCNTRL [1], UNSOL [8] take.
+        ctrl.write(regs::GCTL, u64::from(u32::MAX), 4);
+        assert_eq!(ctrl.read(regs::GCTL, 4), 0x103, "GCTL reserved bits read 0");
+        assert_eq!(ctrl.gctl, 0x103);
     }
 
     #[test]
