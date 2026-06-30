@@ -308,7 +308,7 @@ impl VirtualXhciController {
         match offset {
             0x20 => self.interrupter.write_iman(value),
             0x24 => self.interrupter.imod = value,
-            0x28 => self.interrupter.erstsz = value,
+            0x28 => self.interrupter.write_erstsz(value),
             0x30 => self.interrupter.erstba = lo(self.interrupter.erstba),
             0x34 => self.interrupter.erstba = hi(self.interrupter.erstba),
             0x38 => self.interrupter.write_erdp(lo(self.interrupter.erdp)),

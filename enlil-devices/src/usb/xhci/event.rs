@@ -469,6 +469,15 @@ impl InterrupterRegisterSet {
         self.iman = (self.iman & 1) | (value & 2);
     }
 
+    /// Write to the ERSTSZ register. Only the Event Ring Segment Table Size
+    /// `[15:0]` is defined; `[31:16]` are reserved (xHCI 1.2 §5.5.2.3.1).
+    /// Masking both forces the reserved bits to read back 0 (a guest that
+    /// stored and read them back would catch a hypervisor tell) and bounds the
+    /// segment count `load`/`matches` iterate over to the spec's 16-bit field.
+    pub const fn write_erstsz(&mut self, value: u32) {
+        self.erstsz = value & 0x0000_FFFF;
+    }
+
     /// Write to the ERDP register.
     ///
     /// Bits [3:0] contain flags (EHB in bit 3), bits [63:4] are the address.
@@ -586,6 +595,14 @@ mod tests {
         assert!(!ir.interrupt_pending());
         assert!(!ir.interrupt_enabled());
         assert_eq!(ir.imod, 0x0000_0FA0);
+    }
+
+    #[test]
+    fn interrupter_erstsz_masks_reserved_high_bits() {
+        let mut ir = InterrupterRegisterSet::new();
+        // A guest writes all-ones; only the 16-bit table size [15:0] is defined.
+        ir.write_erstsz(u32::MAX);
+        assert_eq!(ir.erstsz, 0x0000_FFFF, "ERSTSZ [31:16] reserved, read 0");
     }
 
     #[test]
