@@ -591,6 +591,29 @@ impl PciConfigSpace {
             && self.read_u8(PM_CAP_OFFSET) == 0x01;
         let saved_pmc = pmc_ro.then(|| self.read_u16(PM_CAP_OFFSET + 2));
 
+        // The PCI Status register (0x06) has no plain read-write bits: it is
+        // read-only except for the RW1C error bits — Master Data Parity Error
+        // [8], Signaled Target Abort [11], Received Target Abort [12], Received
+        // Master Abort [13], Signaled System Error [14], Detected Parity Error
+        // [15] (PCI Local Bus spec §6.2.3). The read-only bits include the
+        // Capabilities List bit [4], which the capability-header protection
+        // below itself reads — a guest that set/cleared it could corrupt that
+        // logic and its own cap-list walk, besides being a transparency tell.
+        // Snapshot the register and which bytes the write covers so the generic
+        // byte loop can be undone: RO bits restored, W1C bits cleared only where
+        // the guest wrote a 1.
+        let status_touched = offset < cfg::STATUS + 2 && offset + u16::from(width) > cfg::STATUS;
+        let saved_status = status_touched.then(|| {
+            let mut covered = 0u16;
+            if offset <= cfg::STATUS {
+                covered |= 0x00FF;
+            }
+            if offset + u16::from(width) > cfg::STATUS + 1 {
+                covered |= 0xFF00;
+            }
+            (self.read_u16(cfg::STATUS), covered)
+        });
+
         // The PCI Express Capabilities register (PCIE_CAP_OFFSET + 2) is also a
         // wholly read-only descriptor: Capability Version (bits 3:0), Device/Port
         // Type (7:4), Slot Implemented (8), and Interrupt Message Number (13:9)
@@ -638,6 +661,19 @@ impl PciConfigSpace {
         }
         if let Some(pcie_cap) = saved_pcie_cap {
             self.write_u16(PCIE_CAP_OFFSET + 2, pcie_cap);
+        }
+
+        // Restore the Status register: keep every read-only bit at its prior
+        // value and only clear the RW1C error bits the guest wrote a 1 to within
+        // the bytes the write actually covered.
+        if let Some((old_status, covered)) = saved_status {
+            // RW1C error bits: Master Data Parity Error [8], Signaled Target
+            // Abort [11], Received Target Abort [12], Received Master Abort [13],
+            // Signaled System Error [14], Detected Parity Error [15].
+            const STATUS_W1C_MASK: u16 = 0xF900;
+            let attempted = self.read_u16(cfg::STATUS);
+            let w1c_clear = attempted & STATUS_W1C_MASK & covered;
+            self.write_u16(cfg::STATUS, old_status & !w1c_clear);
         }
     }
 
@@ -1780,6 +1816,30 @@ mod tests {
         // The list is still walkable end to end.
         assert_eq!(u16::from(head), MSI_CAP_OFFSET);
         assert_eq!(u16::from(cs.read_u8(MSI_CAP_OFFSET + 1)), PM_CAP_OFFSET);
+    }
+
+    #[test]
+    fn guest_writes_to_the_status_register_preserve_ro_bits_and_w1c_errors() {
+        let mut cs = PciConfigSpace::new(PciBdf::new(0, 6, 0), 0x8086, 0x1234);
+        cs.add_msi_capability(); // sets the Capabilities List bit [4] in STATUS
+        // Seed two RW1C error bits as if hardware had latched them: Received
+        // Master Abort [13] and Signaled System Error [14].
+        let seeded = cs.read_u16(cfg::STATUS) | 0x6000;
+        cs.write_u16(cfg::STATUS, seeded);
+        assert_ne!(cs.read_u16(cfg::STATUS) & 0x0010, 0, "caps list bit set");
+
+        // A guest writes all-ones to the whole Status register.
+        cs.guest_write(cfg::STATUS, 2, 0xFFFF);
+
+        let after = cs.read_u16(cfg::STATUS);
+        // The read-only Capabilities List bit [4] is unchanged (still set) — a
+        // guest cannot clear it (which would also break the cap-header guard).
+        assert_ne!(after & 0x0010, 0, "Capabilities List bit is read-only");
+        // The two seeded RW1C error bits were cleared by the write-1.
+        assert_eq!(after & 0x6000, 0, "RW1C error bits cleared by write-1");
+        // A guest cannot SET a read-only bit it had no business setting (e.g.
+        // 66 MHz Capable [5], not advertised by this model): it stays 0.
+        assert_eq!(after & 0x0020, 0, "guest cannot set the read-only 66MHz bit");
     }
 
     #[test]
