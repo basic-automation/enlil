@@ -2510,4 +2510,45 @@ mod tests {
         cam.pio_write(CONFIG_ADDRESS_PORT, 4, config_address(0, 2, 0, 0x3C));
         assert_eq!(cam.pio_read(CONFIG_DATA_PORT, 1), 0x2A);
     }
+
+    #[test]
+    fn config_write_front_ends_cannot_reprogram_device_identity() {
+        // The read-only identity registers must survive a hostile all-ones write
+        // through EITHER config front-end — both the legacy CF8/CFC ports and the
+        // ECAM MMIO window forward to guest_write, which honours the read-only
+        // bytes. This is the general config-space write-mask pass proven end to
+        // end (not just on the bare PciConfigSpace), so a regression that made a
+        // front-end bypass guest_write would be caught.
+        let mut rc = PcieRootComplex::new(0xB000_0000);
+        // The Q35 MCH at 0:0.0 stamps Intel vendor + the board subsystem IDs.
+        rc.add_device(PcieRootComplex::create_q35_host_bridge(0xB000_0000));
+        let shared = Rc::new(RefCell::new(rc));
+        let mut cam = PciConfigIo::with_shared(Rc::clone(&shared));
+        let mut ecam = EcamSpace::new(Rc::clone(&shared));
+        let base = PciBdf::new(0, 0, 0).ecam_offset() as u64;
+
+        // A guest scribbles all-ones over the Subsystem ID dword via the legacy
+        // ports and over the Vendor/Device ID dword via ECAM.
+        cam.pio_write(CONFIG_ADDRESS_PORT, 4, config_address(0, 0, 0, 0x2C)); // Subsystem Vendor ID
+        cam.pio_write(CONFIG_DATA_PORT, 4, 0xFFFF_FFFF);
+        ecam.mmio_write(base + u64::from(cfg::VENDOR_ID), 4, 0xFFFF_FFFF);
+
+        // Identity is unchanged, read back through both front-ends.
+        assert_eq!(
+            ecam.mmio_read(base + u64::from(cfg::SUBSYSTEM_VENDOR_ID), 2),
+            u64::from(BOARD_SUBSYSTEM_VENDOR_ID),
+            "Subsystem Vendor ID is read-only (ECAM view)"
+        );
+        assert_eq!(
+            ecam.mmio_read(base + u64::from(cfg::SUBSYSTEM_ID), 2),
+            u64::from(BOARD_SUBSYSTEM_DEVICE_ID),
+            "Subsystem Device ID is read-only"
+        );
+        cam.pio_write(CONFIG_ADDRESS_PORT, 4, config_address(0, 0, 0, 0x00)); // Vendor ID
+        assert_eq!(
+            cam.pio_read(CONFIG_DATA_PORT, 2),
+            u32::from(vendors::INTEL),
+            "Vendor ID is read-only (legacy port view)"
+        );
+    }
 }
