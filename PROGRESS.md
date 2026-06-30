@@ -6,6 +6,152 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-06-30 — Session: continue the guest-write reserved-bit / read-only-field hardening sweep across the device transparency surface (Phases 4 & 5)
+
+**12 tested code increments, each independently green and committed** (branch
+`routine/enlil-2026-06-30`). Wall-clock ~00:39→~01:15 CDT (~36 min; the WSL
+test/clippy and the Windows-native `enlil-devices` build overlapped in the
+background for every increment, so the loop never serialized on a build). One
+coherent theme, continuing the 2026-06-29 seam: a guest must not be able to
+write a reserved or read-only register/MSR bit and read it back unchanged — every
+such *reserved-bit-writeback* is a hypervisor tell (real hardware reads those
+bits 0 / `#GP`s the write), and several cases (PCI Status Capabilities-List bit,
+PCI Command hardwired-0 bits, ACPI PM1 reserved bits, xHCI ERSTSZ count) are also
+correctness bugs. Started from the 2026-06-29 STOP REASON's recommended next step
+(vendor-aware `IA32_PERFEVTSEL` masking) and swept outward to every remaining
+high-confidence member of the class across `enlil-devices`.
+
+### Increments (commit — what)
+1. `7b7e690` — **vendor-aware `PERFEVTSEL` mask** (`stealth/pmc.rs`). The shared
+   `event_select` shadow stored guest writes verbatim. Intel reserves all of
+   `[63:32]`; AMD keeps the event-select extension `[35:32]` and HostOnly/
+   GuestOnly `[41:40]` live, so a single mask would corrupt one vendor. Each
+   write path now masks to its own vendor (the guest is presented exactly one
+   vendor and writes only that MSR namespace): Intel `0xFFFF_FFFF`, AMD
+   `0x0000_030F_FFFF_FFFF`. (the deferred item #1 from 2026-06-29)
+2. `008019d` — **LAPIC Timer Divide Config Register** (`interrupt/lapic.rs`):
+   masked to bits 0,1,3 (`0xB`); bit 2 + `[31:4]` reserved (SDM Fig 10-10). The
+   divisor decode already ignored them, so behaviour is unchanged.
+3. `dae1045` — **HPET Timer N config** (`timer/hpet.rs`): the old
+   `!read_only_mask` left bits 0/7/`[31:16]` and the RO `FSB_INT_DEL_CAP` `[15]`
+   writable. Replaced with a positive `TIMER_CONFIG_WRITABLE_MASK = 0x7F4E` (the
+   architecturally-writable bits, IA-PC HPET §2.3.8).
+4. `f98e8dc` — **HDA `GCTL`** (`hda/controller.rs`): masked to CRST#/FCNTRL/UNSOL
+   (`0x103`); rest reserved (Intel HD Audio §3.3.7).
+5. `38801dc` — **SMBus `AUX_CTL`** (`smbus.rs`): masked to AAC/E32B (`0x03`);
+   `[7:2]` reserved.
+6. `75e88fa` — **xHCI `DNCTRL` + `CONFIG`** (`usb/xhci/registers.rs`,
+   `usb/controller.rs`): added `write_dnctrl` (`0xFFFF`) / `write_config`
+   (`0xFF`, `MaxSlotsEn` only) and routed the controller through them (xHCI 1.2
+   §5.4.4/§5.4.7).
+7. `17e244c` — **xHCI `ERSTSZ`** (`usb/xhci/event.rs`): `write_erstsz` masks to
+   `[15:0]`; besides the reserved-bit tell this bounds the segment count
+   `GuestEventRing::load`/`matches` iterate over to the spec field width.
+8. `ce0e4d6` — **PCI Status register RO/RW1C** (`pcie.rs`): the Status register
+   (0x06) was unprotected, so a guest could set/clear RO bits including the
+   Capabilities-List bit `[4]` that the cap-header guard itself reads.
+   `guest_write` now restores every RO bit and clears only the RW1C error bits
+   `{8,11-15}` the guest wrote a 1 to (PCI §6.2.3).
+9. `db4c36b` — **PCI Command register** (`pcie.rs`): masked to the writable bits
+   `0x0547` `{0,1,2,6,8,10}`; the PCIe-hardwired-0 bits `{3,4,5,7,9}` and reserved
+   `[15:11]` now read 0 (PCI §6.2.2 / PCIe §7.5.1.1).
+10. `301c8c3` — **ACPI PM1 Control** (`chipset.rs`): `STORED_MASK` was `!SLP_EN`,
+    storing `GBL_RLS` `[2]` and reserved bits. Tightened to
+    `SCI_EN | BM_RLD | SLP_TYP` (`0x1C03`); the write-only/reserved bits read 0
+    (ACPI PM1 Control). `SLP_EN` sleep-request capture unaffected.
+11. `9cf36d7` — **ACPI PM1 Enable** (`chipset.rs`): masked both write paths to the
+    defined enables `0x0721` `{TMR,GBL,PWRBTN,SLPBTN,RTC}`; the rest reserved
+    (ACPI §4.8.3.1.2).
+12. `43cc604` — **front-end identity regression test** (`pcie.rs`): proves the
+    legacy CF8/CFC ports (`PciConfigIo`) and the ECAM MMIO window (`EcamSpace`)
+    both route guest writes through `guest_write`, so Vendor/Device/Subsystem IDs
+    survive an all-ones write through *either* front-end. Closes the stale
+    ROADMAP §5 note that subsystem registers were still guest-writable (the
+    general config-space write-mask pass is in fact done — code + test).
+
+### Research (informed the build)
+No new external literature logged — every increment was checked against the
+primary specs already cited in `RESEARCH.md`: Intel SDM Vol.3 §20.2.1.1
+(`IA32_PERFEVTSEL` fields, Fig 20-1), §10.5.4 (LAPIC Timer DCR, Fig 10-10);
+AMD APM Vol.2 §13.2.1 (`PerfEvtSel` event-select extension + HO/GO); IA-PC HPET
+§2.3.8 (Timer N config); Intel HD Audio §3.3.7 (`GCTL`); the ICH/PCH SMBus
+`AUX_CTL`; xHCI 1.2 §5.4.4/§5.4.7/§5.5.2.3.1 (`DNCTRL`/`CONFIG`/`ERSTSZ`); PCI
+Local Bus §6.2.2/§6.2.3 + PCIe Base §7.5.1.1 (Command/Status); ACPI §4.8.3
+(PM1 Control/Enable).
+
+### Test results (exact)
+- **`/dev/kvm`: read-writable at start, mid-run, AND at wrap (`KVM_RW_OK` /
+  `KVM_RW_OK_MIDRUN` / `KVM_RW_OK_AT_WRAP`).** The KVM / guest-boot tests **ran
+  for real, none skipped.** Final `cargo test --workspace` on real `/dev/kvm`:
+  **enlil-core lib 231** (unchanged — no enlil-core source touched; the real-KVM
+  tests `guest_ram_is_page_aligned_zeroed_and_writable`,
+  `read_guest_tsc_reports_a_running_counter`,
+  `run_loop_guest_arms_and_fires_a_tsc_deadline_timer_via_the_msr`,
+  `protected_mode_guest_writes_the_high_lapic_mmio_page`,
+  `immediate_exit_bounds_an_unending_run`, the CPUID/topology/PMU-stealth and
+  AMD/Intel PMC+LBR forwarding tests, all passed), **enlil-devices lib 951**
+  (was 941 at session start, +10: one new test per code increment — increment 1's
+  test was already in the 941 baseline), plus all integration binaries
+  (device_bus, run_loop, acpi_iasl ×3, smbios_dmidecode ×1, integration ×7,
+  enlil-platform 74, config 14, hal 9, mgmt 12, setup 9, std 4) green, **0
+  failed.** The `smbios_dmidecode_validation` reference gate still parses cleanly.
+- **Clippy**: `cargo clippy --all-targets -p enlil-devices -- -D warnings` clean
+  at every increment (a handful of transient `doc_markdown` / `items_after_statements`
+  / `cast`/`try_from` pedantic lints were hit and fixed before each commit).
+- **Toolchains.** Every increment touches only `enlil-devices` (host-agnostic, no
+  KVM dependency), so each was built/tested on **Linux/WSL** (nightly
+  `x86_64-unknown-linux-gnu`) AND **Windows-native** (`x86_64-pc-windows-msvc`,
+  `cargo build -p enlil-devices` against the WSL manifest with a Windows
+  target-dir at `D:\Development\.enlil-win-target`) — **exit 0** on both for all
+  12. No `no_std` / `x86_64-unknown-enlil` / UEFI payload build was required (no
+  `no_std` crate touched). Note: the stale DAILY-ROUTINE wrapper claim that
+  "enlil-core pulls tokio (breaks uefi)" was checked and is **not** current —
+  enlil-core has no tokio dependency (direct or, for its own build, problematic);
+  tokio lives only in the std crates `enlil-devices`/`enlil-mgmt`. The no_std
+  decoupling for the Phase-6 UEFI payload remains future awake-design work.
+
+### STOP REASON
+**Genuine lack of further high-confidence, unattended-safe unblocked work in the
+swept seam — NOT the wall-clock budget** (the system clock showed only ~36 min of
+the 3–4 h window elapsed; the operations and overlapped builds were fast). This
+session opened the 2026-06-29 seam's recommended next step and then *exhausted*
+the remaining high-confidence reserved-bit/RO-bit class across `enlil-devices`
+(PMU `PERFEVTSEL`, LAPIC Timer DCR, HPET Timer N config, HDA `GCTL`, SMBus
+`AUX_CTL`, xHCI `DNCTRL`/`CONFIG`/`ERSTSZ`, PCI Command/Status, ACPI PM1
+Control/Enable). I also **verified-clean** (no change needed) many other
+subsystems: the 16550 serial UART (IER `&0x0F`, MCR `&0x1F`), MSI-X Vector
+Control (`&0x1`), the RTC (REG_A masks UIP, REG_C/D read-only), the xHCI PORTSC
+(built from decoded fields, never stored raw), virtio-net feature negotiation
+(intersection only), the raw storage backend's read-only enforcement, and the
+CPUID hypervisor-present-bit clearing. The remaining same-area candidates are
+deliberately left because they are **not** high-confidence-unattended-safe:
+  1. **Cross-vendor CPUID identity** (vendor string + FMS + brand + feature-flag
+     mask) and the related **machine-identity coherence gap** (ROADMAP §5(3b):
+     the default SMBIOS profile is an AMD Ryzen on an ASUS B650E while the chipset
+     is Intel Q35 and CPUID carries both vendor profiles) — both are awake-design
+     masquerade passes where *a partial version is worse than none*; untouched.
+  2. **PS/2 8042 controller config byte** bits 3/7 ("should be zero") — real 8042
+     KBC RAM stores/returns them on many parts, so masking could be *less*
+     authentic; family-dependent, low-confidence, deliberately left.
+  3. New device models (AHCI/SATA at `1F.2`; ECAM relocation on `PCIEXBAR`
+     reprogram) and the driven run-loop / qcow2 refcount growth — all large or
+     awake-design, as previously logged.
+`master` stays buildable (green per increment).
+
+### Recommended next step (tomorrow)
+1. **Cross-vendor machine-identity coherence pass** (the standing highest-value
+   transparency item, ROADMAP §5.3 + §5(3b)) — select CPU vendor profile +
+   chipset + SMBIOS board/CPU strings coherently from ONE machine profile, in a
+   single awake session (Intel-flavoured SMBIOS to match the Q35 chipset, or a
+   profile selector). Only when it can be done in one coherent go.
+2. If a lighter increment is wanted first: an **AHCI/IDE model at `00:1F.2`** (a
+   real ICH9 always has SATA there; its absence is a SKU that never shipped) — a
+   larger but well-scoped device-model addition that closes a chipset-fidelity
+   gap, not awake-design.
+
+### PR
+<!-- PR_URL -->
+
 ## 2026-06-29 — Session: systematic guest-write reserved-bit / read-only-field hardening across the device transparency surface (Phases 4 & 5)
 
 **11 tested code increments, each independently green and committed** (branch

@@ -514,8 +514,17 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 > promises instead of a timeout; (3) ~~subsystem IDs~~ **done (2026-06-11):** all three onboard
 > functions (MCH, LPC, SMBus) carry `1043:8694` — ASUSTeK's PCI-SIG vendor ID,
 > pinned by test against the SMBIOS default baseboard manufacturer (same-fact
-> pair); note the subsystem registers are still guest-writable (real ones are
-> RO) — a general config-space write-mask pass is a separate item;
+> pair); ~~note the subsystem registers are still guest-writable (real ones are
+> RO) — a general config-space write-mask pass is a separate item~~ **done
+> (2026-06-30):** the general config-space write-mask pass is complete —
+> `PciConfigSpace::guest_write` honours the read-only header bytes (Vendor/Device/
+> Subsystem/Class IDs, Header Type) and the capability-list structure, and **both**
+> config front-ends (legacy CF8/CFC `PciConfigIo` and ECAM MMIO `EcamSpace`)
+> forward through it, so identity registers are RO through either mechanism
+> (regression-tested end-to-end). The same pass now also enforces the **Command**
+> register's writable mask (`0x0547`; PCIe-hardwired-0/reserved bits read 0) and
+> the **Status** register's RO/RW1C semantics (Capabilities-List bit and the rest
+> RO, error bits `{8,11-15}` write-1-to-clear) on guest writes;
 > (3b) **machine-identity coherence gap (flagged 2026-06-11):** the default
 > SMBIOS profile describes an AMD Ryzen 7950X on an ASUS B650E board while the
 > chipset model is Intel Q35 and the CPUID stealth table has both vendor
@@ -2050,6 +2059,23 @@ Physical USB Devices
   - Use `iasl` (Intel ACPI compiler) to validate all generated AML
 - Test against common anti-cheat (BattlEye, EAC, Vanguard) and DRM software
 - **Milestone:** Windows 11 installs and runs as a guest, passes pafish + al-khaser + custom IET test
+- **Guest-write register-transparency hardening (status, 2026-06-28 → 2026-06-30):**
+  a recurring sweep has closed the *reserved-bit-writeback* class — a guest that
+  writes a reserved or read-only register/MSR bit must read it back as 0/its fixed
+  value (real hardware does), or the readback is a hypervisor tell. Covered so far:
+  MSI Message Control / PM PMC / PCIe Capabilities / capability-list headers /
+  **Command** (writable `0x0547`) / **Status** (RO + RW1C) config registers and the
+  ECAM+CF8 front-ends (`pcie.rs`); LAPIC LVT/SVR/ICR and the **Timer Divide Config**
+  register; the Intel + AMD PMU control MSRs, the vendor-aware **`PERFEVTSEL`** mask,
+  and `IA32_DEBUGCTL` (`stealth/`, `interrupt/lapic.rs`); **HPET Timer N config**;
+  **HDA `GCTL`**; **SMBus `AUX_CTL`**; xHCI **USBCMD**/**`DNCTRL`**/**`CONFIG`**/
+  **`ERSTSZ`**; and **ACPI PM1 Control/Enable** (`chipset.rs`). Verified-clean (no
+  change needed): 16550 UART IER/MCR, MSI-X Vector Control, RTC Reg A/C/D, xHCI
+  PORTSC, virtio-net feature negotiation. **Remaining transparency work is
+  awake-design** (§5.3): the cross-vendor CPUID identity and the **machine-identity
+  coherence gap** — the default profile mixes an AMD CPU with an Intel Q35 chipset;
+  CPU vendor + chipset + SMBIOS strings must be chosen from ONE coherent machine
+  profile (a partial version is worse than none).
 
 ---
 
