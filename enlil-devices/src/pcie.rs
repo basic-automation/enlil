@@ -614,6 +614,28 @@ impl PciConfigSpace {
             (self.read_u16(cfg::STATUS), covered)
         });
 
+        // The PCI Command register (0x04) is only partly writable. On a PCIe
+        // function the legacy bits Special Cycles [3], Memory Write & Invalidate
+        // [4], VGA Palette Snoop [5], the reserved bit [7] and Fast Back-to-Back
+        // Enable [9] are hardwired to 0, and [15:11] are reserved — only I/O [0],
+        // Memory [1], Bus Master [2], Parity Error Response [6], SERR# [8] and
+        // Interrupt Disable [10] are guest-writable (PCI Local Bus spec §6.2.2,
+        // PCIe Base §7.5.1.1). Storing the raw value let a guest set hardwired-0
+        // bits and read them back — a transparency tell. Snapshot so the generic
+        // loop can be re-masked to the writable bits in the covered bytes.
+        let command_touched =
+            offset < cfg::COMMAND + 2 && offset + u16::from(width) > cfg::COMMAND;
+        let saved_command = command_touched.then(|| {
+            let mut covered = 0u16;
+            if offset <= cfg::COMMAND {
+                covered |= 0x00FF;
+            }
+            if offset + u16::from(width) > cfg::COMMAND + 1 {
+                covered |= 0xFF00;
+            }
+            (self.read_u16(cfg::COMMAND), covered)
+        });
+
         // The PCI Express Capabilities register (PCIE_CAP_OFFSET + 2) is also a
         // wholly read-only descriptor: Capability Version (bits 3:0), Device/Port
         // Type (7:4), Slot Implemented (8), and Interrupt Message Number (13:9)
@@ -674,6 +696,16 @@ impl PciConfigSpace {
             let attempted = self.read_u16(cfg::STATUS);
             let w1c_clear = attempted & STATUS_W1C_MASK & covered;
             self.write_u16(cfg::STATUS, old_status & !w1c_clear);
+        }
+
+        // Restore the Command register: keep the guest's value only in the
+        // writable bits of the covered bytes; force the hardwired-0 / reserved
+        // bits back to their prior value (0).
+        if let Some((old_command, covered)) = saved_command {
+            const COMMAND_WRITABLE_MASK: u16 = 0x0547; // bits 0,1,2,6,8,10
+            let writable = COMMAND_WRITABLE_MASK & covered;
+            let attempted = self.read_u16(cfg::COMMAND);
+            self.write_u16(cfg::COMMAND, (old_command & !writable) | (attempted & writable));
         }
     }
 
@@ -1840,6 +1872,28 @@ mod tests {
         // A guest cannot SET a read-only bit it had no business setting (e.g.
         // 66 MHz Capable [5], not advertised by this model): it stays 0.
         assert_eq!(after & 0x0020, 0, "guest cannot set the read-only 66MHz bit");
+    }
+
+    #[test]
+    fn guest_command_register_writable_bits_take_but_hardwired_bits_stay_zero() {
+        let mut cs = PciConfigSpace::new(PciBdf::new(0, 6, 0), 0x8086, 0x1234);
+        // A guest writes all-ones to the Command register.
+        cs.guest_write(cfg::COMMAND, 2, 0xFFFF);
+        let cmd = cs.read_u16(cfg::COMMAND);
+        // The writable bits (I/O [0], Mem [1], Bus Master [2], PERR [6],
+        // SERR# [8], Interrupt Disable [10]) took.
+        assert_eq!(cmd & 0x0547, 0x0547, "writable Command bits took");
+        // The hardwired-0 (PCIe) / reserved bits read back 0.
+        assert_eq!(cmd & !0x0547, 0, "hardwired-0 and reserved Command bits stay 0");
+
+        // A byte write to the high Command byte must not disturb the low byte's
+        // already-set writable bits.
+        cs.guest_write(cfg::COMMAND + 1, 1, 0xFF);
+        assert_eq!(
+            cs.read_u16(cfg::COMMAND) & 0x07,
+            0x07,
+            "low-byte writable bits survive a high-byte write"
+        );
     }
 
     #[test]
