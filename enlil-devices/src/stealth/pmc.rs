@@ -32,6 +32,29 @@ const FIXED_CTR_CTRL_MASK: u64 = (1u64 << (4 * MAX_FIXED_PMCS)) - 1;
 /// actually exercises.
 const AMD_GLOBAL_CTRL_MASK: u64 = (1u64 << msr::AMD_CORE_PMCS) - 1;
 
+/// Writable bits of an **Intel** `IA32_PERFEVTSELn` (MSR `0x186 + n`). Every
+/// architectural field — Event Select `[7:0]`, Unit Mask `[15:8]`, USR/OS/Edge/
+/// PinControl/INT `[16:20]`, `AnyThread` `[21]`, EN/INV `[22:23]`, CMASK `[31:24]`
+/// — lives in the low 32 bits; **all of `[63:32]` is reserved** (SDM Vol. 3
+/// §20.2.1.1, Fig. 20-1). A guest that writes all-ones and reads back the high
+/// bits unchanged would catch a hypervisor that stored the value verbatim, so
+/// the reserved upper half must read 0.
+const INTEL_PERFEVTSEL_MASK: u64 = 0xFFFF_FFFF;
+
+/// Writable bits of an **AMD** `PerfEvtSel` (legacy `0xC001_000n` / core
+/// `0xC001_0200 + 2n`). AMD defines more than Intel: besides the low-32 fields
+/// it has the Event Select extension `[35:32]` and HostOnly/GuestOnly `[41:40]`
+/// (AMD APM Vol. 2 §13.2.1). The definitely-reserved regions `[39:36]` and
+/// `[63:42]` must read back 0. The low 32 bits are kept verbatim (AMD's two
+/// in-range reserved holes at `[19]`/`[21]` vary by family, so policing them
+/// risks corrupting a legitimate counter config for a negligible extra tell).
+/// This is the crux of why the mask must be vendor-aware: the shared
+/// `event_select` shadow is reached by **either** the Intel `IA32_*` path
+/// **or** this AMD path (never both, since a guest is presented one vendor), and
+/// Intel reserves `[63:32]` wholesale where AMD keeps `[41:32]` partly live — a
+/// single mask would corrupt one vendor.
+const AMD_PERFEVTSEL_MASK: u64 = 0x0000_030F_FFFF_FFFF;
+
 /// Rates at which the fixed-function counters advance per unit of guest time.
 ///
 /// `advance_counters` receives a **TSC delta** (reference cycles). On bare
@@ -264,7 +287,7 @@ impl PmcState {
             }
             m if m >= msr::IA32_PERFEVTSEL0 && m < msr::IA32_PERFEVTSEL0 + u32_of(MAX_GP_PMCS) => {
                 let idx = (m - msr::IA32_PERFEVTSEL0) as usize;
-                self.event_select[idx] = value;
+                self.event_select[idx] = value & INTEL_PERFEVTSEL_MASK;
             }
             m if m >= msr::IA32_FIXED_CTR0 && m < msr::IA32_FIXED_CTR0 + u32_of(MAX_FIXED_PMCS) => {
                 let idx = (m - msr::IA32_FIXED_CTR0) as usize;
@@ -284,7 +307,9 @@ impl PmcState {
     const fn write_amd_msr(&mut self, msr: u32, value: u64) {
         match amd_pmc_target(msr) {
             Some(AmdPmcTarget::Counter(i)) if i < MAX_GP_PMCS => self.gp_counters[i] = value,
-            Some(AmdPmcTarget::EventSelect(i)) if i < MAX_GP_PMCS => self.event_select[i] = value,
+            Some(AmdPmcTarget::EventSelect(i)) if i < MAX_GP_PMCS => {
+                self.event_select[i] = value & AMD_PERFEVTSEL_MASK;
+            }
             Some(AmdPmcTarget::GlobalCtrl) => self.global_ctrl = value & AMD_GLOBAL_CTRL_MASK,
             // Writing the clear MSR clears the set status bits (write-1-to-clear),
             // matching the Intel `GLOBAL_STATUS_RESET` semantics above.
@@ -446,6 +471,44 @@ mod tests {
             pmc.read_msr(msr::AMD_PERF_CNTR_GLOBAL_CTL),
             Some(0x3F),
             "AMD PerfCntrGlobalCtl reserved bits must read back 0"
+        );
+    }
+
+    #[test]
+    fn perfevtsel_masking_is_vendor_aware() {
+        // The Intel and AMD event-select MSRs share one shadow, but a guest is
+        // presented exactly one vendor and writes only that namespace, so each
+        // write path masks to its own vendor's valid bits.
+
+        // Intel IA32_PERFEVTSEL: only the low 32 bits are defined; all of
+        // [63:32] is reserved and must read back 0.
+        let mut intel = PmcState::new();
+        intel.write_msr(msr::IA32_PERFEVTSEL0, u64::MAX);
+        assert_eq!(
+            intel.read_msr(msr::IA32_PERFEVTSEL0),
+            Some(0xFFFF_FFFF),
+            "Intel PERFEVTSEL reserved high bits [63:32] must read back 0"
+        );
+        // A legitimate low-32 event config is untouched (event 0xC0, umask 0x00,
+        // USR|OS|EN = 0x53_0000 → 0x0053_00C0).
+        intel.write_msr(msr::IA32_PERFEVTSEL0 + 1, 0x0053_00C0);
+        assert_eq!(intel.read_msr(msr::IA32_PERFEVTSEL0 + 1), Some(0x0053_00C0));
+
+        // AMD PerfEvtSel additionally defines the Event Select extension [35:32]
+        // and HostOnly/GuestOnly [41:40]; only [39:36] and [63:42] are reserved.
+        // Masking AMD with the Intel mask would wrongly drop the high event bits.
+        let mut amd = PmcState::new();
+        amd.write_msr(msr::AMD_CORE_PERFEVTSEL0, u64::MAX);
+        assert_eq!(
+            amd.read_msr(msr::AMD_CORE_PERFEVTSEL0),
+            Some(0x0000_030F_FFFF_FFFF),
+            "AMD PerfEvtSel keeps [41:40] and [35:32]; clears [39:36] and [63:42]"
+        );
+        // The legacy block aliases the same shadow and is masked identically.
+        amd.write_msr(msr::AMD_LEGACY_PERFEVTSEL0 + 1, u64::MAX);
+        assert_eq!(
+            amd.read_msr(msr::AMD_CORE_PERFEVTSEL0 + 2),
+            Some(0x0000_030F_FFFF_FFFF)
         );
     }
 
