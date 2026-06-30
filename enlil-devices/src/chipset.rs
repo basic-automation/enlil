@@ -194,14 +194,18 @@ const PM1_CNT_SLP_EN: u16 = 1 << 13;
 const PM1_CNT_SLP_TYP_MASK: u16 = 0x7 << 10;
 /// `SLP_TYP` field shift.
 const PM1_CNT_SLP_TYP_SHIFT: u16 = 10;
-/// Bits the guest can store in the control register. Only `SLP_EN` (bit 13) is
-/// excluded: it is a write-only trigger that always reads back 0. `SLP_TYP`
-/// (bits 10-12) IS a read/write field per the ACPI spec (PM1 Control) and on
-/// real hardware (ICH9) / QEMU retains the last value written, so a guest that
-/// programs `SLP_TYP` and reads it back sees what it wrote — masking it to 0
-/// here was a guest-visible non-conformance (and a transparency tell). We still
-/// capture the value into a one-shot sleep request when `SLP_EN` commits it.
-const PM1_CNT_STORED_MASK: u16 = !PM1_CNT_SLP_EN;
+/// `BM_RLD` (bit 1): bus-master reload — a read/write control bit.
+const PM1_CNT_BM_RLD: u16 = 1 << 1;
+/// Bits the guest can store in the control register and read back. Only the
+/// genuinely read/write fields persist: `SCI_EN` (bit 0), `BM_RLD` (bit 1), and
+/// `SLP_TYP` (bits 10-12, the DSDT `_Sx` value — a guest that programs it must
+/// read back what it wrote, matching ICH9/QEMU). Everything else reads back 0
+/// per the ACPI spec (PM1 Control): `GBL_RLS` (bit 2) is a write-only trigger,
+/// `SLP_EN` (bit 13) is a write-only commit, and bits [9:3] / [15:14] are
+/// reserved. Storing those let a guest write all-ones and read them back — a
+/// non-conformance and a transparency tell. `SLP_EN` still captures the
+/// `SLP_TYP` into a one-shot sleep request when it commits.
+const PM1_CNT_STORED_MASK: u16 = PM1_CNT_SCI_EN | PM1_CNT_BM_RLD | PM1_CNT_SLP_TYP_MASK;
 
 /// The **ACPI `PM1a` event + control block** as a bus [`PioDevice`].
 ///
@@ -659,6 +663,19 @@ mod tests {
         );
         assert_eq!(cnt & 1, 1, "SCI_EN still set");
         assert_eq!(cnt & (1 << 13), 0, "SLP_EN is write-only and reads 0");
+    }
+
+    #[test]
+    fn pm1_control_reserved_and_write_only_bits_read_back_zero() {
+        let mut pm1 = AcpiPm1Block::new();
+        // A guest writes all-ones. Only SCI_EN [0], BM_RLD [1] and SLP_TYP
+        // [12:10] persist; GBL_RLS [2], the reserved bits [9:3]/[15:14] and the
+        // write-only SLP_EN [13] must read back 0 (ACPI PM1 Control).
+        pm1.pio_write(PM1_CNT_PORT, 2, 0xFFFF);
+        let cnt = pm1.pio_read(PM1_CNT_PORT, 2);
+        assert_eq!(cnt, 0x1C03, "only SCI_EN | BM_RLD | SLP_TYP persist");
+        // SLP_TYP = 0b111 committed a sleep request (SLP_EN was in the write).
+        assert_eq!(pm1.take_sleep(), Some(0x7), "all-ones set SLP_EN + SLP_TYP=7");
     }
 
     #[test]
