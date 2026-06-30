@@ -591,6 +591,51 @@ impl PciConfigSpace {
             && self.read_u8(PM_CAP_OFFSET) == 0x01;
         let saved_pmc = pmc_ro.then(|| self.read_u16(PM_CAP_OFFSET + 2));
 
+        // The PCI Status register (0x06) has no plain read-write bits: it is
+        // read-only except for the RW1C error bits — Master Data Parity Error
+        // [8], Signaled Target Abort [11], Received Target Abort [12], Received
+        // Master Abort [13], Signaled System Error [14], Detected Parity Error
+        // [15] (PCI Local Bus spec §6.2.3). The read-only bits include the
+        // Capabilities List bit [4], which the capability-header protection
+        // below itself reads — a guest that set/cleared it could corrupt that
+        // logic and its own cap-list walk, besides being a transparency tell.
+        // Snapshot the register and which bytes the write covers so the generic
+        // byte loop can be undone: RO bits restored, W1C bits cleared only where
+        // the guest wrote a 1.
+        let status_touched = offset < cfg::STATUS + 2 && offset + u16::from(width) > cfg::STATUS;
+        let saved_status = status_touched.then(|| {
+            let mut covered = 0u16;
+            if offset <= cfg::STATUS {
+                covered |= 0x00FF;
+            }
+            if offset + u16::from(width) > cfg::STATUS + 1 {
+                covered |= 0xFF00;
+            }
+            (self.read_u16(cfg::STATUS), covered)
+        });
+
+        // The PCI Command register (0x04) is only partly writable. On a PCIe
+        // function the legacy bits Special Cycles [3], Memory Write & Invalidate
+        // [4], VGA Palette Snoop [5], the reserved bit [7] and Fast Back-to-Back
+        // Enable [9] are hardwired to 0, and [15:11] are reserved — only I/O [0],
+        // Memory [1], Bus Master [2], Parity Error Response [6], SERR# [8] and
+        // Interrupt Disable [10] are guest-writable (PCI Local Bus spec §6.2.2,
+        // PCIe Base §7.5.1.1). Storing the raw value let a guest set hardwired-0
+        // bits and read them back — a transparency tell. Snapshot so the generic
+        // loop can be re-masked to the writable bits in the covered bytes.
+        let command_touched =
+            offset < cfg::COMMAND + 2 && offset + u16::from(width) > cfg::COMMAND;
+        let saved_command = command_touched.then(|| {
+            let mut covered = 0u16;
+            if offset <= cfg::COMMAND {
+                covered |= 0x00FF;
+            }
+            if offset + u16::from(width) > cfg::COMMAND + 1 {
+                covered |= 0xFF00;
+            }
+            (self.read_u16(cfg::COMMAND), covered)
+        });
+
         // The PCI Express Capabilities register (PCIE_CAP_OFFSET + 2) is also a
         // wholly read-only descriptor: Capability Version (bits 3:0), Device/Port
         // Type (7:4), Slot Implemented (8), and Interrupt Message Number (13:9)
@@ -638,6 +683,29 @@ impl PciConfigSpace {
         }
         if let Some(pcie_cap) = saved_pcie_cap {
             self.write_u16(PCIE_CAP_OFFSET + 2, pcie_cap);
+        }
+
+        // Restore the Status register: keep every read-only bit at its prior
+        // value and only clear the RW1C error bits the guest wrote a 1 to within
+        // the bytes the write actually covered.
+        if let Some((old_status, covered)) = saved_status {
+            // RW1C error bits: Master Data Parity Error [8], Signaled Target
+            // Abort [11], Received Target Abort [12], Received Master Abort [13],
+            // Signaled System Error [14], Detected Parity Error [15].
+            const STATUS_W1C_MASK: u16 = 0xF900;
+            let attempted = self.read_u16(cfg::STATUS);
+            let w1c_clear = attempted & STATUS_W1C_MASK & covered;
+            self.write_u16(cfg::STATUS, old_status & !w1c_clear);
+        }
+
+        // Restore the Command register: keep the guest's value only in the
+        // writable bits of the covered bytes; force the hardwired-0 / reserved
+        // bits back to their prior value (0).
+        if let Some((old_command, covered)) = saved_command {
+            const COMMAND_WRITABLE_MASK: u16 = 0x0547; // bits 0,1,2,6,8,10
+            let writable = COMMAND_WRITABLE_MASK & covered;
+            let attempted = self.read_u16(cfg::COMMAND);
+            self.write_u16(cfg::COMMAND, (old_command & !writable) | (attempted & writable));
         }
     }
 
@@ -1783,6 +1851,52 @@ mod tests {
     }
 
     #[test]
+    fn guest_writes_to_the_status_register_preserve_ro_bits_and_w1c_errors() {
+        let mut cs = PciConfigSpace::new(PciBdf::new(0, 6, 0), 0x8086, 0x1234);
+        cs.add_msi_capability(); // sets the Capabilities List bit [4] in STATUS
+        // Seed two RW1C error bits as if hardware had latched them: Received
+        // Master Abort [13] and Signaled System Error [14].
+        let seeded = cs.read_u16(cfg::STATUS) | 0x6000;
+        cs.write_u16(cfg::STATUS, seeded);
+        assert_ne!(cs.read_u16(cfg::STATUS) & 0x0010, 0, "caps list bit set");
+
+        // A guest writes all-ones to the whole Status register.
+        cs.guest_write(cfg::STATUS, 2, 0xFFFF);
+
+        let after = cs.read_u16(cfg::STATUS);
+        // The read-only Capabilities List bit [4] is unchanged (still set) — a
+        // guest cannot clear it (which would also break the cap-header guard).
+        assert_ne!(after & 0x0010, 0, "Capabilities List bit is read-only");
+        // The two seeded RW1C error bits were cleared by the write-1.
+        assert_eq!(after & 0x6000, 0, "RW1C error bits cleared by write-1");
+        // A guest cannot SET a read-only bit it had no business setting (e.g.
+        // 66 MHz Capable [5], not advertised by this model): it stays 0.
+        assert_eq!(after & 0x0020, 0, "guest cannot set the read-only 66MHz bit");
+    }
+
+    #[test]
+    fn guest_command_register_writable_bits_take_but_hardwired_bits_stay_zero() {
+        let mut cs = PciConfigSpace::new(PciBdf::new(0, 6, 0), 0x8086, 0x1234);
+        // A guest writes all-ones to the Command register.
+        cs.guest_write(cfg::COMMAND, 2, 0xFFFF);
+        let cmd = cs.read_u16(cfg::COMMAND);
+        // The writable bits (I/O [0], Mem [1], Bus Master [2], PERR [6],
+        // SERR# [8], Interrupt Disable [10]) took.
+        assert_eq!(cmd & 0x0547, 0x0547, "writable Command bits took");
+        // The hardwired-0 (PCIe) / reserved bits read back 0.
+        assert_eq!(cmd & !0x0547, 0, "hardwired-0 and reserved Command bits stay 0");
+
+        // A byte write to the high Command byte must not disturb the low byte's
+        // already-set writable bits.
+        cs.guest_write(cfg::COMMAND + 1, 1, 0xFF);
+        assert_eq!(
+            cs.read_u16(cfg::COMMAND) & 0x07,
+            0x07,
+            "low-byte writable bits survive a high-byte write"
+        );
+    }
+
+    #[test]
     fn guest_writes_cannot_change_pm_or_pcie_capability_descriptors() {
         let mut cs = PciConfigSpace::new(PciBdf::new(0, 6, 0), 0x8086, 0x1234);
         cs.add_power_management_capability(); // PMC = 0x0003 (PM v1.2, no PME)
@@ -2395,5 +2509,46 @@ mod tests {
         ecam.mmio_write(offset, 1, 0x2A);
         cam.pio_write(CONFIG_ADDRESS_PORT, 4, config_address(0, 2, 0, 0x3C));
         assert_eq!(cam.pio_read(CONFIG_DATA_PORT, 1), 0x2A);
+    }
+
+    #[test]
+    fn config_write_front_ends_cannot_reprogram_device_identity() {
+        // The read-only identity registers must survive a hostile all-ones write
+        // through EITHER config front-end — both the legacy CF8/CFC ports and the
+        // ECAM MMIO window forward to guest_write, which honours the read-only
+        // bytes. This is the general config-space write-mask pass proven end to
+        // end (not just on the bare PciConfigSpace), so a regression that made a
+        // front-end bypass guest_write would be caught.
+        let mut rc = PcieRootComplex::new(0xB000_0000);
+        // The Q35 MCH at 0:0.0 stamps Intel vendor + the board subsystem IDs.
+        rc.add_device(PcieRootComplex::create_q35_host_bridge(0xB000_0000));
+        let shared = Rc::new(RefCell::new(rc));
+        let mut cam = PciConfigIo::with_shared(Rc::clone(&shared));
+        let mut ecam = EcamSpace::new(Rc::clone(&shared));
+        let base = PciBdf::new(0, 0, 0).ecam_offset() as u64;
+
+        // A guest scribbles all-ones over the Subsystem ID dword via the legacy
+        // ports and over the Vendor/Device ID dword via ECAM.
+        cam.pio_write(CONFIG_ADDRESS_PORT, 4, config_address(0, 0, 0, 0x2C)); // Subsystem Vendor ID
+        cam.pio_write(CONFIG_DATA_PORT, 4, 0xFFFF_FFFF);
+        ecam.mmio_write(base + u64::from(cfg::VENDOR_ID), 4, 0xFFFF_FFFF);
+
+        // Identity is unchanged, read back through both front-ends.
+        assert_eq!(
+            ecam.mmio_read(base + u64::from(cfg::SUBSYSTEM_VENDOR_ID), 2),
+            u64::from(BOARD_SUBSYSTEM_VENDOR_ID),
+            "Subsystem Vendor ID is read-only (ECAM view)"
+        );
+        assert_eq!(
+            ecam.mmio_read(base + u64::from(cfg::SUBSYSTEM_ID), 2),
+            u64::from(BOARD_SUBSYSTEM_DEVICE_ID),
+            "Subsystem Device ID is read-only"
+        );
+        cam.pio_write(CONFIG_ADDRESS_PORT, 4, config_address(0, 0, 0, 0x00)); // Vendor ID
+        assert_eq!(
+            cam.pio_read(CONFIG_DATA_PORT, 2),
+            u32::from(vendors::INTEL),
+            "Vendor ID is read-only (legacy port view)"
+        );
     }
 }

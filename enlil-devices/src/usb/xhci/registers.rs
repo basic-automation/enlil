@@ -485,6 +485,23 @@ impl OperationalRegisters {
         }
     }
 
+    /// Write to DNCTRL (Device Notification Control). Only the 16 Notification
+    /// Enable bits N0-N15 `[15:0]` are defined (xHCI 1.2 §5.4.4); `[31:16]` are
+    /// reserved and read 0. Storing the raw value would let a guest read the
+    /// reserved bits back unchanged — a hypervisor tell.
+    pub const fn write_dnctrl(&mut self, value: u32) {
+        self.dnctrl = value & 0x0000_FFFF;
+    }
+
+    /// Write to CONFIG. `MaxSlotsEn` `[7:0]` is the only field this model honours
+    /// (`max_slots_enabled` reads it); U3E `[8]` / CIE `[9]` are gated on
+    /// HCCPARAMS2 capabilities this model does not advertise, and `[31:10]` are
+    /// reserved (xHCI 1.2 §5.4.7). Mask to `[7:0]` so reserved/unsupported bits
+    /// read back 0 rather than storing the guest's value verbatim.
+    pub const fn write_config(&mut self, value: u32) {
+        self.config = value & 0x0000_00FF;
+    }
+
     /// Write to USBSTS — write-1-to-clear semantics for event bits.
     pub const fn write_usbsts(&mut self, value: u32) {
         // HSE(2), EINT(3), PCD(4) are write-1-to-clear
@@ -728,6 +745,18 @@ mod tests {
             "only sticky control bits persist"
         );
         assert!(ops.is_running(), "R/S took");
+    }
+
+    #[test]
+    fn dnctrl_and_config_mask_reserved_bits() {
+        let mut ops = OperationalRegisters::new(4);
+        // DNCTRL: only the 16 notification-enable bits [15:0] are defined.
+        ops.write_dnctrl(u32::MAX);
+        assert_eq!(ops.read(0x14), 0x0000_FFFF, "DNCTRL [31:16] reserved");
+        // CONFIG: only MaxSlotsEn [7:0] is honoured; [31:8] read 0.
+        ops.write_config(u32::MAX);
+        assert_eq!(ops.read(0x38), 0x0000_00FF, "CONFIG [31:8] reserved");
+        assert_eq!(ops.max_slots_enabled(), 0xFF);
     }
 
     #[test]

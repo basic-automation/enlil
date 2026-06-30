@@ -80,6 +80,13 @@ const ICR_LOW_WRITE_MASK: u32 = 0x000C_CFFF;
 /// dword. Bits [55:32] are reserved.
 const ICR_HIGH_WRITE_MASK: u32 = 0xFF00_0000;
 
+/// Writable bits of the Timer Divide Configuration Register (`0x3E0`, Intel SDM
+/// Vol.3 Figure 10-10): the divide value is encoded in bits 0, 1, and 3. Bit 2
+/// and bits [31:4] are reserved and must read back 0 (a guest that writes
+/// all-ones and reads the reserved bits back unchanged would catch a hypervisor
+/// that stored the raw value — the divisor decode already ignores them).
+const TIMER_DCR_WRITE_MASK: u32 = 0x0000_000B;
+
 /// MSR number of `IA32_TSC_DEADLINE` (Intel SDM Vol.3 §10.5.4.1).
 ///
 /// The per-logical-processor register a guest writes to arm the LAPIC
@@ -394,7 +401,7 @@ impl LocalApic {
                 }
             }
             LAPIC_TIMER_DIVIDE => {
-                self.timer_divide = value;
+                self.timer_divide = value & TIMER_DCR_WRITE_MASK;
                 self.timer_divide_residual = 0;
             }
             LAPIC_SELF_IPI => {
@@ -1249,5 +1256,20 @@ mod tests {
             lapic.write_register(LAPIC_TIMER_DIVIDE, dcr);
             assert_eq!(lapic.timer_divisor(), divisor, "DCR {dcr:#06b}");
         }
+    }
+
+    #[test]
+    fn timer_divide_register_masks_reserved_bits() {
+        let mut lapic = LocalApic::new(0);
+        // A guest writes all-ones. Only bits 0, 1, 3 are writable; bit 2 and
+        // [31:4] are reserved and must read back 0 (real hardware reads 0).
+        lapic.write_register(LAPIC_TIMER_DIVIDE, u32::MAX);
+        assert_eq!(
+            lapic.read_register(LAPIC_TIMER_DIVIDE),
+            0x0000_000B,
+            "Timer DCR reserved bits must read back 0"
+        );
+        // 0b1011 still decodes to divide-by-1, unaffected by the dropped bits.
+        assert_eq!(lapic.timer_divisor(), 1);
     }
 }

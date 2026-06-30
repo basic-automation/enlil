@@ -234,11 +234,20 @@ impl Hpet {
                 if let Some(timer) = self.timers.get_mut(timer_idx) {
                     match reg_offset {
                         0x00 => {
-                            // Timer config — preserve read-only bits
-                            let read_only_mask: u64 = 0xFFFF_FFFF_0000_0000 | (1 << 4) | (1 << 5);
-                            let writable_mask = !read_only_mask;
-                            timer.config =
-                                (timer.config & read_only_mask) | (value & writable_mask);
+                            // Timer config — write only the architecturally-writable
+                            // config bits (IA-PC HPET §2.3.8): INT_TYPE[1], INT_ENB[2],
+                            // TYPE/periodic[3], VAL_SET[6], 32MODE[8], INT_ROUTE[13:9],
+                            // FSB_EN[14]. Everything else is preserved from the current
+                            // value: the read-only capability bits PER_INT_CAP[4],
+                            // SIZE_CAP[5], FSB_INT_DEL_CAP[15], INT_ROUTE_CAP[63:32], and
+                            // the reserved bits 0, 7, [31:16] — all of which start at 0
+                            // (or their advertised cap) and so read back unchanged. The
+                            // old `!read_only_mask` left bits 0/7/15/[31:16] writable, so
+                            // a guest could store reserved/RO bits and read them back — a
+                            // hypervisor tell (real hardware reads them 0).
+                            const TIMER_CONFIG_WRITABLE_MASK: u64 = 0x0000_0000_0000_7F4E;
+                            timer.config = (timer.config & !TIMER_CONFIG_WRITABLE_MASK)
+                                | (value & TIMER_CONFIG_WRITABLE_MASK);
                         }
                         0x08 => {
                             // IA-PC HPET §2.3.9.2.2: the comparator (next-fire)
@@ -496,6 +505,28 @@ mod tests {
         let cfg = hpet.read(0x100);
         assert_ne!(cfg & (1 << 4), 0, "periodic-capable is read-only");
         assert_ne!(cfg & (1 << 5), 0, "64-bit-capable is read-only");
+    }
+
+    #[test]
+    fn hpet_timer_config_reserved_bits_read_back_zero() {
+        let mut hpet = Hpet::new();
+        // A guest writes all-ones to the Timer 0 config register. Only the
+        // writable config bits {1,2,3,6,8,9-13,14} take; the reserved bits
+        // (0, 7, [31:16]) and the read-only FSB_INT_DEL_CAP (15) must read 0,
+        // while the read-only capability/route bits keep their advertised value.
+        hpet.write(0x100, u64::MAX);
+        let cfg = hpet.read(0x100);
+        assert_eq!(cfg & (1 << 0), 0, "bit 0 is reserved");
+        assert_eq!(cfg & (1 << 7), 0, "bit 7 is reserved");
+        assert_eq!(cfg & (1 << 15), 0, "FSB_INT_DEL_CAP (15) is not advertised");
+        assert_eq!(cfg & 0xFFFF_0000, 0, "bits [31:16] are reserved");
+        // The writable bits did take, and the route-capability high word survives.
+        assert_eq!(cfg & 0x7F4E, 0x7F4E, "every writable config bit took");
+        assert_eq!(
+            cfg & 0xFFFF_FFFF_0000_0000,
+            u64::from(TIMER_ROUTE_CAP) << 32,
+            "INT_ROUTE_CAP [63:32] is read-only"
+        );
     }
 
     #[test]

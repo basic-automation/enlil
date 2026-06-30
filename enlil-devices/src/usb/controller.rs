@@ -258,7 +258,7 @@ impl VirtualXhciController {
         match offset {
             0x00 => self.op.write_usbcmd(value),
             0x04 => self.op.write_usbsts(value),
-            0x14 => self.op.dnctrl = value,
+            0x14 => self.op.write_dnctrl(value),
             // Rewriting CRCR re-establishes the guest ring's consumer
             // cursor at the new pointer/RCS on the next doorbell 0.
             0x18 => {
@@ -271,7 +271,7 @@ impl VirtualXhciController {
             }
             0x30 => self.op.dcbaap = (self.op.dcbaap & !0xFFFF_FFFF) | u64::from(value),
             0x34 => self.op.dcbaap = (self.op.dcbaap & 0xFFFF_FFFF) | (u64::from(value) << 32),
-            0x38 => self.op.config = value,
+            0x38 => self.op.write_config(value),
             o if o >= 0x400 => {
                 // PORTSC is the only writable port register modelled;
                 // PORTPMSC/PORTLI/PORTHLPMC writes are accepted and ignored.
@@ -308,7 +308,7 @@ impl VirtualXhciController {
         match offset {
             0x20 => self.interrupter.write_iman(value),
             0x24 => self.interrupter.imod = value,
-            0x28 => self.interrupter.erstsz = value,
+            0x28 => self.interrupter.write_erstsz(value),
             0x30 => self.interrupter.erstba = lo(self.interrupter.erstba),
             0x34 => self.interrupter.erstba = hi(self.interrupter.erstba),
             0x38 => self.interrupter.write_erdp(lo(self.interrupter.erdp)),
