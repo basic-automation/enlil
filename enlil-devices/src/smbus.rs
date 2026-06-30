@@ -236,7 +236,10 @@ impl SmbusHost {
                 self.block_index = (self.block_index + 1) % BLOCK_BUF_LEN;
             }
             PEC => self.pec = value,
-            AUX_CTL => self.aux_control = value,
+            // Only AAC [0] and E32B [1] are writable; bits [7:2] are reserved
+            // and read 0 (real hardware reads them 0, so a guest must not be
+            // able to store them and read them back — a hypervisor tell).
+            AUX_CTL => self.aux_control = value & 0x03,
             _ => {}
         }
     }
@@ -368,5 +371,13 @@ mod tests {
         assert_eq!(read(&mut smb, HST_D1), 0x56);
         assert_eq!(read(&mut smb, PEC), 0x78);
         assert_eq!(read(&mut smb, AUX_CTL), 0x02);
+    }
+
+    #[test]
+    fn aux_ctl_reserved_bits_read_back_zero() {
+        let mut smb = SmbusHost::new();
+        // A guest writes all-ones; only AAC [0] and E32B [1] are writable.
+        write(&mut smb, AUX_CTL, 0xFF);
+        assert_eq!(read(&mut smb, AUX_CTL), 0x03, "AUX_CTL reserved bits read 0");
     }
 }
