@@ -133,12 +133,18 @@ pub struct LocalApicNmiEntry {
 }
 
 impl LocalApicNmiEntry {
-    /// NMI on LINT1 for all processors
+    /// NMI on LINT1 for all processors.
+    ///
+    /// Flags are the MPS INTI polarity/trigger encoding: `0x0005` = active-high
+    /// (bits 1:0 = 01) + edge-triggered (bits 3:2 = 01), the canonical NMI wiring
+    /// every real firmware (and QEMU) emits here. Leaving it 0 ("conforms to the
+    /// bus specification") is ambiguous for a LINT pin, which has no bus — the
+    /// explicit active-high/edge value is what a genuine MADT carries.
     #[must_use]
     pub const fn all_processors_lint1() -> Self {
         Self {
             acpi_processor_uid: 0xFF,
-            flags: 0,
+            flags: 0x0005,
             lint: 1,
         }
     }
@@ -356,6 +362,27 @@ mod tests {
             offset += madt[offset + 1] as usize;
         }
         assert!(found, "MADT must contain IO APIC entry");
+    }
+
+    #[test]
+    fn madt_local_apic_nmi_is_all_cpus_lint1_active_high_edge() {
+        let madt = MadtBuilder::standard(2).build();
+        // Walk the entries for the Local APIC NMI structure (type 4).
+        let mut offset = 44;
+        let mut found = false;
+        while offset + 1 < madt.len() {
+            if madt[offset] == 4 {
+                found = true;
+                assert_eq!(madt[offset + 1], 6, "type-4 entry length is 6");
+                assert_eq!(madt[offset + 2], 0xFF, "NMI applies to all processors");
+                let flags = u16::from_le_bytes(madt[offset + 3..offset + 5].try_into().unwrap());
+                assert_eq!(flags, 0x0005, "NMI is active-high, edge-triggered");
+                assert_eq!(madt[offset + 5], 1, "NMI is wired to LINT1");
+                break;
+            }
+            offset += madt[offset + 1] as usize;
+        }
+        assert!(found, "MADT must contain a Local APIC NMI entry");
     }
 
     #[test]
