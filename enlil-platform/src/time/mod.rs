@@ -163,49 +163,81 @@ pub fn tsc_frequency() -> u64 {
     TSC_FREQ_HZ.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Calibrate TSC frequency using CPUID leaf 0x15 (Time Stamp Counter and
-/// Nominal Core Crystal Clock Information).
+/// Derive the TSC frequency in Hz from raw CPUID leaf `0x15` / `0x16` values.
 ///
-/// CPUID.15H:
-///   EAX = denominator of TSC/core crystal clock ratio
-///   EBX = numerator of TSC/core crystal clock ratio\
-///   ECX = nominal frequency of the core crystal clock in Hz (may be 0)
+/// Pure (no `__cpuid`), so it is unit-testable with synthetic leaf values;
+/// returns `None` when neither leaf pins the frequency down.
 ///
-/// TSC frequency = ECX * EBX / EAX (if ECX != 0)
-/// If ECX == 0, the crystal clock frequency must be determined from the processor model.
+/// - **Leaf `0x15`** (TSC / core-crystal info): `ratio_den` = `EAX`,
+///   `ratio_num` = `EBX`, `crystal_hz` = `ECX` (crystal frequency in Hz, often
+///   0). With the ratio and crystal all present, `TSC = ECX × EBX / EAX`
+///   exactly (Intel SDM Vol.3 §18.7.3).
+/// - **Leaf `0x16`** (processor frequency): `leaf16_eax[15:0]` = base frequency
+///   in MHz. On invariant-TSC parts the TSC runs at the base frequency, so when
+///   leaf `0x15` reports the ratio but no crystal (`ECX == 0`) we fall back to
+///   `TSC ≈ base_MHz × 1e6` — the same fallback the kernel's
+///   `native_calibrate_tsc` uses.
 ///
-/// Returns `Some(frequency_hz)` on success, None if CPUID 0x15 is not supported
-/// or the values are zero.
+/// `max_leaf` is leaf-0 `EAX` (the maximum basic leaf); a leaf is consulted
+/// only when `max_leaf` advertises it.
+#[must_use]
+pub fn tsc_hz_from_cpuid_leaves(
+    max_leaf: u32,
+    ratio_den: u32,
+    ratio_num: u32,
+    crystal_hz: u32,
+    leaf16_eax: u32,
+) -> Option<u64> {
+    if max_leaf < 0x15 {
+        return None;
+    }
+    let denominator = u64::from(ratio_den);
+    let numerator = u64::from(ratio_num);
+
+    // Exact path: the ratio plus an enumerated crystal frequency.
+    if denominator != 0 && numerator != 0 {
+        let crystal = u64::from(crystal_hz);
+        if crystal != 0 {
+            return Some(crystal * numerator / denominator);
+        }
+    }
+
+    // Crystal absent (or the ratio unusable): fall back to leaf 0x16's base
+    // frequency (MHz, low 16 bits), which the TSC tracks on invariant-TSC parts.
+    if max_leaf >= 0x16 {
+        let base_mhz = u64::from(leaf16_eax & 0xFFFF);
+        if base_mhz != 0 {
+            return Some(base_mhz * 1_000_000);
+        }
+    }
+
+    None
+}
+
+/// Calibrate the TSC frequency from CPUID.
 ///
-/// On Linux backend, this reads from the actual CPU. On bare-metal, same.
-/// This is architecture-specific (`x86_64` only).
+/// Uses leaf `0x15` (TSC / core-crystal info), falling back to leaf `0x16`
+/// (processor base frequency) when the crystal is not enumerated — see
+/// [`tsc_hz_from_cpuid_leaves`] for the arithmetic. Returns `Some(frequency_hz)`
+/// on success, `None` if neither leaf pins the frequency down. Reads the actual
+/// CPU on both the Linux and bare-metal backends; architecture-specific
+/// (`x86_64` only).
 #[cfg(target_arch = "x86_64")]
 #[must_use]
 pub fn calibrate_tsc_from_cpuid() -> Option<u64> {
-    // Check if CPUID leaf 0x15 is supported
     let max_leaf = core::arch::x86_64::__cpuid(0x0).eax;
     if max_leaf < 0x15 {
         return None;
     }
-
-    let cpuid = core::arch::x86_64::__cpuid(0x15);
-    let denominator = u64::from(cpuid.eax);
-    let numerator = u64::from(cpuid.ebx);
-    let crystal_hz = u64::from(cpuid.ecx);
-
-    if denominator == 0 || numerator == 0 {
-        return None;
-    }
-
-    if crystal_hz != 0 {
-        // Direct calculation
-        Some(crystal_hz * numerator / denominator)
+    let l15 = core::arch::x86_64::__cpuid(0x15);
+    // Only read leaf 0x16 when the CPU advertises it, so we never sample an
+    // out-of-range leaf (whose value is vendor-defined and not a frequency).
+    let l16_eax = if max_leaf >= 0x16 {
+        core::arch::x86_64::__cpuid(0x16).eax
     } else {
-        // Crystal clock not reported — would need model-specific lookup
-        // Common values: 24 MHz (Skylake+), 25 MHz (Atom), 19.2 MHz (some mobile)
-        // For now, return None and fall back to other calibration methods
-        None
-    }
+        0
+    };
+    tsc_hz_from_cpuid_leaves(max_leaf, l15.eax, l15.ebx, l15.ecx, l16_eax)
 }
 
 /// Attempt to calibrate TSC and store the result.
@@ -393,5 +425,50 @@ mod tests {
                 "TSC frequency suspiciously high: {freq}"
             );
         }
+    }
+
+    #[test]
+    fn tsc_hz_exact_from_leaf_15_crystal() {
+        // Skylake-style: crystal 24 MHz, ratio 250/2 → 3.0 GHz TSC. ECX present
+        // takes the exact path regardless of leaf 0x16.
+        assert_eq!(
+            tsc_hz_from_cpuid_leaves(0x16, 2, 250, 24_000_000, 2600),
+            Some(3_000_000_000)
+        );
+    }
+
+    #[test]
+    fn tsc_hz_falls_back_to_leaf_16_base_frequency() {
+        // Ratio present but no crystal (ECX == 0): fall back to leaf 0x16's
+        // base frequency (2600 MHz → 2.6 GHz). Only the low 16 bits are the MHz.
+        assert_eq!(
+            tsc_hz_from_cpuid_leaves(0x16, 2, 250, 0, 2600),
+            Some(2_600_000_000)
+        );
+        assert_eq!(
+            tsc_hz_from_cpuid_leaves(0x16, 2, 250, 0, 0xFFFF_0000 | 3200),
+            Some(3_200_000_000),
+            "only EAX[15:0] is the base-frequency MHz field"
+        );
+    }
+
+    #[test]
+    fn tsc_hz_none_when_no_leaf_pins_it() {
+        // Leaf 0x15 unsupported at all.
+        assert_eq!(tsc_hz_from_cpuid_leaves(0x14, 2, 250, 0, 2600), None);
+        // Leaf 0x15 with no crystal, and leaf 0x16 not advertised.
+        assert_eq!(tsc_hz_from_cpuid_leaves(0x15, 2, 250, 0, 2600), None);
+        // Leaf 0x15 with no crystal, and leaf 0x16 advertised but zero MHz.
+        assert_eq!(tsc_hz_from_cpuid_leaves(0x16, 2, 250, 0, 0), None);
+    }
+
+    #[test]
+    fn tsc_hz_bad_ratio_still_uses_leaf_16() {
+        // A zero numerator/denominator makes the 0x15 ratio unusable, but the
+        // leaf 0x16 base frequency still yields an answer.
+        assert_eq!(
+            tsc_hz_from_cpuid_leaves(0x16, 0, 0, 0, 2600),
+            Some(2_600_000_000)
+        );
     }
 }
