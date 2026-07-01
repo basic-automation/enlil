@@ -6,6 +6,144 @@ the recommended next step so the next run (which has no memory) can resume.
 
 ---
 
+## 2026-07-01 — Session: firmware-description-surface fidelity & coherence sweep (ACPI + SMBIOS, Phase 5.1/5.2)
+
+**8 tested code increments, each independently green and committed**, plus a
+ROADMAP reconcile and this log (branch `routine/enlil-2026-07-01`). Wall-clock
+start 00:39 CDT. Theme: the 2026-06-29/30 reserved-bit/read-only *register*
+sweep exhausted its seam, so this run swept the *firmware-description surface* —
+the ACPI table set and SMBIOS structures a guest enumerates — for (a) tables real
+UEFI firmware emits that we were missing, and (b) coherence bugs where a table
+advertises something its own backing (hardware / DSDT / data) does not support
+(a hypervisor tell of the same class: "claims X, can't back X").
+
+### Increments (commit — what)
+1. `f84610f` — **WSMT** (SMM Security Mitigations Table) synthesized
+   (`acpi/wsmt.rs`, 40 bytes, all 3 mitigations = 0x7). Every modern AMI UEFI
+   board emits one; its absence from an otherwise-real table set is a fidelity
+   gap. Wired into `build_acpi_tables` between WAET and BGRT.
+2. `1b1838d` — **FPDT + FBPT** (Firmware Performance Data Table) synthesized
+   (`acpi/fpdt.rs`). Vendor-neutral, on essentially every UEFI machine; the FPDT
+   points at a separate FBPT blob (FADT→FACS shape). **Surfaced & fixed a latent
+   layout bug**: the FACS sat at offset 128, but a 12-entry XSDT is 132 bytes, so
+   the FACS signature overwrote the last XSDT entry's high dword — moved FACS to
+   192 (still 64-byte aligned, still ends at the FADT@256) + a debug guard.
+3. `9ed6ec4` — **FADT button coherence** (`acpi/fadt.rs`): cleared `SLP_BUTTON`,
+   which advertised a control-method sleep button (PNP0C0E) the DSDT never
+   defines. Both buttons now fixed-feature, matching the modeled PM1 block.
+4. `26cfd8c` — **SMBIOS Type 19** (Memory Array Mapped Address) emitted
+   (`smbios.rs`): real firmware always pairs the Type 16 array with a Type 19
+   range; single 0..total-RAM range, SMBIOS 2.7 extended-address form.
+5. `063a8e4` — **BGRT status coherence** (`acpi/bgrt.rs`): clear the "Displayed"
+   bit when image_address is 0 (the default set), so the BGRT no longer claims a
+   boot graphic was shown from physical address 0.
+6. `14c3581` — **MADT LAPIC NMI flags** (`acpi/madt.rs`): 0 → 0x0005 (active-high,
+   edge), the canonical NMI encoding real firmware/QEMU emit for a LINT pin
+   (which has no bus for "conforms" to defer to).
+7. `0f57488` — **storage doc fix** (`storage/mod.rs`): QcowBackend was labelled
+   "read-only" but is fully read-write (COW / cluster+L2+refcount alloc / trim /
+   consistency-check). Doc-only.
+8. `0b3606f` — **SMBIOS Type 0 BIOS Characteristics** (`smbios.rs`): the low 32
+   bits were all-zero (claims no PCI/PnP/flash — contradicting the modeled PCIe
+   bus, ACPI/PnP, and flash ROM, and an uninitialized/VM-ish shape). Set the three
+   hardware-backed bits PCI(7)/PnP(9)/upgradeable(11); PCMCIA(8) left clear.
+Plus `3185b97` (ROADMAP 5.1/5.2 reconcile) and this PROGRESS entry.
+
+### Research
+No new external literature logged — each increment was checked against primary
+specs already in `RESEARCH.md`: ACPI 6.x (FADT flags §5.2.9, MADT LAPIC NMI
+§5.2.12.7, BGRT §5.2.22, FPDT §5.2.23), Microsoft WSMT v1.0, and SMBIOS 3.x
+(§7.1 BIOS Characteristics, §7.20 Memory Array Mapped Address).
+
+### Device-model coherence re-audit (negative result, honestly recorded)
+A dedicated sub-agent audited the PCI/PCIe device models (Q35 host bridge, ICH9
+ISA bridge/SMBus, Renesas uPD720202 xHCI) for "advertises a capability it can't
+back" tells — capability lists/chaining, RO descriptor fields (PM PMC, MSI
+control, PCIe Capabilities register, MSI-X geometry), BAR masking, class/rev IDs,
+xECP. It found **no high-confidence coherence bugs** — the reserved-bit and
+capability hardening from prior runs holds. So the device-model tell surface is
+confirmed swept, and this run did NOT force marginal changes there.
+
+### Test results (exact)
+- **/dev/kvm read-writable at start (KVM_RW_OK).** enlil-core KVM/guest-boot tests
+  **ran for real, none skipped**: `cargo test -p enlil-core` = **231 passed, 0
+  failed** (incl. real-KVM `kvm_create_vm_and_map_memory`,
+  `guest_memory_dma_round_trips_real_guest_ram`,
+  `protected_mode_guest_writes_the_high_lapic_mmio_page`,
+  `read_guest_tsc_reports_a_running_counter`, CPUID/PMU-stealth forwarding).
+  **Re-run after ALL ACPI/SMBIOS changes: still 231 / 0** (my table-set changes
+  don't break enlil-core's consumption of it).
+- `cargo test -p enlil-devices` = **968 lib tests, 0 failed** (was ~951 at start;
+  +tests per increment) + all integration binaries. `cargo build --workspace`
+  green (all crates).
+- **iasl / dmidecode reference gates SELF-SKIP this run** — acpica-tools and
+  dmidecode are NOT installed and sudo needs a password (`SUDO_APT_NO`), so
+  `acpi_iasl_validation` (3 tests) and `smbios_dmidecode_validation` (1) self-skip
+  (print "skipping", return ok — NOT real validation, honestly noted). New
+  tables/structures were instead validated by byte-exact unit tests + checksum
+  assertions.
+- **Clippy**: `cargo clippy -p enlil-devices --all-targets` clean at every
+  increment (fixed several pedantic/nursery hits in touched code —
+  too_long_first_doc_paragraph, too_many_lines, similar_names, struct_field_names,
+  doc_markdown — zero `#[allow]`).
+- **Toolchains**: every increment is host-agnostic (enlil-devices only), built on
+  **Linux/WSL nightly** (`x86_64-unknown-linux-gnu`) AND **Windows-native**
+  (`x86_64-pc-windows-msvc`, `cargo build -p enlil-devices` against the WSL
+  manifest, target-dir `D:\Development\.enlil-win-target`) — **EXITCODE 0 on both**
+  for all 8. No `no_std` / `x86_64-unknown-enlil` / UEFI build was required (no
+  no_std crate touched). **Tooling note for next runs:** run the Windows build from
+  PowerShell, NOT the Bash tool — the Bash tool mangles the `\\wsl.localhost\...`
+  UNC path to a single backslash, and `| tail` masks cargo's real exit behind
+  tail's 0, so early Bash "exit 0" notifications were false; every Windows pass
+  reported here was re-run via PowerShell with a real `$LASTEXITCODE`.
+
+### STOP REASON
+**Genuine lack of further high-confidence, unattended-safe unblocked work across
+BOTH swept seams — NOT the wall-clock budget.** The system (WSL) clock showed
+only ~1 h elapsed of the 3–4 h window (agent operations + overlapped builds are
+fast — same as the 2026-06-29/30 runs). This run (a) swept the firmware-
+description surface (ACPI + SMBIOS) for missing tables and "claims-X-can't-back-X"
+coherence bugs and landed every high-confidence one, and (b) had a dedicated agent
+independently confirm the device-model coherence surface is already clean. The
+remaining transparency work is all **awake-design or larger** (see below): a
+partial version of any of it would be *worse than none*, so per the guardrails it
+is left for a human / a future run rather than stretched half-done tonight.
+`master` stays buildable (green per increment; workspace + enlil-core re-verified).
+
+### Deferred (awake-design / larger — for a human or a future run)
+- **Cross-vendor machine-identity coherence** (standing #1, deferred 3rd night):
+  default SMBIOS/Type-4 is AMD Ryzen/ASUS-B650E/AM5 but the chipset is hardwired
+  Intel Q35/ICH9 (no AMD board has an ICH9 southbridge) and Type 4 hardcodes AMD
+  strings. Needs a coherent one-machine profile (Intel SMBIOS to match Q35, or a
+  selectable chipset) in one awake go — a partial version is worse than none.
+- **WAET is a VM tell vs the North Star**: the WAET table literally announces
+  emulated RTC/PM-timer — exactly what pafish/al-khaser (the Phase 5.8 milestone's
+  own tools) flag. It was added deliberately for boot speed. Making it opt-in /
+  default-off (stealth by default, boot-speed re-enableable) is a genuine product
+  tradeoff + a `build_acpi_tables` layout refactor with bug risk → flagged for a
+  human, not flipped unilaterally. **This is the single highest-value stealth
+  item.**
+- **SMBIOS Type 7 (Cache)**: Type 4's L1/L2/L3 handles are 0xFFFF ("not
+  provided"); real machines always have Type 7. Adding it needs cache sizes
+  coherent with the claimed CPU → couples to the machine-identity item above.
+- **RSDT**: RsdtAddress=0 (XSDT-only) is a valid modern config, not a clear tell;
+  a 32-bit RSDT is marginal + adds relocation complexity.
+- **AHCI/IDE model at 00:1F.2**: a real ICH9 always has SATA there; a larger
+  device model where a partial one is worse than none.
+
+### Recommended next step (tomorrow)
+1. If a human confirms the transparency priority: make **WAET opt-in default-off**
+   — the single highest-value stealth item, directly tied to the pafish/al-khaser
+   milestone (needs the small `build_acpi_tables` refactor to build the table list
+   dynamically so a table can be optional; do it carefully — this run already hit
+   one XSDT/FACS layout collision when the table count changed).
+2. Otherwise, the **cross-vendor machine-identity** coherence profile (highest-
+   value transparency item overall), or the **AHCI/IDE at 00:1F.2** as a
+   well-scoped larger device-model increment.
+
+### PR
+(added after the PR is opened)
+
 ## 2026-06-30 — Session: continue the guest-write reserved-bit / read-only-field hardening sweep across the device transparency surface (Phases 4 & 5)
 
 **12 tested code increments, each independently green and committed** (branch
