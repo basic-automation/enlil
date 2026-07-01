@@ -142,7 +142,7 @@ is left for a human / a future run rather than stretched half-done tonight.
    well-scoped larger device-model increment.
 
 ### PR
-(added after the PR is opened)
+https://github.com/physics515/enlil/pull/46
 
 ## 2026-06-30 — Session: continue the guest-write reserved-bit / read-only-field hardening sweep across the device transparency surface (Phases 4 & 5)
 
