@@ -6,19 +6,24 @@ use std::path::Path;
 /// `HypervisorConfig::log_level`.
 const VALID_LOG_LEVELS: [&str; 5] = ["trace", "debug", "info", "warn", "error"];
 
-/// Validate an Enlil configuration. Returns a list of errors (empty = valid).
-#[must_use]
-pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
+/// Validate CPU-set assignments across all guests (LOCKED PRINCIPLE 5 —
+/// isolation): every guest has cores, no core is duplicated within a guest, and
+/// a core a guest holds with Dedicated/Auto scheduling is owned *exclusively* —
+/// no other guest may list it, neither another dedicated guest nor a time-sliced
+/// (`Timeslice`) guest, or the dedication is a lie (a `Timeslice` guest sharing
+/// a dedicated core steals cycles the dedicated guest is promised). Two
+/// `Timeslice` guests MAY share cores — that is what time-slicing a shared pool
+/// means — so their overlap is allowed. Returns the list of violations.
+fn validate_cpu_isolation(config: &EnlilConfig) -> Vec<String> {
     let mut errors = Vec::new();
+    let mut dedicated_owner: HashMap<u32, &str> = HashMap::new();
 
-    // Check for CPU overlap between guests
-    let mut global_cpus: HashSet<u32> = HashSet::new();
     for (id, guest) in &config.guest {
         if guest.cpus.is_empty() {
             errors.push(format!("Guest '{id}': no CPUs assigned"));
         }
 
-        // Check for duplicates within this guest
+        // Duplicates within this guest.
         let mut local = HashSet::new();
         for &cpu in &guest.cpus {
             if !local.insert(cpu) {
@@ -26,12 +31,13 @@ pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
             }
         }
 
-        // Check for overlap with other guests (only for dedicated scheduling)
+        // Claim exclusive ownership of each core for a dedicated guest, flagging
+        // a second dedicated claim on the same core.
         if guest.scheduling == crate::SchedulingMode::Dedicated
             || guest.scheduling == crate::SchedulingMode::Auto
         {
             for &cpu in &guest.cpus {
-                if !global_cpus.insert(cpu) {
+                if dedicated_owner.insert(cpu, id.as_str()).is_some() {
                     errors.push(format!(
                         "Guest '{id}': CPU {cpu} already assigned to another guest"
                     ));
@@ -39,6 +45,35 @@ pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
             }
         }
     }
+
+    // Second pass (after every dedicated claim is recorded): a time-sliced guest
+    // must not intrude on a core dedicated to a *different* guest.
+    for (id, guest) in &config.guest {
+        if guest.scheduling != crate::SchedulingMode::Timeslice {
+            continue;
+        }
+        for &cpu in &guest.cpus {
+            if let Some(&owner) = dedicated_owner.get(&cpu)
+                && owner != id.as_str()
+            {
+                errors.push(format!(
+                    "Guest '{id}': CPU {cpu} is dedicated to guest '{owner}' and \
+                     cannot be time-sliced by another guest"
+                ));
+            }
+        }
+    }
+
+    errors
+}
+
+/// Validate an Enlil configuration. Returns a list of errors (empty = valid).
+#[must_use]
+pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    // Non-overlapping CPU sets (LOCKED PRINCIPLE 5 — isolation).
+    errors.append(&mut validate_cpu_isolation(config));
 
     // Check memory
     let total_guest_memory: u64 = config.guest.values().map(|g| g.memory_mb).sum();
@@ -195,6 +230,63 @@ mod tests {
         );
         let errors = validate_config(&config);
         assert!(errors.iter().any(|e| e.contains("CPU 1 already assigned")));
+    }
+
+    #[test]
+    fn detects_timeslice_guest_intruding_on_a_dedicated_core() {
+        // vm1 (from minimal_config) holds CPUs 0,1 as Dedicated. A Timeslice
+        // guest that also lists CPU 1 would steal cycles the dedicated guest is
+        // promised — the isolation the Dedicated mode guarantees.
+        let mut config = minimal_config();
+        config.guest.insert(
+            "vm2".into(),
+            GuestConfig {
+                name: "Test VM 2".into(),
+                cpus: vec![1, 2], // CPU 1 is dedicated to vm1
+                memory_mb: 2048,
+                kernel: None,
+                initrd: None,
+                cmdline: "console=ttyS0".into(),
+                scheduling: SchedulingMode::Timeslice,
+                disks: vec![],
+                serial: SerialPortConfig::default(),
+            },
+        );
+        let errors = validate_config(&config);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("CPU 1 is dedicated to guest 'vm1'")
+                    && e.contains("cannot be time-sliced")),
+            "expected a dedicated-core intrusion error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn timeslice_guests_may_share_cores() {
+        // Two time-sliced guests sharing a core pool is exactly what Timeslice
+        // scheduling is for, so overlapping their CPU sets must NOT be flagged.
+        let mut config = minimal_config();
+        config.guest.get_mut("vm1").unwrap().scheduling = SchedulingMode::Timeslice;
+        config.guest.insert(
+            "vm2".into(),
+            GuestConfig {
+                name: "Test VM 2".into(),
+                cpus: vec![1, 2], // overlaps vm1's CPU 1, but both are Timeslice
+                memory_mb: 2048,
+                kernel: None,
+                initrd: None,
+                cmdline: "console=ttyS0".into(),
+                scheduling: SchedulingMode::Timeslice,
+                disks: vec![],
+                serial: SerialPortConfig::default(),
+            },
+        );
+        let errors = validate_config(&config);
+        assert!(
+            !errors.iter().any(|e| e.contains("CPU")),
+            "time-sliced guests may share cores, got: {errors:?}"
+        );
     }
 
     #[test]
