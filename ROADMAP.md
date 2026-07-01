@@ -220,7 +220,7 @@ they succeed precisely because they don't share hot state:
   trust-ranking plane that grows the pool beyond your own machines.
 - **Verifiable execution + consensus (à la Ethereum):** validity/fraud proofs and BFT
   consensus let untrusted remote nodes run work you can trust without redoing it, and keep
-  replicated guests consistent. See [`RESEARCH.md`](RESEARCH.md) → Part II.
+  replicated guests consistent. See the ZK proving-performance references under **Reference Resources** below.
 
 ### Transparency is per-guest-family
 
@@ -261,6 +261,11 @@ timing, VM-exit latency, ACPI/device signatures). "Transparent virtual PC" gener
 ---
 
 ## Phase 0 — Project Scaffold & Dev Environment
+
+- [x] 0.1 Repository setup (Cargo workspace, resolver 2, edition 2024, pinned nightly)
+- [x] 0.2 Minimal KVM-backed VMM (create VM → vCPU → load kernel → `KVM_RUN` → handle exits)
+- [x] 0.3 USB live boot & non-destructive testing (UEFI payload + OVMF design; real-hardware boot bring-up still to be validated → see M0a)
+- [x] 0.4 Documentation
 
 **Goal:** Repo structure, toolchain, CI, and a "hello world" VMM that boots a minimal Linux guest using KVM + RustVMM.
 
@@ -621,6 +626,10 @@ reachable with sub-2 GB-coverage tiny-cluster images; the 64 KiB default covers
 
 ## Phase 1 — Enlil Platform Layer & Custom `std` Target (HIGH PRIORITY)
 
+- [x] 1.1 Platform abstraction layer · [x] 1.2 `x86_64-unknown-enlil` custom target
+- [x] 1.3 Memory subsystem · [x] 1.4 Threading · [x] 1.5 Sync primitives · [x] 1.6 Async runtime
+- [x] 1.7 Time · [x] 1.8 I/O trait layer · [x] 1.9 Dual-backend strategy · [x] 1.10 Redox port · [x] 1.11 Milestone
+
 **Goal:** Build a custom Rust platform layer that enables full `std` at the hypervisor level — including threads, async, synchronization, and collections — even when running bare-metal. This is foundational infrastructure that every subsequent phase benefits from.
 
 **Duration:** 4–6 weeks
@@ -942,6 +951,9 @@ Redox is the primary reference. Specific components to study and adapt:
 
 ## Phase 2 — Multi-Guest CPU & Memory Partitioning
 
+- [x] 2.1 Guest configuration system · [x] 2.2 CPU core dedication · [x] 2.3 Time-slicing fallback
+- [x] 2.4 Memory isolation · [x] 2.5 Per-guest serial console
+
 **Goal:** Run two Linux guests simultaneously on the same host, each with dedicated CPU cores and isolated memory.
 
 **Duration:** 4–6 weeks
@@ -997,6 +1009,14 @@ Redox is the primary reference. Specific components to study and adapt:
 ---
 
 ## Phase 3 — Virtual Device Layer & Storage
+
+- [x] 3.1 VirtIO block · [x] 3.2 VirtIO net · [x] 3.3 Interrupt virtualization (LAPIC/IOAPIC/MSI, guest-reachable apertures)
+- [x] 3.4 Virtual timer & clock (PIT/HPET/TSC/paravirt; LAPIC timer) · [x] 3.5 Management console v1
+- [x] 3.6 Display compositor — "Enlil Zones" · [x] 3.7 Inter-guest bridge (clipboard/DnD/shared-fs/notifications)
+- [ ] 3.8 **Production platform-clock cadence** — `advance_clocks` has no production caller; wire it into the run loop from guest execution time, interlocked with the timing-stealth TSC offset
+- [ ] 3.9 LAPIC **TSC-deadline** timer mode (modern Linux default; needs guest TSC + `IA32_TSC_DEADLINE` through the run loop)
+- [ ] 3.10 qcow2 refcount-table growth (`storage/qcow.rs`) — needs interior-mutable `QcowHeader`; image-corruption risk, do carefully
+- [ ] 3.11 Cap the 16550 UART's unbounded RX buffer (`inject_input`, vm-superio issue #17) before wiring host stdin
 
 **Goal:** Give each guest block devices and network so they're usable systems, not just serial consoles.
 
@@ -1554,6 +1574,9 @@ enabled = true
 
 ## Phase 4 — USB Peripheral Routing
 
+- [x] 4.1 USB subsystem architecture · [x] 4.2 Host USB enumeration · [x] 4.3 Routing policy engine
+- [x] 4.4 Virtual xHCI controller (TRB-level) · [ ] 4.5 Management console USB controls (verify end-to-end)
+
 **IMPLEMENTATION NOTE: Build Phase 4 BEFORE Phase 5 (Windows).** Windows guests almost always need USB devices during initial setup — a physical keyboard/mouse for installation, game controllers, USB audio. Without USB routing, Windows installation requires VirtIO-only input, which means installing VirtIO drivers during Windows Setup (a pain point that requires a custom driver ISO). With USB routing available first, you simply route a physical keyboard and mouse to the Windows guest during installation, and the standard Windows installer works out of the box.
 
 **Goal:** Granular per-device USB routing so each guest gets specific physical USB devices.
@@ -1701,6 +1724,11 @@ Physical USB Devices
 ---
 
 ## Phase 5 — Windows Guest Support & Transparency
+
+- [x] 5.1 ACPI table synthesis · [x] 5.2 SMBIOS synthesis · [x] 5.3 CPUID stealth · [x] 5.4 Timing stealth · [x] 5.5 Virtual TPM 2.0 (CRB, guest-reachable)
+- [ ] 5.6 Windows boot path (OVMF) · [ ] 5.7 Windows-specific virtual devices
+- [ ] 5.8 Anti-detection testing (pafish + al-khaser + IET divergence)
+- [ ] 5.9 CPUID `0x15`/`0x16` frequency leaves using `tsc_khz`, threaded through the topology stealth
 
 **Goal:** Boot Windows as a guest with full transparency — the OS and applications must not detect the hypervisor.
 
@@ -2121,6 +2149,9 @@ Physical USB Devices
 
 ## Phase 6 — Bare-Metal Boot (UEFI Payload)
 
+- [ ] 6.1 UEFI application · [ ] 6.2 Bare-metal kernel · [ ] 6.3 Hardware discovery (no Linux)
+- [ ] 6.4 IOMMU programming · [ ] 6.5 Direct device management · [ ] 6.6 Service-VM option · [ ] 6.7 Milestone
+
 **Goal:** Remove the Linux host dependency. Enlil boots directly from UEFI firmware as the first code that runs.
 
 **Duration:** 8–12 weeks
@@ -2192,6 +2223,9 @@ Physical USB Devices
 ---
 
 ## Phase 7 — GPU Sharing
+
+- [ ] 7.1 Strategy tier system · [ ] 7.2 Tier 1 full passthrough · [ ] 7.3 Tier 2 SR-IOV (Intel iGPU / NVIDIA MIG / AMD GIM / VirtIO-GPU)
+- [ ] 7.4 Tier 3 mediated passthrough · [ ] 7.5 Tier 4 time-sliced · [ ] 7.6 GPU configuration
 
 **Goal:** Multiple guests share GPU(s) with a tiered strategy based on hardware capabilities.
 
@@ -2439,6 +2473,10 @@ vram_split = { windows = "12GB", linux = "4GB" }
 
 ## Phase 8 — Polish, Hardening & Advanced Features
 
+- [ ] 8.1 Live migration between strategies · [ ] 8.2 Audio subsystem · [ ] 8.3 Display routing · [ ] 8.4 Suspend/resume & hypervisor live-update
+- [ ] 8.5 Performance monitoring · [ ] 8.6 Security hardening · [ ] 8.7 Confidential VMs (SEV-SNP / TDX) · [ ] 8.8 Paravisor mode
+- [ ] 8.9 Cross-guest isolation verification (ZK) · [ ] 8.10 Laptop & mobile hardware · [ ] 8.11 Mobile/Android guests · [ ] 8.12 Snapshot & rollback · [ ] 8.13 Plugin/extension system
+
 **Duration:** Ongoing
 
 ### 8.1 Live Migration Between Strategies
@@ -2546,7 +2584,7 @@ Both guests producing audio simultaneously (music on Linux, game on Windows) mus
 A single CVM's attestation is one closed-firmware root of trust (AMD ASP / Intel TDX Module). Nillion's "blind compute" thesis argues no single privacy primitive suffices and TEEs are "fragile" — they depend on chip integrity *and* the attestation process and are best for *stateless* compute — so **compose PETs, don't bet on one**. For Enlil:
 - **Threshold / quorum attestation:** instead of trusting one node's TEE quote, a threshold-signature scheme over a cluster yields a quorum-signed attestation resilient to up to **n−1** corrupted nodes in the online phase (Nillion's preprocessing-setup threshold ECDSA). This pairs with the 8.7/8.9 ZK attestation: ZK proves the *property* (isolation), the threshold quorum anchors the *identity* (genuine Enlil cluster) without a single chip as the linchpin.
 - **MPC as a TEE-independent privacy complement** for cross-node compute — see Phase 9.12. Unlike CVM mode (which conflicts with Phase 5 stealth — attestation/encrypted memory are "I know I'm in a VM" features), secret-sharing the work across nodes leaks no such signal.
-- See `RESEARCH.md 2026-06-20 (Nillion)`.
+- Nillion MPC references: *The Nillion Standard* (May 2025) https://nillion.pub/the_nillion_standard.pdf · sum-of-products LSSS (Nov 2023) https://nillion.pub/sum-of-products-lsss-non-interactive.pdf · threshold-ECDSA preprocessing (Dec 2023) https://nillion.pub/threshold-ecdsa-preprocessing-setup.pdf
 
 ### 8.8 Paravisor Mode (Stretch Goal — from Microsoft OpenHCL architecture)
 
@@ -3012,6 +3050,9 @@ metrics_format = "prometheus"  # prometheus | json
 
 ## Phase 9 — Compute Fabric (Heterogeneous Work Routing)
 
+- [ ] 9.1 Architecture · [ ] 9.2 Guest-side compute ICD · [ ] 9.3 VirtIO compute device · [ ] 9.4 Fabric core · [ ] 9.5 Work router · [ ] 9.6 CPU backend
+- [ ] 9.7 GPU backend · [ ] 9.8 Buffer memory management · [ ] 9.9 Cross-guest work stealing · [ ] 9.10 Configuration · [ ] 9.11 Enablement · [ ] 9.12 Verifiable compute (ZK)
+
 **Goal:** Automatically route GPU compute workloads to whichever hardware (CPU or GPU) has capacity, transparently to applications. Applications use standard Vulkan/OpenCL APIs with zero code changes.
 
 **Duration:** 12–16 weeks (after Phase 7 GPU infrastructure exists)
@@ -3344,11 +3385,13 @@ When the fabric routes a SPIR-V kernel to the CPU backend instead of the GPU, th
   ```
 - `sample` mode: randomly verify a fraction of dispatches. If any verification fails, switch to `always` mode and alert.
 
-**Private (not just verified) fabric compute via MPC — TEE-independent (Nillion research, 2026-06-20):** the ZK proof above shows the result is *correct*, but the prover (the executing node) still sees the plaintext inputs. For workloads that must hide inputs from the executing node, **secret-share the work across N fabric nodes** so no single node ever sees plaintext — node compromise ≠ data disclosure, with no hardware-TEE dependency (complements, does not replace, the CVM path). Nillion's LSSS sum-of-products and threshold-ECDSA reports give the key latency technique: an **input-independent preprocessing phase** stages the correlated randomness (masks, shares) ahead of time, leaving a **non-interactive online phase** — each node broadcasts its masked inputs `⟨x⟩ = x·g^−λ` once, computes locally, and reveals; no round-trips during compute. This **decouples interaction-latency from computation** (Core Model governing law): the round-heavy preprocessing is deferrable/poolable into idle-interconnect windows, so even RDMA/WAN-class nodes can serve a 1–2-round online phase. Cost is the offline preprocessing + a modest share-size overhead. See `RESEARCH.md 2026-06-20 (Nillion)`.
+**Private (not just verified) fabric compute via MPC — TEE-independent (Nillion research, 2026-06-20):** the ZK proof above shows the result is *correct*, but the prover (the executing node) still sees the plaintext inputs. For workloads that must hide inputs from the executing node, **secret-share the work across N fabric nodes** so no single node ever sees plaintext — node compromise ≠ data disclosure, with no hardware-TEE dependency (complements, does not replace, the CVM path). Nillion's LSSS sum-of-products and threshold-ECDSA reports give the key latency technique: an **input-independent preprocessing phase** stages the correlated randomness (masks, shares) ahead of time, leaving a **non-interactive online phase** — each node broadcasts its masked inputs `⟨x⟩ = x·g^−λ` once, computes locally, and reveals; no round-trips during compute. This **decouples interaction-latency from computation** (Core Model governing law): the round-heavy preprocessing is deferrable/poolable into idle-interconnect windows, so even RDMA/WAN-class nodes can serve a 1–2-round online phase. Cost is the offline preprocessing + a modest share-size overhead. Refs: *The Nillion Standard* (May 2025) https://nillion.pub/the_nillion_standard.pdf · sum-of-products LSSS (Nov 2023) https://nillion.pub/sum-of-products-lsss-non-interactive.pdf · threshold-ECDSA preprocessing (Dec 2023) https://nillion.pub/threshold-ecdsa-preprocessing-setup.pdf.
 
 ---
 
 ## Phase 10 — Architecture Portability (ARM & RISC-V)
+
+- [ ] 10.1 Arch-specific vs neutral split · [ ] 10.2 ARM (AArch64, EL2/GICv3) · [ ] 10.3 RISC-V (H-ext) · [ ] 10.4 Compute-fabric cross-architecture
 
 **Goal:** Extend Enlil to run on AArch64 and RISC-V hardware, leveraging the HAL trait defined in Phase 0 and the platform abstraction from Phase 1.
 
@@ -3438,6 +3481,9 @@ ARCHITECTURE-SPECIFIC (must be re-implemented per arch):
 ---
 
 ## Phase 11 — Enlil Mesh (Multi-Machine Distributed Hypervisor)
+
+- [ ] 11.1 Network tiers · [ ] 11.2 Discovery/coordination · [ ] 11.3 ZK-verified mesh trust · [ ] 11.4 WAN · [ ] 11.5 LAN · [ ] 11.6 RDMA fabric · [ ] 11.7 CXL fabric · [ ] 11.8 Mesh compute fabric
+- [ ] 11.9 Work shares · [ ] 11.10 Mesh seats · [ ] 11.11 Fault tolerance · [ ] 11.12 Storage pool · [ ] 11.13 Security/isolation · [ ] 11.14 Implementation · [ ] 11.15 Milestones · [ ] 11.16 References
 
 **The vision:** Multiple physical PCs, each running Enlil, form a single logical hypervisor. Guests can span machines, migrate between them, share GPUs across the network, and composite displays from multiple physical locations — all with cryptographic proof that every node in the mesh is running genuine, unmodified Enlil and maintaining guest isolation.
 
@@ -4934,23 +4980,6 @@ Phase 11f — Advanced Fabric (M27–M28)
 
 ---
 
-## Immediate Next Steps (Weeks 1–2)
-
-1. `cargo init --name enlil` with workspace layout including `enlil-platform`, `enlil-hal`, `enlil-core`
-2. Define the `HypervisorBackend` trait in `enlil-hal` (architecture-neutral from day one)
-3. Create the `x86_64-unknown-enlil.json` target spec, verify `cargo build -Z build-std` compiles `core` + `alloc` for it
-4. Implement `GlobalAlloc` in `enlil-platform` backed by Linux `mmap` (the `platform-linux` backend) — this unlocks `Vec`, `String`, `Box`, `HashMap` immediately
-5. Implement platform threading backed by `pthread` — this unlocks `std::thread::spawn`
-6. Implement platform sync backed by `futex` — this unlocks `std::sync::Mutex`, `Arc`, `Condvar`
-7. Write a test binary that uses `std::thread::spawn`, `Mutex<Vec<String>>`, and `println!()` compiled for `x86_64-unknown-enlil` running on the Linux backend — **this proves the platform layer works**
-8. Add `kvm-ioctls`, `vm-memory`, `vm-superio`, `linux-loader` dependencies to `enlil-core`
-9. Write the VMM main loop: create VM → create vCPU → load kernel → KVM_RUN → handle exits
-10. Get a minimal Linux kernel (grab a prebuilt vmlinuz + buildroot initramfs) booting to a serial shell
-11. **Build a USB live boot image** — format a FAT32 USB drive with the Enlil EFI binary + config + OVMF, boot it on real hardware, launch a guest. This is the first "holy shit it works" moment and validates the entire boot chain.
-12. Celebrate — you have full `std` Rust, a working VMM, and a bootable USB image. Everything else is incremental from here.
-
----
-
 ## Reference Resources
 
 **Platform Layer & Custom std:**
@@ -4998,6 +5027,12 @@ Phase 11f — Advanced Fabric (M27–M28)
 - **RISC Zero:** https://github.com/risc0/risc0 — zkVM for general-purpose verifiable computation (Rust-native)
 - **SP1 (Succinct):** https://github.com/succinctlabs/sp1 — fast zkVM, RISC-V based prover
 - **NoirVisor:** https://github.com/Zero-Tang/NoirVisor — x86 hypervisor with LBR virtualization reference (Intel + AMD)
+- **ZK proving-performance playbook (from zkEVM engineering, informs Phases 8.7 / 8.9 / 9.12):** precompiles, continuations, recursive aggregation, lookup arguments (LogUp/Plookup), Poseidon-over-Keccak, and GPU proving take proofs from minutes to seconds — apply from day one so attestation/isolation/compute proofs are fast enough to actually run:
+  - Ethereum Foundation zkEVM: https://zkevm.ethereum.foundation/ · "Shipping an L1 zkEVM #2: Security" (Dec 2025): https://blog.ethereum.org/2025/12/18/zkevm-security-foundations
+  - SP1 Turbo: https://blog.succinct.xyz/sp1-turbo/ · SP1 Reth (precompiles): https://blog.succinct.xyz/sp1-reth/ · RISC Zero recursion: https://dev.risczero.com/api/recursion · continuations: https://dev.risczero.com/terminology
+  - Lookup-argument survey: https://eprint.iacr.org/2025/1876 · LogUp: https://eprint.iacr.org/2022/1530 · Plookup: https://eprint.iacr.org/2020/315 · proof aggregation: https://blog.lambdaclass.com/proof-aggregation-techniques/
+  - GPU proving: ICICLE https://github.com/ingonyama-zk/icicle · Paradigm ZK hardware https://www.paradigm.xyz/2022/04/zk-hardware · GPU ZKP characterization (IEEE IISWC 2025) https://arxiv.org/pdf/2509.22684 · WebGPU ZK https://blog.zksecurity.xyz/posts/webgpu/
+  - zkVM surveys: SoK Understanding zkVM (2026) https://eprint.iacr.org/2026/525 · zkVM compiler optimizations (Jan 2026) https://arxiv.org/html/2508.17518v2
 
 **Anti-Detection / Stealth:**
 - **Anti-Cheat VM Detection (secret.club):** https://secret.club/2020/04/13/how-anti-cheats-detect-system-emulation.html — IET divergence, LBR analysis, APERF detection

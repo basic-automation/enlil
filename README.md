@@ -83,8 +83,7 @@ later (this is the same pragmatic strategy Firecracker and Cloud Hypervisor used
 > `target_os = "linux"`, and live guest-boot/integration tests require KVM (nested
 > virtualization). On other hosts the logic-level unit tests still build and run, but a real
 > guest boot does not. Wiring `enlil-core` and `enlil-devices` fully through `enlil-hal` is
-> in progress. See [`ROADMAP.md`](ROADMAP.md) for exactly what is built vs. planned, and
-> [`DAILY-ROUTINE.md`](DAILY-ROUTINE.md) for the development cadence.
+> in progress. See [`ROADMAP.md`](ROADMAP.md) for exactly what is built vs. planned.
 
 ---
 
@@ -248,9 +247,7 @@ enlil/
 ├── rust-toolchain.toml         # Pinned nightly
 ├── x86_64-unknown-enlil.json   # Custom bare-metal target spec
 ├── README.md                   # This file
-├── ROADMAP.md                  # The full 11-phase plan, milestones, risks
-├── RESEARCH.md                 # Research review + ZK proving performance notes
-├── DAILY-ROUTINE.md            # Autonomous daily-development routine
+├── ROADMAP.md                  # Development roadmap — all 11 phases as a checklist, milestones, risks, research refs
 ├── examples/                   # Sample guest configurations
 ├── enlil-platform/             # Platform abstraction (linux + baremetal backends)
 ├── enlil-std/                  # std-shaped facade over the platform layer
@@ -297,7 +294,7 @@ enlil/
 - **Rust safety.** `unsafe` is minimized and kept to small, audited blocks; it is concentrated in `enlil-platform` and `enlil-hal`, with some `unsafe` in `enlil-core`/`enlil-devices` for FFI and CPU instructions.
 
 The roadmap goes further with confidential-VM support (AMD SEV-SNP / Intel TDX) and optional
-ZK-proof attestation and cross-guest isolation proofs — see [`RESEARCH.md`](RESEARCH.md).
+ZK-proof attestation and cross-guest isolation proofs — see [`ROADMAP.md`](ROADMAP.md) (Phases 8.7 / 8.9 / 9.12 and the ZK references).
 
 ---
 
@@ -305,9 +302,8 @@ ZK-proof attestation and cross-guest isolation proofs — see [`RESEARCH.md`](RE
 
 | Document | What's in it |
 |----------|--------------|
-| [**ROADMAP.md**](ROADMAP.md) | The authoritative plan: Project Identity, the Core Model, all 11 phases (scaffold → platform → multi-guest → devices → USB → Windows → bare metal → GPU → hardening → compute fabric → architecture portability → mesh), the milestone table, technical risks, and reference resources. |
-| [**RESEARCH.md**](RESEARCH.md) | Research that informs the plan — Part I: a cross-domain review (Rust VMMs, confidential computing, GPU virtualization, SPIR-V, USB, anti-detection); Part II: ZK proving performance lessons from zkEVM engineering. |
-| [**DAILY-ROUTINE.md**](DAILY-ROUTINE.md) | The autonomous daily-development routine the project runs against. |
+| **README.md** (this file) | Project overview — what Enlil is, its architecture, the crate layout, how to build, and where things stand today. |
+| [**ROADMAP.md**](ROADMAP.md) | The development roadmap — every phase from scaffold to multi-machine mesh, tracked as a checklist, with the detailed technical design, milestones, risks, and references behind each item. |
 
 ---
 
