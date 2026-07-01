@@ -173,6 +173,22 @@ pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
         }
     }
 
+    // A management port of 0 means the console binds to an OS-chosen ephemeral
+    // port, so a client has no fixed port to connect to — the console is
+    // effectively unreachable. A real console needs a pinned port.
+    if config.hypervisor.management_port == 0 {
+        errors.push(
+            "Hypervisor management_port is 0; the console needs a fixed port to bind to".into(),
+        );
+    }
+
+    // A configuration with no guests has nothing to run. Flag it so an empty or
+    // mistyped `[guest.*]` table is caught rather than silently starting an idle
+    // hypervisor.
+    if config.guest.is_empty() {
+        errors.push("No guests configured; the hypervisor has nothing to run".into());
+    }
+
     errors
 }
 
@@ -286,6 +302,28 @@ mod tests {
         assert!(
             !errors.iter().any(|e| e.contains("CPU")),
             "time-sliced guests may share cores, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn detects_zero_management_port() {
+        let mut config = minimal_config();
+        config.hypervisor.management_port = 0;
+        let errors = validate_config(&config);
+        assert!(
+            errors.iter().any(|e| e.contains("management_port is 0")),
+            "expected a zero-port error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn detects_no_guests() {
+        let mut config = minimal_config();
+        config.guest.clear();
+        let errors = validate_config(&config);
+        assert!(
+            errors.iter().any(|e| e.contains("No guests configured")),
+            "expected a no-guests error, got: {errors:?}"
         );
     }
 
