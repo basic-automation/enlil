@@ -14,6 +14,7 @@
 //!                ├ SRAT (NUMA topology)
 //!                ├ SLIT (NUMA distances)
 //!                ├ WAET (Emulated device hints)
+//!                ├ WSMT (SMM security mitigations)
 //!                ├ BGRT (Boot logo)
 //!                └ TPM2 (Trusted Platform Module)
 //! ```
@@ -33,6 +34,7 @@ pub mod ssdt;
 pub mod tables;
 pub mod tpm2;
 pub mod waet;
+pub mod wsmt;
 pub mod xsdt;
 
 use tables::OemInfo;
@@ -142,6 +144,7 @@ struct SecondaryTables {
     srat: Vec<u8>,
     slit: Vec<u8>,
     waet: Vec<u8>,
+    wsmt: Vec<u8>,
     bgrt: Vec<u8>,
     tpm2: Vec<u8>,
 }
@@ -170,6 +173,9 @@ fn build_secondary_tables(config: &AcpiTableSetConfig) -> SecondaryTables {
         waet: waet::WaetBuilder::new()
             .oem_info(config.oem.clone())
             .build(),
+        wsmt: wsmt::WsmtBuilder::new()
+            .oem_info(config.oem.clone())
+            .build(),
         bgrt: bgrt::BgrtBuilder::new()
             .oem_info(config.oem.clone())
             .image_address(config.boot_logo_address)
@@ -178,6 +184,31 @@ fn build_secondary_tables(config: &AcpiTableSetConfig) -> SecondaryTables {
             .oem_info(config.oem.clone())
             .build(),
     }
+}
+
+/// Build the FACS and the FADT that points at it (and at the DSDT).
+///
+/// The FACS lives at a fixed 64-byte-aligned offset (128) in the zero-filled
+/// padding between the XSDT and the FADT; it is referenced only through the
+/// FADT's `FIRMWARE_CTRL`, never the XSDT, so it is not a table-set entry.
+///
+/// The layout and the FADT relocation offsets assume the fixed 276-byte FADT
+/// (= `madt_start - fadt_offset`); the `fadt_fixed_layout_assumption_holds` test
+/// pins that. Returns `(facs_offset, facs_bytes, fadt_bytes)`.
+fn build_fadt_and_facs(
+    config: &AcpiTableSetConfig,
+    base: u64,
+    dsdt_start: usize,
+) -> (usize, Vec<u8>, Vec<u8>) {
+    let facs_offset = 128usize;
+    let facs_bytes = facs::FacsBuilder::new().build();
+    let facs_gpa = base + facs_offset as u64;
+    let dsdt_gpa = base + dsdt_start as u64;
+    let fadt_bytes = fadt::FadtBuilder::new(dsdt_gpa)
+        .firmware_ctrl(facs_gpa)
+        .oem_info(config.oem.clone())
+        .build();
+    (facs_offset, facs_bytes, fadt_bytes)
 }
 
 /// Build a complete ACPI table set for a guest VM
@@ -204,11 +235,12 @@ pub fn build_acpi_tables(config: &AcpiTableSetConfig) -> AcpiTableSet {
         srat: srat_bytes,
         slit: slit_bytes,
         waet: waet_bytes,
+        wsmt: wsmt_bytes,
         bgrt: bgrt_bytes,
         tpm2: tpm2_bytes,
     } = build_secondary_tables(config);
 
-    // Layout: XSDT | FADT | MADT | MCFG | HPET | SSDT | SRAT | SLIT | WAET | BGRT | TPM2 | DSDT
+    // Layout: XSDT | FADT | MADT | MCFG | HPET | SSDT | SRAT | SLIT | WAET | WSMT | BGRT | TPM2 | DSDT
     let xsdt_offset = 0usize;
     let fadt_offset = 256; // align XSDT to 256 bytes
     let madt_start = fadt_offset + 276; // FADT is always 276 bytes
@@ -218,27 +250,14 @@ pub fn build_acpi_tables(config: &AcpiTableSetConfig) -> AcpiTableSet {
     let srat_start = ssdt_start + ssdt_bytes.len();
     let slit_start = srat_start + srat_bytes.len();
     let waet_start = slit_start + slit_bytes.len();
-    let bgrt_start = waet_start + waet_bytes.len();
+    let wsmt_start = waet_start + waet_bytes.len();
+    let bgrt_start = wsmt_start + wsmt_bytes.len();
     let tpm2_start = bgrt_start + bgrt_bytes.len();
     let dsdt_start = tpm2_start + tpm2_bytes.len();
 
-    // The FACS lives in the 64-byte-aligned padding between the XSDT and the
-    // FADT (the region is zero-filled to `fadt_offset` below). It is referenced
-    // only through the FADT's FIRMWARE_CTRL, never the XSDT, so it is not a
-    // table-set entry. ACPI requires 64-byte alignment; offset 128 over the
-    // 64-byte-aligned table base satisfies that and fits before the FADT at 256.
-    let facs_offset = 128usize;
-    let facs_bytes = facs::FacsBuilder::new().build();
-    let facs_gpa = base + facs_offset as u64;
-
-    // Build FADT with DSDT + FACS addresses. The layout and the FADT relocation
-    // offsets assume the fixed 276-byte FADT (= madt_start - fadt_offset); the
-    // fadt_fixed_layout_assumption_holds test pins that.
-    let dsdt_gpa = base + dsdt_start as u64;
-    let fadt_bytes = fadt::FadtBuilder::new(dsdt_gpa)
-        .firmware_ctrl(facs_gpa)
-        .oem_info(config.oem.clone())
-        .build();
+    // FACS + FADT (the FACS lives in the aligned padding before the FADT and is
+    // reached only via the FADT's FIRMWARE_CTRL, so it is not an XSDT entry).
+    let (facs_offset, facs_bytes, fadt_bytes) = build_fadt_and_facs(config, base, dsdt_start);
 
     // Build XSDT with all table addresses, in layout order. The same offset
     // list feeds the pointer-relocation map below, so the XSDT entries and the
@@ -252,6 +271,7 @@ pub fn build_acpi_tables(config: &AcpiTableSetConfig) -> AcpiTableSet {
         srat_start,
         slit_start,
         waet_start,
+        wsmt_start,
         bgrt_start,
         tpm2_start,
     ];
@@ -280,6 +300,7 @@ pub fn build_acpi_tables(config: &AcpiTableSetConfig) -> AcpiTableSet {
         ("SRAT", &srat_bytes),
         ("SLIT", &slit_bytes),
         ("WAET", &waet_bytes),
+        ("WSMT", &wsmt_bytes),
         ("BGRT", &bgrt_bytes),
         ("TPM2", &tpm2_bytes),
         ("DSDT", &dsdt_bytes),
@@ -427,8 +448,8 @@ mod tests {
             "Tables must be larger than just FADT"
         );
 
-        // Should have 12 table entries (XSDT + FADT + MADT + MCFG + HPET + SSDT + SRAT + SLIT + WAET + BGRT + TPM2 + DSDT)
-        assert_eq!(table_set.table_offsets.len(), 12);
+        // Should have 13 table entries (XSDT + FADT + MADT + MCFG + HPET + SSDT + SRAT + SLIT + WAET + WSMT + BGRT + TPM2 + DSDT)
+        assert_eq!(table_set.table_offsets.len(), 13);
 
         let names: Vec<&str> = table_set
             .table_offsets
@@ -444,6 +465,7 @@ mod tests {
         assert!(names.contains(&"SRAT"));
         assert!(names.contains(&"SLIT"));
         assert!(names.contains(&"WAET"));
+        assert!(names.contains(&"WSMT"));
         assert!(names.contains(&"BGRT"));
         assert!(names.contains(&"TPM2"));
         assert!(names.contains(&"DSDT"));
@@ -553,8 +575,8 @@ mod tests {
             .filter(|p| p.pointer_file == AcpiFile::Rsdp)
             .count();
         assert_eq!(rsdp_links, 1, "exactly the RSDP->XSDT pointer");
-        // 1 (RSDP) + 10 (XSDT entries) + 4 (FADT FACS/DSDT x {32,64}-bit) = 15.
-        assert_eq!(ts.pointers.len(), 15);
+        // 1 (RSDP) + 11 (XSDT entries) + 4 (FADT FACS/DSDT x {32,64}-bit) = 16.
+        assert_eq!(ts.pointers.len(), 16);
     }
 
     fn mask(size: u8) -> u64 {
@@ -883,15 +905,15 @@ mod tests {
     }
 
     #[test]
-    fn table_set_xsdt_has_10_entries() {
+    fn table_set_xsdt_has_11_entries() {
         let table_set = build_acpi_tables(&AcpiTableSetConfig::default());
         let xsdt = &table_set.tables[0..];
         let xsdt_len = u32::from_le_bytes(xsdt[4..8].try_into().unwrap()) as usize;
         // XSDT: 36-byte header + 8 bytes per entry
         let entry_count = (xsdt_len - 36) / 8;
         assert_eq!(
-            entry_count, 10,
-            "XSDT must point to 10 tables (FADT+MADT+MCFG+HPET+SSDT+SRAT+SLIT+WAET+BGRT+TPM2)"
+            entry_count, 11,
+            "XSDT must point to 11 tables (FADT+MADT+MCFG+HPET+SSDT+SRAT+SLIT+WAET+WSMT+BGRT+TPM2)"
         );
     }
 
