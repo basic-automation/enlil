@@ -4,7 +4,7 @@
 //! Windows reads these extensively during setup and activation. The tables
 //! must look like they came from a real motherboard vendor.
 
-use crate::truncate::{u16_of, u32_of};
+use crate::truncate::{u8_of, u16_of, u32_of};
 /// SMBIOS entry point versions
 const SMBIOS_MAJOR: u8 = 3;
 const SMBIOS_MINOR: u8 = 4;
@@ -288,6 +288,8 @@ impl SmbiosBuilder {
         for (i, module) in self.config.ram_modules.iter().enumerate() {
             data.extend_from_slice(&Self::build_type17(i, module));
         }
+        // Type 19: Memory Array Mapped Address (maps the Type 16 array)
+        data.extend_from_slice(&self.build_type19());
         // Type 32: System Boot Information
         data.extend_from_slice(&Self::build_type32());
         // Type 127: End-of-Table
@@ -734,6 +736,40 @@ impl SmbiosBuilder {
         header
     }
 
+    /// Type 19: Memory Array Mapped Address (SMBIOS §7.20). Maps the Type 16
+    /// physical memory array onto the guest's physical address space. Real
+    /// firmware always pairs a Type 16 array with at least one Type 19 range;
+    /// emitting Type 16 (and the Type 17 devices) without it is a fidelity gap a
+    /// firmware-table probe can notice. A single contiguous 0..total-RAM range is
+    /// a valid representation. The handle sits just past the Type 17 devices
+    /// (handles 17..17+N) so it never collides regardless of module count.
+    fn build_type19(&self) -> Vec<u8> {
+        let handle = u16_of(17 + self.config.ram_modules.len());
+        let total_bytes = u64::from(self.config.total_ram_mb) * 1024 * 1024;
+        let mut header = vec![
+            19,   // Type 19
+            0x1F, // Length 31 (SMBIOS 2.7, with 64-bit extended addresses)
+        ];
+        header.extend_from_slice(&handle.to_le_bytes());
+        // Starting/Ending Address (KB DWORDs): 0xFFFF_FFFF => use the 64-bit
+        // extended fields below (what modern firmware does uniformly).
+        header.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        header.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        // Physical Memory Array Handle => the Type 16 array (handle 16).
+        header.extend_from_slice(&16u16.to_le_bytes());
+        // Partition Width: number of devices that make up this range.
+        header.push(u8_of(self.config.ram_modules.len()));
+        // Extended Starting Address (bytes) and Extended Ending Address (bytes).
+        header.extend_from_slice(&0u64.to_le_bytes());
+        header.extend_from_slice(&total_bytes.saturating_sub(1).to_le_bytes());
+
+        // No strings.
+        header.push(0);
+        header.push(0);
+
+        header
+    }
+
     fn build_type32() -> Vec<u8> {
         let mut header = vec![
             32, // Type 32
@@ -839,6 +875,46 @@ mod tests {
             }
         }
         assert!(found, "SMBIOS must end with Type 127");
+    }
+
+    #[test]
+    fn smbios_has_a_type19_mapping_the_memory_array_over_all_ram() {
+        let config = SmbiosConfig::default();
+        let total_bytes = u64::from(config.total_ram_mb) * 1024 * 1024;
+        let builder = SmbiosBuilder::new(config);
+        let data = builder.build_structures();
+
+        // Find the Type 19 structure header by walking the formatted areas.
+        let mut i = 0;
+        let mut t19: Option<usize> = None;
+        while i + 1 < data.len() {
+            if data[i] == 19 {
+                t19 = Some(i);
+                break;
+            }
+            let len = data[i + 1] as usize;
+            let mut j = i + len;
+            while j + 1 < data.len() && !(data[j] == 0 && data[j + 1] == 0) {
+                j += 1;
+            }
+            i = j + 2;
+        }
+        let s = t19.expect("a Type 19 Memory Array Mapped Address must be present");
+
+        assert_eq!(data[s + 1], 0x1F, "Type 19 length must be 31 (SMBIOS 2.7)");
+        // Starting/Ending Address DWORDs are 0xFFFF_FFFF => extended fields used.
+        assert_eq!(u32::from_le_bytes(data[s + 4..s + 8].try_into().unwrap()), 0xFFFF_FFFF);
+        assert_eq!(u32::from_le_bytes(data[s + 8..s + 12].try_into().unwrap()), 0xFFFF_FFFF);
+        // Physical Memory Array Handle must reference the Type 16 array (16).
+        assert_eq!(u16::from_le_bytes(data[s + 12..s + 14].try_into().unwrap()), 16);
+        // Partition Width = number of memory devices.
+        assert_eq!(data[s + 14], 2);
+        // Extended range covers 0 .. total_ram - 1.
+        assert_eq!(u64::from_le_bytes(data[s + 15..s + 23].try_into().unwrap()), 0);
+        assert_eq!(
+            u64::from_le_bytes(data[s + 23..s + 31].try_into().unwrap()),
+            total_bytes - 1
+        );
     }
 
     /// Walk the structure table, returning for each structure its
