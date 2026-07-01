@@ -644,17 +644,20 @@ impl QcowBackend {
         Ok(())
     }
 
-    /// Write the on-disk refcount of host cluster `cluster_index`. Fails if no
-    /// refcount block covers the cluster yet (block / table growth are later
-    /// steps). Writing sub-byte refcounts is unsupported — every image we
-    /// produce uses 16-bit refcounts (`refcount_order` 4).
+    /// Write the on-disk refcount of host cluster `cluster_index`. The covering
+    /// refcount block must already exist: callers allocate it first via
+    /// [`allocate_refcount_block`](Self::allocate_refcount_block) (or
+    /// [`allocate_host_cluster`](Self::allocate_host_cluster), which does so on
+    /// demand), so reaching a cluster with no block here is a caller bug, not an
+    /// unimplemented path. Writing sub-byte refcounts is unsupported — every
+    /// image we produce uses 16-bit refcounts (`refcount_order` 4).
     fn write_refcount(&self, cluster_index: u64, value: u64, file: &mut File) -> Result<()> {
         let block_offset = self
             .refcount_block_offset(cluster_index, file)?
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "no refcount block for cluster {cluster_index} \
-                 (refcount block allocation not yet implemented)"
+                    "no refcount block covers cluster {cluster_index}; \
+                     the caller must allocate one before writing its refcount"
                 )
             })?;
         let block_index = cluster_index % self.header.refcount_block_entries();
