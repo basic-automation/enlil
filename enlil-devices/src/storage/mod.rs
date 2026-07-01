@@ -2,7 +2,10 @@
 //!
 //! Defines the `StorageBackend` trait and concrete implementations:
 //! - `RawFileBackend` — raw disk image files
-//! - `QcowBackend` — qcow2 disk images (read-only)
+//! - `QcowBackend` — qcow2 disk images, read-write: copy-on-write over a backing
+//!   chain, cluster/L2/refcount allocation, trim/discard, and consistency
+//!   checking (a read-only mode is available by opening the image read-only)
+//! - `MemoryBackend` — a fixed-size in-memory backend for tests
 
 use crate::truncate::usize_of;
 pub mod qcow;

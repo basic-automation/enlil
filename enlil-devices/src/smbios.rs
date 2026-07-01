@@ -4,7 +4,7 @@
 //! Windows reads these extensively during setup and activation. The tables
 //! must look like they came from a real motherboard vendor.
 
-use crate::truncate::{u16_of, u32_of};
+use crate::truncate::{u8_of, u16_of, u32_of};
 /// SMBIOS entry point versions
 const SMBIOS_MAJOR: u8 = 3;
 const SMBIOS_MINOR: u8 = 4;
@@ -288,6 +288,8 @@ impl SmbiosBuilder {
         for (i, module) in self.config.ram_modules.iter().enumerate() {
             data.extend_from_slice(&Self::build_type17(i, module));
         }
+        // Type 19: Memory Array Mapped Address (maps the Type 16 array)
+        data.extend_from_slice(&self.build_type19());
         // Type 32: System Boot Information
         data.extend_from_slice(&Self::build_type32());
         // Type 127: End-of-Table
@@ -349,8 +351,16 @@ impl SmbiosBuilder {
         header.push(3);
         // BIOS ROM Size (64K blocks - 1)
         header.push(0xFF); // 16MB
-        // BIOS Characteristics (8 bytes)
-        header.extend_from_slice(&0x0000_0003_0000_0000u64.to_le_bytes());
+        // BIOS Characteristics (8 bytes). The low 32 bits are the standard
+        // capability flags; leaving them all-zero claimed the BIOS supports
+        // neither PCI, Plug and Play, nor flash update — contradicting the
+        // modeled hardware (a PCIe bus, ACPI/PnP, and the flash ROM sized above)
+        // and itself an uninitialized/VM-ish shape no real BIOS presents. Assert
+        // the three the platform demonstrably backs: bit 7 PCI, bit 9 Plug and
+        // Play, bit 11 BIOS is upgradeable (Flash) = 0xA80. Bit 8 (PC Card /
+        // PCMCIA) stays clear — not modeled. Bits 32-33 are vendor-reserved and
+        // kept as-is.
+        header.extend_from_slice(&0x0000_0003_0000_0A80u64.to_le_bytes());
         // BIOS Characteristics Extension Bytes (SMBIOS §7.1.2.2).
         header.push(0x01); // byte 1: ACPI supported (bit 0)
         // byte 2: targeted content distribution (bit 2) + UEFI (bit 3). Bit 4 —
@@ -734,6 +744,40 @@ impl SmbiosBuilder {
         header
     }
 
+    /// Type 19: Memory Array Mapped Address (SMBIOS §7.20). Maps the Type 16
+    /// physical memory array onto the guest's physical address space. Real
+    /// firmware always pairs a Type 16 array with at least one Type 19 range;
+    /// emitting Type 16 (and the Type 17 devices) without it is a fidelity gap a
+    /// firmware-table probe can notice. A single contiguous 0..total-RAM range is
+    /// a valid representation. The handle sits just past the Type 17 devices
+    /// (handles 17..17+N) so it never collides regardless of module count.
+    fn build_type19(&self) -> Vec<u8> {
+        let handle = u16_of(17 + self.config.ram_modules.len());
+        let total_bytes = u64::from(self.config.total_ram_mb) * 1024 * 1024;
+        let mut header = vec![
+            19,   // Type 19
+            0x1F, // Length 31 (SMBIOS 2.7, with 64-bit extended addresses)
+        ];
+        header.extend_from_slice(&handle.to_le_bytes());
+        // Starting/Ending Address (KB DWORDs): 0xFFFF_FFFF => use the 64-bit
+        // extended fields below (what modern firmware does uniformly).
+        header.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        header.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        // Physical Memory Array Handle => the Type 16 array (handle 16).
+        header.extend_from_slice(&16u16.to_le_bytes());
+        // Partition Width: number of devices that make up this range.
+        header.push(u8_of(self.config.ram_modules.len()));
+        // Extended Starting Address (bytes) and Extended Ending Address (bytes).
+        header.extend_from_slice(&0u64.to_le_bytes());
+        header.extend_from_slice(&total_bytes.saturating_sub(1).to_le_bytes());
+
+        // No strings.
+        header.push(0);
+        header.push(0);
+
+        header
+    }
+
     fn build_type32() -> Vec<u8> {
         let mut header = vec![
             32, // Type 32
@@ -841,6 +885,46 @@ mod tests {
         assert!(found, "SMBIOS must end with Type 127");
     }
 
+    #[test]
+    fn smbios_has_a_type19_mapping_the_memory_array_over_all_ram() {
+        let config = SmbiosConfig::default();
+        let total_bytes = u64::from(config.total_ram_mb) * 1024 * 1024;
+        let builder = SmbiosBuilder::new(config);
+        let data = builder.build_structures();
+
+        // Find the Type 19 structure header by walking the formatted areas.
+        let mut i = 0;
+        let mut t19: Option<usize> = None;
+        while i + 1 < data.len() {
+            if data[i] == 19 {
+                t19 = Some(i);
+                break;
+            }
+            let len = data[i + 1] as usize;
+            let mut j = i + len;
+            while j + 1 < data.len() && !(data[j] == 0 && data[j + 1] == 0) {
+                j += 1;
+            }
+            i = j + 2;
+        }
+        let s = t19.expect("a Type 19 Memory Array Mapped Address must be present");
+
+        assert_eq!(data[s + 1], 0x1F, "Type 19 length must be 31 (SMBIOS 2.7)");
+        // Starting/Ending Address DWORDs are 0xFFFF_FFFF => extended fields used.
+        assert_eq!(u32::from_le_bytes(data[s + 4..s + 8].try_into().unwrap()), 0xFFFF_FFFF);
+        assert_eq!(u32::from_le_bytes(data[s + 8..s + 12].try_into().unwrap()), 0xFFFF_FFFF);
+        // Physical Memory Array Handle must reference the Type 16 array (16).
+        assert_eq!(u16::from_le_bytes(data[s + 12..s + 14].try_into().unwrap()), 16);
+        // Partition Width = number of memory devices.
+        assert_eq!(data[s + 14], 2);
+        // Extended range covers 0 .. total_ram - 1.
+        assert_eq!(u64::from_le_bytes(data[s + 15..s + 23].try_into().unwrap()), 0);
+        assert_eq!(
+            u64::from_le_bytes(data[s + 23..s + 31].try_into().unwrap()),
+            total_bytes - 1
+        );
+    }
+
     /// Walk the structure table, returning for each structure its
     /// `(type, declared_len, strings)` where `strings` are decoded using the
     /// declared formatted-area `Length`. If `Length` overshoots or undershoots the
@@ -895,6 +979,21 @@ mod tests {
             0,
             "the BIOS must not set the 'virtual machine' characteristic bit"
         );
+    }
+
+    #[test]
+    fn smbios_type0_bios_characteristics_match_the_modeled_platform() {
+        // BIOS Characteristics QWORD is at Type 0 offset 10. The low 32 bits are
+        // the standard flags; an all-zero field claims no PCI/PnP/flash support,
+        // contradicting the modeled PCIe bus, ACPI/PnP, and flash ROM.
+        let data = SmbiosBuilder::new(SmbiosConfig::default()).build_structures();
+        let chars = u64::from_le_bytes(data[10..18].try_into().unwrap());
+        assert_ne!(chars & (1 << 7), 0, "PCI supported (bit 7)");
+        assert_ne!(chars & (1 << 9), 0, "Plug and Play supported (bit 9)");
+        assert_ne!(chars & (1 << 11), 0, "BIOS is upgradeable / Flash (bit 11)");
+        // Not modeled, must stay clear:
+        assert_eq!(chars & (1 << 8), 0, "PC Card (PCMCIA) is not modeled");
+        assert_eq!(chars & (1 << 3), 0, "'characteristics not supported' must be clear");
     }
 
     #[test]

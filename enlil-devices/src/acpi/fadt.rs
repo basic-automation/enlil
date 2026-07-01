@@ -164,9 +164,17 @@ impl FadtBuilder {
             // the FADT SLEEP_*_REG fields instead, so setting that flag here would
             // both contradict the legacy hardware we model (breaking ACPI shutdown
             // through PM1a) and be an oddity a real consumer PC never exhibits.
+            // PWR_BUTTON and SLP_BUTTON are both left *clear* = fixed-feature
+            // programming model, driven through the PM1 event block (PWRBTN_STS/
+            // SLPBTN_STS at bits 8/9, whose enables the chipset PM1 model already
+            // reserves). Setting SLP_BUTTON would advertise a *control-method*
+            // sleep button and make OSPM enumerate the namespace for a PNP0C0E
+            // device — which the synthesized DSDT does not define, so the flag
+            // would promise a device that isn't there (an ACPI incoherence a
+            // strict OS/validator flags). Keep the flags coherent with the
+            // fixed-feature PM1 hardware we actually model.
             flags: fadt_flags::WBINVD
                 | fadt_flags::PROC_C1
-                | fadt_flags::SLP_BUTTON
                 | fadt_flags::TMR_VAL_EXT
                 | fadt_flags::RESET_REG_SUP,
             boot_arch_flags: boot_flags::LEGACY_DEVICES | boot_flags::PS2_8042,
@@ -463,6 +471,28 @@ mod tests {
         // HW_REDUCED_ACPI (they are mutually exclusive in practice).
         let boot = u16::from_le_bytes(fadt[109..111].try_into().unwrap());
         assert_ne!(boot & boot_flags::LEGACY_DEVICES, 0);
+    }
+
+    #[test]
+    fn button_flags_are_fixed_feature_matching_the_absent_dsdt_button_devices() {
+        // The synthesized DSDT defines no control-method power/sleep button
+        // (PNP0C0C / PNP0C0E). Setting either PWR_BUTTON or SLP_BUTTON in the
+        // FADT would tell OSPM to enumerate the namespace for such a device —
+        // promising hardware that isn't there. Both must stay clear so the
+        // buttons are handled through the fixed-feature PM1 event block, which
+        // the chipset model actually implements.
+        let fadt = FadtBuilder::new(0xDEAD_0000).build();
+        let flags = u32::from_le_bytes(fadt[112..116].try_into().unwrap());
+        assert_eq!(
+            flags & fadt_flags::PWR_BUTTON,
+            0,
+            "PWR_BUTTON must be clear (fixed-feature; no PNP0C0C in the DSDT)"
+        );
+        assert_eq!(
+            flags & fadt_flags::SLP_BUTTON,
+            0,
+            "SLP_BUTTON must be clear (fixed-feature; no PNP0C0E in the DSDT)"
+        );
     }
 
     #[test]
