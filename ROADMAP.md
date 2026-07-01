@@ -1748,6 +1748,24 @@ Physical USB Devices
   `OperationRegion` (e.g. `_SRS` does `FindSetRightBit` of the IRQ mask − 1 → `PIRx`), so a
   PIC-mode guest that reroutes a PCI interrupt actually moves it and `_CRS` reflects it.
   **Remaining (future):** `_PSD`/`_CSD` SSDT domain coordination.
+- **Table-set fidelity + coherence sweep (2026-07-01):** added two tables real
+  UEFI firmware always emits but we lacked — **WSMT** (SMM Security Mitigations,
+  all 3 flags) and **FPDT** (Firmware Performance Data Table, with its FBPT blob
+  reached via a relocated pointer like FADT→FACS). Fixed a latent layout bug the
+  FPDT surfaced: a 12-entry XSDT is 132 bytes but the FACS sat at offset 128, so
+  its signature overwrote the last XSDT entry — FACS moved to 192 (guarded). Also
+  three coherence fixes where a table advertised something absent: **FADT**
+  `SLP_BUTTON` cleared (it claimed a control-method PNP0C0E the DSDT never
+  defines; both buttons now fixed-feature, matching the PM1 block); **BGRT**
+  Displayed bit cleared when there is no image (was claiming a logo shown from
+  address 0); **MADT** LAPIC-NMI flags 0 → 0x0005 (active-high/edge, the
+  canonical NMI encoding for a LINT pin). **Still missing (deferred):** the WAET
+  table is a *VM tell* (it announces emulated RTC/PM-timer — flagged by
+  pafish/al-khaser); making it opt-in/default-off is a stealth-vs-boot-speed
+  product decision left for a human. An RSDT (RsdtAddress is 0 / XSDT-only) is a
+  valid modern config, low value. iasl round-trip gate still self-skips when
+  acpica-tools is absent (as on the local WSL runner) — install it to gate the
+  new tables too.
 
 ### 5.2 SMBIOS Synthesis
 - Generate SMBIOS/DMI tables that report:
@@ -1776,9 +1794,10 @@ Physical USB Devices
   command-stream emitter (`enlil-devices::fw_cfg_loader::BiosLinkerLoader`,
   ALLOCATE / ADD_POINTER / ADD_CHECKSUM / WRITE_POINTER, 128-byte entries
   transcribed byte-for-byte from `qemu/hw/acpi/bios-linker-loader.c`) now exists.
-  `build_acpi_tables` reports its 15 inter-table pointer relocations (RSDP→XSDT,
-  the 10 XSDT entries, FADT FACS/DSDT in both 32- and 64-bit form) *validated
-  against the built bytes*, `acpi::build_acpi_table_loader` turns them into the
+  `build_acpi_tables` reports its 18 inter-table pointer relocations (RSDP→XSDT,
+  the 12 XSDT entries, FADT FACS/DSDT in both 32- and 64-bit form, and the
+  FPDT→FBPT pointer) *validated against the built bytes* (was 15/10 before the
+  2026-07-01 WSMT+FPDT additions), `acpi::build_acpi_table_loader` turns them into the
   loader (relocations + per-SDT and RSDP checksums), and
   `FwCfgDevice::add_acpi_with_loader` / `StandardPc::install_acpi_fw_cfg` build
   the set at base 0 and register `etc/acpi/rsdp` + `etc/acpi/tables` +
@@ -1791,6 +1810,27 @@ Physical USB Devices
   emits no SMBIOS bios-linker-loader commands. **Remaining:** `install_acpi_fw_cfg`
   is opt-in, not yet baked into `standard_pc_complete`; an OVMF/SeaBIOS smoke
   boot to confirm against a real firmware (the executor is the in-tree proxy).
+- **Structure fidelity + coherence (2026-07-01):** added **Type 19** (Memory
+  Array Mapped Address) — real firmware always pairs the Type 16 array with a
+  Type 19 range; a single 0..total-RAM range in the SMBIOS 2.7 extended-address
+  form, derived from `total_ram_mb`. Fixed the **Type 0 BIOS Characteristics**:
+  the low 32 bits were all-zero (claimed no PCI/PnP/flash — contradicting the
+  modeled PCIe bus, ACPI/PnP, and flash ROM, and an uninitialized/VM-ish shape);
+  set the three hardware-backed bits PCI(7)/PnP(9)/upgradeable(11), PCMCIA(8) left
+  clear. **Deferred (awake-design):** **Type 7 (Cache)** — Type 4's L1/L2/L3 cache
+  handles are 0xFFFF ("not provided") while every real machine has Type 7;
+  populating it needs cache sizes coherent with the claimed CPU, which couples to
+  the standing **cross-vendor machine-identity** gap (default SMBIOS/Type-4 is AMD
+  Ryzen/ASUS-B650E/AM5 but the chipset is hardwired Intel Q35/ICH9 — no AMD board
+  has an ICH9 southbridge; needs a coherent one-machine profile in one awake go).
+  The dmidecode gate self-skips when dmidecode is absent (as on the WSL runner).
+- **Device-model coherence re-audited (2026-07-01):** a dedicated audit of the
+  PCI/PCIe device models (Q35 host bridge, ICH9 ISA bridge/SMBus, Renesas xHCI —
+  capability lists, RO descriptor fields, BAR masking, class/rev IDs, MSI/MSI-X
+  geometry, xECP) found **no high-confidence coherence tells** — the reserved-bit
+  and capability hardening from prior runs holds. The device-model tell surface is
+  considered swept; the open transparency work is the awake-design machine-identity
+  profile and the WAET stealth decision above.
 
 ### 5.3 CPUID Stealth
 - Intercept all CPUID exits and craft responses:
