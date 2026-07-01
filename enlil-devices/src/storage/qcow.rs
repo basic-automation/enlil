@@ -136,6 +136,27 @@ impl QcowHeader {
     pub const fn refcount_table_entries(&self) -> u64 {
         (self.refcount_table_clusters as u64 * self.cluster_size()) / 8
     }
+
+    /// Number of refcount-*table* clusters needed for the table to hold a
+    /// (u64) entry at index `rt_index` — i.e. to cover the refcount block for
+    /// that slot. The table must span at least `rt_index + 1` entries × 8 bytes,
+    /// rounded up to whole clusters, and never shrinks below its current size.
+    ///
+    /// This is the sizing math refcount-*table* growth needs (item 3.10): when
+    /// [`QcowBackend::allocate_refcount_block`] finds `rt_index` beyond
+    /// [`refcount_table_entries`](Self::refcount_table_entries), this says how
+    /// large the grown table must be. Pure arithmetic — it computes the target
+    /// size but performs no allocation.
+    #[must_use]
+    pub fn refcount_table_clusters_for(&self, rt_index: u64) -> u32 {
+        let bytes_needed = (rt_index + 1) * 8;
+        let needed = bytes_needed.div_ceil(self.cluster_size());
+        // Never propose shrinking the table below its current size.
+        let clusters = needed.max(u64::from(self.refcount_table_clusters));
+        // Refcount-table cluster counts are small; saturate rather than wrap if a
+        // pathological index is passed.
+        u32::try_from(clusters).unwrap_or(u32::MAX)
+    }
 }
 
 /// Qcow2 backend.
@@ -691,9 +712,12 @@ impl QcowBackend {
         let rb_entries = self.header.refcount_block_entries();
         let rt_index = cluster_index / rb_entries;
         if rt_index >= self.header.refcount_table_entries() {
+            let needed = self.header.refcount_table_clusters_for(rt_index);
             bail!(
-                "refcount table too small for cluster {cluster_index} \
-                 (refcount table growth not yet implemented)"
+                "refcount table too small for cluster {cluster_index}: slot \
+                 {rt_index} needs a {needed}-cluster refcount table (have {}); \
+                 refcount table growth not yet implemented",
+                self.header.refcount_table_clusters
             );
         }
         if let Some(off) = self.refcount_block_offset(cluster_index, file)? {
@@ -1313,6 +1337,28 @@ mod tests {
         assert_eq!(header.cluster_bits, 16);
         assert_eq!(header.size, 1024 * 1024);
         assert_eq!(header.l1_size, 1);
+    }
+
+    #[test]
+    fn refcount_table_clusters_for_sizes_growth() {
+        let img = make_refcounted_qcow2(0);
+        let header = QcowHeader::from_bytes(&img).unwrap();
+        // 64 KiB clusters, 16-bit refcounts: one table cluster holds 8192 u64
+        // entries, so refcount-table slots 0..=8191 fit in the existing cluster.
+        assert_eq!(header.cluster_bits, 16);
+        assert_eq!(header.refcount_table_clusters, 1);
+        assert_eq!(header.refcount_table_entries(), 8192);
+
+        // Within the current table it never proposes shrinking below the
+        // one cluster the image already has.
+        assert_eq!(header.refcount_table_clusters_for(0), 1);
+        assert_eq!(header.refcount_table_clusters_for(8191), 1);
+        // The first slot that overflows the table needs a second cluster,
+        // and it stays two through the end of that cluster's coverage.
+        assert_eq!(header.refcount_table_clusters_for(8192), 2);
+        assert_eq!(header.refcount_table_clusters_for(16383), 2);
+        // One past that spills into a third cluster.
+        assert_eq!(header.refcount_table_clusters_for(16384), 3);
     }
 
     #[test]
