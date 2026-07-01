@@ -74,6 +74,7 @@ later (this is the same pragmatic strategy Firecracker and Cloud Hypervisor used
 | HAL portability trait (`HypervisorBackend`) | ✅ Defined (`enlil-hal`) |
 | KVM-backed VMM: single & multi-guest, CPU/memory partitioning | ✅ Implemented on Linux (`enlil-core`) |
 | Virtual device layer (VirtIO net/block, interrupts, timers, PS/2, HDA, storage) | ✅ Implemented (`enlil-devices`) |
+| Managed vCPU run loop: stealth stack + per-entry platform-timer cadence & LAPIC TSC-deadline firing | ✅ Implemented on Linux (`enlil-core`, `StealthRunLoop`) |
 | USB peripheral routing (virtual xHCI, TRB-level) | 🚧 Substantially implemented |
 | Windows transparency (ACPI/SMBIOS synthesis, CPUID/timing/LBR stealth, vTPM) | 🚧 Building blocks implemented |
 | Bare-metal UEFI boot (Phase 6) | ⏳ Stub (`enlil-boot`) — planned |

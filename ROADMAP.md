@@ -1013,10 +1013,12 @@ Redox is the primary reference. Specific components to study and adapt:
 - [x] 3.1 VirtIO block · [x] 3.2 VirtIO net · [x] 3.3 Interrupt virtualization (LAPIC/IOAPIC/MSI, guest-reachable apertures)
 - [x] 3.4 Virtual timer & clock (PIT/HPET/TSC/paravirt; LAPIC timer) · [x] 3.5 Management console v1
 - [x] 3.6 Display compositor — "Enlil Zones" · [x] 3.7 Inter-guest bridge (clipboard/DnD/shared-fs/notifications)
-- [ ] 3.8 **Production platform-clock cadence** — `advance_clocks` has no production caller; wire it into the run loop from guest execution time, interlocked with the timing-stealth TSC offset
-- [ ] 3.9 LAPIC **TSC-deadline** timer mode (modern Linux default; needs guest TSC + `IA32_TSC_DEADLINE` through the run loop)
+- [x] 3.8 **Production platform-clock cadence** — `StealthRunLoop::run_real_mode` now calls `advance_platform_clocks(step.guest_cycles)` per entry, converting the guest-perceived reference-cycle delta to ns at the cached `tsc_khz` and driving the PIT/HPET/ACPI-PM/bus-clock-LAPIC timers, interlocked with the timing-stealth TSC (enlil offsets but does not scale the rate). KVM test `run_real_mode_drives_the_platform_clock_cadence`
+- [x] 3.9 LAPIC **TSC-deadline** timer mode — `run_real_mode` also calls `fire_due_tsc_deadlines(index)` per entry, checking the armed deadline against the live guest TSC; the `IA32_TSC_DEADLINE` write is forwarded to userspace by `install()`. KVM test `run_real_mode_fires_an_armed_tsc_deadline_timer`
 - [ ] 3.10 qcow2 refcount-table growth (`storage/qcow.rs`) — needs interior-mutable `QcowHeader`; image-corruption risk, do carefully
-- [ ] 3.11 Cap the 16550 UART's unbounded RX buffer (`inject_input`, vm-superio issue #17) before wiring host stdin
+- [x] 3.11 Cap the 16550 UART's unbounded RX buffer — `UartState::inject_input` (and the loopback TX path) bound the RX FIFO at `RX_FIFO_CAPACITY` (4096) and raise the LSR Overrun Error when full (vm-superio issue #17). Tests `rx_fifo_is_bounded_and_flags_overrun`, `rx_overrun_drops_newest_and_keeps_earliest`
+- [ ] 3.12 Wire `StealthRunLoop::run_real_mode` into a top-level guest-boot / multi-guest orchestrator — the driver has no binary caller yet (only end-to-end tests drive it); a VMM entry point is needed to run a real guest boot from firmware
+- [ ] 3.13 Optimize `fire_due_tsc_deadlines`: it does one `KVM_GET_MSRS` (guest-TSC read) per `run_real_mode` entry unconditionally; skip it when no LAPIC has an armed TSC-deadline (needs a cheap "any deadline armed" query on the bus)
 
 **Goal:** Give each guest block devices and network so they're usable systems, not just serial consoles.
 
@@ -1728,7 +1730,7 @@ Physical USB Devices
 - [x] 5.1 ACPI table synthesis · [x] 5.2 SMBIOS synthesis · [x] 5.3 CPUID stealth · [x] 5.4 Timing stealth · [x] 5.5 Virtual TPM 2.0 (CRB, guest-reachable)
 - [ ] 5.6 Windows boot path (OVMF) · [ ] 5.7 Windows-specific virtual devices
 - [ ] 5.8 Anti-detection testing (pafish + al-khaser + IET divergence)
-- [ ] 5.9 CPUID `0x15`/`0x16` frequency leaves using `tsc_khz`, threaded through the topology stealth
+- [x] 5.9 CPUID `0x15`/`0x16` frequency leaves using `tsc_khz`, threaded through the topology stealth — `KvmBackend::upsert_frequency_leaves` folds the Intel TSC/processor-frequency leaves into the `apply_topology_stealth` rebuild, pinning the enumerated base to the measured guest TSC rate and raising leaf-0 max-basic to ≥`0x16`; no-op for an AMD-vendor table. Test `upsert_frequency_leaves_pins_intel_tsc_rate_and_skips_amd`
 
 **Goal:** Boot Windows as a guest with full transparency — the OS and applications must not detect the hypervisor.
 
