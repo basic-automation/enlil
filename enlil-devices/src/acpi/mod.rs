@@ -15,6 +15,7 @@
 //!                ├ SLIT (NUMA distances)
 //!                ├ WAET (Emulated device hints)
 //!                ├ WSMT (SMM security mitigations)
+//!                ├ FPDT (Firmware boot-performance → FBPT)
 //!                ├ BGRT (Boot logo)
 //!                └ TPM2 (Trusted Platform Module)
 //! ```
@@ -24,6 +25,7 @@ pub mod bgrt;
 pub mod dsdt;
 pub mod facs;
 pub mod fadt;
+pub mod fpdt;
 pub mod hpet;
 pub mod madt;
 pub mod mcfg;
@@ -188,9 +190,11 @@ fn build_secondary_tables(config: &AcpiTableSetConfig) -> SecondaryTables {
 
 /// Build the FACS and the FADT that points at it (and at the DSDT).
 ///
-/// The FACS lives at a fixed 64-byte-aligned offset (128) in the zero-filled
+/// The FACS lives at a fixed 64-byte-aligned offset (192) in the zero-filled
 /// padding between the XSDT and the FADT; it is referenced only through the
-/// FADT's `FIRMWARE_CTRL`, never the XSDT, so it is not a table-set entry.
+/// FADT's `FIRMWARE_CTRL`, never the XSDT, so it is not a table-set entry. 192
+/// (not 128) so the FACS clears the XSDT even once the XSDT holds a dozen entry
+/// pointers (12 entries = 132 bytes); it still ends exactly at the FADT (256).
 ///
 /// The layout and the FADT relocation offsets assume the fixed 276-byte FADT
 /// (= `madt_start - fadt_offset`); the `fadt_fixed_layout_assumption_holds` test
@@ -200,7 +204,7 @@ fn build_fadt_and_facs(
     base: u64,
     dsdt_start: usize,
 ) -> (usize, Vec<u8>, Vec<u8>) {
-    let facs_offset = 128usize;
+    let facs_offset = 192usize;
     let facs_bytes = facs::FacsBuilder::new().build();
     let facs_gpa = base + facs_offset as u64;
     let dsdt_gpa = base + dsdt_start as u64;
@@ -209,6 +213,38 @@ fn build_fadt_and_facs(
         .oem_info(config.oem.clone())
         .build();
     (facs_offset, facs_bytes, fadt_bytes)
+}
+
+/// Build the XSDT pointing at each table, in layout order. `entry_targets` are
+/// base-relative offsets; the same list feeds the pointer-relocation map so the
+/// XSDT entries and the table-loader `ADD_POINTER` offsets can never disagree.
+///
+/// `facs_offset` is only used for a debug-mode guard: the XSDT grows 8 bytes per
+/// entry and must still clear the FACS that sits in the pre-FADT padding (a
+/// 12-entry XSDT is 132 bytes, the FACS starts at 192).
+fn build_xsdt(oem: &OemInfo, base: u64, entry_targets: &[usize], facs_offset: usize) -> Vec<u8> {
+    let gpas: Vec<u64> = entry_targets.iter().map(|&o| base + o as u64).collect();
+    let bytes = xsdt::XsdtBuilder::new()
+        .oem_info(oem.clone())
+        .add_tables(&gpas)
+        .build();
+    debug_assert!(
+        bytes.len() <= facs_offset,
+        "XSDT ({} bytes) overruns the FACS at offset {facs_offset}",
+        bytes.len()
+    );
+    bytes
+}
+
+/// Build the FPDT and its FBPT target blob. The FPDT's pointer record targets
+/// the FBPT's guest-physical address (`base + fbpt_offset`), relocated by the
+/// firmware table-loader like FADT→FACS. Returns `(fpdt_table, fbpt_blob)`.
+fn build_fpdt_and_fbpt(config: &AcpiTableSetConfig, base: u64, fbpt_offset: usize) -> (Vec<u8>, Vec<u8>) {
+    let fpdt_table = fpdt::FpdtBuilder::new()
+        .oem_info(config.oem.clone())
+        .fbpt_address(base + fbpt_offset as u64)
+        .build();
+    (fpdt_table, fpdt::FbptBuilder::new().build())
 }
 
 /// Build a complete ACPI table set for a guest VM
@@ -240,7 +276,7 @@ pub fn build_acpi_tables(config: &AcpiTableSetConfig) -> AcpiTableSet {
         tpm2: tpm2_bytes,
     } = build_secondary_tables(config);
 
-    // Layout: XSDT | FADT | MADT | MCFG | HPET | SSDT | SRAT | SLIT | WAET | WSMT | BGRT | TPM2 | DSDT
+    // Layout: XSDT | FADT | MADT | MCFG | HPET | SSDT | SRAT | SLIT | WAET | WSMT | FPDT | BGRT | TPM2 | DSDT | FBPT
     let xsdt_offset = 0usize;
     let fadt_offset = 256; // align XSDT to 256 bytes
     let madt_start = fadt_offset + 276; // FADT is always 276 bytes
@@ -251,9 +287,19 @@ pub fn build_acpi_tables(config: &AcpiTableSetConfig) -> AcpiTableSet {
     let slit_start = srat_start + srat_bytes.len();
     let waet_start = slit_start + slit_bytes.len();
     let wsmt_start = waet_start + waet_bytes.len();
-    let bgrt_start = wsmt_start + wsmt_bytes.len();
+    // FPDT has a fixed 52-byte length, so its slot can be reserved before the
+    // FBPT (its pointer target) address is known.
+    let fpdt_start = wsmt_start + wsmt_bytes.len();
+    let bgrt_start = fpdt_start + fpdt::FPDT_LENGTH as usize;
     let tpm2_start = bgrt_start + bgrt_bytes.len();
     let dsdt_start = tpm2_start + tpm2_bytes.len();
+    // The FBPT (Firmware Basic Boot Performance Table) is the FPDT pointer's
+    // target: a plain blob after the DSDT, reached only via the relocated FPDT
+    // pointer, so — like the FACS — it is not an XSDT entry.
+    let fbpt_offset = dsdt_start + dsdt_bytes.len();
+
+    // FPDT (address-dependent, like the FADT) + its FBPT target blob.
+    let (fpdt_table, fbpt_blob) = build_fpdt_and_fbpt(config, base, fbpt_offset);
 
     // FACS + FADT (the FACS lives in the aligned padding before the FADT and is
     // reached only via the FADT's FIRMWARE_CTRL, so it is not an XSDT entry).
@@ -272,17 +318,11 @@ pub fn build_acpi_tables(config: &AcpiTableSetConfig) -> AcpiTableSet {
         slit_start,
         waet_start,
         wsmt_start,
+        fpdt_start,
         bgrt_start,
         tpm2_start,
     ];
-    let xsdt_gpas: Vec<u64> = xsdt_entry_targets
-        .iter()
-        .map(|&o| base + o as u64)
-        .collect();
-    let xsdt_bytes = xsdt::XsdtBuilder::new()
-        .oem_info(config.oem.clone())
-        .add_tables(&xsdt_gpas)
-        .build();
+    let xsdt_bytes = build_xsdt(&config.oem, base, &xsdt_entry_targets, facs_offset);
 
     // Assemble all tables into a contiguous buffer (XSDT at 0, FADT at fadt_offset).
     tables.resize(fadt_offset, 0);
@@ -301,6 +341,7 @@ pub fn build_acpi_tables(config: &AcpiTableSetConfig) -> AcpiTableSet {
         ("SLIT", &slit_bytes),
         ("WAET", &waet_bytes),
         ("WSMT", &wsmt_bytes),
+        ("FPDT", &fpdt_table),
         ("BGRT", &bgrt_bytes),
         ("TPM2", &tpm2_bytes),
         ("DSDT", &dsdt_bytes),
@@ -308,6 +349,10 @@ pub fn build_acpi_tables(config: &AcpiTableSetConfig) -> AcpiTableSet {
         offsets.push((name.to_string(), tables.len()));
         tables.extend_from_slice(bytes);
     }
+    // Append the FBPT after the DSDT (not an XSDT entry; reached only via the
+    // FPDT pointer relocated below). Its computed offset must match the layout.
+    debug_assert_eq!(tables.len(), fbpt_offset);
+    tables.extend_from_slice(&fbpt_blob);
 
     // Build RSDP pointing to XSDT
     let xsdt_gpa = base + xsdt_offset as u64;
@@ -322,6 +367,8 @@ pub fn build_acpi_tables(config: &AcpiTableSetConfig) -> AcpiTableSet {
         facs_offset,
         dsdt_start,
         &xsdt_entry_targets,
+        fpdt_start,
+        fbpt_offset,
     );
 
     AcpiTableSet {
@@ -347,6 +394,8 @@ fn build_acpi_pointers(
     facs_offset: usize,
     dsdt_start: usize,
     xsdt_entry_targets: &[usize],
+    fpdt_start: usize,
+    fbpt_offset: usize,
 ) -> Vec<AcpiPointer> {
     let u32_of = crate::truncate::u32_of;
     let mut pointers = vec![AcpiPointer {
@@ -381,6 +430,14 @@ fn build_acpi_pointers(
             target_offset: target as u64,
         });
     }
+    // FPDT's Firmware Basic Boot Performance Pointer record → the FBPT blob.
+    pointers.push(AcpiPointer {
+        pointer_file: AcpiFile::Tables,
+        target_file: AcpiFile::Tables,
+        offset: u32_of(fpdt_start + fpdt::FPDT_FBPT_POINTER_OFFSET),
+        size: 8,
+        target_offset: fbpt_offset as u64,
+    });
     pointers
 }
 
@@ -448,8 +505,8 @@ mod tests {
             "Tables must be larger than just FADT"
         );
 
-        // Should have 13 table entries (XSDT + FADT + MADT + MCFG + HPET + SSDT + SRAT + SLIT + WAET + WSMT + BGRT + TPM2 + DSDT)
-        assert_eq!(table_set.table_offsets.len(), 13);
+        // Should have 14 table entries (XSDT + FADT + MADT + MCFG + HPET + SSDT + SRAT + SLIT + WAET + WSMT + FPDT + BGRT + TPM2 + DSDT). The FBPT is a sub-blob, not an XSDT entry, so it is not counted.
+        assert_eq!(table_set.table_offsets.len(), 14);
 
         let names: Vec<&str> = table_set
             .table_offsets
@@ -466,6 +523,7 @@ mod tests {
         assert!(names.contains(&"SLIT"));
         assert!(names.contains(&"WAET"));
         assert!(names.contains(&"WSMT"));
+        assert!(names.contains(&"FPDT"));
         assert!(names.contains(&"BGRT"));
         assert!(names.contains(&"TPM2"));
         assert!(names.contains(&"DSDT"));
@@ -575,8 +633,9 @@ mod tests {
             .filter(|p| p.pointer_file == AcpiFile::Rsdp)
             .count();
         assert_eq!(rsdp_links, 1, "exactly the RSDP->XSDT pointer");
-        // 1 (RSDP) + 11 (XSDT entries) + 4 (FADT FACS/DSDT x {32,64}-bit) = 16.
-        assert_eq!(ts.pointers.len(), 16);
+        // 1 (RSDP) + 12 (XSDT entries) + 4 (FADT FACS/DSDT x {32,64}-bit)
+        // + 1 (FPDT → FBPT) = 18.
+        assert_eq!(ts.pointers.len(), 18);
     }
 
     fn mask(size: u8) -> u64 {
@@ -905,15 +964,15 @@ mod tests {
     }
 
     #[test]
-    fn table_set_xsdt_has_11_entries() {
+    fn table_set_xsdt_has_12_entries() {
         let table_set = build_acpi_tables(&AcpiTableSetConfig::default());
         let xsdt = &table_set.tables[0..];
         let xsdt_len = u32::from_le_bytes(xsdt[4..8].try_into().unwrap()) as usize;
         // XSDT: 36-byte header + 8 bytes per entry
         let entry_count = (xsdt_len - 36) / 8;
         assert_eq!(
-            entry_count, 11,
-            "XSDT must point to 11 tables (FADT+MADT+MCFG+HPET+SSDT+SRAT+SLIT+WAET+WSMT+BGRT+TPM2)"
+            entry_count, 12,
+            "XSDT must point to 12 tables (FADT+MADT+MCFG+HPET+SSDT+SRAT+SLIT+WAET+WSMT+FPDT+BGRT+TPM2)"
         );
     }
 
