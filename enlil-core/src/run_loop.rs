@@ -441,11 +441,22 @@ mod linux {
         /// Call after [`run_vcpu_once`](Self::run_vcpu_once) for the vCPU just
         /// run. Kept separate from `run_vcpu_once` so a caller that does not use
         /// the TSC-deadline timer pays neither the extra `KVM_GET_MSRS` nor a
-        /// change in `run_vcpu_once`'s behaviour.
+        /// change in `run_vcpu_once`'s behaviour. When no LAPIC has an armed
+        /// deadline it returns without reading the guest TSC at all (a cheap
+        /// host-side [`any_lapic_tsc_deadline_armed`](StandardPc::any_lapic_tsc_deadline_armed)
+        /// check), so the per-entry cost in `run_real_mode` is negligible for a
+        /// guest that never uses the mode.
         ///
         /// # Errors
         /// Propagates [`KvmBackend::read_guest_tsc`].
         pub fn fire_due_tsc_deadlines(&mut self, index: usize) -> Result<Vec<usize>> {
+            // Skip the guest-TSC read entirely when no LAPIC has a deadline armed
+            // — the common case for a guest using the bus-clock timer, so the
+            // per-entry cost in the run loop is a cheap host-side check, not a
+            // `KVM_GET_MSRS` ioctl on every entry.
+            if !self.pc.any_lapic_tsc_deadline_armed() {
+                return Ok(Vec::new());
+            }
             let guest_tsc = self.backend.read_guest_tsc(index)?;
             Ok(self.pc.check_lapic_tsc_deadlines(guest_tsc))
         }

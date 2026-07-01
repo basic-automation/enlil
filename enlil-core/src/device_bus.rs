@@ -1474,6 +1474,21 @@ impl StandardPc {
         });
         fired
     }
+
+    /// Whether any software-enabled vCPU LAPIC currently has an armed
+    /// TSC-deadline timer (a non-zero `IA32_TSC_DEADLINE`, which is only ever
+    /// non-zero in TSC-deadline mode — a mode switch or an expiry resets it to
+    /// 0). A cheap, host-only check the run loop uses to skip the per-entry
+    /// guest-TSC read ([`check_lapic_tsc_deadlines`](Self::check_lapic_tsc_deadlines))
+    /// when nothing is armed.
+    #[must_use]
+    pub fn any_lapic_tsc_deadline_armed(&self) -> bool {
+        self.ioapic.with(|c| {
+            c.lapics
+                .iter()
+                .any(|l| l.is_enabled() && l.tsc_deadline() != 0)
+        })
+    }
 }
 
 /// Drive a PCI device's level-triggered `INTx` line into the interrupt fabric
@@ -2335,6 +2350,54 @@ mod tests {
         assert!(VmExitHandler::wrmsr(&mut bus, IA32_TSC_DEADLINE, 0));
         assert_eq!(VmExitHandler::rdmsr(&mut bus, IA32_TSC_DEADLINE), Some(0));
         assert_eq!(pic.with(|c| c.lapics[0].tsc_deadline()), 0);
+    }
+
+    // any_lapic_tsc_deadline_armed is the cheap host-side guard the run loop uses
+    // to skip its per-entry guest-TSC read: false on a fresh machine and while a
+    // LAPIC is only in TSC-deadline *mode*, true once a non-zero deadline is
+    // armed, and false again for a software-disabled APIC (the is_enabled guard).
+    #[test]
+    fn any_lapic_tsc_deadline_armed_tracks_the_armed_state() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+
+        const LAPIC_SVR_OFF: u32 = 0x0F0;
+        const LAPIC_LVT_TIMER_OFF: u32 = 0x320;
+        const TSC_DEADLINE_MODE: u32 = 2 << 17;
+
+        let pc =
+            DeviceBus::standard_pc_complete(SerialOutput::new("g", SerialOutputMode::Null), 0, 2)
+                .expect("build standard pc");
+
+        // Fresh machine: no LAPIC has a deadline armed.
+        assert!(!pc.any_lapic_tsc_deadline_armed());
+
+        // Software-enable LAPIC 1 and put its timer in TSC-deadline mode, but do
+        // not arm a deadline — the mode alone is not "armed".
+        pc.ioapic.with(|c| {
+            c.lapics[1].write_register(LAPIC_SVR_OFF, 0x1FF);
+            c.lapics[1].write_register(LAPIC_LVT_TIMER_OFF, 0x40 | TSC_DEADLINE_MODE);
+        });
+        assert!(
+            !pc.any_lapic_tsc_deadline_armed(),
+            "TSC-deadline mode with no deadline is not armed"
+        );
+
+        // Arm a non-zero deadline: now the machine reports an armed deadline.
+        pc.ioapic
+            .with(|c| c.lapics[1].write_tsc_deadline_msr(0x1_0000));
+        assert!(
+            pc.any_lapic_tsc_deadline_armed(),
+            "a non-zero armed deadline is detected"
+        );
+
+        // Software-disable the APIC (clear SVR bit 8): the stale deadline no
+        // longer counts, matching check_lapic_tsc_deadlines' is_enabled guard.
+        pc.ioapic
+            .with(|c| c.lapics[1].write_register(LAPIC_SVR_OFF, 0x0FF));
+        assert!(
+            !pc.any_lapic_tsc_deadline_armed(),
+            "a software-disabled APIC is not armed"
+        );
     }
 
     #[test]
