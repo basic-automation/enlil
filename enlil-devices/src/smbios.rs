@@ -351,8 +351,16 @@ impl SmbiosBuilder {
         header.push(3);
         // BIOS ROM Size (64K blocks - 1)
         header.push(0xFF); // 16MB
-        // BIOS Characteristics (8 bytes)
-        header.extend_from_slice(&0x0000_0003_0000_0000u64.to_le_bytes());
+        // BIOS Characteristics (8 bytes). The low 32 bits are the standard
+        // capability flags; leaving them all-zero claimed the BIOS supports
+        // neither PCI, Plug and Play, nor flash update — contradicting the
+        // modeled hardware (a PCIe bus, ACPI/PnP, and the flash ROM sized above)
+        // and itself an uninitialized/VM-ish shape no real BIOS presents. Assert
+        // the three the platform demonstrably backs: bit 7 PCI, bit 9 Plug and
+        // Play, bit 11 BIOS is upgradeable (Flash) = 0xA80. Bit 8 (PC Card /
+        // PCMCIA) stays clear — not modeled. Bits 32-33 are vendor-reserved and
+        // kept as-is.
+        header.extend_from_slice(&0x0000_0003_0000_0A80u64.to_le_bytes());
         // BIOS Characteristics Extension Bytes (SMBIOS §7.1.2.2).
         header.push(0x01); // byte 1: ACPI supported (bit 0)
         // byte 2: targeted content distribution (bit 2) + UEFI (bit 3). Bit 4 —
@@ -971,6 +979,21 @@ mod tests {
             0,
             "the BIOS must not set the 'virtual machine' characteristic bit"
         );
+    }
+
+    #[test]
+    fn smbios_type0_bios_characteristics_match_the_modeled_platform() {
+        // BIOS Characteristics QWORD is at Type 0 offset 10. The low 32 bits are
+        // the standard flags; an all-zero field claims no PCI/PnP/flash support,
+        // contradicting the modeled PCIe bus, ACPI/PnP, and flash ROM.
+        let data = SmbiosBuilder::new(SmbiosConfig::default()).build_structures();
+        let chars = u64::from_le_bytes(data[10..18].try_into().unwrap());
+        assert_ne!(chars & (1 << 7), 0, "PCI supported (bit 7)");
+        assert_ne!(chars & (1 << 9), 0, "Plug and Play supported (bit 9)");
+        assert_ne!(chars & (1 << 11), 0, "BIOS is upgradeable / Flash (bit 11)");
+        // Not modeled, must stay clear:
+        assert_eq!(chars & (1 << 8), 0, "PC Card (PCMCIA) is not modeled");
+        assert_eq!(chars & (1 << 3), 0, "'characteristics not supported' must be clear");
     }
 
     #[test]
