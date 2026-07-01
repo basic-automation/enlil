@@ -2,8 +2,9 @@
 //!
 //! Windows expects this table to locate the OEM boot logo image. It contains
 //! a pointer to a BMP image in memory, display coordinates, and status flags.
-//! Even with a zeroed image address, the table's presence satisfies the
-//! Windows boot loader's ACPI table enumeration.
+//! When no image is configured (address 0) the table is still emitted, but its
+//! "Displayed" status bit is cleared so it does not claim a boot graphic was
+//! shown from physical address 0.
 
 use super::tables::{AcpiSdtHeader, OemInfo};
 
@@ -77,8 +78,17 @@ impl BgrtBuilder {
         // Offset 36: Version (2 bytes)
         buf.extend_from_slice(&self.version.to_le_bytes());
 
-        // Offset 38: Status (1 byte)
-        buf.push(self.status);
+        // Offset 38: Status (1 byte). The "Displayed" bit asserts a boot graphic
+        // was actually shown; with no image (address 0) that is incoherent — a
+        // BGRT consumer would try to read a BMP at physical address 0 — so clear
+        // it unless a real image is present. A BGRT with Displayed=0 is the valid
+        // "no boot logo shown" state.
+        let status = if self.image_address == 0 {
+            self.status & !BGRT_STATUS_DISPLAYED
+        } else {
+            self.status
+        };
+        buf.push(status);
 
         // Offset 39: Image Type (1 byte)
         buf.push(self.image_type);
@@ -132,9 +142,20 @@ mod tests {
     }
 
     #[test]
-    fn bgrt_status_displayed() {
+    fn bgrt_status_is_not_displayed_without_an_image() {
+        // Default builder has image_address 0: the Displayed bit must be clear so
+        // the table does not claim a graphic was shown from address 0.
         let bgrt = BgrtBuilder::new().build();
-        assert_eq!(bgrt[38], BGRT_STATUS_DISPLAYED);
+        assert_eq!(bgrt[38] & BGRT_STATUS_DISPLAYED, 0);
+        let addr = u64::from_le_bytes(bgrt[40..48].try_into().unwrap());
+        assert_eq!(addr, 0);
+    }
+
+    #[test]
+    fn bgrt_status_displayed_with_a_real_image() {
+        // With a real image address the Displayed bit is preserved.
+        let bgrt = BgrtBuilder::new().image_address(0x8000_0000).build();
+        assert_eq!(bgrt[38] & BGRT_STATUS_DISPLAYED, BGRT_STATUS_DISPLAYED);
     }
 
     #[test]
