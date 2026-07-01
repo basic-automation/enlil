@@ -1489,6 +1489,29 @@ impl StandardPc {
                 .any(|l| l.is_enabled() && l.tsc_deadline() != 0)
         })
     }
+
+    /// Advance the MC146818 RTC/CMOS calendar by `seconds` whole wall seconds,
+    /// ticking it once per second so a guest reading the RTC sees real calendar
+    /// time pass during a run and any enabled update/alarm interrupt (IRQ8)
+    /// fires. Returns whether the RTC asserted its interrupt line at least once.
+    ///
+    /// Unlike [`advance_clocks`](Self::advance_clocks) (driven by guest
+    /// execution time), the RTC tracks *wall-clock* time, so the run loop drives
+    /// it from the host clock, not the guest cycle delta. Capped at
+    /// [`RTC_MAX_CATCHUP_SECONDS`] per call so a pathologically large gap (e.g.
+    /// a long descheduled stretch) cannot spin here; the remainder is caught up
+    /// on later calls.
+    #[must_use]
+    pub fn advance_rtc_seconds(&self, seconds: u64) -> bool {
+        let ticks = seconds.min(RTC_MAX_CATCHUP_SECONDS);
+        self.rtc.with(|r| {
+            let mut fired = false;
+            for _ in 0..ticks {
+                fired |= r.tick_second();
+            }
+            fired
+        })
+    }
 }
 
 /// Drive a PCI device's level-triggered `INTx` line into the interrupt fabric
@@ -1549,6 +1572,13 @@ pub const IRQ_COM1: u8 = 4;
 /// clocks (see [`DeviceBus::advance_clocks`]). At 1 GHz one input clock is one
 /// nanosecond, so the conversion is exact.
 pub const LAPIC_TIMER_INPUT_HZ: u64 = 1_000_000_000;
+
+/// Maximum whole seconds [`StandardPc::advance_rtc_seconds`] ticks the RTC in a
+/// single call. One day: enough to absorb any realistic scheduling gap in one
+/// pass, while bounding the worst-case tick loop so a pathological wall-clock
+/// jump (or a first-call baseline error) cannot spin. A larger gap is caught up
+/// over subsequent calls.
+pub const RTC_MAX_CATCHUP_SECONDS: u64 = 86_400;
 
 /// BDF of the ICH9 LPC bridge / PCI interrupt router (`00:1F.0`) seeded by
 /// [`DeviceBus::standard_pc_complete`]; its config space holds the
@@ -2398,6 +2428,41 @@ mod tests {
             !pc.any_lapic_tsc_deadline_armed(),
             "a software-disabled APIC is not armed"
         );
+    }
+
+    // advance_rtc_seconds ticks the MC146818 calendar by whole wall seconds and
+    // aggregates the update/alarm IRQ, so a long run's real-time clock keeps
+    // moving instead of freezing. Driven through the RTC's public port methods
+    // (register B = 0x0B; UIE 0x10 | DM 0x04 | 24H 0x02).
+    #[test]
+    fn advance_rtc_seconds_ticks_the_calendar_and_fires_updates() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+
+        // RTC seeded at unix time 0 (1970-01-01 00:00:00).
+        let pc =
+            DeviceBus::standard_pc_complete(SerialOutput::new("g", SerialOutputMode::Null), 0, 1)
+                .expect("build standard pc");
+
+        // Enable the update-ended interrupt and binary / 24-hour mode so the
+        // time registers read back as plain integers.
+        pc.rtc.with(|r| {
+            r.write_index(0x0B); // Register B
+            r.write_data(0x10 | 0x04 | 0x02); // UIE | DM | 24H
+        });
+
+        // Zero seconds ticks nothing and fires nothing.
+        assert!(!pc.advance_rtc_seconds(0));
+
+        // 90 seconds advances the calendar to 00:01:30 and fires the update IRQ.
+        assert!(pc.advance_rtc_seconds(90));
+        let (seconds, minutes) = pc.rtc.with(|r| {
+            r.write_index(0x00); // seconds register
+            let s = r.read_data();
+            r.write_index(0x02); // minutes register
+            let m = r.read_data();
+            (s, m)
+        });
+        assert_eq!((minutes, seconds), (1, 30), "calendar advanced by 1m30s");
     }
 
     #[test]

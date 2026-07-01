@@ -112,6 +112,11 @@ mod linux {
         /// cached thereafter. The reference rate that converts a guest entry's
         /// reference-cycle delta to the nanoseconds the platform timers advance.
         tsc_khz: Option<u32>,
+        /// Host wall-clock second the RTC/CMOS calendar was last advanced to.
+        /// `run_real_mode` ticks the MC146818 by the real seconds elapsed since
+        /// this baseline (the RTC tracks wall time, not guest execution time);
+        /// `None` until the first entry establishes it.
+        last_rtc_wall_secs: Option<u64>,
     }
 
     /// Convert a guest reference-cycle delta to nanoseconds at `tsc_khz`.
@@ -204,6 +209,7 @@ mod linux {
                 timings,
                 model,
                 tsc_khz: None,
+                last_rtc_wall_secs: None,
             })
         }
 
@@ -371,7 +377,8 @@ mod linux {
         /// mid-run — this is the production caller of `StandardPc::advance_clocks`.
         /// It likewise calls [`fire_due_tsc_deadlines`](Self::fire_due_tsc_deadlines)
         /// each entry so a guest-armed LAPIC TSC-deadline timer fires against the
-        /// guest TSC.
+        /// guest TSC, and advances the RTC/CMOS calendar by real wall-clock
+        /// seconds so a long run's real-time clock does not freeze.
         ///
         /// `reset_entry` is usually the same guest-physical address the vCPU was
         /// first prepared at (firmware reset vector). Returns
@@ -405,6 +412,11 @@ mod linux {
                 // the primary per-CPU clock event, so without this a guest that
                 // armed one via IA32_TSC_DEADLINE would never see it fire.
                 self.fire_due_tsc_deadlines(index)?;
+                // Advance the RTC/CMOS calendar by real wall-clock seconds, so a
+                // long-running guest's real-time clock does not freeze (a
+                // correctness gap and a mild tell). Wall-driven, not guest-cycle
+                // driven; a sub-second run ticks nothing.
+                let _ = self.advance_rtc_from_wall_clock();
                 match step.event {
                     Some(PlatformEvent::Sleep(slp_typ)) => {
                         return Ok(LoopOutcome::Shutdown(slp_typ));
@@ -500,6 +512,28 @@ mod linux {
             };
             let ns = cycles_to_ns(guest_ref_cycles, khz);
             Ok(self.pc.advance_clocks(ns))
+        }
+
+        /// Advance the RTC/CMOS calendar to the current host wall-clock second,
+        /// ticking the MC146818 once per real second elapsed since the last
+        /// call. The first call only records the baseline (ticks nothing), and
+        /// wall time moving backwards (e.g. an NTP step) is clamped to no
+        /// advance. Returns whether the RTC asserted its interrupt line.
+        ///
+        /// The RTC tracks wall-clock time, so — unlike
+        /// [`advance_platform_clocks`](Self::advance_platform_clocks), driven by
+        /// guest execution time — it is advanced from the host clock. A run that
+        /// completes within one second ticks nothing.
+        fn advance_rtc_from_wall_clock(&mut self) -> bool {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let fired = match self.last_rtc_wall_secs {
+                Some(last) => self.pc.advance_rtc_seconds(now.saturating_sub(last)),
+                None => false,
+            };
+            self.last_rtc_wall_secs = Some(now);
+            fired
         }
 
         /// vCPU 0's shared timing handle — for a watchdog or test to read the
