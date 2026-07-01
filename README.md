@@ -247,7 +247,7 @@ enlil/
 ├── rust-toolchain.toml         # Pinned nightly
 ├── x86_64-unknown-enlil.json   # Custom bare-metal target spec
 ├── README.md                   # This file
-├── ROADMAP.md                  # Checkbox work queue + full 11-phase plan, milestones, risks, research refs
+├── ROADMAP.md                  # Development roadmap — all 11 phases as a checklist, milestones, risks, research refs
 ├── examples/                   # Sample guest configurations
 ├── enlil-platform/             # Platform abstraction (linux + baremetal backends)
 ├── enlil-std/                  # std-shaped facade over the platform layer
@@ -300,14 +300,10 @@ ZK-proof attestation and cross-guest isolation proofs — see [`ROADMAP.md`](ROA
 
 ## Documentation
 
-Enlil keeps exactly two documents, with a clean split of responsibility:
-
 | Document | What's in it |
 |----------|--------------|
-| **README.md** (this file) | **What already works** — the shipped features, architecture, crate map, build matrix, and current status. When a capability ships it is described here. |
-| [**ROADMAP.md**](ROADMAP.md) | **The single source of truth for what's left to build** — a phase-based `[ ]`/`[x]` checkbox work queue up top, then the detailed design spec for all 11 phases (scaffold → platform → multi-guest → devices → USB → Windows → bare metal → GPU → hardening → compute fabric → architecture portability → mesh), the milestone table, technical risks, and reference resources (including the research that informs the plan). |
-
-There is no progress log or run log — **git history and the merged PRs are the record.**
+| **README.md** (this file) | Project overview — what Enlil is, its architecture, the crate layout, how to build, and where things stand today. |
+| [**ROADMAP.md**](ROADMAP.md) | The development roadmap — every phase from scaffold to multi-machine mesh, tracked as a checklist, with the detailed technical design, milestones, risks, and references behind each item. |
 
 ---
 
