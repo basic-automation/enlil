@@ -112,6 +112,11 @@ mod linux {
         /// cached thereafter. The reference rate that converts a guest entry's
         /// reference-cycle delta to the nanoseconds the platform timers advance.
         tsc_khz: Option<u32>,
+        /// Host wall-clock second the RTC/CMOS calendar was last advanced to.
+        /// `run_real_mode` ticks the MC146818 by the real seconds elapsed since
+        /// this baseline (the RTC tracks wall time, not guest execution time);
+        /// `None` until the first entry establishes it.
+        last_rtc_wall_secs: Option<u64>,
     }
 
     /// Convert a guest reference-cycle delta to nanoseconds at `tsc_khz`.
@@ -204,6 +209,7 @@ mod linux {
                 timings,
                 model,
                 tsc_khz: None,
+                last_rtc_wall_secs: None,
             })
         }
 
@@ -364,6 +370,16 @@ mod linux {
         ///   [`LoopOutcome::Shutdown`] with the `SLP_TYP` (`5` = power off).
         /// - [`GuestExit::Halted`] with no event → return [`LoopOutcome::Halted`].
         ///
+        /// After each entry it also drives the platform-timer cadence via
+        /// [`advance_platform_clocks`](Self::advance_platform_clocks), so the
+        /// PIT / HPET / ACPI-PM / bus-clock-LAPIC timers advance by the
+        /// guest-perceived time the entry consumed and a guest-armed timer fires
+        /// mid-run — this is the production caller of `StandardPc::advance_clocks`.
+        /// It likewise calls [`fire_due_tsc_deadlines`](Self::fire_due_tsc_deadlines)
+        /// each entry so a guest-armed LAPIC TSC-deadline timer fires against the
+        /// guest TSC, and advances the RTC/CMOS calendar by real wall-clock
+        /// seconds so a long run's real-time clock does not freeze.
+        ///
         /// `reset_entry` is usually the same guest-physical address the vCPU was
         /// first prepared at (firmware reset vector). Returns
         /// [`LoopOutcome::Exhausted`] if the bound is hit first.
@@ -379,6 +395,28 @@ mod linux {
         ) -> Result<LoopOutcome> {
             for _ in 0..max_entries {
                 let step = self.run_vcpu_once(index)?;
+                // Advance the platform timers (PIT, HPET, ACPI PM, bus-clock
+                // LAPIC) by the guest-perceived time this entry consumed, so a
+                // guest that armed a timer sees it expire while the run loop is
+                // driving it — this is the production cadence for
+                // `StandardPc::advance_clocks`. The ns are derived from the same
+                // reference-cycle delta the RDTSC/RDPMC stealth surfaces use, so
+                // the timers stay in lockstep with the guest's TSC (enlil offsets
+                // but does not scale the rate).
+                self.advance_platform_clocks(step.guest_cycles)?;
+                // Fire any armed LAPIC TSC-deadline timer whose absolute deadline
+                // the guest TSC has now reached. Unlike the bus-clock timer above
+                // this mode is checked against the guest TSC, not an ns delta, so
+                // it is a separate call — but it belongs in the same production
+                // driver (3.9): modern Linux/Windows use the TSC-deadline timer as
+                // the primary per-CPU clock event, so without this a guest that
+                // armed one via IA32_TSC_DEADLINE would never see it fire.
+                self.fire_due_tsc_deadlines(index)?;
+                // Advance the RTC/CMOS calendar by real wall-clock seconds, so a
+                // long-running guest's real-time clock does not freeze (a
+                // correctness gap and a mild tell). Wall-driven, not guest-cycle
+                // driven; a sub-second run ticks nothing.
+                let _ = self.advance_rtc_from_wall_clock();
                 match step.event {
                     Some(PlatformEvent::Sleep(slp_typ)) => {
                         return Ok(LoopOutcome::Shutdown(slp_typ));
@@ -415,11 +453,22 @@ mod linux {
         /// Call after [`run_vcpu_once`](Self::run_vcpu_once) for the vCPU just
         /// run. Kept separate from `run_vcpu_once` so a caller that does not use
         /// the TSC-deadline timer pays neither the extra `KVM_GET_MSRS` nor a
-        /// change in `run_vcpu_once`'s behaviour.
+        /// change in `run_vcpu_once`'s behaviour. When no LAPIC has an armed
+        /// deadline it returns without reading the guest TSC at all (a cheap
+        /// host-side [`any_lapic_tsc_deadline_armed`](StandardPc::any_lapic_tsc_deadline_armed)
+        /// check), so the per-entry cost in `run_real_mode` is negligible for a
+        /// guest that never uses the mode.
         ///
         /// # Errors
         /// Propagates [`KvmBackend::read_guest_tsc`].
         pub fn fire_due_tsc_deadlines(&mut self, index: usize) -> Result<Vec<usize>> {
+            // Skip the guest-TSC read entirely when no LAPIC has a deadline armed
+            // — the common case for a guest using the bus-clock timer, so the
+            // per-entry cost in the run loop is a cheap host-side check, not a
+            // `KVM_GET_MSRS` ioctl on every entry.
+            if !self.pc.any_lapic_tsc_deadline_armed() {
+                return Ok(Vec::new());
+            }
             let guest_tsc = self.backend.read_guest_tsc(index)?;
             Ok(self.pc.check_lapic_tsc_deadlines(guest_tsc))
         }
@@ -463,6 +512,28 @@ mod linux {
             };
             let ns = cycles_to_ns(guest_ref_cycles, khz);
             Ok(self.pc.advance_clocks(ns))
+        }
+
+        /// Advance the RTC/CMOS calendar to the current host wall-clock second,
+        /// ticking the MC146818 once per real second elapsed since the last
+        /// call. The first call only records the baseline (ticks nothing), and
+        /// wall time moving backwards (e.g. an NTP step) is clamped to no
+        /// advance. Returns whether the RTC asserted its interrupt line.
+        ///
+        /// The RTC tracks wall-clock time, so — unlike
+        /// [`advance_platform_clocks`](Self::advance_platform_clocks), driven by
+        /// guest execution time — it is advanced from the host clock. A run that
+        /// completes within one second ticks nothing.
+        fn advance_rtc_from_wall_clock(&mut self) -> bool {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let fired = match self.last_rtc_wall_secs {
+                Some(last) => self.pc.advance_rtc_seconds(now.saturating_sub(last)),
+                None => false,
+            };
+            self.last_rtc_wall_secs = Some(now);
+            fired
         }
 
         /// vCPU 0's shared timing handle — for a watchdog or test to read the
@@ -1949,6 +2020,155 @@ mod tests {
             outcome,
             LoopOutcome::Shutdown(S5),
             "guest committed an S5 power-off via PM1a_CNT"
+        );
+    }
+
+    // run_real_mode itself drives the platform-clock cadence: a guest that
+    // programs a one-shot LAPIC timer with a tiny count and HLTs sees the timer
+    // *fire during the managed run*, with no manual advance_clocks call. This is
+    // the 3.8 wiring — advance_platform_clocks is now called per entry from the
+    // production driver, so a guest-armed timer expires from the guest-perceived
+    // time the run consumed.
+    #[test]
+    fn run_real_mode_drives_the_platform_clock_cadence() {
+        if !is_kvm_available() {
+            eprintln!("skipping run_real_mode_drives_the_platform_clock_cadence: no /dev/kvm");
+            return;
+        }
+
+        // Protected-mode blob: SVR(0x0F0)=0x1FF software-enable; LVT timer(0x320)
+        //   =0x40 one-shot, unmasked; divide(0x3E0)=0x0B divide-by-1; init(0x380)
+        //   =1 (one bus clock, so any advance expires it); hlt.
+        #[rustfmt::skip]
+        let code: [u8; 41] = [
+            0xB8, 0xFF, 0x01, 0x00, 0x00, // mov eax, 0x1FF
+            0xA3, 0xF0, 0x00, 0xE0, 0xFE, // mov [0xFEE000F0], eax  (SVR)
+            0xB8, 0x40, 0x00, 0x00, 0x00, // mov eax, 0x40
+            0xA3, 0x20, 0x03, 0xE0, 0xFE, // mov [0xFEE00320], eax  (LVT timer)
+            0xB8, 0x0B, 0x00, 0x00, 0x00, // mov eax, 0x0B
+            0xA3, 0xE0, 0x03, 0xE0, 0xFE, // mov [0xFEE003E0], eax  (divide)
+            0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+            0xA3, 0x80, 0x03, 0xE0, 0xFE, // mov [0xFEE00380], eax  (initial count)
+            0xF4,                         // hlt
+        ];
+        const ENTRY: u64 = 0x1000;
+
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            0,
+            1,
+        )
+        .expect("build standard pc");
+        let ioapic = pc.ioapic.clone();
+
+        let backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        let mut run = match StealthRunLoop::install(backend, pc, LbrPlatform::AmdSvm) {
+            Ok(run) => run,
+            Err(e) => {
+                eprintln!("skipping run_real_mode_drives_the_platform_clock_cadence: {e}");
+                return;
+            }
+        };
+
+        let mut ram = GuestRam::new(0x1000);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+        // SAFETY: `ram` outlives `run` within this test scope.
+        unsafe {
+            run.backend_mut()
+                .map_memory(ENTRY, host_addr, ram.len() as u64)
+        }
+        .expect("map guest memory");
+        run.create_vcpu(0).expect("create vcpu");
+        run.apply_cpuid_stealth().expect("clear hypervisor bit");
+        run.backend_mut()
+            .prepare_protected_mode_vcpu(0, ENTRY)
+            .expect("set protected-mode entry");
+
+        // No manual advance_clocks: the driver advances the clocks per entry, so
+        // by the time the guest HLTs the one-bus-clock count has already expired
+        // and self-injected the LVT vector into LAPIC 0's IRR. IF stays 0 (the
+        // guest never STIs), so the vector persists in the IRR rather than being
+        // delivered — observable at the end of the managed run.
+        let outcome = run.run_real_mode(0, ENTRY, 100).expect("run real mode");
+        assert_eq!(outcome, LoopOutcome::Halted, "guest halts after arming");
+        assert_eq!(
+            ioapic.with(|c| c.pending_vector(0)),
+            Some(0x40),
+            "run_real_mode's clock cadence must expire and fire the LAPIC timer"
+        );
+    }
+
+    // run_real_mode itself fires a guest-armed LAPIC TSC-deadline timer: a guest
+    // that puts its LVT timer in TSC-deadline mode and WRMSRs an absolute
+    // deadline already in the past sees the timer fire *during the managed run*,
+    // with no manual fire_due_tsc_deadlines call. This is the 3.9 wiring — the
+    // production driver now checks the guest TSC per entry.
+    #[test]
+    fn run_real_mode_fires_an_armed_tsc_deadline_timer() {
+        if !is_kvm_available() {
+            eprintln!("skipping run_real_mode_fires_an_armed_tsc_deadline_timer: no /dev/kvm");
+            return;
+        }
+
+        //   SVR(0x0F0)=0x1FF software-enable; LVT timer(0x320)=0x40040
+        //   (TSC-deadline mode bits[18:17]=0b10, vector 0x40, unmasked);
+        //   wrmsr IA32_TSC_DEADLINE(0x6E0)=1 (absolute TSC, already past); hlt.
+        #[rustfmt::skip]
+        let code: [u8; 35] = [
+            0xB8, 0xFF, 0x01, 0x00, 0x00, // mov eax, 0x1FF
+            0xA3, 0xF0, 0x00, 0xE0, 0xFE, // mov [0xFEE000F0], eax  (SVR)
+            0xB8, 0x40, 0x00, 0x04, 0x00, // mov eax, 0x00040040
+            0xA3, 0x20, 0x03, 0xE0, 0xFE, // mov [0xFEE00320], eax  (LVT timer, TSC-deadline)
+            0xB9, 0xE0, 0x06, 0x00, 0x00, // mov ecx, 0x6E0        (IA32_TSC_DEADLINE)
+            0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+            0x31, 0xD2,                   // xor edx, edx
+            0x0F, 0x30,                   // wrmsr
+            0xF4,                         // hlt
+        ];
+        const ENTRY: u64 = 0x1000;
+
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            0,
+            1,
+        )
+        .expect("build standard pc");
+        let ioapic = pc.ioapic.clone();
+
+        let backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        let mut run = match StealthRunLoop::install(backend, pc, LbrPlatform::AmdSvm) {
+            Ok(run) => run,
+            Err(e) => {
+                eprintln!("skipping run_real_mode_fires_an_armed_tsc_deadline_timer: {e}");
+                return;
+            }
+        };
+
+        let mut ram = GuestRam::new(0x1000);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+        // SAFETY: `ram` outlives `run` within this test scope.
+        unsafe {
+            run.backend_mut()
+                .map_memory(ENTRY, host_addr, ram.len() as u64)
+        }
+        .expect("map guest memory");
+        run.create_vcpu(0).expect("create vcpu");
+        run.apply_cpuid_stealth().expect("clear hypervisor bit");
+        run.backend_mut()
+            .prepare_protected_mode_vcpu(0, ENTRY)
+            .expect("set protected-mode entry");
+
+        // No manual fire_due_tsc_deadlines: the driver checks the guest TSC per
+        // entry, so the deadline (armed at 1, already past) has fired by the time
+        // the guest HLTs. IF stays 0, so the LVT vector persists in LAPIC 0's IRR.
+        let outcome = run.run_real_mode(0, ENTRY, 100).expect("run real mode");
+        assert_eq!(outcome, LoopOutcome::Halted, "guest halts after arming");
+        assert_eq!(
+            ioapic.with(|c| c.pending_vector(0)),
+            Some(0x40),
+            "run_real_mode must fire the armed TSC-deadline timer"
         );
     }
 }

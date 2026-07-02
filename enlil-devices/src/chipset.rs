@@ -683,7 +683,11 @@ mod tests {
         let cnt = pm1.pio_read(PM1_CNT_PORT, 2);
         assert_eq!(cnt, 0x1C03, "only SCI_EN | BM_RLD | SLP_TYP persist");
         // SLP_TYP = 0b111 committed a sleep request (SLP_EN was in the write).
-        assert_eq!(pm1.take_sleep(), Some(0x7), "all-ones set SLP_EN + SLP_TYP=7");
+        assert_eq!(
+            pm1.take_sleep(),
+            Some(0x7),
+            "all-ones set SLP_EN + SLP_TYP=7"
+        );
     }
 
     #[test]

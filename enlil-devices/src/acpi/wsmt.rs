@@ -38,8 +38,9 @@ pub const WSMT_SYSTEM_RESOURCE_PROTECTION: u32 = 1 << 2;
 /// The full protection-flag set a hardened modern firmware reports — all three
 /// mitigations asserted, which is what a shipping AMI board on the impersonated
 /// hardware presents.
-pub const WSMT_ALL_MITIGATIONS: u32 =
-    WSMT_FIXED_COMM_BUFFERS | WSMT_COMM_BUFFER_NESTED_PTR_PROTECTION | WSMT_SYSTEM_RESOURCE_PROTECTION;
+pub const WSMT_ALL_MITIGATIONS: u32 = WSMT_FIXED_COMM_BUFFERS
+    | WSMT_COMM_BUFFER_NESTED_PTR_PROTECTION
+    | WSMT_SYSTEM_RESOURCE_PROTECTION;
 
 /// WSMT table builder.
 pub struct WsmtBuilder {

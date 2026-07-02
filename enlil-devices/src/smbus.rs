@@ -378,6 +378,10 @@ mod tests {
         let mut smb = SmbusHost::new();
         // A guest writes all-ones; only AAC [0] and E32B [1] are writable.
         write(&mut smb, AUX_CTL, 0xFF);
-        assert_eq!(read(&mut smb, AUX_CTL), 0x03, "AUX_CTL reserved bits read 0");
+        assert_eq!(
+            read(&mut smb, AUX_CTL),
+            0x03,
+            "AUX_CTL reserved bits read 0"
+        );
     }
 }

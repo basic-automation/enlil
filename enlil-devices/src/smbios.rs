@@ -911,14 +911,26 @@ mod tests {
 
         assert_eq!(data[s + 1], 0x1F, "Type 19 length must be 31 (SMBIOS 2.7)");
         // Starting/Ending Address DWORDs are 0xFFFF_FFFF => extended fields used.
-        assert_eq!(u32::from_le_bytes(data[s + 4..s + 8].try_into().unwrap()), 0xFFFF_FFFF);
-        assert_eq!(u32::from_le_bytes(data[s + 8..s + 12].try_into().unwrap()), 0xFFFF_FFFF);
+        assert_eq!(
+            u32::from_le_bytes(data[s + 4..s + 8].try_into().unwrap()),
+            0xFFFF_FFFF
+        );
+        assert_eq!(
+            u32::from_le_bytes(data[s + 8..s + 12].try_into().unwrap()),
+            0xFFFF_FFFF
+        );
         // Physical Memory Array Handle must reference the Type 16 array (16).
-        assert_eq!(u16::from_le_bytes(data[s + 12..s + 14].try_into().unwrap()), 16);
+        assert_eq!(
+            u16::from_le_bytes(data[s + 12..s + 14].try_into().unwrap()),
+            16
+        );
         // Partition Width = number of memory devices.
         assert_eq!(data[s + 14], 2);
         // Extended range covers 0 .. total_ram - 1.
-        assert_eq!(u64::from_le_bytes(data[s + 15..s + 23].try_into().unwrap()), 0);
+        assert_eq!(
+            u64::from_le_bytes(data[s + 15..s + 23].try_into().unwrap()),
+            0
+        );
         assert_eq!(
             u64::from_le_bytes(data[s + 23..s + 31].try_into().unwrap()),
             total_bytes - 1
@@ -993,7 +1005,11 @@ mod tests {
         assert_ne!(chars & (1 << 11), 0, "BIOS is upgradeable / Flash (bit 11)");
         // Not modeled, must stay clear:
         assert_eq!(chars & (1 << 8), 0, "PC Card (PCMCIA) is not modeled");
-        assert_eq!(chars & (1 << 3), 0, "'characteristics not supported' must be clear");
+        assert_eq!(
+            chars & (1 << 3),
+            0,
+            "'characteristics not supported' must be clear"
+        );
     }
 
     #[test]

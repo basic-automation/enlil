@@ -125,8 +125,12 @@
   - [ ] guest bridge-agent packaging/installers (.deb/.rpm/.msi) (3.7.7)
 - [x] 3.8 Production platform-clock cadence — advance_platform_clocks drives advance_clocks from guest ref-cycles in the run loop
 - [x] 3.9 LAPIC TSC-deadline timer mode (IA32_TSC_DEADLINE install + fire_due_tsc_deadlines against guest TSC)
-- [ ] 3.10 qcow2 refcount-TABLE growth in storage/qcow.rs (still bails "growth not yet implemented")
+- [ ] 3.10 qcow2 refcount-TABLE growth in storage/qcow.rs (sizing primitive refcount_table_clusters_for landed; on-disk grow still bails)
 - [x] 3.11 Cap the 16550 UART RX FIFO (RX_FIFO_CAPACITY bound + overrun flag)
+- [ ] 3.12 Wire StealthRunLoop::run_real_mode into a top-level guest-boot/orchestrator binary (no binary caller yet)
+- [x] 3.13 Skip the per-entry guest-TSC read when no LAPIC deadline is armed (any_lapic_tsc_deadline_armed gate)
+- [x] 3.14 RTC/CMOS wall-clock cadence in run_real_mode (advance_rtc_seconds, capped) so the calendar does not freeze
+- [ ] 3.15 Drive the RTC periodic interrupt (tick_periodic at periodic_rate_hz) from the run loop (no caller yet)
 
 ## Phase 4 — USB Peripheral Routing
 - [x] 4.1 Assemble the USB subsystem stack (host monitor to routing engine to per-guest virtual xHCI) as a cohesive module

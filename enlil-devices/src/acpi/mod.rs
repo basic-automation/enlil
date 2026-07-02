@@ -239,7 +239,11 @@ fn build_xsdt(oem: &OemInfo, base: u64, entry_targets: &[usize], facs_offset: us
 /// Build the FPDT and its FBPT target blob. The FPDT's pointer record targets
 /// the FBPT's guest-physical address (`base + fbpt_offset`), relocated by the
 /// firmware table-loader like FADT→FACS. Returns `(fpdt_table, fbpt_blob)`.
-fn build_fpdt_and_fbpt(config: &AcpiTableSetConfig, base: u64, fbpt_offset: usize) -> (Vec<u8>, Vec<u8>) {
+fn build_fpdt_and_fbpt(
+    config: &AcpiTableSetConfig,
+    base: u64,
+    fbpt_offset: usize,
+) -> (Vec<u8>, Vec<u8>) {
     let fpdt_table = fpdt::FpdtBuilder::new()
         .oem_info(config.oem.clone())
         .fbpt_address(base + fbpt_offset as u64)
