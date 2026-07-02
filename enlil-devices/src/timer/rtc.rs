@@ -163,6 +163,10 @@ pub struct Rtc146818 {
     time: RtcTime,
     /// Optional sink pulsed when the RTC asserts IRQ8.
     irq: Option<Box<dyn IrqLine>>,
+    /// Elapsed guest-perceived nanoseconds not yet converted to a whole periodic
+    /// tick, carried across [`advance_periodic`](Self::advance_periodic) calls so
+    /// the periodic-interrupt phase does not drift.
+    periodic_accum_ns: u64,
 }
 
 impl Rtc146818 {
@@ -181,6 +185,7 @@ impl Rtc146818 {
             nmi_disabled: false,
             time,
             irq: None,
+            periodic_accum_ns: 0,
         }
     }
 
@@ -378,6 +383,50 @@ impl Rtc146818 {
             irq.set_level(true);
         }
         asserted
+    }
+
+    /// Drive the periodic interrupt from `ns` of elapsed **guest-perceived**
+    /// time, latching one periodic tick ([`tick_periodic`](Self::tick_periodic))
+    /// once enough time has accumulated for the selected rate.
+    ///
+    /// The periodic interrupt fires at the Register-A rate-select frequency
+    /// ([`periodic_rate_hz`](Self::periodic_rate_hz)). This accumulates elapsed
+    /// nanoseconds and, when at least one whole `1/rate` period has passed,
+    /// latches a periodic tick, carrying the sub-tick remainder so the phase does
+    /// not drift across calls. It is driven by the same guest-perceived
+    /// nanosecond base as the PIT/HPET/LAPIC timers — **not** wall-clock like the
+    /// calendar in [`tick_second`](Self::tick_second) — so all of a guest's timer
+    /// sources stay in lockstep with its TSC.
+    ///
+    /// At most one tick is latched per call regardless of how many periods
+    /// elapsed: the periodic flag (PF) coalesces on real hardware — a guest that
+    /// was not executing (in a VMEXIT) across several periods can observe only a
+    /// single pending periodic interrupt when it resumes and reads Register C —
+    /// so firing once is the faithful behaviour, while the accumulator still
+    /// tracks the true elapsed phase. A no-op returning `false` when the periodic
+    /// timer is disabled (RS = 0), where any accumulated remainder is dropped so a
+    /// later re-enable starts from a clean phase. Returns whether the interrupt
+    /// line was asserted.
+    pub fn advance_periodic(&mut self, ns: u64) -> bool {
+        const NANOS_PER_SEC: u128 = 1_000_000_000;
+        let Some(rate) = self.periodic_rate_hz() else {
+            self.periodic_accum_ns = 0;
+            return false; // RS = 0: periodic timer off
+        };
+        self.periodic_accum_ns = self.periodic_accum_ns.saturating_add(ns);
+        let rate = u128::from(rate);
+        // Whole periodic ticks now due: floor(accum_ns * rate / 1e9).
+        let due = u128::from(self.periodic_accum_ns) * rate / NANOS_PER_SEC;
+        if due == 0 {
+            return false;
+        }
+        // Consume exactly the nanoseconds those whole ticks represent, keeping the
+        // sub-tick remainder so the periodic phase does not drift. `consumed` is
+        // `floor(due * 1e9 / rate) <= accum_ns` by construction, so it always fits
+        // in u64 and never underflows the accumulator.
+        let consumed = u64::try_from(due * NANOS_PER_SEC / rate).unwrap_or(u64::MAX);
+        self.periodic_accum_ns = self.periodic_accum_ns.saturating_sub(consumed);
+        self.tick_periodic()
     }
 
     /// Whether the current time matches the alarm shadow registers. A "don't
@@ -743,5 +792,79 @@ mod tests {
         assert!(!rtc.tick_periodic(), "no periodic tick when RS=0");
         rtc.write_index(REG_C);
         assert_eq!(rtc.read_data() & REG_C_PF, 0, "no PF latched when RS=0");
+    }
+
+    #[test]
+    fn advance_periodic_latches_a_tick_once_a_full_period_accrues() {
+        let mut rtc = Rtc146818::new(sample()); // RS=6 → 1024 Hz (~976562.5 ns/period), PIE off
+        // Under one period: nothing latches yet.
+        assert!(!rtc.advance_periodic(500_000));
+        rtc.write_index(REG_C);
+        assert_eq!(rtc.read_data() & REG_C_PF, 0, "no PF before a full period");
+        // Crossing a full period latches PF; PIE off so no interrupt (returns false).
+        assert!(!rtc.advance_periodic(500_000));
+        rtc.write_index(REG_C);
+        assert_ne!(
+            rtc.read_data() & REG_C_PF,
+            0,
+            "PF latched after a full period"
+        );
+    }
+
+    #[test]
+    fn advance_periodic_asserts_irq8_with_pie_and_coalesces() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let log = Arc::clone(&log);
+            move |level: bool| log.lock().unwrap().push(level)
+        };
+        let mut rtc = Rtc146818::new(sample()); // RS=6 (1024 Hz)
+        rtc.attach_irq(Box::new(sink));
+        rtc.write_index(REG_B);
+        rtc.write_data(REG_B_DM | REG_B_24H | REG_B_PIE);
+
+        // One advance spanning ~1024 periods coalesces to a single interrupt, as
+        // a guest that was not executing across them can observe only one.
+        assert!(rtc.advance_periodic(1_000_000_000));
+        rtc.write_index(REG_C);
+        let c = rtc.read_data();
+        assert_ne!(c & REG_C_PF, 0);
+        assert_ne!(c & REG_C_IRQF, 0);
+        assert_eq!(
+            &*log.lock().unwrap(),
+            &[true, false],
+            "coalesced to a single interrupt"
+        );
+    }
+
+    #[test]
+    fn advance_periodic_carries_the_sub_tick_remainder() {
+        let mut rtc = Rtc146818::new(sample()); // 1024 Hz
+        // Two calls that each fall just short of a period sum to just over one,
+        // so the carried remainder — not a dropped fraction — crosses the period.
+        assert!(!rtc.advance_periodic(976_562)); // < one 1024 Hz period
+        rtc.write_index(REG_C);
+        assert_eq!(rtc.read_data() & REG_C_PF, 0, "still short of a period");
+        assert!(!rtc.advance_periodic(1)); // now ≥ one period (PIE off → false)
+        rtc.write_index(REG_C);
+        assert_ne!(
+            rtc.read_data() & REG_C_PF,
+            0,
+            "carried remainder crosses a period"
+        );
+    }
+
+    #[test]
+    fn advance_periodic_is_a_noop_and_drops_remainder_when_disabled() {
+        let mut rtc = Rtc146818::new(sample());
+        rtc.write_index(REG_A);
+        rtc.write_data(0x20); // RS = 0: periodic off
+        assert!(!rtc.advance_periodic(5_000_000_000));
+        rtc.write_index(REG_C);
+        assert_eq!(
+            rtc.read_data() & REG_C_PF,
+            0,
+            "nothing latches while disabled"
+        );
     }
 }

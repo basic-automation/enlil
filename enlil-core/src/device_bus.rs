@@ -1445,6 +1445,15 @@ impl StandardPc {
             });
         }
 
+        // RTC periodic interrupt: latch a periodic tick from the same
+        // guest-perceived ns base as the timers above, so a guest driving its
+        // clock event from the MC146818 periodic source (Register-A rate select +
+        // Register-B PIE) stays in lockstep with its PIT/HPET/LAPIC timers and its
+        // TSC. IRQ8 is asserted only when the guest has enabled PIE; the flag (PF)
+        // otherwise just latches, exactly like real hardware. The RTC *calendar*
+        // is separate and wall-clock driven ([`advance_rtc_seconds`]).
+        self.rtc.with(|r| r.advance_periodic(ns));
+
         fired
     }
 
@@ -2463,6 +2472,46 @@ mod tests {
             (s, m)
         });
         assert_eq!((minutes, seconds), (1, 30), "calendar advanced by 1m30s");
+    }
+
+    // advance_clocks drives the RTC *periodic* interrupt (3.15) from the same
+    // guest-perceived ns base as the PIT/HPET/LAPIC timers, so a guest using the
+    // MC146818 periodic source as its clock event gets IRQ8 in lockstep. Enable
+    // Register-B PIE (Register A keeps its 0x26 power-on default → RS=6 = 1024 Hz)
+    // and confirm a period's worth of advance_clocks latches PF + IRQF.
+    #[test]
+    fn advance_clocks_drives_the_rtc_periodic_interrupt() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        // Register C flag bits (MC146818): IRQF = 0x80, PF = 0x40.
+        const REG_C: u8 = 0x0C;
+        const REG_C_PF: u8 = 0x40;
+        const REG_C_IRQF: u8 = 0x80;
+
+        let pc =
+            DeviceBus::standard_pc_complete(SerialOutput::new("g", SerialOutputMode::Null), 0, 1)
+                .expect("build standard pc");
+        // Enable the periodic interrupt (PIE | DM | 24H) on Register B.
+        pc.rtc.with(|r| {
+            r.write_index(0x0B);
+            r.write_data(0x40 | 0x04 | 0x02);
+        });
+
+        // Under one 1024 Hz period (~976 µs): nothing latches.
+        let _ = pc.advance_clocks(500_000);
+        let c0 = pc.rtc.with(|r| {
+            r.write_index(REG_C);
+            r.read_data()
+        });
+        assert_eq!(c0 & REG_C_PF, 0, "no periodic flag before a full period");
+
+        // Crossing a full period latches PF and, with PIE enabled, IRQF.
+        let _ = pc.advance_clocks(1_000_000);
+        let c1 = pc.rtc.with(|r| {
+            r.write_index(REG_C);
+            r.read_data()
+        });
+        assert_ne!(c1 & REG_C_PF, 0, "advance_clocks latched the periodic flag");
+        assert_ne!(c1 & REG_C_IRQF, 0, "IRQF set with PIE enabled");
     }
 
     #[test]

@@ -124,13 +124,37 @@ pub struct VirtualTpm {
     /// NV index storage — persistent blobs a guest seals/reads back
     /// (`BitLocker` metadata, Windows Hello, EK certificate indices, …)
     nv_storage: HashMap<u32, Vec<u8>>,
-    /// `GetRandom` PRNG state (xorshift64*); seeded deterministically at creation.
+    /// `GetRandom` PRNG state (xorshift64*); seeded per guest at creation.
     rng_state: u64,
+    /// Endorsement Primary Seed (TCG TPM 2.0 Part 1 §14.4) — the per-guest root
+    /// from which the Endorsement Key is deterministically derived. Distinct per
+    /// guest (so no two guests share an EK identity) yet stable for a given seed
+    /// and persisted, so a guest's EK survives reboots.
+    endorsement_primary_seed: [u8; 32],
 }
 
 impl VirtualTpm {
+    /// Fallback per-guest seed used by [`new`](Self::new) — a nonzero constant so
+    /// callers that do not distinguish guests still get a valid TPM.
+    const DEFAULT_GUEST_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
+    /// A new TPM with the [default guest seed](Self::DEFAULT_GUEST_SEED). Prefer
+    /// [`seeded`](Self::seeded) for a real guest so its RNG stream and
+    /// endorsement identity are independent of every other guest's.
     #[must_use]
     pub fn new(interface: TpmInterface) -> Self {
+        Self::seeded(interface, Self::DEFAULT_GUEST_SEED)
+    }
+
+    /// A new TPM whose `GetRandom` PRNG and Endorsement Primary Seed are derived
+    /// from a per-guest `guest_seed`, so two guests never share random output or
+    /// endorsement identity (each guest's Endorsement Key derives from its own
+    /// seed). The derivation is deterministic, so the same `guest_seed` always
+    /// yields the same endorsement identity — the EK must be stable for a guest
+    /// across reboots.
+    #[must_use]
+    pub fn seeded(interface: TpmInterface, guest_seed: u64) -> Self {
+        let (rng_state, endorsement_primary_seed) = Self::derive_identity(guest_seed);
         Self {
             interface,
             pcr_sha256: [[0u8; SHA256_DIGEST_SIZE]; PCR_COUNT],
@@ -146,7 +170,157 @@ impl VirtualTpm {
             rsp_buffer: vec![0u8; 4096],
             state_path: None,
             nv_storage: HashMap::new(),
-            rng_state: 0x9E37_79B9_7F4A_7C15, // nonzero seed (xorshift requires it)
+            rng_state,
+            endorsement_primary_seed,
+        }
+    }
+
+    /// Derive the per-guest `(rng_state, endorsement_primary_seed)` from a guest
+    /// seed via two domain-separated SHA-256 KDFs, so the RNG stream and the
+    /// endorsement identity are independent of each other and unique per guest.
+    fn derive_identity(guest_seed: u64) -> (u64, [u8; 32]) {
+        let mut rng_input = b"enlil-tpm-rng".to_vec();
+        rng_input.extend_from_slice(&guest_seed.to_le_bytes());
+        let rng_digest = crate::crypto::sha256(&rng_input);
+        let mut rng_state = u64::from_le_bytes(rng_digest[0..8].try_into().unwrap_or([0; 8]));
+        if rng_state == 0 {
+            rng_state = Self::DEFAULT_GUEST_SEED; // xorshift64* requires a nonzero seed
+        }
+
+        let mut eps_input = b"enlil-tpm-eps".to_vec();
+        eps_input.extend_from_slice(&guest_seed.to_le_bytes());
+        let endorsement_primary_seed = crate::crypto::sha256(&eps_input);
+        (rng_state, endorsement_primary_seed)
+    }
+
+    /// The guest's Endorsement Primary Seed — the stable, per-guest root from
+    /// which its Endorsement Key derives (see [`seeded`](Self::seeded)).
+    #[must_use]
+    pub const fn endorsement_primary_seed(&self) -> [u8; 32] {
+        self.endorsement_primary_seed
+    }
+
+    /// A new TPM bound to an on-disk persistent state file, loading any existing
+    /// state from it (so a guest's sealed NV blobs — `BitLocker` recovery
+    /// metadata, Windows Hello keys, EK-cert indices — survive a guest reboot or
+    /// a hypervisor restart).
+    ///
+    /// If the file does not yet exist the TPM starts empty and the file is
+    /// created on the first persisting operation; a malformed file is ignored
+    /// (the TPM starts empty) rather than failing construction. See
+    /// [`load_state`](Self::load_state) / [`save_state`](Self::save_state).
+    #[must_use]
+    pub fn with_state_path(interface: TpmInterface, path: impl Into<String>) -> Self {
+        let mut tpm = Self::new(interface);
+        tpm.state_path = Some(path.into());
+        let _ = tpm.load_state();
+        tpm
+    }
+
+    /// Persistent-state format magic + version (`ETP` + format byte `1`).
+    const STATE_MAGIC: [u8; 4] = *b"ETP1";
+
+    /// Serialize the durable TPM state — the NV index storage, the endorsement
+    /// primary seed, and the `GetRandom` PRNG state — into a versioned byte blob.
+    ///
+    /// PCR banks are deliberately **excluded**: PCRs are volatile on real
+    /// hardware, reset to zero on a TPM reset / platform reboot and re-extended
+    /// by the boot sequence, so persisting them across a power cycle would break
+    /// the measured-boot / sealing security model (a guest's `BitLocker` seal is
+    /// bound to PCR *policy* re-satisfied at boot, and lives in NV). Persisting
+    /// the RNG state keeps `GetRandom` from repeating its stream after a reboot;
+    /// persisting the endorsement primary seed keeps the guest's EK identity
+    /// stable across reboots.
+    ///
+    /// Layout: magic (4) · `rng_state` (8, LE) · `endorsement_primary_seed` (32) ·
+    /// `nv_count` (4, LE) · then per entry `nv_index` (4, LE) · len (4, LE) ·
+    /// bytes.
+    #[must_use]
+    fn serialize_state(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&Self::STATE_MAGIC);
+        out.extend_from_slice(&self.rng_state.to_le_bytes());
+        out.extend_from_slice(&self.endorsement_primary_seed);
+        out.extend_from_slice(&u32_of(self.nv_storage.len()).to_le_bytes());
+        // Sort by index so the on-disk blob is deterministic across runs.
+        let mut entries: Vec<(&u32, &Vec<u8>)> = self.nv_storage.iter().collect();
+        entries.sort_by_key(|(idx, _)| **idx);
+        for (idx, data) in entries {
+            out.extend_from_slice(&idx.to_le_bytes());
+            out.extend_from_slice(&u32_of(data.len()).to_le_bytes());
+            out.extend_from_slice(data);
+        }
+        out
+    }
+
+    /// Replace the NV storage, RNG state, and endorsement primary seed from a
+    /// blob produced by [`serialize_state`](Self::serialize_state). Returns
+    /// `false` (leaving self unchanged) if the blob's magic, header, or an entry
+    /// length is malformed — a corrupt state file must not panic or partially
+    /// apply.
+    fn apply_state(&mut self, bytes: &[u8]) -> bool {
+        // magic(4) + rng(8) + eps(32) + count(4) = 48
+        const HEADER_LEN: usize = 48;
+        if bytes.len() < HEADER_LEN || bytes[0..4] != Self::STATE_MAGIC {
+            return false;
+        }
+        let rng = u64::from_le_bytes(bytes[4..12].try_into().unwrap_or([0; 8]));
+        if rng == 0 {
+            return false; // xorshift requires a nonzero seed
+        }
+        let mut eps = [0u8; 32];
+        eps.copy_from_slice(&bytes[12..44]);
+        let count = u32::from_le_bytes(bytes[44..48].try_into().unwrap_or([0; 4]));
+        let mut pos = HEADER_LEN;
+        let mut nv = HashMap::new();
+        for _ in 0..count {
+            if pos + 8 > bytes.len() {
+                return false;
+            }
+            let idx = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap_or([0; 4]));
+            let len = usize_of(u32::from_le_bytes(
+                bytes[pos + 4..pos + 8].try_into().unwrap_or([0; 4]),
+            ));
+            pos += 8;
+            if pos + len > bytes.len() {
+                return false;
+            }
+            nv.insert(idx, bytes[pos..pos + len].to_vec());
+            pos += len;
+        }
+        self.nv_storage = nv;
+        self.rng_state = rng;
+        self.endorsement_primary_seed = eps;
+        true
+    }
+
+    /// Persist the durable TPM state to [`state_path`](Self::state_path), if one
+    /// is configured. A no-op returning `Ok(())` when no path is set.
+    ///
+    /// # Errors
+    /// Propagates any [`std::io::Error`] from writing the file.
+    pub fn save_state(&self) -> std::io::Result<()> {
+        let Some(path) = &self.state_path else {
+            return Ok(());
+        };
+        std::fs::write(path, self.serialize_state())
+    }
+
+    /// Load durable TPM state from [`state_path`](Self::state_path) if the file
+    /// exists and is well-formed. Returns `Ok(true)` when state was applied,
+    /// `Ok(false)` when no path is set, the file is absent, or its contents are
+    /// malformed (the TPM is left in its current — typically empty — state).
+    ///
+    /// # Errors
+    /// Propagates a [`std::io::Error`] other than "not found" from reading.
+    pub fn load_state(&mut self) -> std::io::Result<bool> {
+        let Some(path) = self.state_path.clone() else {
+            return Ok(false);
+        };
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(self.apply_state(&bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
         }
     }
 
@@ -374,6 +548,10 @@ impl VirtualTpm {
         let nv_index = u32::from_be_bytes(self.cmd_buffer[10..14].try_into().unwrap_or([0; 4]));
         let data = self.cmd_buffer[14..size].to_vec();
         self.nv_storage.insert(nv_index, data);
+        // Persist NV storage on change so a guest's sealed blobs survive a reboot
+        // (best-effort: a persistence path is optional, and an I/O failure must
+        // not fail the guest's NV_Write). No-op when no state_path is configured.
+        let _ = self.save_state();
         self.write_success_response();
     }
 
@@ -563,6 +741,16 @@ impl SharedTpm {
         Self(std::sync::Arc::new(std::sync::Mutex::new(VirtualTpm::new(
             interface,
         ))))
+    }
+
+    /// Wrap a fresh per-guest TPM seeded from `guest_seed`, so its `GetRandom`
+    /// stream and endorsement identity are independent of every other guest's
+    /// (see [`VirtualTpm::seeded`]).
+    #[must_use]
+    pub fn seeded(interface: TpmInterface, guest_seed: u64) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(
+            VirtualTpm::seeded(interface, guest_seed),
+        )))
     }
 
     /// Run `f` with exclusive access to the TPM — to drive a command, read a
@@ -840,6 +1028,158 @@ mod tests {
             0x0000_018B,
             "undefined NV index is TPM_RC_HANDLE, not permissive success"
         );
+    }
+
+    #[test]
+    fn nv_storage_persists_across_a_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tpm-state.bin");
+        let path_str = path.to_str().expect("utf-8 path").to_string();
+
+        // First TPM: seal a BitLocker-style blob under an NV index. NV_Write
+        // persists to the state file.
+        {
+            let mut tpm = VirtualTpm::with_state_path(TpmInterface::Crb, path_str.clone());
+            tpm.started = true;
+            let mut payload = 0x0100_0001u32.to_be_bytes().to_vec();
+            payload.extend_from_slice(b"sealed-blob");
+            let rsp = tpm.execute_command(&tpm_cmd(0x0000_0137, &payload));
+            assert_eq!(&rsp[6..10], &[0, 0, 0, 0], "NV_Write must succeed");
+        }
+        assert!(path.exists(), "NV_Write persisted a state file");
+
+        // A fresh TPM bound to the same path reads the sealed blob back.
+        let mut tpm2 = VirtualTpm::with_state_path(TpmInterface::Crb, path_str);
+        tpm2.started = true;
+        let rsp = tpm2.execute_command(&tpm_cmd(0x0000_014E, &0x0100_0001u32.to_be_bytes()));
+        assert_eq!(
+            &rsp[6..10],
+            &[0, 0, 0, 0],
+            "NV_Read after reload must succeed"
+        );
+        let len = usize::from(u16::from_be_bytes([rsp[10], rsp[11]]));
+        assert_eq!(&rsp[12..12 + len], b"sealed-blob", "reloaded blob matches");
+    }
+
+    #[test]
+    fn load_state_ignores_a_malformed_file_and_starts_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("corrupt.bin");
+        std::fs::write(&path, b"not a valid tpm state blob").expect("write garbage");
+
+        // Construction must not panic; the malformed file is ignored (empty TPM).
+        let mut tpm =
+            VirtualTpm::with_state_path(TpmInterface::Crb, path.to_str().unwrap().to_string());
+        tpm.started = true;
+        let rsp = tpm.execute_command(&tpm_cmd(0x0000_014E, &0x0100_0001u32.to_be_bytes()));
+        assert_eq!(
+            u32::from_be_bytes(rsp[6..10].try_into().unwrap()),
+            0x0000_018B,
+            "a corrupt state file leaves the NV store empty"
+        );
+    }
+
+    #[test]
+    fn serialize_state_round_trips_nv_rng_and_eps() {
+        let mut a = VirtualTpm::new(TpmInterface::Crb);
+        a.nv_storage.insert(0x0100_0002, b"one".to_vec());
+        a.nv_storage.insert(0x0100_0003, vec![0u8; 64]);
+        a.rng_state = 0x1234_5678_9ABC_DEF1;
+        a.endorsement_primary_seed = [0xAB; 32];
+        let blob = a.serialize_state();
+
+        let mut b = VirtualTpm::new(TpmInterface::Crb);
+        assert!(b.apply_state(&blob), "well-formed blob applies");
+        assert_eq!(b.rng_state, 0x1234_5678_9ABC_DEF1);
+        assert_eq!(b.endorsement_primary_seed, [0xAB; 32]);
+        assert_eq!(
+            b.nv_storage.get(&0x0100_0002).map(Vec::as_slice),
+            Some(&b"one"[..])
+        );
+        assert_eq!(b.nv_storage.get(&0x0100_0003).map(Vec::len), Some(64));
+
+        // A truncated blob is rejected without partially applying.
+        let mut c = VirtualTpm::new(TpmInterface::Crb);
+        assert!(
+            !c.apply_state(&blob[..blob.len() - 5]),
+            "truncated blob rejected"
+        );
+        assert!(c.nv_storage.is_empty(), "rejected blob leaves NV untouched");
+    }
+
+    #[test]
+    fn seeded_gives_distinct_guests_distinct_rng_and_endorsement_seed() {
+        let a = VirtualTpm::seeded(TpmInterface::Crb, 1);
+        let b = VirtualTpm::seeded(TpmInterface::Crb, 2);
+        assert_ne!(
+            a.endorsement_primary_seed(),
+            b.endorsement_primary_seed(),
+            "two guests must not share an endorsement primary seed"
+        );
+        assert_ne!(
+            a.rng_state, b.rng_state,
+            "two guests must not share a GetRandom stream"
+        );
+
+        // Concretely: their GetRandom outputs differ.
+        let get16 = |mut t: VirtualTpm| {
+            t.started = true;
+            let cmd = [
+                0x80, 0x01, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x01, 0x7B, 0x00, 0x10,
+            ];
+            t.cmd_buffer[..cmd.len()].copy_from_slice(&cmd);
+            t.process_command();
+            t.rsp_buffer[14..30].to_vec()
+        };
+        assert_ne!(
+            get16(VirtualTpm::seeded(TpmInterface::Crb, 1)),
+            get16(VirtualTpm::seeded(TpmInterface::Crb, 2)),
+            "distinct-seed guests must produce distinct random bytes"
+        );
+    }
+
+    #[test]
+    fn same_seed_reproduces_the_same_endorsement_seed() {
+        // The EK must be stable for a guest across reboots, so a repeated seed
+        // reproduces the same endorsement primary seed.
+        let a = VirtualTpm::seeded(TpmInterface::Crb, 0xABCD_1234);
+        let b = VirtualTpm::seeded(TpmInterface::Crb, 0xABCD_1234);
+        assert_eq!(a.endorsement_primary_seed(), b.endorsement_primary_seed());
+        assert_ne!(
+            a.endorsement_primary_seed(),
+            [0u8; 32],
+            "endorsement seed must not be all-zero"
+        );
+    }
+
+    #[test]
+    fn endorsement_seed_persists_across_a_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tpm-eps.bin");
+        let path_str = path.to_str().unwrap().to_string();
+
+        let want = {
+            let mut tpm = VirtualTpm::seeded(TpmInterface::Crb, 0x5EED);
+            tpm.state_path = Some(path_str.clone());
+            tpm.save_state().expect("persist state");
+            tpm.endorsement_primary_seed()
+        };
+        // A TPM reloaded from the file recovers the same endorsement identity even
+        // though it is constructed with the default seed.
+        let reloaded = VirtualTpm::with_state_path(TpmInterface::Crb, path_str);
+        assert_eq!(
+            reloaded.endorsement_primary_seed(),
+            want,
+            "reloaded endorsement seed must match the persisted one"
+        );
+    }
+
+    #[test]
+    fn save_state_is_a_noop_without_a_path() {
+        let tpm = VirtualTpm::new(TpmInterface::Crb);
+        assert!(tpm.state_path.is_none());
+        tpm.save_state()
+            .expect("save with no path is Ok and writes nothing");
     }
 
     #[test]

@@ -129,8 +129,8 @@ later (this is the same pragmatic strategy Firecracker and Cloud Hypervisor used
 | KVM-backed VMM: single & multi-guest, CPU/memory partitioning | ✅ Implemented on Linux (`enlil-core`) |
 | Virtual device layer (VirtIO net/block, interrupts, timers, PS/2, HDA, storage) | ✅ Implemented (`enlil-devices`) |
 | Managed vCPU run loop: stealth stack + per-entry platform-timer cadence & LAPIC TSC-deadline firing | ✅ Implemented on Linux (`enlil-core`, `StealthRunLoop`) |
-| USB peripheral routing (virtual xHCI, TRB-level) | 🚧 Substantially implemented |
-| Windows transparency (ACPI/SMBIOS synthesis, CPUID/timing/LBR stealth, vTPM) | 🚧 Building blocks implemented |
+| USB peripheral routing (virtual xHCI, TRB-level; config-driven `[usb.routing]` rules) | 🚧 Substantially implemented |
+| Windows transparency (ACPI/SMBIOS synthesis, CPUID identity+topology/timing/LBR stealth, per-guest vTPM with persistent NV state & independent endorsement keys) | 🚧 Building blocks implemented |
 | Bare-metal UEFI boot (Phase 6) | ⏳ Stub (`enlil-boot`) — planned |
 | GPU sharing, compute fabric, ARM/RISC-V, multi-machine mesh | ⏳ Planned (Phases 7–11) |
 
@@ -210,7 +210,7 @@ pub trait HypervisorBackend: Send + Sync {
 | **`enlil-std`** | A `std`-shaped facade (`collections`, `future`, `io`, `sync`, `thread`, `time`) over `enlil-platform`, with integration tests — proves the platform layer can carry ordinary Rust on the custom target. |
 | **`enlil-hal`** | The architecture-neutral `HypervisorBackend` trait — the only place ISA-specific virtualization details are meant to appear. |
 | **`enlil-core`** | The hypervisor core: VM lifecycle, vCPU management, memory partitioning, EPT, CPUID/SMBIOS/ACPI handling, serial console, timing stealth, vTPM. Carries the RustVMM stack (`kvm-ioctls`, `vm-memory`, `vm-superio`, `linux-loader`, …) gated to Linux for the KVM-backed dev path. |
-| **`enlil-devices`** | The virtual device library: VirtIO net/block, full ACPI table synthesis, SMBIOS, interrupt controllers (LAPIC/IOAPIC/MSI), timers (PIT/HPET/TSC/paravirt), PS/2, HDA audio, qcow2/raw storage, a virtual **xHCI** USB stack with routing, an inter-guest **bridge** (clipboard, drag-and-drop, shared FS, notifications), a display compositor, and anti-detection **stealth** modules (CPUID, timing, LBR, PMC). |
+| **`enlil-devices`** | The virtual device library: VirtIO net/block, full ACPI table synthesis, SMBIOS, interrupt controllers (LAPIC/IOAPIC/MSI), timers (PIT/HPET/TSC/paravirt), PS/2, HDA audio, qcow2/raw storage, a virtual **xHCI** USB stack with routing, an inter-guest **bridge** (clipboard, drag-and-drop, shared FS, notifications, URL/protocol-handler routing), a display compositor, and anti-detection **stealth** modules (CPUID, timing, LBR, PMC). |
 | **`enlil-config`** | TOML guest definitions and validation (no overlapping CPU sets, memory, or device assignments). |
 | **`enlil-mgmt`** | The management console — `clap` CLI + `ratatui`/`crossterm` TUI for live control (list/start/stop/attach/status). |
 | **`enlil-setup`** | First-run setup wizard: detect hardware, define guests, assign resources, write `config.toml`. |
