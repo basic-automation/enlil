@@ -27,8 +27,8 @@ directions* of every hardware interaction (guest→hardware traps and hardware�
 interrupts) and can route them across a pool of nodes. That turns physical machines into
 stateless hardware providers and each guest into a logical machine defined only by a
 resource manifest and a routing table — hardware disaggregation *underneath unmodified
-operating systems*. See the [**Core Model**](ROADMAP.md#core-model--logical-machines-over-a-physical-pool)
-in the roadmap for the full picture.
+operating systems*. See the [**Core Model**](#core-model--logical-machines-over-a-physical-pool)
+below for the full picture.
 
 A defining usability constraint shapes the whole project: **Enlil must be testable without
 modifying your system.** It boots from a USB stick as a standard UEFI application
@@ -56,9 +56,63 @@ bare metal instantly.
 ```
 
 Each guest gets its own virtual UEFI (OVMF) and its own bootloader *inside* the VM — Enlil
-sits below everything and never replaces GRUB or the Windows Boot Manager. The full
-power-on-to-desktops boot flow is documented in the
-[roadmap](ROADMAP.md#architecture-overview).
+sits below everything and never replaces GRUB or the Windows Boot Manager.
+
+---
+
+## Core Model — Logical Machines over a Physical Pool
+
+The near-term product (transparent virtual PCs on one machine, described in [**What is Enlil?**](#what-is-enlil)) is one point on a much larger design. Enlil **mediates both directions of every hardware interaction** — the guest→hardware path (VM-exits, MMIO/PIO traps, hypercalls, VirtIO kicks) *and* the hardware→guest path (physical IRQs, DMA completions, input events, captured on the node that owns the device and injected as virtual interrupts on the node running the guest). Because both directions pass through Enlil, the mapping from a guest to the hardware it runs on is arbitrary and may cross machine and network boundaries.
+
+That turns classic virtualization inside out. Instead of *N guests on 1 host*, Enlil aims for **N guests on M hosts, fully composable**: each physical machine becomes a stateless hardware node (a resource provider), and each guest becomes a **logical machine** defined only by a resource manifest plus a routing table. It is hardware disaggregation *underneath unmodified operating systems* — the ambition behind CXL, RDMA device pools, and LegoOS, but working transparently beneath stock Windows and Linux rather than requiring a custom OS.
+
+Three physical laws bound what such a pool can actually do, and they shape the whole design.
+
+### Interconnect latency sets the granularity of sharing
+
+How tightly two nodes can share resources is governed by the latency of the link between them. Local DRAM is ~80 ns; a WAN round-trip is ~20–40 ms — roughly 100,000× slower — so a vCPU can never run against RAM that lives thousands of miles away.
+
+| Interconnect | Added latency | What can be pooled transparently |
+|---|---|---|
+| On-board PCIe / **CXL** | sub-µs (~200–400 ns) | almost anything, including memory as a NUMA tier and live devices |
+| **RDMA**, same datacenter | ~1–5 µs | storage, NIC, GPU-compute, cold-page memory — *not* a hot vCPU's RAM |
+| **WAN**, 1000s of miles | ~20–40 ms RTT | coarse/async only: remote storage, streamed I/O, whole-guest migration, replication |
+
+The rule that falls out: **a single kernel's tightly-coupled hot CPU+RAM working set stays on one node** (or one CXL-NUMA domain). Across distance you *move or replicate* a guest — you don't share its hot state. Everything else (devices, storage, GPU offload, spare capacity) is poolable with latency-aware placement. To make this practical, every virtual device is built as a front-end/back-end pair behind a pluggable transport (`local | CXL | RDMA | network`), so remoting a device is a transport swap rather than a rewrite.
+
+### ISA sets the boundary of a logical machine
+
+The latency law has a hardware-architecture twin: **a single kernel's execution cannot span an ISA boundary.** Page-table formats, the interrupt model, atomics, and the memory model are all ISA-fixed, and no machine description a stock OS accepts (ACPI or device tree) can express mixed-ISA SMP. So every logical machine carries a **placement key** — `(ISA, vendor, feature baseline)` — frozen at creation; its vCPUs run natively only on matching nodes, and that key defines its live-migration domain. Foreign-ISA nodes can still serve every *other* lane (device back-ends, memory tiers, fabric work units are ISA-blind).
+
+A guest may optionally run via binary translation, expressed as a per-guest **execution mode**:
+
+- **transparent** — vCPUs run natively on matching nodes; remote nodes contribute device back-ends only. This is the full-fidelity product.
+- **hybrid** — native vCPUs plus a translated compute *device* (an opt-in paravirtual accelerator); the native surface stays fully stealthed.
+- **mesh** — all vCPUs translated (JIT); location- and ISA-free, but a compatibility mode only, and explicitly detectable.
+
+Each guest manifest declares the floor it will accept (e.g. `require = transparent` … `allow = mesh`) and the pool's composition decides what is achievable — Windows-for-ARM on an all-x86 pool admits only in mesh mode, if at all. Modes are switchable at runtime without a guest reboot. Crucially, **translation is a compatibility tool, never a transparency one**: per-block overhead and timing artifacts defeat the anti-detection guarantees, so the translated layer is always presented to the guest as a *device*, never as extra CPUs.
+
+### Trust domains: your own pool vs. federating with others
+
+Latency and ISA decide *what* can be pooled and *where* it runs natively. A third, orthogonal axis — the **trust domain** — decides *how* compute must be protected once a pool spans more than one owner.
+
+- **An "Enlil device" = every node under one owner.** Your phone, desktop, and laptop join into a single pool that presents as one logical-machine device. Inside this boundary compute is **trusted** and shared in the clear — plaintext memory tiers, zero-copy fabric, native vCPU placement — exactly the Core Model above.
+- **Federating across owners = untrusted compute.** Two Enlil devices can share capacity (borrow a friend's idle GPU or cores), but across that boundary a node you don't own must never see plaintext or be trusted for integrity. That is the **blind-compute** regime: secret-shared / MPC / ZK-verified work units, backed by attestation that the peer runs genuine Enlil.
+
+Trust is orthogonal to latency — a node can be near-but-untrusted (a friend's LAN) or far-but-trusted (your own VPS) — so the placement key gains a trust dimension on top of `(latency class, ISA, vendor, feature baseline)`. Each logical machine declares which trust domains may serve it: a sensitive guest pins to `trust = owner-only`, while fungible, decomposable work may spill to `federated-blind` capacity. This is what extends *N guests on M hosts* to *M hosts owned by different people*.
+
+### Transparency and guest-OS feasibility
+
+Transparency is **per-guest-family**: Enlil presents whatever machine model each OS expects (PC/UEFI, ARM SoC, Apple platform) and defeats that family's specific VM-detection vectors, generalizing "transparent virtual PC" to a *transparent virtual machine, platform-shaped per guest*. How far that reaches today:
+
+| Guest | Feasibility |
+|---|---|
+| Linux, *BSD (x86) | ✅ near-term |
+| Windows (x86) | ✅ in scope, with VM-detection hardening |
+| Android (x86) | ✅ near-term |
+| Android (ARM) | ⏳ needs the ARM backend; Play Integrity is hardware-attested |
+| macOS | ⚠️ Apple hardware only — license + SMC/board-id, a major transparency lift |
+| iOS | ❌ research-only — Apple-signed boot chain + Secure Enclave, not transparently virtualizable on non-Apple hardware |
 
 ---
 
@@ -248,7 +302,7 @@ enlil/
 ├── rust-toolchain.toml         # Pinned nightly
 ├── x86_64-unknown-enlil.json   # Custom bare-metal target spec
 ├── README.md                   # This file
-├── ROADMAP.md                  # Development roadmap — all 11 phases as a checklist, milestones, risks, research refs
+├── ROADMAP.md                  # Development roadmap — a [ ]/[x] task checklist of all 11 phases
 ├── examples/                   # Sample guest configurations
 ├── enlil-platform/             # Platform abstraction (linux + baremetal backends)
 ├── enlil-std/                  # std-shaped facade over the platform layer
@@ -295,7 +349,7 @@ enlil/
 - **Rust safety.** `unsafe` is minimized and kept to small, audited blocks; it is concentrated in `enlil-platform` and `enlil-hal`, with some `unsafe` in `enlil-core`/`enlil-devices` for FFI and CPU instructions.
 
 The roadmap goes further with confidential-VM support (AMD SEV-SNP / Intel TDX) and optional
-ZK-proof attestation and cross-guest isolation proofs — see [`ROADMAP.md`](ROADMAP.md) (Phases 8.7 / 8.9 / 9.12 and the ZK references).
+ZK-proof attestation and cross-guest isolation proofs — see [`ROADMAP.md`](ROADMAP.md) (Phases 8.7 / 8.9 / 9.12).
 
 ---
 
@@ -304,7 +358,7 @@ ZK-proof attestation and cross-guest isolation proofs — see [`ROADMAP.md`](ROA
 | Document | What's in it |
 |----------|--------------|
 | **README.md** (this file) | Project overview — what Enlil is, its architecture, the crate layout, how to build, and where things stand today. |
-| [**ROADMAP.md**](ROADMAP.md) | The development roadmap — every phase from scaffold to multi-machine mesh, tracked as a checklist, with the detailed technical design, milestones, risks, and references behind each item. |
+| [**ROADMAP.md**](ROADMAP.md) | The development roadmap — a `[ ]`/`[x]` task checklist of every phase, from scaffold through to the multi-machine mesh. |
 
 ---
 
