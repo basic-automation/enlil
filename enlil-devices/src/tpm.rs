@@ -150,6 +150,121 @@ impl VirtualTpm {
         }
     }
 
+    /// A new TPM bound to an on-disk persistent state file, loading any existing
+    /// state from it (so a guest's sealed NV blobs — `BitLocker` recovery
+    /// metadata, Windows Hello keys, EK-cert indices — survive a guest reboot or
+    /// a hypervisor restart).
+    ///
+    /// If the file does not yet exist the TPM starts empty and the file is
+    /// created on the first persisting operation; a malformed file is ignored
+    /// (the TPM starts empty) rather than failing construction. See
+    /// [`load_state`](Self::load_state) / [`save_state`](Self::save_state).
+    #[must_use]
+    pub fn with_state_path(interface: TpmInterface, path: impl Into<String>) -> Self {
+        let mut tpm = Self::new(interface);
+        tpm.state_path = Some(path.into());
+        let _ = tpm.load_state();
+        tpm
+    }
+
+    /// Persistent-state format magic + version (`ETP` + format byte `1`).
+    const STATE_MAGIC: [u8; 4] = *b"ETP1";
+
+    /// Serialize the durable TPM state — the NV index storage and the `GetRandom`
+    /// PRNG state — into a versioned byte blob.
+    ///
+    /// PCR banks are deliberately **excluded**: PCRs are volatile on real
+    /// hardware, reset to zero on a TPM reset / platform reboot and re-extended
+    /// by the boot sequence, so persisting them across a power cycle would break
+    /// the measured-boot / sealing security model (a guest's `BitLocker` seal is
+    /// bound to PCR *policy* re-satisfied at boot, and lives in NV). Persisting
+    /// the RNG state keeps `GetRandom` from repeating its stream after a reboot.
+    ///
+    /// Layout: magic (4) · `rng_state` (8, LE) · `nv_count` (4, LE) · then per
+    /// entry `nv_index` (4, LE) · len (4, LE) · bytes.
+    #[must_use]
+    fn serialize_state(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&Self::STATE_MAGIC);
+        out.extend_from_slice(&self.rng_state.to_le_bytes());
+        out.extend_from_slice(&u32_of(self.nv_storage.len()).to_le_bytes());
+        // Sort by index so the on-disk blob is deterministic across runs.
+        let mut entries: Vec<(&u32, &Vec<u8>)> = self.nv_storage.iter().collect();
+        entries.sort_by_key(|(idx, _)| **idx);
+        for (idx, data) in entries {
+            out.extend_from_slice(&idx.to_le_bytes());
+            out.extend_from_slice(&u32_of(data.len()).to_le_bytes());
+            out.extend_from_slice(data);
+        }
+        out
+    }
+
+    /// Replace the NV storage and RNG state from a blob produced by
+    /// [`serialize_state`](Self::serialize_state). Returns `false` (leaving self
+    /// unchanged) if the blob's magic, header, or an entry length is malformed —
+    /// a corrupt state file must not panic or partially apply.
+    fn apply_state(&mut self, bytes: &[u8]) -> bool {
+        // magic(4) + rng(8) + count(4)
+        if bytes.len() < 16 || bytes[0..4] != Self::STATE_MAGIC {
+            return false;
+        }
+        let rng = u64::from_le_bytes(bytes[4..12].try_into().unwrap_or([0; 8]));
+        if rng == 0 {
+            return false; // xorshift requires a nonzero seed
+        }
+        let count = u32::from_le_bytes(bytes[12..16].try_into().unwrap_or([0; 4]));
+        let mut pos = 16usize;
+        let mut nv = HashMap::new();
+        for _ in 0..count {
+            if pos + 8 > bytes.len() {
+                return false;
+            }
+            let idx = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap_or([0; 4]));
+            let len = usize_of(u32::from_le_bytes(
+                bytes[pos + 4..pos + 8].try_into().unwrap_or([0; 4]),
+            ));
+            pos += 8;
+            if pos + len > bytes.len() {
+                return false;
+            }
+            nv.insert(idx, bytes[pos..pos + len].to_vec());
+            pos += len;
+        }
+        self.nv_storage = nv;
+        self.rng_state = rng;
+        true
+    }
+
+    /// Persist the durable TPM state to [`state_path`](Self::state_path), if one
+    /// is configured. A no-op returning `Ok(())` when no path is set.
+    ///
+    /// # Errors
+    /// Propagates any [`std::io::Error`] from writing the file.
+    pub fn save_state(&self) -> std::io::Result<()> {
+        let Some(path) = &self.state_path else {
+            return Ok(());
+        };
+        std::fs::write(path, self.serialize_state())
+    }
+
+    /// Load durable TPM state from [`state_path`](Self::state_path) if the file
+    /// exists and is well-formed. Returns `Ok(true)` when state was applied,
+    /// `Ok(false)` when no path is set, the file is absent, or its contents are
+    /// malformed (the TPM is left in its current — typically empty — state).
+    ///
+    /// # Errors
+    /// Propagates a [`std::io::Error`] other than "not found" from reading.
+    pub fn load_state(&mut self) -> std::io::Result<bool> {
+        let Some(path) = self.state_path.clone() else {
+            return Ok(false);
+        };
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(self.apply_state(&bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Dispatch a raw TPM2 command buffer against this TPM and return the
     /// response bytes. This is the byte-vec front the management plane uses;
     /// it shares all state (PCR bank, NV storage, RNG) with the CRB MMIO
@@ -374,6 +489,10 @@ impl VirtualTpm {
         let nv_index = u32::from_be_bytes(self.cmd_buffer[10..14].try_into().unwrap_or([0; 4]));
         let data = self.cmd_buffer[14..size].to_vec();
         self.nv_storage.insert(nv_index, data);
+        // Persist NV storage on change so a guest's sealed blobs survive a reboot
+        // (best-effort: a persistence path is optional, and an I/O failure must
+        // not fail the guest's NV_Write). No-op when no state_path is configured.
+        let _ = self.save_state();
         self.write_success_response();
     }
 
@@ -840,6 +959,89 @@ mod tests {
             0x0000_018B,
             "undefined NV index is TPM_RC_HANDLE, not permissive success"
         );
+    }
+
+    #[test]
+    fn nv_storage_persists_across_a_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tpm-state.bin");
+        let path_str = path.to_str().expect("utf-8 path").to_string();
+
+        // First TPM: seal a BitLocker-style blob under an NV index. NV_Write
+        // persists to the state file.
+        {
+            let mut tpm = VirtualTpm::with_state_path(TpmInterface::Crb, path_str.clone());
+            tpm.started = true;
+            let mut payload = 0x0100_0001u32.to_be_bytes().to_vec();
+            payload.extend_from_slice(b"sealed-blob");
+            let rsp = tpm.execute_command(&tpm_cmd(0x0000_0137, &payload));
+            assert_eq!(&rsp[6..10], &[0, 0, 0, 0], "NV_Write must succeed");
+        }
+        assert!(path.exists(), "NV_Write persisted a state file");
+
+        // A fresh TPM bound to the same path reads the sealed blob back.
+        let mut tpm2 = VirtualTpm::with_state_path(TpmInterface::Crb, path_str);
+        tpm2.started = true;
+        let rsp = tpm2.execute_command(&tpm_cmd(0x0000_014E, &0x0100_0001u32.to_be_bytes()));
+        assert_eq!(
+            &rsp[6..10],
+            &[0, 0, 0, 0],
+            "NV_Read after reload must succeed"
+        );
+        let len = usize::from(u16::from_be_bytes([rsp[10], rsp[11]]));
+        assert_eq!(&rsp[12..12 + len], b"sealed-blob", "reloaded blob matches");
+    }
+
+    #[test]
+    fn load_state_ignores_a_malformed_file_and_starts_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("corrupt.bin");
+        std::fs::write(&path, b"not a valid tpm state blob").expect("write garbage");
+
+        // Construction must not panic; the malformed file is ignored (empty TPM).
+        let mut tpm =
+            VirtualTpm::with_state_path(TpmInterface::Crb, path.to_str().unwrap().to_string());
+        tpm.started = true;
+        let rsp = tpm.execute_command(&tpm_cmd(0x0000_014E, &0x0100_0001u32.to_be_bytes()));
+        assert_eq!(
+            u32::from_be_bytes(rsp[6..10].try_into().unwrap()),
+            0x0000_018B,
+            "a corrupt state file leaves the NV store empty"
+        );
+    }
+
+    #[test]
+    fn serialize_state_round_trips_nv_and_rng() {
+        let mut a = VirtualTpm::new(TpmInterface::Crb);
+        a.nv_storage.insert(0x0100_0002, b"one".to_vec());
+        a.nv_storage.insert(0x0100_0003, vec![0u8; 64]);
+        a.rng_state = 0x1234_5678_9ABC_DEF1;
+        let blob = a.serialize_state();
+
+        let mut b = VirtualTpm::new(TpmInterface::Crb);
+        assert!(b.apply_state(&blob), "well-formed blob applies");
+        assert_eq!(b.rng_state, 0x1234_5678_9ABC_DEF1);
+        assert_eq!(
+            b.nv_storage.get(&0x0100_0002).map(Vec::as_slice),
+            Some(&b"one"[..])
+        );
+        assert_eq!(b.nv_storage.get(&0x0100_0003).map(Vec::len), Some(64));
+
+        // A truncated blob is rejected without partially applying.
+        let mut c = VirtualTpm::new(TpmInterface::Crb);
+        assert!(
+            !c.apply_state(&blob[..blob.len() - 5]),
+            "truncated blob rejected"
+        );
+        assert!(c.nv_storage.is_empty(), "rejected blob leaves NV untouched");
+    }
+
+    #[test]
+    fn save_state_is_a_noop_without_a_path() {
+        let tpm = VirtualTpm::new(TpmInterface::Crb);
+        assert!(tpm.state_path.is_none());
+        tpm.save_state()
+            .expect("save with no path is Ok and writes nothing");
     }
 
     #[test]
