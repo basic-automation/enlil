@@ -446,7 +446,8 @@ mod tests {
             Some(2_600_000_000)
         );
         assert_eq!(
-            tsc_hz_from_cpuid_leaves(0x16, 2, 250, 0, 0xFFFF_0000 | 3200),
+            // 0x0C80 == 3200 MHz in EAX[15:0]; the high bits must be ignored.
+            tsc_hz_from_cpuid_leaves(0x16, 2, 250, 0, 0xFFFF_0C80),
             Some(3_200_000_000),
             "only EAX[15:0] is the base-frequency MHz field"
         );
