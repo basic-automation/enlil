@@ -9,6 +9,7 @@ pub mod run_loop;
 pub mod serial;
 pub mod stealth_msr;
 pub mod timing_stealth;
+pub mod usb_routing;
 pub mod vcpu;
 pub mod vm;
 
