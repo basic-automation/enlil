@@ -623,8 +623,7 @@ impl PciConfigSpace {
         // PCIe Base §7.5.1.1). Storing the raw value let a guest set hardwired-0
         // bits and read them back — a transparency tell. Snapshot so the generic
         // loop can be re-masked to the writable bits in the covered bytes.
-        let command_touched =
-            offset < cfg::COMMAND + 2 && offset + u16::from(width) > cfg::COMMAND;
+        let command_touched = offset < cfg::COMMAND + 2 && offset + u16::from(width) > cfg::COMMAND;
         let saved_command = command_touched.then(|| {
             let mut covered = 0u16;
             if offset <= cfg::COMMAND {
@@ -705,7 +704,10 @@ impl PciConfigSpace {
             const COMMAND_WRITABLE_MASK: u16 = 0x0547; // bits 0,1,2,6,8,10
             let writable = COMMAND_WRITABLE_MASK & covered;
             let attempted = self.read_u16(cfg::COMMAND);
-            self.write_u16(cfg::COMMAND, (old_command & !writable) | (attempted & writable));
+            self.write_u16(
+                cfg::COMMAND,
+                (old_command & !writable) | (attempted & writable),
+            );
         }
     }
 
@@ -1871,7 +1873,11 @@ mod tests {
         assert_eq!(after & 0x6000, 0, "RW1C error bits cleared by write-1");
         // A guest cannot SET a read-only bit it had no business setting (e.g.
         // 66 MHz Capable [5], not advertised by this model): it stays 0.
-        assert_eq!(after & 0x0020, 0, "guest cannot set the read-only 66MHz bit");
+        assert_eq!(
+            after & 0x0020,
+            0,
+            "guest cannot set the read-only 66MHz bit"
+        );
     }
 
     #[test]
@@ -1884,7 +1890,11 @@ mod tests {
         // SERR# [8], Interrupt Disable [10]) took.
         assert_eq!(cmd & 0x0547, 0x0547, "writable Command bits took");
         // The hardwired-0 (PCIe) / reserved bits read back 0.
-        assert_eq!(cmd & !0x0547, 0, "hardwired-0 and reserved Command bits stay 0");
+        assert_eq!(
+            cmd & !0x0547,
+            0,
+            "hardwired-0 and reserved Command bits stay 0"
+        );
 
         // A byte write to the high Command byte must not disturb the low byte's
         // already-set writable bits.
