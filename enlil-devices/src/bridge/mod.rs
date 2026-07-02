@@ -8,3 +8,4 @@ pub mod dragdrop;
 pub mod notification;
 pub mod shared_fs;
 pub mod transport;
+pub mod url_router;
