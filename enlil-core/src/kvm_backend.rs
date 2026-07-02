@@ -815,6 +815,19 @@ mod linux {
             // host-passthrough rate. No-op for an AMD-vendor table.
             Self::upsert_frequency_leaves(&mut entries, table, self.tsc_khz().ok());
 
+            // Fold in the CPU **identity** leaves (leaf-0 vendor string, leaf-1
+            // FMS, brand 0x8000_0002-4) from the table in the same rebuild, so the
+            // identity the guest reads matches the topology/PMU/frequency already
+            // installed from that table. KVM passes the *host's* identity through
+            // its supported set, so without this a masqueraded table (a different
+            // model presented uniformly across a pool, or the future bare-metal
+            // backend which has no KVM passthrough to inherit from) would install a
+            // guest topology while the vendor/brand still read the host's — a
+            // stealth-surface disagreement. For the live `from_host` table this
+            // reinstalls the true host identity (no observable change), but it
+            // closes that consistency gap.
+            Self::upsert_identity_leaves(&mut entries, table);
+
             // Per-vCPU APIC identity. Several CPUID fields are the *current*
             // logical CPU's ID — distinct per vCPU on real hardware — yet KVM
             // only fills them per vCPU when an in-kernel LAPIC exists; without
@@ -1058,6 +1071,77 @@ mod linux {
             if let Some(leaf0) = entries.iter_mut().find(|e| e.function == 0) {
                 if leaf0.eax < HIGHEST_FREQ_LEAF {
                     leaf0.eax = HIGHEST_FREQ_LEAF;
+                }
+            }
+        }
+
+        /// Install the table's CPU **identity** leaves into `entries`: the
+        /// leaf-`0` vendor string (`EBX`/`ECX`/`EDX`), the leaf-`1` `EAX`
+        /// family/model/stepping, and the brand string in leaves
+        /// `0x8000_0002`..=`0x8000_0004`.
+        ///
+        /// KVM's `KVM_GET_SUPPORTED_CPUID` mirrors the **host's** identity, so a
+        /// [`CpuidStealthTable`] presenting a different identity (a masqueraded
+        /// model unified across a heterogeneous pool, or the future bare-metal
+        /// backend that has no supported-set to inherit) would otherwise install a
+        /// guest topology/PMU/frequency view while the vendor and brand still read
+        /// the host's — a self-inconsistent stealth surface. This makes the
+        /// identity the guest reads agree with the rest of the table.
+        ///
+        /// Only the **identity** fields are touched: leaf-`0` `EAX`
+        /// (max-basic-leaf, managed by [`upsert_frequency_leaves`] and by KVM's
+        /// real leaf enumeration) and leaf-`1` `EBX`/`ECX`/`EDX` (APIC/max-IDs and
+        /// the host-real feature bits, which must not be widened past what the
+        /// physical CPU supports) are left exactly as-is. The brand leaves are
+        /// upserted (KVM enumerates them on x86_64, but synthesise them if absent
+        /// so the bare-metal path is covered too). `pub(crate)` so it is
+        /// unit-testable with a synthetic entry set, like
+        /// [`upsert_frequency_leaves`](Self::upsert_frequency_leaves).
+        ///
+        /// [`upsert_frequency_leaves`]: Self::upsert_frequency_leaves
+        /// [`CpuidStealthTable`]: enlil_devices::stealth::cpuid::CpuidStealthTable
+        pub(crate) fn upsert_identity_leaves(
+            entries: &mut Vec<kvm_bindings::kvm_cpuid_entry2>,
+            table: &enlil_devices::stealth::cpuid::CpuidStealthTable,
+        ) {
+            // Leaf 0: vendor string in EBX/EDX/ECX. Leave EAX (max-basic-leaf)
+            // untouched — lowering it would hide leaves KVM actually enumerates.
+            let l0 = table.lookup(0, 0);
+            if let Some(entry) = entries.iter_mut().find(|e| e.function == 0) {
+                entry.ebx = l0.ebx;
+                entry.ecx = l0.ecx;
+                entry.edx = l0.edx;
+            }
+
+            // Leaf 1: family/model/stepping in EAX only. EBX carries the APIC ID /
+            // max-addressable-IDs field patched elsewhere, and ECX/EDX are the
+            // host-real feature bits — none of which this rewrite may disturb.
+            let l1 = table.lookup(1, 0);
+            if let Some(entry) = entries.iter_mut().find(|e| e.function == 1) {
+                entry.eax = l1.eax;
+            }
+
+            // Brand string: leaves 0x8000_0002..=0x8000_0004, four registers each.
+            for i in 0..3u32 {
+                let function = 0x8000_0002 + i;
+                let r = table.lookup(function, 0);
+                if let Some(entry) = entries.iter_mut().find(|e| e.function == function) {
+                    entry.index = 0;
+                    entry.eax = r.eax;
+                    entry.ebx = r.ebx;
+                    entry.ecx = r.ecx;
+                    entry.edx = r.edx;
+                } else {
+                    entries.push(kvm_bindings::kvm_cpuid_entry2 {
+                        function,
+                        index: 0,
+                        flags: 0,
+                        eax: r.eax,
+                        ebx: r.ebx,
+                        ecx: r.ecx,
+                        edx: r.edx,
+                        padding: [0; 3],
+                    });
                 }
             }
         }
@@ -1716,6 +1800,192 @@ mod tests {
             amd_entries.iter().find(|e| e.function == 0).unwrap().eax,
             0x10,
             "AMD table must not touch the max-basic-leaf"
+        );
+    }
+
+    // upsert_identity_leaves stamps the table's vendor string (leaf 0), FMS
+    // (leaf 1 EAX), and brand string (0x8000_0002-4) into a CPUID entry set while
+    // leaving leaf-0 EAX (max-basic-leaf) and leaf-1 EBX/ECX/EDX (APIC + host
+    // feature bits) untouched. Pure over `entries`, so unit-testable without
+    // /dev/kvm; uses a masqueraded (Intel) table distinct from this AMD host so
+    // every assertion is non-vacuous.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn upsert_identity_leaves_installs_vendor_fms_and_brand() {
+        use enlil_devices::stealth::cpuid::{CpuVendor, CpuidStealthConfig, CpuidStealthTable};
+        use kvm_bindings::kvm_cpuid_entry2;
+
+        // A masqueraded identity: Intel vendor, a distinctive FMS, and a sentinel
+        // brand string — all different from the AMD host this test runs on.
+        let mut cfg = CpuidStealthConfig::from_host(1, 1);
+        cfg.vendor = CpuVendor::Intel;
+        cfg.family_model_stepping = 0x000B_06F2;
+        let mut brand = [0u8; 48];
+        brand[..b"Enlil Masquerade CPU @ 3.00GHz".len()]
+            .copy_from_slice(b"Enlil Masquerade CPU @ 3.00GHz");
+        cfg.brand_string = brand;
+        let table = CpuidStealthTable::build(&cfg);
+
+        // Host-mirrored starting set: leaf 0 with AMD-style vendor regs and a low
+        // max-basic-leaf, leaf 1 with a host FMS + sentinel EBX/ECX/EDX, and one
+        // existing brand leaf (to prove overwrite) — 0x8000_0003/4 are absent so
+        // the insert path is also exercised.
+        let (amd_ebx, amd_edx, amd_ecx) = CpuVendor::Amd.vendor_regs();
+        let mut entries = vec![
+            kvm_cpuid_entry2 {
+                function: 0,
+                eax: 0x10,
+                ebx: amd_ebx,
+                ecx: amd_ecx,
+                edx: amd_edx,
+                ..Default::default()
+            },
+            kvm_cpuid_entry2 {
+                function: 1,
+                eax: 0x00A0_0F11, // host FMS
+                ebx: 0x0102_0304, // APIC/max-IDs + CLFLUSH — must survive
+                ecx: 0x1234_5678, // feature bits — must survive
+                edx: 0x8765_4321,
+                ..Default::default()
+            },
+            kvm_cpuid_entry2 {
+                function: 0x8000_0002,
+                eax: 0xDEAD_BEEF, // stale host brand chunk — must be overwritten
+                ..Default::default()
+            },
+        ];
+
+        KvmBackend::upsert_identity_leaves(&mut entries, &table);
+
+        // Leaf 0: vendor regs replaced with the table's (Intel); EAX untouched.
+        let l0 = entries.iter().find(|e| e.function == 0).unwrap();
+        let t0 = table.lookup(0, 0);
+        assert_eq!(l0.eax, 0x10, "leaf-0 max-basic-leaf must not be lowered");
+        assert_eq!((l0.ebx, l0.ecx, l0.edx), (t0.ebx, t0.ecx, t0.edx));
+        assert_ne!(
+            (l0.ebx, l0.ecx, l0.edx),
+            (amd_ebx, amd_ecx, amd_edx),
+            "vendor regs must no longer be the host AMD string"
+        );
+
+        // Leaf 1: EAX = table FMS; EBX/ECX/EDX preserved.
+        let l1 = entries.iter().find(|e| e.function == 1).unwrap();
+        assert_eq!(l1.eax, table.lookup(1, 0).eax, "leaf-1 EAX = table FMS");
+        assert_eq!(l1.ebx, 0x0102_0304, "leaf-1 EBX preserved");
+        assert_eq!(l1.ecx, 0x1234_5678, "leaf-1 ECX preserved");
+        assert_eq!(l1.edx, 0x8765_4321, "leaf-1 EDX preserved");
+
+        // Brand leaves: existing overwritten, missing inserted, all from table.
+        for i in 0..3u32 {
+            let function = 0x8000_0002 + i;
+            let e = entries
+                .iter()
+                .find(|e| e.function == function)
+                .unwrap_or_else(|| panic!("brand leaf {function:#x} present"));
+            let r = table.lookup(function, 0);
+            assert_eq!(
+                (e.eax, e.ebx, e.ecx, e.edx),
+                (r.eax, r.ebx, r.ecx, r.edx),
+                "brand leaf {function:#x} matches table"
+            );
+        }
+        assert_eq!(
+            entries.iter().filter(|e| e.function == 0x8000_0002).count(),
+            1,
+            "no duplicate brand leaf"
+        );
+    }
+
+    // Real-KVM: apply_topology_stealth must make the guest read the *table's*
+    // brand string, not the host's KVM-passthrough brand. Builds a host-vendor
+    // (AMD) table with only the brand string masqueraded — safe on real hardware
+    // since the brand is pure data — and has a real-mode guest read leaf
+    // 0x8000_0002 and echo its four bytes over COM1. Self-skips without /dev/kvm.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn topology_stealth_installs_the_table_brand_string() {
+        use enlil_devices::stealth::cpuid::{CpuidStealthConfig, CpuidStealthTable};
+
+        if !is_kvm_available() {
+            eprintln!("skipping topology_stealth_installs_the_table_brand_string: no /dev/kvm");
+            return;
+        }
+
+        // 16-bit real-mode blob; reads leaf 0x8000_0002 (first 4 brand bytes in
+        // EAX) and echoes them low-byte-first over COM1:
+        //   66 B8 02 00 00 80   mov eax, 0x80000002
+        //   0F A2               cpuid
+        //   BA F8 03            mov dx, 0x3F8
+        //   EE                  out dx, al        ; brand[0]
+        //   66 C1 E8 08         shr eax, 8
+        //   EE                  out dx, al        ; brand[1]
+        //   66 C1 E8 08         shr eax, 8
+        //   EE                  out dx, al        ; brand[2]
+        //   66 C1 E8 08         shr eax, 8
+        //   EE                  out dx, al        ; brand[3]
+        //   F4                  hlt
+        #[rustfmt::skip]
+        let code: [u8; 28] = [
+            0x66, 0xB8, 0x02, 0x00, 0x00, 0x80,
+            0x0F, 0xA2,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0x66, 0xC1, 0xE8, 0x08,
+            0xEE,
+            0x66, 0xC1, 0xE8, 0x08,
+            0xEE,
+            0x66, 0xC1, 0xE8, 0x08,
+            0xEE,
+            0xF4,
+        ];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu 0");
+
+        // Host-vendor table with only the brand string masqueraded to a sentinel
+        // that differs from the real host brand, so the assertion is non-vacuous.
+        let mut cfg = CpuidStealthConfig::from_host(1, 1);
+        let mut brand = [0u8; 48];
+        brand[..b"ENLIL-STEALTH-IDENTITY".len()].copy_from_slice(b"ENLIL-STEALTH-IDENTITY");
+        cfg.brand_string = brand;
+        let table = CpuidStealthTable::build(&cfg);
+        let want = table.lookup(0x8000_0002, 0).eax.to_le_bytes().to_vec();
+
+        backend
+            .apply_topology_stealth(&table)
+            .expect("apply topology stealth");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        struct EchoOut(Vec<u8>);
+        impl VmExitHandler for EchoOut {
+            fn io_out(&mut self, _port: u16, data: &[u8]) {
+                self.0.extend_from_slice(data);
+            }
+        }
+        let mut echo = EchoOut(Vec::new());
+
+        let mut halted = false;
+        for _ in 0..100 {
+            if backend.run_vcpu(0, &mut echo).expect("run vcpu") == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        assert_eq!(
+            echo.0, want,
+            "guest must read the table's masqueraded brand, not the host's"
         );
     }
 
