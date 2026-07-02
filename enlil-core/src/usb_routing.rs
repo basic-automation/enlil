@@ -161,6 +161,48 @@ mod tests {
     }
 
     #[test]
+    fn routes_real_devices_through_the_built_table() {
+        use enlil_devices::usb::routing::RoutingDecision;
+        use enlil_devices::usb::types::{UsbDeviceClass, UsbDeviceId, UsbSpeed};
+
+        let device = |vid: u16, pid: u16, class: UsbDeviceClass| UsbDeviceId {
+            vendor_id: vid,
+            product_id: pid,
+            class,
+            speed: UsbSpeed::High,
+            serial: None,
+            manufacturer: None,
+            product: None,
+            port_path: None,
+        };
+
+        let usb = UsbConfig {
+            default_guest: Some("linux1".into()),
+            routing: vec![
+                rule("046d:c52b", "windows1", 10), // a specific mouse
+                rule("class:hid", "linux2", 50),   // any other HID
+            ],
+        };
+        let table = routing_table_from_config(&usb).expect("build");
+
+        // The specific VID:PID wins over the class rule (lower priority number).
+        assert_eq!(
+            table.route(&device(0x046d, 0xc52b, UsbDeviceClass::Hid)),
+            RoutingDecision::RouteToGuest("windows1".into())
+        );
+        // A different HID falls to the class rule.
+        assert_eq!(
+            table.route(&device(0x1234, 0x5678, UsbDeviceClass::Hid)),
+            RoutingDecision::RouteToGuest("linux2".into())
+        );
+        // A non-HID matches no rule and lands on the default guest.
+        assert_eq!(
+            table.route(&device(0x1234, 0x5678, UsbDeviceClass::MassStorage)),
+            RoutingDecision::RouteToGuest("linux1".into())
+        );
+    }
+
+    #[test]
     fn an_unknown_class_token_is_an_error() {
         let usb = UsbConfig {
             default_guest: None,
