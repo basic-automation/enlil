@@ -67,6 +67,39 @@ fn validate_cpu_isolation(config: &EnlilConfig) -> Vec<String> {
     errors
 }
 
+/// Validate the `[usb]` routing block (Phase 4.3): every rule's match spec must
+/// parse, and every rule target — plus the optional `default_guest` — must name
+/// a defined guest, or a device would be routed to a guest that does not exist.
+fn validate_usb_routing(config: &EnlilConfig) -> Vec<String> {
+    let mut errors = Vec::new();
+    let usb = &config.usb;
+
+    if let Some(default_guest) = &usb.default_guest
+        && !config.guest.contains_key(default_guest)
+    {
+        errors.push(format!(
+            "USB default_guest '{default_guest}' is not a defined guest"
+        ));
+    }
+
+    for (i, rule) in usb.routing.iter().enumerate() {
+        if let Err(e) = crate::parse_usb_match(&rule.match_spec) {
+            errors.push(format!(
+                "USB routing rule {i} (match '{}'): {e}",
+                rule.match_spec
+            ));
+        }
+        if !config.guest.contains_key(&rule.target) {
+            errors.push(format!(
+                "USB routing rule {i} targets guest '{}', which is not defined",
+                rule.target
+            ));
+        }
+    }
+
+    errors
+}
+
 /// Validate an Enlil configuration. Returns a list of errors (empty = valid).
 #[must_use]
 pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
@@ -74,6 +107,9 @@ pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
 
     // Non-overlapping CPU sets (LOCKED PRINCIPLE 5 — isolation).
     errors.append(&mut validate_cpu_isolation(config));
+
+    // USB peripheral routing (Phase 4.3): match specs parse, targets exist.
+    errors.append(&mut validate_usb_routing(config));
 
     // Check memory
     let total_guest_memory: u64 = config.guest.values().map(|g| g.memory_mb).sum();
@@ -217,6 +253,7 @@ mod tests {
         EnlilConfig {
             hypervisor: HypervisorConfig::default(),
             guest: guests,
+            usb: UsbConfig::default(),
         }
     }
 
@@ -225,6 +262,148 @@ mod tests {
         let config = minimal_config();
         let errors = validate_config(&config);
         assert!(errors.is_empty(), "Expected no errors, got: {errors:?}");
+    }
+
+    #[test]
+    fn valid_usb_routing_passes() {
+        let mut config = minimal_config();
+        config.usb = UsbConfig {
+            default_guest: Some("vm1".into()),
+            routing: vec![
+                UsbRoutingRule {
+                    match_spec: "046d:c52b".into(),
+                    target: "vm1".into(),
+                    priority: 10,
+                },
+                UsbRoutingRule {
+                    match_spec: "class:hid".into(),
+                    target: "vm1".into(),
+                    priority: 20,
+                },
+                UsbRoutingRule {
+                    match_spec: "*".into(),
+                    target: "vm1".into(),
+                    priority: 1000,
+                },
+            ],
+        };
+        let errors = validate_config(&config);
+        assert!(errors.is_empty(), "Expected no errors, got: {errors:?}");
+    }
+
+    #[test]
+    fn detects_usb_rule_with_unknown_target() {
+        let mut config = minimal_config();
+        config.usb.routing.push(UsbRoutingRule {
+            match_spec: "046d:c52b".into(),
+            target: "ghost".into(),
+            priority: 10,
+        });
+        let errors = validate_config(&config);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("ghost") && e.contains("not defined")),
+            "unknown routing target should be flagged: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn detects_malformed_usb_match_spec() {
+        let mut config = minimal_config();
+        config.usb.routing.push(UsbRoutingRule {
+            match_spec: "not-a-match".into(),
+            target: "vm1".into(),
+            priority: 10,
+        });
+        let errors = validate_config(&config);
+        assert!(
+            errors.iter().any(|e| e.contains("not-a-match")),
+            "malformed match spec should be flagged: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn detects_unknown_usb_default_guest() {
+        let mut config = minimal_config();
+        config.usb.default_guest = Some("ghost".into());
+        let errors = validate_config(&config);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("default_guest") && e.contains("ghost")),
+            "unknown default_guest should be flagged: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn usb_routing_parses_from_toml() {
+        let toml = r#"
+            [hypervisor]
+
+            [guest.vm1]
+            name = "VM 1"
+            cpus = [0]
+            memory_mb = 512
+
+            [usb]
+            default_guest = "vm1"
+
+            [[usb.routing]]
+            match = "046d:*"
+            target = "vm1"
+            priority = 5
+
+            [[usb.routing]]
+            match = "port:1-1"
+            target = "vm1"
+        "#;
+        let config: EnlilConfig = toml::from_str(toml).expect("parse");
+        assert_eq!(config.usb.default_guest.as_deref(), Some("vm1"));
+        assert_eq!(config.usb.routing.len(), 2);
+        assert_eq!(config.usb.routing[0].priority, 5);
+        // The second rule takes the default priority.
+        assert_eq!(config.usb.routing[1].priority, 1000);
+        assert_eq!(
+            config.usb.routing[0].parsed_match(),
+            Ok(UsbMatchKind::VendorOnly { vendor_id: 0x046d })
+        );
+        assert_eq!(
+            config.usb.routing[1].parsed_match(),
+            Ok(UsbMatchKind::PortPath("1-1".into()))
+        );
+        assert!(validate_config(&config).is_empty());
+    }
+
+    #[test]
+    fn parse_usb_match_covers_every_form() {
+        assert_eq!(parse_usb_match("*"), Ok(UsbMatchKind::Any));
+        assert_eq!(
+            parse_usb_match("046d:c52b"),
+            Ok(UsbMatchKind::VidPid {
+                vendor_id: 0x046d,
+                product_id: 0xc52b
+            })
+        );
+        assert_eq!(
+            parse_usb_match("046d:*"),
+            Ok(UsbMatchKind::VendorOnly { vendor_id: 0x046d })
+        );
+        assert_eq!(
+            parse_usb_match("port:2-3.1"),
+            Ok(UsbMatchKind::PortPath("2-3.1".into()))
+        );
+        assert_eq!(
+            parse_usb_match("serial:ABC123"),
+            Ok(UsbMatchKind::Serial("ABC123".into()))
+        );
+        assert_eq!(
+            parse_usb_match("class:hid"),
+            Ok(UsbMatchKind::DeviceClass("hid".into()))
+        );
+        assert!(parse_usb_match("garbage").is_err());
+        assert!(parse_usb_match("zzzz:0001").is_err());
+        assert!(parse_usb_match("port:").is_err());
     }
 
     #[test]

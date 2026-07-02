@@ -11,6 +11,138 @@ pub struct EnlilConfig {
     /// Guest VM definitions, keyed by ID.
     #[serde(default)]
     pub guest: HashMap<String, GuestConfig>,
+    /// USB peripheral routing (`[usb]`).
+    #[serde(default, skip_serializing_if = "UsbConfig::is_empty")]
+    pub usb: UsbConfig,
+}
+
+/// USB peripheral-routing configuration (`[usb]`).
+///
+/// A default guest plus an ordered list of match→guest rules the routing engine
+/// applies to each physical device (Phase 4.3).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsbConfig {
+    /// Guest that receives any device matching no rule (`None` = unassigned,
+    /// i.e. the device stays with the hypervisor).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_guest: Option<String>,
+    /// Ordered routing rules (`[[usb.routing]]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routing: Vec<UsbRoutingRule>,
+}
+
+impl UsbConfig {
+    /// Whether no USB routing is configured (used to omit `[usb]` from written
+    /// TOML so a config with no USB policy stays clean).
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.default_guest.is_none() && self.routing.is_empty()
+    }
+}
+
+/// A single `[[usb.routing]]` rule: a device match spec, a target guest, and a
+/// priority (lower is evaluated first).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsbRoutingRule {
+    /// Match spec: `VVVV:PPPP` (VID:PID), `VVVV:*` (vendor only), `port:<path>`,
+    /// `serial:<s>`, `class:<name>`, or `*` (any). Parsed by
+    /// [`parse_usb_match`].
+    #[serde(rename = "match")]
+    pub match_spec: String,
+    /// Target guest ID — must name a defined `[guest.*]`.
+    pub target: String,
+    /// Priority — lower numbers are evaluated first. Defaults to the lowest
+    /// priority so an unprioritized rule sits behind explicit ones.
+    #[serde(default = "default_usb_priority")]
+    pub priority: u32,
+}
+
+impl UsbRoutingRule {
+    /// Parse this rule's [`match_spec`](Self::match_spec) into a structured
+    /// [`UsbMatchKind`].
+    ///
+    /// # Errors
+    /// Propagates [`parse_usb_match`]'s error message for a malformed spec.
+    pub fn parsed_match(&self) -> Result<UsbMatchKind, String> {
+        parse_usb_match(&self.match_spec)
+    }
+}
+
+const fn default_usb_priority() -> u32 {
+    1000
+}
+
+/// A parsed USB device match criterion.
+///
+/// The config-layer mirror of the device crate's `DeviceMatcher`. The run loop
+/// maps this into that enum when it builds the routing table (kept here so
+/// `enlil-config` stays independent of `enlil-devices`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UsbMatchKind {
+    /// Match a specific vendor + product ID.
+    VidPid { vendor_id: u16, product_id: u16 },
+    /// Match any product from a vendor.
+    VendorOnly { vendor_id: u16 },
+    /// Match a physical port path (e.g. `1-1`, `2-3.1`).
+    PortPath(String),
+    /// Match a device serial number.
+    Serial(String),
+    /// Match a USB device-class token (e.g. `hid`), validated against the device
+    /// crate's class set when the routing table is built.
+    DeviceClass(String),
+    /// Match every device (default routing).
+    Any,
+}
+
+/// Parse a `[[usb.routing]]` match spec into a [`UsbMatchKind`].
+///
+/// Accepted forms: `*` (any), `VVVV:PPPP` (hex VID:PID), `VVVV:*` (vendor only),
+/// `port:<path>`, `serial:<value>`, `class:<name>`.
+///
+/// # Errors
+/// Returns a human-readable message when the spec is not a recognized form, or
+/// carries a malformed VID/PID or an empty `port:`/`serial:`/`class:` selector.
+pub fn parse_usb_match(spec: &str) -> Result<UsbMatchKind, String> {
+    let spec = spec.trim();
+    if spec == "*" {
+        return Ok(UsbMatchKind::Any);
+    }
+    if let Some(path) = spec.strip_prefix("port:") {
+        let path = path.trim();
+        if path.is_empty() {
+            return Err("port: match needs a non-empty path".into());
+        }
+        return Ok(UsbMatchKind::PortPath(path.to_string()));
+    }
+    if let Some(serial) = spec.strip_prefix("serial:") {
+        let serial = serial.trim();
+        if serial.is_empty() {
+            return Err("serial: match needs a non-empty value".into());
+        }
+        return Ok(UsbMatchKind::Serial(serial.to_string()));
+    }
+    if let Some(class) = spec.strip_prefix("class:") {
+        let class = class.trim();
+        if class.is_empty() {
+            return Err("class: match needs a non-empty class name".into());
+        }
+        return Ok(UsbMatchKind::DeviceClass(class.to_string()));
+    }
+    if let Some((vid, pid)) = spec.split_once(':') {
+        let vendor_id = u16::from_str_radix(vid.trim(), 16)
+            .map_err(|_| format!("invalid vendor id '{vid}' (expected up to 4 hex digits)"))?;
+        if pid.trim() == "*" {
+            return Ok(UsbMatchKind::VendorOnly { vendor_id });
+        }
+        let product_id = u16::from_str_radix(pid.trim(), 16).map_err(|_| {
+            format!("invalid product id '{pid}' (expected up to 4 hex digits or *)")
+        })?;
+        return Ok(UsbMatchKind::VidPid {
+            vendor_id,
+            product_id,
+        });
+    }
+    Err(format!("unrecognized USB match spec '{spec}'"))
 }
 
 /// Hypervisor-wide configuration.
