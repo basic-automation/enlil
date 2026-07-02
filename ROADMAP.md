@@ -121,16 +121,16 @@
   - [x] shared filesystem / VirtIO-fs (3.7.3)
   - [x] notification forwarding (3.7.4)
   - [x] fast inter-guest virtual network via the virtual switch (3.7.5)
-  - [ ] URL/protocol-handler scheme routing table + resolution logic (3.7.6)
+  - [x] URL/protocol-handler scheme routing table + resolution logic (3.7.6)
   - [ ] guest bridge-agent packaging/installers (.deb/.rpm/.msi) (3.7.7)
 - [x] 3.8 Production platform-clock cadence — advance_platform_clocks drives advance_clocks from guest ref-cycles in the run loop
 - [x] 3.9 LAPIC TSC-deadline timer mode (IA32_TSC_DEADLINE install + fire_due_tsc_deadlines against guest TSC)
-- [ ] 3.10 qcow2 refcount-TABLE growth in storage/qcow.rs (sizing primitive refcount_table_clusters_for landed; on-disk grow still bails)
+- [ ] 3.10 qcow2 refcount-TABLE growth in storage/qcow.rs (sizing primitive refcount_table_clusters_for landed; on-disk grow still bails; BLOCKER: QcowHeader is a plain field, so refcount_table_offset/clusters cannot be updated through &self — NEXT SLICE: make those two header fields interior-mutable, then implement grow + free-old-table and validate with check_consistency)
 - [x] 3.11 Cap the 16550 UART RX FIFO (RX_FIFO_CAPACITY bound + overrun flag)
 - [ ] 3.12 Wire StealthRunLoop::run_real_mode into a top-level guest-boot/orchestrator binary (no binary caller yet)
 - [x] 3.13 Skip the per-entry guest-TSC read when no LAPIC deadline is armed (any_lapic_tsc_deadline_armed gate)
 - [x] 3.14 RTC/CMOS wall-clock cadence in run_real_mode (advance_rtc_seconds, capped) so the calendar does not freeze
-- [ ] 3.15 Drive the RTC periodic interrupt (tick_periodic at periodic_rate_hz) from the run loop (no caller yet)
+- [x] 3.15 Drive the RTC periodic interrupt from the platform cadence (Rtc146818::advance_periodic accumulates guest-perceived ns and latches a coalesced tick at periodic_rate_hz; wired into StandardPc::advance_clocks, which the run loop drives per entry)
 
 ## Phase 4 — USB Peripheral Routing
 - [x] 4.1 Assemble the USB subsystem stack (host monitor to routing engine to per-guest virtual xHCI) as a cohesive module
@@ -144,7 +144,8 @@
   - [x] RoutingTable/RoutingState resolving a device to its target guest by priority
   - [x] Live re-routing of a device between guests at runtime (reassign)
   - [x] HotplugDispatcher bridging monitor callbacks to the run loop and applying rules on plug-in
-  - [ ] Config-driven [usb.routing] TOML block parsed by enlil-config into a RoutingTable
+  - [x] Config-driven [usb.routing] TOML block parsed by enlil-config (UsbConfig + parse_usb_match + validation) and converted to a RoutingTable by enlil-core::usb_routing::routing_table_from_config
+  - [ ] Wire routing_table_from_config into the run-loop/guest setup so a configured [usb.routing] populates the live RoutingState (adapter landed; no caller yet)
 - [x] 4.4 Virtual xHCI (USB 3.x) host controller per guest with TRB-level interception
   - [x] VirtualXhciController with cap/operational/runtime/port registers behind one MMIO window (XhciMmio)
   - [x] Mounted as a discrete Renesas uPD720202 PCI function (1912:0015) at 00:04.0 with INTx/PIRQ delivery
@@ -175,7 +176,8 @@
 - [x] 5.3 CPUID stealth table + live-KVM injection (clear hypervisor bit, out-of-range leaves, vendor/topology/PMU leaves)
   - [x] apply_topology_stealth rebuilds CPUID array (leaf 0xB topology, leaf-1 max-IDs, per-vCPU x2APIC IDs)
   - [x] PMU leaf 0xA + AMD topology triad (0x8000_0008 NC, 0x8000_001D cache sharing, 0x8000_001E SMT)
-  - [ ] Cross-vendor identity leaves (leaf-0 vendor string / leaf-1 FMS / brand 0x8000_0002-4 masquerade)
+  - [x] Install the CPUID identity leaves from the stealth table (upsert_identity_leaves folds leaf-0 vendor string, leaf-1 FMS, brand 0x8000_0002-4 into apply_topology_stealth so the guest identity matches the topology/PMU/frequency view)
+  - [ ] Cross-vendor identity at runtime: presenting a different vendor (e.g. Intel-on-AMD) needs vendor-appropriate MSR emulation before it is safe — the identity install exists but the live from_host table stays same-vendor
 - [x] 5.4 Timing stealth — TSC offsetting, constant-time CPUID table, APERF/MPERF + PMC + LBR shadowing
   - [x] Shadow IA32_APERF/MPERF counters advancing at model rate, hiding VMEXIT overhead (VcpuTimingState)
   - [x] RDPMC / PMC MSR shadowing (Intel + AMD blocks) via PmcState/PmcRateModel
@@ -183,8 +185,9 @@
   - [x] StealthMsrRouter + per-vCPU StealthBank wired through StealthRunLoop over /dev/kvm
 - [x] 5.5 Virtual TPM 2.0 (CRB interface, MMIO 0xFED40000, per-guest PCR banks/NV storage)
   - [x] CRB register interface + TPM2 command dispatch (Startup/SelfTest/PcrExtend/PcrRead/GetRandom/NvRead/NvWrite)
-  - [ ] Independent per-guest endorsement key generation
-  - [ ] On-disk persistent TPM state store (BitLocker/Windows Hello) — state_path field exists but no fs read/write
+  - [x] Independent per-guest endorsement key generation (VirtualTpm::seeded derives a distinct GetRandom stream + Endorsement Primary Seed per guest via domain-separated SHA-256; deterministic so the EK is stable across reboots, persisted in the state store)
+  - [ ] Wire the per-guest TPM seed through standard_pc_complete / guest setup so each guest's vTPM gets a distinct seed (mechanism landed; the live path still builds the TPM via SharedTpm::new with the default seed)
+  - [x] On-disk persistent TPM state store (BitLocker/Windows Hello): save_state/load_state/with_state_path persist NV storage + endorsement seed + RNG to state_path (PCRs stay volatile), tolerant of a missing/malformed file
 - [ ] 5.6 Windows boot path via OVMF — provide/load virtual UEFI firmware image per guest and boot Windows in UEFI mode
 - [x] 5.7 Windows-specific virtual devices (HDA audio, PS/2 kbd/mouse, PCIe root complex, ACPI power management)
   - [x] Intel HDA controller + codec device model
