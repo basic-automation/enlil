@@ -54,7 +54,7 @@ pub use hotplug::{HotplugDispatcher, HotplugOutcome};
 pub use monitor::{UsbHotplugEvent, UsbMonitor};
 pub use registry::{AttachOutcome, DevicePlacement, RegistryError, XhciRegistry};
 pub use routing::{RoutingRule, RoutingState, RoutingTable};
-pub use sysfs::{SYSFS_USB_DEVICES, scan_devices, sync_monitor};
+pub use sysfs::{SYSFS_USB_DEVICES, poll, scan_devices, sync_monitor};
 pub use xhci::{
     CONTROL_DCI, CapabilityRegisters, CommandRing, CommandTrb, DmaMemory, DoorbellArray,
     DoorbellTarget, EventRing, EventTrb, InterrupterRegisterSet, NormalTrb, OperationalRegisters,

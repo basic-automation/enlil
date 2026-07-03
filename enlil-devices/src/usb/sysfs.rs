@@ -233,6 +233,28 @@ pub fn sync_monitor(monitor: &UsbMonitor, root: impl AsRef<Path>) -> UsbResult<(
     Ok((connected, disconnected))
 }
 
+/// Cadence-respecting poll cycle: run a [`sync_monitor`] only if the monitor's
+/// poll interval has elapsed since its last poll, then record the poll.
+///
+/// This is the drop-in the run loop calls every iteration: it self-throttles to
+/// the monitor's configured [`poll_interval`](UsbMonitor::poll_interval) via
+/// [`should_poll`](UsbMonitor::should_poll) / [`mark_polled`](UsbMonitor::mark_polled),
+/// so scanning `/sys` (a syscall-heavy walk) happens at most once per interval
+/// no matter how often the loop ticks. Returns `Some((connected, disconnected))`
+/// with the deltas when a scan ran, or `None` when the interval had not yet
+/// elapsed and nothing was scanned.
+///
+/// # Errors
+/// Propagates [`sync_monitor`]'s error when a scan runs.
+pub fn poll(monitor: &UsbMonitor, root: impl AsRef<Path>) -> UsbResult<Option<(usize, usize)>> {
+    if !monitor.should_poll() {
+        return Ok(None);
+    }
+    let deltas = sync_monitor(monitor, root)?;
+    monitor.mark_polled();
+    Ok(Some(deltas))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::monitor::UsbHotplugEvent;
@@ -391,6 +413,33 @@ mod tests {
         assert_eq!(monitor.device_count(), 1);
         assert_eq!(disconnects.load(Ordering::SeqCst), 1);
         assert!(monitor.device_by_vid_pid(0x046d, 0xc52b).is_some());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn poll_respects_the_monitor_cadence() {
+        use std::time::Duration;
+
+        // A monitor with a long interval was just constructed, so a poll is not
+        // yet due: poll() scans nothing and reports None even if the root exists.
+        let base = std::env::temp_dir().join(format!("enlil-sysfs-poll-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("devices");
+        let dir = root.join("1-1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("idVendor"), "046d").unwrap();
+        std::fs::write(dir.join("idProduct"), "c52b").unwrap();
+
+        let slow = UsbMonitor::new(Duration::from_secs(3600));
+        assert_eq!(poll(&slow, &root).unwrap(), None, "not due yet");
+        assert_eq!(slow.device_count(), 0, "nothing scanned when not due");
+
+        // A zero-interval monitor is always due: poll() runs the sync and reports
+        // the deltas.
+        let eager = UsbMonitor::new(Duration::from_millis(0));
+        assert_eq!(poll(&eager, &root).unwrap(), Some((1, 0)));
+        assert_eq!(eager.device_count(), 1);
 
         let _ = std::fs::remove_dir_all(&base);
     }
