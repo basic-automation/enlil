@@ -10,7 +10,7 @@
 //! hot-plug router (Phase 4.3).
 
 use enlil_config::{UsbConfig, UsbMatchKind};
-use enlil_devices::usb::routing::{DeviceMatcher, RoutingTable};
+use enlil_devices::usb::routing::{DeviceMatcher, RoutingState, RoutingTable};
 use enlil_devices::usb::types::UsbDeviceClass;
 
 /// Map a config-layer USB device-class token to a [`UsbDeviceClass`].
@@ -90,6 +90,26 @@ pub fn routing_table_from_config(usb: &UsbConfig) -> Result<RoutingTable, String
         table.add_rule(rule.priority, matcher, rule.target.clone());
     }
     Ok(table)
+}
+
+/// Build a live [`RoutingState`](enlil_devices::usb::routing::RoutingState) from
+/// a parsed [`UsbConfig`], ready to hand to an
+/// [`XhciRegistry`](enlil_devices::usb::registry::XhciRegistry) /
+/// [`HotplugDispatcher`](enlil_devices::usb::hotplug::HotplugDispatcher) in the
+/// guest-setup path.
+///
+/// This is the caller-ready form of [`routing_table_from_config`]: it wraps the
+/// built [`RoutingTable`] in the thread-safe `RoutingState` the hot-plug router
+/// and the management console share, so a configured `[usb.routing]` block
+/// directly populates the live routing surface (Phase 4.3). An empty/absent
+/// `[usb.routing]` yields an empty table with no default guest — every plugged
+/// device then lands on [`RoutingDecision::NoRoute`](enlil_devices::usb::routing::RoutingDecision::NoRoute),
+/// exactly as an unconfigured host behaves.
+///
+/// # Errors
+/// As [`routing_table_from_config`].
+pub fn routing_state_from_config(usb: &UsbConfig) -> Result<RoutingState, String> {
+    Ok(RoutingState::new(routing_table_from_config(usb)?))
 }
 
 #[cfg(test)]
@@ -200,6 +220,36 @@ mod tests {
             table.route(&device(0x1234, 0x5678, UsbDeviceClass::MassStorage)),
             RoutingDecision::RouteToGuest("linux1".into())
         );
+    }
+
+    #[test]
+    fn builds_a_live_routing_state_that_assigns_a_plugged_device() {
+        use enlil_devices::usb::routing::RoutingDecision;
+        use enlil_devices::usb::types::{UsbDeviceClass, UsbDeviceId, UsbSpeed};
+
+        let usb = UsbConfig {
+            default_guest: Some("linux1".into()),
+            routing: vec![rule("046d:c52b", "windows1", 10)],
+        };
+        let state = routing_state_from_config(&usb).expect("build state");
+
+        let mouse = UsbDeviceId {
+            vendor_id: 0x046d,
+            product_id: 0xc52b,
+            class: UsbDeviceClass::Hid,
+            speed: UsbSpeed::High,
+            serial: None,
+            manufacturer: None,
+            product: None,
+            port_path: None,
+        };
+        // Plugging the configured mouse routes it to its guest and records the
+        // assignment in the live state — the hot-plug path's exact operation.
+        assert_eq!(
+            state.assign_device(3, &mouse),
+            RoutingDecision::RouteToGuest("windows1".into())
+        );
+        assert_eq!(state.get_assignment(3).as_deref(), Some("windows1"));
     }
 
     #[test]
