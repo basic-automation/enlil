@@ -146,6 +146,33 @@ impl VirtualTpm {
         Self::seeded(interface, Self::DEFAULT_GUEST_SEED)
     }
 
+    /// Derive a stable per-guest TPM seed from a guest's name.
+    ///
+    /// A configured guest gets its distinct vTPM identity by seeding
+    /// [`seeded`](Self::seeded) with `seed_for_guest(&guest.name)`: the mapping
+    /// is a domain-separated SHA-256 of the name, so two differently-named
+    /// guests get independent Endorsement Keys and `GetRandom` streams, while
+    /// the same name always yields the same seed — the guest's EK identity is
+    /// stable across reboots and config reloads without persisting the seed
+    /// separately. Distinct from the `enlil-tpm-rng`/`enlil-tpm-eps` domains
+    /// [`derive_identity`](Self::derive_identity) uses, so the name→seed step
+    /// and the seed→identity step never collide.
+    #[must_use]
+    pub fn seed_for_guest(name: &str) -> u64 {
+        let mut input = b"enlil-tpm-guest-seed".to_vec();
+        input.extend_from_slice(name.as_bytes());
+        let digest = crate::crypto::sha256(&input);
+        let seed = u64::from_le_bytes(digest[0..8].try_into().unwrap_or([0; 8]));
+        // seeded() tolerates any u64 (derive_identity re-nonzeroes the RNG), but
+        // keep the seed itself nonzero so it never coincides with a "no seed"
+        // sentinel a caller might special-case.
+        if seed == 0 {
+            Self::DEFAULT_GUEST_SEED
+        } else {
+            seed
+        }
+    }
+
     /// A new TPM whose `GetRandom` PRNG and Endorsement Primary Seed are derived
     /// from a per-guest `guest_seed`, so two guests never share random output or
     /// endorsement identity (each guest's Endorsement Key derives from its own
@@ -753,6 +780,14 @@ impl SharedTpm {
         )))
     }
 
+    /// Wrap a fresh per-guest TPM whose seed is derived from a guest's `name`
+    /// via [`VirtualTpm::seed_for_guest`] — the one-call path from a configured
+    /// guest identity to a stable, distinct vTPM.
+    #[must_use]
+    pub fn for_guest(interface: TpmInterface, name: &str) -> Self {
+        Self::seeded(interface, VirtualTpm::seed_for_guest(name))
+    }
+
     /// Run `f` with exclusive access to the TPM — to drive a command, read a
     /// PCR, or inspect state.
     ///
@@ -1136,6 +1171,30 @@ mod tests {
             get16(VirtualTpm::seeded(TpmInterface::Crb, 2)),
             "distinct-seed guests must produce distinct random bytes"
         );
+    }
+
+    #[test]
+    fn seed_for_guest_is_stable_per_name_and_distinct_across_names() {
+        // Same name -> same seed (EK identity survives reboots/config reloads).
+        assert_eq!(
+            VirtualTpm::seed_for_guest("windows1"),
+            VirtualTpm::seed_for_guest("windows1")
+        );
+        // Different names -> different seeds.
+        assert_ne!(
+            VirtualTpm::seed_for_guest("windows1"),
+            VirtualTpm::seed_for_guest("linux1")
+        );
+        // Never the zero sentinel.
+        assert_ne!(VirtualTpm::seed_for_guest(""), 0);
+
+        // End to end: two guests built by name have distinct endorsement seeds,
+        // and the same name reproduces the same one.
+        let eps = |name: &str| {
+            SharedTpm::for_guest(TpmInterface::Crb, name).with(|t| t.endorsement_primary_seed())
+        };
+        assert_ne!(eps("windows1"), eps("linux1"));
+        assert_eq!(eps("windows1"), eps("windows1"));
     }
 
     #[test]
