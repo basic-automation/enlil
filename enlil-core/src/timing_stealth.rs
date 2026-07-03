@@ -283,6 +283,55 @@ mod tests {
     }
 
     #[test]
+    fn iet_ratio_does_not_diverge_across_many_interleaved_exits() {
+        // Model a pafish/al-khaser-style IET (Instruction-Emulation-Time)
+        // detector: a guest interleaves real execution with many hypervisor
+        // exits and, at each sample, reads IA32_APERF/IA32_MPERF and computes the
+        // core-frequency ratio. On bare metal that ratio is rock-steady; a naive
+        // hypervisor that lets exit overhead leak into one counter but not the
+        // other makes it wobble in a detectable way. Drive the stealth shadows
+        // through that interleaving and assert the sampled ratio never strays from
+        // the model ratio beyond a tight tolerance — the anti-detection guarantee
+        // (Phase 5.8), exercising the 5.4 timing-stealth path end to end.
+        let model = PmcRateModel::DEFAULT;
+        let state = VcpuTimingState::new();
+        let model_ratio = model.core_per_kilo_ref as f64 / 1000.0;
+
+        // A realistic starting TSC so exit timestamps look like real rdtsc reads.
+        let mut tsc: u64 = 0x1_0000_0000;
+        // Establish the non-1.0 ratio from an initial slice of execution.
+        state.advance(500_000, &model);
+
+        let mut max_dev = 0.0_f64;
+        for i in 0..1000u64 {
+            // A slice of guest execution advances both shadows at the model rates.
+            let ref_cycles = 10_000 + (i % 7) * 1_234;
+            state.advance(ref_cycles, &model);
+            tsc += ref_cycles;
+
+            // A hypervisor exit of varying — sometimes large — overhead the guest
+            // must not be able to see in either counter.
+            state.on_vmexit(tsc);
+            let overhead = 200 + (i % 13) * 90;
+            tsc += overhead;
+            state.on_vmresume(tsc, 0x1000 + i);
+
+            // The guest samples the two MSRs and computes the frequency ratio.
+            let aperf = state.read_aperf() as f64;
+            let mperf = state.read_mperf() as f64;
+            assert!(mperf > 0.0, "MPERF must keep advancing");
+            max_dev = max_dev.max((aperf / mperf - model_ratio).abs());
+        }
+
+        // Over 1000 interleaved exits the sampled ratio stays glued to the model
+        // ratio; only sub-cycle integer truncation may drift it.
+        assert!(
+            max_dev < 1e-3,
+            "IET ratio diverged by {max_dev} across 1000 exits (model ratio {model_ratio})"
+        );
+    }
+
+    #[test]
     fn test_tsc_offset_calculation() {
         let mut helper = TscOffsetHelper::new(0);
         helper.calculate_offset(1000, 2000);

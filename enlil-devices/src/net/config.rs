@@ -28,6 +28,49 @@ impl MacAddress {
     pub const fn as_bytes(&self) -> &[u8; 6] {
         &self.0
     }
+
+    /// The 24-bit Organizationally Unique Identifier (the first three octets).
+    #[must_use]
+    pub const fn oui(self) -> [u8; 3] {
+        [self.0[0], self.0[1], self.0[2]]
+    }
+
+    /// Whether the address is locally administered (bit 1 of the first octet).
+    /// A locally-administered address carries no registered vendor identity, so
+    /// it reveals nothing about the underlying hardware — the safe default for a
+    /// synthesized guest NIC.
+    #[must_use]
+    pub const fn is_locally_administered(self) -> bool {
+        self.0[0] & 0x02 != 0
+    }
+
+    /// OUIs registered to virtualization vendors, which a guest-side detector
+    /// (pafish/al-khaser, and plain `ip link`) treats as a hypervisor tell.
+    /// A synthesized guest NIC must never present one of these.
+    const HYPERVISOR_OUIS: [[u8; 3]; 10] = [
+        [0x52, 0x54, 0x00], // QEMU / KVM virtio-net
+        [0x00, 0x16, 0x3E], // Xen
+        [0x00, 0x15, 0x5D], // Microsoft Hyper-V
+        [0x00, 0x1C, 0x42], // Parallels
+        [0x08, 0x00, 0x27], // Oracle VirtualBox
+        [0x0A, 0x00, 0x27], // VirtualBox host-only
+        [0x00, 0x05, 0x69], // VMware
+        [0x00, 0x0C, 0x29], // VMware
+        [0x00, 0x1C, 0x14], // VMware
+        [0x00, 0x50, 0x56], // VMware
+    ];
+
+    /// Whether this address's OUI is registered to a virtualization vendor and
+    /// so would betray the hypervisor to a guest inspecting its own NIC (Phase
+    /// 5.8 NIC-OUI check). Config validation should reject a guest MAC for which
+    /// this is `true`; prefer a locally-administered address
+    /// ([`is_locally_administered`](Self::is_locally_administered)) or a real
+    /// physical-vendor OUI instead.
+    #[must_use]
+    pub fn is_hypervisor_oui(self) -> bool {
+        let oui = self.oui();
+        Self::HYPERVISOR_OUIS.contains(&oui)
+    }
 }
 
 impl std::fmt::Display for MacAddress {
@@ -123,6 +166,29 @@ mod tests {
     fn test_mac_display() {
         let mac = MacAddress([0x02, 0xAB, 0xCD, 0xEF, 0x01, 0x23]);
         assert_eq!(format!("{mac}"), "02:ab:cd:ef:01:23");
+    }
+
+    #[test]
+    fn flags_hypervisor_ouis_and_clears_transparent_ones() {
+        // QEMU/KVM's virtio-net OUI is the classic tell.
+        assert!(MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]).is_hypervisor_oui());
+        // A few more vendors a detector checks.
+        assert!(MacAddress([0x00, 0x16, 0x3E, 0, 0, 1]).is_hypervisor_oui()); // Xen
+        assert!(MacAddress([0x00, 0x15, 0x5D, 0, 0, 1]).is_hypervisor_oui()); // Hyper-V
+        assert!(MacAddress([0x08, 0x00, 0x27, 0, 0, 1]).is_hypervisor_oui()); // VirtualBox
+        assert!(MacAddress([0x00, 0x0C, 0x29, 0, 0, 1]).is_hypervisor_oui()); // VMware
+
+        // A locally-administered address betrays no vendor: transparent.
+        let la = MacAddress([0x02, 0xAB, 0xCD, 0x01, 0x02, 0x03]);
+        assert!(la.is_locally_administered());
+        assert!(!la.is_hypervisor_oui());
+        assert_eq!(la.oui(), [0x02, 0xAB, 0xCD]);
+
+        // A real physical-vendor OUI (Dell) is not flagged, and is globally
+        // administered (bit 1 clear).
+        let dell = MacAddress([0x00, 0x14, 0x22, 0x11, 0x22, 0x33]);
+        assert!(!dell.is_hypervisor_oui());
+        assert!(!dell.is_locally_administered());
     }
 
     #[test]

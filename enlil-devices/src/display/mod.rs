@@ -278,6 +278,51 @@ impl Zone {
     }
 }
 
+/// A physical monitor's placement within the virtual desktop.
+///
+/// Each monitor occupies a rectangle of global compositor coordinates: its
+/// origin `(x, y)` is the top-left corner in the virtual desktop that all
+/// monitors together span, and `width`/`height` are its pixel dimensions. Two
+/// side-by-side 1080p monitors are, for example, `(0, 0, 1920, 1080)` and
+/// `(1920, 0, 1920, 1080)`. This is the placement a multi-monitor zone layout
+/// (Phase 3.6) tiles each display within, and that cross-monitor input routing
+/// resolves a global cursor position against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Monitor {
+    pub id: u32,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Monitor {
+    #[must_use]
+    pub const fn new(id: u32, x: u32, y: u32, width: u32, height: u32) -> Self {
+        Self {
+            id,
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// Whether the global point `(px, py)` falls on this monitor.
+    #[must_use]
+    pub const fn contains_point(&self, px: u32, py: u32) -> bool {
+        px >= self.x && px < self.x + self.width && py >= self.y && py < self.y + self.height
+    }
+
+    /// Find which monitor in `monitors` contains the global point `(px, py)`,
+    /// or `None` if the point falls in a gap between displays. The first match
+    /// wins, so overlapping monitors resolve to the earlier entry.
+    #[must_use]
+    pub fn at(monitors: &[Self], px: u32, py: u32) -> Option<&Self> {
+        monitors.iter().find(|m| m.contains_point(px, py))
+    }
+}
+
 /// Zone layout configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZoneLayout {
@@ -379,22 +424,70 @@ impl ZoneLayoutEngine {
             (layout.screen_width, layout.screen_height)
         };
         self.layout.write().unwrap().zones.clear();
+        self.tile_region((0, 0, sw, sh), rows, cols, "zone")
+    }
+
+    /// Append a `rows` × `cols` grid of zones that exactly tiles the rectangular
+    /// `region` `(x, y, width, height)` (in global coordinates), **without**
+    /// clearing existing zones. Integer-division remainder is absorbed by the
+    /// last column and row so the region is covered with no gaps or overlaps.
+    /// Zones are named `<name_prefix>-<row>-<col>`. Returns the new zone ids in
+    /// row-major order; `rows` or `cols` of 0 adds nothing.
+    ///
+    /// This is the shared tiling primitive behind [`tile_grid`](Self::tile_grid)
+    /// (which tiles the whole screen) and [`tile_monitors`](Self::tile_monitors)
+    /// (which tiles each display's region), so a per-monitor layout reuses the
+    /// exact edge-remainder handling the single-screen path is tested for.
+    ///
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
+    #[must_use]
+    pub fn tile_region(
+        &self,
+        region: (u32, u32, u32, u32),
+        rows: u32,
+        cols: u32,
+        name_prefix: &str,
+    ) -> Vec<u32> {
+        let (rx, ry, rw, rh) = region;
         if rows == 0 || cols == 0 {
             return Vec::new();
         }
-        let cell_w = sw / cols;
-        let cell_h = sh / rows;
+        let cell_w = rw / cols;
+        let cell_h = rh / rows;
         let mut ids = Vec::with_capacity((rows * cols) as usize);
         for r in 0..rows {
             for c in 0..cols {
-                let x = c * cell_w;
-                let y = r * cell_h;
-                // The last column/row stretches to the screen edge so integer
+                let x = rx + c * cell_w;
+                let y = ry + r * cell_h;
+                // The last column/row stretches to the region's edge so integer
                 // remainders never leave an uncovered strip.
-                let w = if c == cols - 1 { sw - x } else { cell_w };
-                let h = if r == rows - 1 { sh - y } else { cell_h };
-                ids.push(self.create_zone(x, y, w, h, format!("zone-{r}-{c}")));
+                let w = if c == cols - 1 { rx + rw - x } else { cell_w };
+                let h = if r == rows - 1 { ry + rh - y } else { cell_h };
+                ids.push(self.create_zone(x, y, w, h, format!("{name_prefix}-{r}-{c}")));
             }
+        }
+        ids
+    }
+
+    /// Replace the layout with a per-monitor tiling: each `(monitor, rows, cols)`
+    /// plan tiles that monitor's region with its own grid, so a multi-monitor
+    /// desktop gets an independent tiling per physical display (Phase 3.6). Zones
+    /// are named `mon<id>-<row>-<col>`, and every zone sits at its monitor's
+    /// global origin, so [`ZoneLayout::find_zone_at`] resolves a global cursor
+    /// position to the right zone on the right monitor. Returns all new zone ids
+    /// in plan order.
+    ///
+    /// # Panics
+    /// Panics if an internal lock is poisoned.
+    #[must_use]
+    pub fn tile_monitors(&self, plans: &[(Monitor, u32, u32)]) -> Vec<u32> {
+        self.layout.write().unwrap().zones.clear();
+        let mut ids = Vec::new();
+        for (mon, rows, cols) in plans {
+            let prefix = format!("mon{}", mon.id);
+            let region = (mon.x, mon.y, mon.width, mon.height);
+            ids.extend(self.tile_region(region, *rows, *cols, &prefix));
         }
         ids
     }
@@ -959,6 +1052,54 @@ mod tests {
         // A zero dimension clears the layout.
         assert!(engine.tile_grid(0, 4).is_empty());
         assert!(engine.get_layout().zones.is_empty());
+    }
+
+    #[test]
+    fn tile_monitors_gives_each_display_its_own_grid_at_its_global_origin() {
+        // Two side-by-side 1080p monitors forming a 3840x1080 virtual desktop.
+        let left = Monitor::new(0, 0, 0, 1920, 1080);
+        let right = Monitor::new(1, 1920, 0, 1920, 1080);
+        // The engine's own screen spans the whole virtual desktop.
+        let engine = ZoneLayoutEngine::new(3840, 1080);
+
+        // Left monitor split into 2 columns, right monitor a single full zone.
+        let ids = engine.tile_monitors(&[(left, 1, 2), (right, 1, 1)]);
+        assert_eq!(ids.len(), 3);
+        let layout = engine.get_layout();
+
+        // The three zones tile both monitors exactly (areas sum to the desktop).
+        let area: u64 = layout
+            .zones
+            .iter()
+            .map(|z| u64::from(z.width) * u64::from(z.height))
+            .sum();
+        assert_eq!(area, 3840 * 1080);
+
+        // A point on the left monitor's right half and one on the right monitor
+        // resolve to different zones — the right-monitor zone starts at x=1920.
+        let left_half = layout.find_zone_at(1000, 500).expect("left covered");
+        let right_zone = layout.find_zone_at(2500, 500).expect("right covered");
+        assert_ne!(left_half.id, right_zone.id);
+        assert_eq!(
+            right_zone.x, 1920,
+            "right monitor's zone at its global origin"
+        );
+        assert_eq!(right_zone.width, 1920);
+    }
+
+    #[test]
+    fn monitor_at_resolves_a_global_point_or_reports_a_gap() {
+        let a = Monitor::new(0, 0, 0, 1920, 1080);
+        // A second monitor mounted to the right but leaving a 80px gap.
+        let b = Monitor::new(1, 2000, 0, 1920, 1080);
+        let mons = [a, b];
+
+        assert_eq!(Monitor::at(&mons, 10, 10).map(|m| m.id), Some(0));
+        assert_eq!(Monitor::at(&mons, 2500, 10).map(|m| m.id), Some(1));
+        // A point in the gap belongs to no monitor.
+        assert!(Monitor::at(&mons, 1960, 10).is_none());
+        // Just inside monitor b's left edge.
+        assert_eq!(Monitor::at(&mons, 2000, 0).map(|m| m.id), Some(1));
     }
 
     #[test]

@@ -806,6 +806,31 @@ impl DeviceBus {
         rtc_unix_secs: u64,
         vcpu_count: u8,
     ) -> Result<StandardPc, enlil_devices::bus::BusError> {
+        Self::standard_pc_complete_seeded(serial_output, rtc_unix_secs, vcpu_count, None)
+    }
+
+    /// Like [`standard_pc_complete`](Self::standard_pc_complete) but seeds the
+    /// guest's vTPM from `tpm_seed` so each guest gets a distinct endorsement
+    /// identity and `GetRandom` stream.
+    ///
+    /// `Some(seed)` derives the per-guest TPM identity via
+    /// [`SharedTpm::seeded`](enlil_devices::tpm::SharedTpm::seeded) — two guests
+    /// built with different seeds never share an Endorsement Key or random
+    /// output, which a Windows guest's TPM-backed BitLocker/Hello identity
+    /// depends on. `None` reproduces the default-seeded TPM of
+    /// [`standard_pc_complete`](Self::standard_pc_complete) for callers that do
+    /// not distinguish guests (tests, single-guest bring-up). Derive `tpm_seed`
+    /// from a stable per-guest value (e.g. the guest name) so the identity is
+    /// reproducible across reboots.
+    ///
+    /// # Errors
+    /// As [`standard_pc_complete`](Self::standard_pc_complete).
+    pub fn standard_pc_complete_seeded(
+        serial_output: SerialOutput,
+        rtc_unix_secs: u64,
+        vcpu_count: u8,
+        tpm_seed: Option<u64>,
+    ) -> Result<StandardPc, enlil_devices::bus::BusError> {
         let pic = SharedPic::new();
         let ioapic = SharedInterruptController::new(vcpu_count);
         let rtc = SharedRtc::new(RtcTime::from_unix(rtc_unix_secs));
@@ -1020,7 +1045,12 @@ impl DeviceBus {
 
         // TPM 2.0 CRB at 0xFED4_0000 — Windows 11 requires it; Linux's tpm_crb
         // driver binds it too. Shared so the host can seed/inspect the device.
-        let tpm = SharedTpm::new(enlil_devices::tpm::TpmInterface::Crb);
+        // A per-guest `tpm_seed` gives this guest a distinct Endorsement Key and
+        // GetRandom stream; `None` keeps the default-seeded identity.
+        let tpm = match tpm_seed {
+            Some(seed) => SharedTpm::seeded(enlil_devices::tpm::TpmInterface::Crb, seed),
+            None => SharedTpm::new(enlil_devices::tpm::TpmInterface::Crb),
+        };
         bus.add_tpm(&tpm)?;
 
         Ok(StandardPc {
@@ -2974,6 +3004,42 @@ mod tests {
         assert_eq!(data[0], 0);
         VmExitHandler::io_in(&mut bus, SMBUS_IO_BASE + HST_STS, &mut data);
         assert_eq!(data[0], STS_INUSE);
+    }
+
+    /// A per-guest `tpm_seed` gives each guest a distinct vTPM identity: two PCs
+    /// assembled with different seeds expose different Endorsement Primary Seeds
+    /// (so no two guests share an EK), while the default (`None`) path matches
+    /// [`standard_pc_complete`](DeviceBus::standard_pc_complete) — a guest's
+    /// TPM-backed BitLocker/Hello identity must not collide with another's.
+    #[test]
+    fn standard_pc_complete_seeds_a_distinct_per_guest_tpm() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+
+        let seed = |s: Option<u64>| {
+            DeviceBus::standard_pc_complete_seeded(
+                SerialOutput::new("g", SerialOutputMode::Null),
+                0,
+                1,
+                s,
+            )
+            .unwrap()
+            .tpm
+            .with(|t| t.endorsement_primary_seed())
+        };
+
+        // Distinct seeds -> distinct endorsement identities.
+        assert_ne!(seed(Some(1)), seed(Some(2)));
+        // A seed is deterministic (stable EK across reboots for the same guest).
+        assert_eq!(seed(Some(7)), seed(Some(7)));
+        // The default (None) path matches the plain constructor's TPM identity.
+        let plain =
+            DeviceBus::standard_pc_complete(SerialOutput::new("g", SerialOutputMode::Null), 0, 1)
+                .unwrap()
+                .tpm
+                .with(|t| t.endorsement_primary_seed());
+        assert_eq!(seed(None), plain);
+        // A seeded guest differs from the default identity.
+        assert_ne!(seed(Some(1)), plain);
     }
 
     /// The SMBus completion interrupt travels the whole path a real one does:
