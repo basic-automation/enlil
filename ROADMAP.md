@@ -113,7 +113,7 @@
   - [x] Zone / ZoneLayout / ZoneLayoutEngine (grid tiling, find-zone-at)
   - [x] InputRouter focus + zone-boundary input routing
   - [x] HotkeyConfig (cycle layout / next guest / focus) and composite_frame pass
-  - [ ] per-monitor multi-monitor layouts
+  - [x] per-monitor multi-monitor layouts (Monitor placement + Monitor::at global-point routing; ZoneLayoutEngine::tile_region / tile_monitors tile each display's region at its global origin)
 - [x] 3.7 Inter-guest bridge over a BridgeTransport trait (clipboard/DnD/shared-fs/notify)
   - [x] BridgeTransport trait + LocalVirtioTransport (8-queue dispatch)
   - [x] clipboard bridge (3.7.1)
@@ -138,14 +138,15 @@
   - [x] UsbMonitor enumerating devices and tracking connect/disconnect (hot-plug) events
   - [x] Identify devices by VID:PID, serial number, and physical port path
   - [x] Live device inventory queryable by port/VID:PID for the console
-  - [ ] Concrete host-source enumeration backend (bare-metal xHCI port scan / Linux sysfs+udev) wired to the monitor
+  - [x] Concrete Linux sysfs host-source enumeration backend wired to the monitor (usb::sysfs: parse_device/scan_devices/sync_monitor diff a /sys/bus/usb/devices scan into report_connect/report_disconnect; poll() self-throttles to the monitor's poll_interval)
+  - [ ] Bare-metal xHCI port-scan host-source backend (the sysfs backend covers the Linux dev path; the bare-metal source lands with Phase 6.5's xHCI driver)
 - [x] 4.3 Routing policy engine mapping devices to guests with live re-routing and hot-plug attach
   - [x] Device matchers: VID:PID, vendor-only, port path, serial, class, and default (Any)
   - [x] RoutingTable/RoutingState resolving a device to its target guest by priority
   - [x] Live re-routing of a device between guests at runtime (reassign)
   - [x] HotplugDispatcher bridging monitor callbacks to the run loop and applying rules on plug-in
   - [x] Config-driven [usb.routing] TOML block parsed by enlil-config (UsbConfig + parse_usb_match + validation) and converted to a RoutingTable by enlil-core::usb_routing::routing_table_from_config
-  - [ ] Wire routing_table_from_config into the run-loop/guest setup so a configured [usb.routing] populates the live RoutingState (adapter landed; no caller yet)
+  - [ ] Wire routing_state_from_config into the run-loop/guest setup so a configured [usb.routing] populates the live RoutingState (both adapters landed: routing_table_from_config + routing_state_from_config build a live RoutingState in one call; the actual guest-setup caller is blocked on the top-level orchestrator binary, item 3.12)
 - [x] 4.4 Virtual xHCI (USB 3.x) host controller per guest with TRB-level interception
   - [x] VirtualXhciController with cap/operational/runtime/port registers behind one MMIO window (XhciMmio)
   - [x] Mounted as a discrete Renesas uPD720202 PCI function (1912:0015) at 00:04.0 with INTx/PIRQ delivery
@@ -186,18 +187,18 @@
 - [x] 5.5 Virtual TPM 2.0 (CRB interface, MMIO 0xFED40000, per-guest PCR banks/NV storage)
   - [x] CRB register interface + TPM2 command dispatch (Startup/SelfTest/PcrExtend/PcrRead/GetRandom/NvRead/NvWrite)
   - [x] Independent per-guest endorsement key generation (VirtualTpm::seeded derives a distinct GetRandom stream + Endorsement Primary Seed per guest via domain-separated SHA-256; deterministic so the EK is stable across reboots, persisted in the state store)
-  - [ ] Wire the per-guest TPM seed through standard_pc_complete / guest setup so each guest's vTPM gets a distinct seed (mechanism landed; the live path still builds the TPM via SharedTpm::new with the default seed)
+  - [x] Wire the per-guest TPM seed through standard_pc_complete / guest setup so each guest's vTPM gets a distinct seed (DeviceBus::standard_pc_complete_seeded takes an optional per-guest seed and builds the CRB vTPM via SharedTpm::seeded; VirtualTpm::seed_for_guest / SharedTpm::for_guest derive a stable distinct seed from the guest name — a guest-setup caller passes Some(seed_for_guest(&guest.name)))
   - [x] On-disk persistent TPM state store (BitLocker/Windows Hello): save_state/load_state/with_state_path persist NV storage + endorsement seed + RNG to state_path (PCRs stay volatile), tolerant of a missing/malformed file
 - [ ] 5.6 Windows boot path via OVMF — provide/load virtual UEFI firmware image per guest and boot Windows in UEFI mode
 - [x] 5.7 Windows-specific virtual devices (HDA audio, PS/2 kbd/mouse, PCIe root complex, ACPI power management)
   - [x] Intel HDA controller + codec device model
   - [x] PS/2 keyboard and mouse (i8042) fallback devices
   - [x] PCIe root complex / host bridge
-  - [ ] ACPI S3/S4 sleep states (only S5 shutdown is defined in DSDT)
+  - [x] ACPI S3/S4 sleep states advertised in the DSDT (\_S3 suspend-to-RAM, \_S4 hibernate, \_S5 soft-off from canonical SLP_TYP_S3/S4/S5; run loop classifies a committed transition as LoopOutcome::Suspend vs Shutdown) — NEXT SLICE: actually save/restore vCPU+device state across a Suspend and re-enter at the FACS firmware waking vector (S3 resume); today the loop returns Suspend to the owner but no resume path exists yet
 - [ ] 5.8 Anti-detection test suite (in-guest hypervisor-presence checks, IET divergence, LBR analysis, pafish/al-khaser, AML fuzzing)
   - [x] iasl AML validation gate
-  - [ ] In-guest automated detection test suite (CPUID/RDTSC/registry/device/NIC-OUI checks)
-  - [ ] Custom IET divergence test using IA32_APERF/MPERF
+  - [ ] In-guest automated detection test suite (CPUID/RDTSC/registry/device/NIC-OUI checks) — host-side NIC-OUI primitive landed (MacAddress::is_hypervisor_oui flags QEMU/Xen/Hyper-V/VMware/VirtualBox/Parallels OUIs, plus is_locally_administered/oui); still need the in-guest agent and to reject a hypervisor-OUI MAC in config validation once a guest NIC MAC config field exists
+  - [x] Custom IET divergence test using IA32_APERF/MPERF (iet_ratio_does_not_diverge_across_many_interleaved_exits: 1000 interleaved advance/exit cycles, sampled ratio pinned to the model ratio within 1e-3)
   - [ ] pafish + al-khaser runs and anti-cheat (BattlEye/EAC/Vanguard) validation
   - [ ] ACPI AML fuzzing (BadAML)
 - [x] 5.9 CPUID 0x15/0x16 TSC/processor-frequency leaves pinned to measured guest tsc_khz, threaded through topology stealth
