@@ -35,6 +35,7 @@ pub mod hotplug;
 pub mod monitor;
 pub mod registry;
 pub mod routing;
+pub mod sysfs;
 pub mod types;
 pub mod xhci;
 
@@ -53,6 +54,7 @@ pub use hotplug::{HotplugDispatcher, HotplugOutcome};
 pub use monitor::{UsbHotplugEvent, UsbMonitor};
 pub use registry::{AttachOutcome, DevicePlacement, RegistryError, XhciRegistry};
 pub use routing::{RoutingRule, RoutingState, RoutingTable};
+pub use sysfs::{SYSFS_USB_DEVICES, scan_devices, sync_monitor};
 pub use xhci::{
     CONTROL_DCI, CapabilityRegisters, CommandRing, CommandTrb, DmaMemory, DoorbellArray,
     DoorbellTarget, EventRing, EventTrb, InterrupterRegisterSet, NormalTrb, OperationalRegisters,
