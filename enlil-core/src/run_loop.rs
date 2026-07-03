@@ -38,6 +38,7 @@ mod linux {
     use crate::kvm_backend::{GuestExit, KvmBackend};
     use crate::timing_stealth::VcpuTimingState;
     use crate::Result;
+    use enlil_devices::acpi::{SLP_TYP_S3, SLP_TYP_S4};
     use enlil_devices::interrupt::IA32_TSC_DEADLINE;
     use enlil_devices::stealth::lbr::LbrPlatform;
     use enlil_devices::stealth::pmc::PmcRateModel;
@@ -65,9 +66,20 @@ mod linux {
         /// The guest executed `HLT` and the run returned (no in-kernel IRQ chip,
         /// or nothing pending to wake it).
         Halted,
-        /// The guest committed an ACPI sleep transition; the `SLP_TYP` value
-        /// (the DSDT's `_S5` value, `5`, means **power off**).
+        /// The guest committed an ACPI **soft-off** transition (the DSDT's `_S5`
+        /// value); the carried `SLP_TYP` means **power off**. Any `SLP_TYP` the
+        /// run loop does not recognize as a suspend state also lands here, so an
+        /// unexpected value defaults to the safe power-down semantics.
         Shutdown(u8),
+        /// The guest committed a **suspend** transition — ACPI S3 (suspend-to-RAM,
+        /// the DSDT's `_S3` value) or S4 (hibernate, `_S4`) — carrying the
+        /// `SLP_TYP`. Distinct from [`Shutdown`](Self::Shutdown): the owner saves
+        /// guest state and later resumes the same vCPU rather than tearing it
+        /// down. Kept a separate outcome so advertising `_S3`/`_S4` in the DSDT
+        /// (a Windows transparency requirement) does not silently collapse a
+        /// suspend into a power-off — which would strand a guest that expected to
+        /// resume.
+        Suspend(u8),
         /// `max_entries` elapsed without the guest halting or sleeping — the
         /// bound that keeps a never-halting or reboot-looping guest from
         /// spinning here forever.
@@ -419,7 +431,14 @@ mod linux {
                 let _ = self.advance_rtc_from_wall_clock();
                 match step.event {
                     Some(PlatformEvent::Sleep(slp_typ)) => {
-                        return Ok(LoopOutcome::Shutdown(slp_typ));
+                        // Classify the committed sleep transition: S3/S4 are
+                        // suspend states the owner resumes from; S5 (and any
+                        // unrecognized value) is a power-off. The SLP_TYP values
+                        // are the DSDT's `_Sx` values (enlil_devices::acpi).
+                        return Ok(match slp_typ {
+                            SLP_TYP_S3 | SLP_TYP_S4 => LoopOutcome::Suspend(slp_typ),
+                            _ => LoopOutcome::Shutdown(slp_typ),
+                        });
                     }
                     Some(PlatformEvent::Reset) => {
                         // Reboot: restart the boot vCPU at its reset vector.
@@ -2020,6 +2039,66 @@ mod tests {
             outcome,
             LoopOutcome::Shutdown(S5),
             "guest committed an S5 power-off via PM1a_CNT"
+        );
+    }
+
+    // run_real_mode returns Suspend (not Shutdown) on an ACPI S3 commit: a guest
+    // that writes SLP_TYP=3 | SLP_EN to PM1a_CNT (0x604) is entering
+    // suspend-to-RAM, which the loop must surface as LoopOutcome::Suspend(3) so
+    // the owner resumes the vCPU rather than tearing it down — advertising _S3 in
+    // the DSDT would strand the guest otherwise.
+    #[test]
+    fn run_real_mode_suspends_on_acpi_s3() {
+        if !is_kvm_available() {
+            eprintln!("skipping run_real_mode_suspends_on_acpi_s3: no /dev/kvm");
+            return;
+        }
+
+        // out 0x604, ax where ax = (3<<10)|(1<<13) = 0x2C00 (SLP_TYP=3, SLP_EN).
+        #[rustfmt::skip]
+        let code: [u8; 8] = [
+            0xBA, 0x04, 0x06,       // mov dx, 0x604
+            0xB8, 0x00, 0x2C,       // mov ax, 0x2C00
+            0xEF,                   // out dx, ax (word)
+            0xF4,                   // hlt (not reached)
+        ];
+        const ENTRY: u64 = 0x1000;
+        const S3: u8 = 3;
+
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            0,
+            1,
+        )
+        .expect("build standard pc");
+        let backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        let mut run = match StealthRunLoop::install(backend, pc, LbrPlatform::AmdSvm) {
+            Ok(run) => run,
+            Err(e) => {
+                eprintln!("skipping run_real_mode_suspends_on_acpi_s3: {e}");
+                return;
+            }
+        };
+
+        let mut ram = GuestRam::new(0x1000);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+        // SAFETY: `ram` outlives `run` within this test scope.
+        unsafe {
+            run.backend_mut()
+                .map_memory(ENTRY, host_addr, ram.len() as u64)
+        }
+        .expect("map guest memory");
+        run.create_vcpu(0).expect("create vcpu");
+        run.backend_mut()
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        let outcome = run.run_real_mode(0, ENTRY, 100).expect("run real mode");
+        assert_eq!(
+            outcome,
+            LoopOutcome::Suspend(S3),
+            "guest committed an S3 suspend via PM1a_CNT"
         );
     }
 

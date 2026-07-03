@@ -6,10 +6,11 @@
 //! - ISA/LPC bridge
 //! - RTC, keyboard controller, COM ports
 //! - Processor objects
-//! - Power management (_S5 sleep state for shutdown)
+//! - Power management (_S3 suspend, _S4 hibernate, _S5 shutdown sleep states)
 
 use super::aml::{AmlBuilder, ResourceTemplate, opcode};
 use super::tables::{AcpiSdtHeader, OemInfo};
+use super::{SLP_TYP_S3, SLP_TYP_S4, SLP_TYP_S5};
 use crate::truncate::u32_of;
 
 /// DSDT builder configuration
@@ -493,15 +494,25 @@ impl DsdtBuilder {
         aml.scope_end(&pr);
     }
 
-    /// Build sleep state objects (\S5 for shutdown)
+    /// Build sleep state objects (\_S3 suspend-to-RAM, \_S4 hibernate, \_S5 soft
+    /// off).
     fn build_sleep_states(aml: &mut AmlBuilder) {
-        // \_S5 (soft off) — required for ACPI shutdown. _Sx must be a *Package*
-        // of { PM1a_CNT.SLP_TYP, PM1b_CNT.SLP_TYP, reserved, reserved }; the OS
-        // evaluates it and writes element 0 to PM1a_CNT to power off. SLP_TYP = 5
-        // matches the value the chipset PM1a model captures as a shutdown request
-        // (see enlil_devices::chipset). Emitting it as a bare integer (as before)
-        // left the guest with no usable S5 object, breaking ACPI shutdown.
-        aml.name_package(b"_S5_", &[5, 5, 0, 0]);
+        // Each _Sx must be a *Package* of { PM1a_CNT.SLP_TYP, PM1b_CNT.SLP_TYP,
+        // reserved, reserved }; the OS evaluates it and writes element 0 to
+        // PM1a_CNT (with SLP_EN) to enter that state. The SLP_TYP values match
+        // what the chipset PM1a model captures and the run loop classifies (see
+        // enlil_devices::acpi::SLP_TYP_S3/S4/S5 and enlil_devices::chipset).
+        //
+        // Advertising \_S3/\_S4 — not just \_S5 — is a transparency requirement:
+        // real firmware exposes suspend-to-RAM and hibernate, and Windows hides
+        // its Sleep/Hibernate power options (an observable divergence from bare
+        // metal) when the DSDT lacks these objects.
+        let s3 = u64::from(SLP_TYP_S3);
+        let s4 = u64::from(SLP_TYP_S4);
+        let s5 = u64::from(SLP_TYP_S5);
+        aml.name_package(b"_S3_", &[s3, s3, 0, 0]);
+        aml.name_package(b"_S4_", &[s4, s4, 0, 0]);
+        aml.name_package(b"_S5_", &[s5, s5, 0, 0]);
     }
 
     /// Build the DSDT as a byte vector
@@ -840,6 +851,37 @@ mod tests {
             dsdt[pos..].windows(slp.len()).any(|w| w == slp),
             "_S5 package must yield SLP_TYP 5 for PM1a and PM1b"
         );
+        let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        assert_eq!(sum, 0);
+    }
+
+    #[test]
+    fn dsdt_advertises_s3_and_s4_sleep_packages() {
+        use super::super::aml::opcode;
+        use super::super::{SLP_TYP_S3, SLP_TYP_S4};
+        let dsdt = DsdtBuilder::new(DsdtConfig::default()).build();
+
+        // Each of _S3/_S4 must be present as a Package yielding its SLP_TYP for
+        // both PM1a and PM1b — the objects Windows reads to enable Sleep and
+        // Hibernate.
+        for (name, slp_typ) in [(b"_S3_", SLP_TYP_S3), (b"_S4_", SLP_TYP_S4)] {
+            let pos = dsdt.windows(4).position(|w| w == name).unwrap_or_else(|| {
+                panic!("DSDT must define {}", std::str::from_utf8(name).unwrap())
+            });
+            assert_eq!(
+                dsdt[pos + 4],
+                opcode::PACKAGE_OP,
+                "{} must be a Package",
+                std::str::from_utf8(name).unwrap()
+            );
+            let slp = [0x0Au8, slp_typ, 0x0A, slp_typ];
+            assert!(
+                dsdt[pos..].windows(slp.len()).any(|w| w == slp),
+                "{} package must yield its SLP_TYP for PM1a and PM1b",
+                std::str::from_utf8(name).unwrap()
+            );
+        }
+        // The whole table still checksums to zero with the extra objects.
         let sum: u8 = dsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         assert_eq!(sum, 0);
     }

@@ -41,6 +41,22 @@ pub mod xsdt;
 
 use tables::OemInfo;
 
+/// Canonical `SLP_TYP` value for ACPI **S3** (suspend-to-RAM) in enlil's DSDT.
+///
+/// The DSDT's `\_S3` package advertises this value and the guest writes it (with
+/// `SLP_EN`) to `PM1a_CNT` to suspend; the chipset PM1 model captures it and the
+/// run loop classifies it as a suspend transition. enlil uses the `SLP_TYP` =
+/// sleep-state-number convention, so S3→3, S4→4, S5→5 — internally consistent
+/// and distinct, which is all a guest requires (the numeric values are
+/// board-specific on real hardware, discovered from the `_Sx` objects).
+pub const SLP_TYP_S3: u8 = 3;
+/// Canonical `SLP_TYP` value for ACPI **S4** (suspend-to-disk / hibernate).
+/// See [`SLP_TYP_S3`].
+pub const SLP_TYP_S4: u8 = 4;
+/// Canonical `SLP_TYP` value for ACPI **S5** (soft off / power down).
+/// See [`SLP_TYP_S3`].
+pub const SLP_TYP_S5: u8 = 5;
+
 /// Configuration for complete ACPI table set generation
 #[derive(Debug, Clone)]
 pub struct AcpiTableSetConfig {
