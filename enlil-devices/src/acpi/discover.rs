@@ -82,6 +82,31 @@ pub fn find_facs_address(mem: &[u8], rsdp_gpa: u64) -> Option<u64> {
     read_facs_address(fadt)
 }
 
+/// Discover the enabled-CPU count from the firmware's MADT (Phase 6.3).
+///
+/// Locates the MADT (signature `APIC`) via [`find_table`] and counts its enabled
+/// processors with [`count_enabled_cpus`](super::madt::count_enabled_cpus).
+/// `None` if no MADT is present.
+#[must_use]
+pub fn host_cpu_count(mem: &[u8], rsdp_gpa: u64) -> Option<usize> {
+    let madt = table_at(mem, find_table(mem, rsdp_gpa, b"APIC")?)?;
+    Some(super::madt::count_enabled_cpus(madt))
+}
+
+/// Discover the `PCIe` ECAM allocations from the firmware's MCFG (Phase 6.3).
+///
+/// Locates the MCFG (signature `MCFG`) via [`find_table`] and parses its
+/// allocations with
+/// [`parse_mcfg_allocations`](super::mcfg::parse_mcfg_allocations). Empty if no
+/// MCFG is present.
+#[must_use]
+pub fn host_ecam_allocations(mem: &[u8], rsdp_gpa: u64) -> Vec<super::mcfg::McfgAllocation> {
+    find_table(mem, rsdp_gpa, b"MCFG")
+        .and_then(|gpa| table_at(mem, gpa))
+        .map(super::mcfg::parse_mcfg_allocations)
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,6 +174,56 @@ mod tests {
         // The FADT ("FACP") is found at its gpa; an absent table is None.
         assert_eq!(find_table(&ram, RSDP_GPA, b"FACP"), Some(FADT_GPA));
         assert_eq!(find_table(&ram, RSDP_GPA, b"APIC"), None, "no MADT present");
+    }
+
+    #[test]
+    fn discovers_host_cpu_count_and_ecam_from_the_tables() {
+        use crate::acpi::madt::MadtBuilder;
+        use crate::acpi::mcfg::McfgBuilder;
+
+        const MADT_GPA: u64 = 0x2000;
+        const MCFG_GPA: u64 = 0x3000;
+        const XSDT_GPA: u64 = 0x4000;
+        const RSDP_GPA: u64 = 0x5000;
+        let mut ram = vec![0u8; 0x6000];
+        place(&mut ram, MADT_GPA, &MadtBuilder::standard(4).build());
+        place(
+            &mut ram,
+            MCFG_GPA,
+            &McfgBuilder::standard(0xE000_0000).build(),
+        );
+        place(
+            &mut ram,
+            XSDT_GPA,
+            &XsdtBuilder::new()
+                .add_table(MADT_GPA)
+                .add_table(MCFG_GPA)
+                .build(),
+        );
+        place(
+            &mut ram,
+            RSDP_GPA,
+            &RsdpBuilder::new().xsdt_address(XSDT_GPA).build(),
+        );
+
+        assert_eq!(
+            host_cpu_count(&ram, RSDP_GPA),
+            Some(4),
+            "MADT enables 4 CPUs"
+        );
+        let ecam = host_ecam_allocations(&ram, RSDP_GPA);
+        assert_eq!(ecam.len(), 1);
+        assert_eq!(ecam[0].base_address, 0xE000_0000);
+        // A table set without a MADT/MCFG → None / empty.
+        let mut bare = vec![0u8; 0x6000];
+        place(&mut bare, XSDT_GPA, &XsdtBuilder::new().build());
+        place(
+            &mut bare,
+            RSDP_GPA,
+            &RsdpBuilder::new().xsdt_address(XSDT_GPA).build(),
+        );
+        assert_eq!(host_cpu_count(&bare, RSDP_GPA), None);
+        assert!(host_ecam_allocations(&bare, RSDP_GPA).is_empty());
     }
 
     #[test]
