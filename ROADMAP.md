@@ -125,7 +125,7 @@
   - [ ] guest bridge-agent packaging/installers (.deb/.rpm/.msi) (3.7.7)
 - [x] 3.8 Production platform-clock cadence — advance_platform_clocks drives advance_clocks from guest ref-cycles in the run loop
 - [x] 3.9 LAPIC TSC-deadline timer mode (IA32_TSC_DEADLINE install + fire_due_tsc_deadlines against guest TSC)
-- [ ] 3.10 qcow2 refcount-TABLE growth in storage/qcow.rs (sizing primitive refcount_table_clusters_for landed; on-disk grow still bails; BLOCKER: QcowHeader is a plain field, so refcount_table_offset/clusters cannot be updated through &self — NEXT SLICE: make those two header fields interior-mutable, then implement grow + free-old-table and validate with check_consistency)
+- [x] 3.10 qcow2 refcount-TABLE growth in storage/qcow.rs (live refcount-table geometry held in interior-mutable AtomicU64/AtomicU32 on QcowBackend so a &self allocation can grow it; grow_refcount_table appends one self-covering arena at EOF — enlarged table + covering refcount blocks built in memory and written in one pass — copies old entries forward, frees the old table's container clusters, and persists the new offset/clusters into the on-disk header so the grow survives reopen; a growth needing a slot the enlarged table still can't address is refused before any mutation; validated by writing past a 1-cluster table's reach and re-running check_consistency, incl. after reopen)
 - [x] 3.11 Cap the 16550 UART RX FIFO (RX_FIFO_CAPACITY bound + overrun flag)
 - [ ] 3.12 Wire StealthRunLoop::run_real_mode into a top-level guest-boot/orchestrator binary (no binary caller yet)
 - [x] 3.13 Skip the per-entry guest-TSC read when no LAPIC deadline is armed (any_lapic_tsc_deadline_armed gate)
