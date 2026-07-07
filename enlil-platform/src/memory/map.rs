@@ -206,6 +206,65 @@ impl MemoryMap {
             .windows(2)
             .all(|w| w[0].end() <= w[1].base.as_u64())
     }
+
+    /// Carve the hypervisor's boot-time physical regions from this map per `req`
+    /// — a low DMA window (under 4 GiB), the hypervisor heap, and one disjoint
+    /// RAM region per guest (each guest gets its own physical span; LOCKED
+    /// PRINCIPLE 5 — isolation). Returns the assigned [`HypervisorRegions`], or
+    /// `None` if the map cannot satisfy the whole request.
+    ///
+    /// All-or-nothing: the carves are tried on a scratch copy and committed only
+    /// if every one succeeds, so a partial plan never mutates the map. The DMA
+    /// window is carved first (it is the most constrained — it must fall under
+    /// 4 GiB), then the heap, then each guest's RAM.
+    ///
+    /// # Panics
+    /// Panics if `req.align` is not a power of two.
+    #[must_use]
+    pub fn plan_hypervisor_regions(
+        &mut self,
+        req: &MemoryPlanRequest,
+    ) -> Option<HypervisorRegions> {
+        let mut trial = self.clone();
+        let dma_base = trial.carve_below(req.dma_size, req.align, 1u64 << 32)?;
+        let heap_base = trial.carve(req.heap_size, req.align)?;
+        let mut guest_ram = Vec::with_capacity(req.guest_ram_sizes.len());
+        for &size in &req.guest_ram_sizes {
+            let base = trial.carve(size, req.align)?;
+            guest_ram.push(MemoryRegion::new(base, size, MemoryKind::Reserved));
+        }
+        // Every carve succeeded — commit the scratch map.
+        *self = trial;
+        Some(HypervisorRegions {
+            dma: MemoryRegion::new(dma_base, req.dma_size, MemoryKind::Reserved),
+            heap: MemoryRegion::new(heap_base, req.heap_size, MemoryKind::Reserved),
+            guest_ram,
+        })
+    }
+}
+
+/// What [`MemoryMap::plan_hypervisor_regions`] should carve.
+#[derive(Clone, Debug)]
+pub struct MemoryPlanRequest {
+    /// Hypervisor heap size in bytes.
+    pub heap_size: u64,
+    /// Low DMA-window size in bytes (carved under 4 GiB).
+    pub dma_size: u64,
+    /// Per-guest RAM sizes in bytes — one carved region each.
+    pub guest_ram_sizes: Vec<u64>,
+    /// Alignment applied to every carved region (a power of two, e.g. 2 MiB).
+    pub align: u64,
+}
+
+/// The physical regions the hypervisor carved for itself at boot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HypervisorRegions {
+    /// Low DMA bounce-buffer window (under 4 GiB).
+    pub dma: MemoryRegion,
+    /// The hypervisor's own heap.
+    pub heap: MemoryRegion,
+    /// One disjoint RAM region per guest, in request order.
+    pub guest_ram: Vec<MemoryRegion>,
 }
 
 #[cfg(test)]
@@ -327,6 +386,80 @@ mod tests {
             map.total_usable(),
             0x1000,
             "failed carves leave the map untouched"
+        );
+    }
+
+    #[test]
+    fn plan_carves_disjoint_dma_heap_and_per_guest_regions() {
+        // Big RAM above 4 GiB plus a small low region under it.
+        let mut map = MemoryMap::from_regions(vec![
+            usable(0x10_0000, 0x20_0000),       // 1 MiB..3 MiB, under 4 GiB
+            usable(0x1_0000_0000, 0x1000_0000), // 4 GiB.., 256 MiB
+        ]);
+        let req = MemoryPlanRequest {
+            heap_size: 0x40_0000, // 4 MiB
+            dma_size: 0x10_0000,  // 1 MiB
+            guest_ram_sizes: vec![0x100_0000, 0x80_0000],
+            align: 0x20_0000, // 2 MiB
+        };
+        let plan = map.plan_hypervisor_regions(&req).expect("plan fits");
+
+        // DMA is under 4 GiB; heap and guests are carved somewhere valid.
+        assert!(plan.dma.end() <= (1u64 << 32), "DMA window under 4 GiB");
+        assert_eq!(plan.dma.size, req.dma_size);
+        assert_eq!(plan.heap.size, req.heap_size);
+        assert_eq!(plan.guest_ram.len(), 2);
+
+        // Every carved region is 2 MiB-aligned and mutually disjoint.
+        let all = [plan.dma, plan.heap, plan.guest_ram[0], plan.guest_ram[1]];
+        for r in &all {
+            assert!(r.base.is_aligned(0x20_0000), "{r:?} aligned");
+        }
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert!(!a.overlaps(b), "{a:?} and {b:?} must be disjoint");
+            }
+        }
+        assert!(map.is_consistent(), "map stays consistent after planning");
+    }
+
+    #[test]
+    fn plan_is_atomic_on_failure() {
+        // Enough for DMA + heap but not the guest RAM: the whole plan must fail
+        // and leave the map completely untouched.
+        let mut map = MemoryMap::from_regions(vec![usable(0x20_0000, 0x60_0000)]); // 6 MiB
+        let before = map.clone();
+        let req = MemoryPlanRequest {
+            heap_size: 0x40_0000,
+            dma_size: 0x10_0000,
+            guest_ram_sizes: vec![0x40_0000], // no room left for this
+            align: 0x20_0000,
+        };
+        assert!(
+            map.plan_hypervisor_regions(&req).is_none(),
+            "plan cannot fit"
+        );
+        assert_eq!(
+            map.regions(),
+            before.regions(),
+            "a failed plan leaves the map untouched"
+        );
+    }
+
+    #[test]
+    fn plan_dma_must_fit_under_four_gib() {
+        // All RAM is above 4 GiB → the DMA window (and thus the plan) fails even
+        // though there is plenty of RAM overall.
+        let mut map = MemoryMap::from_regions(vec![usable(0x1_0000_0000, 0x1000_0000)]);
+        let req = MemoryPlanRequest {
+            heap_size: 0x20_0000,
+            dma_size: 0x20_0000,
+            guest_ram_sizes: vec![],
+            align: 0x20_0000,
+        };
+        assert!(
+            map.plan_hypervisor_regions(&req).is_none(),
+            "DMA cannot be carved above 4 GiB"
         );
     }
 
