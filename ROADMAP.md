@@ -223,11 +223,11 @@
   - [ ] Host page-table management plus EPT/NPT for guests
   - [ ] Interrupt handling: IDT setup, APIC configuration, APIC preemption timer
   - [ ] Per-CPU data structures (one per core, GS-base TLS); implement baremetal_init() (currently a stub)
-- [ ] 6.3 Parse host firmware ACPI/UEFI tables to discover physical hardware and build Enlil's own device tree (currently only guest-facing ACPI synthesis exists)
-  - [ ] CPU topology from MADT/SRAT
-  - [ ] PCI devices via MCFG ECAM config-space walk
-  - [ ] IOMMU discovery from DMAR (VT-d) / IVRS (AMD-Vi)
-  - [ ] Memory map from UEFI (E820-style conversion)
+- [ ] 6.3 Parse host firmware ACPI/UEFI tables to discover physical hardware and build Enlil's own device tree — READER primitives landed (enlil-devices::acpi::discover): find_table(sig) generic walk over RSDP→XSDT/RSDT, plus discover_host_topology bundling all of the below into a HostTopology in one call; bounds-checked, unit-tested. NEXT SLICE for the whole item: feed these the *real* host tables (RSDP scan + tables) from the bare-metal boot payload (Phase 6.1) and build the device tree from the results.
+  - [ ] CPU topology from MADT/SRAT — parsers landed: madt::count_enabled_cpus (Local APIC/x2APIC ENABLED count) + srat::numa_domains (distinct enabled proximity domains) + discover::host_cpu_count/host_numa_domains; needs the real host tables (6.1)
+  - [ ] PCI devices via MCFG ECAM config-space walk — mcfg::parse_mcfg_allocations + discover::host_ecam_allocations read the ECAM windows; the actual config-space walk over those windows is the remaining piece
+  - [x] IOMMU discovery from DMAR (VT-d) / IVRS (AMD-Vi) — discover::host_iommu_kind returns IntelVtd for a DMAR table, AmdVi for IVRS, None otherwise; unit-tested
+  - [x] Memory map from UEFI (E820-style conversion) — enlil-platform::memory::map::MemoryMap::from_uefi(&[UefiMemoryDescriptor]) maps EFI types→MemoryKinds, pages→bytes, sorts (companion to from_e820); unit-tested
   - [ ] USB controller discovery (PCI enum to xHCI BARs)
 - [ ] 6.4 Program the physical IOMMU directly (VT-d DMAR / AMD-Vi IVRS): DMA remapping tables, per-guest domain device assignment, interrupt remapping
 - [ ] 6.5 Write bare-metal host device drivers to replace Linux-managed hardware: xHCI USB, NVMe/AHCI storage, minimal management NIC, GOP framebuffer console
