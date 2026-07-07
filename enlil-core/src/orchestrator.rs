@@ -151,6 +151,68 @@ mod linux {
             })
         }
 
+        /// Like [`prepare_real_mode`](Self::prepare_real_mode) but starts the boot
+        /// vCPU in 64-bit **long mode** with paging on. This writes a minimal
+        /// identity-mapping page-table tree into guest RAM (a PML4 → PDPT → PD
+        /// chain with a single 2 MiB page mapping `[0, 2 MiB)`) at fixed low
+        /// addresses and enters long mode at it — the mode a real x86-64 kernel
+        /// and a 64-bit ACPI S3 resume trampoline run in.
+        ///
+        /// Requires `load_base == 0` (so guest-physical addresses equal RAM
+        /// offsets and line up with the identity map). The page tables occupy
+        /// `[0x4000, 0x6008)`, so the payload must not reach `0x4000`, and the RAM
+        /// must be at least that large.
+        ///
+        /// # Errors
+        /// Returns [`Error::Config`] if `load_base != 0`, the payload overlaps the
+        /// page-table region, or the RAM is too small; otherwise as
+        /// [`prepare_real_mode`](Self::prepare_real_mode) but propagating
+        /// `prepare_long_mode_vcpu`.
+        pub fn prepare_long_mode(spec: GuestBootSpec) -> Result<Self> {
+            const PML4_GPA: u64 = 0x4000;
+            const PDPT_GPA: u64 = 0x5000;
+            const PD_GPA: u64 = 0x6000;
+
+            if spec.load_base != 0 {
+                return Err(Error::Config(format!(
+                    "long-mode boot requires load_base 0, got {:#x}",
+                    spec.load_base
+                )));
+            }
+            let image_end = spec.entry as usize + spec.image.len();
+            if image_end > PML4_GPA as usize {
+                return Err(Error::Config(format!(
+                    "long-mode payload ends at {image_end:#x}, overlapping the identity \
+                     page tables at {PML4_GPA:#x}"
+                )));
+            }
+            if spec.ram_bytes < PD_GPA as usize + 8 {
+                return Err(Error::Config(format!(
+                    "long-mode boot needs at least {} bytes of RAM for the page tables",
+                    PD_GPA + 8
+                )));
+            }
+
+            let (mut run, mut ram, entry, load_base) = Self::assemble(spec)?;
+            {
+                let mem = ram.as_mut_slice();
+                let mut put = |gpa: u64, val: u64| {
+                    let o = gpa as usize;
+                    mem[o..o + 8].copy_from_slice(&val.to_le_bytes());
+                };
+                put(PML4_GPA, PDPT_GPA | 0x3); // present | write
+                put(PDPT_GPA, PD_GPA | 0x3);
+                put(PD_GPA, 0x83); // present | write | PS (2 MiB page mapping [0, 2 MiB))
+            }
+            run.backend_mut()
+                .prepare_long_mode_vcpu(0, entry, PML4_GPA)?;
+            Ok(Self {
+                run,
+                load_base,
+                ram,
+            })
+        }
+
         /// Shared setup for both boot modes: validate the spec, build the PC,
         /// install the run loop, allocate+load+map guest RAM, and create the boot
         /// vCPU. Returns the run loop, the RAM to keep alive, and the entry point;
@@ -407,6 +469,62 @@ mod tests {
         let outcome = guest.run(0x1000, 100).expect("run guest");
         assert_eq!(outcome, LoopOutcome::Halted, "guest halts after greeting");
         assert_eq!(&*sink.lock().unwrap(), b"K", "guest emitted its greeting");
+    }
+
+    #[test]
+    fn orchestrates_a_long_mode_guest() {
+        if !is_kvm_available() {
+            eprintln!("skipping orchestrates_a_long_mode_guest: no /dev/kvm");
+            return;
+        }
+        // 64-bit payload: mov al,'L'; mov edx,0x3F8; out dx,al; hlt. If it runs to
+        // hlt and emits 'L', long-mode entry + the identity page tables worked.
+        #[rustfmt::skip]
+        let image: Vec<u8> = vec![
+            0xB0, 0x4C,                   // mov al, 'L'
+            0xBA, 0xF8, 0x03, 0x00, 0x00, // mov edx, 0x3F8
+            0xEE,                         // out dx, al
+            0xF4,                         // hlt
+        ];
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let spec = GuestBootSpec {
+            name: "long".into(),
+            serial: SerialOutput::new("long", SerialOutputMode::Shared(Arc::clone(&sink))),
+            ram_bytes: 0x1_0000,
+            load_base: 0,
+            entry: 0x1000,
+            image,
+            rtc_unix_secs: 0,
+            platform: LbrPlatform::AmdSvm,
+        };
+        let mut guest = match GuestRuntime::prepare_long_mode(spec) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping orchestrates_a_long_mode_guest: {e}");
+                return;
+            }
+        };
+        assert_eq!(guest.run(0x1000, 100).unwrap(), LoopOutcome::Halted);
+        assert_eq!(
+            &*sink.lock().unwrap(),
+            b"L",
+            "guest executed in 64-bit long mode through the identity page tables"
+        );
+    }
+
+    #[test]
+    fn long_mode_rejects_a_nonzero_load_base_without_kvm() {
+        let spec = GuestBootSpec {
+            name: "long-badbase".into(),
+            serial: SerialOutput::new("long-badbase", SerialOutputMode::Null),
+            ram_bytes: 0x1_0000,
+            load_base: 0x1000, // must be 0 for the identity map
+            entry: 0x1000,
+            image: vec![0xF4],
+            rtc_unix_secs: 0,
+            platform: LbrPlatform::AmdSvm,
+        };
+        assert!(GuestRuntime::prepare_long_mode(spec).is_err());
     }
 
     #[test]

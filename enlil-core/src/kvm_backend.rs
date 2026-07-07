@@ -1543,6 +1543,91 @@ mod linux {
             Ok(())
         }
 
+        /// Prepare vCPU `index` to start executing 64-bit **long-mode** code at
+        /// `entry`, with paging enabled through the page tables the caller has
+        /// already written to guest RAM, rooted at `pml4_gpa` (the PML4's
+        /// guest-physical address). This is the mode a real x86-64 kernel — and a
+        /// 64-bit ACPI S3 resume trampoline — runs in.
+        ///
+        /// Sets `CR4.PAE`, `EFER.LME|LMA`, and `CR0.PE|PG`, points `CR3` at
+        /// `pml4_gpa`, and loads a flat 64-bit code segment (`CS.L = 1`, selector
+        /// `0x08`) plus flat data segments (selector `0x10`) straight into the
+        /// cached descriptors — the descriptor-cache trick, so no GDT is needed in
+        /// guest memory. The **caller owns the page tables**: they must at least
+        /// identity-map the code at `entry` (and be reachable at `pml4_gpa`) or the
+        /// first instruction fetch page-faults.
+        ///
+        /// # Errors
+        /// Returns [`Error::Vcpu`] if `index` is out of range or any of the
+        /// `KVM_{GET,SET}_{SREGS,REGS}` ioctls fail.
+        pub fn prepare_long_mode_vcpu(
+            &self,
+            index: usize,
+            entry: u64,
+            pml4_gpa: u64,
+        ) -> Result<()> {
+            let vcpu = self
+                .vcpus
+                .get(index)
+                .ok_or_else(|| Error::Vcpu(format!("no vcpu at index {index}")))?;
+
+            let mut sregs = vcpu
+                .get_sregs()
+                .map_err(|e| Error::Vcpu(format!("KVM_GET_SREGS: {e}")))?;
+
+            // Flat 64-bit code segment (selector 0x08): execute/read, accessed,
+            // L = 1 (64-bit), db = 0 (required when L = 1).
+            sregs.cs.base = 0;
+            sregs.cs.limit = 0xFFFF_FFFF;
+            sregs.cs.selector = 0x08;
+            sregs.cs.type_ = 0b1011;
+            sregs.cs.s = 1;
+            sregs.cs.dpl = 0;
+            sregs.cs.present = 1;
+            sregs.cs.l = 1;
+            sregs.cs.db = 0;
+            sregs.cs.g = 1;
+
+            // Flat data segments (selector 0x10): read/write, accessed.
+            for seg in [
+                &mut sregs.ds,
+                &mut sregs.es,
+                &mut sregs.fs,
+                &mut sregs.gs,
+                &mut sregs.ss,
+            ] {
+                seg.base = 0;
+                seg.limit = 0xFFFF_FFFF;
+                seg.selector = 0x10;
+                seg.type_ = 0b0011;
+                seg.s = 1;
+                seg.dpl = 0;
+                seg.present = 1;
+                seg.db = 1;
+                seg.l = 0;
+                seg.g = 1;
+            }
+
+            // Enable long mode: PAE, EFER.LME|LMA, CR0.PE|PG, CR3 → the caller's
+            // page tables.
+            sregs.cr3 = pml4_gpa;
+            sregs.cr4 |= 1 << 5; // CR4.PAE
+            sregs.efer |= (1 << 8) | (1 << 10); // EFER.LME | EFER.LMA
+            sregs.cr0 |= (1 << 0) | (1 << 31); // CR0.PE | CR0.PG
+
+            vcpu.set_sregs(&sregs)
+                .map_err(|e| Error::Vcpu(format!("KVM_SET_SREGS: {e}")))?;
+
+            let mut regs = vcpu
+                .get_regs()
+                .map_err(|e| Error::Vcpu(format!("KVM_GET_REGS: {e}")))?;
+            regs.rip = entry;
+            regs.rflags = 0x2;
+            vcpu.set_regs(&regs)
+                .map_err(|e| Error::Vcpu(format!("KVM_SET_REGS: {e}")))?;
+            Ok(())
+        }
+
         /// Registered guest memory slots.
         #[must_use]
         pub fn mem_slots(&self) -> &[MemSlot] {
