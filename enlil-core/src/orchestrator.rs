@@ -422,15 +422,23 @@ mod linux {
                 _ => (0, 0),
             };
 
+            // A standard-PC E820 map: low RAM below the EBDA, the EBDA + BIOS/VGA
+            // hole [0x9FC00, 0x100000) reserved, and high RAM from 1 MiB up. The
+            // kernel loads at 1 MiB, so `load_bzimage` always has >= 1 MiB of RAM.
+            const LOW_RAM_END: u64 = 0x9_FC00;
+            let e820 = [
+                (0, LOW_RAM_END, 1),                                      // low usable
+                (LOW_RAM_END, PROTECTED_MODE_LOAD_ADDR - LOW_RAM_END, 2), // EBDA + BIOS hole
+                (
+                    PROTECTED_MODE_LOAD_ADDR,
+                    ram_len - PROTECTED_MODE_LOAD_ADDR,
+                    1,
+                ), // high usable
+            ];
             let cmdline_ptr = u32::try_from(CMDLINE_GPA).expect("CMDLINE_GPA fits u32");
-            let boot_params = build_boot_params(
-                image,
-                cmdline_ptr,
-                ramdisk_image,
-                ramdisk_size,
-                &[(0, ram_len, 1)],
-            )
-            .ok_or_else(|| Error::Config("bzImage too short for its boot_params".into()))?;
+            let boot_params =
+                build_boot_params(image, cmdline_ptr, ramdisk_image, ramdisk_size, &e820)
+                    .ok_or_else(|| Error::Config("bzImage too short for its boot_params".into()))?;
 
             self.write_guest_bytes(BOOT_PARAMS_GPA, &boot_params)?;
             self.write_guest_bytes(CMDLINE_GPA, cmdline.as_bytes())?;
@@ -956,7 +964,26 @@ mod tests {
             0x2_0000,
             "cmd_line_ptr points at the cmdline"
         );
-        assert_eq!(bp[0x1E8], 1, "one E820 entry (guest RAM)");
+        // A standard-PC E820: low usable, reserved BIOS hole, high usable.
+        assert_eq!(bp[0x1E8], 3, "three E820 entries");
+        assert_eq!(u64::from_le_bytes(bp[0x2D0..0x2D8].try_into().unwrap()), 0);
+        assert_eq!(
+            u64::from_le_bytes(bp[0x2D8..0x2E0].try_into().unwrap()),
+            0x9_FC00,
+            "low usable RAM below the EBDA"
+        );
+        assert_eq!(u32::from_le_bytes(bp[0x2E0..0x2E4].try_into().unwrap()), 1);
+        // Second entry (at 0x2D0 + 20 = 0x2E4): the EBDA + BIOS/VGA hole, reserved.
+        assert_eq!(
+            u64::from_le_bytes(bp[0x2E4..0x2EC].try_into().unwrap()),
+            0x9_FC00,
+            "BIOS hole starts at 0x9FC00"
+        );
+        assert_eq!(
+            u32::from_le_bytes(bp[0x2F4..0x2F8].try_into().unwrap()),
+            2,
+            "BIOS hole is reserved"
+        );
         // The initrd was placed high in RAM and recorded in boot_params.
         let ramdisk_image = u32::from_le_bytes(bp[0x218..0x21C].try_into().unwrap());
         let ramdisk_size = u32::from_le_bytes(bp[0x21C..0x220].try_into().unwrap());
