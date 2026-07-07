@@ -371,9 +371,52 @@ impl FadtBuilder {
     }
 }
 
+/// Read the FACS physical address a FADT points at — its `FIRMWARE_CTRL` /
+/// `X_FIRMWARE_CTRL` fields — which is where the S3 resume path reads the FACS
+/// (and its waking vector) from.
+///
+/// Prefers the 64-bit `X_FIRMWARE_CTRL` (offset 132) when the FADT extends that
+/// far and it is non-zero, else the 32-bit `FIRMWARE_CTRL` (offset 36), matching
+/// ACPI's rule that the extended field supersedes the legacy one. Returns `None`
+/// if the FADT names no FACS or the buffer is too short to hold the field.
+#[must_use]
+pub fn read_facs_address(fadt: &[u8]) -> Option<u64> {
+    // 64-bit X_FIRMWARE_CTRL at offset 132.
+    if fadt.len() >= 140 {
+        let x = u64::from_le_bytes(fadt[132..140].try_into().ok()?);
+        if x != 0 {
+            return Some(x);
+        }
+    }
+    // 32-bit FIRMWARE_CTRL at offset 36.
+    if fadt.len() >= 40 {
+        let f = u32::from_le_bytes(fadt[36..40].try_into().ok()?);
+        if f != 0 {
+            return Some(u64::from(f));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_facs_address_it_points_at() {
+        let facs_gpa = 0x7_F000;
+        let fadt = FadtBuilder::new(0x8_0000).firmware_ctrl(facs_gpa).build();
+        assert_eq!(read_facs_address(&fadt), Some(facs_gpa));
+    }
+
+    #[test]
+    fn read_facs_address_is_none_when_no_facs_or_too_short() {
+        // A FADT with FIRMWARE_CTRL left at 0 names no FACS.
+        let no_facs = FadtBuilder::new(0x8_0000).build();
+        assert_eq!(read_facs_address(&no_facs), None);
+        // A buffer too short to hold even the 32-bit field.
+        assert_eq!(read_facs_address(&[0u8; 32]), None);
+    }
 
     #[test]
     fn fadt_length_is_correct() {
