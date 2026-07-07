@@ -107,6 +107,19 @@ impl E820Entry {
     pub const BAD: u32 = 5;
 }
 
+/// The fields of a UEFI memory descriptor (`EFI_MEMORY_DESCRIPTOR`) the
+/// hypervisor needs to build a [`MemoryMap`] — the memory type, physical start,
+/// and page count. UEFI pages are 4 KiB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UefiMemoryDescriptor {
+    /// The `EFI_MEMORY_TYPE` value (0 = reserved, 7 = conventional, …).
+    pub kind: u32,
+    /// Physical base address.
+    pub phys_start: u64,
+    /// Length in 4 KiB pages.
+    pub page_count: u64,
+}
+
 /// A physical memory map: a set of contiguous regions kept sorted by base
 /// address, from which the hypervisor carves the regions it needs.
 #[derive(Clone, Debug, Default)]
@@ -151,6 +164,37 @@ impl MemoryMap {
                     _ => MemoryKind::Reserved,
                 };
                 MemoryRegion::new(PhysAddr::new(e.base), e.length, kind)
+            })
+            .collect();
+        Self::from_regions(regions)
+    }
+
+    /// Build a map from a UEFI memory map (item 1.3 / Phase 6.3 — "memory map from
+    /// UEFI"), the way the boot payload converts the map it collected before
+    /// `ExitBootServices`. Each descriptor's `EFI_MEMORY_TYPE` is mapped to a
+    /// [`MemoryKind`]: loader / boot-services / conventional memory
+    /// (types 1–4, 7) become [`Usable`](MemoryKind::Usable) — boot-services memory
+    /// is reclaimable once boot services exit — unusable (8) becomes
+    /// [`Bad`](MemoryKind::Bad), ACPI-reclaim (9) / ACPI-NVS (10) map through, and
+    /// everything else (reserved, runtime-services, MMIO, …) is conservatively
+    /// [`Reserved`](MemoryKind::Reserved). Zero-page descriptors are dropped; the
+    /// result is sorted by base.
+    #[must_use]
+    pub fn from_uefi(descriptors: &[UefiMemoryDescriptor]) -> Self {
+        const UEFI_PAGE: u64 = 4096;
+        let regions = descriptors
+            .iter()
+            .filter(|d| d.page_count != 0)
+            .map(|d| {
+                let kind = match d.kind {
+                    // EfiLoaderCode/Data, EfiBootServicesCode/Data, EfiConventionalMemory.
+                    1 | 2 | 3 | 4 | 7 => MemoryKind::Usable,
+                    8 => MemoryKind::Bad,             // EfiUnusableMemory
+                    9 => MemoryKind::AcpiReclaimable, // EfiACPIReclaimMemory
+                    10 => MemoryKind::AcpiNvs,        // EfiACPIMemoryNVS
+                    _ => MemoryKind::Reserved,
+                };
+                MemoryRegion::new(PhysAddr::new(d.phys_start), d.page_count * UEFI_PAGE, kind)
             })
             .collect();
         Self::from_regions(regions)
@@ -362,6 +406,44 @@ mod tests {
             !r.overlaps(&usable(0x2000, 0x1000)),
             "adjacent do not overlap"
         );
+    }
+
+    #[test]
+    fn from_uefi_maps_efi_types_and_converts_pages() {
+        let uefi = |kind, phys_start, page_count| UefiMemoryDescriptor {
+            kind,
+            phys_start,
+            page_count,
+        };
+        let map = MemoryMap::from_uefi(&[
+            uefi(7, 0x10_0000, 0x100), // conventional → usable, 0x100 pages = 1 MiB
+            uefi(4, 0x0, 0x9F),        // boot-services data → usable, [0, 0x9F000)
+            uefi(0, 0x9_F000, 0x1),    // reserved
+            uefi(9, 0x30_0000, 0x2),   // ACPI reclaimable
+            uefi(10, 0x31_0000, 0x1),  // ACPI NVS
+            uefi(8, 0x32_0000, 0x1),   // unusable → bad
+            uefi(5, 0x40_0000, 0x10),  // runtime-services code → reserved
+            uefi(7, 0x50_0000, 0),     // zero pages → dropped
+        ]);
+        assert!(map.is_consistent());
+        assert_eq!(
+            map.regions().len(),
+            7,
+            "the zero-page descriptor was dropped"
+        );
+        // Sorted by base; sizes are pages × 4 KiB.
+        assert_eq!(map.regions()[0].base, PhysAddr::new(0));
+        assert_eq!(map.regions()[0].kind, MemoryKind::Usable);
+        assert_eq!(map.regions()[0].size, 0x9F * 4096);
+        assert_eq!(map.regions()[1].kind, MemoryKind::Reserved); // 0x9F000
+        assert_eq!(map.regions()[2].kind, MemoryKind::Usable); // 0x100000 conventional
+        assert_eq!(map.regions()[2].size, 0x100 * 4096);
+        assert_eq!(map.regions()[3].kind, MemoryKind::AcpiReclaimable);
+        assert_eq!(map.regions()[4].kind, MemoryKind::AcpiNvs);
+        assert_eq!(map.regions()[5].kind, MemoryKind::Bad);
+        assert_eq!(map.regions()[6].kind, MemoryKind::Reserved); // runtime-services
+        // Usable = conventional (1 MiB) + boot-services data (0x9F pages).
+        assert_eq!(map.total_usable(), 0x100 * 4096 + 0x9F * 4096);
     }
 
     #[test]
