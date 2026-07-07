@@ -24,8 +24,9 @@ mod linux {
     use crate::error::Error;
     use crate::kvm_backend::{GuestRam, KvmBackend};
     use crate::run_loop::{LoopOutcome, StealthRunLoop};
-    use crate::serial::SerialOutput;
+    use crate::serial::{SerialOutput, SerialOutputMode};
     use crate::Result;
+    use enlil_config::GuestConfig;
     use enlil_devices::stealth::lbr::LbrPlatform;
     use enlil_devices::tpm::VirtualTpm;
 
@@ -49,6 +50,44 @@ mod linux {
         pub rtc_unix_secs: u64,
         /// Host virtualization vendor, for the LBR/PMC stealth model.
         pub platform: LbrPlatform,
+    }
+
+    impl GuestBootSpec {
+        /// Build a boot spec from a guest's [`GuestConfig`] plus the payload to run.
+        ///
+        /// Maps the config-derived fields: the guest name, its RAM
+        /// (`memory_mb` → bytes), and its serial sink (from
+        /// [`SerialOutputMode::from_output_spec`], or [`Null`](SerialOutputMode::Null)
+        /// when the config disables the serial console). The caller supplies the
+        /// boot payload and its placement (`load_base`, `entry`), the RTC epoch,
+        /// and the host `platform` — deriving `image`/`entry` from `config.kernel`
+        /// needs the bzImage loader, a later slice — so this is the config→spec
+        /// half of the top-level orchestrator (item 3.12).
+        #[must_use]
+        pub fn from_guest_config(
+            config: &GuestConfig,
+            image: Vec<u8>,
+            load_base: u64,
+            entry: u64,
+            rtc_unix_secs: u64,
+            platform: LbrPlatform,
+        ) -> Self {
+            let mode = if config.serial.enabled {
+                SerialOutputMode::from_output_spec(&config.serial.output)
+            } else {
+                SerialOutputMode::Null
+            };
+            Self {
+                serial: SerialOutput::new(&config.name, mode),
+                name: config.name.clone(),
+                ram_bytes: (config.memory_mb as usize).saturating_mul(1024 * 1024),
+                load_base,
+                entry,
+                image,
+                rtc_unix_secs,
+                platform,
+            }
+        }
     }
 
     /// A prepared, runnable guest. Owns the guest RAM and the stealth run loop; the
@@ -189,6 +228,38 @@ mod tests {
             platform: LbrPlatform::AmdSvm,
         };
         assert!(GuestRuntime::prepare_real_mode(spec).is_err());
+    }
+
+    #[test]
+    fn boot_spec_maps_a_guest_config_without_kvm() {
+        use enlil_config::{GuestConfig, SchedulingMode, SerialPortConfig};
+
+        let config = GuestConfig {
+            name: "win11".into(),
+            cpus: vec![0, 1],
+            memory_mb: 512,
+            kernel: None,
+            initrd: None,
+            cmdline: "console=ttyS0".into(),
+            scheduling: SchedulingMode::Auto,
+            disks: vec![],
+            serial: SerialPortConfig::default(),
+            mac: None,
+        };
+        let spec = GuestBootSpec::from_guest_config(
+            &config,
+            vec![0xF4], // hlt
+            0x1000,
+            0x1000,
+            42,
+            LbrPlatform::AmdSvm,
+        );
+        assert_eq!(spec.name, "win11");
+        assert_eq!(spec.ram_bytes, 512 * 1024 * 1024, "memory_mb → bytes");
+        assert_eq!(spec.load_base, 0x1000);
+        assert_eq!(spec.entry, 0x1000);
+        assert_eq!(spec.rtc_unix_secs, 42);
+        assert_eq!(spec.image, vec![0xF4]);
     }
 
     #[test]
