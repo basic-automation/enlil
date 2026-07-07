@@ -78,6 +78,35 @@ impl MemoryRegion {
     }
 }
 
+/// One entry of a BIOS E820 / `INT 0x15, EAX=0xE820` memory map.
+///
+/// This is the shape the boot path receives (and the shape a UEFI memory map is
+/// converted into). The `kind` is the raw E820 type code;
+/// [`MemoryMap::from_e820`] maps it to a [`MemoryKind`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct E820Entry {
+    /// Physical base address.
+    pub base: u64,
+    /// Length in bytes.
+    pub length: u64,
+    /// Raw E820 type: 1 usable, 2 reserved, 3 ACPI-reclaimable, 4 ACPI-NVS,
+    /// 5 bad/unusable; any other value is treated conservatively as reserved.
+    pub kind: u32,
+}
+
+impl E820Entry {
+    /// The E820 type code for usable RAM (`AddressRangeMemory`).
+    pub const USABLE: u32 = 1;
+    /// The E820 type code for reserved memory (`AddressRangeReserved`).
+    pub const RESERVED: u32 = 2;
+    /// The E820 type code for ACPI-reclaimable memory (`AddressRangeACPI`).
+    pub const ACPI_RECLAIMABLE: u32 = 3;
+    /// The E820 type code for ACPI NVS memory (`AddressRangeNVS`).
+    pub const ACPI_NVS: u32 = 4;
+    /// The E820 type code for bad/unusable memory (`AddressRangeUnusable`).
+    pub const BAD: u32 = 5;
+}
+
 /// A physical memory map: a set of contiguous regions kept sorted by base
 /// address, from which the hypervisor carves the regions it needs.
 #[derive(Clone, Debug, Default)]
@@ -99,6 +128,32 @@ impl MemoryMap {
     pub fn from_regions(mut regions: Vec<MemoryRegion>) -> Self {
         regions.sort_by_key(|r| r.base.as_u64());
         Self { regions }
+    }
+
+    /// Build a map from an E820 memory map (item 1.3 — the firmware-specific
+    /// parser). Each [`E820Entry`]'s raw type code is mapped to a
+    /// [`MemoryKind`]; zero-length entries are dropped, and the result is sorted
+    /// by base address. Unknown type codes are treated as
+    /// [`Reserved`](MemoryKind::Reserved) so an unrecognized range is never
+    /// mistaken for free RAM.
+    #[must_use]
+    pub fn from_e820(entries: &[E820Entry]) -> Self {
+        let regions = entries
+            .iter()
+            .filter(|e| e.length != 0)
+            .map(|e| {
+                let kind = match e.kind {
+                    E820Entry::USABLE => MemoryKind::Usable,
+                    E820Entry::ACPI_RECLAIMABLE => MemoryKind::AcpiReclaimable,
+                    E820Entry::ACPI_NVS => MemoryKind::AcpiNvs,
+                    E820Entry::BAD => MemoryKind::Bad,
+                    // 2 (reserved) and any unknown code → Reserved.
+                    _ => MemoryKind::Reserved,
+                };
+                MemoryRegion::new(PhysAddr::new(e.base), e.length, kind)
+            })
+            .collect();
+        Self::from_regions(regions)
     }
 
     /// Insert a region, keeping the map sorted by base address.
@@ -290,6 +345,67 @@ mod tests {
             !r.overlaps(&usable(0x2000, 0x1000)),
             "adjacent do not overlap"
         );
+    }
+
+    #[test]
+    fn from_e820_maps_type_codes_and_sorts() {
+        // Deliberately out of order, with a zero-length entry and an unknown code.
+        let entries = [
+            E820Entry {
+                base: 0x10_0000,
+                length: 0x10_0000,
+                kind: E820Entry::USABLE,
+            },
+            E820Entry {
+                base: 0x0,
+                length: 0x9_FC00,
+                kind: E820Entry::USABLE,
+            },
+            E820Entry {
+                base: 0x9_FC00,
+                length: 0x400,
+                kind: E820Entry::RESERVED,
+            },
+            E820Entry {
+                base: 0xE_0000,
+                length: 0x2_0000,
+                kind: 42, // unknown → Reserved
+            },
+            E820Entry {
+                base: 0x20_0000,
+                length: 0, // dropped
+                kind: E820Entry::USABLE,
+            },
+            E820Entry {
+                base: 0x30_0000,
+                length: 0x1000,
+                kind: E820Entry::ACPI_RECLAIMABLE,
+            },
+            E820Entry {
+                base: 0x31_0000,
+                length: 0x1000,
+                kind: E820Entry::ACPI_NVS,
+            },
+            E820Entry {
+                base: 0x32_0000,
+                length: 0x1000,
+                kind: E820Entry::BAD,
+            },
+        ];
+        let map = MemoryMap::from_e820(&entries);
+        assert!(map.is_consistent(), "sorted, non-overlapping");
+        assert_eq!(map.regions().len(), 7, "the zero-length entry was dropped");
+        // Sorted by base, with the type codes mapped through.
+        assert_eq!(map.regions()[0].base, PhysAddr::new(0));
+        assert_eq!(map.regions()[0].kind, MemoryKind::Usable);
+        assert_eq!(map.regions()[1].kind, MemoryKind::Reserved); // 0x9FC00
+        assert_eq!(map.regions()[2].kind, MemoryKind::Reserved); // unknown → Reserved
+        assert_eq!(map.regions()[3].kind, MemoryKind::Usable); // 0x100000
+        assert_eq!(map.regions()[4].kind, MemoryKind::AcpiReclaimable);
+        assert_eq!(map.regions()[5].kind, MemoryKind::AcpiNvs);
+        assert_eq!(map.regions()[6].kind, MemoryKind::Bad);
+        // Only the two USABLE ranges count as free RAM.
+        assert_eq!(map.total_usable(), 0x9_FC00 + 0x10_0000);
     }
 
     #[test]
