@@ -1628,6 +1628,36 @@ mod linux {
             Ok(())
         }
 
+        /// Prepare vCPU `index` to enter a Linux protected-mode kernel at `entry`
+        /// per the 32-bit boot protocol: flat 32-bit protected mode (as
+        /// [`prepare_protected_mode_vcpu`](Self::prepare_protected_mode_vcpu)) with
+        /// `RSI` pointing at the `boot_params` zero page — the one register the
+        /// kernel's 32-bit entry reads to find its configuration. The caller must
+        /// have placed the kernel and `boot_params` in guest RAM first.
+        ///
+        /// # Errors
+        /// Returns [`Error::Vcpu`] if `index` is out of range or any of the
+        /// `KVM_{GET,SET}_{SREGS,REGS}` ioctls fail.
+        pub fn prepare_linux_boot_vcpu(
+            &self,
+            index: usize,
+            entry: u64,
+            boot_params: u64,
+        ) -> Result<()> {
+            self.prepare_protected_mode_vcpu(index, entry)?;
+            let vcpu = self
+                .vcpus
+                .get(index)
+                .ok_or_else(|| Error::Vcpu(format!("no vcpu at index {index}")))?;
+            let mut regs = vcpu
+                .get_regs()
+                .map_err(|e| Error::Vcpu(format!("KVM_GET_REGS: {e}")))?;
+            regs.rsi = boot_params;
+            vcpu.set_regs(&regs)
+                .map_err(|e| Error::Vcpu(format!("KVM_SET_REGS: {e}")))?;
+            Ok(())
+        }
+
         /// Registered guest memory slots.
         #[must_use]
         pub fn mem_slots(&self) -> &[MemSlot] {

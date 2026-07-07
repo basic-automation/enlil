@@ -409,6 +409,19 @@ mod linux {
             })
         }
 
+        /// Point the boot vCPU at a kernel [`load_bzimage`](Self::load_bzimage)
+        /// placed, per the Linux 32-bit boot protocol: flat protected mode at the
+        /// kernel entry with `RSI` → the `boot_params`. After this, [`run`](Self::run)
+        /// executes the kernel. This is the entry counterpart to `load_bzimage`.
+        ///
+        /// # Errors
+        /// Propagates [`KvmBackend::prepare_linux_boot_vcpu`].
+        pub fn boot_kernel(&mut self, boot: &KernelBoot) -> Result<()> {
+            self.run
+                .backend_mut()
+                .prepare_linux_boot_vcpu(0, boot.kernel_entry, boot.boot_params)
+        }
+
         /// Resume the guest from an ACPI S3 (suspend-to-RAM) transition: read the
         /// FACS (the OS wrote its firmware waking vector there before suspending)
         /// from guest RAM at `facs_gpa` — the address the FADT's `FIRMWARE_CTRL`
@@ -774,6 +787,15 @@ mod tests {
             "cmd_line_ptr points at the cmdline"
         );
         assert_eq!(bp[0x1E8], 1, "one E820 entry (guest RAM)");
+
+        // boot_kernel points the vCPU at the kernel per the boot protocol:
+        // protected mode at the entry, RSI → boot_params. Verify via a snapshot
+        // (no real kernel needed to check the register state).
+        guest.boot_kernel(&boot).expect("prepare kernel entry");
+        let snap = guest.snapshot_vcpu().expect("snapshot after boot_kernel");
+        assert_eq!(snap.regs.rip, 0x10_0000, "rip at the kernel entry");
+        assert_eq!(snap.regs.rsi, 0x1_0000, "rsi points at boot_params");
+        assert_ne!(snap.sregs.cr0 & 1, 0, "protected mode (CR0.PE) enabled");
     }
 
     #[test]
