@@ -393,6 +393,11 @@ mod linux {
             }
             let info = parse_bzimage_header(image)
                 .ok_or_else(|| Error::Config("not a boot-protocol bzImage".into()))?;
+            if !info.is_loaded_high() {
+                return Err(Error::Config(
+                    "kernel is not loaded-high (a legacy zImage); only bzImage is supported".into(),
+                ));
+            }
             let kernel = image
                 .get(info.protected_mode_kernel_offset..)
                 .ok_or_else(|| {
@@ -863,6 +868,7 @@ mod tests {
         image[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
         image[0x202..0x206].copy_from_slice(b"HdrS");
         image[0x206..0x208].copy_from_slice(&0x020Fu16.to_le_bytes());
+        image[0x211] = 0x01; // loadflags: LOADED_HIGH (a real bzImage)
         image[0x400] = 0xF4; // hlt
 
         let mut guests = HashMap::new();
@@ -912,6 +918,7 @@ mod tests {
         image[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
         image[0x202..0x206].copy_from_slice(b"HdrS");
         image[0x206..0x208].copy_from_slice(&0x020Fu16.to_le_bytes());
+        image[0x211] = 0x01; // loadflags: LOADED_HIGH (a real bzImage)
         let kernel_body: [u8; 16] = [
             0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
         ];

@@ -18,6 +18,11 @@ pub const BOOT_FLAG: u16 = 0xAA55;
 /// the fixed load address for a "big" kernel in the Linux boot protocol.
 pub const PROTECTED_MODE_LOAD_ADDR: u64 = 0x10_0000;
 
+/// `loadflags` bit 0 (`LOADED_HIGH`): the protected-mode kernel is loaded high,
+/// at 1 MiB — set for every "big" kernel (`bzImage`), clear for a legacy
+/// `zImage` that loads in low memory.
+pub const LOADFLAG_LOADED_HIGH: u8 = 0x01;
+
 /// Parsed fields from a `bzImage` setup header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BzImageInfo {
@@ -27,9 +32,21 @@ pub struct BzImageInfo {
     /// Number of 512-byte setup sectors preceding the protected-mode kernel (the
     /// on-disk `setup_sects`, with the legacy `0` normalized to `4`).
     pub setup_sects: u8,
+    /// The `loadflags` byte (setup-header offset `0x211`).
+    pub loadflags: u8,
     /// Byte offset within the image where the protected-mode kernel begins:
     /// `(setup_sects + 1) * 512` (the boot sector plus the setup sectors).
     pub protected_mode_kernel_offset: usize,
+}
+
+impl BzImageInfo {
+    /// Whether the protected-mode kernel is loaded high (at 1 MiB) — true for a
+    /// `bzImage`, false for a legacy low-loaded `zImage`. The loader only
+    /// supports high-loaded kernels.
+    #[must_use]
+    pub const fn is_loaded_high(&self) -> bool {
+        self.loadflags & LOADFLAG_LOADED_HIGH != 0
+    }
 }
 
 /// Parse a `bzImage`'s setup header.
@@ -39,8 +56,8 @@ pub struct BzImageInfo {
 /// boot-protocol kernel image).
 #[must_use]
 pub fn parse_bzimage_header(image: &[u8]) -> Option<BzImageInfo> {
-    // Need through the protocol-version field at 0x206..0x208.
-    if image.len() < 0x208 {
+    // Need through the loadflags byte at 0x211 (past the version at 0x206..0x208).
+    if image.len() < 0x212 {
         return None;
     }
     if u16::from_le_bytes([image[0x1FE], image[0x1FF]]) != BOOT_FLAG {
@@ -55,10 +72,12 @@ pub fn parse_bzimage_header(image: &[u8]) -> Option<BzImageInfo> {
         0 => 4,
         n => n,
     };
+    let loadflags = image[0x211];
     let protected_mode_kernel_offset = (usize::from(setup_sects) + 1) * 512;
     Some(BzImageInfo {
         protocol_version,
         setup_sects,
+        loadflags,
         protected_mode_kernel_offset,
     })
 }
@@ -133,13 +152,15 @@ mod tests {
     use super::*;
 
     /// Build a minimal, valid `bzImage`-like header: boot signature, `"HdrS"`
-    /// magic, a protocol version, and a `setup_sects` count.
+    /// magic, a protocol version, a `setup_sects` count, and LOADED_HIGH set (a
+    /// real big kernel).
     fn header(setup_sects: u8, version: u16) -> Vec<u8> {
-        let mut img = vec![0u8; 0x208];
+        let mut img = vec![0u8; 0x218];
         img[0x1F1] = setup_sects;
         img[0x1FE..0x200].copy_from_slice(&BOOT_FLAG.to_le_bytes());
         img[0x202..0x206].copy_from_slice(SETUP_HEADER_MAGIC);
         img[0x206..0x208].copy_from_slice(&version.to_le_bytes());
+        img[0x211] = LOADFLAG_LOADED_HIGH;
         img
     }
 
@@ -150,6 +171,15 @@ mod tests {
         assert_eq!(info.setup_sects, 4);
         // (4 + 1) * 512 = 0xA00.
         assert_eq!(info.protected_mode_kernel_offset, 0xA00);
+        assert!(info.is_loaded_high(), "the test header sets LOADED_HIGH");
+    }
+
+    #[test]
+    fn detects_a_low_loaded_zimage() {
+        let mut img = header(1, 0x0200);
+        img[0x211] = 0; // clear LOADED_HIGH → a legacy zImage
+        let info = parse_bzimage_header(&img).unwrap();
+        assert!(!info.is_loaded_high());
     }
 
     #[test]
