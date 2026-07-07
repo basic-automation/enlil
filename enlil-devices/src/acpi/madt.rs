@@ -306,9 +306,69 @@ impl Default for MadtBuilder {
     }
 }
 
+/// Count the enabled processors a MADT advertises: Processor Local APIC (type 0)
+/// and Processor Local x2APIC (type 9) entries whose ENABLED flag (bit 0) is set.
+///
+/// This is the CPU-count discovery Phase 6.3 needs from the host firmware's MADT
+/// (paired with [`crate::acpi::discover::find_table`] using `b"APIC"`). The MADT
+/// header is 44 bytes (36-byte SDT header + a 4-byte local-APIC address + 4-byte
+/// flags); the interrupt-controller structures follow, each a `(type, length)`
+/// byte pair plus a type-specific body. Malformed/truncated entries stop the
+/// walk rather than panic.
+#[must_use]
+pub const fn count_enabled_cpus(madt: &[u8]) -> usize {
+    /// Offset of the first interrupt-controller structure.
+    const CONTROLLER_LIST: usize = 44;
+    /// `MADT` local-APIC ENABLED flag (bit 0 of the entry's flags).
+    const ENABLED: u32 = 0x1;
+
+    let mut count = 0;
+    let mut off = CONTROLLER_LIST;
+    while off + 2 <= madt.len() {
+        let entry_type = madt[off];
+        let len = madt[off + 1] as usize;
+        if len < 2 || off + len > madt.len() {
+            break; // truncated or self-referential entry — stop
+        }
+        // Flags live at a different offset per structure: type 0 (Local APIC) at
+        // entry+4, type 9 (Local x2APIC) at entry+8.
+        let flags_at = match entry_type {
+            0 => Some(off + 4),
+            9 => Some(off + 8),
+            _ => None,
+        };
+        if let Some(fo) = flags_at
+            && fo + 4 <= madt.len()
+        {
+            let flags = u32::from_le_bytes([madt[fo], madt[fo + 1], madt[fo + 2], madt[fo + 3]]);
+            if flags & ENABLED != 0 {
+                count += 1;
+            }
+        }
+        off += len;
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn count_enabled_cpus_counts_only_enabled_local_apics() {
+        // Three Local APICs, one of them disabled → 2 enabled.
+        let madt = MadtBuilder::new()
+            .add_local_apic(LocalApicEntry::new(0, 0, true))
+            .add_local_apic(LocalApicEntry::new(1, 1, false)) // disabled
+            .add_local_apic(LocalApicEntry::new(2, 2, true))
+            .build();
+        assert_eq!(count_enabled_cpus(&madt), 2);
+
+        // The standard N-vcpu MADT enables all N.
+        assert_eq!(count_enabled_cpus(&MadtBuilder::standard(6).build()), 6);
+        // A truncated buffer is handled without panicking.
+        assert_eq!(count_enabled_cpus(&[0u8; 10]), 0);
+    }
 
     #[test]
     fn madt_standard_4_vcpus() {
