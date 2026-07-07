@@ -589,6 +589,13 @@ mod linux {
             &mut self.backend
         }
 
+        /// Shared access to the owned [`KvmBackend`], e.g. to snapshot vCPU state
+        /// ([`KvmBackend::save_vcpu_state`]) without mutating the run loop.
+        #[must_use]
+        pub const fn backend(&self) -> &KvmBackend {
+            &self.backend
+        }
+
         /// Mutable access to the owned [`StandardPc`] — for device setup and
         /// inspection (the bus is also the exit handler `run_vcpu_once` binds).
         pub fn pc_mut(&mut self) -> &mut StandardPc {

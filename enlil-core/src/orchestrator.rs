@@ -22,7 +22,7 @@ pub use linux::{GuestBootSpec, GuestRuntime};
 mod linux {
     use crate::device_bus::DeviceBus;
     use crate::error::Error;
-    use crate::kvm_backend::{GuestRam, KvmBackend};
+    use crate::kvm_backend::{GuestRam, KvmBackend, KvmVcpuState};
     use crate::run_loop::{LoopOutcome, StealthRunLoop};
     use crate::serial::{SerialOutput, SerialOutputMode};
     use crate::Result;
@@ -201,6 +201,27 @@ mod linux {
         pub const fn run_loop_mut(&mut self) -> &mut StealthRunLoop {
             &mut self.run
         }
+
+        /// Snapshot the boot vCPU's architectural state (the item 2.3 primitive) —
+        /// the volatile state a suspend must preserve. The guest RAM stays live in
+        /// the KVM memory slot this runtime owns, so a snapshot plus that RAM is a
+        /// complete resume point (groundwork for S3 suspend/resume, item 5.7, and
+        /// hibernation, item 8.4).
+        ///
+        /// # Errors
+        /// Propagates [`KvmBackend::save_vcpu_state`].
+        pub fn snapshot_vcpu(&self) -> Result<KvmVcpuState> {
+            self.run.backend().save_vcpu_state(0)
+        }
+
+        /// Restore the boot vCPU from a [`snapshot_vcpu`](Self::snapshot_vcpu)
+        /// capture, rewinding it to exactly the point it was taken.
+        ///
+        /// # Errors
+        /// Propagates [`KvmBackend::restore_vcpu_state`].
+        pub fn restore_vcpu(&mut self, state: &KvmVcpuState) -> Result<()> {
+            self.run.backend_mut().restore_vcpu_state(0, state)
+        }
     }
 }
 
@@ -313,6 +334,53 @@ mod tests {
         let outcome = guest.run(0x1000, 100).expect("run guest");
         assert_eq!(outcome, LoopOutcome::Halted, "guest halts after greeting");
         assert_eq!(&*sink.lock().unwrap(), b"K", "guest emitted its greeting");
+    }
+
+    #[test]
+    fn snapshot_and_restore_rewinds_the_boot_vcpu() {
+        if !is_kvm_available() {
+            eprintln!("skipping snapshot_and_restore_rewinds_the_boot_vcpu: no /dev/kvm");
+            return;
+        }
+        // out 0x3F8,'A'; hlt — greets once per run from the entry point.
+        #[rustfmt::skip]
+        let image: Vec<u8> = vec![
+            0xB0, 0x41,       // mov al, 'A'
+            0xBA, 0xF8, 0x03, // mov dx, 0x3F8
+            0xEE,             // out dx, al
+            0xF4,             // hlt
+        ];
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let spec = GuestBootSpec {
+            name: "rewind".into(),
+            serial: SerialOutput::new("rewind", SerialOutputMode::Shared(Arc::clone(&sink))),
+            ram_bytes: 0x2000,
+            load_base: 0x1000,
+            entry: 0x1000,
+            image,
+            rtc_unix_secs: 0,
+            platform: LbrPlatform::AmdSvm,
+        };
+        let mut guest = match GuestRuntime::prepare_real_mode(spec) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping snapshot_and_restore_rewinds_the_boot_vcpu: {e}");
+                return;
+            }
+        };
+
+        // Snapshot at the entry (RIP = 0x1000), run to the hlt (RIP advances past
+        // the code and 'A' is emitted), then restore — rewinding RIP to the entry.
+        let snap = guest.snapshot_vcpu().expect("snapshot boot vcpu");
+        assert_eq!(guest.run(0x1000, 100).unwrap(), LoopOutcome::Halted);
+        guest.restore_vcpu(&snap).expect("restore boot vcpu");
+        // Running again re-executes the payload from the rewound entry.
+        assert_eq!(guest.run(0x1000, 100).unwrap(), LoopOutcome::Halted);
+        assert_eq!(
+            &*sink.lock().unwrap(),
+            b"AA",
+            "restore rewound the vCPU so the payload ran twice"
+        );
     }
 
     #[test]
