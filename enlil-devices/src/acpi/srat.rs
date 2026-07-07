@@ -199,9 +199,101 @@ impl Default for SratBuilder {
     }
 }
 
+/// Collect the distinct NUMA proximity domains a SRAT advertises (Phase 6.3 NUMA
+/// topology).
+///
+/// Walks the enabled Processor Local APIC Affinity (type 0) and Memory Affinity
+/// (type 1) structures and returns their proximity domains, sorted and
+/// deduplicated — so the length is the NUMA-node count. The SRAT header is 48
+/// bytes (36-byte SDT header + 4-byte revision + 8 reserved); each structure is a
+/// `(type, length)` pair; a truncated/self-referential entry stops the walk.
+#[must_use]
+pub fn numa_domains(srat: &[u8]) -> Vec<u32> {
+    /// Offset of the first affinity structure.
+    const STRUCTURES: usize = 48;
+    let mut domains = Vec::new();
+    let mut off = STRUCTURES;
+    while off + 2 <= srat.len() {
+        let entry_type = srat[off];
+        let len = srat[off + 1] as usize;
+        if len < 2 || off + len > srat.len() {
+            break;
+        }
+        match entry_type {
+            // Processor Local APIC Affinity: flags at +4 (bit 0 enabled), the
+            // proximity domain split across +2 (low byte) and +9..+12 (high 3).
+            0 if len >= 16 => {
+                let flags = u32::from_le_bytes([
+                    srat[off + 4],
+                    srat[off + 5],
+                    srat[off + 6],
+                    srat[off + 7],
+                ]);
+                if flags & 1 != 0 {
+                    domains.push(
+                        u32::from(srat[off + 2])
+                            | (u32::from(srat[off + 9]) << 8)
+                            | (u32::from(srat[off + 10]) << 16)
+                            | (u32::from(srat[off + 11]) << 24),
+                    );
+                }
+            }
+            // Memory Affinity: proximity domain at +2 (u32), flags at +28.
+            1 if len >= 40 => {
+                let flags = u32::from_le_bytes([
+                    srat[off + 28],
+                    srat[off + 29],
+                    srat[off + 30],
+                    srat[off + 31],
+                ]);
+                if flags & 1 != 0 {
+                    domains.push(u32::from_le_bytes([
+                        srat[off + 2],
+                        srat[off + 3],
+                        srat[off + 4],
+                        srat[off + 5],
+                    ]));
+                }
+            }
+            _ => {}
+        }
+        off += len;
+    }
+    domains.sort_unstable();
+    domains.dedup();
+    domains
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numa_domains_collects_distinct_enabled_proximity_domains() {
+        let srat = SratBuilder::new()
+            .add_processor(ProcessorAffinityEntry::new(0, 0, true)) // domain 0
+            .add_processor(ProcessorAffinityEntry::new(1, 1, true)) // domain 1
+            .add_processor(ProcessorAffinityEntry::new(2, 2, false)) // disabled → skipped
+            .add_memory(MemoryAffinityEntry::new(
+                1,
+                0x1_0000_0000,
+                0x1_0000_0000,
+                true,
+                false,
+            )) // dup of 1
+            .add_memory(MemoryAffinityEntry::new(
+                3,
+                0x2_0000_0000,
+                0x1_0000_0000,
+                true,
+                false,
+            )) // domain 3
+            .build();
+        // Distinct enabled domains: {0, 1, 3}.
+        assert_eq!(numa_domains(&srat), vec![0, 1, 3]);
+        // An empty/header-only SRAT has no domains.
+        assert!(numa_domains(&SratBuilder::new().build()).is_empty());
+    }
 
     #[test]
     fn srat_single_node_builds() {
