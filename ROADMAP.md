@@ -36,7 +36,7 @@
 - [x] 1.3 Memory subsystem — global allocator plus physical/virtual memory management
   - [x] Hybrid GlobalAlloc: buddy allocator + slab cache, registered as PlatformAllocator
   - [x] Physical memory manager: PhysAddr/VirtAddr/PhysFrame types + bitmap frame allocator
-  - [ ] Region carving from UEFI/host map (hypervisor heap, guest RAM, DMA, MMIO)
+  - [ ] Region carving from UEFI/host map (hypervisor heap, guest RAM, DMA, MMIO) — backend-neutral model + algorithm landed (memory::map: MemoryKind/MemoryRegion with end/contains/overlaps, MemoryMap kept sorted with total_usable/largest_usable, and carve/carve_below first-fit that splits a usable region, retypes the carved span Reserved, and honors alignment + a below-limit constraint for a 32-bit DMA window; is_consistent invariant; unit-tested); NEXT SLICE: the firmware-specific parser that produces a MemoryMap (UEFI memory map / E820, ties into Phase 6.3) and the policy that assigns the four specific regions
   - [ ] Virtual memory: host page tables (CR3), mmap-like semantics, guard pages
 - [x] 1.4 Threading — per-CPU run queues, priority scheduling, and work-stealing
   - [x] Priority levels (Critical>High>Normal>Low), Task, per-CPU RunQueue
