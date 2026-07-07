@@ -571,8 +571,8 @@ mod linux {
     /// guest's config to a [`GuestBootSpec`] (RAM from `memory_mb`, serial sink,
     /// name-seeded vTPM; boot base at guest-physical 0, host-detected stealth
     /// platform), assemble the [`GuestRuntime`], [`load_bzimage`](GuestRuntime::load_bzimage)
-    /// the kernel with `cmdline`, [`boot_kernel`](GuestRuntime::boot_kernel), and
-    /// [`run`](GuestRuntime::run).
+    /// the kernel with `cmdline` and optional `initrd`,
+    /// [`boot_kernel`](GuestRuntime::boot_kernel), and [`run`](GuestRuntime::run).
     ///
     /// # Errors
     /// Returns [`Error::Config`] if `config` has no guests; otherwise propagates
@@ -580,6 +580,7 @@ mod linux {
     pub fn run_first_guest(
         config: &EnlilConfig,
         kernel: &[u8],
+        initrd: Option<&[u8]>,
         cmdline: &str,
         max_entries: usize,
     ) -> Result<LoopOutcome> {
@@ -599,7 +600,7 @@ mod linux {
             LbrPlatform::detect_host(),
         );
         let mut runtime = GuestRuntime::prepare_real_mode(spec)?;
-        let boot = runtime.load_bzimage(kernel, cmdline, None)?;
+        let boot = runtime.load_bzimage(kernel, cmdline, initrd)?;
         runtime.boot_kernel(&boot)?;
         runtime.run(0, max_entries)
     }
@@ -878,7 +879,7 @@ mod tests {
             usb: UsbConfig::default(),
         };
 
-        match run_first_guest(&config, &image, "console=ttyS0", 100) {
+        match run_first_guest(&config, &image, None, "console=ttyS0", 100) {
             Ok(outcome) => assert_eq!(
                 outcome,
                 LoopOutcome::Halted,

@@ -43,13 +43,34 @@ fn run(config_path: &str, kernel_path: &str, cmdline: &str) -> anyhow::Result<()
     let kernel = std::fs::read(kernel_path)
         .map_err(|e| anyhow::anyhow!("reading kernel {kernel_path}: {e}"))?;
 
+    // Load the first guest's initrd from its config path, if it names one.
+    let initrd = config
+        .guest
+        .values()
+        .next()
+        .and_then(|g| g.initrd.as_ref())
+        .map(|path| {
+            std::fs::read(path)
+                .map_err(|e| anyhow::anyhow!("reading initrd {}: {e}", path.display()))
+        })
+        .transpose()?;
+
     println!(
-        "Booting first guest from {config_path} with kernel {kernel_path} \
-         ({} bytes), cmdline: {cmdline:?}",
-        kernel.len()
+        "Booting first guest from {config_path} with kernel {kernel_path} ({} bytes){}, \
+         cmdline: {cmdline:?}",
+        kernel.len(),
+        initrd
+            .as_ref()
+            .map_or(String::new(), |i| format!(" + initrd ({} bytes)", i.len())),
     );
     // A generous per-boot entry bound; a real guest runs until it halts/resets.
-    let outcome = enlil_core::orchestrator::run_first_guest(&config, &kernel, cmdline, 10_000_000)?;
+    let outcome = enlil_core::orchestrator::run_first_guest(
+        &config,
+        &kernel,
+        initrd.as_deref(),
+        cmdline,
+        10_000_000,
+    )?;
     println!("Guest exited: {outcome:?}");
     Ok(())
 }
