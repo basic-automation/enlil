@@ -75,6 +75,33 @@ mod linux {
         /// [`KvmBackend`], [`StealthRunLoop::install`], `map_memory`,
         /// `create_vcpu`, and `prepare_real_mode_vcpu`.
         pub fn prepare_real_mode(spec: GuestBootSpec) -> Result<Self> {
+            let (mut run, ram, entry) = Self::assemble(spec)?;
+            run.backend_mut().prepare_real_mode_vcpu(0, entry)?;
+            Ok(Self { run, _ram: ram })
+        }
+
+        /// Like [`prepare_real_mode`](Self::prepare_real_mode) but starts the boot
+        /// vCPU in flat 32-bit **protected mode** (paging off, flat 4 GiB
+        /// segments). Real-mode payloads can only address the low 1 MiB and so
+        /// cannot reach the platform's high MMIO apertures (LAPIC `0xFEE0_0000`,
+        /// I/O APIC `0xFEC0_0000`, HPET `0xFED0_0000`); a protected-mode payload
+        /// can, which is the mode a real kernel's early setup runs in. The payload
+        /// is loaded at `entry` exactly as in real mode.
+        ///
+        /// # Errors
+        /// As [`prepare_real_mode`](Self::prepare_real_mode), but propagating
+        /// `prepare_protected_mode_vcpu`.
+        pub fn prepare_protected_mode(spec: GuestBootSpec) -> Result<Self> {
+            let (mut run, ram, entry) = Self::assemble(spec)?;
+            run.backend_mut().prepare_protected_mode_vcpu(0, entry)?;
+            Ok(Self { run, _ram: ram })
+        }
+
+        /// Shared setup for both boot modes: validate the spec, build the PC,
+        /// install the run loop, allocate+load+map guest RAM, and create the boot
+        /// vCPU. Returns the run loop, the RAM to keep alive, and the entry point;
+        /// the caller applies the mode-specific `prepare_*_vcpu`.
+        fn assemble(spec: GuestBootSpec) -> Result<(StealthRunLoop, GuestRam, u64)> {
             if spec.entry < spec.load_base {
                 return Err(Error::Config(format!(
                     "entry {:#x} is below the load base {:#x}",
@@ -109,16 +136,14 @@ mod linux {
             let mut ram = GuestRam::new(spec.ram_bytes);
             ram.as_mut_slice()[offset..end].copy_from_slice(&spec.image);
             let host_addr = ram.host_addr();
-            // SAFETY: `ram` is moved into the returned GuestRuntime and dropped
+            // SAFETY: `ram` is returned to and owned by the GuestRuntime, dropped
             // after `run`, so the mapped host buffer outlives the KVM VM slot.
             unsafe {
                 run.backend_mut()
                     .map_memory(spec.load_base, host_addr, ram.len() as u64)
             }?;
             run.create_vcpu(0)?;
-            run.backend_mut().prepare_real_mode_vcpu(0, spec.entry)?;
-
-            Ok(Self { run, _ram: ram })
+            Ok((run, ram, spec.entry))
         }
 
         /// Run the boot vCPU until it halts, resets to `reset_entry`, or commits a
@@ -215,5 +240,59 @@ mod tests {
         let outcome = guest.run(0x1000, 100).expect("run guest");
         assert_eq!(outcome, LoopOutcome::Halted, "guest halts after greeting");
         assert_eq!(&*sink.lock().unwrap(), b"K", "guest emitted its greeting");
+    }
+
+    #[test]
+    fn orchestrates_a_protected_mode_guest_reaching_high_mmio() {
+        if !is_kvm_available() {
+            eprintln!(
+                "skipping orchestrates_a_protected_mode_guest_reaching_high_mmio: no /dev/kvm"
+            );
+            return;
+        }
+        // 32-bit protected-mode payload:
+        //   mov eax, [0xFED00000]   ; read the HPET (high MMIO — real mode can't reach it)
+        //   mov al, 'P'
+        //   mov edx, 0x3F8
+        //   out dx, al              ; greet only if the high read did not fault
+        //   hlt
+        #[rustfmt::skip]
+        let image: Vec<u8> = vec![
+            0xA1, 0x00, 0x00, 0xD0, 0xFE, // mov eax, [0xFED00000]
+            0xB0, 0x50,                   // mov al, 'P'
+            0xBA, 0xF8, 0x03, 0x00, 0x00, // mov edx, 0x3F8
+            0xEE,                         // out dx, al
+            0xF4,                         // hlt
+        ];
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let spec = GuestBootSpec {
+            name: "pm-greeter".into(),
+            serial: SerialOutput::new("pm-greeter", SerialOutputMode::Shared(Arc::clone(&sink))),
+            ram_bytes: 0x2000,
+            load_base: 0x1000,
+            entry: 0x1000,
+            image,
+            rtc_unix_secs: 0,
+            platform: LbrPlatform::AmdSvm,
+        };
+
+        let mut guest = match GuestRuntime::prepare_protected_mode(spec) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping orchestrates_a_protected_mode_guest_reaching_high_mmio: {e}");
+                return;
+            }
+        };
+        let outcome = guest.run(0x1000, 100).expect("run guest");
+        assert_eq!(
+            outcome,
+            LoopOutcome::Halted,
+            "guest halts after the high read"
+        );
+        assert_eq!(
+            &*sink.lock().unwrap(),
+            b"P",
+            "guest read high MMIO in protected mode and greeted"
+        );
     }
 }
