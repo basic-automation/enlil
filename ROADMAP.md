@@ -49,7 +49,7 @@
   - [x] Bounded MPSC channel with Send/TrySend/Recv error types
 - [x] 1.6 Async runtime — lightweight priority-aware executor with waker and reactor
   - [x] Executor + PriorityExecutor with Wake-based re-enqueue and block_on
-  - [ ] I/O reactor (interrupt/epoll-driven waker, IPI wakeups)
+  - [ ] I/O reactor (interrupt/epoll-driven waker, IPI wakeups) — backend-neutral core landed (async_rt::Reactor: Mutex-guarded registration table with unique never-reused tokens, set_waker arming that fires immediately on an already-ready source to close the poll/arm race, mark_ready enqueue+wake fired outside the lock, take_ready draining, deregister; unit-tested with a counting waker); NEXT SLICE: wire the OS event source that drives mark_ready — epoll on Linux, device interrupt + IPI wakeups on bare metal
   - [ ] Priority inheritance on lock contention
 - [x] 1.7 Time subsystem — monotonic Instant/Duration, sleep, and TSC calibration
   - [x] Instant/Duration with monotonic ordering + sleep + Stopwatch
