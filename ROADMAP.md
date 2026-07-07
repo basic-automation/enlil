@@ -161,9 +161,10 @@
 - [ ] 4.5 Management-console USB controls (device list, reassignment UI, hot-plug notifications) with two-mice/two-keyboards live-reassign milestone
   - [x] USB wire protocol surface (UsbDeviceEntry, UsbDeviceList, UsbHotplugNotice, UsbCommand/UsbAction Reassign+Detach)
   - [x] USB tab view-model (enlil-mgmt::usb_tab::UsbTabState): headless state the render layer drives — device inventory with selection that sticks to a device by bus_addr across hot-plug refreshes, wrap-around cursor nav, reassign_action/detach_action UsbAction builders (no-op when redundant), cycle_target rotating the assignment through available guests skipping the current holder, and a bounded hot-plug notice ring; fully unit-tested without a TTY
-  - [ ] TUI USB tab rendering physical devices with their current guest assignment (logic lives in usb_tab::UsbTabState; needs the ratatui render layer — note: the enlil-mgmt binary is a CLI today with no interactive ratatui app host yet, despite 3.5's tab claims)
-  - [ ] Reassignment interface wiring keystrokes to usb_tab actions and driving UsbCommand over the socket
-  - [ ] Hot-plug notifications rendered in the console (feed ServerMessage::UsbHotplugNotice into UsbTabState::record_hotplug and render the ring)
+  - [x] USB tab controller (enlil-mgmt::usb_tab::UsbTabController): the wire↔view-model bridge — handle_server_message folds UsbDeviceList/UsbHotplugNotice into the UsbTabState (returns whether a redraw is needed, ignores non-USB messages), and reassign_selected/detach_selected/cycle_selected turn keystrokes into ClientMessage::UsbCommand with a monotonic command-id sequence (request_devices builds RequestUsbDevices); unit-tested
+  - [ ] TUI USB tab rendering physical devices with their current guest assignment (all logic lives in usb_tab::UsbTabState + UsbTabController; needs the ratatui render layer — note: the enlil-mgmt binary is a CLI today with no interactive ratatui app host yet, despite 3.5's tab claims)
+  - [ ] Reassignment interface: bind keystrokes to UsbTabController::reassign_selected/detach_selected/cycle_selected and send the returned UsbCommand over the socket (message-building done; needs the event-loop + socket glue)
+  - [ ] Hot-plug notifications rendered in the console (UsbTabController::handle_server_message already folds ServerMessage::UsbHotplugNotice into the notice ring; needs the render)
   - [ ] End-to-end milestone: two mice + two keyboards routed to different guests with live TUI reassignment
 
 ## Phase 5 — Windows Guest Support & Transparency

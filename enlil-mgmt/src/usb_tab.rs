@@ -9,7 +9,7 @@
 //! [`devices`](UsbTabState::devices), [`selected`](UsbTabState::selected), and
 //! [`notices`](UsbTabState::notices).
 
-use crate::protocol::{GuestId, UsbAction, UsbDeviceEntry};
+use crate::protocol::{ClientMessage, GuestId, ServerMessage, UsbAction, UsbDeviceEntry};
 use std::collections::VecDeque;
 
 /// How many hot-plug notices the tab keeps for display before dropping the
@@ -150,6 +150,94 @@ impl UsbTabState {
     }
 }
 
+/// Bridges the [`UsbTabState`] view-model to the wire protocol.
+///
+/// Folds inbound [`ServerMessage`]s into the state and turns operator keystrokes
+/// into the [`ClientMessage`]s the console sends to `enlil-core`. This is the
+/// piece the render/event loop drives; it owns the command-id sequence so each
+/// [`UsbAction`] is matched to its `CommandResponse`.
+#[derive(Debug, Default)]
+pub struct UsbTabController {
+    state: UsbTabState,
+    next_id: u64,
+}
+
+impl UsbTabController {
+    /// A fresh controller with an empty tab.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The backing view-model, for the renderer.
+    #[must_use]
+    pub const fn state(&self) -> &UsbTabState {
+        &self.state
+    }
+
+    /// The backing view-model, for cursor-navigation keystrokes
+    /// ([`UsbTabState::select_next`] / [`select_prev`](UsbTabState::select_prev)).
+    pub const fn state_mut(&mut self) -> &mut UsbTabState {
+        &mut self.state
+    }
+
+    /// Fold a server message into the tab, returning `true` if it changed
+    /// USB-tab state (i.e. the tab should be redrawn). Non-USB messages are
+    /// ignored and return `false`.
+    pub fn handle_server_message(&mut self, msg: &ServerMessage) -> bool {
+        match msg {
+            ServerMessage::UsbDeviceList(devices) => {
+                self.state.set_devices(devices.clone());
+                true
+            }
+            ServerMessage::UsbHotplugNotice { message, .. } => {
+                self.state.record_hotplug(message);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The message that (re)requests the full USB inventory — sent on entering
+    /// the tab and to refresh.
+    #[must_use]
+    pub const fn request_devices() -> ClientMessage {
+        ClientMessage::RequestUsbDevices
+    }
+
+    /// Build a [`ClientMessage::UsbCommand`] reassigning the selected device to
+    /// `target`, with a fresh command id. `None` when nothing is selected or the
+    /// move would be a no-op (already on `target`).
+    pub fn reassign_selected(&mut self, target: &GuestId) -> Option<ClientMessage> {
+        let action = self.state.reassign_action(target)?;
+        Some(self.command(action))
+    }
+
+    /// Build a [`ClientMessage::UsbCommand`] detaching the selected device back to
+    /// the hypervisor. `None` when nothing is selected or it is already
+    /// unassigned.
+    pub fn detach_selected(&mut self) -> Option<ClientMessage> {
+        let action = self.state.detach_action()?;
+        Some(self.command(action))
+    }
+
+    /// Advance the selected device's assignment to the next guest in `guests`
+    /// (skipping its current holder) and build the reassignment command — the
+    /// "cycle assignment" keystroke. `None` when nothing is selected or there is
+    /// no other guest to move to.
+    pub fn cycle_selected(&mut self, guests: &[GuestId]) -> Option<ClientMessage> {
+        let target = self.state.cycle_target(guests)?;
+        self.reassign_selected(&target)
+    }
+
+    /// Wrap a [`UsbAction`] in a command with the next id in sequence.
+    const fn command(&mut self, action: UsbAction) -> ClientMessage {
+        let id = self.next_id;
+        self.next_id += 1;
+        ClientMessage::UsbCommand { id, action }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,5 +359,94 @@ mod tests {
         );
         // Oldest retained is the first one that was not evicted.
         assert_eq!(t.notices().front().map(String::as_str), Some("event 10"));
+    }
+
+    #[test]
+    fn controller_folds_server_messages_into_the_tab() {
+        let mut c = UsbTabController::new();
+        // A device list populates the tab and asks for a redraw.
+        let changed = c.handle_server_message(&ServerMessage::UsbDeviceList(vec![
+            dev(1, Some("vm1")),
+            dev(2, None),
+        ]));
+        assert!(changed);
+        assert_eq!(c.state().devices().len(), 2);
+        // A hotplug notice is recorded and asks for a redraw.
+        assert!(c.handle_server_message(&ServerMessage::UsbHotplugNotice {
+            message: "device 3 attached".into(),
+            device: None,
+        }));
+        assert_eq!(c.state().latest_notice(), Some("device 3 attached"));
+        // An unrelated (non-USB) message changes nothing.
+        assert!(!c.handle_server_message(&ServerMessage::CommandResponse {
+            id: 0,
+            success: true,
+            message: String::new(),
+        }));
+    }
+
+    #[test]
+    fn controller_builds_commands_with_increasing_ids() {
+        let mut c = UsbTabController::new();
+        c.handle_server_message(&ServerMessage::UsbDeviceList(vec![dev(5, Some("vm1"))]));
+
+        // Reassign selected → UsbCommand with id 0 and a Reassign action.
+        let msg = c.reassign_selected(&"vm2".to_string()).expect("reassign");
+        match msg {
+            ClientMessage::UsbCommand { id, action } => {
+                assert_eq!(id, 0);
+                assert_eq!(
+                    action,
+                    UsbAction::Reassign {
+                        bus_addr: 5,
+                        target_guest: "vm2".into()
+                    }
+                );
+            }
+            other => panic!("expected UsbCommand, got {other:?}"),
+        }
+
+        // Detach → next id 1.
+        let msg = c.detach_selected().expect("detach");
+        match msg {
+            ClientMessage::UsbCommand { id, action } => {
+                assert_eq!(id, 1, "command ids increase");
+                assert_eq!(action, UsbAction::Detach { bus_addr: 5 });
+            }
+            other => panic!("expected UsbCommand, got {other:?}"),
+        }
+
+        // A redundant reassign (already on vm1) yields no command and no id burn.
+        assert!(c.reassign_selected(&"vm1".to_string()).is_none());
+    }
+
+    #[test]
+    fn controller_cycle_selected_advances_the_target() {
+        let mut c = UsbTabController::new();
+        c.handle_server_message(&ServerMessage::UsbDeviceList(vec![dev(1, Some("vm1"))]));
+        let guests = vec!["vm1".to_string(), "vm2".to_string()];
+        // Cycling from vm1 targets vm2.
+        let msg = c.cycle_selected(&guests).expect("cycle produces a command");
+        match msg {
+            ClientMessage::UsbCommand { id, action } => {
+                assert_eq!(id, 0);
+                assert_eq!(
+                    action,
+                    UsbAction::Reassign {
+                        bus_addr: 1,
+                        target_guest: "vm2".into()
+                    }
+                );
+            }
+            other => panic!("expected UsbCommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_devices_is_the_inventory_request() {
+        assert!(matches!(
+            UsbTabController::request_devices(),
+            ClientMessage::RequestUsbDevices
+        ));
     }
 }
