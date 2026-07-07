@@ -456,6 +456,47 @@ mod linux {
                 .prepare_linux_boot_vcpu(0, boot.kernel_entry, boot.boot_params)
         }
 
+        /// Enter a loaded kernel via its **64-bit** entry point
+        /// (`kernel_entry + 0x200`) in long mode with `RSI` → the `boot_params` —
+        /// the 64-bit Linux boot protocol modern kernels prefer. Installs a minimal
+        /// identity map (`[0, 2 MiB)`) in guest RAM and enters long mode at the
+        /// 64-bit entry. Requires `load_base == 0`.
+        ///
+        /// # Errors
+        /// Returns [`Error::Config`] if `load_base != 0`; otherwise propagates the
+        /// page-table write and [`KvmBackend::prepare_linux_boot_vcpu_64`].
+        pub fn boot_kernel_64(&mut self, boot: &KernelBoot) -> Result<()> {
+            /// Offset of the 64-bit entry point from the protected-mode kernel base
+            /// (Linux boot protocol).
+            const ENTRY_64_OFFSET: u64 = 0x200;
+            if self.load_base != 0 {
+                return Err(Error::Config(
+                    "64-bit kernel entry requires load_base 0".into(),
+                ));
+            }
+            let pml4 = self.install_identity_page_tables()?;
+            self.run.backend_mut().prepare_linux_boot_vcpu_64(
+                0,
+                boot.kernel_entry + ENTRY_64_OFFSET,
+                boot.boot_params,
+                pml4,
+            )
+        }
+
+        /// Write a minimal identity-mapping page-table tree — PML4 → PDPT → PD with
+        /// a single 2 MiB page covering `[0, 2 MiB)` — into guest RAM at fixed low
+        /// addresses (`0x4000`/`0x5000`/`0x6000`), returning the PML4 gpa. The
+        /// long-mode kernel-entry path uses it. Assumes `load_base == 0`.
+        fn install_identity_page_tables(&mut self) -> Result<u64> {
+            const PML4_GPA: u64 = 0x4000;
+            const PDPT_GPA: u64 = 0x5000;
+            const PD_GPA: u64 = 0x6000;
+            self.write_guest_bytes(PML4_GPA, &(PDPT_GPA | 0x3).to_le_bytes())?; // present|write
+            self.write_guest_bytes(PDPT_GPA, &(PD_GPA | 0x3).to_le_bytes())?;
+            self.write_guest_bytes(PD_GPA, &0x83u64.to_le_bytes())?; // present|write|PS
+            Ok(PML4_GPA)
+        }
+
         /// Resume the guest from an ACPI S3 (suspend-to-RAM) transition: read the
         /// FACS (the OS wrote its firmware waking vector there before suspending)
         /// from guest RAM at `facs_gpa` — the address the FADT's `FIRMWARE_CTRL`
@@ -937,6 +978,22 @@ mod tests {
         assert_eq!(snap.regs.rip, 0x10_0000, "rip at the kernel entry");
         assert_eq!(snap.regs.rsi, 0x1_0000, "rsi points at boot_params");
         assert_ne!(snap.sregs.cr0 & 1, 0, "protected mode (CR0.PE) enabled");
+
+        // The 64-bit entry path: long mode at kernel_entry + 0x200, RSI preserved.
+        guest
+            .boot_kernel_64(&boot)
+            .expect("prepare 64-bit kernel entry");
+        let snap64 = guest
+            .snapshot_vcpu()
+            .expect("snapshot after boot_kernel_64");
+        assert_eq!(snap64.regs.rip, 0x10_0200, "rip at the 64-bit entry");
+        assert_eq!(snap64.regs.rsi, 0x1_0000, "rsi points at boot_params");
+        assert_ne!(snap64.sregs.cr0 & (1 << 31), 0, "paging (CR0.PG) enabled");
+        assert_ne!(
+            snap64.sregs.efer & (1 << 10),
+            0,
+            "long mode active (EFER.LMA)"
+        );
     }
 
     #[test]

@@ -1658,6 +1658,37 @@ mod linux {
             Ok(())
         }
 
+        /// Prepare vCPU `index` to enter a Linux kernel via its **64-bit** entry
+        /// point at `entry` — long mode through the page tables at `pml4_gpa` (as
+        /// [`prepare_long_mode_vcpu`](Self::prepare_long_mode_vcpu)) with `RSI`
+        /// pointing at `boot_params`. This is the 64-bit boot protocol modern
+        /// kernels prefer; the caller places the kernel, `boot_params`, and page
+        /// tables in guest RAM first.
+        ///
+        /// # Errors
+        /// Returns [`Error::Vcpu`] if `index` is out of range or any of the
+        /// `KVM_{GET,SET}_{SREGS,REGS}` ioctls fail.
+        pub fn prepare_linux_boot_vcpu_64(
+            &self,
+            index: usize,
+            entry: u64,
+            boot_params: u64,
+            pml4_gpa: u64,
+        ) -> Result<()> {
+            self.prepare_long_mode_vcpu(index, entry, pml4_gpa)?;
+            let vcpu = self
+                .vcpus
+                .get(index)
+                .ok_or_else(|| Error::Vcpu(format!("no vcpu at index {index}")))?;
+            let mut regs = vcpu
+                .get_regs()
+                .map_err(|e| Error::Vcpu(format!("KVM_GET_REGS: {e}")))?;
+            regs.rsi = boot_params;
+            vcpu.set_regs(&regs)
+                .map_err(|e| Error::Vcpu(format!("KVM_SET_REGS: {e}")))?;
+            Ok(())
+        }
+
         /// Registered guest memory slots.
         #[must_use]
         pub fn mem_slots(&self) -> &[MemSlot] {
