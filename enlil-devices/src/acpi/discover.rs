@@ -107,6 +107,30 @@ pub fn host_ecam_allocations(mem: &[u8], rsdp_gpa: u64) -> Vec<super::mcfg::Mcfg
         .unwrap_or_default()
 }
 
+/// Which IOMMU the firmware advertises, discovered from the ACPI tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IommuKind {
+    /// Intel VT-d — advertised by the `DMAR` table.
+    IntelVtd,
+    /// AMD-Vi — advertised by the `IVRS` table.
+    AmdVi,
+}
+
+/// Discover which IOMMU (if any) the firmware advertises (Phase 6.3 / 6.4).
+///
+/// A `DMAR` table means Intel VT-d, an `IVRS` table means AMD-Vi. `None` if
+/// neither is present (no IOMMU, so DMA-remapped passthrough is unavailable).
+#[must_use]
+pub fn host_iommu_kind(mem: &[u8], rsdp_gpa: u64) -> Option<IommuKind> {
+    if find_table(mem, rsdp_gpa, b"DMAR").is_some() {
+        Some(IommuKind::IntelVtd)
+    } else if find_table(mem, rsdp_gpa, b"IVRS").is_some() {
+        Some(IommuKind::AmdVi)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +141,47 @@ mod tests {
     fn place(ram: &mut [u8], gpa: u64, bytes: &[u8]) {
         let o = usize::try_from(gpa).unwrap();
         ram[o..o + bytes.len()].copy_from_slice(bytes);
+    }
+
+    /// A minimal 36-byte SDT with the given signature and a correct length field,
+    /// enough for the walker to identify it (no builder exists for DMAR/IVRS).
+    fn fake_table(signature: [u8; 4]) -> Vec<u8> {
+        let mut t = vec![0u8; 36];
+        t[0..4].copy_from_slice(&signature);
+        t[4..8].copy_from_slice(&36u32.to_le_bytes());
+        t
+    }
+
+    #[test]
+    fn discovers_the_iommu_kind() {
+        const TBL_GPA: u64 = 0x2000;
+        const XSDT_GPA: u64 = 0x4000;
+        const RSDP_GPA: u64 = 0x5000;
+        let build = |sig: [u8; 4]| {
+            let mut ram = vec![0u8; 0x6000];
+            place(&mut ram, TBL_GPA, &fake_table(sig));
+            place(
+                &mut ram,
+                XSDT_GPA,
+                &XsdtBuilder::new().add_table(TBL_GPA).build(),
+            );
+            place(
+                &mut ram,
+                RSDP_GPA,
+                &RsdpBuilder::new().xsdt_address(XSDT_GPA).build(),
+            );
+            ram
+        };
+        assert_eq!(
+            host_iommu_kind(&build(*b"DMAR"), RSDP_GPA),
+            Some(IommuKind::IntelVtd)
+        );
+        assert_eq!(
+            host_iommu_kind(&build(*b"IVRS"), RSDP_GPA),
+            Some(IommuKind::AmdVi)
+        );
+        // A table set with neither → no IOMMU.
+        assert_eq!(host_iommu_kind(&build(*b"APIC"), RSDP_GPA), None);
     }
 
     #[test]
