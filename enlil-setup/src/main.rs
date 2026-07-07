@@ -67,8 +67,9 @@ pub fn detect_hardware() -> HardwareInfo {
 #[cfg(target_os = "linux")]
 fn detect_hardware_linux() -> HardwareInfo {
     // Start from the stub and overlay whatever we can read for real. CPU count
-    // and RAM come from procfs; NVMe drives and IOMMU groups from sysfs. The
-    // GPU and USB-controller lists still need a PCI-class walk and stay stubbed.
+    // and RAM come from procfs; NVMe drives, IOMMU groups, and the GPU/USB
+    // controllers (by PCI class) from sysfs — everything but the stub's own
+    // fallbacks is now live.
     let mut hw = detect_hardware_stub();
     if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo")
         && let Some(n) = count_cpus_from_cpuinfo(&cpuinfo)
@@ -84,7 +85,69 @@ fn detect_hardware_linux() -> HardwareInfo {
     // fabricated hardware. A host with the IOMMU disabled truthfully shows none.
     hw.nvme_drives = detect_nvme_drives();
     hw.iommu_groups = detect_iommu_groups();
+    hw.gpus = detect_pci_devices(is_display_controller);
+    hw.usb_controllers = detect_pci_devices(is_usb_controller);
     hw
+}
+
+/// Enumerate PCI devices under `/sys/bus/pci/devices` whose class matches
+/// `is_match`, labelling each `vendor:device [BDF]`. Empty if the directory is
+/// absent. Shared by the GPU and USB-controller scans.
+#[cfg(target_os = "linux")]
+fn detect_pci_devices(is_match: fn(&str) -> bool) -> Vec<String> {
+    let root = "/sys/bus/pci/devices";
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut bdfs: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(String::from))
+        .collect();
+    bdfs.sort();
+    bdfs.into_iter()
+        .filter_map(|bdf| {
+            let class = std::fs::read_to_string(format!("{root}/{bdf}/class")).ok()?;
+            if !is_match(&class) {
+                return None;
+            }
+            let vendor =
+                std::fs::read_to_string(format!("{root}/{bdf}/vendor")).unwrap_or_default();
+            let device =
+                std::fs::read_to_string(format!("{root}/{bdf}/device")).unwrap_or_default();
+            Some(pci_device_label(&vendor, &device, &bdf))
+        })
+        .collect()
+}
+
+/// Whether a PCI `class` string (sysfs form, e.g. `0x030000`) is a display
+/// controller — base class `0x03`, which is how GPUs enumerate.
+#[cfg(any(target_os = "linux", test))]
+fn is_display_controller(class: &str) -> bool {
+    class
+        .trim()
+        .strip_prefix("0x")
+        .is_some_and(|c| c.starts_with("03"))
+}
+
+/// Whether a PCI `class` string is a USB controller — base class `0x0c`,
+/// subclass `0x03`.
+#[cfg(any(target_os = "linux", test))]
+fn is_usb_controller(class: &str) -> bool {
+    class
+        .trim()
+        .strip_prefix("0x")
+        .is_some_and(|c| c.starts_with("0c03"))
+}
+
+/// Label a PCI device `vendor:device [BDF]` from its sysfs `vendor`/`device`
+/// hex IDs (each of the form `0x10de`) and its bus address.
+#[cfg(any(target_os = "linux", test))]
+fn pci_device_label(vendor: &str, device: &str, bdf: &str) -> String {
+    let id = |raw: &str| {
+        let raw = raw.trim();
+        raw.strip_prefix("0x").unwrap_or(raw).to_string()
+    };
+    format!("{}:{} [{bdf}]", id(vendor), id(device))
 }
 
 /// Enumerate `NVMe` drives from `/sys/class/nvme`, labelling each with its model.
@@ -379,6 +442,24 @@ mod tests {
             nvme_label("   ", "nvme1"),
             "NVMe [nvme1]",
             "blank model falls back"
+        );
+    }
+
+    #[test]
+    fn classifies_pci_display_and_usb_controllers() {
+        assert!(is_display_controller("0x030000")); // VGA display controller
+        assert!(is_display_controller("0x038000\n")); // other display, trailing newline
+        assert!(!is_display_controller("0x0c0330")); // USB, not display
+        assert!(is_usb_controller("0x0c0330")); // xHCI
+        assert!(!is_usb_controller("0x030000")); // display, not USB
+        assert!(!is_usb_controller("0x0c0500")); // SMBus (0c05), not USB
+    }
+
+    #[test]
+    fn pci_device_label_formats_vendor_device_and_bdf() {
+        assert_eq!(
+            pci_device_label("0x10de\n", "0x2684\n", "0000:01:00.0"),
+            "10de:2684 [0000:01:00.0]"
         );
     }
 
