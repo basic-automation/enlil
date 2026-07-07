@@ -129,9 +129,11 @@ later (this is the same pragmatic strategy Firecracker and Cloud Hypervisor used
 | KVM-backed VMM: single & multi-guest, CPU/memory partitioning | ✅ Implemented on Linux (`enlil-core`) |
 | Virtual device layer (VirtIO net/block, interrupts, timers, PS/2, HDA, storage) | ✅ Implemented (`enlil-devices`) |
 | Managed vCPU run loop: stealth stack + per-entry platform-timer cadence & LAPIC TSC-deadline firing | ✅ Implemented on Linux (`enlil-core`, `StealthRunLoop`) |
-| USB peripheral routing (virtual xHCI, TRB-level; config-driven `[usb.routing]` rules; Linux sysfs host enumeration + cadence-throttled hot-plug polling) | 🚧 Substantially implemented |
-| Windows transparency (ACPI/SMBIOS synthesis incl. S3/S4/S5 sleep states, CPUID identity+topology/timing/LBR stealth, per-guest vTPM with persistent NV state, independent endorsement keys & name-derived seeds; anti-detection checks: IET APERF/MPERF divergence, NIC-OUI tells) | 🚧 Building blocks implemented |
-| Bare-metal UEFI boot (Phase 6) | ⏳ Stub (`enlil-boot`) — planned |
+| Guest-boot orchestrator: config→`GuestRuntime`→run, `bzImage` kernel load (setup-header/`boot_params`/initrd/E820, real·protected·long-mode entry), per-guest CPUID+vTPM+LBR transparency, guest-RAM I/O — driven by the `enlil-run` binary | ✅ Implemented on Linux (`enlil-core`, `orchestrator`), KVM-verified end to end |
+| Suspend/resume: vCPU state snapshot/restore + ACPI S3 (FACS waking-vector discovery via the RSDP→XSDT→FADT→FACS walk, re-entry at the waking vector) | ✅ Implemented on Linux (`enlil-core`, KVM-verified) |
+| USB peripheral routing (virtual xHCI, TRB-level; config-driven `[usb.routing]` rules; Linux sysfs host enumeration + cadence-throttled hot-plug polling; console USB-tab view-model/controller) | 🚧 Substantially implemented |
+| Windows transparency (ACPI/SMBIOS synthesis incl. S3/S4/S5 sleep states, CPUID identity+topology/timing/LBR stealth, per-guest vTPM with persistent NV state, independent endorsement keys & name-derived seeds; NIC-OUI transparency in config + safe MAC synthesis; anti-detection checks: IET APERF/MPERF divergence) | 🚧 Building blocks implemented |
+| Bare-metal UEFI boot (Phase 6) | ⏳ Stub (`enlil-boot`) — firmware-table discovery primitives landed (ACPI `find_table`/MADT-CPU-count/MCFG-ECAM/DMAR·IVRS IOMMU discovery; `MemoryMap` carve/plan from E820 & UEFI maps) |
 | GPU sharing, compute fabric, ARM/RISC-V, multi-machine mesh | ⏳ Planned (Phases 7–11) |
 
 > **Honest caveat:** the RustVMM/KVM dependencies in `enlil-core` are gated to
