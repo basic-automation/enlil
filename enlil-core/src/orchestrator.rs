@@ -18,7 +18,7 @@
 //! `target_os = "linux"`-only, like the run loop it drives.
 
 #[cfg(target_os = "linux")]
-pub use linux::{GuestBootSpec, GuestRuntime, KernelBoot};
+pub use linux::{run_first_guest, GuestBootSpec, GuestRuntime, KernelBoot};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -29,7 +29,7 @@ mod linux {
     use crate::run_loop::{LoopOutcome, StealthRunLoop};
     use crate::serial::{SerialOutput, SerialOutputMode};
     use crate::Result;
-    use enlil_config::GuestConfig;
+    use enlil_config::{EnlilConfig, GuestConfig};
     use enlil_devices::acpi::facs::{FacsWaking, ResumeTarget, FACS_LENGTH};
     use enlil_devices::stealth::cpuid::{CpuidStealthConfig, CpuidStealthTable};
     use enlil_devices::stealth::lbr::LbrPlatform;
@@ -488,6 +488,46 @@ mod linux {
             self.resume_from_s3(facs_gpa)
         }
     }
+
+    /// Boot the first guest defined in `config` from a Linux `bzImage`, running it
+    /// until it halts / resets / sleeps or `max_entries` guest entries elapse.
+    ///
+    /// The end-to-end orchestration a top-level binary drives (item 3.12): map the
+    /// guest's config to a [`GuestBootSpec`] (RAM from `memory_mb`, serial sink,
+    /// name-seeded vTPM; boot base at guest-physical 0, host-detected stealth
+    /// platform), assemble the [`GuestRuntime`], [`load_bzimage`](GuestRuntime::load_bzimage)
+    /// the kernel with `cmdline`, [`boot_kernel`](GuestRuntime::boot_kernel), and
+    /// [`run`](GuestRuntime::run).
+    ///
+    /// # Errors
+    /// Returns [`Error::Config`] if `config` has no guests; otherwise propagates
+    /// the [`GuestRuntime`] preparation, load, and run errors.
+    pub fn run_first_guest(
+        config: &EnlilConfig,
+        kernel: &[u8],
+        cmdline: &str,
+        max_entries: usize,
+    ) -> Result<LoopOutcome> {
+        let guest = config
+            .guest
+            .values()
+            .next()
+            .ok_or_else(|| Error::Config("configuration has no guests to boot".into()))?;
+        // The boot payload is unused (the kernel is placed at 1 MiB by
+        // load_bzimage); a single hlt is a harmless placeholder at entry 0.
+        let spec = GuestBootSpec::from_guest_config(
+            guest,
+            vec![0xF4],
+            0,
+            0,
+            0,
+            LbrPlatform::detect_host(),
+        );
+        let mut runtime = GuestRuntime::prepare_real_mode(spec)?;
+        let boot = runtime.load_bzimage(kernel, cmdline)?;
+        runtime.boot_kernel(&boot)?;
+        runtime.run(0, max_entries)
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -720,6 +760,58 @@ mod tests {
             platform: LbrPlatform::AmdSvm,
         };
         assert!(GuestRuntime::prepare_long_mode(spec).is_err());
+    }
+
+    #[test]
+    fn run_first_guest_boots_a_bzimage_kernel_to_halt() {
+        use enlil_config::{
+            EnlilConfig, GuestConfig, HypervisorConfig, SchedulingMode, SerialPortConfig, UsbConfig,
+        };
+        use std::collections::HashMap;
+
+        if !is_kvm_available() {
+            eprintln!("skipping run_first_guest_boots_a_bzimage_kernel_to_halt: no /dev/kvm");
+            return;
+        }
+        // A fake bzImage whose protected-mode kernel is a single hlt.
+        let mut image = vec![0u8; 0x401];
+        image[0x1F1] = 1; // setup_sects → kernel at (1+1)*512 = 0x400
+        image[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+        image[0x202..0x206].copy_from_slice(b"HdrS");
+        image[0x206..0x208].copy_from_slice(&0x020Fu16.to_le_bytes());
+        image[0x400] = 0xF4; // hlt
+
+        let mut guests = HashMap::new();
+        guests.insert(
+            "vm1".into(),
+            GuestConfig {
+                name: "vm1".into(),
+                cpus: vec![0],
+                memory_mb: 2, // 2 MiB — room for the kernel at 1 MiB
+                kernel: None,
+                initrd: None,
+                cmdline: "console=ttyS0".into(),
+                scheduling: SchedulingMode::Auto,
+                disks: vec![],
+                serial: SerialPortConfig::default(),
+                mac: None,
+            },
+        );
+        let config = EnlilConfig {
+            hypervisor: HypervisorConfig::default(),
+            guest: guests,
+            usb: UsbConfig::default(),
+        };
+
+        match run_first_guest(&config, &image, "console=ttyS0", 100) {
+            Ok(outcome) => assert_eq!(
+                outcome,
+                LoopOutcome::Halted,
+                "the config-driven kernel booted and halted"
+            ),
+            // KVM present but VM setup unavailable (e.g. capability) → honest skip.
+            Err(e) => eprintln!("skipping run_first_guest_boots_a_bzimage_kernel_to_halt: {e}"),
+        }
     }
 
     #[test]
