@@ -27,6 +27,7 @@ mod linux {
     use crate::serial::{SerialOutput, SerialOutputMode};
     use crate::Result;
     use enlil_config::GuestConfig;
+    use enlil_devices::stealth::cpuid::{CpuidStealthConfig, CpuidStealthTable};
     use enlil_devices::stealth::lbr::LbrPlatform;
     use enlil_devices::tpm::VirtualTpm;
 
@@ -184,6 +185,18 @@ mod linux {
                     .map_memory(spec.load_base, host_addr, ram.len() as u64)
             }?;
             run.create_vcpu(0)?;
+
+            // Apply CPUID stealth before the guest runs (LOCKED PRINCIPLE 1 —
+            // transparency): clear the CPUID.1:ECX[31] hypervisor-present bit,
+            // present the guest's own single-vCPU topology (not the host's
+            // logical-processor count), and a PMU leaf consistent with the RDPMC
+            // shadow — so a guest that reads CPUID cannot trivially detect the
+            // hypervisor. The table takes the physical machine's identity via
+            // from_host.
+            let table = CpuidStealthTable::build(&CpuidStealthConfig::from_host(1, 1));
+            run.apply_topology_stealth(&table)?;
+            run.apply_pmu_stealth(&table)?;
+
             Ok((run, ram, spec.entry))
         }
 
@@ -380,6 +393,58 @@ mod tests {
             &*sink.lock().unwrap(),
             b"AA",
             "restore rewound the vCPU so the payload ran twice"
+        );
+    }
+
+    #[test]
+    fn orchestrated_guest_sees_the_hypervisor_bit_cleared() {
+        if !is_kvm_available() {
+            eprintln!("skipping orchestrated_guest_sees_the_hypervisor_bit_cleared: no /dev/kvm");
+            return;
+        }
+        // Read CPUID.1, extract ECX bit 31 (hypervisor-present), and emit it as
+        // ASCII '0' (clear = stealthy) or '1' (set = detectable) over COM1:
+        //   mov eax, 1
+        //   cpuid
+        //   shr ecx, 31        ; ecx = the hypervisor-present bit
+        //   add cl, '0'
+        //   mov al, cl
+        //   mov dx, 0x3F8 ; out dx, al
+        //   hlt
+        #[rustfmt::skip]
+        let image: Vec<u8> = vec![
+            0x66, 0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+            0x0F, 0xA2,                         // cpuid
+            0x66, 0xC1, 0xE9, 0x1F,             // shr ecx, 31
+            0x80, 0xC1, 0x30,                   // add cl, '0'
+            0x88, 0xC8,                         // mov al, cl
+            0xBA, 0xF8, 0x03,                   // mov dx, 0x3F8
+            0xEE,                               // out dx, al
+            0xF4,                               // hlt
+        ];
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let spec = GuestBootSpec {
+            name: "stealth-check".into(),
+            serial: SerialOutput::new("stealth-check", SerialOutputMode::Shared(Arc::clone(&sink))),
+            ram_bytes: 0x2000,
+            load_base: 0x1000,
+            entry: 0x1000,
+            image,
+            rtc_unix_secs: 0,
+            platform: LbrPlatform::AmdSvm,
+        };
+        let mut guest = match GuestRuntime::prepare_real_mode(spec) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping orchestrated_guest_sees_the_hypervisor_bit_cleared: {e}");
+                return;
+            }
+        };
+        assert_eq!(guest.run(0x1000, 100).unwrap(), LoopOutcome::Halted);
+        assert_eq!(
+            &*sink.lock().unwrap(),
+            b"0",
+            "the orchestrator applied CPUID stealth: hypervisor-present bit is clear"
         );
     }
 
