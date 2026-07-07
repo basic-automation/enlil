@@ -100,6 +100,44 @@ fn validate_usb_routing(config: &EnlilConfig) -> Vec<String> {
     errors
 }
 
+/// Validate every guest's NIC MAC: each configured address must be transparent
+/// and well-formed (LOCKED PRINCIPLE 1 — no virtualization-vendor OUI, no
+/// multicast/broadcast source; Phase 5.8), and no two guests may share one
+/// (LOCKED PRINCIPLE 5 — a duplicate source MAC flaps the MAC-learning virtual
+/// switch between ports and misdelivers inter-guest traffic). Duplicates are
+/// compared on the parsed bytes so `de:ad:..` and `DE-AD-..` count as equal;
+/// malformed MACs are reported once (by the transparency check) and skipped by
+/// the duplicate check.
+fn validate_guest_macs(config: &EnlilConfig) -> Vec<String> {
+    let mut errors = Vec::new();
+    let mut mac_owners: HashMap<[u8; 6], Vec<&str>> = HashMap::new();
+    for (id, guest) in &config.guest {
+        let Some(mac) = &guest.mac else { continue };
+        if let Some(reason) = crate::mac::mac_rejection_reason(mac) {
+            errors.push(format!("Guest '{id}': {reason}"));
+        }
+        if let Ok(bytes) = crate::mac::parse_mac(mac) {
+            mac_owners.entry(bytes).or_default().push(id.as_str());
+        }
+    }
+    for (bytes, ids) in mac_owners {
+        if ids.len() >= 2 {
+            let mut who = ids;
+            who.sort_unstable();
+            let mac = bytes
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(":");
+            errors.push(format!(
+                "MAC {mac} is shared by guests {}; a NIC MAC must be unique per guest",
+                who.join(", ")
+            ));
+        }
+    }
+    errors
+}
+
 /// Validate an Enlil configuration. Returns a list of errors (empty = valid).
 #[must_use]
 pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
@@ -180,16 +218,8 @@ pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
         }
     }
 
-    // A configured guest NIC MAC must be well-formed and must not betray the
-    // hypervisor: no virtualization-vendor OUI, no multicast/broadcast source
-    // (LOCKED PRINCIPLE 1 — transparency; Phase 5.8 NIC-OUI check).
-    for (id, guest) in &config.guest {
-        if let Some(mac) = &guest.mac
-            && let Some(reason) = crate::mac::mac_rejection_reason(mac)
-        {
-            errors.push(format!("Guest '{id}': {reason}"));
-        }
-    }
+    // Guest NIC MAC transparency + uniqueness (LOCKED PRINCIPLES 1 & 5).
+    errors.append(&mut validate_guest_macs(config));
 
     // A writable disk image must not be shared. If the same path is mounted by
     // more than one disk entry (across guests or twice in one guest) and any of
@@ -527,6 +557,35 @@ mod tests {
                 .iter()
                 .any(|e| e.contains("vm1") && e.contains("unicast")),
             "multicast MAC must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_two_guests_sharing_a_mac() {
+        let mut config = minimal_config();
+        config.guest.get_mut("vm1").unwrap().mac = Some("de:ad:be:ef:00:01".into());
+        config.guest.insert(
+            "vm2".into(),
+            GuestConfig {
+                name: "Test VM 2".into(),
+                cpus: vec![2, 3],
+                memory_mb: 2048,
+                kernel: None,
+                initrd: None,
+                cmdline: "console=ttyS0".into(),
+                scheduling: SchedulingMode::Dedicated,
+                disks: vec![],
+                serial: SerialPortConfig::default(),
+                // Same address as vm1 but written with hyphens + upper case.
+                mac: Some("DE-AD-BE-EF-00-01".into()),
+            },
+        );
+        let errors = validate_config(&config);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("shared by guests") && e.contains("vm1") && e.contains("vm2")),
+            "expected a duplicate-MAC error, got: {errors:?}"
         );
     }
 
