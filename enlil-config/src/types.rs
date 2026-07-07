@@ -208,6 +208,12 @@ pub struct GuestConfig {
     /// Serial console configuration.
     #[serde(default)]
     pub serial: SerialPortConfig,
+    /// Optional guest NIC MAC address, six `:`/`-`-separated hex octets (e.g.
+    /// `de:ad:be:ef:00:01`). Validated for transparency: a malformed, multicast,
+    /// or virtualization-vendor-OUI address is rejected (Phase 5.8). Leave unset
+    /// to let the hypervisor synthesize a safe locally-administered address.
+    #[serde(default)]
+    pub mac: Option<String>,
 }
 
 fn default_cmdline() -> String {

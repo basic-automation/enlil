@@ -13,6 +13,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Qcow2 magic number: "QFI\xfb"
 const QCOW2_MAGIC: u32 = 0x5146_49FB;
@@ -170,6 +171,16 @@ impl QcowHeader {
 pub struct QcowBackend {
     file: Mutex<File>,
     header: QcowHeader,
+    /// Live refcount-*table* geometry. These start at the header's parsed values
+    /// but move when the table is grown and relocated (item 3.10); the header's
+    /// own `refcount_table_offset` / `refcount_table_clusters` are left at their
+    /// open-time values and must not be read for the live location. Interior
+    /// mutability lets a `&self` allocation grow the table; every access happens
+    /// while the `file` mutex is held, so `Relaxed` ordering is sufficient (the
+    /// mutex provides the real synchronisation). Read via [`rt_offset`],
+    /// [`rt_clusters`], [`rt_entries`].
+    rt_offset: AtomicU64,
+    rt_clusters: AtomicU32,
     /// In-memory copy of the L1 table, kept in sync with the on-disk table when
     /// allocation grows it (`Mutex` so a write can update it through `&self`).
     /// Always lock `file` before `l1_table` to keep a consistent lock order.
@@ -308,9 +319,13 @@ impl QcowBackend {
 
         let backing = Self::open_backing(&mut file, &header, image_path)?;
 
+        let rt_offset = AtomicU64::new(header.refcount_table_offset);
+        let rt_clusters = AtomicU32::new(header.refcount_table_clusters);
         Ok(Self {
             file: Mutex::new(file),
             header,
+            rt_offset,
+            rt_clusters,
             l1_table: Mutex::new(l1_table),
             writable,
             backing,
@@ -413,18 +428,34 @@ impl QcowBackend {
         Ok(ClusterLoc::Mapped(host_cluster_offset + in_cluster_offset))
     }
 
+    /// Live host offset of the refcount table (tracks table growth; see
+    /// [`rt_offset`](Self::rt_offset) field docs).
+    fn rt_offset(&self) -> u64 {
+        self.rt_offset.load(Ordering::Relaxed)
+    }
+
+    /// Live refcount-table size in clusters.
+    fn rt_clusters(&self) -> u32 {
+        self.rt_clusters.load(Ordering::Relaxed)
+    }
+
+    /// Live number of `u64` entries the refcount table holds. Mirrors
+    /// [`QcowHeader::refcount_table_entries`] but over the live cluster count so
+    /// it reflects a grown table.
+    fn rt_entries(&self) -> u64 {
+        (u64::from(self.rt_clusters()) * self.header.cluster_size()) / 8
+    }
+
     /// Locate the refcount block covering host cluster `cluster_index`, or
     /// `None` when the refcount table has no block for it yet (the cluster is
     /// free / unmanaged). Shared by the refcount read, write, and pre-check.
     fn refcount_block_offset(&self, cluster_index: u64, file: &mut File) -> Result<Option<u64>> {
         let rb_entries = self.header.refcount_block_entries();
         let rt_index = cluster_index / rb_entries;
-        if rt_index >= self.header.refcount_table_entries() {
+        if rt_index >= self.rt_entries() {
             return Ok(None); // beyond the refcount table → unmanaged → free
         }
-        file.seek(SeekFrom::Start(
-            self.header.refcount_table_offset + rt_index * 8,
-        ))?;
+        file.seek(SeekFrom::Start(self.rt_offset() + rt_index * 8))?;
         let mut buf = [0u8; 8];
         file.read_exact(&mut buf)?;
         let block_offset = u64::from_be_bytes(buf) & REFT_OFFSET_MASK;
@@ -552,11 +583,11 @@ impl QcowBackend {
         }
 
         // Refcount table clusters and every refcount block they point at.
-        for c in 0..u64::from(self.header.refcount_table_clusters) {
-            bump(self.header.refcount_table_offset + c * cluster_size)?;
+        for c in 0..u64::from(self.rt_clusters()) {
+            bump(self.rt_offset() + c * cluster_size)?;
         }
-        for i in 0..self.header.refcount_table_entries() {
-            file.seek(SeekFrom::Start(self.header.refcount_table_offset + i * 8))?;
+        for i in 0..self.rt_entries() {
+            file.seek(SeekFrom::Start(self.rt_offset() + i * 8))?;
             let mut b = [0u8; 8];
             file.read_exact(&mut b)?;
             let block_off = u64::from_be_bytes(b) & REFT_OFFSET_MASK;
@@ -709,19 +740,14 @@ impl QcowBackend {
     /// appended at EOF, where it falls inside its own coverage, so it can record
     /// its own refcount (1) inside itself. Returns the block's host offset.
     ///
-    /// Growing the refcount *table* itself (more than `refcount_table_entries`
-    /// blocks) is a separate, larger step and is reported as an error here.
+    /// If `cluster_index`'s table slot lies beyond the current refcount table,
+    /// the table is grown first via [`grow_refcount_table`](Self::grow_refcount_table)
+    /// (item 3.10).
     fn allocate_refcount_block(&self, cluster_index: u64, file: &mut File) -> Result<u64> {
         let rb_entries = self.header.refcount_block_entries();
         let rt_index = cluster_index / rb_entries;
-        if rt_index >= self.header.refcount_table_entries() {
-            let needed = self.header.refcount_table_clusters_for(rt_index);
-            bail!(
-                "refcount table too small for cluster {cluster_index}: slot \
-                 {rt_index} needs a {needed}-cluster refcount table (have {}); \
-                 refcount table growth not yet implemented",
-                self.header.refcount_table_clusters
-            );
+        if rt_index >= self.rt_entries() {
+            self.grow_refcount_table(rt_index, file)?;
         }
         if let Some(off) = self.refcount_block_offset(cluster_index, file)? {
             return Ok(off); // already present
@@ -741,12 +767,133 @@ impl QcowBackend {
             );
         }
         // Publish the block in the refcount table, then record its own refcount.
-        file.seek(SeekFrom::Start(
-            self.header.refcount_table_offset + rt_index * 8,
-        ))?;
+        file.seek(SeekFrom::Start(self.rt_offset() + rt_index * 8))?;
         file.write_all(&block_off.to_be_bytes())?;
         self.write_refcount(block_self_index, 1, file)?;
         Ok(block_off)
+    }
+
+    /// Grow the refcount *table* so it can address slot `rt_index`, relocating it
+    /// to a larger table and freeing the old one (item 3.10). No-op if the table
+    /// already covers `rt_index`.
+    ///
+    /// Table growth is only ever triggered once the host file has already grown
+    /// past the current table's reach, so the enlarged table cannot land inside
+    /// existing coverage — it must describe its own new clusters. We therefore
+    /// append one contiguous *arena* at EOF holding the new table followed by the
+    /// refcount block(s) that cover the whole arena (and the next cluster the
+    /// caller will retry into), build the table entries and block contents in
+    /// memory, and write them in one pass. The old table's entries are copied
+    /// forward so the existing refcount blocks stay referenced; only the old
+    /// table's container clusters are freed. If the arena would need a table slot
+    /// the enlarged table still cannot address, the grow is refused *before any
+    /// file mutation*, so a rejected grow never leaves the image inconsistent.
+    fn grow_refcount_table(&self, rt_index: u64, file: &mut File) -> Result<()> {
+        let cluster_size = self.header.cluster_size();
+        let rbe = self.header.refcount_block_entries();
+        let old_off = self.rt_offset();
+        let old_clusters = u64::from(self.rt_clusters());
+        let old_entries = self.rt_entries();
+        // A degenerate image with no refcount table at all (offset 0 / 0 clusters)
+        // has nothing to relocate — growth would need to invent one from scratch
+        // and its "old table" would alias the header. Refuse; such an image simply
+        // cannot allocate.
+        if old_clusters == 0 || old_off == 0 {
+            bail!(
+                "cannot grow refcount table for cluster {}: image has no refcount \
+                 table (offset {old_off:#x}, {old_clusters} clusters)",
+                rt_index * self.header.refcount_block_entries()
+            );
+        }
+        let new_clusters = u64::from(self.header.refcount_table_clusters_for(rt_index));
+        if new_clusters <= old_clusters {
+            return Ok(()); // already large enough
+        }
+        let new_entries = new_clusters * cluster_size / 8;
+
+        // Arena layout: [new table: new_clusters][new blocks: nb], contiguous at
+        // EOF. The blocks must cover every arena cluster plus the cluster the
+        // caller retries into (arena_end), so their count depends on the arena
+        // size — solved by a quick fixed-point (converges in one step unless the
+        // arena spans a refcount-block boundary).
+        let arena_start = file.seek(SeekFrom::End(0))?.div_ceil(cluster_size);
+        let blk_start = arena_start + new_clusters;
+        let first_slot = old_entries; // first slot beyond the old table's reach
+        let mut nb = 1u64;
+        let top_slot = loop {
+            let arena_end = blk_start + nb;
+            let top_slot = arena_end / rbe; // slot covering the retry cluster
+            let needed = top_slot - first_slot + 1;
+            if needed <= nb {
+                break top_slot;
+            }
+            nb = needed;
+        };
+        let arena_end = blk_start + nb;
+
+        // Refuse before any mutation if the enlarged table still cannot address
+        // the top slot the arena needs.
+        if top_slot >= new_entries {
+            bail!(
+                "refcount-table growth needs slot {top_slot} beyond the enlarged \
+                 table's {new_entries} entries"
+            );
+        }
+
+        // Build the new table image in memory: old entries verbatim, then a
+        // pointer to each new block for slots first_slot..=top_slot.
+        let mut table = vec![0u8; usize_of(new_clusters * cluster_size)];
+        file.seek(SeekFrom::Start(old_off))?;
+        file.read_exact(&mut table[..usize_of(old_clusters * cluster_size)])?;
+        for s in first_slot..=top_slot {
+            let blk_off = (blk_start + (s - first_slot)) * cluster_size;
+            let p = usize_of(s * 8);
+            table[p..p + 8].copy_from_slice(&blk_off.to_be_bytes());
+        }
+
+        // Build the new blocks in memory: refcount 1 for every arena cluster.
+        let refcount_bits = self.header.refcount_bits();
+        let mut blocks = vec![0u8; usize_of(nb * cluster_size)];
+        for cluster in arena_start..arena_end {
+            let ordinal = cluster / rbe - first_slot; // which new block
+            let within = cluster % rbe;
+            let base = usize_of(ordinal * cluster_size);
+            match refcount_bits {
+                8 => blocks[base + usize_of(within)] = 1,
+                16 => blocks[base + usize_of(within * 2)..base + usize_of(within * 2) + 2]
+                    .copy_from_slice(&1u16.to_be_bytes()),
+                32 => blocks[base + usize_of(within * 4)..base + usize_of(within * 4) + 4]
+                    .copy_from_slice(&1u32.to_be_bytes()),
+                64 => blocks[base + usize_of(within * 8)..base + usize_of(within * 8) + 8]
+                    .copy_from_slice(&1u64.to_be_bytes()),
+                other => bail!("writing {other}-bit refcounts is not supported"),
+            }
+        }
+
+        // Write the arena (table then blocks, contiguous) in one pass, then
+        // publish the enlarged table so later refcount access uses it.
+        let new_off = arena_start * cluster_size;
+        file.seek(SeekFrom::Start(new_off))?;
+        file.write_all(&table)?;
+        file.write_all(&blocks)?;
+        self.rt_offset.store(new_off, Ordering::Relaxed);
+        self.rt_clusters
+            .store(u32_of(new_clusters), Ordering::Relaxed);
+        // Persist the new table location into the on-disk header (offset at bytes
+        // 48..56, cluster count at 56..60) so the grow survives a reopen; without
+        // this a fresh open would read the stale geometry and see a corrupt image.
+        file.seek(SeekFrom::Start(48))?;
+        file.write_all(&new_off.to_be_bytes())?;
+        file.write_all(&u32_of(new_clusters).to_be_bytes())?;
+
+        // Free the old table's container clusters (its blocks stay referenced by
+        // the copied-forward entries); done under the new geometry.
+        let old_first = old_off / cluster_size;
+        for i in old_first..old_first + old_clusters {
+            let rc = self.read_refcount(i, file)?;
+            self.write_refcount(i, rc.saturating_sub(1), file)?;
+        }
+        Ok(())
     }
 
     /// Allocate a new (zeroed) L2 table for L1 slot `l1_index`: refcount it,
@@ -1637,6 +1784,88 @@ mod tests {
         // Reopen and re-check, proving it all hit disk consistently.
         let reopened = QcowBackend::open(tmp.path()).unwrap();
         reopened.check_consistency().unwrap();
+    }
+
+    /// A 512-byte-cluster image with **64-bit** refcounts, so one refcount block
+    /// covers only 64 clusters and a single-cluster refcount *table* reaches just
+    /// 64 blocks = 4096 clusters (2 MiB). Writing past that forces the refcount
+    /// *table* itself to grow (item 3.10), which the 64 KiB/16-bit default images
+    /// would only hit at multi-GiB sizes.
+    fn make_table_growth_qcow2() -> Vec<u8> {
+        let cluster_bits: u32 = 9; // 512-byte clusters
+        let cs: usize = 1 << cluster_bits;
+        let virtual_size: u64 = 4 * 1024 * 1024; // 128 L1 slots of 32 KiB
+        let reftable_off = cs as u64; // cluster 1
+        let refblock_off = 2 * cs as u64; // cluster 2
+        let l1_off = 3 * cs as u64; // clusters 3..5 (128 slots * 8B = 2 clusters)
+        let used_clusters = 5; // header, reftable, refblock, 2×L1
+
+        let mut img = vec![0u8; used_clusters * cs];
+        img[0..4].copy_from_slice(&QCOW2_MAGIC.to_be_bytes());
+        img[4..8].copy_from_slice(&3u32.to_be_bytes());
+        img[20..24].copy_from_slice(&cluster_bits.to_be_bytes());
+        img[24..32].copy_from_slice(&virtual_size.to_be_bytes());
+        img[36..40].copy_from_slice(&128u32.to_be_bytes()); // l1_size = 128
+        img[40..48].copy_from_slice(&l1_off.to_be_bytes());
+        img[48..56].copy_from_slice(&reftable_off.to_be_bytes());
+        img[56..60].copy_from_slice(&1u32.to_be_bytes()); // refcount_table_clusters
+        img[96..100].copy_from_slice(&6u32.to_be_bytes()); // refcount_order = 6 (64-bit)
+        img[100..104].copy_from_slice(&104u32.to_be_bytes());
+
+        let rt = usize_of(reftable_off);
+        img[rt..rt + 8].copy_from_slice(&refblock_off.to_be_bytes());
+        // 64-bit refcount block: each metadata cluster gets refcount 1.
+        let rb = usize_of(refblock_off);
+        for c in 0..used_clusters {
+            img[rb + c * 8..rb + c * 8 + 8].copy_from_slice(&1u64.to_be_bytes());
+        }
+        img
+    }
+
+    #[test]
+    fn writing_past_the_refcount_table_reach_grows_the_table() {
+        // One refcount table cluster reaches 4096 host clusters (2 MiB). A 2.5 MiB
+        // write pushes the host file past that, forcing the table to grow.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), make_table_growth_qcow2()).unwrap();
+        let backend = QcowBackend::open_rw(tmp.path()).unwrap();
+        assert_eq!(backend.rt_clusters(), 1, "table starts at one cluster");
+
+        let payload: Vec<u8> = (0..2_500_000u32)
+            .map(|i| u8_of((i % 251) as usize))
+            .collect();
+        backend.write_at(0, &payload).unwrap();
+        backend.flush().unwrap();
+
+        // The table actually grew, and moved off its original cluster-1 home.
+        assert!(backend.rt_clusters() >= 2, "refcount table grew");
+        assert_ne!(
+            backend.rt_offset(),
+            512,
+            "grown table was relocated off cluster 1"
+        );
+
+        // Data reads back and the image is refcount-consistent through the grow
+        // (self-covering arena + freed old table) — the qemu-img-check substitute.
+        let mut buf = vec![0u8; payload.len()];
+        backend.read_at(0, &mut buf).unwrap();
+        assert_eq!(buf, payload, "data written across the table growth");
+        backend.check_consistency().unwrap();
+        drop(backend);
+
+        // Reopen: the grown geometry was persisted into the on-disk header, so a
+        // fresh open reads the enlarged table and the whole image still verifies.
+        let reopened = QcowBackend::open(tmp.path()).unwrap();
+        assert!(
+            reopened.rt_clusters() >= 2,
+            "grown table persisted in header"
+        );
+        reopened
+            .check_consistency()
+            .expect("reopened grown image stays refcount-consistent");
+        let mut buf2 = vec![0u8; payload.len()];
+        reopened.read_at(0, &mut buf2).unwrap();
+        assert_eq!(buf2, payload, "all data survives reopen after table growth");
     }
 
     #[test]

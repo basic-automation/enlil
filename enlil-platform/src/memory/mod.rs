@@ -9,6 +9,8 @@
 //! - **Bare-metal:** Buddy allocator over physical memory with slab allocator
 //!   for small objects. Implemented in Phase 6.
 
+pub mod map;
+
 use std::alloc::{GlobalAlloc, Layout};
 use std::sync::atomic::{AtomicUsize, Ordering};
 

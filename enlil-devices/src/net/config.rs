@@ -71,6 +71,39 @@ impl MacAddress {
         let oui = self.oui();
         Self::HYPERVISOR_OUIS.contains(&oui)
     }
+
+    /// Synthesize a stable, transparent guest NIC MAC from the guest name — the
+    /// safe default when a guest config leaves its NIC MAC unset (the complement
+    /// to `enlil-config`'s hypervisor-OUI rejection, item 5.8).
+    ///
+    /// Deterministic: a domain-separated SHA-256 of the name (the same scheme
+    /// [`crate::tpm::VirtualTpm::seed_for_guest`] uses), so a guest keeps the same
+    /// MAC across reboots. Guaranteed transparent — the address is unicast (bit 0
+    /// clear), locally administered (bit 1 set, so it carries no registered
+    /// vendor identity), and never a virtualization-vendor OUI (a QEMU/Xen/VMware/…
+    /// prefix would be an immediate hypervisor tell to a guest inspecting its own
+    /// NIC).
+    #[must_use]
+    pub fn synthesize_for_guest(name: &str) -> Self {
+        let mut input = b"enlil-guest-mac:".to_vec();
+        input.extend_from_slice(name.as_bytes());
+        let digest = crate::crypto::sha256(&input);
+        let mut octets = [0u8; 6];
+        octets.copy_from_slice(&digest[..6]);
+        // Force unicast (clear bit 0) + locally administered (set bit 1).
+        octets[0] = (octets[0] & 0xFC) | 0x02;
+        let mut mac = Self(octets);
+        // A locally-administered first octet can still land on a hypervisor OUI
+        // that is itself locally administered (QEMU 52:54:00, VirtualBox host-only
+        // 0A:00:27). If it does, bump the first octet by 0x04 — which preserves
+        // the unicast (bit 0) and locally-administered (bit 1) bits and never
+        // carries into them — until the OUI is transparent. The hypervisor OUI
+        // set is finite, so this terminates.
+        while mac.is_hypervisor_oui() {
+            mac.0[0] = mac.0[0].wrapping_add(0x04);
+        }
+        mac
+    }
 }
 
 impl std::fmt::Display for MacAddress {
@@ -189,6 +222,48 @@ mod tests {
         let dell = MacAddress([0x00, 0x14, 0x22, 0x11, 0x22, 0x33]);
         assert!(!dell.is_hypervisor_oui());
         assert!(!dell.is_locally_administered());
+    }
+
+    #[test]
+    fn synthesized_guest_mac_is_deterministic_and_transparent() {
+        let a = MacAddress::synthesize_for_guest("windows-11");
+        // Deterministic: same name → same MAC (stable across reboots).
+        assert_eq!(a, MacAddress::synthesize_for_guest("windows-11"));
+        // Distinct names → distinct MACs (no collision for a couple of names).
+        assert_ne!(a, MacAddress::synthesize_for_guest("ubuntu"));
+        // Transparent: unicast, locally administered, never a hypervisor OUI.
+        for name in ["windows-11", "ubuntu", "", "guest-Ω", "52-54-00"] {
+            let mac = MacAddress::synthesize_for_guest(name);
+            assert!(mac.is_unicast(), "{name}: must be unicast");
+            assert!(
+                mac.is_locally_administered(),
+                "{name}: must be locally administered"
+            );
+            assert!(
+                !mac.is_hypervisor_oui(),
+                "{name}: must not present a hypervisor OUI, got {mac}"
+            );
+        }
+    }
+
+    #[test]
+    fn synthesize_escapes_a_locally_administered_hypervisor_oui() {
+        // The escape loop preserves the unicast + locally-administered bits while
+        // bumping off any hypervisor OUI. Exercise it directly on the two
+        // locally-administered hypervisor prefixes.
+        for start in [
+            MacAddress([0x52, 0x54, 0x00, 1, 2, 3]), // QEMU (locally administered)
+            MacAddress([0x0A, 0x00, 0x27, 1, 2, 3]), // VirtualBox host-only
+        ] {
+            assert!(start.is_hypervisor_oui() && start.is_locally_administered());
+            let mut mac = start;
+            while mac.is_hypervisor_oui() {
+                mac.0[0] = mac.0[0].wrapping_add(0x04);
+            }
+            assert!(mac.is_unicast());
+            assert!(mac.is_locally_administered());
+            assert!(!mac.is_hypervisor_oui());
+        }
     }
 
     #[test]

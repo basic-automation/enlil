@@ -31,17 +31,6 @@ enum Commands {
     Stop,
 }
 
-fn parse_serial_output(output: &str) -> enlil_core::serial::SerialOutputMode {
-    match output {
-        "null" => enlil_core::serial::SerialOutputMode::Null,
-        "buffer" => enlil_core::serial::SerialOutputMode::Buffer,
-        s if s.starts_with("file:") => {
-            enlil_core::serial::SerialOutputMode::File(s[5..].to_string())
-        }
-        _ => enlil_core::serial::SerialOutputMode::Stdout,
-    }
-}
-
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     let cli = Cli::parse();
@@ -102,7 +91,9 @@ fn main() -> anyhow::Result<()> {
                             enlil_core::vcpu::SchedulingPolicy::Auto
                         }
                     },
-                    serial_output: parse_serial_output(&guest.serial.output),
+                    serial_output: enlil_core::serial::SerialOutputMode::from_output_spec(
+                        &guest.serial.output,
+                    ),
                 };
 
                 let idx = hypervisor.add_vm(vm_config)?;

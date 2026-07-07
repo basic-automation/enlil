@@ -1,10 +1,12 @@
 pub mod acpi;
 pub mod affinity;
+pub mod bzimage;
 pub mod device_bus;
 pub mod ept;
 pub mod error;
 pub mod kvm_backend;
 pub mod memory;
+pub mod orchestrator;
 pub mod run_loop;
 pub mod serial;
 pub mod stealth_msr;

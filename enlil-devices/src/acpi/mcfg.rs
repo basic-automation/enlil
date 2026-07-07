@@ -7,7 +7,7 @@ use super::tables::{AcpiSdtHeader, OemInfo};
 use crate::truncate::u32_of;
 
 /// A single MCFG allocation entry
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McfgAllocation {
     pub base_address: u64,
     pub segment_group: u16,
@@ -102,9 +102,71 @@ impl Default for McfgBuilder {
     }
 }
 
+/// Parse the ECAM allocations out of an MCFG table.
+///
+/// Each [`McfgAllocation`] gives a `PCIe` Enhanced Configuration Access Mechanism
+/// window — a base address and the bus range it covers — which the config-space
+/// walk (Phase 6.3, "PCI devices via MCFG ECAM") uses to reach device config
+/// space. The table is a 36-byte SDT header + 8 reserved bytes + one 16-byte
+/// allocation entry each; a trailing partial entry is ignored.
+#[must_use]
+pub fn parse_mcfg_allocations(mcfg: &[u8]) -> Vec<McfgAllocation> {
+    /// First allocation entry: past the 36-byte header and 8 reserved bytes.
+    const ALLOCATIONS: usize = 44;
+    let mut out = Vec::new();
+    let mut off = ALLOCATIONS;
+    while off + 16 <= mcfg.len() {
+        let base_address = u64::from_le_bytes([
+            mcfg[off],
+            mcfg[off + 1],
+            mcfg[off + 2],
+            mcfg[off + 3],
+            mcfg[off + 4],
+            mcfg[off + 5],
+            mcfg[off + 6],
+            mcfg[off + 7],
+        ]);
+        out.push(McfgAllocation {
+            base_address,
+            segment_group: u16::from_le_bytes([mcfg[off + 8], mcfg[off + 9]]),
+            start_bus: mcfg[off + 10],
+            end_bus: mcfg[off + 11],
+        });
+        off += 16;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_mcfg_allocations_round_trips_the_builder() {
+        let mcfg = McfgBuilder::new()
+            .add_allocation(McfgAllocation {
+                base_address: 0xE000_0000,
+                segment_group: 0,
+                start_bus: 0,
+                end_bus: 255,
+            })
+            .add_allocation(McfgAllocation {
+                base_address: 0xF000_0000,
+                segment_group: 1,
+                start_bus: 0,
+                end_bus: 63,
+            })
+            .build();
+        let allocs = parse_mcfg_allocations(&mcfg);
+        assert_eq!(allocs.len(), 2);
+        assert_eq!(allocs[0].base_address, 0xE000_0000);
+        assert_eq!(allocs[0].end_bus, 255);
+        assert_eq!(allocs[1].base_address, 0xF000_0000);
+        assert_eq!(allocs[1].segment_group, 1);
+        assert_eq!(allocs[1].end_bus, 63);
+        // A header with no allocations parses to an empty list.
+        assert!(parse_mcfg_allocations(&McfgBuilder::new().build()).is_empty());
+    }
 
     #[test]
     fn mcfg_standard() {

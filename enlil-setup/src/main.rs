@@ -67,8 +67,9 @@ pub fn detect_hardware() -> HardwareInfo {
 #[cfg(target_os = "linux")]
 fn detect_hardware_linux() -> HardwareInfo {
     // Start from the stub and overlay whatever we can read for real. CPU count
-    // and RAM come straight from procfs; the device lists (GPU/NVMe/USB/IOMMU)
-    // still need PCI/sysfs walking and stay stubbed for now.
+    // and RAM come from procfs; NVMe drives, IOMMU groups, and the GPU/USB
+    // controllers (by PCI class) from sysfs — everything but the stub's own
+    // fallbacks is now live.
     let mut hw = detect_hardware_stub();
     if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo")
         && let Some(n) = count_cpus_from_cpuinfo(&cpuinfo)
@@ -80,7 +81,147 @@ fn detect_hardware_linux() -> HardwareInfo {
     {
         hw.ram_mb = mb;
     }
+    // Overlay the real device lists — honest (possibly empty) beats the stub's
+    // fabricated hardware. A host with the IOMMU disabled truthfully shows none.
+    hw.nvme_drives = detect_nvme_drives();
+    hw.iommu_groups = detect_iommu_groups();
+    hw.gpus = detect_pci_devices(is_display_controller);
+    hw.usb_controllers = detect_pci_devices(is_usb_controller);
     hw
+}
+
+/// Enumerate PCI devices under `/sys/bus/pci/devices` whose class matches
+/// `is_match`, labelling each `vendor:device [BDF]`. Empty if the directory is
+/// absent. Shared by the GPU and USB-controller scans.
+#[cfg(target_os = "linux")]
+fn detect_pci_devices(is_match: fn(&str) -> bool) -> Vec<String> {
+    let root = "/sys/bus/pci/devices";
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut bdfs: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(String::from))
+        .collect();
+    bdfs.sort();
+    bdfs.into_iter()
+        .filter_map(|bdf| {
+            let class = std::fs::read_to_string(format!("{root}/{bdf}/class")).ok()?;
+            if !is_match(&class) {
+                return None;
+            }
+            let vendor =
+                std::fs::read_to_string(format!("{root}/{bdf}/vendor")).unwrap_or_default();
+            let device =
+                std::fs::read_to_string(format!("{root}/{bdf}/device")).unwrap_or_default();
+            Some(pci_device_label(&vendor, &device, &bdf))
+        })
+        .collect()
+}
+
+/// Whether a PCI `class` string (sysfs form, e.g. `0x030000`) is a display
+/// controller — base class `0x03`, which is how GPUs enumerate.
+#[cfg(any(target_os = "linux", test))]
+fn is_display_controller(class: &str) -> bool {
+    class
+        .trim()
+        .strip_prefix("0x")
+        .is_some_and(|c| c.starts_with("03"))
+}
+
+/// Whether a PCI `class` string is a USB controller — base class `0x0c`,
+/// subclass `0x03`.
+#[cfg(any(target_os = "linux", test))]
+fn is_usb_controller(class: &str) -> bool {
+    class
+        .trim()
+        .strip_prefix("0x")
+        .is_some_and(|c| c.starts_with("0c03"))
+}
+
+/// Label a PCI device `vendor:device [BDF]` from its sysfs `vendor`/`device`
+/// hex IDs (each of the form `0x10de`) and its bus address.
+#[cfg(any(target_os = "linux", test))]
+fn pci_device_label(vendor: &str, device: &str, bdf: &str) -> String {
+    let id = |raw: &str| {
+        let raw = raw.trim();
+        raw.strip_prefix("0x").unwrap_or(raw).to_string()
+    };
+    format!("{}:{} [{bdf}]", id(vendor), id(device))
+}
+
+/// Enumerate `NVMe` drives from `/sys/class/nvme`, labelling each with its model.
+/// Empty if the directory is absent (no `NVMe` / not exposed).
+#[cfg(target_os = "linux")]
+fn detect_nvme_drives() -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir("/sys/class/nvme") else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(String::from))
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| {
+            let model = std::fs::read_to_string(format!("/sys/class/nvme/{name}/model"))
+                .unwrap_or_default();
+            nvme_label(&model, &name)
+        })
+        .collect()
+}
+
+/// Enumerate IOMMU groups from `/sys/kernel/iommu_groups`, each with its member
+/// devices. Empty if the directory is absent (IOMMU off / not exposed) — which
+/// is itself a meaningful signal, since passthrough isolation needs it.
+#[cfg(target_os = "linux")]
+fn detect_iommu_groups() -> Vec<String> {
+    let root = "/sys/kernel/iommu_groups";
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<u64> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u64>().ok())
+        .collect();
+    ids.sort_unstable();
+    ids.into_iter()
+        .map(|id| {
+            let devices: Vec<String> = std::fs::read_dir(format!("{root}/{id}/devices"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| e.file_name().to_str().map(String::from))
+                .collect();
+            format_iommu_group(id, &devices)
+        })
+        .collect()
+}
+
+/// Label an `NVMe` drive from its sysfs `model` and device `name` (e.g.
+/// `Samsung 990 Pro [nvme0]`). Falls back to a generic label when the model is
+/// blank.
+#[cfg(any(target_os = "linux", test))]
+fn nvme_label(model: &str, name: &str) -> String {
+    let model = model.trim();
+    if model.is_empty() {
+        format!("NVMe [{name}]")
+    } else {
+        format!("{model} [{name}]")
+    }
+}
+
+/// Format one IOMMU group and its (sorted) member devices for the inventory.
+#[cfg(any(target_os = "linux", test))]
+fn format_iommu_group(id: u64, devices: &[String]) -> String {
+    let mut devices = devices.to_vec();
+    devices.sort();
+    if devices.is_empty() {
+        format!("Group {id}: (no devices)")
+    } else {
+        format!("Group {id}: {}", devices.join(", "))
+    }
 }
 
 /// Total RAM in MB parsed from the contents of `/proc/meminfo`. The `MemTotal`
@@ -198,6 +339,19 @@ pub fn generate_config(config: &SetupConfig) -> Result<String> {
     Ok(toml::to_string_pretty(config)?)
 }
 
+/// Write a [`SetupConfig`] to `path` as TOML — the wizard's output the rest of
+/// the Enlil stack loads.
+///
+/// # Errors
+///
+/// Returns an error if serialization ([`generate_config`]) fails or the file
+/// cannot be written.
+pub fn write_config(config: &SetupConfig, path: &std::path::Path) -> Result<()> {
+    let toml = generate_config(config)?;
+    std::fs::write(path, toml)?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Banner
 // ---------------------------------------------------------------------------
@@ -227,7 +381,10 @@ fn main() -> Result<()> {
     let toml_output = generate_config(&config)?;
     println!("{toml_output}");
 
-    println!("[4/4] Done. (Phase 0 — config not yet written to disk)");
+    println!("[4/4] Writing configuration...\n");
+    let out_path = std::path::Path::new("enlil.toml");
+    write_config(&config, out_path)?;
+    println!("Done. Wrote {}", out_path.display());
 
     Ok(())
 }
@@ -291,6 +448,48 @@ mod tests {
     }
 
     #[test]
+    fn nvme_label_uses_the_model_or_a_fallback() {
+        assert_eq!(
+            nvme_label("Samsung 990 Pro 2TB\n", "nvme0"),
+            "Samsung 990 Pro 2TB [nvme0]",
+            "trims the sysfs model and appends the device name"
+        );
+        assert_eq!(
+            nvme_label("   ", "nvme1"),
+            "NVMe [nvme1]",
+            "blank model falls back"
+        );
+    }
+
+    #[test]
+    fn classifies_pci_display_and_usb_controllers() {
+        assert!(is_display_controller("0x030000")); // VGA display controller
+        assert!(is_display_controller("0x038000\n")); // other display, trailing newline
+        assert!(!is_display_controller("0x0c0330")); // USB, not display
+        assert!(is_usb_controller("0x0c0330")); // xHCI
+        assert!(!is_usb_controller("0x030000")); // display, not USB
+        assert!(!is_usb_controller("0x0c0500")); // SMBus (0c05), not USB
+    }
+
+    #[test]
+    fn pci_device_label_formats_vendor_device_and_bdf() {
+        assert_eq!(
+            pci_device_label("0x10de\n", "0x2684\n", "0000:01:00.0"),
+            "10de:2684 [0000:01:00.0]"
+        );
+    }
+
+    #[test]
+    fn format_iommu_group_sorts_devices_and_handles_empty() {
+        assert_eq!(
+            format_iommu_group(5, &["0000:01:00.1".into(), "0000:01:00.0".into()]),
+            "Group 5: 0000:01:00.0, 0000:01:00.1",
+            "devices are sorted"
+        );
+        assert_eq!(format_iommu_group(3, &[]), "Group 3: (no devices)");
+    }
+
+    #[test]
     fn generate_config_produces_valid_toml() {
         let hw = detect_hardware();
         let config = run_wizard(&hw);
@@ -302,6 +501,23 @@ mod tests {
         let parsed: SetupConfig = toml::from_str(&output).expect("deserialization failed");
         assert_eq!(parsed.guests.len(), config.guests.len());
         assert_eq!(parsed.host_cpus, config.host_cpus);
+    }
+
+    #[test]
+    fn write_config_round_trips_through_a_file() {
+        let config = run_wizard(&detect_hardware());
+        // Unique temp path (no tempfile dep); cleaned up at the end.
+        let path = std::env::temp_dir().join(format!(
+            "enlil-setup-write-{}-{}.toml",
+            std::process::id(),
+            config.guests.len()
+        ));
+        write_config(&config, &path).expect("write config");
+        let text = std::fs::read_to_string(&path).expect("read back config");
+        let parsed: SetupConfig = toml::from_str(&text).expect("parse written config");
+        assert_eq!(parsed.guests.len(), config.guests.len());
+        assert_eq!(parsed.host_cpus, config.host_cpus);
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

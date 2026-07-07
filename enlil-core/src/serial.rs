@@ -187,6 +187,28 @@ pub enum SerialOutputMode {
     Shared(Arc<Mutex<Vec<u8>>>),
 }
 
+impl SerialOutputMode {
+    /// Parse a config `serial.output` string (see `enlil-config`'s
+    /// `SerialPortConfig::output`) into a mode. Recognizes `"null"`, `"buffer"`,
+    /// and `"file:<path>"`; anything else — including `"stdout"` and `"pty"`,
+    /// which has no distinct sink yet — maps to [`Stdout`](Self::Stdout). This is
+    /// the single canonical mapping shared by the management console and the
+    /// guest-boot orchestrator, so they cannot drift apart.
+    #[must_use]
+    pub fn from_output_spec(spec: &str) -> Self {
+        let spec = spec.trim();
+        if spec == "null" {
+            Self::Null
+        } else if spec == "buffer" {
+            Self::Buffer
+        } else if let Some(path) = spec.strip_prefix("file:") {
+            Self::File(path.to_string())
+        } else {
+            Self::Stdout
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SerialOutput — the per-guest output sink
 // ---------------------------------------------------------------------------
@@ -1534,6 +1556,37 @@ mod tests {
             let mux = shared.lock().unwrap();
             assert_eq!(mux.guest_count(), 1);
             drop(mux);
+        }
+    }
+
+    #[test]
+    fn from_output_spec_maps_each_sink() {
+        assert!(matches!(
+            SerialOutputMode::from_output_spec("null"),
+            SerialOutputMode::Null
+        ));
+        assert!(matches!(
+            SerialOutputMode::from_output_spec("buffer"),
+            SerialOutputMode::Buffer
+        ));
+        assert!(matches!(
+            SerialOutputMode::from_output_spec("  stdout "),
+            SerialOutputMode::Stdout
+        ));
+        // "pty" has no distinct sink yet → Stdout fallback, not a panic.
+        assert!(matches!(
+            SerialOutputMode::from_output_spec("pty"),
+            SerialOutputMode::Stdout
+        ));
+        match SerialOutputMode::from_output_spec("file:/var/log/vm1.log") {
+            SerialOutputMode::File(path) => assert_eq!(path, "/var/log/vm1.log"),
+            other => panic!("expected File, got {other:?}"),
+        }
+        // A bare "file:" yields an empty path (config validation rejects that
+        // separately); the parser itself is total.
+        match SerialOutputMode::from_output_spec("file:") {
+            SerialOutputMode::File(path) => assert!(path.is_empty()),
+            other => panic!("expected File, got {other:?}"),
         }
     }
 }
