@@ -1,0 +1,55 @@
+//! `enlil-run` — the top-level guest-boot orchestrator binary (item 3.12).
+//!
+//! Loads a hypervisor config and a Linux `bzImage`, validates the config, and
+//! boots the first configured guest via
+//! [`enlil_core::orchestrator::run_first_guest`] — the thin CLI over the tested
+//! orchestration library. `target_os = "linux"`-only (it drives KVM).
+//!
+//! Usage: `enlil-run <config.toml> <bzImage> [cmdline]`
+
+use std::path::Path;
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 3 {
+        eprintln!("usage: {} <config.toml> <bzImage> [cmdline]", args[0]);
+        return ExitCode::FAILURE;
+    }
+    let config_path = &args[1];
+    let kernel_path = &args[2];
+    let cmdline = args.get(3).map_or("console=ttyS0", String::as_str);
+
+    match run(config_path, kernel_path, cmdline) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("enlil-run: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(config_path: &str, kernel_path: &str, cmdline: &str) -> anyhow::Result<()> {
+    let config = enlil_config::load_config(Path::new(config_path))?;
+
+    let errors = enlil_config::validate_config(&config);
+    if !errors.is_empty() {
+        for err in &errors {
+            eprintln!("config error: {err}");
+        }
+        anyhow::bail!("{} configuration error(s)", errors.len());
+    }
+
+    let kernel = std::fs::read(kernel_path)
+        .map_err(|e| anyhow::anyhow!("reading kernel {kernel_path}: {e}"))?;
+
+    println!(
+        "Booting first guest from {config_path} with kernel {kernel_path} \
+         ({} bytes), cmdline: {cmdline:?}",
+        kernel.len()
+    );
+    // A generous per-boot entry bound; a real guest runs until it halts/resets.
+    let outcome = enlil_core::orchestrator::run_first_guest(&config, &kernel, cmdline, 10_000_000)?;
+    println!("Guest exited: {outcome:?}");
+    Ok(())
+}
