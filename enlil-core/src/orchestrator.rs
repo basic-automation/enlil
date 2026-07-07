@@ -10,10 +10,11 @@
 //! 4.3) has one place to boot a guest.
 //!
 //! It boots a raw **real-mode**, flat **32-bit protected-mode**, or **64-bit
-//! long-mode** payload, and [`load_bzimage`](GuestRuntime::load_bzimage) places a
-//! Linux `bzImage` (protected-mode kernel + `boot_params` + cmdline) into guest
-//! RAM; entering that loaded kernel with the boot-protocol register state is a
-//! later slice.
+//! long-mode** payload, and boots a whole **Linux `bzImage`**:
+//! [`load_bzimage`](GuestRuntime::load_bzimage) places the protected-mode kernel,
+//! `boot_params`, cmdline, and optional initrd into guest RAM, and
+//! [`boot_kernel`](GuestRuntime::boot_kernel) enters it per the 32-bit boot
+//! protocol. [`run_first_guest`] does the whole config→boot path end to end.
 //!
 //! `target_os = "linux"`-only, like the run loop it drives.
 
@@ -376,7 +377,12 @@ mod linux {
         /// # Errors
         /// Returns [`Error::Config`] if `load_base != 0`, `image` is not a
         /// boot-protocol `bzImage`, or anything does not fit in guest RAM.
-        pub fn load_bzimage(&mut self, image: &[u8], cmdline: &str) -> Result<KernelBoot> {
+        pub fn load_bzimage(
+            &mut self,
+            image: &[u8],
+            cmdline: &str,
+            initrd: Option<&[u8]>,
+        ) -> Result<KernelBoot> {
             /// Where the `boot_params` zero page is placed (64 KiB).
             const BOOT_PARAMS_GPA: u64 = 0x1_0000;
             /// Where the kernel command line is placed (128 KiB).
@@ -393,10 +399,38 @@ mod linux {
                     Error::Config("bzImage shorter than its setup header claims".into())
                 })?;
 
-            let cmdline_ptr = u32::try_from(CMDLINE_GPA).expect("CMDLINE_GPA fits u32");
+            // Place the initrd high in RAM (page-aligned), if any, and record
+            // where — the kernel reads ramdisk_image/size from boot_params.
             let ram_len = self.ram.len() as u64;
-            let boot_params = build_boot_params(image, cmdline_ptr, &[(0, ram_len, 1)])
-                .ok_or_else(|| Error::Config("bzImage too short for its boot_params".into()))?;
+            let kernel_end = PROTECTED_MODE_LOAD_ADDR + kernel.len() as u64;
+            let (ramdisk_image, ramdisk_size) = match initrd {
+                Some(initrd) if !initrd.is_empty() => {
+                    let addr = (ram_len.saturating_sub(initrd.len() as u64)) & !0xFFF;
+                    if addr < kernel_end {
+                        return Err(Error::Config(
+                            "initrd does not fit above the kernel in guest RAM".into(),
+                        ));
+                    }
+                    self.write_guest_bytes(addr, initrd)?;
+                    (
+                        u32::try_from(addr)
+                            .map_err(|_| Error::Config("initrd address exceeds 4 GiB".into()))?,
+                        u32::try_from(initrd.len())
+                            .map_err(|_| Error::Config("initrd larger than 4 GiB".into()))?,
+                    )
+                }
+                _ => (0, 0),
+            };
+
+            let cmdline_ptr = u32::try_from(CMDLINE_GPA).expect("CMDLINE_GPA fits u32");
+            let boot_params = build_boot_params(
+                image,
+                cmdline_ptr,
+                ramdisk_image,
+                ramdisk_size,
+                &[(0, ram_len, 1)],
+            )
+            .ok_or_else(|| Error::Config("bzImage too short for its boot_params".into()))?;
 
             self.write_guest_bytes(BOOT_PARAMS_GPA, &boot_params)?;
             self.write_guest_bytes(CMDLINE_GPA, cmdline.as_bytes())?;
@@ -524,7 +558,7 @@ mod linux {
             LbrPlatform::detect_host(),
         );
         let mut runtime = GuestRuntime::prepare_real_mode(spec)?;
-        let boot = runtime.load_bzimage(kernel, cmdline)?;
+        let boot = runtime.load_bzimage(kernel, cmdline, None)?;
         runtime.boot_kernel(&boot)?;
         runtime.run(0, max_entries)
     }
@@ -851,8 +885,10 @@ mod tests {
             }
         };
 
+        // Include a small initrd to exercise the ramdisk placement.
+        let initrd = [0x11u8, 0x22, 0x33, 0x44];
         let boot = guest
-            .load_bzimage(&image, "console=ttyS0")
+            .load_bzimage(&image, "console=ttyS0", Some(&initrd))
             .expect("load bzImage");
         assert_eq!(boot.kernel_entry, 0x10_0000);
         assert_eq!(boot.boot_params, 0x1_0000);
@@ -879,6 +915,19 @@ mod tests {
             "cmd_line_ptr points at the cmdline"
         );
         assert_eq!(bp[0x1E8], 1, "one E820 entry (guest RAM)");
+        // The initrd was placed high in RAM and recorded in boot_params.
+        let ramdisk_image = u32::from_le_bytes(bp[0x218..0x21C].try_into().unwrap());
+        let ramdisk_size = u32::from_le_bytes(bp[0x21C..0x220].try_into().unwrap());
+        assert_eq!(ramdisk_size, 4, "ramdisk_size records the initrd length");
+        assert!(
+            u64::from(ramdisk_image) >= 0x10_0000,
+            "initrd placed above the kernel"
+        );
+        assert_eq!(
+            guest.read_guest_bytes(u64::from(ramdisk_image), 4).unwrap(),
+            initrd,
+            "initrd bytes landed at ramdisk_image"
+        );
 
         // boot_kernel points the vCPU at the kernel per the boot protocol:
         // protected mode at the entry, RSI → boot_params. Verify via a snapshot

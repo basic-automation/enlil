@@ -75,6 +75,10 @@ const BP_SETUP_HEADER: usize = 0x1F1;
 const BP_SETUP_HEADER_END: usize = 0x268;
 /// `type_of_loader` (`u8`).
 const BP_TYPE_OF_LOADER: usize = 0x210;
+/// `ramdisk_image` (`u32`) — guest-physical address of the initrd (0 = none).
+const BP_RAMDISK_IMAGE: usize = 0x218;
+/// `ramdisk_size` (`u32`) — initrd size in bytes.
+const BP_RAMDISK_SIZE: usize = 0x21C;
 /// `cmd_line_ptr` (`u32`) — guest-physical address of the NUL-terminated cmdline.
 const BP_CMD_LINE_PTR: usize = 0x228;
 /// Start of the E820 table — an array of 20-byte `(addr u64, size u64, type u32)`.
@@ -88,18 +92,20 @@ const LOADER_TYPE_UNDEFINED: u8 = 0xFF;
 
 /// Build the `boot_params` "zero page" for a `bzImage`: copy the setup header
 /// from the image, mark an undefined bootloader, point `cmd_line_ptr` at the
-/// guest cmdline, and write the E820 memory map. `e820` entries are
-/// `(base, size, type)` using the E820 type codes (1 usable, 2 reserved, …).
+/// guest cmdline, record the initrd (`ramdisk_image`/`ramdisk_size`, both 0 for
+/// none), and write the E820 memory map. `e820` entries are `(base, size, type)`
+/// using the E820 type codes (1 usable, 2 reserved, …).
 ///
 /// This is the block the protected-mode kernel is entered with (RSI → its
-/// guest-physical address); placing it and the kernel in guest RAM and entering
-/// is the next slice.
+/// guest-physical address).
 ///
 /// Returns `None` if `image` is too short to contain the setup header.
 #[must_use]
 pub fn build_boot_params(
     image: &[u8],
     cmd_line_ptr: u32,
+    ramdisk_image: u32,
+    ramdisk_size: u32,
     e820: &[(u64, u64, u32)],
 ) -> Option<[u8; BOOT_PARAMS_SIZE]> {
     let header = image.get(BP_SETUP_HEADER..BP_SETUP_HEADER_END)?;
@@ -108,6 +114,8 @@ pub fn build_boot_params(
     bp[BP_SETUP_HEADER..BP_SETUP_HEADER_END].copy_from_slice(header);
     bp[BP_TYPE_OF_LOADER] = LOADER_TYPE_UNDEFINED;
     bp[BP_CMD_LINE_PTR..BP_CMD_LINE_PTR + 4].copy_from_slice(&cmd_line_ptr.to_le_bytes());
+    bp[BP_RAMDISK_IMAGE..BP_RAMDISK_IMAGE + 4].copy_from_slice(&ramdisk_image.to_le_bytes());
+    bp[BP_RAMDISK_SIZE..BP_RAMDISK_SIZE + 4].copy_from_slice(&ramdisk_size.to_le_bytes());
 
     let n = e820.len().min(MAX_E820_ENTRIES);
     bp[BP_E820_ENTRIES] = u8::try_from(n).unwrap_or(u8::MAX);
@@ -165,6 +173,8 @@ mod tests {
         let bp = build_boot_params(
             &img,
             0x9_0000,
+            0x800_0000,
+            0x20_0000,
             &[(0, 0xA_0000, 1), (0x10_0000, 0x1000_0000, 1)],
         )
         .expect("header long enough");
@@ -179,6 +189,16 @@ mod tests {
             0x9_0000,
             "cmd_line_ptr set"
         );
+        assert_eq!(
+            u32::from_le_bytes(bp[0x218..0x21C].try_into().unwrap()),
+            0x800_0000,
+            "ramdisk_image set"
+        );
+        assert_eq!(
+            u32::from_le_bytes(bp[0x21C..0x220].try_into().unwrap()),
+            0x20_0000,
+            "ramdisk_size set"
+        );
         // E820 map: two entries, first is [0, 0xA0000) usable.
         assert_eq!(bp[0x1E8], 2, "e820_entries count");
         assert_eq!(u64::from_le_bytes(bp[0x2D0..0x2D8].try_into().unwrap()), 0);
@@ -191,7 +211,7 @@ mod tests {
 
     #[test]
     fn build_boot_params_rejects_a_short_image() {
-        assert!(build_boot_params(&[0u8; 0x100], 0, &[]).is_none());
+        assert!(build_boot_params(&[0u8; 0x100], 0, 0, 0, &[]).is_none());
     }
 
     #[test]
