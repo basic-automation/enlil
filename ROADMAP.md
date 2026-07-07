@@ -50,7 +50,7 @@
 - [x] 1.6 Async runtime — lightweight priority-aware executor with waker and reactor
   - [x] Executor + PriorityExecutor with Wake-based re-enqueue and block_on
   - [ ] I/O reactor (interrupt/epoll-driven waker, IPI wakeups) — backend-neutral core landed (async_rt::Reactor: Mutex-guarded registration table with unique never-reused tokens, set_waker arming that fires immediately on an already-ready source to close the poll/arm race, mark_ready enqueue+wake fired outside the lock, take_ready draining, deregister; unit-tested with a counting waker); NEXT SLICE: wire the OS event source that drives mark_ready — epoll on Linux, device interrupt + IPI wakeups on bare metal
-  - [ ] Priority inheritance on lock contention
+  - [ ] Priority inheritance on lock contention — tracker landed (threading::scheduler::PriorityInheritance: tracks a lock holder's base priority + the multiset of blocked-waiter priorities and reports the effective donated priority = highest-priority waiter, where highest is the smallest Priority discriminant Critical=0 so donation is Ord::min; add_waiter/remove_waiter with multiset semantics keep the boost until the last equal waiter leaves, set_base tracks holder changes; unit-tested); NEXT SLICE: wire it into the platform Mutex — arm a waiter on block, drop it on acquire, and re-target the scheduler at the effective priority
 - [x] 1.7 Time subsystem — monotonic Instant/Duration, sleep, and TSC calibration
   - [x] Instant/Duration with monotonic ordering + sleep + Stopwatch
   - [x] TSC frequency calibration via CPUID leaf 0x15

@@ -267,6 +267,95 @@ impl Scheduler {
     }
 }
 
+/// Priority-inheritance tracker for a single lock (roadmap 1.6 — priority
+/// inheritance on lock contention).
+///
+/// Priority inversion happens when a low-priority task holds a lock that a
+/// high-priority task needs: the high task is blocked behind the low one, which
+/// a medium task can then preempt indefinitely. The fix is *donation* — while a
+/// higher-priority task waits, the holder runs at that higher priority so it
+/// finishes and releases the lock quickly. This type tracks a holder's base
+/// priority and the priorities of the tasks currently blocked on the lock, and
+/// reports the [`effective`](Self::effective) priority the scheduler should run
+/// the holder at.
+///
+/// [`Priority`] orders the *highest* priority as the smallest discriminant
+/// (`Critical == 0`), so "the highest waiting priority" is the minimum — the
+/// tracker donates via [`Ord::min`]. Waiters form a multiset: two tasks blocked
+/// at the same priority both count, so releasing one keeps the boost while the
+/// other still waits.
+///
+/// This is the backend-neutral bookkeeping; wiring it into the platform
+/// [`Mutex`](crate::sync::Mutex) (arm a waiter on block, drop it on acquire, and
+/// re-target the scheduler at the effective priority) is the next slice.
+#[derive(Debug, Clone)]
+pub struct PriorityInheritance {
+    base: Priority,
+    waiters: Vec<Priority>,
+}
+
+impl PriorityInheritance {
+    /// Track a lock held by a task whose own priority is `base`.
+    #[must_use]
+    pub const fn new(base: Priority) -> Self {
+        Self {
+            base,
+            waiters: Vec::new(),
+        }
+    }
+
+    /// Record a task of priority `p` blocking on the lock.
+    pub fn add_waiter(&mut self, p: Priority) {
+        self.waiters.push(p);
+    }
+
+    /// Drop one waiter of priority `p` (e.g. it was granted the lock or timed
+    /// out). Returns `true` if such a waiter was tracked. Multiset semantics: a
+    /// second waiter at the same priority keeps the donation alive.
+    pub fn remove_waiter(&mut self, p: Priority) -> bool {
+        if let Some(i) = self.waiters.iter().position(|&w| w == p) {
+            self.waiters.swap_remove(i);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Update the holder's own (base) priority.
+    pub const fn set_base(&mut self, base: Priority) {
+        self.base = base;
+    }
+
+    /// The holder's own priority, ignoring any donation.
+    #[must_use]
+    pub const fn base(&self) -> Priority {
+        self.base
+    }
+
+    /// The priority the holder should actually run at: its base, boosted to the
+    /// highest-priority waiter (the minimum [`Priority`] discriminant).
+    #[must_use]
+    pub fn effective(&self) -> Priority {
+        self.waiters
+            .iter()
+            .copied()
+            .min()
+            .map_or(self.base, |highest| highest.min(self.base))
+    }
+
+    /// Whether a waiter is currently donating a higher priority than the base.
+    #[must_use]
+    pub fn is_boosted(&self) -> bool {
+        self.effective() != self.base
+    }
+
+    /// Number of tasks currently blocked on the lock.
+    #[must_use]
+    pub const fn waiter_count(&self) -> usize {
+        self.waiters.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,5 +473,70 @@ mod tests {
         // Add another — now stealing should work.
         sched.submit_to(0, Priority::Normal, || {});
         assert!(sched.try_steal(1).is_some());
+    }
+
+    #[test]
+    fn inheritance_boosts_holder_to_highest_waiter() {
+        let mut pi = PriorityInheritance::new(Priority::Low);
+        assert_eq!(pi.effective(), Priority::Low, "no waiters → base priority");
+        assert!(!pi.is_boosted());
+
+        // A Normal waiter boosts a Low holder to Normal.
+        pi.add_waiter(Priority::Normal);
+        assert_eq!(pi.effective(), Priority::Normal);
+        assert!(pi.is_boosted());
+
+        // A Critical waiter boosts further (Critical is the highest = smallest).
+        pi.add_waiter(Priority::Critical);
+        assert_eq!(pi.effective(), Priority::Critical);
+        assert_eq!(pi.waiter_count(), 2);
+    }
+
+    #[test]
+    fn inheritance_never_lowers_below_the_base() {
+        // A holder already at High is not dragged down by a Low waiter.
+        let mut pi = PriorityInheritance::new(Priority::High);
+        pi.add_waiter(Priority::Low);
+        assert_eq!(
+            pi.effective(),
+            Priority::High,
+            "base wins over a lower waiter"
+        );
+        assert!(!pi.is_boosted());
+    }
+
+    #[test]
+    fn inheritance_multiset_keeps_boost_until_last_equal_waiter_leaves() {
+        let mut pi = PriorityInheritance::new(Priority::Low);
+        pi.add_waiter(Priority::High);
+        pi.add_waiter(Priority::High);
+        assert_eq!(pi.effective(), Priority::High);
+
+        // Removing one High waiter keeps the boost (the other still waits).
+        assert!(pi.remove_waiter(Priority::High));
+        assert_eq!(
+            pi.effective(),
+            Priority::High,
+            "second waiter still donates"
+        );
+        // Removing the last drops back to base.
+        assert!(pi.remove_waiter(Priority::High));
+        assert_eq!(pi.effective(), Priority::Low);
+        assert!(
+            !pi.remove_waiter(Priority::High),
+            "no waiter left to remove"
+        );
+    }
+
+    #[test]
+    fn inheritance_tracks_base_changes() {
+        let mut pi = PriorityInheritance::new(Priority::Low);
+        pi.add_waiter(Priority::Normal);
+        assert_eq!(pi.effective(), Priority::Normal);
+        // If the holder's own priority is raised above the waiter, no donation.
+        pi.set_base(Priority::Critical);
+        assert_eq!(pi.base(), Priority::Critical);
+        assert_eq!(pi.effective(), Priority::Critical);
+        assert!(!pi.is_boosted());
     }
 }
