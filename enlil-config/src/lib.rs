@@ -1,8 +1,10 @@
 #![deny(clippy::all, clippy::pedantic, clippy::nursery)]
 
+pub mod mac;
 pub mod types;
 pub mod validate;
 
+pub use mac::{is_hypervisor_oui, mac_rejection_reason, parse_mac};
 pub use types::*;
 pub use validate::validate_config;
 

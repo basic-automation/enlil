@@ -180,6 +180,17 @@ pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
         }
     }
 
+    // A configured guest NIC MAC must be well-formed and must not betray the
+    // hypervisor: no virtualization-vendor OUI, no multicast/broadcast source
+    // (LOCKED PRINCIPLE 1 — transparency; Phase 5.8 NIC-OUI check).
+    for (id, guest) in &config.guest {
+        if let Some(mac) = &guest.mac
+            && let Some(reason) = crate::mac::mac_rejection_reason(mac)
+        {
+            errors.push(format!("Guest '{id}': {reason}"));
+        }
+    }
+
     // A writable disk image must not be shared. If the same path is mounted by
     // more than one disk entry (across guests or twice in one guest) and any of
     // those mounts is writable, the holders race each other and corrupt the
@@ -248,6 +259,7 @@ mod tests {
                 scheduling: SchedulingMode::Dedicated,
                 disks: vec![],
                 serial: SerialPortConfig::default(),
+                mac: None,
             },
         );
         EnlilConfig {
@@ -421,6 +433,7 @@ mod tests {
                 scheduling: SchedulingMode::Dedicated,
                 disks: vec![],
                 serial: SerialPortConfig::default(),
+                mac: None,
             },
         );
         let errors = validate_config(&config);
@@ -445,6 +458,7 @@ mod tests {
                 scheduling: SchedulingMode::Timeslice,
                 disks: vec![],
                 serial: SerialPortConfig::default(),
+                mac: None,
             },
         );
         let errors = validate_config(&config);
@@ -475,12 +489,54 @@ mod tests {
                 scheduling: SchedulingMode::Timeslice,
                 disks: vec![],
                 serial: SerialPortConfig::default(),
+                mac: None,
             },
         );
         let errors = validate_config(&config);
         assert!(
             !errors.iter().any(|e| e.contains("CPU")),
             "time-sliced guests may share cores, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_hypervisor_oui_guest_mac() {
+        // A KVM/QEMU OUI MAC betrays the hypervisor to the guest (Phase 5.8).
+        let mut config = minimal_config();
+        config.guest.get_mut("vm1").unwrap().mac = Some("52:54:00:ab:cd:ef".into());
+        let errors = validate_config(&config);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("vm1") && e.contains("virtualization-vendor OUI")),
+            "expected a hypervisor-OUI rejection, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_and_multicast_guest_mac() {
+        let mut config = minimal_config();
+        config.guest.get_mut("vm1").unwrap().mac = Some("not:a:valid:mac".into());
+        assert!(
+            validate_config(&config).iter().any(|e| e.contains("vm1")),
+            "malformed MAC must be rejected"
+        );
+        config.guest.get_mut("vm1").unwrap().mac = Some("01:00:5e:00:00:01".into());
+        assert!(
+            validate_config(&config)
+                .iter()
+                .any(|e| e.contains("vm1") && e.contains("unicast")),
+            "multicast MAC must be rejected"
+        );
+    }
+
+    #[test]
+    fn accepts_safe_locally_administered_guest_mac() {
+        let mut config = minimal_config();
+        config.guest.get_mut("vm1").unwrap().mac = Some("de:ad:be:ef:00:01".into());
+        assert!(
+            !validate_config(&config).iter().any(|e| e.contains("MAC")),
+            "a safe locally-administered unicast MAC must be accepted"
         );
     }
 
@@ -615,6 +671,7 @@ mod tests {
             scheduling: SchedulingMode::Dedicated,
             disks,
             serial: SerialPortConfig::default(),
+            mac: None,
         }
     }
 
