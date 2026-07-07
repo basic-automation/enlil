@@ -9,17 +9,20 @@
 //! future orchestrator binary (and the config-driven USB-routing wiring, item
 //! 4.3) has one place to boot a guest.
 //!
-//! Today it boots a raw **real-mode** or flat **32-bit protected-mode** payload;
-//! a kernel *loader* (bzImage via `linux-loader`, with boot params and long-mode
-//! entry) is a later slice.
+//! It boots a raw **real-mode**, flat **32-bit protected-mode**, or **64-bit
+//! long-mode** payload, and [`load_bzimage`](GuestRuntime::load_bzimage) places a
+//! Linux `bzImage` (protected-mode kernel + `boot_params` + cmdline) into guest
+//! RAM; entering that loaded kernel with the boot-protocol register state is a
+//! later slice.
 //!
 //! `target_os = "linux"`-only, like the run loop it drives.
 
 #[cfg(target_os = "linux")]
-pub use linux::{GuestBootSpec, GuestRuntime};
+pub use linux::{GuestBootSpec, GuestRuntime, KernelBoot};
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use crate::bzimage::{build_boot_params, parse_bzimage_header, PROTECTED_MODE_LOAD_ADDR};
     use crate::device_bus::DeviceBus;
     use crate::error::Error;
     use crate::kvm_backend::{GuestRam, KvmBackend, KvmVcpuState};
@@ -90,6 +93,17 @@ mod linux {
                 platform,
             }
         }
+    }
+
+    /// Where [`GuestRuntime::load_bzimage`] placed a loaded kernel — the entry
+    /// point and the `boot_params` block, which the (later) kernel-entry slice
+    /// hands to the vCPU.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct KernelBoot {
+        /// Guest-physical entry of the protected-mode kernel.
+        pub kernel_entry: u64,
+        /// Guest-physical address of the `boot_params` zero page.
+        pub boot_params: u64,
     }
 
     /// A prepared, runnable guest. Owns the guest RAM and the stealth run loop; the
@@ -346,6 +360,53 @@ mod linux {
         pub fn read_guest_bytes(&self, gpa: u64, len: usize) -> Result<Vec<u8>> {
             let range = self.ram_range(gpa, len)?;
             Ok(self.ram.as_slice()[range].to_vec())
+        }
+
+        /// Load a Linux `bzImage` into guest RAM per the boot protocol (items
+        /// 3.12 / 5.6): place the `boot_params` zero page and the NUL-terminated
+        /// `cmdline` at fixed low addresses and the protected-mode kernel at
+        /// [`PROTECTED_MODE_LOAD_ADDR`] (1 MiB), and return the [`KernelBoot`]
+        /// placement. The `boot_params` E820 map advertises the guest's RAM as one
+        /// usable region.
+        ///
+        /// This does the *placement*; entering the kernel with the boot-protocol
+        /// register state (`RSI` → `boot_params`, protected mode at the entry) is
+        /// a later slice. Requires `load_base == 0`.
+        ///
+        /// # Errors
+        /// Returns [`Error::Config`] if `load_base != 0`, `image` is not a
+        /// boot-protocol `bzImage`, or anything does not fit in guest RAM.
+        pub fn load_bzimage(&mut self, image: &[u8], cmdline: &str) -> Result<KernelBoot> {
+            /// Where the `boot_params` zero page is placed (64 KiB).
+            const BOOT_PARAMS_GPA: u64 = 0x1_0000;
+            /// Where the kernel command line is placed (128 KiB).
+            const CMDLINE_GPA: u64 = 0x2_0000;
+
+            if self.load_base != 0 {
+                return Err(Error::Config("bzImage loading requires load_base 0".into()));
+            }
+            let info = parse_bzimage_header(image)
+                .ok_or_else(|| Error::Config("not a boot-protocol bzImage".into()))?;
+            let kernel = image
+                .get(info.protected_mode_kernel_offset..)
+                .ok_or_else(|| {
+                    Error::Config("bzImage shorter than its setup header claims".into())
+                })?;
+
+            let cmdline_ptr = u32::try_from(CMDLINE_GPA).expect("CMDLINE_GPA fits u32");
+            let ram_len = self.ram.len() as u64;
+            let boot_params = build_boot_params(image, cmdline_ptr, &[(0, ram_len, 1)])
+                .ok_or_else(|| Error::Config("bzImage too short for its boot_params".into()))?;
+
+            self.write_guest_bytes(BOOT_PARAMS_GPA, &boot_params)?;
+            self.write_guest_bytes(CMDLINE_GPA, cmdline.as_bytes())?;
+            self.write_guest_bytes(CMDLINE_GPA + cmdline.len() as u64, &[0])?; // NUL-terminate
+            self.write_guest_bytes(PROTECTED_MODE_LOAD_ADDR, kernel)?;
+
+            Ok(KernelBoot {
+                kernel_entry: PROTECTED_MODE_LOAD_ADDR,
+                boot_params: BOOT_PARAMS_GPA,
+            })
         }
 
         /// Resume the guest from an ACPI S3 (suspend-to-RAM) transition: read the
@@ -646,6 +707,73 @@ mod tests {
             platform: LbrPlatform::AmdSvm,
         };
         assert!(GuestRuntime::prepare_long_mode(spec).is_err());
+    }
+
+    #[test]
+    fn load_bzimage_places_kernel_boot_params_and_cmdline() {
+        if !is_kvm_available() {
+            eprintln!("skipping load_bzimage_places_kernel_boot_params_and_cmdline: no /dev/kvm");
+            return;
+        }
+        // A fake bzImage: a valid setup header with setup_sects = 1 (so the
+        // protected-mode kernel starts at (1+1)*512 = 0x400), followed by a
+        // recognizable "kernel" body.
+        let mut image = vec![0u8; 0x410];
+        image[0x1F1] = 1; // setup_sects
+        image[0x1FE..0x200].copy_from_slice(&0xAA55u16.to_le_bytes());
+        image[0x202..0x206].copy_from_slice(b"HdrS");
+        image[0x206..0x208].copy_from_slice(&0x020Fu16.to_le_bytes());
+        let kernel_body: [u8; 16] = [
+            0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+        ];
+        image[0x400..0x410].copy_from_slice(&kernel_body);
+
+        let spec = GuestBootSpec {
+            name: "kload".into(),
+            serial: SerialOutput::new("kload", SerialOutputMode::Null),
+            ram_bytes: 0x11_0000, // > 1 MiB so the kernel fits at 0x100000
+            load_base: 0,
+            entry: 0,
+            image: vec![0xF4], // boot payload unused; we only load the kernel
+            rtc_unix_secs: 0,
+            platform: LbrPlatform::AmdSvm,
+        };
+        let mut guest = match GuestRuntime::prepare_real_mode(spec) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping load_bzimage_places_kernel_boot_params_and_cmdline: {e}");
+                return;
+            }
+        };
+
+        let boot = guest
+            .load_bzimage(&image, "console=ttyS0")
+            .expect("load bzImage");
+        assert_eq!(boot.kernel_entry, 0x10_0000);
+        assert_eq!(boot.boot_params, 0x1_0000);
+
+        // The protected-mode kernel body landed at 1 MiB.
+        assert_eq!(
+            guest
+                .read_guest_bytes(0x10_0000, kernel_body.len())
+                .unwrap(),
+            kernel_body
+        );
+        // The cmdline landed (NUL-terminated) at 0x20000.
+        assert_eq!(
+            guest.read_guest_bytes(0x2_0000, 13).unwrap(),
+            b"console=ttyS0"
+        );
+        assert_eq!(guest.read_guest_bytes(0x2_0000 + 13, 1).unwrap(), vec![0]);
+        // boot_params carries the copied setup header + the cmdline pointer.
+        let bp = guest.read_guest_bytes(0x1_0000, 0x1000).unwrap();
+        assert_eq!(bp[0x1F1], 1, "setup_sects copied into boot_params");
+        assert_eq!(
+            u32::from_le_bytes(bp[0x228..0x22C].try_into().unwrap()),
+            0x2_0000,
+            "cmd_line_ptr points at the cmdline"
+        );
+        assert_eq!(bp[0x1E8], 1, "one E820 entry (guest RAM)");
     }
 
     #[test]
