@@ -72,6 +72,22 @@ pub enum LbrPlatform {
     AmdSvm,
 }
 
+impl LbrPlatform {
+    /// Select the LBR/PMC stealth model matching the **physical host** CPU: an
+    /// AMD host runs KVM's SVM backend, an Intel host its VMX backend. The LBR
+    /// shadow model must match the real virtualization extension so a guest
+    /// inspecting its own LBR state after a forced VMEXIT sees a consistent,
+    /// hypervisor-appropriate record — a mismatched model would itself be a tell.
+    #[cfg(target_arch = "x86_64")]
+    #[must_use]
+    pub fn detect_host() -> Self {
+        match crate::stealth::cpuid::CpuVendor::detect_host() {
+            crate::stealth::cpuid::CpuVendor::Amd => Self::AmdSvm,
+            crate::stealth::cpuid::CpuVendor::Intel => Self::IntelVmx,
+        }
+    }
+}
+
 impl LbrState {
     #[must_use]
     pub const fn new(platform: LbrPlatform) -> Self {
@@ -212,6 +228,21 @@ impl LbrState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detect_host_matches_the_cpu_vendor() {
+        use crate::stealth::cpuid::CpuVendor;
+        let platform = LbrPlatform::detect_host();
+        let expected = match CpuVendor::detect_host() {
+            CpuVendor::Amd => LbrPlatform::AmdSvm,
+            CpuVendor::Intel => LbrPlatform::IntelVmx,
+        };
+        assert_eq!(
+            platform, expected,
+            "LBR platform tracks the host CPU vendor"
+        );
+        assert_eq!(LbrPlatform::detect_host(), platform, "detection is stable");
+    }
 
     #[test]
     fn initial_state_clean() {

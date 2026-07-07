@@ -153,12 +153,9 @@ impl CpuidStealthConfig {
         use core::arch::x86_64::{__cpuid, __cpuid_count};
 
         let leaf0 = __cpuid(0);
-        let vendor = match (leaf0.ebx, leaf0.edx, leaf0.ecx) {
-            v if v == CpuVendor::Amd.vendor_regs() => CpuVendor::Amd,
-            // Anything else (including unknown vendors) takes the Intel
-            // profile — the common case, and a coherent identity either way.
-            _ => CpuVendor::Intel,
-        };
+        // Anything other than AuthenticAMD takes the Intel profile — the common
+        // case, and a coherent identity either way (see CpuVendor::detect_host).
+        let vendor = CpuVendor::detect_host();
         let leaf1 = __cpuid(1);
         let leaf7_candidates = if leaf0.eax >= 7 {
             let r = __cpuid_count(7, 0);
@@ -280,6 +277,22 @@ impl CpuVendor {
                 u32::from_le_bytes(*b"enti"),
                 u32::from_le_bytes(*b"cAMD"),
             ),
+        }
+    }
+
+    /// Detect the physical CPU vendor from CPUID leaf 0 on the current host.
+    /// `AuthenticAMD` maps to [`Amd`](Self::Amd); everything else (including an
+    /// unknown vendor) takes the [`Intel`](Self::Intel) profile, matching
+    /// [`CpuidStealthConfig::from_host`](Self::from_host)'s classification.
+    #[cfg(target_arch = "x86_64")]
+    #[must_use]
+    pub fn detect_host() -> Self {
+        // `__cpuid` is safe on x86-64 — CPUID leaf 0 is available on every CPU.
+        let leaf0 = core::arch::x86_64::__cpuid(0);
+        if (leaf0.ebx, leaf0.edx, leaf0.ecx) == Self::Amd.vendor_regs() {
+            Self::Amd
+        } else {
+            Self::Intel
         }
     }
 }
@@ -1024,6 +1037,19 @@ pub fn brand_string_from_str(s: &str) -> [u8; 48] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detect_host_is_deterministic_and_agrees_with_from_host() {
+        let vendor = CpuVendor::detect_host();
+        assert!(matches!(vendor, CpuVendor::Intel | CpuVendor::Amd));
+        assert_eq!(CpuVendor::detect_host(), vendor, "detection is stable");
+        // from_host classifies the same physical vendor it reads from CPUID.
+        assert_eq!(
+            CpuidStealthConfig::from_host(1, 1).vendor,
+            vendor,
+            "from_host and detect_host agree on the host vendor"
+        );
+    }
 
     fn test_config() -> CpuidStealthConfig {
         CpuidStealthConfig {
