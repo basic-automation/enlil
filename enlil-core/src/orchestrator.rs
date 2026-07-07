@@ -9,8 +9,9 @@
 //! future orchestrator binary (and the config-driven USB-routing wiring, item
 //! 4.3) has one place to boot a guest.
 //!
-//! Today it boots a **real-mode** payload; a protected/long-mode kernel loader
-//! (bzImage via `linux-loader`) is a later slice.
+//! Today it boots a raw **real-mode** or flat **32-bit protected-mode** payload;
+//! a kernel *loader* (bzImage via `linux-loader`, with boot params and long-mode
+//! entry) is a later slice.
 //!
 //! `target_os = "linux"`-only, like the run loop it drives.
 
@@ -28,7 +29,8 @@ mod linux {
     use enlil_devices::stealth::lbr::LbrPlatform;
     use enlil_devices::tpm::VirtualTpm;
 
-    /// What to boot: one guest's real-mode payload and the resources it runs in.
+    /// What to boot: one guest's payload and the resources it runs in. The boot
+    /// CPU mode is chosen by which `prepare_*` constructor is called.
     pub struct GuestBootSpec {
         /// Guest name — also seeds the per-guest vTPM identity.
         pub name: String,
@@ -38,8 +40,8 @@ mod linux {
         pub ram_bytes: usize,
         /// Guest-physical base the RAM is mapped at.
         pub load_base: u64,
-        /// Real-mode entry point (guest-physical); the payload is loaded here and
-        /// the boot vCPU starts executing at it. Must be within the mapped RAM.
+        /// Entry point (guest-physical); the payload is loaded here and the boot
+        /// vCPU starts executing at it. Must be within the mapped RAM.
         pub entry: u64,
         /// The code/data image loaded at `entry`.
         pub image: Vec<u8>,
