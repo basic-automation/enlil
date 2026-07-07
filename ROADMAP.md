@@ -19,7 +19,7 @@
   - [x] Writable qcow2 overlay backend: read-only base + COW overlay, backing chain, refcount consistency check
   - [ ] UEFI boot application (/EFI/BOOT/BOOTX64.EFI) that loads config + OVMF from USB/ESP
   - [ ] ESP layout + OVMF firmware/vars plumbing and config for guest boot
-  - [ ] enlil-setup first-run wizard: real hardware detection (/sys, /proc) + interactive TUI prompts
+  - [ ] enlil-setup first-run wizard: real hardware detection (/sys, /proc) + interactive TUI prompts — real detection progressing: CPU count + RAM from /proc (landed earlier), and now NVMe drives from /sys/class/nvme (with model labels) and IOMMU groups + their member devices from /sys/kernel/iommu_groups, overlaying the stub with honest (possibly-empty) data; pure formatters (nvme_label, format_iommu_group) unit-tested. STILL STUBBED: GPU + USB-controller PCI-class walk, and the interactive TUI prompts
   - [x] enlil-setup writes config.toml from wizard output
 - [ ] 0.4 Documentation: README (crate structure, layer stack, migration plan) + developer docs tooling
   - [x] README.md documenting crate structure, layer stack, and KVM-to-bare-metal migration/phase plan

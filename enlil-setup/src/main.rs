@@ -67,8 +67,8 @@ pub fn detect_hardware() -> HardwareInfo {
 #[cfg(target_os = "linux")]
 fn detect_hardware_linux() -> HardwareInfo {
     // Start from the stub and overlay whatever we can read for real. CPU count
-    // and RAM come straight from procfs; the device lists (GPU/NVMe/USB/IOMMU)
-    // still need PCI/sysfs walking and stay stubbed for now.
+    // and RAM come from procfs; NVMe drives and IOMMU groups from sysfs. The
+    // GPU and USB-controller lists still need a PCI-class walk and stay stubbed.
     let mut hw = detect_hardware_stub();
     if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo")
         && let Some(n) = count_cpus_from_cpuinfo(&cpuinfo)
@@ -80,7 +80,85 @@ fn detect_hardware_linux() -> HardwareInfo {
     {
         hw.ram_mb = mb;
     }
+    // Overlay the real device lists — honest (possibly empty) beats the stub's
+    // fabricated hardware. A host with the IOMMU disabled truthfully shows none.
+    hw.nvme_drives = detect_nvme_drives();
+    hw.iommu_groups = detect_iommu_groups();
     hw
+}
+
+/// Enumerate `NVMe` drives from `/sys/class/nvme`, labelling each with its model.
+/// Empty if the directory is absent (no `NVMe` / not exposed).
+#[cfg(target_os = "linux")]
+fn detect_nvme_drives() -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir("/sys/class/nvme") else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(String::from))
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| {
+            let model = std::fs::read_to_string(format!("/sys/class/nvme/{name}/model"))
+                .unwrap_or_default();
+            nvme_label(&model, &name)
+        })
+        .collect()
+}
+
+/// Enumerate IOMMU groups from `/sys/kernel/iommu_groups`, each with its member
+/// devices. Empty if the directory is absent (IOMMU off / not exposed) — which
+/// is itself a meaningful signal, since passthrough isolation needs it.
+#[cfg(target_os = "linux")]
+fn detect_iommu_groups() -> Vec<String> {
+    let root = "/sys/kernel/iommu_groups";
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<u64> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u64>().ok())
+        .collect();
+    ids.sort_unstable();
+    ids.into_iter()
+        .map(|id| {
+            let devices: Vec<String> = std::fs::read_dir(format!("{root}/{id}/devices"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| e.file_name().to_str().map(String::from))
+                .collect();
+            format_iommu_group(id, &devices)
+        })
+        .collect()
+}
+
+/// Label an `NVMe` drive from its sysfs `model` and device `name` (e.g.
+/// `Samsung 990 Pro [nvme0]`). Falls back to a generic label when the model is
+/// blank.
+#[cfg(any(target_os = "linux", test))]
+fn nvme_label(model: &str, name: &str) -> String {
+    let model = model.trim();
+    if model.is_empty() {
+        format!("NVMe [{name}]")
+    } else {
+        format!("{model} [{name}]")
+    }
+}
+
+/// Format one IOMMU group and its (sorted) member devices for the inventory.
+#[cfg(any(target_os = "linux", test))]
+fn format_iommu_group(id: u64, devices: &[String]) -> String {
+    let mut devices = devices.to_vec();
+    devices.sort();
+    if devices.is_empty() {
+        format!("Group {id}: (no devices)")
+    } else {
+        format!("Group {id}: {}", devices.join(", "))
+    }
 }
 
 /// Total RAM in MB parsed from the contents of `/proc/meminfo`. The `MemTotal`
@@ -288,6 +366,30 @@ mod tests {
         let sample = "processor\t: 0\nvendor_id\t: X\n\nprocessor\t: 1\nvendor_id\t: X\n";
         assert_eq!(count_cpus_from_cpuinfo(sample), Some(2));
         assert_eq!(count_cpus_from_cpuinfo("no cpus here"), None);
+    }
+
+    #[test]
+    fn nvme_label_uses_the_model_or_a_fallback() {
+        assert_eq!(
+            nvme_label("Samsung 990 Pro 2TB\n", "nvme0"),
+            "Samsung 990 Pro 2TB [nvme0]",
+            "trims the sysfs model and appends the device name"
+        );
+        assert_eq!(
+            nvme_label("   ", "nvme1"),
+            "NVMe [nvme1]",
+            "blank model falls back"
+        );
+    }
+
+    #[test]
+    fn format_iommu_group_sorts_devices_and_handles_empty() {
+        assert_eq!(
+            format_iommu_group(5, &["0000:01:00.1".into(), "0000:01:00.0".into()]),
+            "Group 5: 0000:01:00.0, 0000:01:00.1",
+            "devices are sorted"
+        );
+        assert_eq!(format_iommu_group(3, &[]), "Group 3: (no devices)");
     }
 
     #[test]
