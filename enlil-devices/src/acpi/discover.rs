@@ -131,6 +131,48 @@ pub fn host_iommu_kind(mem: &[u8], rsdp_gpa: u64) -> Option<IommuKind> {
     }
 }
 
+/// Discover the NUMA proximity domains from the firmware's SRAT (Phase 6.3).
+///
+/// Locates the SRAT (signature `SRAT`) via [`find_table`] and reads its domains
+/// with [`numa_domains`](super::srat::numa_domains). Empty if no SRAT is present
+/// (treat as a single implicit node).
+#[must_use]
+pub fn host_numa_domains(mem: &[u8], rsdp_gpa: u64) -> Vec<u32> {
+    find_table(mem, rsdp_gpa, b"SRAT")
+        .and_then(|gpa| table_at(mem, gpa))
+        .map(super::srat::numa_domains)
+        .unwrap_or_default()
+}
+
+/// The host machine's topology as discovered from its ACPI tables — the input to
+/// building Enlil's own device tree on the bare-metal boot path (Phase 6.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostTopology {
+    /// Enabled CPU count from the MADT (0 if no MADT).
+    pub cpu_count: usize,
+    /// NUMA proximity domains from the SRAT (empty = one implicit node).
+    pub numa_domains: Vec<u32>,
+    /// The IOMMU the firmware advertises, if any.
+    pub iommu: Option<IommuKind>,
+    /// The `PCIe` ECAM allocations from the MCFG.
+    pub ecam: Vec<super::mcfg::McfgAllocation>,
+}
+
+/// Discover the whole [`HostTopology`] from live ACPI tables in one call.
+///
+/// Runs every discovery — CPU count (MADT), NUMA domains (SRAT), IOMMU kind
+/// (DMAR/IVRS), and `PCIe` ECAM (MCFG). `mem` is memory based at physical
+/// address 0, `rsdp_gpa` the RSDP's address.
+#[must_use]
+pub fn discover_host_topology(mem: &[u8], rsdp_gpa: u64) -> HostTopology {
+    HostTopology {
+        cpu_count: host_cpu_count(mem, rsdp_gpa).unwrap_or(0),
+        numa_domains: host_numa_domains(mem, rsdp_gpa),
+        iommu: host_iommu_kind(mem, rsdp_gpa),
+        ecam: host_ecam_allocations(mem, rsdp_gpa),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +192,55 @@ mod tests {
         t[0..4].copy_from_slice(&signature);
         t[4..8].copy_from_slice(&36u32.to_le_bytes());
         t
+    }
+
+    #[test]
+    fn discovers_the_whole_host_topology() {
+        use crate::acpi::madt::MadtBuilder;
+        use crate::acpi::mcfg::McfgBuilder;
+        use crate::acpi::srat::{ProcessorAffinityEntry, SratBuilder};
+
+        const MADT_GPA: u64 = 0x1000;
+        const MCFG_GPA: u64 = 0x2000;
+        const DMAR_GPA: u64 = 0x2800;
+        const SRAT_GPA: u64 = 0x3000;
+        const XSDT_GPA: u64 = 0x4000;
+        const RSDP_GPA: u64 = 0x5000;
+        let mut ram = vec![0u8; 0x6000];
+        place(&mut ram, MADT_GPA, &MadtBuilder::standard(2).build());
+        place(
+            &mut ram,
+            MCFG_GPA,
+            &McfgBuilder::standard(0xE000_0000).build(),
+        );
+        place(&mut ram, DMAR_GPA, &fake_table(*b"DMAR"));
+        place(
+            &mut ram,
+            SRAT_GPA,
+            &SratBuilder::new()
+                .add_processor(ProcessorAffinityEntry::new(0, 0, true))
+                .add_processor(ProcessorAffinityEntry::new(1, 1, true))
+                .build(),
+        );
+        place(
+            &mut ram,
+            XSDT_GPA,
+            &XsdtBuilder::new()
+                .add_tables(&[MADT_GPA, MCFG_GPA, DMAR_GPA, SRAT_GPA])
+                .build(),
+        );
+        place(
+            &mut ram,
+            RSDP_GPA,
+            &RsdpBuilder::new().xsdt_address(XSDT_GPA).build(),
+        );
+
+        let topo = discover_host_topology(&ram, RSDP_GPA);
+        assert_eq!(topo.cpu_count, 2);
+        assert_eq!(topo.numa_domains, vec![0, 1]);
+        assert_eq!(topo.iommu, Some(IommuKind::IntelVtd));
+        assert_eq!(topo.ecam.len(), 1);
+        assert_eq!(topo.ecam[0].base_address, 0xE000_0000);
     }
 
     #[test]

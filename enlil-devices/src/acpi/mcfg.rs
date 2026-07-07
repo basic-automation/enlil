@@ -7,7 +7,7 @@ use super::tables::{AcpiSdtHeader, OemInfo};
 use crate::truncate::u32_of;
 
 /// A single MCFG allocation entry
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McfgAllocation {
     pub base_address: u64,
     pub segment_group: u16,
