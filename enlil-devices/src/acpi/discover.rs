@@ -18,16 +18,17 @@ fn table_at(mem: &[u8], gpa: u64) -> Option<&[u8]> {
     mem.get(start..start.checked_add(length)?)
 }
 
-/// Walk a guest's live ACPI tables to find its FACS physical address.
+/// Find an ACPI table by its 4-byte signature in a guest's live tables.
 ///
-/// Validates the RSDP at `rsdp_gpa`, follows it to the XSDT (or the RSDT on an
-/// ACPI-1.0 RSDP), finds the FADT (signature `FACP`) among the entries, and
-/// reads its FACS pointer via [`read_facs_address`]. `mem` is guest RAM based at
-/// guest-physical 0. Returns `None` if any step is missing or out of range.
-/// Checksums are not verified — this reads a table set enlil (or the guest)
-/// built, not an adversarial one.
+/// Returns the guest-physical address of the first table whose signature matches
+/// `signature` (e.g. `b"FACP"` for the FADT, `b"APIC"` for the MADT, `b"MCFG"`
+/// for the `PCIe` ECAM table). Validates the RSDP at `rsdp_gpa`, follows it to
+/// the XSDT (or the RSDT on an ACPI-1.0 RSDP), and scans the entries. `mem` is
+/// guest RAM based at guest-physical 0. Returns `None` if any step is missing or
+/// out of range. Checksums are not verified — this reads a table set enlil (or
+/// the guest) built, not an adversarial one.
 #[must_use]
-pub fn find_facs_address(mem: &[u8], rsdp_gpa: u64) -> Option<u64> {
+pub fn find_table(mem: &[u8], rsdp_gpa: u64, signature: &[u8; 4]) -> Option<u64> {
     let start = usize::try_from(rsdp_gpa).ok()?;
     // ACPI 1.0 RSDP is 20 bytes (signature..RsdtAddress); 2.0+ extends to 36.
     let rsdp = mem.get(start..start.checked_add(20)?)?;
@@ -61,12 +62,24 @@ pub fn find_facs_address(mem: &[u8], rsdp_gpa: u64) -> Option<u64> {
         off += entry_size;
         if let Some(table) = table_at(mem, table_gpa)
             && table.len() >= 4
-            && &table[0..4] == b"FACP"
+            && &table[0..4] == signature
         {
-            return read_facs_address(table);
+            return Some(table_gpa);
         }
     }
     None
+}
+
+/// Find a guest's FACS physical address by walking its live ACPI tables.
+///
+/// Locates the FADT (signature `FACP`) via [`find_table`] and reads its FACS
+/// pointer with [`read_facs_address`]. `mem` is guest RAM based at
+/// guest-physical 0.
+#[must_use]
+pub fn find_facs_address(mem: &[u8], rsdp_gpa: u64) -> Option<u64> {
+    let fadt_gpa = find_table(mem, rsdp_gpa, b"FACP")?;
+    let fadt = table_at(mem, fadt_gpa)?;
+    read_facs_address(fadt)
 }
 
 #[cfg(test)]
@@ -110,6 +123,32 @@ mod tests {
             Some(FACS_GPA),
             "discovery walks RSDP → XSDT → FADT → FACS"
         );
+    }
+
+    #[test]
+    fn find_table_locates_a_table_by_signature() {
+        const FADT_GPA: u64 = 0x2000;
+        const XSDT_GPA: u64 = 0x4000;
+        const RSDP_GPA: u64 = 0x5000;
+        let mut ram = vec![0u8; 0x6000];
+        place(
+            &mut ram,
+            FADT_GPA,
+            &FadtBuilder::new(0x3000).firmware_ctrl(0x1000).build(),
+        );
+        place(
+            &mut ram,
+            XSDT_GPA,
+            &XsdtBuilder::new().add_table(FADT_GPA).build(),
+        );
+        place(
+            &mut ram,
+            RSDP_GPA,
+            &RsdpBuilder::new().xsdt_address(XSDT_GPA).build(),
+        );
+        // The FADT ("FACP") is found at its gpa; an absent table is None.
+        assert_eq!(find_table(&ram, RSDP_GPA, b"FACP"), Some(FADT_GPA));
+        assert_eq!(find_table(&ram, RSDP_GPA, b"APIC"), None, "no MADT present");
     }
 
     #[test]
