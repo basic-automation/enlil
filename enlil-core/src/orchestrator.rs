@@ -27,6 +27,7 @@ mod linux {
     use crate::serial::{SerialOutput, SerialOutputMode};
     use crate::Result;
     use enlil_config::GuestConfig;
+    use enlil_devices::acpi::facs::{FacsWaking, ResumeTarget, FACS_LENGTH};
     use enlil_devices::stealth::cpuid::{CpuidStealthConfig, CpuidStealthTable};
     use enlil_devices::stealth::lbr::LbrPlatform;
     use enlil_devices::tpm::VirtualTpm;
@@ -96,10 +97,13 @@ mod linux {
     /// two are dropped in that order.
     pub struct GuestRuntime {
         run: StealthRunLoop,
+        /// Guest-physical base the RAM is mapped at — used to translate a
+        /// guest-physical address (e.g. the FACS) to an offset into `ram`.
+        load_base: u64,
         /// Backing store for the guest's RAM. Must be declared *after* `run` so it
         /// is dropped last — the KVM VM (inside `run`) referencing this memory must
         /// tear down before the buffer is freed.
-        _ram: GuestRam,
+        ram: GuestRam,
     }
 
     impl GuestRuntime {
@@ -117,9 +121,13 @@ mod linux {
         /// [`KvmBackend`], [`StealthRunLoop::install`], `map_memory`,
         /// `create_vcpu`, and `prepare_real_mode_vcpu`.
         pub fn prepare_real_mode(spec: GuestBootSpec) -> Result<Self> {
-            let (mut run, ram, entry) = Self::assemble(spec)?;
+            let (mut run, ram, entry, load_base) = Self::assemble(spec)?;
             run.backend_mut().prepare_real_mode_vcpu(0, entry)?;
-            Ok(Self { run, _ram: ram })
+            Ok(Self {
+                run,
+                load_base,
+                ram,
+            })
         }
 
         /// Like [`prepare_real_mode`](Self::prepare_real_mode) but starts the boot
@@ -134,16 +142,20 @@ mod linux {
         /// As [`prepare_real_mode`](Self::prepare_real_mode), but propagating
         /// `prepare_protected_mode_vcpu`.
         pub fn prepare_protected_mode(spec: GuestBootSpec) -> Result<Self> {
-            let (mut run, ram, entry) = Self::assemble(spec)?;
+            let (mut run, ram, entry, load_base) = Self::assemble(spec)?;
             run.backend_mut().prepare_protected_mode_vcpu(0, entry)?;
-            Ok(Self { run, _ram: ram })
+            Ok(Self {
+                run,
+                load_base,
+                ram,
+            })
         }
 
         /// Shared setup for both boot modes: validate the spec, build the PC,
         /// install the run loop, allocate+load+map guest RAM, and create the boot
         /// vCPU. Returns the run loop, the RAM to keep alive, and the entry point;
         /// the caller applies the mode-specific `prepare_*_vcpu`.
-        fn assemble(spec: GuestBootSpec) -> Result<(StealthRunLoop, GuestRam, u64)> {
+        fn assemble(spec: GuestBootSpec) -> Result<(StealthRunLoop, GuestRam, u64, u64)> {
             if spec.entry < spec.load_base {
                 return Err(Error::Config(format!(
                     "entry {:#x} is below the load base {:#x}",
@@ -197,7 +209,7 @@ mod linux {
             run.apply_topology_stealth(&table)?;
             run.apply_pmu_stealth(&table)?;
 
-            Ok((run, ram, spec.entry))
+            Ok((run, ram, spec.entry, spec.load_base))
         }
 
         /// Run the boot vCPU until it halts, resets to `reset_entry`, or commits a
@@ -234,6 +246,54 @@ mod linux {
         /// Propagates [`KvmBackend::restore_vcpu_state`].
         pub fn restore_vcpu(&mut self, state: &KvmVcpuState) -> Result<()> {
             self.run.backend_mut().restore_vcpu_state(0, state)
+        }
+
+        /// Resume the guest from an ACPI S3 (suspend-to-RAM) transition: read the
+        /// FACS (the OS wrote its firmware waking vector there before suspending)
+        /// from guest RAM at `facs_gpa` — the address the FADT's `FIRMWARE_CTRL`
+        /// points at — decode the waking vector, and prepare the boot vCPU to
+        /// re-enter at it (item 5.7). Returns the [`ResumeTarget`] that was armed.
+        ///
+        /// The guest's RAM is untouched (S3 preserves it), so the OS's own
+        /// resume trampoline at the waking vector restores the rest of its state.
+        /// A real-mode waking vector (the common case) re-enters in real mode; a
+        /// 64-bit waking vector needs a long-mode entry, which the vCPU-prepare
+        /// helpers do not offer yet, so it is rejected rather than entered wrong.
+        ///
+        /// # Errors
+        /// Returns [`Error::Config`] if `facs_gpa` is outside guest RAM, the FACS
+        /// is malformed, no waking vector is armed, or the armed vector needs an
+        /// unsupported long-mode entry; propagates `prepare_real_mode_vcpu`.
+        pub fn resume_from_s3(&mut self, facs_gpa: u64) -> Result<ResumeTarget> {
+            let offset = facs_gpa
+                .checked_sub(self.load_base)
+                .and_then(|o| usize::try_from(o).ok())
+                .ok_or_else(|| Error::Config(format!("FACS gpa {facs_gpa:#x} below load base")))?;
+            let facs = self
+                .ram
+                .as_slice()
+                .get(offset..offset + FACS_LENGTH as usize)
+                .ok_or_else(|| {
+                    Error::Config(format!("FACS at gpa {facs_gpa:#x} is outside guest RAM"))
+                })?;
+            let waking = FacsWaking::from_facs(facs)
+                .ok_or_else(|| Error::Config("FACS buffer too short".into()))?;
+            let target = waking.resume_target();
+            match target {
+                ResumeTarget::RealMode(vector) => {
+                    self.run
+                        .backend_mut()
+                        .prepare_real_mode_vcpu(0, u64::from(vector))?;
+                    Ok(target)
+                }
+                ResumeTarget::Extended(vector) => Err(Error::Config(format!(
+                    "S3 X waking vector {vector:#x} needs a long-mode resume entry, \
+                     which is not implemented yet"
+                ))),
+                ResumeTarget::None => Err(Error::Config(
+                    "no S3 waking vector armed in the FACS".into(),
+                )),
+            }
         }
     }
 }
@@ -445,6 +505,82 @@ mod tests {
             &*sink.lock().unwrap(),
             b"0",
             "the orchestrator applied CPUID stealth: hypervisor-present bit is clear"
+        );
+    }
+
+    #[test]
+    fn resume_from_s3_re_enters_at_the_facs_waking_vector() {
+        use enlil_devices::acpi::facs::{FacsBuilder, ResumeTarget};
+
+        if !is_kvm_available() {
+            eprintln!("skipping resume_from_s3_re_enters_at_the_facs_waking_vector: no /dev/kvm");
+            return;
+        }
+        // Lay out one image over guest RAM at 0x1000:
+        //   offset 0x500 (gpa 0x1500): the FACS, with OSPM's waking vector = 0x1600
+        //   offset 0x600 (gpa 0x1600): the resume payload — out 0x3F8,'W'; hlt
+        let mut image = vec![0u8; 0x610];
+        #[rustfmt::skip]
+        let wake: [u8; 7] = [
+            0xB0, 0x57,       // mov al, 'W'
+            0xBA, 0xF8, 0x03, // mov dx, 0x3F8
+            0xEE,             // out dx, al
+            0xF4,             // hlt
+        ];
+        image[0x600..0x600 + wake.len()].copy_from_slice(&wake);
+        let mut facs = FacsBuilder::new().build();
+        facs[12..16].copy_from_slice(&0x1600u32.to_le_bytes()); // firmware waking vector
+        image[0x500..0x500 + facs.len()].copy_from_slice(&facs);
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let spec = GuestBootSpec {
+            name: "s3".into(),
+            serial: SerialOutput::new("s3", SerialOutputMode::Shared(Arc::clone(&sink))),
+            ram_bytes: 0x2000,
+            load_base: 0x1000,
+            entry: 0x1000,
+            image,
+            rtc_unix_secs: 0,
+            platform: LbrPlatform::AmdSvm,
+        };
+        let mut guest = match GuestRuntime::prepare_real_mode(spec) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping resume_from_s3_re_enters_at_the_facs_waking_vector: {e}");
+                return;
+            }
+        };
+
+        // Resume: read the FACS at gpa 0x1500, decode the waking vector, and
+        // re-point the boot vCPU at 0x1600.
+        let target = guest.resume_from_s3(0x1500).expect("resume from S3");
+        assert_eq!(target, ResumeTarget::RealMode(0x1600));
+        assert_eq!(guest.run(0x1000, 100).unwrap(), LoopOutcome::Halted);
+        assert_eq!(
+            &*sink.lock().unwrap(),
+            b"W",
+            "guest re-entered at the FACS firmware waking vector"
+        );
+
+        // An unarmed FACS (no waking vector) is rejected.
+        let mut guest2 = GuestRuntime::prepare_real_mode(GuestBootSpec {
+            name: "s3-unarmed".into(),
+            serial: SerialOutput::new("s3-unarmed", SerialOutputMode::Null),
+            ram_bytes: 0x2000,
+            load_base: 0x1000,
+            entry: 0x1000,
+            image: {
+                let mut img = vec![0u8; 0x540];
+                img[0x500..0x500 + 64].copy_from_slice(&FacsBuilder::new().build());
+                img
+            },
+            rtc_unix_secs: 0,
+            platform: LbrPlatform::AmdSvm,
+        })
+        .expect("prepare unarmed guest");
+        assert!(
+            guest2.resume_from_s3(0x1500).is_err(),
+            "an unarmed FACS has no waking vector to resume to"
         );
     }
 
