@@ -397,6 +397,50 @@ mod linux {
         }
     }
 
+    /// The context-relevant MSRs captured and restored as part of a vCPU state
+    /// snapshot ([`KvmVcpuState`]). These are pure architectural registers a
+    /// context switch or S3 resume must preserve; `IA32_EFER` already lives in
+    /// `kvm_sregs`, and `IA32_TSC` is deliberately *excluded* — the guest TSC is
+    /// owned by the timing-stealth layer ([`crate::run_loop::StealthRunLoop`]),
+    /// and re-writing it from a snapshot would fight the TSC offset it maintains.
+    const CONTEXT_MSRS: [u32; 11] = [
+        0xC000_0100, // IA32_FS_BASE
+        0xC000_0101, // IA32_GS_BASE
+        0xC000_0102, // IA32_KERNEL_GS_BASE
+        0xC000_0081, // IA32_STAR
+        0xC000_0082, // IA32_LSTAR
+        0xC000_0083, // IA32_CSTAR
+        0xC000_0084, // IA32_FMASK
+        0x0000_0174, // IA32_SYSENTER_CS
+        0x0000_0175, // IA32_SYSENTER_ESP
+        0x0000_0176, // IA32_SYSENTER_EIP
+        0x0000_0277, // IA32_PAT
+    ];
+
+    /// A captured snapshot of one vCPU's architectural state — the general
+    /// register file, the special/segment/control registers, the XSAVE area
+    /// (x87 / SSE / AVX … extended state), and the context-relevant MSRs
+    /// ([`CONTEXT_MSRS`]) — enough to pause a vCPU on a scheduling-quantum
+    /// expiry (item 2.3) or across an ACPI S3 suspend (item 5.7) and later
+    /// resume it exactly. Produced by [`KvmBackend::save_vcpu_state`] and
+    /// re-applied by [`KvmBackend::restore_vcpu_state`].
+    ///
+    /// Not `Clone`/`Debug`: `kvm_xsave` carries a trailing flexible-array member,
+    /// so the snapshot is a move-only transient held only long enough to restore.
+    pub struct KvmVcpuState {
+        /// General-purpose registers, `RIP`, and `RFLAGS` (`KVM_GET_REGS`).
+        pub regs: kvm_bindings::kvm_regs,
+        /// Segment/control/descriptor-table registers, `EFER`, `APIC_BASE`
+        /// (`KVM_GET_SREGS`).
+        pub sregs: kvm_bindings::kvm_sregs,
+        /// The XSAVE extended-state area (`KVM_GET_XSAVE`): x87, SSE, and any
+        /// AVX/AVX-512 state the guest was using.
+        pub xsave: kvm_bindings::kvm_xsave,
+        /// `(index, value)` for each [`CONTEXT_MSRS`] entry the host KVM serves
+        /// (`KVM_GET_MSRS`); unsupported MSRs are omitted.
+        pub msrs: Vec<(u32, u64)>,
+    }
+
     /// A live KVM virtual machine plus its vCPUs.
     pub struct KvmBackend {
         kvm: Kvm,
@@ -1270,6 +1314,113 @@ mod linux {
             Ok(msrs.as_slice()[0].data)
         }
 
+        /// Capture vCPU `index`'s full architectural state into a
+        /// [`KvmVcpuState`] — general registers, special/segment/control
+        /// registers, the XSAVE extended state, and the context-relevant MSRs
+        /// ([`CONTEXT_MSRS`]) — via `KVM_GET_{REGS,SREGS,XSAVE,MSRS}`.
+        ///
+        /// This is the state-save primitive the time-slice scheduler needs to
+        /// pause a vCPU on quantum expiry (item 2.3) and the ACPI S3 path needs
+        /// to snapshot a guest across suspend (item 5.7); pair it with
+        /// [`restore_vcpu_state`](Self::restore_vcpu_state).
+        ///
+        /// The vCPU's CPUID must already be configured (as the run loop does via
+        /// the CPUID-stealth install before entry): the long-mode MSRs in
+        /// [`CONTEXT_MSRS`] (FS/GS base, the SYSCALL MSRs) are gated on the guest
+        /// advertising long mode, so `KVM_GET_MSRS` on a bare, CPUID-less vCPU
+        /// would report them missing.
+        ///
+        /// # Errors
+        /// Returns [`Error::Vcpu`] if `index` names no vCPU or the
+        /// `KVM_GET_{REGS,SREGS,XSAVE}` ioctls fail. Individual MSRs the host
+        /// KVM does not serve are skipped, not treated as errors.
+        pub fn save_vcpu_state(&self, index: usize) -> Result<KvmVcpuState> {
+            use kvm_bindings::{kvm_msr_entry, Msrs};
+            let vcpu = self
+                .vcpus
+                .get(index)
+                .ok_or_else(|| Error::Vcpu(format!("no vcpu at index {index}")))?;
+            let regs = vcpu
+                .get_regs()
+                .map_err(|e| Error::Vcpu(format!("KVM_GET_REGS: {e}")))?;
+            let sregs = vcpu
+                .get_sregs()
+                .map_err(|e| Error::Vcpu(format!("KVM_GET_SREGS: {e}")))?;
+            let xsave = vcpu
+                .get_xsave()
+                .map_err(|e| Error::Vcpu(format!("KVM_GET_XSAVE: {e}")))?;
+            // Read each context MSR individually and keep the subset this host's
+            // KVM actually exposes. KVM_GET_MSRS processes a batch in order and
+            // stops at the first MSR it does not serve (returning only the count
+            // read before it), so a single host-unsupported MSR would truncate a
+            // batched read; per-MSR reads let us skip the unsupported ones. An MSR
+            // KVM cannot read is not part of the guest's architectural state on
+            // this host, so excluding it loses nothing to restore.
+            let mut saved_msrs = Vec::with_capacity(CONTEXT_MSRS.len());
+            for &index in &CONTEXT_MSRS {
+                let mut one = Msrs::from_entries(&[kvm_msr_entry {
+                    index,
+                    ..Default::default()
+                }])
+                .map_err(|e| Error::Vcpu(format!("Msrs alloc: {e:?}")))?;
+                if let Ok(1) = vcpu.get_msrs(&mut one) {
+                    saved_msrs.push((index, one.as_slice()[0].data));
+                }
+            }
+            Ok(KvmVcpuState {
+                regs,
+                sregs,
+                xsave,
+                msrs: saved_msrs,
+            })
+        }
+
+        /// Re-apply a [`KvmVcpuState`] captured by
+        /// [`save_vcpu_state`](Self::save_vcpu_state) onto vCPU `index`, restoring
+        /// it to the exact point it was paused (item 2.3 resume / item 5.7 S3
+        /// resume). Sets the special registers before the general registers (the
+        /// order the `prepare_*_vcpu` helpers use so segment/control state is in
+        /// place before `RIP`/`RFLAGS`), then the XSAVE area and the MSRs.
+        ///
+        /// # Errors
+        /// Returns [`Error::Vcpu`] if `index` names no vCPU, any of the
+        /// `KVM_SET_*` ioctls fail, or `KVM_SET_MSRS` does not accept every
+        /// snapshot MSR.
+        pub fn restore_vcpu_state(&self, index: usize, state: &KvmVcpuState) -> Result<()> {
+            use kvm_bindings::{kvm_msr_entry, Msrs};
+            let vcpu = self
+                .vcpus
+                .get(index)
+                .ok_or_else(|| Error::Vcpu(format!("no vcpu at index {index}")))?;
+            vcpu.set_sregs(&state.sregs)
+                .map_err(|e| Error::Vcpu(format!("KVM_SET_SREGS: {e}")))?;
+            vcpu.set_regs(&state.regs)
+                .map_err(|e| Error::Vcpu(format!("KVM_SET_REGS: {e}")))?;
+            vcpu.set_xsave(&state.xsave)
+                .map_err(|e| Error::Vcpu(format!("KVM_SET_XSAVE: {e}")))?;
+            let entries: Vec<kvm_msr_entry> = state
+                .msrs
+                .iter()
+                .map(|&(index, data)| kvm_msr_entry {
+                    index,
+                    data,
+                    ..Default::default()
+                })
+                .collect();
+            let msrs = Msrs::from_entries(&entries)
+                .map_err(|e| Error::Vcpu(format!("Msrs alloc: {e:?}")))?;
+            let n = vcpu
+                .set_msrs(&msrs)
+                .map_err(|e| Error::Vcpu(format!("KVM_SET_MSRS: {e}")))?;
+            if n != state.msrs.len() {
+                return Err(Error::Vcpu(format!(
+                    "KVM_SET_MSRS accepted {n} of {} entries",
+                    state.msrs.len()
+                )));
+            }
+            Ok(())
+        }
+
         /// Point vCPU `index` at a flat 16-bit real-mode entry: every segment
         /// gets base 0 (so `rip` is a direct guest-physical offset), `rip` is
         /// set to `entry`, and `rflags` to the reserved-bit-only `0x2`.
@@ -1579,7 +1730,9 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{is_kvm_available, GuestMemory, GuestRam, KvmBackend, MemSlot, HOST_PAGE_SIZE};
+pub use linux::{
+    is_kvm_available, GuestMemory, GuestRam, KvmBackend, KvmVcpuState, MemSlot, HOST_PAGE_SIZE,
+};
 
 #[cfg(test)]
 mod tests {
@@ -2142,6 +2295,90 @@ mod tests {
         assert!(
             second >= first,
             "guest TSC went backwards: {first} -> {second}"
+        );
+    }
+
+    // Item 2.3 / 5.7: a full vCPU state snapshot must round-trip through
+    // save_vcpu_state → restore_vcpu_state exactly. Real KVM (skips without
+    // /dev/kvm). The proof is non-vacuous: between save and restore the live
+    // vCPU is driven to a divergent state (protected mode), and one MSR in the
+    // snapshot is set to a sentinel so the restore provably writes it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vcpu_state_round_trips_through_save_and_restore() {
+        if !is_kvm_available() {
+            eprintln!("skipping: /dev/kvm not available (no nested virt)");
+            return;
+        }
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        let ram = GuestRam::new(SIZE);
+        let host_addr = ram.host_addr();
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu 0");
+        // Configure the guest CPUID (as the run loop does before entry) so KVM
+        // exposes the long-mode MSRs (FS/GS base, the SYSCALL MSRs) to
+        // KVM_GET_MSRS — they are gated on the guest advertising long mode.
+        backend
+            .clear_cpuid_hypervisor_bit()
+            .expect("install supported CPUID");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("prepare real-mode vcpu");
+
+        // Baseline snapshot, with LSTAR overwritten to a sentinel so restoring it
+        // is provably faithful rather than a no-op.
+        const LSTAR: u32 = 0xC000_0082;
+        const SENTINEL: u64 = 0xFFFF_8000_DEAD_BEEF; // canonical MSR_LSTAR value
+        let mut snap = backend.save_vcpu_state(0).expect("save baseline state");
+        assert_eq!(snap.regs.rip, ENTRY, "baseline rip is the real-mode entry");
+        // LSTAR is served by every long-mode KVM; guard anyway so the MSR
+        // assertion is skipped rather than spuriously failing on a host that
+        // does not expose it, while the regs/sregs/xsave proof always runs.
+        let has_lstar = snap.msrs.iter().any(|m| m.0 == LSTAR);
+        for m in &mut snap.msrs {
+            if m.0 == LSTAR {
+                m.1 = SENTINEL;
+            }
+        }
+
+        // Drive the live vCPU away from the snapshot: entering protected mode
+        // flips CR0.PE and CS and moves rip, so the restore has real work to undo.
+        backend
+            .prepare_protected_mode_vcpu(0, 0x2000)
+            .expect("enter protected mode");
+        let diverged = backend.save_vcpu_state(0).expect("save diverged state");
+        assert_ne!(diverged.regs.rip, snap.regs.rip, "rip diverged");
+        assert_ne!(diverged.sregs.cr0, snap.sregs.cr0, "cr0.PE diverged");
+
+        // Restore the baseline and confirm every class of state came back.
+        backend
+            .restore_vcpu_state(0, &snap)
+            .expect("restore baseline state");
+        let restored = backend.save_vcpu_state(0).expect("re-save after restore");
+        assert_eq!(restored.regs.rip, ENTRY, "rip restored");
+        assert_eq!(restored.regs.rflags, snap.regs.rflags, "rflags restored");
+        assert_eq!(restored.sregs.cr0, snap.sregs.cr0, "cr0 restored");
+        assert_eq!(
+            restored.sregs.cs.selector, snap.sregs.cs.selector,
+            "cs restored"
+        );
+        if has_lstar {
+            let lstar = restored
+                .msrs
+                .iter()
+                .find(|m| m.0 == LSTAR)
+                .expect("lstar present after restore")
+                .1;
+            assert_eq!(lstar, SENTINEL, "LSTAR restored from the snapshot");
+        }
+        assert_eq!(
+            restored.xsave.region, snap.xsave.region,
+            "XSAVE extended-state area restored losslessly"
         );
     }
 

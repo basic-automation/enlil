@@ -74,7 +74,7 @@
 - [ ] 2.3 Time-slicing fallback scheduler — cooperative per-core vCPU time-slicing with full state save on quantum expiry and APIC/TSC-deadline preemption
   - [x] scheduling = dedicated|timeslice|auto config plus resolve_scheduling auto dedicate-or-timeslice logic
   - [x] TimeSliceScheduler run-queue with round-robin switch_next and quantum_ms
-  - [ ] Full vCPU context save on quantum expiry (registers, MSRs, FPU/SSE/AVX via XSAVE) — only a placeholder Vec<u8> VcpuContext exists
+  - [ ] Full vCPU context save on quantum expiry (registers, MSRs, FPU/SSE/AVX via XSAVE) — backend primitive landed: KvmBackend::save_vcpu_state/restore_vcpu_state capture+reapply a KvmVcpuState (kvm_regs, kvm_sregs, kvm_xsave, and the context-relevant MSRs — FS/GS/KERNEL_GS base, STAR/LSTAR/CSTAR/FMASK, SYSENTER trio, PAT; IA32_TSC deliberately excluded to not fight the stealth TSC offset; host-unsupported MSRs skipped per-read), verified by a real-KVM save→diverge(protected-mode + LSTAR sentinel)→restore round-trip; NEXT SLICE: replace TimeSliceScheduler's placeholder Vec<u8> VcpuContext with KvmVcpuState and call save/restore across switch_next (also the enabling primitive for 5.7 S3 resume)
   - [ ] APIC-timer / TSC-deadline preemption to force the context switch
 - [x] 2.4 Memory isolation — per-guest physical allocator carving host RAM (GPA 0 each) over KVM memory slots, with EPT write-protect + dirty-bitmap primitives
   - [x] MemoryManager physical allocator (2MB-aligned per-guest regions, hypervisor reserve, GPA0->HPA map) in enlil-core/memory.rs
