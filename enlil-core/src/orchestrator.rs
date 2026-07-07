@@ -310,6 +310,44 @@ mod linux {
             self.run.backend_mut().restore_vcpu_state(0, state)
         }
 
+        /// Translate a guest-physical address to an offset into the owned RAM,
+        /// bounds-checked so `[gpa, gpa+len)` lies within the mapped guest RAM.
+        fn ram_range(&self, gpa: u64, len: usize) -> Result<std::ops::Range<usize>> {
+            let start = gpa
+                .checked_sub(self.load_base)
+                .and_then(|o| usize::try_from(o).ok())
+                .ok_or_else(|| Error::Config(format!("gpa {gpa:#x} is below the load base")))?;
+            let end = start
+                .checked_add(len)
+                .filter(|&e| e <= self.ram.len())
+                .ok_or_else(|| {
+                    Error::Config(format!("gpa {gpa:#x}+{len:#x} overruns guest RAM"))
+                })?;
+            Ok(start..end)
+        }
+
+        /// Write `bytes` into guest RAM at guest-physical `gpa` — e.g. to load a
+        /// kernel, initrd, or boot parameters before running. Bounds-checked.
+        ///
+        /// # Errors
+        /// Returns [`Error::Config`] if `[gpa, gpa+bytes.len())` is outside the
+        /// mapped guest RAM.
+        pub fn write_guest_bytes(&mut self, gpa: u64, bytes: &[u8]) -> Result<()> {
+            let range = self.ram_range(gpa, bytes.len())?;
+            self.ram.as_mut_slice()[range].copy_from_slice(bytes);
+            Ok(())
+        }
+
+        /// Read `len` bytes of guest RAM at guest-physical `gpa`. Bounds-checked.
+        ///
+        /// # Errors
+        /// Returns [`Error::Config`] if `[gpa, gpa+len)` is outside the mapped
+        /// guest RAM.
+        pub fn read_guest_bytes(&self, gpa: u64, len: usize) -> Result<Vec<u8>> {
+            let range = self.ram_range(gpa, len)?;
+            Ok(self.ram.as_slice()[range].to_vec())
+        }
+
         /// Resume the guest from an ACPI S3 (suspend-to-RAM) transition: read the
         /// FACS (the OS wrote its firmware waking vector there before suspending)
         /// from guest RAM at `facs_gpa` — the address the FADT's `FIRMWARE_CTRL`
@@ -327,18 +365,8 @@ mod linux {
         /// is malformed, no waking vector is armed, or the armed vector needs an
         /// unsupported long-mode entry; propagates `prepare_real_mode_vcpu`.
         pub fn resume_from_s3(&mut self, facs_gpa: u64) -> Result<ResumeTarget> {
-            let offset = facs_gpa
-                .checked_sub(self.load_base)
-                .and_then(|o| usize::try_from(o).ok())
-                .ok_or_else(|| Error::Config(format!("FACS gpa {facs_gpa:#x} below load base")))?;
-            let facs = self
-                .ram
-                .as_slice()
-                .get(offset..offset + FACS_LENGTH as usize)
-                .ok_or_else(|| {
-                    Error::Config(format!("FACS at gpa {facs_gpa:#x} is outside guest RAM"))
-                })?;
-            let waking = FacsWaking::from_facs(facs)
+            let facs = self.read_guest_bytes(facs_gpa, FACS_LENGTH as usize)?;
+            let waking = FacsWaking::from_facs(&facs)
                 .ok_or_else(|| Error::Config("FACS buffer too short".into()))?;
             let target = waking.resume_target();
             match target {
@@ -618,6 +646,48 @@ mod tests {
             platform: LbrPlatform::AmdSvm,
         };
         assert!(GuestRuntime::prepare_long_mode(spec).is_err());
+    }
+
+    #[test]
+    fn guest_ram_bytes_round_trip_and_bounds_check() {
+        if !is_kvm_available() {
+            eprintln!("skipping guest_ram_bytes_round_trip_and_bounds_check: no /dev/kvm");
+            return;
+        }
+        let spec = GuestBootSpec {
+            name: "ramio".into(),
+            serial: SerialOutput::new("ramio", SerialOutputMode::Null),
+            ram_bytes: 0x2000,
+            load_base: 0x1000,
+            entry: 0x1000,
+            image: vec![0xF4], // hlt
+            rtc_unix_secs: 0,
+            platform: LbrPlatform::AmdSvm,
+        };
+        let mut guest = match GuestRuntime::prepare_real_mode(spec) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping guest_ram_bytes_round_trip_and_bounds_check: {e}");
+                return;
+            }
+        };
+        // Write near the top of RAM (gpa 0x1000..0x3000) and read it back.
+        guest
+            .write_guest_bytes(0x2500, &[0xDE, 0xAD, 0xBE, 0xEF])
+            .expect("write within RAM");
+        assert_eq!(
+            guest.read_guest_bytes(0x2500, 4).unwrap(),
+            vec![0xDE, 0xAD, 0xBE, 0xEF]
+        );
+        // Below the load base and past the end are rejected.
+        assert!(
+            guest.write_guest_bytes(0x0, &[0]).is_err(),
+            "below load base"
+        );
+        assert!(
+            guest.read_guest_bytes(0x2FFE, 4).is_err(),
+            "read overruns the end of RAM"
+        );
     }
 
     #[test]
