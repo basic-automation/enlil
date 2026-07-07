@@ -357,6 +357,34 @@ mod linux {
                 )),
             }
         }
+
+        /// Resume from S3 by first *discovering* the FACS from the guest's live
+        /// ACPI tables — walk RSDP → XSDT/RSDT → FADT → FACS starting at
+        /// `rsdp_gpa` — then [`resume_from_s3`](Self::resume_from_s3). This is the
+        /// realistic entry point: the guest OS placed its tables in RAM, so the
+        /// FACS address is only knowable by walking them (item 5.7).
+        ///
+        /// Requires `load_base == 0` (the ACPI walker indexes guest RAM by
+        /// guest-physical address).
+        ///
+        /// # Errors
+        /// Returns [`Error::Config`] if `load_base != 0` or the FACS cannot be
+        /// discovered; otherwise as [`resume_from_s3`](Self::resume_from_s3).
+        pub fn resume_from_s3_via_rsdp(&mut self, rsdp_gpa: u64) -> Result<ResumeTarget> {
+            if self.load_base != 0 {
+                return Err(Error::Config(
+                    "ACPI-table discovery requires load_base 0".into(),
+                ));
+            }
+            let facs_gpa =
+                enlil_devices::acpi::discover::find_facs_address(self.ram.as_slice(), rsdp_gpa)
+                    .ok_or_else(|| {
+                        Error::Config(
+                            "could not discover the FACS from the guest's ACPI tables".into(),
+                        )
+                    })?;
+            self.resume_from_s3(facs_gpa)
+        }
     }
 }
 
@@ -469,6 +497,71 @@ mod tests {
         let outcome = guest.run(0x1000, 100).expect("run guest");
         assert_eq!(outcome, LoopOutcome::Halted, "guest halts after greeting");
         assert_eq!(&*sink.lock().unwrap(), b"K", "guest emitted its greeting");
+    }
+
+    #[test]
+    fn resume_from_s3_discovers_the_facs_via_the_acpi_tables() {
+        use enlil_devices::acpi::facs::{FacsBuilder, ResumeTarget};
+        use enlil_devices::acpi::fadt::FadtBuilder;
+        use enlil_devices::acpi::rsdp::RsdpBuilder;
+        use enlil_devices::acpi::xsdt::XsdtBuilder;
+
+        if !is_kvm_available() {
+            eprintln!(
+                "skipping resume_from_s3_discovers_the_facs_via_the_acpi_tables: no /dev/kvm"
+            );
+            return;
+        }
+        // A full ACPI table set laid out in guest RAM (based at gpa 0):
+        //   0x0800: resume payload — out 0x3F8,'W'; hlt
+        //   0x1000: FACS, waking vector = 0x0800
+        //   0x2000: FADT, FIRMWARE_CTRL = 0x1000
+        //   0x4000: XSDT listing the FADT
+        //   0x5000: RSDP pointing at the XSDT
+        let mut image = vec![0u8; 0x5100];
+        #[rustfmt::skip]
+        let wake: [u8; 7] = [0xB0, 0x57, 0xBA, 0xF8, 0x03, 0xEE, 0xF4]; // mov al,'W'; mov dx,0x3F8; out; hlt
+        image[0x800..0x800 + wake.len()].copy_from_slice(&wake);
+        let mut facs = FacsBuilder::new().build();
+        facs[12..16].copy_from_slice(&0x800u32.to_le_bytes());
+        image[0x1000..0x1000 + facs.len()].copy_from_slice(&facs);
+        let fadt = FadtBuilder::new(0x3000).firmware_ctrl(0x1000).build();
+        image[0x2000..0x2000 + fadt.len()].copy_from_slice(&fadt);
+        let xsdt = XsdtBuilder::new().add_table(0x2000).build();
+        image[0x4000..0x4000 + xsdt.len()].copy_from_slice(&xsdt);
+        let rsdp = RsdpBuilder::new().xsdt_address(0x4000).build();
+        image[0x5000..0x5000 + rsdp.len()].copy_from_slice(&rsdp);
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let spec = GuestBootSpec {
+            name: "s3-discover".into(),
+            serial: SerialOutput::new("s3-discover", SerialOutputMode::Shared(Arc::clone(&sink))),
+            ram_bytes: 0x1_0000,
+            load_base: 0,
+            entry: 0,
+            image,
+            rtc_unix_secs: 0,
+            platform: LbrPlatform::AmdSvm,
+        };
+        let mut guest = match GuestRuntime::prepare_real_mode(spec) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping resume_from_s3_discovers_the_facs_via_the_acpi_tables: {e}");
+                return;
+            }
+        };
+
+        // Discover the FACS from the RSDP and resume into the waking vector.
+        let target = guest
+            .resume_from_s3_via_rsdp(0x5000)
+            .expect("discover FACS and resume");
+        assert_eq!(target, ResumeTarget::RealMode(0x800));
+        assert_eq!(guest.run(0, 100).unwrap(), LoopOutcome::Halted);
+        assert_eq!(
+            &*sink.lock().unwrap(),
+            b"W",
+            "resumed at the FACS waking vector discovered by walking the ACPI tables"
+        );
     }
 
     #[test]
