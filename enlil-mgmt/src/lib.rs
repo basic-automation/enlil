@@ -7,3 +7,4 @@
 //! importantly the [`protocol`] spoken between them.
 
 pub mod protocol;
+pub mod usb_tab;
