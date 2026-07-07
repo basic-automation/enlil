@@ -22,6 +22,7 @@
 
 pub mod aml;
 pub mod bgrt;
+pub mod discover;
 pub mod dsdt;
 pub mod facs;
 pub mod fadt;
