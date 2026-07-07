@@ -262,6 +262,23 @@ impl MemoryMap {
             .all(|w| w[0].end() <= w[1].base.as_u64())
     }
 
+    /// Merge adjacent regions of the same [`MemoryKind`] into one — a firmware map
+    /// commonly reports a contiguous run of one type as several entries. Assumes
+    /// the map is sorted by base (as maintained), and leaves gaps and
+    /// differing-kind boundaries intact.
+    pub fn coalesce(&mut self) {
+        let mut merged: Vec<MemoryRegion> = Vec::with_capacity(self.regions.len());
+        for region in self.regions.drain(..) {
+            match merged.last_mut() {
+                Some(last) if last.kind == region.kind && last.end() == region.base.as_u64() => {
+                    last.size += region.size;
+                }
+                _ => merged.push(region),
+            }
+        }
+        self.regions = merged;
+    }
+
     /// Carve the hypervisor's boot-time physical regions from this map per `req`
     /// — a low DMA window (under 4 GiB), the hypervisor heap, and one disjoint
     /// RAM region per guest (each guest gets its own physical span; LOCKED
@@ -406,6 +423,33 @@ mod tests {
         assert_eq!(map.regions()[6].kind, MemoryKind::Bad);
         // Only the two USABLE ranges count as free RAM.
         assert_eq!(map.total_usable(), 0x9_FC00 + 0x10_0000);
+    }
+
+    #[test]
+    fn coalesce_merges_adjacent_same_kind_regions() {
+        let mut map = MemoryMap::from_regions(vec![
+            usable(0x0000, 0x1000),
+            usable(0x1000, 0x1000), // adjacent + same kind → merges with above
+            usable(0x2000, 0x1000), // and this one too
+            reserved(0x3000, 0x1000), // different kind → boundary kept
+            usable(0x5000, 0x1000), // gap before it (0x4000..0x5000) → kept separate
+        ]);
+        let usable_before = map.total_usable();
+        map.coalesce();
+        assert!(map.is_consistent());
+        // The three adjacent usable regions became one [0, 0x3000).
+        assert_eq!(
+            map.regions().len(),
+            3,
+            "3 usable merged to 1, + reserved + far usable"
+        );
+        assert_eq!(map.regions()[0].base, PhysAddr::new(0));
+        assert_eq!(map.regions()[0].size, 0x3000);
+        assert_eq!(map.regions()[0].kind, MemoryKind::Usable);
+        assert_eq!(map.regions()[1].kind, MemoryKind::Reserved);
+        assert_eq!(map.regions()[2].base, PhysAddr::new(0x5000));
+        // Coalescing conserves total usable RAM.
+        assert_eq!(map.total_usable(), usable_before);
     }
 
     #[test]
