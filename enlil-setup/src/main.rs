@@ -339,6 +339,19 @@ pub fn generate_config(config: &SetupConfig) -> Result<String> {
     Ok(toml::to_string_pretty(config)?)
 }
 
+/// Write a [`SetupConfig`] to `path` as TOML — the wizard's output the rest of
+/// the Enlil stack loads.
+///
+/// # Errors
+///
+/// Returns an error if serialization ([`generate_config`]) fails or the file
+/// cannot be written.
+pub fn write_config(config: &SetupConfig, path: &std::path::Path) -> Result<()> {
+    let toml = generate_config(config)?;
+    std::fs::write(path, toml)?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Banner
 // ---------------------------------------------------------------------------
@@ -368,7 +381,10 @@ fn main() -> Result<()> {
     let toml_output = generate_config(&config)?;
     println!("{toml_output}");
 
-    println!("[4/4] Done. (Phase 0 — config not yet written to disk)");
+    println!("[4/4] Writing configuration...\n");
+    let out_path = std::path::Path::new("enlil.toml");
+    write_config(&config, out_path)?;
+    println!("Done. Wrote {}", out_path.display());
 
     Ok(())
 }
@@ -485,6 +501,23 @@ mod tests {
         let parsed: SetupConfig = toml::from_str(&output).expect("deserialization failed");
         assert_eq!(parsed.guests.len(), config.guests.len());
         assert_eq!(parsed.host_cpus, config.host_cpus);
+    }
+
+    #[test]
+    fn write_config_round_trips_through_a_file() {
+        let config = run_wizard(&detect_hardware());
+        // Unique temp path (no tempfile dep); cleaned up at the end.
+        let path = std::env::temp_dir().join(format!(
+            "enlil-setup-write-{}-{}.toml",
+            std::process::id(),
+            config.guests.len()
+        ));
+        write_config(&config, &path).expect("write config");
+        let text = std::fs::read_to_string(&path).expect("read back config");
+        let parsed: SetupConfig = toml::from_str(&text).expect("parse written config");
+        assert_eq!(parsed.guests.len(), config.guests.len());
+        assert_eq!(parsed.host_cpus, config.host_cpus);
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
