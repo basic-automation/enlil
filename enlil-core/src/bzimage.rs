@@ -63,6 +63,63 @@ pub fn parse_bzimage_header(image: &[u8]) -> Option<BzImageInfo> {
     })
 }
 
+/// Size of the `boot_params` "zero page" the kernel is entered with.
+pub const BOOT_PARAMS_SIZE: usize = 4096;
+
+// Offsets within `boot_params` (Linux boot protocol / `struct boot_params`).
+/// `e820_entries` — number of E820 map entries (`u8`).
+const BP_E820_ENTRIES: usize = 0x1E8;
+/// Start of the setup header inside `boot_params` (mirrors the `bzImage` layout).
+const BP_SETUP_HEADER: usize = 0x1F1;
+/// End of the setup header region copied from the image (exclusive).
+const BP_SETUP_HEADER_END: usize = 0x268;
+/// `type_of_loader` (`u8`).
+const BP_TYPE_OF_LOADER: usize = 0x210;
+/// `cmd_line_ptr` (`u32`) — guest-physical address of the NUL-terminated cmdline.
+const BP_CMD_LINE_PTR: usize = 0x228;
+/// Start of the E820 table — an array of 20-byte `(addr u64, size u64, type u32)`.
+const BP_E820_TABLE: usize = 0x2D0;
+/// One E820 map entry as `boot_params` stores it.
+const E820_ENTRY_SIZE: usize = 20;
+/// Max E820 entries the zero page holds (`E820_MAX_ENTRIES_ZEROPAGE`).
+const MAX_E820_ENTRIES: usize = 128;
+/// `type_of_loader` value for an undefined/unregistered bootloader.
+const LOADER_TYPE_UNDEFINED: u8 = 0xFF;
+
+/// Build the `boot_params` "zero page" for a `bzImage`: copy the setup header
+/// from the image, mark an undefined bootloader, point `cmd_line_ptr` at the
+/// guest cmdline, and write the E820 memory map. `e820` entries are
+/// `(base, size, type)` using the E820 type codes (1 usable, 2 reserved, …).
+///
+/// This is the block the protected-mode kernel is entered with (RSI → its
+/// guest-physical address); placing it and the kernel in guest RAM and entering
+/// is the next slice.
+///
+/// Returns `None` if `image` is too short to contain the setup header.
+#[must_use]
+pub fn build_boot_params(
+    image: &[u8],
+    cmd_line_ptr: u32,
+    e820: &[(u64, u64, u32)],
+) -> Option<[u8; BOOT_PARAMS_SIZE]> {
+    let header = image.get(BP_SETUP_HEADER..BP_SETUP_HEADER_END)?;
+    let mut bp = [0u8; BOOT_PARAMS_SIZE];
+    // Copy the setup header first; the overrides below sit inside its range.
+    bp[BP_SETUP_HEADER..BP_SETUP_HEADER_END].copy_from_slice(header);
+    bp[BP_TYPE_OF_LOADER] = LOADER_TYPE_UNDEFINED;
+    bp[BP_CMD_LINE_PTR..BP_CMD_LINE_PTR + 4].copy_from_slice(&cmd_line_ptr.to_le_bytes());
+
+    let n = e820.len().min(MAX_E820_ENTRIES);
+    bp[BP_E820_ENTRIES] = u8::try_from(n).unwrap_or(u8::MAX);
+    for (i, &(base, size, kind)) in e820.iter().take(n).enumerate() {
+        let off = BP_E820_TABLE + i * E820_ENTRY_SIZE;
+        bp[off..off + 8].copy_from_slice(&base.to_le_bytes());
+        bp[off + 8..off + 16].copy_from_slice(&size.to_le_bytes());
+        bp[off + 16..off + 20].copy_from_slice(&kind.to_le_bytes());
+    }
+    Some(bp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,6 +149,49 @@ mod tests {
         let info = parse_bzimage_header(&header(0, 0x0200)).unwrap();
         assert_eq!(info.setup_sects, 4, "legacy 0 means 4 setup sectors");
         assert_eq!(info.protected_mode_kernel_offset, 0xA00);
+    }
+
+    #[test]
+    fn builds_boot_params_with_header_cmdline_and_e820() {
+        // A header big enough to hold the full setup-header region, with a couple
+        // of recognizable field values to prove the copy.
+        let mut img = vec![0u8; 0x300];
+        img[0x1FE..0x200].copy_from_slice(&BOOT_FLAG.to_le_bytes());
+        img[0x202..0x206].copy_from_slice(SETUP_HEADER_MAGIC);
+        img[0x206..0x208].copy_from_slice(&0x020Fu16.to_le_bytes());
+        img[0x1F1] = 0x04; // setup_sects
+        img[0x211] = 0x81; // loadflags — a header field that must survive the copy
+
+        let bp = build_boot_params(
+            &img,
+            0x9_0000,
+            &[(0, 0xA_0000, 1), (0x10_0000, 0x1000_0000, 1)],
+        )
+        .expect("header long enough");
+
+        // Setup-header fields copied verbatim.
+        assert_eq!(bp[0x1F1], 0x04, "setup_sects copied");
+        assert_eq!(bp[0x211], 0x81, "loadflags copied");
+        // Overrides applied after the copy.
+        assert_eq!(bp[0x210], LOADER_TYPE_UNDEFINED, "type_of_loader set");
+        assert_eq!(
+            u32::from_le_bytes(bp[0x228..0x22C].try_into().unwrap()),
+            0x9_0000,
+            "cmd_line_ptr set"
+        );
+        // E820 map: two entries, first is [0, 0xA0000) usable.
+        assert_eq!(bp[0x1E8], 2, "e820_entries count");
+        assert_eq!(u64::from_le_bytes(bp[0x2D0..0x2D8].try_into().unwrap()), 0);
+        assert_eq!(
+            u64::from_le_bytes(bp[0x2D8..0x2E0].try_into().unwrap()),
+            0xA_0000
+        );
+        assert_eq!(u32::from_le_bytes(bp[0x2E0..0x2E4].try_into().unwrap()), 1);
+    }
+
+    #[test]
+    fn build_boot_params_rejects_a_short_image() {
+        assert!(build_boot_params(&[0u8; 0x100], 0, &[]).is_none());
     }
 
     #[test]
