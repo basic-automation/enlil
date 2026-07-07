@@ -81,9 +81,130 @@ impl FacsBuilder {
     }
 }
 
+/// The S3-resume waking state OSPM programmed into a FACS.
+///
+/// Read back by the hypervisor on wake to decide where — and in what CPU mode —
+/// to re-enter the guest (item 5.7). OSPM writes these fields into the shared
+/// FACS just before committing the S3 (suspend-to-RAM) transition; on resume the
+/// firmware (here, enlil) hands control to the waking vector, and the OS's own
+/// trampoline restores the rest of its context from RAM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FacsWaking {
+    /// 32-bit real-mode firmware waking vector (FACS offset 12).
+    pub waking_vector: u32,
+    /// 64-bit firmware waking vector (FACS offset 24), used when OSPM requests a
+    /// non-real-mode resume.
+    pub x_waking_vector: u64,
+    /// OSPM `64BIT_WAKE` flag (FACS OSPM-flags offset 36, bit 0): OSPM set it to
+    /// ask for control to return via the 64-bit `x_waking_vector`.
+    pub ospm_64bit_wake: bool,
+}
+
+/// Where and in what mode to resume a guest from S3, decoded from a
+/// [`FacsWaking`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeTarget {
+    /// Re-enter in **real mode** at the 32-bit firmware waking vector.
+    RealMode(u32),
+    /// Re-enter via the 64-bit `x_waking_vector` (OSPM asked for it).
+    Extended(u64),
+    /// No waking vector was programmed — the guest never armed an S3 resume, so
+    /// there is nothing to resume to.
+    None,
+}
+
+impl FacsWaking {
+    /// Parse the waking state from a FACS byte buffer, or `None` if the buffer is
+    /// too short to be a valid FACS.
+    #[must_use]
+    pub fn from_facs(facs: &[u8]) -> Option<Self> {
+        if facs.len() < FACS_LENGTH as usize {
+            return None;
+        }
+        Some(Self {
+            waking_vector: u32::from_le_bytes(facs[12..16].try_into().ok()?),
+            x_waking_vector: u64::from_le_bytes(facs[24..32].try_into().ok()?),
+            ospm_64bit_wake: facs[36] & 0x1 != 0,
+        })
+    }
+
+    /// The address and CPU mode to resume at (ACPI 6.x §5.2.10): use the 64-bit
+    /// `x_waking_vector` iff OSPM set the `64BIT_WAKE` flag *and* that vector is
+    /// non-zero; otherwise the 32-bit real-mode waking vector; otherwise nothing
+    /// is armed.
+    #[must_use]
+    pub const fn resume_target(&self) -> ResumeTarget {
+        if self.ospm_64bit_wake && self.x_waking_vector != 0 {
+            ResumeTarget::Extended(self.x_waking_vector)
+        } else if self.waking_vector != 0 {
+            ResumeTarget::RealMode(self.waking_vector)
+        } else {
+            ResumeTarget::None
+        }
+    }
+
+    /// Whether the guest has armed an S3 resume (a waking vector is programmed).
+    #[must_use]
+    pub const fn is_armed(&self) -> bool {
+        !matches!(self.resume_target(), ResumeTarget::None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a FACS then let OSPM program the S3 waking fields into it, the way a
+    /// guest does before entering S3.
+    fn facs_with_waking(vector: u32, x_vector: u64, wake64: bool) -> Vec<u8> {
+        let mut facs = FacsBuilder::new().build();
+        facs[12..16].copy_from_slice(&vector.to_le_bytes());
+        facs[24..32].copy_from_slice(&x_vector.to_le_bytes());
+        facs[36] = u8::from(wake64);
+        facs
+    }
+
+    #[test]
+    fn reads_the_real_mode_waking_vector() {
+        let facs = facs_with_waking(0x8000, 0, false);
+        let w = FacsWaking::from_facs(&facs).unwrap();
+        assert_eq!(w.waking_vector, 0x8000);
+        assert!(!w.ospm_64bit_wake);
+        assert_eq!(w.resume_target(), ResumeTarget::RealMode(0x8000));
+        assert!(w.is_armed());
+    }
+
+    #[test]
+    fn prefers_the_x_vector_only_when_ospm_asks_and_it_is_set() {
+        // 64BIT_WAKE set + X non-zero → Extended.
+        let facs = facs_with_waking(0x8000, 0x1_0000_0000, true);
+        let w = FacsWaking::from_facs(&facs).unwrap();
+        assert_eq!(w.resume_target(), ResumeTarget::Extended(0x1_0000_0000));
+
+        // 64BIT_WAKE set but X zero → fall back to the real-mode vector.
+        let facs = facs_with_waking(0x8000, 0, true);
+        let w = FacsWaking::from_facs(&facs).unwrap();
+        assert_eq!(w.resume_target(), ResumeTarget::RealMode(0x8000));
+
+        // X set but OSPM did not ask for 64-bit wake → real mode.
+        let facs = facs_with_waking(0x8000, 0x1_0000_0000, false);
+        let w = FacsWaking::from_facs(&facs).unwrap();
+        assert_eq!(w.resume_target(), ResumeTarget::RealMode(0x8000));
+    }
+
+    #[test]
+    fn a_freshly_built_facs_is_not_armed() {
+        // OSPM has not programmed a waking vector yet.
+        let facs = FacsBuilder::new().build();
+        let w = FacsWaking::from_facs(&facs).unwrap();
+        assert_eq!(w.resume_target(), ResumeTarget::None);
+        assert!(!w.is_armed());
+    }
+
+    #[test]
+    fn a_short_buffer_is_rejected() {
+        assert!(FacsWaking::from_facs(&[0u8; 32]).is_none());
+    }
 
     #[test]
     fn facs_is_64_bytes_with_signature_and_version() {
