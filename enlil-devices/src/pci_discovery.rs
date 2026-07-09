@@ -330,6 +330,137 @@ pub struct XhciController {
     pub mmio_base: Option<u64>,
 }
 
+/// A legacy PCI capability found in standard config space (the `0x40..=0xFF`
+/// device-specific region), reached from the capability pointer at `0x34`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Capability {
+    /// Capability ID (`0x01` PM, `0x05` MSI, `0x10` PCIe, `0x11` MSI-X, …).
+    pub id: u8,
+    /// Config-space offset of the capability structure.
+    pub offset: u16,
+}
+
+impl Capability {
+    /// Power Management capability ID.
+    pub const POWER_MANAGEMENT: u8 = 0x01;
+    /// MSI capability ID.
+    pub const MSI: u8 = 0x05;
+    /// PCI Express capability ID.
+    pub const PCI_EXPRESS: u8 = 0x10;
+    /// MSI-X capability ID.
+    pub const MSI_X: u8 = 0x11;
+}
+
+/// Walk a function's legacy capability list, following the next-pointer chain
+/// from the capability pointer at config `0x34`.
+///
+/// Returns each `(id, offset)` in list order. Empty if the STATUS
+/// "capabilities list" bit (bit 4) is clear. The walk is cycle-guarded (a
+/// malformed next-pointer that revisits an offset stops it) and masks the
+/// reserved low two bits of each pointer.
+#[must_use]
+pub fn capabilities(mem: &[u8], alloc: &McfgAllocation, func: &PciFunction) -> Vec<Capability> {
+    let Some(base) = function_base(alloc, func.bus, func.device, func.function) else {
+        return Vec::new();
+    };
+    // Capabilities present only if STATUS bit 4 is set.
+    match read_u16(mem, base + u64::from(cfg::STATUS)) {
+        Some(status) if status & 0x10 != 0 => {}
+        _ => return Vec::new(),
+    }
+    let Some(head) = read_u8(mem, base + u64::from(cfg::CAPABILITY_PTR)) else {
+        return Vec::new();
+    };
+    let mut ptr = head & 0xFC;
+    let mut out = Vec::new();
+    let mut visited = Vec::new();
+    while ptr >= 0x40 && !visited.contains(&ptr) {
+        visited.push(ptr);
+        let (Some(id), Some(next)) = (
+            read_u8(mem, base + u64::from(ptr)),
+            read_u8(mem, base + u64::from(ptr) + 1),
+        ) else {
+            break;
+        };
+        out.push(Capability {
+            id,
+            offset: u16::from(ptr),
+        });
+        ptr = next & 0xFC;
+    }
+    out
+}
+
+/// A PCI Express extended capability in extended config space (`>= 0x100`),
+/// reached from the fixed head at offset `0x100`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtendedCapability {
+    /// Extended capability ID (`0x0010` SR-IOV, `0x000B` Vendor-specific, …).
+    pub id: u16,
+    /// Capability version (low nibble of the header's second byte).
+    pub version: u8,
+    /// Extended-config-space offset of the capability structure.
+    pub offset: u16,
+}
+
+impl ExtendedCapability {
+    /// Single Root I/O Virtualization (SR-IOV) extended capability ID.
+    pub const SR_IOV: u16 = 0x0010;
+    /// Access Control Services (ACS) extended capability ID.
+    pub const ACS: u16 = 0x000D;
+}
+
+/// Walk a function's PCI Express extended capability list from the fixed head
+/// at offset `0x100`, following the next-offset chain in each 32-bit header.
+///
+/// Returns each `(id, version, offset)` in list order. Empty if extended config
+/// space is not backed by `mem` or the head reads as all-ones/zero (no extended
+/// capabilities). Cycle-guarded like [`capabilities`].
+#[must_use]
+pub fn extended_capabilities(
+    mem: &[u8],
+    alloc: &McfgAllocation,
+    func: &PciFunction,
+) -> Vec<ExtendedCapability> {
+    let Some(base) = function_base(alloc, func.bus, func.device, func.function) else {
+        return Vec::new();
+    };
+    let mut off: u16 = 0x100;
+    let mut out = Vec::new();
+    let mut visited = Vec::new();
+    while off >= 0x100 && !visited.contains(&off) {
+        visited.push(off);
+        let Some(header) = read_u32(mem, base + u64::from(off)) else {
+            break;
+        };
+        let id = (header & 0xFFFF) as u16;
+        // All-ones (unimplemented) or a zero header ends the list.
+        if id == 0xFFFF || header == 0 {
+            break;
+        }
+        out.push(ExtendedCapability {
+            id,
+            version: ((header >> 16) & 0xF) as u8,
+            offset: off,
+        });
+        let next = ((header >> 20) & 0xFFF) as u16;
+        if next == 0 {
+            break;
+        }
+        off = next & 0xFFC;
+    }
+    out
+}
+
+/// Whether a function advertises the SR-IOV extended capability — the check the
+/// GPU/NIC SR-IOV passthrough tiers (Phases 3.2, 7.3) gate on.
+#[must_use]
+pub fn is_sr_iov_capable(mem: &[u8], alloc: &McfgAllocation, func: &PciFunction) -> bool {
+    extended_capabilities(mem, alloc, func)
+        .iter()
+        .any(|cap| cap.id == ExtendedCapability::SR_IOV)
+}
+
 /// Discover every xHCI (USB 3.x) host controller across all ECAM windows,
 /// pairing each with its BAR0 MMIO base — the "PCI enum to xHCI BARs" step
 /// the USB routing engine and the bare-metal xHCI driver (Phase 6.5) consume.
@@ -511,6 +642,98 @@ mod tests {
         assert_eq!(controllers.len(), 1);
         assert_eq!(controllers[0].function.bdf(), (0, 4, 0));
         assert_eq!(controllers[0].mmio_base, Some(0x0000_0004_F700_0000));
+    }
+
+    /// A bare general PciFunction at 00:00.0 for capability-walk tests.
+    fn plain_function() -> PciFunction {
+        PciFunction {
+            segment: 0,
+            bus: 0,
+            device: 0,
+            function: 0,
+            vendor_id: 0x8086,
+            device_id: 0x10FB,
+            revision: 1,
+            prog_if: 0,
+            subclass: 0,
+            class_code: 0x02,
+            header_type: 0,
+        }
+    }
+
+    #[test]
+    fn walks_the_legacy_capability_chain() {
+        let mut mem = vec![0u8; 0x110];
+        mem[0x06..0x08].copy_from_slice(&0x0010u16.to_le_bytes()); // STATUS: caps present
+        mem[0x34] = 0x40; // capability pointer -> first cap
+        mem[0x40] = Capability::POWER_MANAGEMENT;
+        mem[0x41] = 0x50; // -> next
+        mem[0x50] = Capability::MSI;
+        mem[0x51] = 0x60; // -> next
+        mem[0x60] = Capability::MSI_X;
+        mem[0x61] = 0x00; // end of list
+
+        let caps = capabilities(&mem, &McfgAllocation::standard(0), &plain_function());
+        assert_eq!(
+            caps,
+            vec![
+                Capability {
+                    id: 0x01,
+                    offset: 0x40,
+                },
+                Capability {
+                    id: 0x05,
+                    offset: 0x50,
+                },
+                Capability {
+                    id: 0x11,
+                    offset: 0x60,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn no_capabilities_when_the_status_bit_is_clear() {
+        let mut mem = vec![0u8; 0x110];
+        // STATUS caps bit clear, but a stale pointer/cap present: must be ignored.
+        mem[0x34] = 0x40;
+        mem[0x40] = Capability::MSI;
+        assert!(
+            capabilities(&mem, &McfgAllocation::standard(0), &plain_function()).is_empty(),
+            "no walk without the STATUS capabilities-list bit"
+        );
+    }
+
+    #[test]
+    fn walks_the_extended_capability_list_and_detects_sr_iov() {
+        let mut mem = vec![0u8; 0x110];
+        // Extended cap head at 0x100: id 0x0010 (SR-IOV), version 1, next 0 (end).
+        let header = u32::from(ExtendedCapability::SR_IOV) | (1 << 16);
+        mem[0x100..0x104].copy_from_slice(&header.to_le_bytes());
+
+        let alloc = McfgAllocation::standard(0);
+        let func = plain_function();
+        assert_eq!(
+            extended_capabilities(&mem, &alloc, &func),
+            vec![ExtendedCapability {
+                id: 0x0010,
+                version: 1,
+                offset: 0x100,
+            }]
+        );
+        assert!(is_sr_iov_capable(&mem, &alloc, &func));
+    }
+
+    #[test]
+    fn extended_capabilities_absent_without_a_backing_image() {
+        // Only 256 bytes of config space (no extended region) -> no ext caps,
+        // and not SR-IOV capable, without panicking.
+        let mem = vec![0u8; 0x100];
+        let alloc = McfgAllocation::standard(0);
+        let func = plain_function();
+        assert!(extended_capabilities(&mem, &alloc, &func).is_empty());
+        assert!(!is_sr_iov_capable(&mem, &alloc, &func));
     }
 
     #[test]
