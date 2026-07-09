@@ -411,6 +411,23 @@ pub fn capabilities(mem: &[u8], alloc: &McfgAllocation, func: &PciFunction) -> V
     out
 }
 
+/// The MSI-X table size (number of interrupt vectors) a function advertises, or
+/// `None` if it has no MSI-X capability.
+///
+/// Read from the MSI-X Message Control register at offset +2 of the capability:
+/// bits 10:0 hold `table_size - 1`, so the returned count is
+/// `(control & 0x7FF) + 1` (1..=2048). This is what interrupt setup needs to
+/// size a guest's MSI-X table.
+#[must_use]
+pub fn msix_table_size(mem: &[u8], alloc: &McfgAllocation, func: &PciFunction) -> Option<u16> {
+    let cap = capabilities(mem, alloc, func)
+        .into_iter()
+        .find(|c| c.id == Capability::MSI_X)?;
+    let base = function_base(alloc, func.bus, func.device, func.function)?;
+    let control = read_u16(mem, base + u64::from(cap.offset) + 2)?;
+    Some((control & 0x7FF) + 1)
+}
+
 /// A PCI Express extended capability in extended config space (`>= 0x100`),
 /// reached from the fixed head at offset `0x100`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -731,6 +748,19 @@ mod tests {
         mem[0x51] = 0x60; // -> next
         mem[0x60] = Capability::MSI_X;
         mem[0x61] = 0x00; // end of list
+        // MSI-X Message Control at +2: table size 8 → encoded as 7.
+        mem[0x62..0x64].copy_from_slice(&7u16.to_le_bytes());
+
+        let alloc = McfgAllocation::standard(0);
+        let func = plain_function();
+        assert_eq!(msix_table_size(&mem, &alloc, &func), Some(8));
+        // A function with no MSI-X capability reports None.
+        let mut bare = vec![0u8; 0x100];
+        bare[0x06..0x08].copy_from_slice(&0x0010u16.to_le_bytes()); // caps present
+        bare[0x34] = 0x40;
+        bare[0x40] = Capability::MSI; // MSI only, no MSI-X
+        bare[0x41] = 0x00;
+        assert_eq!(msix_table_size(&bare, &alloc, &func), None);
 
         let caps = capabilities(&mem, &McfgAllocation::standard(0), &plain_function());
         assert_eq!(
