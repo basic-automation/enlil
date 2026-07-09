@@ -107,6 +107,20 @@ pub fn host_ecam_allocations(mem: &[u8], rsdp_gpa: u64) -> Vec<super::mcfg::Mcfg
         .unwrap_or_default()
 }
 
+/// Discover the host's PCI functions by walking every ECAM window (Phase 6.3).
+///
+/// Finds the MCFG's ECAM allocations ([`host_ecam_allocations`]) and walks each
+/// window's config space with
+/// [`walk_ecam_allocations`](crate::pci_discovery::walk_ecam_allocations),
+/// returning every present function. `mem` must be memory based at physical
+/// address 0 covering the ECAM apertures; functions whose config space is not
+/// backed by `mem` are silently skipped. Empty if the firmware exposes no MCFG.
+#[must_use]
+pub fn host_pci_functions(mem: &[u8], rsdp_gpa: u64) -> Vec<crate::pci_discovery::PciFunction> {
+    let allocations = host_ecam_allocations(mem, rsdp_gpa);
+    crate::pci_discovery::walk_ecam_allocations(mem, &allocations)
+}
+
 /// Which IOMMU the firmware advertises, discovered from the ACPI tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IommuKind {
