@@ -48,6 +48,7 @@ pub mod fw_cfg_loader;
 pub mod hda;
 pub mod interrupt;
 pub mod net;
+pub mod pci_discovery;
 pub mod pcie;
 pub mod ps2;
 pub mod smbios;

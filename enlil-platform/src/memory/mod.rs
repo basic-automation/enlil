@@ -10,6 +10,7 @@
 //!   for small objects. Implemented in Phase 6.
 
 pub mod map;
+pub mod paging;
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -316,6 +317,7 @@ unsafe impl GlobalAlloc for PlatformAllocator {
         {
             // Bare-metal: would dispatch to buddy/slab.
             // Stubbed — real implementation in Phase 6.
+            let _ = layout;
             std::ptr::null_mut()
         }
     }

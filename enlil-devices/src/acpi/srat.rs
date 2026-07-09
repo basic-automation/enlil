@@ -199,19 +199,15 @@ impl Default for SratBuilder {
     }
 }
 
-/// Collect the distinct NUMA proximity domains a SRAT advertises (Phase 6.3 NUMA
-/// topology).
-///
-/// Walks the enabled Processor Local APIC Affinity (type 0) and Memory Affinity
-/// (type 1) structures and returns their proximity domains, sorted and
-/// deduplicated — so the length is the NUMA-node count. The SRAT header is 48
-/// bytes (36-byte SDT header + 4-byte revision + 8 reserved); each structure is a
-/// `(type, length)` pair; a truncated/self-referential entry stops the walk.
-#[must_use]
-pub fn numa_domains(srat: &[u8]) -> Vec<u32> {
+/// Walk the SRAT's affinity structures, invoking `visit(entry_type, entry)` for
+/// each well-formed one (`entry` is the whole structure, `entry[0]` its type,
+/// `entry[1]` its length). The SRAT header is 48 bytes (36-byte SDT header +
+/// 4-byte revision + 8 reserved); each structure is a `(type, length)` pair. A
+/// truncated or self-referential entry (`length < 2`, or one that runs past the
+/// table) stops the walk.
+fn for_each_structure(srat: &[u8], mut visit: impl FnMut(u8, &[u8])) {
     /// Offset of the first affinity structure.
     const STRUCTURES: usize = 48;
-    let mut domains = Vec::new();
     let mut off = STRUCTURES;
     while off + 2 <= srat.len() {
         let entry_type = srat[off];
@@ -219,49 +215,150 @@ pub fn numa_domains(srat: &[u8]) -> Vec<u32> {
         if len < 2 || off + len > srat.len() {
             break;
         }
-        match entry_type {
-            // Processor Local APIC Affinity: flags at +4 (bit 0 enabled), the
-            // proximity domain split across +2 (low byte) and +9..+12 (high 3).
-            0 if len >= 16 => {
-                let flags = u32::from_le_bytes([
-                    srat[off + 4],
-                    srat[off + 5],
-                    srat[off + 6],
-                    srat[off + 7],
-                ]);
-                if flags & 1 != 0 {
-                    domains.push(
-                        u32::from(srat[off + 2])
-                            | (u32::from(srat[off + 9]) << 8)
-                            | (u32::from(srat[off + 10]) << 16)
-                            | (u32::from(srat[off + 11]) << 24),
-                    );
-                }
-            }
-            // Memory Affinity: proximity domain at +2 (u32), flags at +28.
-            1 if len >= 40 => {
-                let flags = u32::from_le_bytes([
-                    srat[off + 28],
-                    srat[off + 29],
-                    srat[off + 30],
-                    srat[off + 31],
-                ]);
-                if flags & 1 != 0 {
-                    domains.push(u32::from_le_bytes([
-                        srat[off + 2],
-                        srat[off + 3],
-                        srat[off + 4],
-                        srat[off + 5],
-                    ]));
-                }
-            }
-            _ => {}
-        }
+        visit(entry_type, &srat[off..off + len]);
         off += len;
     }
+}
+
+/// The proximity domain of a Processor Local APIC Affinity (type 0) structure,
+/// reassembled from its low byte (+2) and high three bytes (+9..+12).
+fn processor_domain(entry: &[u8]) -> u32 {
+    u32::from(entry[2])
+        | (u32::from(entry[9]) << 8)
+        | (u32::from(entry[10]) << 16)
+        | (u32::from(entry[11]) << 24)
+}
+
+/// Collect the distinct NUMA proximity domains a SRAT advertises (Phase 6.3 NUMA
+/// topology).
+///
+/// Walks the enabled Processor Local APIC Affinity (type 0) and Memory Affinity
+/// (type 1) structures and returns their proximity domains, sorted and
+/// deduplicated — so the length is the NUMA-node count.
+#[must_use]
+pub fn numa_domains(srat: &[u8]) -> Vec<u32> {
+    let mut domains = Vec::new();
+    for_each_structure(srat, |entry_type, entry| match entry_type {
+        // Processor Local APIC Affinity: flags at +4 (bit 0 enabled).
+        0 if entry.len() >= 16 => {
+            let flags = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
+            if flags & 1 != 0 {
+                domains.push(processor_domain(entry));
+            }
+        }
+        // Memory Affinity: proximity domain at +2 (u32), flags at +28.
+        1 if entry.len() >= 40 => {
+            let flags = u32::from_le_bytes([entry[28], entry[29], entry[30], entry[31]]);
+            if flags & 1 != 0 {
+                domains.push(u32::from_le_bytes([entry[2], entry[3], entry[4], entry[5]]));
+            }
+        }
+        _ => {}
+    });
     domains.sort_unstable();
     domains.dedup();
     domains
+}
+
+/// A NUMA memory range from a SRAT Memory Affinity (type 1) structure: which
+/// proximity domain owns which physical RAM span.
+///
+/// This is the placement primitive behind the north-star rule that a kernel's
+/// hot CPU+RAM working set stays on one node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryAffinity {
+    /// The proximity (NUMA) domain the range belongs to.
+    pub proximity_domain: u32,
+    /// Physical base address of the range.
+    pub base_address: u64,
+    /// Length of the range in bytes.
+    pub length: u64,
+    /// Whether the range is hot-pluggable (flags bit 1).
+    pub hot_pluggable: bool,
+    /// Whether the range is non-volatile memory (flags bit 2).
+    pub non_volatile: bool,
+}
+
+/// Parse the enabled Memory Affinity (type 1) structures into their
+/// `(proximity_domain, base, length)` ranges (Phase 6.3 NUMA topology).
+///
+/// Disabled ranges (flags bit 0 clear) are skipped. Base is at +8 (u64), length
+/// at +16 (u64), flags at +28 (bit 1 hot-pluggable, bit 2 non-volatile).
+#[must_use]
+pub fn memory_affinities(srat: &[u8]) -> Vec<MemoryAffinity> {
+    let mut out = Vec::new();
+    for_each_structure(srat, |entry_type, entry| {
+        if entry_type == 1 && entry.len() >= 40 {
+            let flags = u32::from_le_bytes([entry[28], entry[29], entry[30], entry[31]]);
+            if flags & 1 == 0 {
+                return; // disabled
+            }
+            out.push(MemoryAffinity {
+                proximity_domain: u32::from_le_bytes([entry[2], entry[3], entry[4], entry[5]]),
+                base_address: u64::from_le_bytes([
+                    entry[8], entry[9], entry[10], entry[11], entry[12], entry[13], entry[14],
+                    entry[15],
+                ]),
+                length: u64::from_le_bytes([
+                    entry[16], entry[17], entry[18], entry[19], entry[20], entry[21], entry[22],
+                    entry[23],
+                ]),
+                hot_pluggable: flags & 0x2 != 0,
+                non_volatile: flags & 0x4 != 0,
+            });
+        }
+    });
+    out
+}
+
+/// A CPU→node binding from a SRAT affinity structure: which APIC (or x2APIC) ID
+/// belongs to which proximity domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuAffinity {
+    /// The processor's local APIC or x2APIC ID (widened to `u32` so x2APIC IDs
+    /// above 255 fit).
+    pub apic_id: u32,
+    /// The proximity (NUMA) domain the processor belongs to.
+    pub proximity_domain: u32,
+}
+
+/// Parse the enabled processor affinity structures into their
+/// `(apic_id, proximity_domain)` bindings (Phase 6.3 NUMA topology).
+///
+/// Covers both Processor Local APIC Affinity (type 0, 8-bit APIC ID at +3, split
+/// proximity domain) and Processor Local x2APIC Affinity (type 2, 32-bit x2APIC
+/// ID at +8, proximity domain at +4) — the latter carries CPUs with APIC IDs
+/// above 255. Disabled processors (flags bit 0 clear) are skipped. This is the
+/// CPU side of [`memory_affinities`]: together they say which cores and which
+/// RAM share a node, so a guest's vCPUs and memory can be co-located.
+#[must_use]
+pub fn cpu_affinities(srat: &[u8]) -> Vec<CpuAffinity> {
+    let mut out = Vec::new();
+    for_each_structure(srat, |entry_type, entry| match entry_type {
+        // Processor Local APIC Affinity: 8-bit APIC ID at +3, flags at +4.
+        0 if entry.len() >= 16 => {
+            let flags = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
+            if flags & 1 != 0 {
+                out.push(CpuAffinity {
+                    apic_id: u32::from(entry[3]),
+                    proximity_domain: processor_domain(entry),
+                });
+            }
+        }
+        // Processor Local x2APIC Affinity: proximity domain at +4 (u32),
+        // 32-bit x2APIC ID at +8, flags at +12.
+        2 if entry.len() >= 24 => {
+            let flags = u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]);
+            if flags & 1 != 0 {
+                out.push(CpuAffinity {
+                    apic_id: u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]),
+                    proximity_domain: u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]),
+                });
+            }
+        }
+        _ => {}
+    });
+    out
 }
 
 #[cfg(test)]
@@ -293,6 +390,122 @@ mod tests {
         assert_eq!(numa_domains(&srat), vec![0, 1, 3]);
         // An empty/header-only SRAT has no domains.
         assert!(numa_domains(&SratBuilder::new().build()).is_empty());
+    }
+
+    #[test]
+    fn memory_affinities_parse_enabled_ranges_with_flags() {
+        let srat = SratBuilder::new()
+            .add_memory(MemoryAffinityEntry::new(0, 0, 0x8000_0000, true, false))
+            .add_memory(MemoryAffinityEntry::new(
+                1,
+                0x1_0000_0000,
+                0x1_0000_0000,
+                true,
+                true, // hot-pluggable
+            ))
+            .add_memory(MemoryAffinityEntry::new(
+                2,
+                0x2_0000_0000,
+                0x1000,
+                false, // disabled → skipped
+                false,
+            ))
+            .build();
+        let ranges = memory_affinities(&srat);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(
+            ranges[0],
+            MemoryAffinity {
+                proximity_domain: 0,
+                base_address: 0,
+                length: 0x8000_0000,
+                hot_pluggable: false,
+                non_volatile: false,
+            }
+        );
+        assert_eq!(
+            ranges[1],
+            MemoryAffinity {
+                proximity_domain: 1,
+                base_address: 0x1_0000_0000,
+                length: 0x1_0000_0000,
+                hot_pluggable: true,
+                non_volatile: false,
+            }
+        );
+        // Header-only SRAT: no ranges.
+        assert!(memory_affinities(&SratBuilder::new().build()).is_empty());
+    }
+
+    #[test]
+    fn cpu_affinities_map_apic_ids_to_domains() {
+        let srat = SratBuilder::new()
+            .add_processor(ProcessorAffinityEntry::new(0, 0, true))
+            .add_processor(ProcessorAffinityEntry::new(7, 1, true))
+            .add_processor(ProcessorAffinityEntry::new(9, 2, false)) // disabled → skipped
+            .build();
+        let cpus = cpu_affinities(&srat);
+        assert_eq!(
+            cpus,
+            vec![
+                CpuAffinity {
+                    apic_id: 0,
+                    proximity_domain: 0,
+                },
+                CpuAffinity {
+                    apic_id: 7,
+                    proximity_domain: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_x2apic_processor_affinity() {
+        // No builder for type-2 x2APIC affinity; append a raw 24-byte structure
+        // after the header (for_each_structure walks from offset 48).
+        let mut srat = SratBuilder::new().build();
+        let mut x2 = vec![0u8; 24];
+        x2[0] = 2; // type: Processor Local x2APIC Affinity
+        x2[1] = 24; // length
+        x2[4..8].copy_from_slice(&5u32.to_le_bytes()); // proximity domain 5
+        x2[8..12].copy_from_slice(&300u32.to_le_bytes()); // x2APIC ID 300 (> 255)
+        x2[12..16].copy_from_slice(&1u32.to_le_bytes()); // enabled
+        srat.extend_from_slice(&x2);
+
+        assert_eq!(
+            cpu_affinities(&srat),
+            vec![CpuAffinity {
+                apic_id: 300,
+                proximity_domain: 5,
+            }]
+        );
+
+        // A disabled x2APIC entry is skipped.
+        let mut srat = SratBuilder::new().build();
+        let mut x2 = vec![0u8; 24];
+        x2[0] = 2;
+        x2[1] = 24;
+        x2[8..12].copy_from_slice(&301u32.to_le_bytes());
+        // flags left 0 → disabled
+        srat.extend_from_slice(&x2);
+        assert!(cpu_affinities(&srat).is_empty());
+    }
+
+    #[test]
+    fn high_proximity_domain_bytes_are_reassembled() {
+        // A domain whose value needs the high three bytes (+9..+12) exercises
+        // the split-field reassembly on both the CPU and memory sides.
+        let domain = 0x0201_0300;
+        let srat = SratBuilder::new()
+            .add_processor(ProcessorAffinityEntry::new(3, domain, true))
+            .add_memory(MemoryAffinityEntry::new(
+                domain, 0x4000, 0x1000, true, false,
+            ))
+            .build();
+        assert_eq!(cpu_affinities(&srat)[0].proximity_domain, domain);
+        assert_eq!(memory_affinities(&srat)[0].proximity_domain, domain);
+        assert_eq!(numa_domains(&srat), vec![domain]);
     }
 
     #[test]

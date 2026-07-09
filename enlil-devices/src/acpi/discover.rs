@@ -93,6 +93,22 @@ pub fn host_cpu_count(mem: &[u8], rsdp_gpa: u64) -> Option<usize> {
     Some(super::madt::count_enabled_cpus(madt))
 }
 
+/// Discover the enabled processors' APIC IDs from the firmware's MADT
+/// (Phase 6.3).
+///
+/// Locates the MADT (signature `APIC`) via [`find_table`] and lists the enabled
+/// processors' APIC/x2APIC IDs with
+/// [`enabled_apic_ids`](super::madt::enabled_apic_ids). Empty if no MADT is
+/// present. The length equals [`host_cpu_count`]; the IDs let a discovered CPU be
+/// matched to its NUMA node from the SRAT ([`host_cpu_affinities`]).
+#[must_use]
+pub fn host_apic_ids(mem: &[u8], rsdp_gpa: u64) -> Vec<u32> {
+    find_table(mem, rsdp_gpa, b"APIC")
+        .and_then(|gpa| table_at(mem, gpa))
+        .map(super::madt::enabled_apic_ids)
+        .unwrap_or_default()
+}
+
 /// Discover the `PCIe` ECAM allocations from the firmware's MCFG (Phase 6.3).
 ///
 /// Locates the MCFG (signature `MCFG`) via [`find_table`] and parses its
@@ -105,6 +121,36 @@ pub fn host_ecam_allocations(mem: &[u8], rsdp_gpa: u64) -> Vec<super::mcfg::Mcfg
         .and_then(|gpa| table_at(mem, gpa))
         .map(super::mcfg::parse_mcfg_allocations)
         .unwrap_or_default()
+}
+
+/// Discover the host's PCI functions by walking every ECAM window (Phase 6.3).
+///
+/// Finds the MCFG's ECAM allocations ([`host_ecam_allocations`]) and walks each
+/// window's config space with
+/// [`walk_ecam_allocations`](crate::pci_discovery::walk_ecam_allocations),
+/// returning every present function. `mem` must be memory based at physical
+/// address 0 covering the ECAM apertures; functions whose config space is not
+/// backed by `mem` are silently skipped. Empty if the firmware exposes no MCFG.
+#[must_use]
+pub fn host_pci_functions(mem: &[u8], rsdp_gpa: u64) -> Vec<crate::pci_discovery::PciFunction> {
+    let allocations = host_ecam_allocations(mem, rsdp_gpa);
+    crate::pci_discovery::walk_ecam_allocations(mem, &allocations)
+}
+
+/// Discover the host's xHCI USB controllers by walking the ECAM windows
+/// (Phase 6.3 "USB controller discovery").
+///
+/// Finds the MCFG's ECAM allocations and returns every xHCI function paired
+/// with its BAR0 MMIO base via
+/// [`find_xhci_controllers`](crate::pci_discovery::find_xhci_controllers).
+/// Empty if the firmware exposes no MCFG or no xHCI controller.
+#[must_use]
+pub fn host_xhci_controllers(
+    mem: &[u8],
+    rsdp_gpa: u64,
+) -> Vec<crate::pci_discovery::XhciController> {
+    let allocations = host_ecam_allocations(mem, rsdp_gpa);
+    crate::pci_discovery::find_xhci_controllers(mem, &allocations)
 }
 
 /// Which IOMMU the firmware advertises, discovered from the ACPI tables.
@@ -144,6 +190,47 @@ pub fn host_numa_domains(mem: &[u8], rsdp_gpa: u64) -> Vec<u32> {
         .unwrap_or_default()
 }
 
+/// Discover the NUMA memory ranges from the firmware's SRAT (Phase 6.3): which
+/// proximity domain owns which physical RAM span.
+///
+/// Locates the SRAT via [`find_table`] and parses its enabled Memory Affinity
+/// structures with [`memory_affinities`](super::srat::memory_affinities). Empty
+/// if no SRAT is present.
+#[must_use]
+pub fn host_memory_affinities(mem: &[u8], rsdp_gpa: u64) -> Vec<super::srat::MemoryAffinity> {
+    find_table(mem, rsdp_gpa, b"SRAT")
+        .and_then(|gpa| table_at(mem, gpa))
+        .map(super::srat::memory_affinities)
+        .unwrap_or_default()
+}
+
+/// Discover the CPU→NUMA-node bindings from the firmware's SRAT (Phase 6.3):
+/// which APIC ID belongs to which proximity domain.
+///
+/// Locates the SRAT via [`find_table`] and parses its enabled Processor Local
+/// APIC Affinity structures with [`cpu_affinities`](super::srat::cpu_affinities).
+/// Empty if no SRAT is present.
+#[must_use]
+pub fn host_cpu_affinities(mem: &[u8], rsdp_gpa: u64) -> Vec<super::srat::CpuAffinity> {
+    find_table(mem, rsdp_gpa, b"SRAT")
+        .and_then(|gpa| table_at(mem, gpa))
+        .map(super::srat::cpu_affinities)
+        .unwrap_or_default()
+}
+
+/// Discover the NUMA node-to-node distance matrix from the firmware's SLIT
+/// (Phase 6.3 / fabric).
+///
+/// Locates the SLIT via [`find_table`] and parses its distance matrix with
+/// [`locality_distances`](super::slit::locality_distances). `None` if no SLIT
+/// is present or it is malformed — treat as a flat/single-node topology.
+#[must_use]
+pub fn host_numa_distances(mem: &[u8], rsdp_gpa: u64) -> Option<super::slit::LocalityMatrix> {
+    find_table(mem, rsdp_gpa, b"SLIT")
+        .and_then(|gpa| table_at(mem, gpa))
+        .and_then(super::slit::locality_distances)
+}
+
 /// The host machine's topology as discovered from its ACPI tables — the input to
 /// building Enlil's own device tree on the bare-metal boot path (Phase 6.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,6 +257,72 @@ pub fn discover_host_topology(mem: &[u8], rsdp_gpa: u64) -> HostTopology {
         numa_domains: host_numa_domains(mem, rsdp_gpa),
         iommu: host_iommu_kind(mem, rsdp_gpa),
         ecam: host_ecam_allocations(mem, rsdp_gpa),
+    }
+}
+
+/// A CPU discovered from the firmware tables: its APIC ID and NUMA node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuNode {
+    /// The processor's local APIC (or x2APIC) ID, from the MADT.
+    pub apic_id: u32,
+    /// The proximity (NUMA) domain from the SRAT, or `None` if the SRAT has no
+    /// affinity entry for this APIC ID (e.g. no SRAT, or an x2APIC whose
+    /// affinity is a type-2 structure this build does not yet parse).
+    pub proximity_domain: Option<u32>,
+}
+
+/// Enlil's own device tree, assembled from the host firmware's ACPI tables.
+///
+/// The culmination of Phase 6.3 discovery: which CPUs (and their NUMA nodes),
+/// which RAM ranges belong to which node and how far apart the nodes are, which
+/// PCI functions exist (and the xHCI controllers among them), and which IOMMU
+/// the platform has. This is the model the bare-metal boot path builds once it
+/// hands the real host tables in (Phase 6.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostDeviceTree {
+    /// The enabled CPUs with their NUMA affinity.
+    pub cpus: Vec<CpuNode>,
+    /// The NUMA memory ranges (which proximity domain owns which RAM span).
+    pub memory: Vec<super::srat::MemoryAffinity>,
+    /// The NUMA node-to-node distance matrix, if the firmware provides a SLIT.
+    pub numa_distances: Option<super::slit::LocalityMatrix>,
+    /// Every PCI function discovered by walking the ECAM windows.
+    pub pci_functions: Vec<crate::pci_discovery::PciFunction>,
+    /// The xHCI USB host controllers among the PCI functions, with MMIO bases.
+    pub xhci_controllers: Vec<crate::pci_discovery::XhciController>,
+    /// The IOMMU the firmware advertises, if any.
+    pub iommu: Option<IommuKind>,
+}
+
+/// Build the whole [`HostDeviceTree`] from the live ACPI tables in one call.
+///
+/// Runs the entire Phase 6.3 discovery pipeline (MADT + SRAT + SLIT + MCFG/ECAM
+/// PCI walk + DMAR/IVRS). `mem` is memory based at physical address 0,
+/// `rsdp_gpa` the RSDP's address.
+///
+/// Each CPU's NUMA domain is resolved by matching its MADT APIC ID against the
+/// SRAT's processor affinities; a CPU with no matching affinity gets
+/// `proximity_domain: None`.
+#[must_use]
+pub fn build_device_tree(mem: &[u8], rsdp_gpa: u64) -> HostDeviceTree {
+    let affinities = host_cpu_affinities(mem, rsdp_gpa);
+    let cpus = host_apic_ids(mem, rsdp_gpa)
+        .into_iter()
+        .map(|apic_id| CpuNode {
+            apic_id,
+            proximity_domain: affinities
+                .iter()
+                .find(|a| a.apic_id == apic_id)
+                .map(|a| a.proximity_domain),
+        })
+        .collect();
+    HostDeviceTree {
+        cpus,
+        memory: host_memory_affinities(mem, rsdp_gpa),
+        numa_distances: host_numa_distances(mem, rsdp_gpa),
+        pci_functions: host_pci_functions(mem, rsdp_gpa),
+        xhci_controllers: host_xhci_controllers(mem, rsdp_gpa),
+        iommu: host_iommu_kind(mem, rsdp_gpa),
     }
 }
 
@@ -241,6 +394,121 @@ mod tests {
         assert_eq!(topo.iommu, Some(IommuKind::IntelVtd));
         assert_eq!(topo.ecam.len(), 1);
         assert_eq!(topo.ecam[0].base_address, 0xE000_0000);
+    }
+
+    #[test]
+    fn builds_a_host_device_tree_from_all_the_tables() {
+        use crate::acpi::madt::MadtBuilder;
+        use crate::acpi::mcfg::McfgBuilder;
+        use crate::acpi::slit::SlitBuilder;
+        use crate::acpi::srat::{MemoryAffinityEntry, ProcessorAffinityEntry, SratBuilder};
+
+        const MADT_GPA: u64 = 0x1000;
+        const MCFG_GPA: u64 = 0x2000;
+        const DMAR_GPA: u64 = 0x2800;
+        const SRAT_GPA: u64 = 0x3000;
+        const SLIT_GPA: u64 = 0x3800;
+        const XSDT_GPA: u64 = 0x4000;
+        const RSDP_GPA: u64 = 0x5000;
+        let mut ram = vec![0u8; 0x6000];
+        // Two CPUs, APIC IDs 0 and 1.
+        place(&mut ram, MADT_GPA, &MadtBuilder::standard(2).build());
+        place(
+            &mut ram,
+            MCFG_GPA,
+            &McfgBuilder::standard(0xE000_0000).build(),
+        );
+        place(&mut ram, DMAR_GPA, &fake_table(*b"DMAR"));
+        // CPU 0 → node 0, CPU 1 → node 1; each node owns a 2 GiB RAM range.
+        place(
+            &mut ram,
+            SRAT_GPA,
+            &SratBuilder::new()
+                .add_processor(ProcessorAffinityEntry::new(0, 0, true))
+                .add_processor(ProcessorAffinityEntry::new(1, 1, true))
+                .add_memory(MemoryAffinityEntry::new(0, 0, 0x8000_0000, true, false))
+                .add_memory(MemoryAffinityEntry::new(
+                    1,
+                    0x8000_0000,
+                    0x8000_0000,
+                    true,
+                    false,
+                ))
+                .build(),
+        );
+        place(
+            &mut ram,
+            SLIT_GPA,
+            &SlitBuilder::multi_node(2, vec![10, 21, 21, 10]).build(),
+        );
+        place(
+            &mut ram,
+            XSDT_GPA,
+            &XsdtBuilder::new()
+                .add_tables(&[MADT_GPA, MCFG_GPA, DMAR_GPA, SRAT_GPA, SLIT_GPA])
+                .build(),
+        );
+        place(
+            &mut ram,
+            RSDP_GPA,
+            &RsdpBuilder::new().xsdt_address(XSDT_GPA).build(),
+        );
+
+        let tree = build_device_tree(&ram, RSDP_GPA);
+        // CPUs carry their SRAT NUMA node.
+        assert_eq!(
+            tree.cpus,
+            vec![
+                CpuNode {
+                    apic_id: 0,
+                    proximity_domain: Some(0),
+                },
+                CpuNode {
+                    apic_id: 1,
+                    proximity_domain: Some(1),
+                },
+            ]
+        );
+        // Two NUMA memory ranges, one per node.
+        assert_eq!(tree.memory.len(), 2);
+        assert_eq!(tree.memory[1].proximity_domain, 1);
+        assert_eq!(tree.memory[1].base_address, 0x8000_0000);
+        // Distances present; cross-node = 21.
+        let d = tree.numa_distances.expect("SLIT parsed");
+        assert_eq!(d.distance(0, 1), Some(21));
+        assert_eq!(tree.iommu, Some(IommuKind::IntelVtd));
+        // The ECAM window is not backed by this small image, so no PCI
+        // functions are discovered — but the walk does not panic.
+        assert!(tree.pci_functions.is_empty());
+        assert!(tree.xhci_controllers.is_empty());
+    }
+
+    #[test]
+    fn device_tree_without_srat_leaves_cpu_numa_unknown() {
+        use crate::acpi::madt::MadtBuilder;
+
+        const MADT_GPA: u64 = 0x1000;
+        const XSDT_GPA: u64 = 0x4000;
+        const RSDP_GPA: u64 = 0x5000;
+        let mut ram = vec![0u8; 0x6000];
+        place(&mut ram, MADT_GPA, &MadtBuilder::standard(1).build());
+        place(
+            &mut ram,
+            XSDT_GPA,
+            &XsdtBuilder::new().add_table(MADT_GPA).build(),
+        );
+        place(
+            &mut ram,
+            RSDP_GPA,
+            &RsdpBuilder::new().xsdt_address(XSDT_GPA).build(),
+        );
+
+        let tree = build_device_tree(&ram, RSDP_GPA);
+        assert_eq!(tree.cpus.len(), 1);
+        assert_eq!(tree.cpus[0].proximity_domain, None);
+        assert!(tree.memory.is_empty());
+        assert!(tree.numa_distances.is_none());
+        assert_eq!(tree.iommu, None);
     }
 
     #[test]

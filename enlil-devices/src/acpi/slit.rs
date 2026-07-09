@@ -84,6 +84,73 @@ impl Default for SlitBuilder {
     }
 }
 
+/// The NUMA node-to-node distance matrix parsed from a SLIT.
+///
+/// `distance(a, b)` is the relative latency from proximity domain `a` to `b`
+/// (10 = local per ACPI; larger = farther). The placement and fabric logic
+/// reads this to honor the north-star rule that a kernel's hot CPU+RAM working
+/// set stays on one node and that interconnect latency bounds what can be
+/// pooled — the SLIT is where the host advertises those relative distances.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalityMatrix {
+    count: usize,
+    /// Row-major `count × count` distances.
+    distances: Vec<u8>,
+}
+
+impl LocalityMatrix {
+    /// The number of proximity domains (localities) the matrix covers.
+    #[must_use]
+    pub const fn locality_count(&self) -> usize {
+        self.count
+    }
+
+    /// The distance from domain `from` to domain `to`, or `None` if either
+    /// index is out of range.
+    #[must_use]
+    pub fn distance(&self, from: usize, to: usize) -> Option<u8> {
+        if from >= self.count || to >= self.count {
+            return None;
+        }
+        self.distances.get(from * self.count + to).copied()
+    }
+
+    /// The distances from domain `from` to every domain (its matrix row), or
+    /// `None` if `from` is out of range.
+    #[must_use]
+    pub fn row(&self, from: usize) -> Option<&[u8]> {
+        if from >= self.count {
+            return None;
+        }
+        self.distances
+            .get(from * self.count..(from + 1) * self.count)
+    }
+}
+
+/// Parse the NUMA distance matrix from a SLIT table (Phase 6.3 / fabric).
+///
+/// The SLIT is a 36-byte SDT header, an 8-byte locality count (`u64` LE) at
+/// offset 36, then a `count × count` row-major matrix of distance bytes at
+/// offset 44. Returns `None` if the table is truncated or its declared count
+/// does not match the matrix length (a corrupt/hostile table), rather than
+/// reading out of bounds.
+#[must_use]
+pub fn locality_distances(slit: &[u8]) -> Option<LocalityMatrix> {
+    /// Offset of the 8-byte locality count.
+    const COUNT_OFF: usize = 36;
+    /// Offset of the distance matrix.
+    const MATRIX_OFF: usize = 44;
+
+    let count_bytes = slit.get(COUNT_OFF..MATRIX_OFF)?;
+    let count = usize::try_from(u64::from_le_bytes(count_bytes.try_into().ok()?)).ok()?;
+    let expected = count.checked_mul(count)?;
+    let matrix = slit.get(MATRIX_OFF..MATRIX_OFF.checked_add(expected)?)?;
+    Some(LocalityMatrix {
+        count,
+        distances: matrix.to_vec(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +204,38 @@ mod tests {
         let slit = SlitBuilder::single_node().build();
         let length = u32::from_le_bytes(slit[4..8].try_into().unwrap());
         assert_eq!(length as usize, slit.len());
+    }
+
+    #[test]
+    fn parses_the_single_node_distance_matrix() {
+        let slit = SlitBuilder::single_node().build();
+        let m = locality_distances(&slit).expect("parse");
+        assert_eq!(m.locality_count(), 1);
+        assert_eq!(m.distance(0, 0), Some(10));
+        assert_eq!(m.distance(0, 1), None); // out of range
+        assert_eq!(m.row(0), Some(&[10u8][..]));
+    }
+
+    #[test]
+    fn parses_a_two_node_distance_matrix() {
+        let slit = SlitBuilder::multi_node(2, vec![10, 21, 21, 10]).build();
+        let m = locality_distances(&slit).expect("parse");
+        assert_eq!(m.locality_count(), 2);
+        assert_eq!(m.distance(0, 0), Some(10));
+        assert_eq!(m.distance(0, 1), Some(21));
+        assert_eq!(m.distance(1, 0), Some(21));
+        assert_eq!(m.distance(1, 1), Some(10));
+        assert_eq!(m.distance(2, 0), None);
+        assert_eq!(m.row(1), Some(&[21u8, 10][..]));
+    }
+
+    #[test]
+    fn rejects_a_truncated_or_mismatched_slit() {
+        // Too short to hold the count field.
+        assert!(locality_distances(&[0u8; 40]).is_none());
+        // Declares 2 localities but carries only 2 matrix bytes (needs 4).
+        let mut bad = vec![0u8; 44 + 2];
+        bad[36..44].copy_from_slice(&2u64.to_le_bytes());
+        assert!(locality_distances(&bad).is_none());
     }
 }

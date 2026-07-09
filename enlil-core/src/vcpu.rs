@@ -65,12 +65,21 @@ pub struct SchedulingPlan {
 const DEFAULT_QUANTUM_MS: u64 = 10;
 
 /// Manages time-slice scheduling for a single physical core.
-pub struct TimeSliceScheduler {
+///
+/// Generic over the per-vCPU saved-context type `C` so the scheduler stays
+/// host-agnostic (LOCKED PRINCIPLE 2/3): the KVM run loop instantiates
+/// `TimeSliceScheduler<KvmVcpuState>` and drives
+/// [`KvmBackend::save_vcpu_state`](crate::kvm_backend)/`restore_vcpu_state`
+/// around [`switch_saving`](Self::switch_saving), while a bare-metal backend
+/// supplies its own VMCS/VMCB context type — neither leaks into this module.
+/// Defaults to the opaque [`VcpuContext`] blob for callers that only need
+/// round-robin ordering.
+pub struct TimeSliceScheduler<C = VcpuContext> {
     physical_core: u32,
     quantum_ms: u64,
     run_queue: VecDeque<(String, u32)>, // (guest_id, vcpu_id)
     current: usize,
-    contexts: HashMap<(String, u32), VcpuContext>,
+    contexts: HashMap<(String, u32), C>,
 }
 
 /// Context saved for a paused vCPU.
@@ -80,7 +89,22 @@ pub struct VcpuContext {
     pub data: Vec<u8>,
 }
 
-impl TimeSliceScheduler {
+/// The result of a time-slice [`switch_saving`](TimeSliceScheduler::switch_saving):
+/// the vCPU to run next and the context to restore into it before resuming.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VcpuSwitch<C> {
+    /// The guest owning the incoming vCPU.
+    pub guest: String,
+    /// The incoming vCPU's id.
+    pub vcpu: u32,
+    /// The context previously saved for the incoming vCPU, taken out of the
+    /// scheduler's store so the run loop owns it while that vCPU runs. `None`
+    /// the first time a vCPU is scheduled — the run loop then starts it fresh
+    /// rather than restoring.
+    pub restore: Option<C>,
+}
+
+impl<C> TimeSliceScheduler<C> {
     /// Create a new scheduler for a physical core.
     #[must_use]
     pub fn new(physical_core: u32, quantum_ms: u64) -> Self {
@@ -148,14 +172,42 @@ impl TimeSliceScheduler {
     }
 
     /// Save context for the current vCPU.
-    pub fn save_context(&mut self, guest_id: &str, vcpu_id: u32, ctx: VcpuContext) {
+    pub fn save_context(&mut self, guest_id: &str, vcpu_id: u32, ctx: C) {
         self.contexts.insert((guest_id.to_string(), vcpu_id), ctx);
     }
 
     /// Get saved context for a vCPU.
     #[must_use]
-    pub fn get_context(&self, guest_id: &str, vcpu_id: u32) -> Option<&VcpuContext> {
+    pub fn get_context(&self, guest_id: &str, vcpu_id: u32) -> Option<&C> {
         self.contexts.get(&(guest_id.to_string(), vcpu_id))
+    }
+
+    /// Save the current vCPU's freshly captured context and advance to the
+    /// next vCPU, returning it together with any context to restore.
+    ///
+    /// This is the quantum-expiry step of cooperative time-slicing (item 2.3).
+    /// On a real KVM core the run loop calls
+    /// [`KvmBackend::save_vcpu_state`](crate::kvm_backend) to capture the
+    /// outgoing vCPU (registers, MSRs, XSAVE) into a `KvmVcpuState`, passes it
+    /// here as `outgoing`, and — if the returned [`VcpuSwitch::restore`] is
+    /// `Some` — re-applies it with `restore_vcpu_state` before resuming the
+    /// incoming vCPU. The incoming context is *taken* out of the store so the
+    /// run loop owns the live state; it comes back on that vCPU's next
+    /// quantum expiry.
+    ///
+    /// Returns `None` only when the run queue is empty. With a single vCPU on
+    /// the core the incoming vCPU is the outgoing one, and `restore` is exactly
+    /// the context just saved (a preserved, resumable state).
+    pub fn switch_saving(&mut self, outgoing: C) -> Option<VcpuSwitch<C>> {
+        let current = self.run_queue.get(self.current)?.clone();
+        self.contexts.insert(current, outgoing);
+        let (guest, vcpu) = self.switch_next()?.clone();
+        let restore = self.contexts.remove(&(guest.clone(), vcpu));
+        Some(VcpuSwitch {
+            guest,
+            vcpu,
+            restore,
+        })
     }
 
     /// Number of vCPUs sharing this core.
@@ -451,7 +503,8 @@ mod tests {
 
     #[test]
     fn timeslice_scheduler_roundrobin() {
-        let mut sched = TimeSliceScheduler::new(0, 10);
+        // Naming the type without args applies the default context (`VcpuContext`).
+        let mut sched: TimeSliceScheduler = TimeSliceScheduler::new(0, 10);
         sched.add_vcpu("g1", 0);
         sched.add_vcpu("g1", 1);
         sched.add_vcpu("g2", 0);
@@ -464,7 +517,7 @@ mod tests {
 
     #[test]
     fn timeslice_scheduler_remove() {
-        let mut sched = TimeSliceScheduler::new(0, 10);
+        let mut sched: TimeSliceScheduler = TimeSliceScheduler::new(0, 10);
         sched.add_vcpu("g1", 0);
         sched.add_vcpu("g1", 1);
         assert_eq!(sched.vcpu_count(), 2);
@@ -472,6 +525,49 @@ mod tests {
         sched.remove_vcpu("g1", 0);
         assert_eq!(sched.vcpu_count(), 1);
         assert!(!sched.remove_vcpu("g1", 0)); // already removed
+    }
+
+    #[test]
+    fn switch_saving_stores_outgoing_and_advances_to_next() {
+        // A stand-in for a backend context (KvmVcpuState in the live path):
+        // any owned type works, keeping the scheduler host-agnostic.
+        let mut sched: TimeSliceScheduler<u64> = TimeSliceScheduler::new(0, 10);
+        sched.add_vcpu("g1", 0);
+        sched.add_vcpu("g2", 0);
+        assert_eq!(sched.current_vcpu(), Some(&("g1".to_string(), 0)));
+
+        // First quantum expiry: save g1:0's state, advance to g2:0, which has
+        // no saved context yet (started fresh).
+        let switch = sched.switch_saving(0xA1).expect("switch");
+        assert_eq!((switch.guest.as_str(), switch.vcpu), ("g2", 0));
+        assert_eq!(switch.restore, None);
+        // g1:0's context was stored.
+        assert_eq!(sched.get_context("g1", 0), Some(&0xA1));
+
+        // Next expiry: save g2:0, advance back to g1:0, restoring its state.
+        let switch = sched.switch_saving(0xB2).expect("switch");
+        assert_eq!((switch.guest.as_str(), switch.vcpu), ("g1", 0));
+        assert_eq!(switch.restore, Some(0xA1));
+        // The restored context was taken out of the store; g2:0's is now held.
+        assert_eq!(sched.get_context("g1", 0), None);
+        assert_eq!(sched.get_context("g2", 0), Some(&0xB2));
+    }
+
+    #[test]
+    fn switch_saving_single_vcpu_preserves_its_state() {
+        let mut sched: TimeSliceScheduler<u64> = TimeSliceScheduler::new(0, 10);
+        sched.add_vcpu("solo", 0);
+        // With one vCPU the incoming is the outgoing; the saved state comes
+        // straight back so it resumes exactly where it left off.
+        let switch = sched.switch_saving(0x55).expect("switch");
+        assert_eq!((switch.guest.as_str(), switch.vcpu), ("solo", 0));
+        assert_eq!(switch.restore, Some(0x55));
+    }
+
+    #[test]
+    fn switch_saving_on_empty_queue_is_none() {
+        let mut sched: TimeSliceScheduler<u64> = TimeSliceScheduler::new(0, 10);
+        assert!(sched.switch_saving(0x1).is_none());
     }
 
     #[test]

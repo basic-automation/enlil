@@ -350,6 +350,68 @@ pub const fn count_enabled_cpus(madt: &[u8]) -> usize {
     count
 }
 
+/// The APIC IDs of the enabled processors a MADT advertises, in table order.
+///
+/// Returns the APIC ID (Local APIC, type 0, at entry+3, a byte) or x2APIC ID
+/// (Local x2APIC, type 9, at entry+4, a `u32`) of each processor whose ENABLED
+/// flag (bit 0) is set. This is the companion to [`count_enabled_cpus`]
+/// (`enabled_apic_ids(madt).len() == count_enabled_cpus(madt)`): where the count
+/// answers "how many CPUs", this answers "which APIC IDs", so a discovered CPU
+/// can be matched to its NUMA node via the SRAT's
+/// [`cpu_affinities`](super::srat::cpu_affinities). Malformed/truncated entries
+/// stop the walk.
+#[must_use]
+pub fn enabled_apic_ids(madt: &[u8]) -> Vec<u32> {
+    /// Offset of the first interrupt-controller structure.
+    const CONTROLLER_LIST: usize = 44;
+    /// `MADT` local-APIC ENABLED flag (bit 0 of the entry's flags).
+    const ENABLED: u32 = 0x1;
+
+    let mut ids = Vec::new();
+    let mut off = CONTROLLER_LIST;
+    while off + 2 <= madt.len() {
+        let entry_type = madt[off];
+        let len = madt[off + 1] as usize;
+        if len < 2 || off + len > madt.len() {
+            break;
+        }
+        match entry_type {
+            // Local APIC (type 0): APIC ID at +3, flags at +4.
+            0 if len >= 8 => {
+                let flags = u32::from_le_bytes([
+                    madt[off + 4],
+                    madt[off + 5],
+                    madt[off + 6],
+                    madt[off + 7],
+                ]);
+                if flags & ENABLED != 0 {
+                    ids.push(u32::from(madt[off + 3]));
+                }
+            }
+            // Local x2APIC (type 9): 32-bit x2APIC ID at +4, flags at +8.
+            9 if len >= 16 => {
+                let flags = u32::from_le_bytes([
+                    madt[off + 8],
+                    madt[off + 9],
+                    madt[off + 10],
+                    madt[off + 11],
+                ]);
+                if flags & ENABLED != 0 {
+                    ids.push(u32::from_le_bytes([
+                        madt[off + 4],
+                        madt[off + 5],
+                        madt[off + 6],
+                        madt[off + 7],
+                    ]));
+                }
+            }
+            _ => {}
+        }
+        off += len;
+    }
+    ids
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,6 +430,23 @@ mod tests {
         assert_eq!(count_enabled_cpus(&MadtBuilder::standard(6).build()), 6);
         // A truncated buffer is handled without panicking.
         assert_eq!(count_enabled_cpus(&[0u8; 10]), 0);
+    }
+
+    #[test]
+    fn enabled_apic_ids_lists_only_enabled_ids_in_order() {
+        // APIC IDs 10, 11 (disabled), 12 → the enabled IDs are [10, 12].
+        let madt = MadtBuilder::new()
+            .add_local_apic(LocalApicEntry::new(0, 10, true))
+            .add_local_apic(LocalApicEntry::new(1, 11, false)) // disabled
+            .add_local_apic(LocalApicEntry::new(2, 12, true))
+            .build();
+        assert_eq!(enabled_apic_ids(&madt), vec![10, 12]);
+        // The list length matches the count, and the standard MADT lists 0..N.
+        let std = MadtBuilder::standard(4).build();
+        assert_eq!(enabled_apic_ids(&std).len(), count_enabled_cpus(&std));
+        assert_eq!(enabled_apic_ids(&std), vec![0, 1, 2, 3]);
+        // A truncated buffer yields nothing without panicking.
+        assert!(enabled_apic_ids(&[0u8; 10]).is_empty());
     }
 
     #[test]

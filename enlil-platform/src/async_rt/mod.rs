@@ -13,6 +13,10 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Wake, Waker};
 
+/// Linux epoll event source driving the [`Reactor`] (item 1.6).
+#[cfg(all(feature = "platform-linux", target_os = "linux"))]
+pub mod epoll;
+
 /// A boxed future that can be sent across threads.
 type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -304,9 +308,10 @@ struct Registration {
 ///
 /// This is the **backend-neutral core**: the registration table and the
 /// readiness→waker bookkeeping. The OS-specific event source that drives
-/// [`mark_ready`](Self::mark_ready) — epoll on Linux, a device interrupt on bare
-/// metal (item 1.6) — layers on top and is not implemented here yet. All state
-/// sits behind a `Mutex` so a task can register and arm its waker from one
+/// [`mark_ready`](Self::mark_ready) layers on top — on Linux the
+/// [`epoll::EpollPoller`] source, a device interrupt on bare metal (item 1.6).
+/// All state sits behind a `Mutex` so a task can register and arm its waker from
+/// one
 /// thread while an interrupt/epoll thread signals readiness from another; wakers
 /// are always fired *after* the lock is released, so a waker that re-enters the
 /// reactor cannot deadlock.
@@ -447,10 +452,12 @@ impl Reactor {
 
     /// Block until an I/O event arrives, waking the associated tasks.
     ///
-    /// Placeholder: the epoll (Linux) / interrupt (bare-metal) event source that
-    /// would unblock this on real readiness is not wired yet (item 1.6), so on
-    /// Linux this just sleeps for `timeout_ms` to yield the CPU. Readiness is
-    /// currently delivered out-of-band via [`mark_ready`](Self::mark_ready).
+    /// This is the *sourceless* fallback: it simply sleeps for `timeout_ms` to
+    /// yield the CPU. The real Linux path drives readiness with
+    /// [`epoll::EpollPoller::poll`], which blocks in the kernel and calls
+    /// [`mark_ready`](Self::mark_ready) for each ready descriptor; a caller
+    /// using a poller uses that instead of this method. The bare-metal source
+    /// (device interrupt + IPI) is still item 1.6.
     pub fn wait(&self, timeout_ms: Option<u64>) {
         #[cfg(feature = "platform-linux")]
         {

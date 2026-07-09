@@ -330,6 +330,7 @@ dependencies = [
  "anyhow",
  "enlil-config",
  "enlil-devices",
+ "enlil-platform",
  "event-manager",
  "kvm-bindings",
  "kvm-ioctls",
@@ -398,6 +399,7 @@ name = "enlil-platform"
 version = "0.1.0"
 dependencies = [
  "env_logger",
+ "libc",
  "log",
  "spin",
 ]
