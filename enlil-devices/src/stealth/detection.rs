@@ -88,6 +88,33 @@ pub fn cpuid_reveals_hypervisor(leaf1_ecx: u32, sig_ebx: u32, sig_ecx: u32, sig_
         || hypervisor_vendor_from_signature(sig_ebx, sig_ecx, sig_edx).is_some()
 }
 
+/// The 12-byte CPU vendor string from CPUID leaf 0, assembled from its `EBX`,
+/// `EDX`, `ECX` registers — note the non-obvious **EBX, EDX, ECX** order the
+/// x86 architecture uses for this leaf (e.g. `"Genu"`, `"ineI"`, `"ntel"`).
+#[must_use]
+pub fn cpu_vendor_string(ebx: u32, edx: u32, ecx: u32) -> [u8; 12] {
+    let mut s = [0u8; 12];
+    s[0..4].copy_from_slice(&ebx.to_le_bytes());
+    s[4..8].copy_from_slice(&edx.to_le_bytes());
+    s[8..12].copy_from_slice(&ecx.to_le_bytes());
+    s
+}
+
+/// Whether the CPUID leaf-0 vendor string names a genuine x86 CPU vendor
+/// (`GenuineIntel` / `AuthenticAMD` / `HygonGenuine`).
+///
+/// enlil presents the real host CPU's vendor, so a guest that reads a blank or
+/// unrecognized vendor string would have a tell. A future in-guest agent uses
+/// this to flag a suspicious vendor; the host uses it to check the identity
+/// install presents a real vendor.
+#[must_use]
+pub fn is_genuine_cpu_vendor(ebx: u32, edx: u32, ecx: u32) -> bool {
+    matches!(
+        &cpu_vendor_string(ebx, edx, ecx),
+        b"GenuineIntel" | b"AuthenticAMD" | b"HygonGenuine"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +168,37 @@ mod tests {
         // A non-signature string (e.g. an Intel brand fragment) is not a vendor.
         let (ebx, ecx, edx) = sig(b"GenuineIntel");
         assert_eq!(hypervisor_vendor_from_signature(ebx, ecx, edx), None);
+    }
+
+    #[test]
+    fn cpu_vendor_string_uses_ebx_edx_ecx_order() {
+        // "GenuineIntel": EBX="Genu", EDX="ineI", ECX="ntel".
+        let (ebx, edx, ecx) = (
+            u32::from_le_bytes(*b"Genu"),
+            u32::from_le_bytes(*b"ineI"),
+            u32::from_le_bytes(*b"ntel"),
+        );
+        assert_eq!(&cpu_vendor_string(ebx, edx, ecx), b"GenuineIntel");
+        assert!(is_genuine_cpu_vendor(ebx, edx, ecx));
+    }
+
+    #[test]
+    fn amd_vendor_is_genuine_but_a_blank_or_hypervisor_vendor_is_not() {
+        let amd = (
+            u32::from_le_bytes(*b"Auth"),
+            u32::from_le_bytes(*b"enti"),
+            u32::from_le_bytes(*b"cAMD"),
+        );
+        assert!(is_genuine_cpu_vendor(amd.0, amd.1, amd.2));
+        // A blank vendor (some emulators) is not genuine.
+        assert!(!is_genuine_cpu_vendor(0, 0, 0));
+        // A hypervisor signature in the leaf-0 slot is not a CPU vendor.
+        let kvm = (
+            u32::from_le_bytes(*b"KVMK"),
+            u32::from_le_bytes(*b"VMKV"),
+            u32::from_le_bytes(*b"M\0\0\0"),
+        );
+        assert!(!is_genuine_cpu_vendor(kvm.0, kvm.1, kvm.2));
     }
 
     /// Enlil's own synthesized CPUID must be clean (LOCKED PRINCIPLE 1): the
