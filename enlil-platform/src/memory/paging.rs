@@ -43,6 +43,8 @@ pub mod flags {
 
 /// A 4-KiB page-table frame.
 const PAGE_SIZE: u64 = 4096;
+/// A 4-KiB page-table frame, as a `usize` (for byte-offset arithmetic).
+const PAGE_BYTES: usize = 4096;
 /// Entries per table (each 8 bytes → 512 per 4-KiB table).
 const TABLE_ENTRIES: u64 = 512;
 /// A 2-MiB huge page.
@@ -91,7 +93,9 @@ pub const fn huge_2mib_entry(phys: u64, flags: u64) -> u64 {
 }
 
 /// A 4-KiB page-table entry (PTE) mapping `phys` (4-KiB aligned; low bits
-/// masked) with `flags`. Unlike [`huge_2mib_entry`] this is a leaf without the
+/// masked) with `flags`.
+///
+/// Unlike [`huge_2mib_entry`] this is a leaf without the
 /// [`HUGE_PAGE`](flags::HUGE_PAGE) bit — the terminal level of a 4-KiB map.
 #[must_use]
 pub const fn pte_entry(phys: u64, flags: u64) -> u64 {
@@ -144,15 +148,14 @@ pub enum PagingError {
     },
 }
 
-/// Build an identity map of `[0, bytes_to_map)` using 2 MiB huge pages, writing
-/// the PML4/PDPT/PD tables into `mem` starting at `tables_base_gpa`.
+/// Build an identity map of `[0, bytes_to_map)` using 2 MiB huge pages.
 ///
-/// `leaf_flags` are OR'd into each 2 MiB leaf entry (the builder always sets
-/// [`PRESENT`](flags::PRESENT) on leaves and [`PRESENT`]`|`[`WRITABLE`](flags::WRITABLE)
-/// on the intermediate table pointers), so a caller typically passes
-/// `flags::WRITABLE` (plus [`NO_CACHE`](flags::NO_CACHE) for an MMIO identity
-/// map, etc.). The table region is zeroed first, so entries the map does not
-/// reach read back not-present.
+/// Writes the PML4/PDPT/PD tables into `mem` at `tables_base_gpa`. `leaf_flags`
+/// are OR'd into each 2 MiB leaf entry — the builder always sets `PRESENT` on
+/// leaves and `PRESENT | WRITABLE` on the intermediate table pointers — so a
+/// caller typically passes `flags::WRITABLE` (plus `flags::NO_CACHE` for an
+/// MMIO identity map). The table region is zeroed first, so entries the map
+/// does not reach read back not-present.
 ///
 /// The tables are laid out contiguously: PML4 at `tables_base_gpa`, the PDPT
 /// next, then one PD per gibibyte of mapped range. `mem` is indexed by
@@ -185,85 +188,82 @@ pub fn build_identity_map_2mib(
     if num_pd > TABLE_ENTRIES {
         return Err(PagingError::MapTooLarge { num_pd });
     }
+    // Both counts are now ≤ 512, so the conversions never hit the fallback.
+    let num_pd = usize::try_from(num_pd).unwrap_or(usize::MAX);
+    let num_2mib = usize::try_from(num_2mib).unwrap_or(usize::MAX);
 
     let table_count = 2 + num_pd; // PML4 + PDPT + PDs
-    let region = table_count * PAGE_SIZE;
-    let base = usize::try_from(tables_base_gpa).map_err(|_| PagingError::TablesExceedMemory {
-        needed: usize::MAX,
-        have: mem.len(),
-    })?;
-    let region_usize = usize::try_from(region).map_err(|_| PagingError::TablesExceedMemory {
-        needed: usize::MAX,
-        have: mem.len(),
-    })?;
-    let end = base
-        .checked_add(region_usize)
-        .ok_or(PagingError::TablesExceedMemory {
-            needed: usize::MAX,
-            have: mem.len(),
-        })?;
-    if end > mem.len() {
-        return Err(PagingError::TablesExceedMemory {
-            needed: end,
-            have: mem.len(),
-        });
-    }
+    let (base, region_usize, end) = table_region(tables_base_gpa, table_count, mem.len())?;
     // Unmapped entries must read back not-present.
     mem[base..end].fill(0);
 
     let table_flags = flags::PRESENT | flags::WRITABLE;
-    let pml4_gpa = tables_base_gpa;
     let pdpt_gpa = tables_base_gpa + PAGE_SIZE;
     let first_pd_gpa = tables_base_gpa + 2 * PAGE_SIZE;
+    let pdpt_off = base + PAGE_BYTES;
+    let first_pd_off = base + 2 * PAGE_BYTES;
 
     // PML4[0] → PDPT (a ≤512 GiB identity map lives entirely under PML4[0]).
-    write_entry(mem, pml4_gpa, 0, table_entry(pdpt_gpa, table_flags));
+    write_entry(mem, base, table_entry(pdpt_gpa, table_flags));
 
     // PDPT[k] → PD[k], one PD per gibibyte.
     for k in 0..num_pd {
-        let pd_gpa = first_pd_gpa + k * PAGE_SIZE;
-        write_entry(
-            mem,
-            pdpt_gpa,
-            usize::try_from(k).expect("num_pd <= 512"),
-            table_entry(pd_gpa, table_flags),
-        );
+        let pd_gpa = first_pd_gpa + (k as u64) * PAGE_SIZE;
+        write_entry(mem, pdpt_off + k * 8, table_entry(pd_gpa, table_flags));
     }
 
     // PD[k][j] → the (k*512 + j)-th 2 MiB physical frame.
     let leaf = leaf_flags | flags::PRESENT;
     for page in 0..num_2mib {
-        let k = page / TABLE_ENTRIES;
-        let j = page % TABLE_ENTRIES;
-        let pd_gpa = first_pd_gpa + k * PAGE_SIZE;
-        let phys = page * HUGE_2MIB;
-        write_entry(
-            mem,
-            pd_gpa,
-            usize::try_from(j).expect("j < 512"),
-            huge_2mib_entry(phys, leaf),
-        );
+        let k = page / 512;
+        let j = page % 512;
+        let pd_off = first_pd_off + k * PAGE_BYTES;
+        let phys = (page as u64) * HUGE_2MIB;
+        write_entry(mem, pd_off + j * 8, huge_2mib_entry(phys, leaf));
     }
 
     Ok(PageTableLayout {
-        cr3: pml4_gpa,
-        table_count: usize::try_from(table_count).expect("table_count fits usize"),
+        cr3: tables_base_gpa,
+        table_count,
         bytes: region_usize,
     })
 }
 
-/// Build a 4-KiB-granular identity map of the first `num_pages` pages
-/// (`[0, num_pages * 4 KiB)`), writing the PML4/PDPT/PD/PT tables into `mem` at
-/// `tables_base_gpa`, and leaving each page in `guard_pages` **not present** so
-/// a touch faults — the guard-page half of item 1.3's "mmap-like semantics,
-/// guard pages".
+/// Validate that `table_count` 4-KiB tables based at `tables_base_gpa` fit in a
+/// `mem_len`-byte image, returning `(base, region_bytes, end)` as `usize`
+/// offsets, or [`PagingError::TablesExceedMemory`] if they do not.
+fn table_region(
+    tables_base_gpa: u64,
+    table_count: usize,
+    mem_len: usize,
+) -> Result<(usize, usize, usize), PagingError> {
+    let too_big = || PagingError::TablesExceedMemory {
+        needed: usize::MAX,
+        have: mem_len,
+    };
+    let base = usize::try_from(tables_base_gpa).map_err(|_| too_big())?;
+    let region = table_count.checked_mul(PAGE_BYTES).ok_or_else(too_big)?;
+    let end = base.checked_add(region).ok_or_else(too_big)?;
+    if end > mem_len {
+        return Err(PagingError::TablesExceedMemory {
+            needed: end,
+            have: mem_len,
+        });
+    }
+    Ok((base, region, end))
+}
+
+/// Build a 4-KiB-granular identity map of the first `num_pages` pages, with
+/// guard pages.
 ///
-/// Unlike [`build_identity_map_2mib`] this maps at 4-KiB granularity, so it uses
-/// the full four levels (PML4 → PDPT → PD → PT). This first slice covers up to
-/// one page table (512 pages / 2 MiB) — enough for a guarded stack or a small
-/// fine-grained region; larger 4-KiB maps (multiple PTs) are a later slice.
-/// `leaf_flags` are OR'd into each mapped page (with [`PRESENT`](flags::PRESENT)
-/// added); guard pages are written as zero (not present).
+/// Writes the PML4/PDPT/PD/PT tables into `mem` at `tables_base_gpa` mapping
+/// `[0, num_pages * 4 KiB)`, and leaves each page in `guard_pages` **not
+/// present** so a touch faults — the guard-page half of item 1.3's mmap-like
+/// semantics. Unlike [`build_identity_map_2mib`] this uses the full four levels
+/// (PML4 → PDPT → PD → PT). This first slice covers up to one page table (512
+/// pages / 2 MiB) — enough for a guarded stack or a small fine-grained region;
+/// larger 4-KiB maps (multiple PTs) are a later slice. `leaf_flags` are OR'd
+/// into each mapped page (with `PRESENT` added); guard pages are written zero.
 ///
 /// # Errors
 /// - [`PagingError::EmptyRegion`] if `num_pages == 0`;
@@ -278,6 +278,9 @@ pub fn build_identity_map_4kib(
     leaf_flags: u64,
     guard_pages: &[u64],
 ) -> Result<PageTableLayout, PagingError> {
+    // PML4 + PDPT + PD + PT.
+    const TABLE_COUNT: usize = 4;
+
     if num_pages == 0 {
         return Err(PagingError::EmptyRegion);
     }
@@ -294,67 +297,49 @@ pub fn build_identity_map_4kib(
             return Err(PagingError::GuardOutOfRange { index: g });
         }
     }
+    // num_pages ≤ 512 here, so the conversion never hits the fallback.
+    let num_pages = usize::try_from(num_pages).unwrap_or(usize::MAX);
 
-    // PML4 + PDPT + PD + PT.
-    const TABLE_COUNT: u64 = 4;
-    let region = TABLE_COUNT * PAGE_SIZE;
-    let base = usize::try_from(tables_base_gpa).map_err(|_| PagingError::TablesExceedMemory {
-        needed: usize::MAX,
-        have: mem.len(),
-    })?;
-    let region_usize = usize::try_from(region).map_err(|_| PagingError::TablesExceedMemory {
-        needed: usize::MAX,
-        have: mem.len(),
-    })?;
-    let end = base
-        .checked_add(region_usize)
-        .ok_or(PagingError::TablesExceedMemory {
-            needed: usize::MAX,
-            have: mem.len(),
-        })?;
-    if end > mem.len() {
-        return Err(PagingError::TablesExceedMemory {
-            needed: end,
-            have: mem.len(),
-        });
-    }
+    let (base, region_usize, end) = table_region(tables_base_gpa, TABLE_COUNT, mem.len())?;
     mem[base..end].fill(0);
 
     let table_flags = flags::PRESENT | flags::WRITABLE;
-    let pml4_gpa = tables_base_gpa;
     let pdpt_gpa = tables_base_gpa + PAGE_SIZE;
-    let pd_gpa = tables_base_gpa + 2 * PAGE_SIZE;
-    let pt_gpa = tables_base_gpa + 3 * PAGE_SIZE;
+    let page_dir_gpa = tables_base_gpa + 2 * PAGE_SIZE;
+    let page_table_gpa = tables_base_gpa + 3 * PAGE_SIZE;
+    let pt_off = base + 3 * PAGE_BYTES;
 
-    write_entry(mem, pml4_gpa, 0, table_entry(pdpt_gpa, table_flags));
-    write_entry(mem, pdpt_gpa, 0, table_entry(pd_gpa, table_flags));
-    write_entry(mem, pd_gpa, 0, table_entry(pt_gpa, table_flags));
+    write_entry(mem, base, table_entry(pdpt_gpa, table_flags));
+    write_entry(
+        mem,
+        base + PAGE_BYTES,
+        table_entry(page_dir_gpa, table_flags),
+    );
+    write_entry(
+        mem,
+        base + 2 * PAGE_BYTES,
+        table_entry(page_table_gpa, table_flags),
+    );
 
     let leaf = leaf_flags | flags::PRESENT;
     for page in 0..num_pages {
-        if guard_pages.contains(&page) {
+        if guard_pages.contains(&(page as u64)) {
             continue; // leave the PTE zero → not present → guard page
         }
-        let phys = page * PAGE_SIZE;
-        write_entry(
-            mem,
-            pt_gpa,
-            usize::try_from(page).expect("page < 512"),
-            pte_entry(phys, leaf),
-        );
+        let phys = (page as u64) * PAGE_SIZE;
+        write_entry(mem, pt_off + page * 8, pte_entry(phys, leaf));
     }
 
     Ok(PageTableLayout {
-        cr3: pml4_gpa,
-        table_count: usize::try_from(TABLE_COUNT).expect("4 fits usize"),
+        cr3: tables_base_gpa,
+        table_count: TABLE_COUNT,
         bytes: region_usize,
     })
 }
 
-/// Write a little-endian `u64` entry at `table_gpa + index*8`. The caller has
-/// validated the whole table region fits in `mem`.
-fn write_entry(mem: &mut [u8], table_gpa: u64, index: usize, entry: u64) {
-    let off = table_gpa as usize + index * 8;
+/// Write a little-endian `u64` entry at byte offset `off` in `mem`. The caller
+/// has validated the whole table region fits in `mem`.
+fn write_entry(mem: &mut [u8], off: usize, entry: u64) {
     mem[off..off + 8].copy_from_slice(&entry.to_le_bytes());
 }
 
@@ -364,7 +349,7 @@ mod tests {
 
     /// Read the little-endian `u64` entry at `table_gpa + index*8`.
     fn read_entry(mem: &[u8], table_gpa: u64, index: usize) -> u64 {
-        let off = table_gpa as usize + index * 8;
+        let off = usize::try_from(table_gpa).unwrap() + index * 8;
         u64::from_le_bytes(mem[off..off + 8].try_into().unwrap())
     }
 

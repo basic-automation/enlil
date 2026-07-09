@@ -3539,8 +3539,8 @@ mod tests {
             eprintln!("skipping cpuid_stealth_preserves_invariant_tsc: no /dev/kvm");
             return;
         }
-        // SAFETY: __cpuid is always available on x86_64.
-        let host_invariant_tsc = unsafe { core::arch::x86_64::__cpuid(0x8000_0007) }.edx & (1 << 8);
+        // __cpuid is safe on baseline x86_64 (CPUID is always available).
+        let host_invariant_tsc = core::arch::x86_64::__cpuid(0x8000_0007).edx & (1 << 8);
         if host_invariant_tsc == 0 {
             eprintln!(
                 "skipping cpuid_stealth_preserves_invariant_tsc: host does not expose Invariant TSC"

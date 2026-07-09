@@ -261,9 +261,10 @@ pub fn numa_domains(srat: &[u8]) -> Vec<u32> {
 }
 
 /// A NUMA memory range from a SRAT Memory Affinity (type 1) structure: which
-/// proximity domain owns which physical RAM span. This is the placement
-/// primitive behind the north-star rule that a kernel's hot CPU+RAM working set
-/// stays on one node.
+/// proximity domain owns which physical RAM span.
+///
+/// This is the placement primitive behind the north-star rule that a kernel's
+/// hot CPU+RAM working set stays on one node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryAffinity {
     /// The proximity (NUMA) domain the range belongs to.

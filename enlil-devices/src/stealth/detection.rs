@@ -18,9 +18,9 @@ pub enum HypervisorVendor {
     Kvm,
     /// Microsoft Hyper-V — `"Microsoft Hv"`.
     HyperV,
-    /// VMware — `"VMwareVMware"`.
+    /// `VMware` — `"VMwareVMware"`.
     Vmware,
-    /// Oracle VirtualBox — `"VBoxVBoxVBox"`.
+    /// Oracle `VirtualBox` — `"VBoxVBoxVBox"`.
     VirtualBox,
     /// Xen — `"XenVMMXenVMM"`.
     Xen,
@@ -80,17 +80,20 @@ pub fn hypervisor_vendor_from_signature(ebx: u32, ecx: u32, edx: u32) -> Option<
 }
 
 /// Whether CPUID exposes any hypervisor tell: the present bit set, or a known
-/// vendor signature at leaf `0x40000000`. Enlil's synthesized CPUID must make
-/// this return `false` for a guest to believe it is on bare metal.
+/// vendor signature at leaf `0x40000000`.
+///
+/// Enlil's synthesized CPUID must make this return `false` for a guest to
+/// believe it is on bare metal.
 #[must_use]
-pub fn cpuid_reveals_hypervisor(leaf1_ecx: u32, sig_ebx: u32, sig_ecx: u32, sig_edx: u32) -> bool {
-    cpuid_hypervisor_present(leaf1_ecx)
-        || hypervisor_vendor_from_signature(sig_ebx, sig_ecx, sig_edx).is_some()
+pub fn cpuid_reveals_hypervisor(leaf1_ecx: u32, ebx: u32, ecx: u32, edx: u32) -> bool {
+    cpuid_hypervisor_present(leaf1_ecx) || hypervisor_vendor_from_signature(ebx, ecx, edx).is_some()
 }
 
 /// The 12-byte CPU vendor string from CPUID leaf 0, assembled from its `EBX`,
-/// `EDX`, `ECX` registers — note the non-obvious **EBX, EDX, ECX** order the
-/// x86 architecture uses for this leaf (e.g. `"Genu"`, `"ineI"`, `"ntel"`).
+/// `EDX`, `ECX` registers.
+///
+/// Note the non-obvious **EBX, EDX, ECX** order the x86 architecture uses for
+/// this leaf (e.g. `"Genu"`, `"ineI"`, `"ntel"`).
 #[must_use]
 pub fn cpu_vendor_string(ebx: u32, edx: u32, ecx: u32) -> [u8; 12] {
     let mut s = [0u8; 12];

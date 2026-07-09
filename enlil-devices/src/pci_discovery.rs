@@ -80,7 +80,7 @@ impl PciFunction {
     }
 
     /// The header layout (Header Type with the multifunction bit masked off):
-    /// `0x00` general device, `0x01` PCI-to-PCI bridge, `0x02` CardBus bridge.
+    /// `0x00` general device, `0x01` PCI-to-PCI bridge, `0x02` `CardBus` bridge.
     #[must_use]
     pub const fn header_layout(&self) -> u8 {
         self.header_type & 0x7F
@@ -273,7 +273,8 @@ fn read_function(
     let header_type = read_u8(mem, base + u64::from(cfg::HEADER_TYPE))?;
     // Subsystem IDs live at 0x2C/0x2E only in the general (layout-0x00) header;
     // a bridge (0x01) uses that region for other fields, so report 0 there.
-    let (subsystem_vendor_id, subsystem_id) = if header_type & 0x7F == 0x00 {
+    let header_layout = header_type & 0x7F;
+    let (subsystem_vendor_id, subsystem_id) = if header_layout == 0x00 {
         (
             read_u16(mem, base + u64::from(cfg::SUBSYSTEM_VENDOR_ID))?,
             read_u16(mem, base + u64::from(cfg::SUBSYSTEM_ID))?,
@@ -353,7 +354,7 @@ pub struct XhciController {
 /// device-specific region), reached from the capability pointer at `0x34`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capability {
-    /// Capability ID (`0x01` PM, `0x05` MSI, `0x10` PCIe, `0x11` MSI-X, …).
+    /// Capability ID (`0x01` PM, `0x05` MSI, `0x10` `PCIe`, `0x11` MSI-X, …).
     pub id: u8,
     /// Config-space offset of the capability structure.
     pub offset: u16,
@@ -480,9 +481,10 @@ pub fn is_sr_iov_capable(mem: &[u8], alloc: &McfgAllocation, func: &PciFunction)
         .any(|cap| cap.id == ExtendedCapability::SR_IOV)
 }
 
-/// Discover every xHCI (USB 3.x) host controller across all ECAM windows,
-/// pairing each with its BAR0 MMIO base — the "PCI enum to xHCI BARs" step
-/// the USB routing engine and the bare-metal xHCI driver (Phase 6.5) consume.
+/// Discover every xHCI (USB 3.x) host controller across all ECAM windows.
+///
+/// Pairs each with its BAR0 MMIO base — the "PCI enum to xHCI BARs" step the USB
+/// routing engine and the bare-metal xHCI driver (Phase 6.5) consume.
 #[must_use]
 pub fn find_xhci_controllers(mem: &[u8], allocs: &[McfgAllocation]) -> Vec<XhciController> {
     walk_ecam_allocations(mem, allocs)
@@ -506,23 +508,23 @@ pub fn find_xhci_controllers(mem: &[u8], allocs: &[McfgAllocation]) -> Vec<XhciC
 mod tests {
     use super::*;
 
-    /// Write a function's identity into a config-space image at `base`.
+    /// Write a function's identity into a config-space image at `base`. `class`
+    /// is the `(class_code, subclass, prog_if)` triple.
     fn put_function(
         mem: &mut [u8],
         base: usize,
         vendor: u16,
         device: u16,
-        class: u8,
-        subclass: u8,
-        prog_if: u8,
+        class: (u8, u8, u8),
         header_type: u8,
     ) {
+        let (class_code, subclass, prog_if) = class;
         mem[base..base + 2].copy_from_slice(&vendor.to_le_bytes());
         mem[base + 2..base + 4].copy_from_slice(&device.to_le_bytes());
         mem[base + usize::from(cfg::REVISION_ID)] = 0x02;
         mem[base + usize::from(cfg::PROG_IF)] = prog_if;
         mem[base + usize::from(cfg::SUBCLASS)] = subclass;
-        mem[base + usize::from(cfg::CLASS_CODE)] = class;
+        mem[base + usize::from(cfg::CLASS_CODE)] = class_code;
         mem[base + usize::from(cfg::HEADER_TYPE)] = header_type;
     }
 
@@ -544,16 +546,44 @@ mod tests {
         // Cover through device 5's config space.
         let mut mem = vec![0u8; off(5, 0) + 0x1000];
         // 00:00.0 Intel host bridge (class 0x06 bridge / 0x00 host).
-        put_function(&mut mem, off(0, 0), 0x8086, 0x29C0, 0x06, 0x00, 0x00, 0x00);
+        put_function(
+            &mut mem,
+            off(0, 0),
+            0x8086,
+            0x29C0,
+            (0x06, 0x00, 0x00),
+            0x00,
+        );
         // 00:02.0 VGA display controller, multifunction (header bit 7).
-        put_function(&mut mem, off(2, 0), 0x8086, 0x2918, 0x03, 0x00, 0x00, 0x80);
+        put_function(
+            &mut mem,
+            off(2, 0),
+            0x8086,
+            0x2918,
+            (0x03, 0x00, 0x00),
+            0x80,
+        );
         // BAR0: 32-bit non-prefetchable memory at 0xF600_0000; BAR1: I/O at 0xE000.
         put_bar(&mut mem, off(2, 0), 0, 0xF600_0000);
         put_bar(&mut mem, off(2, 0), 1, 0xE000 | 0x1);
         // 00:02.1 audio device — only reachable because 02.0 is multifunction.
-        put_function(&mut mem, off(2, 1), 0x8086, 0x2668, 0x04, 0x03, 0x00, 0x00);
+        put_function(
+            &mut mem,
+            off(2, 1),
+            0x8086,
+            0x2668,
+            (0x04, 0x03, 0x00),
+            0x00,
+        );
         // 00:04.0 xHCI USB 3 controller (class 0x0C / sub 0x03 / prog-IF 0x30).
-        put_function(&mut mem, off(4, 0), 0x1912, 0x0015, 0x0C, 0x03, 0x30, 0x00);
+        put_function(
+            &mut mem,
+            off(4, 0),
+            0x1912,
+            0x0015,
+            (0x0C, 0x03, 0x30),
+            0x00,
+        );
         // Its subsystem IDs (0x2C/0x2E) identify the card's OEM.
         mem[off(4, 0) + 0x2C..off(4, 0) + 0x2E].copy_from_slice(&0x1043u16.to_le_bytes());
         mem[off(4, 0) + 0x2E..off(4, 0) + 0x30].copy_from_slice(&0x8694u16.to_le_bytes());
@@ -671,7 +701,7 @@ mod tests {
         assert_eq!(controllers[0].mmio_base, Some(0x0000_0004_F700_0000));
     }
 
-    /// A bare general PciFunction at 00:00.0 for capability-walk tests.
+    /// A bare general `PciFunction` at 00:00.0 for capability-walk tests.
     fn plain_function() -> PciFunction {
         PciFunction {
             segment: 0,

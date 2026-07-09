@@ -138,12 +138,17 @@ impl EpollPoller {
             }
             return Err(err);
         }
+        // `n >= 0` here (the negative case returned above), so the count fits.
+        let ready = usize::try_from(n).unwrap_or(0);
         let mut marked = 0;
-        for ev in &events[..n as usize] {
+        for ev in &events[..ready] {
             // epoll_event is `#[repr(C, packed)]`; read the data field with an
             // unaligned read rather than forming a reference to it.
             // SAFETY: `ev` points at a valid, initialized event.
-            let token = unsafe { (&raw const ev.u64).read_unaligned() } as usize;
+            let token_u64 = unsafe { (&raw const ev.u64).read_unaligned() };
+            // Tokens originate as `usize` (see `add`), so this round-trips; an
+            // impossible >usize::MAX value falls back to an unknown token.
+            let token = usize::try_from(token_u64).unwrap_or(usize::MAX);
             if reactor.mark_ready(token) {
                 marked += 1;
             }
@@ -176,7 +181,12 @@ mod tests {
         let mut fds = [0 as RawFd; 2];
         let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
         assert_eq!(rc, 0, "pipe2 failed: {}", io::Error::last_os_error());
-        (fds[0], fds[1])
+        fds.into()
+    }
+
+    /// Register a file descriptor as an opaque reactor source.
+    fn register_fd(reactor: &Reactor, fd: RawFd) -> usize {
+        reactor.register(usize::try_from(fd).expect("fd is non-negative"))
     }
 
     fn close(fd: RawFd) {
@@ -187,7 +197,7 @@ mod tests {
     fn a_readable_fd_marks_its_reactor_token_ready() {
         let reactor = Reactor::new();
         let (rd, wr) = pipe();
-        let token = reactor.register(rd as usize);
+        let token = register_fd(&reactor, rd);
 
         let poller = EpollPoller::new().expect("epoll");
         poller.add_reader(rd, token).expect("add reader");
@@ -209,7 +219,7 @@ mod tests {
     fn removing_an_fd_stops_its_events() {
         let reactor = Reactor::new();
         let (rd, wr) = pipe();
-        let token = reactor.register(rd as usize);
+        let token = register_fd(&reactor, rd);
         let poller = EpollPoller::new().expect("epoll");
         poller.add_reader(rd, token).expect("add");
         poller.remove(rd).expect("remove");
@@ -228,8 +238,8 @@ mod tests {
         let reactor = Reactor::new();
         let (rd1, wr1) = pipe();
         let (rd2, wr2) = pipe();
-        let t1 = reactor.register(rd1 as usize);
-        let t2 = reactor.register(rd2 as usize);
+        let t1 = register_fd(&reactor, rd1);
+        let t2 = register_fd(&reactor, rd2);
         let poller = EpollPoller::new().expect("epoll");
         poller.add_reader(rd1, t1).expect("add1");
         poller.add_reader(rd2, t2).expect("add2");

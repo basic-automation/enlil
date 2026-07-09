@@ -271,8 +271,9 @@ pub struct CpuNode {
     pub proximity_domain: Option<u32>,
 }
 
-/// Enlil's own device tree, assembled from the host firmware's ACPI tables —
-/// the culmination of Phase 6.3 discovery: which CPUs (and their NUMA nodes),
+/// Enlil's own device tree, assembled from the host firmware's ACPI tables.
+///
+/// The culmination of Phase 6.3 discovery: which CPUs (and their NUMA nodes),
 /// which RAM ranges belong to which node and how far apart the nodes are, which
 /// PCI functions exist (and the xHCI controllers among them), and which IOMMU
 /// the platform has. This is the model the bare-metal boot path builds once it
@@ -293,10 +294,11 @@ pub struct HostDeviceTree {
     pub iommu: Option<IommuKind>,
 }
 
-/// Build the whole [`HostDeviceTree`] from the live ACPI tables in one call —
-/// the entire Phase 6.3 discovery pipeline (MADT + SRAT + SLIT + MCFG/ECAM PCI
-/// walk + DMAR/IVRS). `mem` is memory based at physical address 0, `rsdp_gpa`
-/// the RSDP's address.
+/// Build the whole [`HostDeviceTree`] from the live ACPI tables in one call.
+///
+/// Runs the entire Phase 6.3 discovery pipeline (MADT + SRAT + SLIT + MCFG/ECAM
+/// PCI walk + DMAR/IVRS). `mem` is memory based at physical address 0,
+/// `rsdp_gpa` the RSDP's address.
 ///
 /// Each CPU's NUMA domain is resolved by matching its MADT APIC ID against the
 /// SRAT's processor affinities; a CPU with no matching affinity gets
