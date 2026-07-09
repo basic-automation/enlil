@@ -13,5 +13,10 @@ platform-baremetal = []
 log = "0.4"
 spin = "0.9"
 
+# The Linux epoll I/O reactor source (async_rt::epoll) needs raw epoll
+# syscalls; gated to the Linux dev host so the bare-metal target never pulls it.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 env_logger = "0.11"
