@@ -3614,6 +3614,96 @@ mod tests {
         );
     }
 
+    #[test]
+    fn guest_cpuid_hypervisor_leaf_exposes_no_vendor_signature() {
+        // Transparency (LOCKED PRINCIPLE 1): the CPUID 0x40000000 hypervisor
+        // vendor leaf must NOT leak a signature like "KVMKVMKVM" to the guest.
+        // apply_topology_stealth builds from KVM_GET_SUPPORTED_CPUID (which has
+        // no 0x40000000 entry), so the guest should read the leaf clean. Verify
+        // by reading it inside a real guest and decoding with the same routine
+        // an in-guest detector (5.8) would use.
+        if !is_kvm_available() {
+            eprintln!("skipping guest_cpuid_hypervisor_leaf_...: no /dev/kvm");
+            return;
+        }
+
+        // Real-mode blob: CPUID(0x40000000), then emit EBX, ECX, EDX as 12
+        // bytes (LSB first) on COM1, then HLT. EDX is copied into EBX before
+        // emission because DX holds the port and shifting EDX would clobber it.
+        #[rustfmt::skip]
+        let code: [u8; 87] = [
+            0x66, 0xB8, 0x00, 0x00, 0x00, 0x40, // mov eax, 0x40000000
+            0x0F, 0xA2,                         // cpuid
+            0xBA, 0xF8, 0x03,                   // mov dx, 0x3F8
+            // emit EBX (4 bytes, LSB first)
+            0x88, 0xD8, 0xEE,                   // mov al, bl; out dx, al
+            0x66, 0xC1, 0xEB, 0x08, 0x88, 0xD8, 0xEE, // shr ebx,8; mov al,bl; out
+            0x66, 0xC1, 0xEB, 0x08, 0x88, 0xD8, 0xEE,
+            0x66, 0xC1, 0xEB, 0x08, 0x88, 0xD8, 0xEE,
+            // emit ECX (4 bytes, LSB first)
+            0x88, 0xC8, 0xEE,                   // mov al, cl; out
+            0x66, 0xC1, 0xE9, 0x08, 0x88, 0xC8, 0xEE, // shr ecx,8; mov al,cl; out
+            0x66, 0xC1, 0xE9, 0x08, 0x88, 0xC8, 0xEE,
+            0x66, 0xC1, 0xE9, 0x08, 0x88, 0xC8, 0xEE,
+            0x66, 0x89, 0xD3,                   // mov ebx, edx
+            // emit EDX (now in EBX; 4 bytes, LSB first)
+            0x88, 0xD8, 0xEE,
+            0x66, 0xC1, 0xEB, 0x08, 0x88, 0xD8, 0xEE,
+            0x66, 0xC1, 0xEB, 0x08, 0x88, 0xD8, 0xEE,
+            0x66, 0xC1, 0xEB, 0x08, 0x88, 0xD8, 0xEE,
+            0xF4,                               // hlt
+        ];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu");
+        let table = enlil_devices::stealth::cpuid::CpuidStealthTable::build(
+            &enlil_devices::stealth::cpuid::CpuidStealthConfig::from_host(1, 1),
+        );
+        backend
+            .apply_topology_stealth(&table)
+            .expect("apply cpuid stealth");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        struct EchoOut(Vec<u8>);
+        impl VmExitHandler for EchoOut {
+            fn io_out(&mut self, _port: u16, data: &[u8]) {
+                self.0.extend_from_slice(data);
+            }
+        }
+        let mut echo = EchoOut(Vec::new());
+
+        let mut halted = false;
+        for _ in 0..200 {
+            if backend.run_vcpu(0, &mut echo).expect("run vcpu") == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        assert_eq!(echo.0.len(), 12, "guest must emit all 12 signature bytes");
+
+        let ebx = u32::from_le_bytes(echo.0[0..4].try_into().unwrap());
+        let ecx = u32::from_le_bytes(echo.0[4..8].try_into().unwrap());
+        let edx = u32::from_le_bytes(echo.0[8..12].try_into().unwrap());
+        assert_eq!(
+            enlil_devices::stealth::detection::hypervisor_vendor_from_signature(ebx, ecx, edx),
+            None,
+            "CPUID 0x40000000 leaked a hypervisor vendor signature to the guest: {:?}",
+            core::str::from_utf8(&echo.0)
+        );
+    }
+
     // apply_topology_stealth makes a guest see ITS OWN topology, not the host's.
     // KVM's supported leaf 0xB mirrors the host's logical-processor count; a
     // 2-vCPU guest reading leaf 0xB subleaf 1 EBX would otherwise find the host's
