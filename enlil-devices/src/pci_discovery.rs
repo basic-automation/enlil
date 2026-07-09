@@ -57,6 +57,12 @@ pub struct PciFunction {
     /// Raw Header Type byte (config offset 0x0E), including the
     /// multifunction bit (bit 7).
     pub header_type: u8,
+    /// Subsystem Vendor ID (config offset 0x2C) — identifies the card's OEM;
+    /// `0` for non-general (header-layout ≠ 0x00) functions, which carry no
+    /// subsystem IDs at that offset.
+    pub subsystem_vendor_id: u16,
+    /// Subsystem ID (config offset 0x2E); `0` for non-general functions.
+    pub subsystem_id: u16,
 }
 
 impl PciFunction {
@@ -264,6 +270,17 @@ fn read_function(
     if vendor_id == 0xFFFF || vendor_id == 0x0000 {
         return None;
     }
+    let header_type = read_u8(mem, base + u64::from(cfg::HEADER_TYPE))?;
+    // Subsystem IDs live at 0x2C/0x2E only in the general (layout-0x00) header;
+    // a bridge (0x01) uses that region for other fields, so report 0 there.
+    let (subsystem_vendor_id, subsystem_id) = if header_type & 0x7F == 0x00 {
+        (
+            read_u16(mem, base + u64::from(cfg::SUBSYSTEM_VENDOR_ID))?,
+            read_u16(mem, base + u64::from(cfg::SUBSYSTEM_ID))?,
+        )
+    } else {
+        (0, 0)
+    };
     Some(PciFunction {
         segment: alloc.segment_group,
         bus,
@@ -275,7 +292,9 @@ fn read_function(
         prog_if: read_u8(mem, base + u64::from(cfg::PROG_IF))?,
         subclass: read_u8(mem, base + u64::from(cfg::SUBCLASS))?,
         class_code: read_u8(mem, base + u64::from(cfg::CLASS_CODE))?,
-        header_type: read_u8(mem, base + u64::from(cfg::HEADER_TYPE))?,
+        header_type,
+        subsystem_vendor_id,
+        subsystem_id,
     })
 }
 
@@ -535,6 +554,9 @@ mod tests {
         put_function(&mut mem, off(2, 1), 0x8086, 0x2668, 0x04, 0x03, 0x00, 0x00);
         // 00:04.0 xHCI USB 3 controller (class 0x0C / sub 0x03 / prog-IF 0x30).
         put_function(&mut mem, off(4, 0), 0x1912, 0x0015, 0x0C, 0x03, 0x30, 0x00);
+        // Its subsystem IDs (0x2C/0x2E) identify the card's OEM.
+        mem[off(4, 0) + 0x2C..off(4, 0) + 0x2E].copy_from_slice(&0x1043u16.to_le_bytes());
+        mem[off(4, 0) + 0x2E..off(4, 0) + 0x30].copy_from_slice(&0x8694u16.to_le_bytes());
         // BAR0: 64-bit non-prefetchable memory at 0x0000_0004_F700_0000
         // (low dword carries base bits 31:4 | type 0b10; high dword bits 63:32).
         put_bar(&mut mem, off(4, 0), 0, 0xF700_0000 | 0x4);
@@ -584,6 +606,11 @@ mod tests {
         assert!(xhci.is_xhci());
         assert_eq!(xhci.vendor_id, 0x1912);
         assert_eq!(xhci.device_id, 0x0015);
+        // Subsystem IDs (0x2C/0x2E) are read for the general-header xHCI.
+        assert_eq!(xhci.subsystem_vendor_id, 0x1043);
+        assert_eq!(xhci.subsystem_id, 0x8694);
+        // The host bridge is a general header too but has no subsystem IDs set.
+        assert_eq!(host.subsystem_vendor_id, 0);
     }
 
     #[test]
@@ -658,6 +685,8 @@ mod tests {
             subclass: 0,
             class_code: 0x02,
             header_type: 0,
+            subsystem_vendor_id: 0,
+            subsystem_id: 0,
         }
     }
 
@@ -760,6 +789,8 @@ mod tests {
             subclass: 0x04,
             class_code: 0x06,
             header_type: 0x01,
+            subsystem_vendor_id: 0,
+            subsystem_id: 0,
         };
         assert!(bridge.is_pci_bridge());
         assert_eq!(bridge.header_layout(), 0x01);
