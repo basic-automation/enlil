@@ -140,6 +140,38 @@ fn validate_guest_macs(config: &EnlilConfig) -> Vec<String> {
 
 /// Validate an Enlil configuration. Returns a list of errors (empty = valid).
 #[must_use]
+/// Validate that every guest's `name` is non-empty and unique.
+///
+/// The name (not the config-map key) seeds each guest's vTPM endorsement key and
+/// its synthesized NIC MAC, so two guests sharing a name would get an identical
+/// EK (LOCKED PRINCIPLE 1 — transparency: each vTPM must be distinct) and, if
+/// neither sets an explicit MAC, the same synthesized MAC (LOCKED PRINCIPLE 5 —
+/// isolation: the MAC-learning switch would flap between them).
+fn validate_guest_names(config: &EnlilConfig) -> Vec<String> {
+    let mut errors = Vec::new();
+    let mut name_owners: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (id, guest) in &config.guest {
+        let name = guest.name.trim();
+        if name.is_empty() {
+            errors.push(format!("Guest '{id}': name cannot be empty"));
+        } else {
+            name_owners.entry(name).or_default().push(id.as_str());
+        }
+    }
+    for (name, mut ids) in name_owners {
+        if ids.len() >= 2 {
+            ids.sort_unstable();
+            errors.push(format!(
+                "Guest name '{name}' is shared by {}; a guest name must be unique \
+                 (it seeds the per-guest vTPM key and synthesized MAC)",
+                ids.join(", ")
+            ));
+        }
+    }
+    errors
+}
+
+#[must_use]
 pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
     let mut errors = Vec::new();
 
@@ -184,12 +216,8 @@ pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
         }
     }
 
-    // Check guest names are non-empty
-    for (id, guest) in &config.guest {
-        if guest.name.trim().is_empty() {
-            errors.push(format!("Guest '{id}': name cannot be empty"));
-        }
-    }
+    // Guest names must be non-empty and unique (see validate_guest_names).
+    errors.append(&mut validate_guest_names(config));
 
     // The hypervisor log level must be one of the documented levels (matched
     // case-insensitively, like the `log` crate's own filter parser).
@@ -304,6 +332,36 @@ mod tests {
         let config = minimal_config();
         let errors = validate_config(&config);
         assert!(errors.is_empty(), "Expected no errors, got: {errors:?}");
+    }
+
+    #[test]
+    fn rejects_two_guests_sharing_a_name() {
+        let mut config = minimal_config();
+        // A second guest under a different config-map key but the SAME name —
+        // they would share a vTPM seed and synthesized MAC.
+        config.guest.insert(
+            "vm2".into(),
+            GuestConfig {
+                name: "Test VM 1".into(), // duplicate of vm1's name
+                cpus: vec![2, 3],
+                memory_mb: 2048,
+                kernel: None,
+                initrd: None,
+                cmdline: "console=ttyS0".into(),
+                scheduling: SchedulingMode::Dedicated,
+                disks: vec![],
+                serial: SerialPortConfig::default(),
+                mac: None,
+            },
+        );
+        let errors = validate_config(&config);
+        assert!(
+            errors.iter().any(|e| e.contains("Test VM 1")
+                && e.contains("vm1")
+                && e.contains("vm2")
+                && e.contains("unique")),
+            "expected a duplicate-name error, got: {errors:?}"
+        );
     }
 
     #[test]
