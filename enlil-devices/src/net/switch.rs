@@ -221,7 +221,13 @@ impl VirtualSwitch {
     }
 
     fn lookup(&self, mac: MacAddress) -> Option<PortId> {
-        self.fdb.get(&mac).map(|entry| entry.port)
+        // Treat an entry aged past the aging time as a miss so a departed or
+        // moved station is flooded to (re-learning its new port) rather than
+        // silently unicast to its stale port until the next bulk age-out.
+        self.fdb
+            .get(&mac)
+            .filter(|entry| entry.last_seen.elapsed() < self.aging_time)
+            .map(|entry| entry.port)
     }
 
     fn flood(&mut self, src_port: PortId, frame: &[u8]) {
@@ -337,6 +343,43 @@ mod tests {
         sw.process_frame(p0, &[0u8; 5]);
         assert_eq!(sw.stats().dropped, 1);
         assert_eq!(sw.stats().received, 0);
+    }
+
+    #[test]
+    fn a_stale_fdb_entry_floods_instead_of_forwarding_to_a_dead_port() {
+        let mut sw = VirtualSwitch::with_aging_time(Duration::from_millis(10));
+        let a = sw.add_port();
+        let b = sw.add_port();
+        let c = sw.add_port();
+
+        let m = [0x02, 0x00, 0x00, 0x00, 0x00, 0x0A];
+        let other = [0x02, 0x00, 0x00, 0x00, 0x00, 0x0B];
+
+        // Learn M on port A (a broadcast frame from A with src = M).
+        sw.process_frame(a, &make_frame([0xFF; 6], m, b"hello"));
+        // Drain the flood the learning frame produced on B and C.
+        while sw.dequeue(a).is_some() {}
+        while sw.dequeue(b).is_some() {}
+        while sw.dequeue(c).is_some() {}
+
+        // Fresh entry: a unicast to M forwards only to A, not flooded to C.
+        let fwd = sw.stats().forwarded;
+        sw.process_frame(b, &make_frame(m, other, b"fresh"));
+        assert_eq!(sw.stats().forwarded, fwd + 1, "fresh entry forwards");
+        assert!(sw.has_pending(a));
+        assert!(!sw.has_pending(c), "a fresh unicast is not flooded to C");
+        while sw.dequeue(a).is_some() {}
+
+        // Let the entry age out, then the same unicast must flood (reaching A
+        // and C), not silently unicast to the stale port.
+        std::thread::sleep(Duration::from_millis(25));
+        let flooded = sw.stats().flooded;
+        sw.process_frame(b, &make_frame(m, other, b"stale"));
+        assert_eq!(sw.stats().flooded, flooded + 1, "a stale entry floods");
+        assert!(
+            sw.has_pending(a) && sw.has_pending(c),
+            "the flood reaches both non-source ports"
+        );
     }
 
     #[test]
