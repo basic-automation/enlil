@@ -10,8 +10,10 @@
 //! hot-plug router (Phase 4.3).
 
 use enlil_config::{UsbConfig, UsbMatchKind};
+use enlil_devices::usb::registry::XhciRegistry;
 use enlil_devices::usb::routing::{DeviceMatcher, RoutingState, RoutingTable};
-use enlil_devices::usb::types::UsbDeviceClass;
+use enlil_devices::usb::types::{GuestId, UsbDeviceClass};
+use enlil_devices::usb::SharedXhci;
 
 /// Map a config-layer USB device-class token to a [`UsbDeviceClass`].
 ///
@@ -110,6 +112,79 @@ pub fn routing_table_from_config(usb: &UsbConfig) -> Result<RoutingTable, String
 /// As [`routing_table_from_config`].
 pub fn routing_state_from_config(usb: &UsbConfig) -> Result<RoutingState, String> {
     Ok(RoutingState::new(routing_table_from_config(usb)?))
+}
+
+/// Every guest a parsed `[usb.routing]` block can send a device to: the
+/// `target` of each routing rule plus the `default_guest`, deduplicated and
+/// sorted.
+///
+/// The guest-setup path uses this to know which guests must have a virtual
+/// xHCI controller registered before the router goes live — a rule targeting a
+/// guest with no controller can never attach
+/// ([`RegistryError::NoController`](enlil_devices::usb::registry::RegistryError::NoController)).
+///
+/// # Errors
+/// As [`routing_table_from_config`] — the config must parse before its targets
+/// can be enumerated.
+pub fn routing_targets(usb: &UsbConfig) -> Result<Vec<GuestId>, String> {
+    let table = routing_table_from_config(usb)?;
+    let mut targets: Vec<GuestId> = table
+        .rules()
+        .iter()
+        .map(|rule| rule.target.clone())
+        .chain(table.default_guest().cloned())
+        .collect();
+    targets.sort();
+    targets.dedup();
+    Ok(targets)
+}
+
+/// Assemble the live USB hot-plug registry for a running configuration: build
+/// the routing engine from `[usb.routing]` and bind it to each guest's virtual
+/// xHCI controller.
+///
+/// `controllers` supplies the per-guest [`SharedXhci`] handles — the same
+/// handles the guests' MMIO windows use — so an attach the router decides
+/// raises the Port Status Change interrupt on the right guest's controller.
+/// This is the guest-setup caller Phase 4.3 was waiting on the top-level
+/// orchestrator (item 3.12) to unblock: a configured `[usb.routing]` block now
+/// populates a ready-to-service [`XhciRegistry`], not just a bare
+/// [`RoutingState`].
+///
+/// Every routing target — each rule's `target` and the `default_guest` — must
+/// have a registered controller; otherwise the registry would answer a
+/// matching plug-in with
+/// [`RegistryError::NoController`](enlil_devices::usb::registry::RegistryError::NoController)
+/// at runtime. This checks that invariant up front and rejects a config that
+/// routes to a guest with no controller, so the misconfiguration surfaces at
+/// setup rather than on the first hot-plug.
+///
+/// # Errors
+/// - the USB config fails to parse (as [`routing_table_from_config`]); or
+/// - a routing target names a guest absent from `controllers`.
+pub fn usb_registry_from_config<I, S>(
+    usb: &UsbConfig,
+    controllers: I,
+) -> Result<XhciRegistry, String>
+where
+    I: IntoIterator<Item = (S, SharedXhci)>,
+    S: Into<GuestId>,
+{
+    let mut registry = XhciRegistry::new(routing_state_from_config(usb)?);
+    for (guest, controller) in controllers {
+        registry.register_controller(guest, controller);
+    }
+    let missing: Vec<GuestId> = routing_targets(usb)?
+        .into_iter()
+        .filter(|guest| registry.controller(guest.as_str()).is_none())
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "USB routing targets have no registered xHCI controller: {}",
+            missing.join(", ")
+        ));
+    }
+    Ok(registry)
 }
 
 #[cfg(test)]
@@ -263,6 +338,93 @@ mod tests {
         assert!(
             err.contains("teleporter"),
             "error names the bad token: {err}"
+        );
+    }
+
+    /// A running xHCI controller mirroring the registry's own test helper:
+    /// MaxSlotsEn set and Run/Stop enabled so it accepts an attach.
+    fn running_controller(ports: u8) -> SharedXhci {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        use enlil_devices::usb::VirtualXhciController;
+
+        let mut c = VirtualXhciController::new(ports);
+        let op = u32::from(c.caps.caplength);
+        c.write_register(op + 0x38, 8); // CONFIG: MaxSlotsEn
+        c.write_register(op, 1); // USBCMD: R/S
+        Rc::new(RefCell::new(c))
+    }
+
+    #[test]
+    fn routing_targets_are_sorted_deduped_and_include_the_default() {
+        let usb = UsbConfig {
+            default_guest: Some("linux1".into()),
+            routing: vec![
+                rule("046d:c52b", "windows1", 10),
+                rule("046d:*", "linux2", 20),
+                // A second rule to the same guest must not duplicate it.
+                rule("1532:0084", "linux2", 30),
+            ],
+        };
+        let targets = routing_targets(&usb).expect("enumerate targets");
+        assert_eq!(targets, vec!["linux1", "linux2", "windows1"]);
+    }
+
+    #[test]
+    fn registry_binds_config_routing_to_the_target_guests_controller() {
+        use enlil_devices::usb::types::{UsbDeviceClass, UsbDeviceId, UsbSpeed};
+
+        let usb = UsbConfig {
+            default_guest: Some("linux1".into()),
+            routing: vec![rule("046d:c52b", "windows1", 10)],
+        };
+        // Both the rule target (windows1) and the default (linux1) have
+        // controllers, so the assembly succeeds.
+        let mut registry = usb_registry_from_config(
+            &usb,
+            [
+                ("linux1", running_controller(4)),
+                ("windows1", running_controller(4)),
+            ],
+        )
+        .expect("assemble registry");
+
+        let mouse = UsbDeviceId {
+            vendor_id: 0x046d,
+            product_id: 0xc52b,
+            class: UsbDeviceClass::Hid,
+            speed: UsbSpeed::High,
+            serial: None,
+            manufacturer: None,
+            product: None,
+            port_path: None,
+        };
+        // The plugged mouse lands on windows1's controller, exactly where the
+        // config routed it.
+        let outcome = registry.attach(3, &mouse).expect("attach routed device");
+        assert!(
+            matches!(
+                outcome,
+                enlil_devices::usb::AttachOutcome::Attached(ref p) if p.guest == "windows1"
+            ),
+            "routed device attaches to its configured guest: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn registry_rejects_a_routing_target_without_a_controller() {
+        let usb = UsbConfig {
+            default_guest: None,
+            routing: vec![rule("046d:c52b", "windows1", 10)],
+        };
+        // windows1 has no registered controller — the assembly must refuse.
+        let err = usb_registry_from_config(&usb, [("linux1", running_controller(4))])
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            err.contains("windows1"),
+            "error names the target lacking a controller: {err}"
         );
     }
 }
