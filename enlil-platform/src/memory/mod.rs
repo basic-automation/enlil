@@ -316,6 +316,7 @@ unsafe impl GlobalAlloc for PlatformAllocator {
         {
             // Bare-metal: would dispatch to buddy/slab.
             // Stubbed — real implementation in Phase 6.
+            let _ = layout;
             std::ptr::null_mut()
         }
     }
