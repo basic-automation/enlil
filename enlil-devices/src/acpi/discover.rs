@@ -312,7 +312,7 @@ pub fn build_device_tree(mem: &[u8], rsdp_gpa: u64) -> HostDeviceTree {
             apic_id,
             proximity_domain: affinities
                 .iter()
-                .find(|a| u32::from(a.apic_id) == apic_id)
+                .find(|a| a.apic_id == apic_id)
                 .map(|a| a.proximity_domain),
         })
         .collect();

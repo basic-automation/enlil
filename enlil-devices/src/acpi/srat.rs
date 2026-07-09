@@ -311,35 +311,52 @@ pub fn memory_affinities(srat: &[u8]) -> Vec<MemoryAffinity> {
     out
 }
 
-/// A CPU→node binding from a Processor Local APIC Affinity (type 0) structure:
-/// which APIC ID belongs to which proximity domain.
+/// A CPU→node binding from a SRAT affinity structure: which APIC (or x2APIC) ID
+/// belongs to which proximity domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuAffinity {
-    /// The processor's local APIC ID (+3).
-    pub apic_id: u8,
+    /// The processor's local APIC or x2APIC ID (widened to `u32` so x2APIC IDs
+    /// above 255 fit).
+    pub apic_id: u32,
     /// The proximity (NUMA) domain the processor belongs to.
     pub proximity_domain: u32,
 }
 
-/// Parse the enabled Processor Local APIC Affinity (type 0) structures into
-/// their `(apic_id, proximity_domain)` bindings (Phase 6.3 NUMA topology).
+/// Parse the enabled processor affinity structures into their
+/// `(apic_id, proximity_domain)` bindings (Phase 6.3 NUMA topology).
 ///
-/// Disabled processors (flags bit 0 clear) are skipped. This is the CPU side of
-/// [`memory_affinities`]: together they say which cores and which RAM share a
-/// node, so a guest's vCPUs and memory can be co-located.
+/// Covers both Processor Local APIC Affinity (type 0, 8-bit APIC ID at +3, split
+/// proximity domain) and Processor Local x2APIC Affinity (type 2, 32-bit x2APIC
+/// ID at +8, proximity domain at +4) — the latter carries CPUs with APIC IDs
+/// above 255. Disabled processors (flags bit 0 clear) are skipped. This is the
+/// CPU side of [`memory_affinities`]: together they say which cores and which
+/// RAM share a node, so a guest's vCPUs and memory can be co-located.
 #[must_use]
 pub fn cpu_affinities(srat: &[u8]) -> Vec<CpuAffinity> {
     let mut out = Vec::new();
-    for_each_structure(srat, |entry_type, entry| {
-        if entry_type == 0 && entry.len() >= 16 {
+    for_each_structure(srat, |entry_type, entry| match entry_type {
+        // Processor Local APIC Affinity: 8-bit APIC ID at +3, flags at +4.
+        0 if entry.len() >= 16 => {
             let flags = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
             if flags & 1 != 0 {
                 out.push(CpuAffinity {
-                    apic_id: entry[3],
+                    apic_id: u32::from(entry[3]),
                     proximity_domain: processor_domain(entry),
                 });
             }
         }
+        // Processor Local x2APIC Affinity: proximity domain at +4 (u32),
+        // 32-bit x2APIC ID at +8, flags at +12.
+        2 if entry.len() >= 24 => {
+            let flags = u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]);
+            if flags & 1 != 0 {
+                out.push(CpuAffinity {
+                    apic_id: u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]),
+                    proximity_domain: u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]),
+                });
+            }
+        }
+        _ => {}
     });
     out
 }
@@ -441,6 +458,38 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn parses_x2apic_processor_affinity() {
+        // No builder for type-2 x2APIC affinity; append a raw 24-byte structure
+        // after the header (for_each_structure walks from offset 48).
+        let mut srat = SratBuilder::new().build();
+        let mut x2 = vec![0u8; 24];
+        x2[0] = 2; // type: Processor Local x2APIC Affinity
+        x2[1] = 24; // length
+        x2[4..8].copy_from_slice(&5u32.to_le_bytes()); // proximity domain 5
+        x2[8..12].copy_from_slice(&300u32.to_le_bytes()); // x2APIC ID 300 (> 255)
+        x2[12..16].copy_from_slice(&1u32.to_le_bytes()); // enabled
+        srat.extend_from_slice(&x2);
+
+        assert_eq!(
+            cpu_affinities(&srat),
+            vec![CpuAffinity {
+                apic_id: 300,
+                proximity_domain: 5,
+            }]
+        );
+
+        // A disabled x2APIC entry is skipped.
+        let mut srat = SratBuilder::new().build();
+        let mut x2 = vec![0u8; 24];
+        x2[0] = 2;
+        x2[1] = 24;
+        x2[8..12].copy_from_slice(&301u32.to_le_bytes());
+        // flags left 0 → disabled
+        srat.extend_from_slice(&x2);
+        assert!(cpu_affinities(&srat).is_empty());
     }
 
     #[test]
