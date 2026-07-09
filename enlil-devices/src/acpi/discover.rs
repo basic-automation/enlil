@@ -174,6 +174,34 @@ pub fn host_numa_domains(mem: &[u8], rsdp_gpa: u64) -> Vec<u32> {
         .unwrap_or_default()
 }
 
+/// Discover the NUMA memory ranges from the firmware's SRAT (Phase 6.3): which
+/// proximity domain owns which physical RAM span.
+///
+/// Locates the SRAT via [`find_table`] and parses its enabled Memory Affinity
+/// structures with [`memory_affinities`](super::srat::memory_affinities). Empty
+/// if no SRAT is present.
+#[must_use]
+pub fn host_memory_affinities(mem: &[u8], rsdp_gpa: u64) -> Vec<super::srat::MemoryAffinity> {
+    find_table(mem, rsdp_gpa, b"SRAT")
+        .and_then(|gpa| table_at(mem, gpa))
+        .map(super::srat::memory_affinities)
+        .unwrap_or_default()
+}
+
+/// Discover the CPU→NUMA-node bindings from the firmware's SRAT (Phase 6.3):
+/// which APIC ID belongs to which proximity domain.
+///
+/// Locates the SRAT via [`find_table`] and parses its enabled Processor Local
+/// APIC Affinity structures with [`cpu_affinities`](super::srat::cpu_affinities).
+/// Empty if no SRAT is present.
+#[must_use]
+pub fn host_cpu_affinities(mem: &[u8], rsdp_gpa: u64) -> Vec<super::srat::CpuAffinity> {
+    find_table(mem, rsdp_gpa, b"SRAT")
+        .and_then(|gpa| table_at(mem, gpa))
+        .map(super::srat::cpu_affinities)
+        .unwrap_or_default()
+}
+
 /// The host machine's topology as discovered from its ACPI tables — the input to
 /// building Enlil's own device tree on the bare-metal boot path (Phase 6.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
