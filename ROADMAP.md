@@ -181,6 +181,7 @@
   - [x] PMU leaf 0xA + AMD topology triad (0x8000_0008 NC, 0x8000_001D cache sharing, 0x8000_001E SMT)
   - [x] Install the CPUID identity leaves from the stealth table (upsert_identity_leaves folds leaf-0 vendor string, leaf-1 FMS, brand 0x8000_0002-4 into apply_topology_stealth so the guest identity matches the topology/PMU/frequency view)
   - [ ] Cross-vendor identity at runtime: presenting a different vendor (e.g. Intel-on-AMD) needs vendor-appropriate MSR emulation before it is safe — the identity install exists but the live from_host table stays same-vendor
+  - [ ] Verify the guest sees Invariant TSC (CPUID 0x8000_0007 EDX[8]): CpuidStealthTable installs no explicit 0x8000_0007 leaf, so lookup() returns zero there — confirm the applied KVM CPUID2 still presents EDX[8] set (host passthrough) and is not zeroed by the stealth apply path; a modern CPU without Invariant TSC is itself a detection tell (stealth::detection can gain an advertises_invariant_tsc primitive + a real-KVM assertion once confirmed)
 - [x] 5.4 Timing stealth — TSC offsetting, constant-time CPUID table, APERF/MPERF + PMC + LBR shadowing
   - [x] Shadow IA32_APERF/MPERF counters advancing at model rate, hiding VMEXIT overhead (VcpuTimingState)
   - [x] RDPMC / PMC MSR shadowing (Intel + AMD blocks) via PmcState/PmcRateModel
