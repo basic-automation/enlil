@@ -112,6 +112,107 @@ impl PciFunction {
     }
 }
 
+/// A decoded PCI Base Address Register (BAR).
+///
+/// Only the base address and kind are recovered here — a BAR's *size* is
+/// discovered by writing all-ones and reading back the writable bits, which
+/// mutates config space and so belongs to the live bare-metal path, not this
+/// read-only walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bar {
+    /// A memory-mapped BAR at `base`. `is_64bit` BARs consume two consecutive
+    /// slots (this one holds the low 32 bits, the next the high 32).
+    Memory {
+        /// Physical base address (low bits masked off).
+        base: u64,
+        /// Whether this is a 64-bit BAR (type bits `10`).
+        is_64bit: bool,
+        /// Whether the region is prefetchable (bit 3).
+        prefetchable: bool,
+    },
+    /// An I/O-space BAR at port `base`.
+    Io {
+        /// I/O port base (low two bits masked off).
+        base: u32,
+    },
+    /// A BAR programmed to zero — unimplemented or not yet assigned.
+    Unimplemented,
+}
+
+/// Decode the BARs of one function from its config space.
+///
+/// Returns one [`Bar`] per implemented slot in ascending order. A general
+/// device (header layout 0x00) has up to six BAR slots; a PCI-to-PCI bridge
+/// (0x01) has two; other header types have none. A 64-bit memory BAR occupies
+/// two slots and is reported once, with the following slot consumed. Slots
+/// whose bytes fall outside the memory image stop the decode.
+#[must_use]
+pub fn read_bars(mem: &[u8], alloc: &McfgAllocation, func: &PciFunction) -> Vec<Bar> {
+    let slots = match func.header_layout() {
+        0x00 => 6,
+        0x01 => 2,
+        _ => 0,
+    };
+    let Some(base) = function_base(alloc, func.bus, func.device, func.function) else {
+        return Vec::new();
+    };
+    let mut bars = Vec::new();
+    let mut i = 0u64;
+    while i < slots {
+        let Some(raw) = read_u32(mem, base + u64::from(cfg::BAR0) + i * 4) else {
+            break;
+        };
+        if raw == 0 {
+            bars.push(Bar::Unimplemented);
+            i += 1;
+        } else if raw & 0x1 != 0 {
+            bars.push(Bar::Io { base: raw & !0x3 });
+            i += 1;
+        } else {
+            let prefetchable = raw & 0x8 != 0;
+            let is_64bit = (raw >> 1) & 0x3 == 0x2;
+            let low = u64::from(raw & !0xF);
+            if is_64bit {
+                // Consume the high dword; a missing high slot means the image
+                // is truncated — stop rather than guess.
+                let Some(high) = read_u32(mem, base + u64::from(cfg::BAR0) + (i + 1) * 4) else {
+                    break;
+                };
+                bars.push(Bar::Memory {
+                    base: (u64::from(high) << 32) | low,
+                    is_64bit,
+                    prefetchable,
+                });
+                i += 2;
+            } else {
+                bars.push(Bar::Memory {
+                    base: low,
+                    is_64bit,
+                    prefetchable,
+                });
+                i += 1;
+            }
+        }
+    }
+    bars
+}
+
+/// The MMIO base address of an xHCI controller's register set — BAR0, the
+/// controller's memory-mapped register window per the xHCI spec.
+///
+/// Returns `None` if `func` is not an xHCI controller or its first BAR is not
+/// a memory BAR (an I/O or unimplemented BAR0 is not a valid xHCI mapping).
+#[must_use]
+pub fn xhci_mmio_base(mem: &[u8], alloc: &McfgAllocation, func: &PciFunction) -> Option<u64> {
+    if !func.is_xhci() {
+        return None;
+    }
+    match read_bars(mem, alloc, func).first() {
+        Some(&Bar::Memory { base, .. }) => Some(base),
+        _ => None,
+    }
+}
+
 /// The physical address of a function's config space within an ECAM window,
 /// or `None` if the bus falls outside the window's decoded range.
 fn function_base(alloc: &McfgAllocation, bus: u8, device: u8, function: u8) -> Option<u64> {
@@ -136,6 +237,16 @@ fn read_u16(mem: &[u8], addr: u64) -> Option<u16> {
     let lo = read_u8(mem, addr)?;
     let hi = read_u8(mem, addr + 1)?;
     Some(u16::from_le_bytes([lo, hi]))
+}
+
+/// Read a little-endian `u32` at a physical address, or `None` if any byte
+/// lies outside the image.
+fn read_u32(mem: &[u8], addr: u64) -> Option<u32> {
+    let b0 = read_u8(mem, addr)?;
+    let b1 = read_u8(mem, addr + 1)?;
+    let b2 = read_u8(mem, addr + 2)?;
+    let b3 = read_u8(mem, addr + 3)?;
+    Some(u32::from_le_bytes([b0, b1, b2, b3]))
 }
 
 /// Read the config-space header of one function, returning `None` if the
@@ -208,6 +319,39 @@ pub fn walk_ecam_allocations(mem: &[u8], allocs: &[McfgAllocation]) -> Vec<PciFu
         .collect()
 }
 
+/// A discovered xHCI USB host controller: the PCI function and its BAR0 MMIO
+/// register base, if that BAR decodes to a memory window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XhciController {
+    /// The PCI function.
+    pub function: PciFunction,
+    /// The controller's MMIO register base (BAR0), or `None` if BAR0 is not a
+    /// memory BAR (e.g. firmware has not assigned it).
+    pub mmio_base: Option<u64>,
+}
+
+/// Discover every xHCI (USB 3.x) host controller across all ECAM windows,
+/// pairing each with its BAR0 MMIO base — the "PCI enum to xHCI BARs" step
+/// the USB routing engine and the bare-metal xHCI driver (Phase 6.5) consume.
+#[must_use]
+pub fn find_xhci_controllers(mem: &[u8], allocs: &[McfgAllocation]) -> Vec<XhciController> {
+    walk_ecam_allocations(mem, allocs)
+        .into_iter()
+        .filter(PciFunction::is_xhci)
+        .map(|function| {
+            // BAR0 is decoded from the window whose bus range contains the
+            // function; windows that do not cover the bus return `None`.
+            let mmio_base = allocs
+                .iter()
+                .find_map(|alloc| xhci_mmio_base(mem, alloc, &function));
+            XhciController {
+                function,
+                mmio_base,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +376,12 @@ mod tests {
         mem[base + usize::from(cfg::HEADER_TYPE)] = header_type;
     }
 
+    /// Write a raw 32-bit BAR value into a function's config space.
+    fn put_bar(mem: &mut [u8], fn_base: usize, index: usize, value: u32) {
+        let off = fn_base + usize::from(cfg::BAR0) + index * 4;
+        mem[off..off + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
     /// The ECAM function offset for base address 0.
     fn off(device: u8, function: u8) -> usize {
         (usize::from(device) << 15) | (usize::from(function) << 12)
@@ -247,10 +397,17 @@ mod tests {
         put_function(&mut mem, off(0, 0), 0x8086, 0x29C0, 0x06, 0x00, 0x00, 0x00);
         // 00:02.0 VGA display controller, multifunction (header bit 7).
         put_function(&mut mem, off(2, 0), 0x8086, 0x2918, 0x03, 0x00, 0x00, 0x80);
+        // BAR0: 32-bit non-prefetchable memory at 0xF600_0000; BAR1: I/O at 0xE000.
+        put_bar(&mut mem, off(2, 0), 0, 0xF600_0000);
+        put_bar(&mut mem, off(2, 0), 1, 0xE000 | 0x1);
         // 00:02.1 audio device — only reachable because 02.0 is multifunction.
         put_function(&mut mem, off(2, 1), 0x8086, 0x2668, 0x04, 0x03, 0x00, 0x00);
         // 00:04.0 xHCI USB 3 controller (class 0x0C / sub 0x03 / prog-IF 0x30).
         put_function(&mut mem, off(4, 0), 0x1912, 0x0015, 0x0C, 0x03, 0x30, 0x00);
+        // BAR0: 64-bit non-prefetchable memory at 0x0000_0004_F700_0000
+        // (low dword carries base bits 31:4 | type 0b10; high dword bits 63:32).
+        put_bar(&mut mem, off(4, 0), 0, 0xF700_0000 | 0x4);
+        put_bar(&mut mem, off(4, 0), 1, 0x0000_0004);
         // 00:05.0 left zeroed -> Vendor 0x0000 -> treated as absent.
         (mem, McfgAllocation::standard(0))
     }
@@ -296,6 +453,74 @@ mod tests {
         assert!(xhci.is_xhci());
         assert_eq!(xhci.vendor_id, 0x1912);
         assert_eq!(xhci.device_id, 0x0015);
+    }
+
+    #[test]
+    fn decodes_a_64bit_memory_bar_and_finds_the_xhci_mmio_base() {
+        let (mem, alloc) = synthetic_ecam();
+        let xhci = walk_ecam(&mem, &alloc)
+            .into_iter()
+            .find(|f| f.bdf() == (0, 4, 0))
+            .unwrap();
+
+        let bars = read_bars(&mem, &alloc, &xhci);
+        // BAR0 is a 64-bit memory BAR occupying two slots, reported once; the
+        // remaining two slots (0x18/0x24 region: indices 2-5, minus the one
+        // the 64-bit BAR consumed) are unprogrammed.
+        assert_eq!(
+            bars[0],
+            Bar::Memory {
+                base: 0x0000_0004_F700_0000,
+                is_64bit: true,
+                prefetchable: false,
+            }
+        );
+        assert!(bars[1..].iter().all(|b| *b == Bar::Unimplemented));
+        assert_eq!(bars.len(), 5); // 1 (64-bit pair) + 4 unprogrammed
+        assert_eq!(
+            xhci_mmio_base(&mem, &alloc, &xhci),
+            Some(0x0000_0004_F700_0000)
+        );
+    }
+
+    #[test]
+    fn decodes_memory_and_io_bars() {
+        let (mem, alloc) = synthetic_ecam();
+        let vga = walk_ecam(&mem, &alloc)
+            .into_iter()
+            .find(|f| f.bdf() == (0, 2, 0))
+            .unwrap();
+        let bars = read_bars(&mem, &alloc, &vga);
+        assert_eq!(
+            bars[0],
+            Bar::Memory {
+                base: 0xF600_0000,
+                is_64bit: false,
+                prefetchable: false,
+            }
+        );
+        assert_eq!(bars[1], Bar::Io { base: 0xE000 });
+        // The remaining four slots are unprogrammed.
+        assert_eq!(bars[2..], [Bar::Unimplemented; 4]);
+    }
+
+    #[test]
+    fn finds_xhci_controllers_with_their_mmio_base() {
+        let (mem, alloc) = synthetic_ecam();
+        let controllers = find_xhci_controllers(&mem, &[alloc]);
+        assert_eq!(controllers.len(), 1);
+        assert_eq!(controllers[0].function.bdf(), (0, 4, 0));
+        assert_eq!(controllers[0].mmio_base, Some(0x0000_0004_F700_0000));
+    }
+
+    #[test]
+    fn xhci_mmio_base_is_none_for_a_non_xhci_function() {
+        let (mem, alloc) = synthetic_ecam();
+        let vga = walk_ecam(&mem, &alloc)
+            .into_iter()
+            .find(|f| f.bdf() == (0, 2, 0))
+            .unwrap();
+        assert_eq!(xhci_mmio_base(&mem, &alloc, &vga), None);
     }
 
     #[test]

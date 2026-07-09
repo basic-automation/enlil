@@ -121,6 +121,22 @@ pub fn host_pci_functions(mem: &[u8], rsdp_gpa: u64) -> Vec<crate::pci_discovery
     crate::pci_discovery::walk_ecam_allocations(mem, &allocations)
 }
 
+/// Discover the host's xHCI USB controllers by walking the ECAM windows
+/// (Phase 6.3 "USB controller discovery").
+///
+/// Finds the MCFG's ECAM allocations and returns every xHCI function paired
+/// with its BAR0 MMIO base via
+/// [`find_xhci_controllers`](crate::pci_discovery::find_xhci_controllers).
+/// Empty if the firmware exposes no MCFG or no xHCI controller.
+#[must_use]
+pub fn host_xhci_controllers(
+    mem: &[u8],
+    rsdp_gpa: u64,
+) -> Vec<crate::pci_discovery::XhciController> {
+    let allocations = host_ecam_allocations(mem, rsdp_gpa);
+    crate::pci_discovery::find_xhci_controllers(mem, &allocations)
+}
+
 /// Which IOMMU the firmware advertises, discovered from the ACPI tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IommuKind {
