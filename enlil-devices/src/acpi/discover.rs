@@ -218,6 +218,19 @@ pub fn host_cpu_affinities(mem: &[u8], rsdp_gpa: u64) -> Vec<super::srat::CpuAff
         .unwrap_or_default()
 }
 
+/// Discover the NUMA node-to-node distance matrix from the firmware's SLIT
+/// (Phase 6.3 / fabric).
+///
+/// Locates the SLIT via [`find_table`] and parses its distance matrix with
+/// [`locality_distances`](super::slit::locality_distances). `None` if no SLIT
+/// is present or it is malformed — treat as a flat/single-node topology.
+#[must_use]
+pub fn host_numa_distances(mem: &[u8], rsdp_gpa: u64) -> Option<super::slit::LocalityMatrix> {
+    find_table(mem, rsdp_gpa, b"SLIT")
+        .and_then(|gpa| table_at(mem, gpa))
+        .and_then(super::slit::locality_distances)
+}
+
 /// The host machine's topology as discovered from its ACPI tables — the input to
 /// building Enlil's own device tree on the bare-metal boot path (Phase 6.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
