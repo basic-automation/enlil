@@ -6,12 +6,13 @@
 //! PDPT → PD chain inline; this module is the reusable, tested primitive.
 //!
 //! It builds an **identity map** (guest/host virtual address == physical
-//! address) out of 2 MiB huge pages, which need only three levels — PML4 →
-//! PDPT → PD, with the PD entries as huge-page leaves — so no PT level or
-//! per-4-KiB entry is required for a straight identity map. The tables are
-//! written into a caller-provided memory image at a caller-chosen base, and
-//! the returned [`PageTableLayout`] carries the `cr3` value (the PML4 physical
-//! address) to load.
+//! address) two ways: [`build_identity_map_2mib`] uses 2 MiB huge pages (three
+//! levels — PML4 → PDPT → PD huge-leaves — the fast path for a large straight
+//! map), while [`build_identity_map_4kib`] uses the full four levels for
+//! fine-grained 4 KiB pages and supports **guard pages** (left not-present so a
+//! touch faults). The tables are written into a caller-provided memory image at
+//! a caller-chosen base, and the returned [`PageTableLayout`] carries the `cr3`
+//! value (the PML4 physical address) to load.
 //!
 //! Everything here is pure address arithmetic over a byte buffer — no backend
 //! detail — so it serves both the Linux/KVM dev path and the bare-metal target.
@@ -89,12 +90,21 @@ pub const fn huge_2mib_entry(phys: u64, flags: u64) -> u64 {
     (phys & HUGE_2MIB_ADDR_MASK) | flags | flags::HUGE_PAGE
 }
 
+/// A 4-KiB page-table entry (PTE) mapping `phys` (4-KiB aligned; low bits
+/// masked) with `flags`. Unlike [`huge_2mib_entry`] this is a leaf without the
+/// [`HUGE_PAGE`](flags::HUGE_PAGE) bit — the terminal level of a 4-KiB map.
+#[must_use]
+pub const fn pte_entry(phys: u64, flags: u64) -> u64 {
+    (phys & TABLE_ADDR_MASK) | flags
+}
+
 /// Where a built page-table hierarchy lives and what to load into `CR3`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageTableLayout {
     /// The value to load into `CR3` — the PML4's physical (guest) address.
     pub cr3: u64,
-    /// Number of 4-KiB tables written (PML4 + PDPT + the PDs).
+    /// Number of 4-KiB tables written (e.g. PML4 + PDPT + the PDs for a 2 MiB
+    /// map, or PML4 + PDPT + PD + PT for a 4 KiB map).
     pub table_count: usize,
     /// Total bytes the tables occupy (`table_count * 4096`).
     pub bytes: usize,
@@ -113,6 +123,17 @@ pub enum PagingError {
     MapTooLarge {
         /// The number of page directories the map would need.
         num_pd: u64,
+    },
+    /// A 4-KiB map requested more pages than a single page table holds (> 512,
+    /// i.e. > 2 MiB), which the single-PT 4-KiB builder does not lay out yet.
+    TooManyPages {
+        /// The number of 4-KiB pages requested.
+        requested: u64,
+    },
+    /// A guard-page index fell outside the mapped range.
+    GuardOutOfRange {
+        /// The offending page index.
+        index: u64,
     },
     /// The tables would run past the end of the memory image.
     TablesExceedMemory {
@@ -227,6 +248,105 @@ pub fn build_identity_map_2mib(
     Ok(PageTableLayout {
         cr3: pml4_gpa,
         table_count: usize::try_from(table_count).expect("table_count fits usize"),
+        bytes: region_usize,
+    })
+}
+
+/// Build a 4-KiB-granular identity map of the first `num_pages` pages
+/// (`[0, num_pages * 4 KiB)`), writing the PML4/PDPT/PD/PT tables into `mem` at
+/// `tables_base_gpa`, and leaving each page in `guard_pages` **not present** so
+/// a touch faults — the guard-page half of item 1.3's "mmap-like semantics,
+/// guard pages".
+///
+/// Unlike [`build_identity_map_2mib`] this maps at 4-KiB granularity, so it uses
+/// the full four levels (PML4 → PDPT → PD → PT). This first slice covers up to
+/// one page table (512 pages / 2 MiB) — enough for a guarded stack or a small
+/// fine-grained region; larger 4-KiB maps (multiple PTs) are a later slice.
+/// `leaf_flags` are OR'd into each mapped page (with [`PRESENT`](flags::PRESENT)
+/// added); guard pages are written as zero (not present).
+///
+/// # Errors
+/// - [`PagingError::EmptyRegion`] if `num_pages == 0`;
+/// - [`PagingError::UnalignedBase`] if `tables_base_gpa` is not 4-KiB aligned;
+/// - [`PagingError::TooManyPages`] if `num_pages > 512`;
+/// - [`PagingError::GuardOutOfRange`] if a guard index is `>= num_pages`;
+/// - [`PagingError::TablesExceedMemory`] if the four tables do not fit in `mem`.
+pub fn build_identity_map_4kib(
+    mem: &mut [u8],
+    tables_base_gpa: u64,
+    num_pages: u64,
+    leaf_flags: u64,
+    guard_pages: &[u64],
+) -> Result<PageTableLayout, PagingError> {
+    if num_pages == 0 {
+        return Err(PagingError::EmptyRegion);
+    }
+    if tables_base_gpa & (PAGE_SIZE - 1) != 0 {
+        return Err(PagingError::UnalignedBase);
+    }
+    if num_pages > TABLE_ENTRIES {
+        return Err(PagingError::TooManyPages {
+            requested: num_pages,
+        });
+    }
+    for &g in guard_pages {
+        if g >= num_pages {
+            return Err(PagingError::GuardOutOfRange { index: g });
+        }
+    }
+
+    // PML4 + PDPT + PD + PT.
+    const TABLE_COUNT: u64 = 4;
+    let region = TABLE_COUNT * PAGE_SIZE;
+    let base = usize::try_from(tables_base_gpa).map_err(|_| PagingError::TablesExceedMemory {
+        needed: usize::MAX,
+        have: mem.len(),
+    })?;
+    let region_usize = usize::try_from(region).map_err(|_| PagingError::TablesExceedMemory {
+        needed: usize::MAX,
+        have: mem.len(),
+    })?;
+    let end = base
+        .checked_add(region_usize)
+        .ok_or(PagingError::TablesExceedMemory {
+            needed: usize::MAX,
+            have: mem.len(),
+        })?;
+    if end > mem.len() {
+        return Err(PagingError::TablesExceedMemory {
+            needed: end,
+            have: mem.len(),
+        });
+    }
+    mem[base..end].fill(0);
+
+    let table_flags = flags::PRESENT | flags::WRITABLE;
+    let pml4_gpa = tables_base_gpa;
+    let pdpt_gpa = tables_base_gpa + PAGE_SIZE;
+    let pd_gpa = tables_base_gpa + 2 * PAGE_SIZE;
+    let pt_gpa = tables_base_gpa + 3 * PAGE_SIZE;
+
+    write_entry(mem, pml4_gpa, 0, table_entry(pdpt_gpa, table_flags));
+    write_entry(mem, pdpt_gpa, 0, table_entry(pd_gpa, table_flags));
+    write_entry(mem, pd_gpa, 0, table_entry(pt_gpa, table_flags));
+
+    let leaf = leaf_flags | flags::PRESENT;
+    for page in 0..num_pages {
+        if guard_pages.contains(&page) {
+            continue; // leave the PTE zero → not present → guard page
+        }
+        let phys = page * PAGE_SIZE;
+        write_entry(
+            mem,
+            pt_gpa,
+            usize::try_from(page).expect("page < 512"),
+            pte_entry(phys, leaf),
+        );
+    }
+
+    Ok(PageTableLayout {
+        cr3: pml4_gpa,
+        table_count: usize::try_from(TABLE_COUNT).expect("4 fits usize"),
         bytes: region_usize,
     })
 }
@@ -346,6 +466,69 @@ mod tests {
         assert_eq!(entry & flags::WRITABLE, flags::WRITABLE);
         assert_eq!(entry & flags::PRESENT, flags::PRESENT);
         assert_eq!(entry & flags::HUGE_PAGE, flags::HUGE_PAGE);
+    }
+
+    #[test]
+    fn maps_4kib_pages_with_a_guard_hole() {
+        let base = 0x1_0000u64;
+        let mut mem = vec![0u8; 0x1_5000];
+        // 8 pages, with page 3 left as a guard (not present).
+        let layout = build_identity_map_4kib(&mut mem, base, 8, flags::WRITABLE, &[3]).unwrap();
+        assert_eq!(layout.cr3, base);
+        assert_eq!(layout.table_count, 4); // PML4 + PDPT + PD + PT
+
+        let pml4 = base;
+        let pdpt = base + 0x1000;
+        let pd = base + 0x2000;
+        let pt = base + 0x3000;
+        assert_eq!(
+            read_entry(&mem, pml4, 0),
+            table_entry(pdpt, flags::PRESENT | flags::WRITABLE)
+        );
+        assert_eq!(
+            read_entry(&mem, pd, 0),
+            table_entry(pt, flags::PRESENT | flags::WRITABLE)
+        );
+        // Page 0 and 2 are present 4-KiB leaves at their identity address.
+        assert_eq!(
+            read_entry(&mem, pt, 0),
+            pte_entry(0, flags::PRESENT | flags::WRITABLE)
+        );
+        assert_eq!(
+            read_entry(&mem, pt, 2),
+            pte_entry(2 * 4096, flags::PRESENT | flags::WRITABLE)
+        );
+        // The guard page (3) is not present.
+        assert_eq!(read_entry(&mem, pt, 3), 0);
+        assert_eq!(read_entry(&mem, pt, 3) & flags::PRESENT, 0);
+        // Pages beyond the mapped 8 are also not present.
+        assert_eq!(read_entry(&mem, pt, 8) & flags::PRESENT, 0);
+    }
+
+    #[test]
+    fn rejects_bad_4kib_inputs() {
+        let mut mem = vec![0u8; 0x5000];
+        assert_eq!(
+            build_identity_map_4kib(&mut mem, 0, 0, 0, &[]),
+            Err(PagingError::EmptyRegion)
+        );
+        assert_eq!(
+            build_identity_map_4kib(&mut mem, 0x100, 4, 0, &[]),
+            Err(PagingError::UnalignedBase)
+        );
+        assert!(matches!(
+            build_identity_map_4kib(&mut mem, 0, 513, 0, &[]),
+            Err(PagingError::TooManyPages { requested: 513 })
+        ));
+        assert!(matches!(
+            build_identity_map_4kib(&mut mem, 0, 4, 0, &[9]),
+            Err(PagingError::GuardOutOfRange { index: 9 })
+        ));
+        let mut tiny = vec![0u8; 0x2000];
+        assert!(matches!(
+            build_identity_map_4kib(&mut tiny, 0, 4, 0, &[]),
+            Err(PagingError::TablesExceedMemory { .. })
+        ));
     }
 
     #[test]
