@@ -93,6 +93,22 @@ pub fn host_cpu_count(mem: &[u8], rsdp_gpa: u64) -> Option<usize> {
     Some(super::madt::count_enabled_cpus(madt))
 }
 
+/// Discover the enabled processors' APIC IDs from the firmware's MADT
+/// (Phase 6.3).
+///
+/// Locates the MADT (signature `APIC`) via [`find_table`] and lists the enabled
+/// processors' APIC/x2APIC IDs with
+/// [`enabled_apic_ids`](super::madt::enabled_apic_ids). Empty if no MADT is
+/// present. The length equals [`host_cpu_count`]; the IDs let a discovered CPU be
+/// matched to its NUMA node from the SRAT ([`host_cpu_affinities`]).
+#[must_use]
+pub fn host_apic_ids(mem: &[u8], rsdp_gpa: u64) -> Vec<u32> {
+    find_table(mem, rsdp_gpa, b"APIC")
+        .and_then(|gpa| table_at(mem, gpa))
+        .map(super::madt::enabled_apic_ids)
+        .unwrap_or_default()
+}
+
 /// Discover the `PCIe` ECAM allocations from the firmware's MCFG (Phase 6.3).
 ///
 /// Locates the MCFG (signature `MCFG`) via [`find_table`] and parses its
