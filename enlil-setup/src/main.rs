@@ -22,6 +22,7 @@ pub struct HardwareInfo {
     pub gpus: Vec<String>,
     pub nvme_drives: Vec<String>,
     pub usb_controllers: Vec<String>,
+    pub nics: Vec<String>,
     pub iommu_groups: Vec<String>,
 }
 
@@ -36,6 +37,7 @@ impl std::fmt::Display for HardwareInfo {
             "  USB controllers : {}",
             format_list(&self.usb_controllers)
         )?;
+        writeln!(f, "  NICs            : {}", format_list(&self.nics))?;
         write!(f, "  IOMMU groups    : {}", format_list(&self.iommu_groups))
     }
 }
@@ -87,6 +89,7 @@ fn detect_hardware_linux() -> HardwareInfo {
     hw.iommu_groups = detect_iommu_groups();
     hw.gpus = detect_pci_devices(is_display_controller);
     hw.usb_controllers = detect_pci_devices(is_usb_controller);
+    hw.nics = detect_pci_devices(is_network_controller);
     hw
 }
 
@@ -137,6 +140,17 @@ fn is_usb_controller(class: &str) -> bool {
         .trim()
         .strip_prefix("0x")
         .is_some_and(|c| c.starts_with("0c03"))
+}
+
+/// Whether a PCI `class` string is a network controller — base class `0x02`,
+/// which is how NICs (Ethernet/Wi-Fi) enumerate. Guests need these for their
+/// virtio-net uplink / SR-IOV NIC passthrough.
+#[cfg(any(target_os = "linux", test))]
+fn is_network_controller(class: &str) -> bool {
+    class
+        .trim()
+        .strip_prefix("0x")
+        .is_some_and(|c| c.starts_with("02"))
 }
 
 /// Label a PCI device `vendor:device [BDF]` from its sysfs `vendor`/`device`
@@ -261,6 +275,7 @@ fn detect_hardware_stub() -> HardwareInfo {
             "Samsung 990 Pro 2TB [nvme1]".into(),
         ],
         usb_controllers: vec!["xHCI Host Controller [8086:a36d]".into()],
+        nics: vec!["Intel I225-V 2.5GbE [8086:15f3]".into()],
         iommu_groups: vec![
             "Group 0: Host bridge".into(),
             "Group 1: GPU 10de:2684".into(),
@@ -423,6 +438,7 @@ mod tests {
             gpus: vec![],
             nvme_drives: vec![],
             usb_controllers: vec![],
+            nics: vec![],
             iommu_groups: vec![],
         };
         let config = run_wizard(&hw);
@@ -469,6 +485,14 @@ mod tests {
         assert!(is_usb_controller("0x0c0330")); // xHCI
         assert!(!is_usb_controller("0x030000")); // display, not USB
         assert!(!is_usb_controller("0x0c0500")); // SMBus (0c05), not USB
+    }
+
+    #[test]
+    fn classifies_pci_network_controllers() {
+        assert!(is_network_controller("0x020000")); // Ethernet
+        assert!(is_network_controller("0x028000\n")); // other network, trailing newline
+        assert!(!is_network_controller("0x030000")); // display, not network
+        assert!(!is_network_controller("0x0c0330")); // USB, not network
     }
 
     #[test]
