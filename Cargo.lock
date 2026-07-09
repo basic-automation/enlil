@@ -330,6 +330,7 @@ dependencies = [
  "anyhow",
  "enlil-config",
  "enlil-devices",
+ "enlil-platform",
  "event-manager",
  "kvm-bindings",
  "kvm-ioctls",

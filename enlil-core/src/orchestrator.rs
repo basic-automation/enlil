@@ -174,9 +174,10 @@ mod linux {
         /// and a 64-bit ACPI S3 resume trampoline run in.
         ///
         /// Requires `load_base == 0` (so guest-physical addresses equal RAM
-        /// offsets and line up with the identity map). The page tables occupy
-        /// `[0x4000, 0x6008)`, so the payload must not reach `0x4000`, and the RAM
-        /// must be at least that large.
+        /// offsets and line up with the identity map). The three page tables
+        /// (built by [`enlil_platform::memory::paging::build_identity_map_2mib`])
+        /// occupy `[0x4000, 0x7000)`, so the payload must not reach `0x4000`, and
+        /// the RAM must be at least that large.
         ///
         /// # Errors
         /// Returns [`Error::Config`] if `load_base != 0`, the payload overlaps the
@@ -184,9 +185,11 @@ mod linux {
         /// [`prepare_real_mode`](Self::prepare_real_mode) but propagating
         /// `prepare_long_mode_vcpu`.
         pub fn prepare_long_mode(spec: GuestBootSpec) -> Result<Self> {
-            const PML4_GPA: u64 = 0x4000;
-            const PDPT_GPA: u64 = 0x5000;
-            const PD_GPA: u64 = 0x6000;
+            use enlil_platform::memory::paging::{self, flags};
+
+            // Page tables live just above the payload's low region; the builder
+            // lays PML4 → PDPT → PD contiguously from this base.
+            const TABLES_GPA: u64 = 0x4000;
 
             if spec.load_base != 0 {
                 return Err(Error::Config(format!(
@@ -195,32 +198,27 @@ mod linux {
                 )));
             }
             let image_end = spec.entry as usize + spec.image.len();
-            if image_end > PML4_GPA as usize {
+            if image_end > TABLES_GPA as usize {
                 return Err(Error::Config(format!(
                     "long-mode payload ends at {image_end:#x}, overlapping the identity \
-                     page tables at {PML4_GPA:#x}"
-                )));
-            }
-            if spec.ram_bytes < PD_GPA as usize + 8 {
-                return Err(Error::Config(format!(
-                    "long-mode boot needs at least {} bytes of RAM for the page tables",
-                    PD_GPA + 8
+                     page tables at {TABLES_GPA:#x}"
                 )));
             }
 
             let (mut run, mut ram, entry, load_base) = Self::assemble(spec)?;
-            {
-                let mem = ram.as_mut_slice();
-                let mut put = |gpa: u64, val: u64| {
-                    let o = gpa as usize;
-                    mem[o..o + 8].copy_from_slice(&val.to_le_bytes());
-                };
-                put(PML4_GPA, PDPT_GPA | 0x3); // present | write
-                put(PDPT_GPA, PD_GPA | 0x3);
-                put(PD_GPA, 0x83); // present | write | PS (2 MiB page mapping [0, 2 MiB))
-            }
+            // Identity-map the low 2 MiB (covering the payload and the tables
+            // themselves) with the reusable page-table builder (item 1.3).
+            let layout = paging::build_identity_map_2mib(
+                ram.as_mut_slice(),
+                TABLES_GPA,
+                2 * 1024 * 1024,
+                flags::WRITABLE,
+            )
+            .map_err(|e| {
+                Error::Config(format!("long-mode boot could not build page tables: {e:?}"))
+            })?;
             run.backend_mut()
-                .prepare_long_mode_vcpu(0, entry, PML4_GPA)?;
+                .prepare_long_mode_vcpu(0, entry, layout.cr3)?;
             Ok(Self {
                 run,
                 load_base,
