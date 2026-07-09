@@ -7,9 +7,12 @@
 //!
 //! Usage: `enlil-run <config.toml> <bzImage> [cmdline]`
 
-use std::path::Path;
 use std::process::ExitCode;
 
+#[cfg(target_os = "linux")]
+use std::path::Path;
+
+#[cfg(target_os = "linux")]
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
@@ -29,6 +32,19 @@ fn main() -> ExitCode {
     }
 }
 
+/// On a target with no host VMM backend (only `target_os = "linux"` ships the
+/// KVM backend today), the orchestrator cannot boot a guest. The binary still
+/// builds — so the workspace stays compilable on the Windows dev toolchain —
+/// but it exits with a clear message rather than pretending to run.
+#[cfg(not(target_os = "linux"))]
+fn main() -> ExitCode {
+    eprintln!(
+        "enlil-run requires the Linux/KVM host backend; this target has no host VMM backend yet."
+    );
+    ExitCode::FAILURE
+}
+
+#[cfg(target_os = "linux")]
 fn run(config_path: &str, kernel_path: &str, cmdline: &str) -> anyhow::Result<()> {
     let config = enlil_config::load_config(Path::new(config_path))?;
 
