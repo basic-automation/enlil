@@ -10,6 +10,7 @@
 //!   for small objects. Implemented in Phase 6.
 
 pub mod map;
+pub mod paging;
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::sync::atomic::{AtomicUsize, Ordering};
