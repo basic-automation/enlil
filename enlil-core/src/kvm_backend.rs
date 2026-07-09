@@ -3528,6 +3528,92 @@ mod tests {
         assert_eq!(echo.0, vec![0, 1]);
     }
 
+    #[test]
+    fn cpuid_stealth_preserves_invariant_tsc() {
+        // Transparency (LOCKED PRINCIPLE 1): a modern CPU always advertises
+        // Invariant TSC (CPUID 0x8000_0007:EDX[8]); a guest that finds it CLEAR
+        // has a detection tell. apply_topology_stealth patches KVM's supported
+        // CPUID rather than rebuilding from the (0x8000_0007-less) stealth
+        // table, so the host's Invariant-TSC bit must survive to the guest.
+        if !is_kvm_available() {
+            eprintln!("skipping cpuid_stealth_preserves_invariant_tsc: no /dev/kvm");
+            return;
+        }
+        // SAFETY: __cpuid is always available on x86_64.
+        let host_invariant_tsc = unsafe { core::arch::x86_64::__cpuid(0x8000_0007) }.edx & (1 << 8);
+        if host_invariant_tsc == 0 {
+            eprintln!(
+                "skipping cpuid_stealth_preserves_invariant_tsc: host does not expose Invariant TSC"
+            );
+            return;
+        }
+
+        // 16-bit real-mode blob: read CPUID 0x8000_0007 and emit EDX[8] on COM1.
+        //   66 B8 07 00 00 80   mov eax, 0x80000007
+        //   0F A2               cpuid
+        //   66 C1 EA 08         shr edx, 8       ; edx bit0 = Invariant TSC (EDX[8])
+        //   80 E2 01            and dl, 1
+        //   88 D0               mov al, dl
+        //   BA F8 03            mov dx, 0x3F8    ; COM1
+        //   EE                  out dx, al
+        //   F4                  hlt
+        #[rustfmt::skip]
+        let code: [u8; 22] = [
+            0x66, 0xB8, 0x07, 0x00, 0x00, 0x80,
+            0x0F, 0xA2,
+            0x66, 0xC1, 0xEA, 0x08,
+            0x80, 0xE2, 0x01,
+            0x88, 0xD0,
+            0xBA, 0xF8, 0x03,
+            0xEE,
+            0xF4,
+        ];
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu");
+        // The exact stealth the orchestrator applies before a guest runs.
+        let table = enlil_devices::stealth::cpuid::CpuidStealthTable::build(
+            &enlil_devices::stealth::cpuid::CpuidStealthConfig::from_host(1, 1),
+        );
+        backend
+            .apply_topology_stealth(&table)
+            .expect("apply cpuid stealth");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        struct EchoOut(Vec<u8>);
+        impl VmExitHandler for EchoOut {
+            fn io_out(&mut self, _port: u16, data: &[u8]) {
+                self.0.extend_from_slice(data);
+            }
+        }
+        let mut echo = EchoOut(Vec::new());
+
+        let mut halted = false;
+        for _ in 0..100 {
+            if backend.run_vcpu(0, &mut echo).expect("run vcpu") == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        assert_eq!(
+            echo.0,
+            vec![1],
+            "guest must see Invariant TSC (CPUID 0x8000_0007:EDX[8]) preserved through CPUID stealth"
+        );
+    }
+
     // apply_topology_stealth makes a guest see ITS OWN topology, not the host's.
     // KVM's supported leaf 0xB mirrors the host's logical-processor count; a
     // 2-vCPU guest reading leaf 0xB subleaf 1 EBX would otherwise find the host's
