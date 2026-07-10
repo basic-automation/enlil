@@ -337,6 +337,114 @@ pub fn build_identity_map_4kib(
     })
 }
 
+/// Build a 4-KiB-granular identity map of the first `num_pages` pages spanning
+/// **any number of page tables** (up to one PDPT / 512 GiB), with guard pages.
+///
+/// This is the multi-table generalization of [`build_identity_map_4kib`]: where
+/// that primitive stops at a single page table (512 pages / 2 MiB), this lays
+/// out one PT per 512 pages and one PD per 512 PTs, so it covers a full 4-KiB
+/// identity map up to a single PDPT's reach (512 PDs × 512 PTs × 512 pages =
+/// 512 GiB). The table region is laid out contiguously as PML4, PDPT, the PDs,
+/// then the PTs. Each page in `guard_pages` is left **not present** so a touch
+/// faults; `leaf_flags` are OR'd into every mapped leaf (with `PRESENT` added).
+///
+/// Use this for a fine-grained region larger than 2 MiB (a big guarded arena, a
+/// 4-KiB host mapping); prefer [`build_identity_map_2mib`] when 2 MiB huge-page
+/// granularity is acceptable, since it needs far fewer tables.
+///
+/// # Errors
+/// - [`PagingError::EmptyRegion`] if `num_pages == 0`;
+/// - [`PagingError::UnalignedBase`] if `tables_base_gpa` is not 4-KiB aligned;
+/// - [`PagingError::MapTooLarge`] if the map needs more than one PDPT (> 512
+///   GiB, i.e. more than 512 page directories);
+/// - [`PagingError::GuardOutOfRange`] if a guard index is `>= num_pages`;
+/// - [`PagingError::TablesExceedMemory`] if the tables do not fit in `mem`.
+pub fn build_identity_map_4kib_multi(
+    mem: &mut [u8],
+    tables_base_gpa: u64,
+    num_pages: u64,
+    leaf_flags: u64,
+    guard_pages: &[u64],
+) -> Result<PageTableLayout, PagingError> {
+    if num_pages == 0 {
+        return Err(PagingError::EmptyRegion);
+    }
+    if tables_base_gpa & (PAGE_SIZE - 1) != 0 {
+        return Err(PagingError::UnalignedBase);
+    }
+    let num_page_tables = num_pages.div_ceil(TABLE_ENTRIES);
+    let num_page_dirs = num_page_tables.div_ceil(TABLE_ENTRIES);
+    // One PDPT (512 entries) points at up to 512 PDs → 512 GiB; beyond that we
+    // would need more than one PML4 entry.
+    if num_page_dirs > TABLE_ENTRIES {
+        return Err(PagingError::MapTooLarge {
+            num_pd: num_page_dirs,
+        });
+    }
+    for &g in guard_pages {
+        if g >= num_pages {
+            return Err(PagingError::GuardOutOfRange { index: g });
+        }
+    }
+    // All three counts are now ≤ their table bounds, so the conversions never
+    // hit the fallback.
+    let num_page_tables = usize::try_from(num_page_tables).unwrap_or(usize::MAX);
+    let num_page_dirs = usize::try_from(num_page_dirs).unwrap_or(usize::MAX);
+    let num_pages = usize::try_from(num_pages).unwrap_or(usize::MAX);
+
+    let table_count = 2 + num_page_dirs + num_page_tables; // PML4 + PDPT + PDs + PTs
+    let (base, region_usize, end) = table_region(tables_base_gpa, table_count, mem.len())?;
+    // Unmapped/guard entries must read back not-present.
+    mem[base..end].fill(0);
+
+    let table_flags = flags::PRESENT | flags::WRITABLE;
+    let pdpt_gpa = tables_base_gpa + PAGE_SIZE;
+    let first_dir_gpa = tables_base_gpa + 2 * PAGE_SIZE;
+    let first_leaf_gpa = first_dir_gpa + (num_page_dirs as u64) * PAGE_SIZE;
+    let pdpt_off = base + PAGE_BYTES;
+    let first_dir_off = base + 2 * PAGE_BYTES;
+    let first_leaf_off = first_dir_off + num_page_dirs * PAGE_BYTES;
+
+    // PML4[0] → PDPT (a ≤512 GiB identity map lives entirely under PML4[0]).
+    write_entry(mem, base, table_entry(pdpt_gpa, table_flags));
+
+    // PDPT[k] → PD[k], one PD per 512 page tables (512 GiB).
+    for k in 0..num_page_dirs {
+        let dir_gpa = first_dir_gpa + (k as u64) * PAGE_SIZE;
+        write_entry(mem, pdpt_off + k * 8, table_entry(dir_gpa, table_flags));
+    }
+
+    // PD entries: the t-th page table (global index) lives in PD t/512 at slot
+    // t%512.
+    for t in 0..num_page_tables {
+        let leaf_gpa = first_leaf_gpa + (t as u64) * PAGE_SIZE;
+        let dir_off = first_dir_off + (t / 512) * PAGE_BYTES;
+        write_entry(
+            mem,
+            dir_off + (t % 512) * 8,
+            table_entry(leaf_gpa, table_flags),
+        );
+    }
+
+    // PT leaves: page p lives in PT p/512 at slot p%512, identity-mapped unless
+    // it is a guard page (left zero → not present).
+    let leaf = leaf_flags | flags::PRESENT;
+    for page in 0..num_pages {
+        if guard_pages.contains(&(page as u64)) {
+            continue;
+        }
+        let leaf_off = first_leaf_off + (page / 512) * PAGE_BYTES;
+        let phys = (page as u64) * PAGE_SIZE;
+        write_entry(mem, leaf_off + (page % 512) * 8, pte_entry(phys, leaf));
+    }
+
+    Ok(PageTableLayout {
+        cr3: tables_base_gpa,
+        table_count,
+        bytes: region_usize,
+    })
+}
+
 /// Write a little-endian `u64` entry at byte offset `off` in `mem`. The caller
 /// has validated the whole table region fits in `mem`.
 fn write_entry(mem: &mut [u8], off: usize, entry: u64) {
@@ -538,6 +646,107 @@ mod tests {
         assert!(matches!(
             build_identity_map_2mib(&mut big, 0, 513 * 1024 * 1024 * 1024, 0),
             Err(PagingError::MapTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn multi_pt_spans_more_than_one_page_table() {
+        // 600 pages (> 512) needs two PTs under one PD.
+        let base = 0x1_0000u64;
+        // table_count = PML4 + PDPT + 1 PD + 2 PTs = 5 → 5 * 0x1000, plus base.
+        let mut mem = vec![0u8; 0x2_0000];
+        let layout =
+            build_identity_map_4kib_multi(&mut mem, base, 600, flags::WRITABLE, &[3, 550]).unwrap();
+        assert_eq!(layout.cr3, base);
+        assert_eq!(layout.table_count, 5); // PML4 + PDPT + 1 PD + 2 PT
+
+        let pml4 = base;
+        let pdpt = base + 0x1000;
+        let pd = base + 0x2000;
+        let pt0 = base + 0x3000; // first page table (pages 0..512)
+        let pt1 = base + 0x4000; // second page table (pages 512..600)
+
+        assert_eq!(
+            read_entry(&mem, pml4, 0),
+            table_entry(pdpt, flags::PRESENT | flags::WRITABLE)
+        );
+        assert_eq!(
+            read_entry(&mem, pdpt, 0),
+            table_entry(pd, flags::PRESENT | flags::WRITABLE)
+        );
+        // PD[0] → PT0, PD[1] → PT1.
+        assert_eq!(
+            read_entry(&mem, pd, 0),
+            table_entry(pt0, flags::PRESENT | flags::WRITABLE)
+        );
+        assert_eq!(
+            read_entry(&mem, pd, 1),
+            table_entry(pt1, flags::PRESENT | flags::WRITABLE)
+        );
+        // Page 0 in PT0[0], page 511 in PT0[511], page 512 in PT1[0].
+        assert_eq!(
+            read_entry(&mem, pt0, 0),
+            pte_entry(0, flags::PRESENT | flags::WRITABLE)
+        );
+        assert_eq!(
+            read_entry(&mem, pt0, 511),
+            pte_entry(511 * 4096, flags::PRESENT | flags::WRITABLE)
+        );
+        assert_eq!(
+            read_entry(&mem, pt1, 0),
+            pte_entry(512 * 4096, flags::PRESENT | flags::WRITABLE)
+        );
+        // Page 599 (last) present in PT1[87]; page 600 (unmapped) not present.
+        assert_eq!(
+            read_entry(&mem, pt1, 87),
+            pte_entry(599 * 4096, flags::PRESENT | flags::WRITABLE)
+        );
+        assert_eq!(read_entry(&mem, pt1, 88) & flags::PRESENT, 0);
+        // Guard pages: 3 (in PT0) and 550 (in PT1[38]) are not present.
+        assert_eq!(read_entry(&mem, pt0, 3), 0);
+        assert_eq!(read_entry(&mem, pt1, 38), 0);
+    }
+
+    #[test]
+    fn multi_pt_matches_single_pt_for_small_maps() {
+        // For ≤ 512 pages the multi builder must produce the same 4 tables and
+        // the same entries as the single-PT primitive.
+        let base = 0x1_0000u64;
+        let mut a = vec![0u8; 0x1_5000];
+        let mut b = vec![0u8; 0x1_5000];
+        let la = build_identity_map_4kib(&mut a, base, 8, flags::WRITABLE, &[3]).unwrap();
+        let lb = build_identity_map_4kib_multi(&mut b, base, 8, flags::WRITABLE, &[3]).unwrap();
+        assert_eq!(la, lb);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn multi_pt_rejects_bad_inputs() {
+        let mut mem = vec![0u8; 0x8000];
+        assert_eq!(
+            build_identity_map_4kib_multi(&mut mem, 0, 0, 0, &[]),
+            Err(PagingError::EmptyRegion)
+        );
+        assert_eq!(
+            build_identity_map_4kib_multi(&mut mem, 0x100, 4, 0, &[]),
+            Err(PagingError::UnalignedBase)
+        );
+        assert!(matches!(
+            build_identity_map_4kib_multi(&mut mem, 0, 600, 0, &[601]),
+            Err(PagingError::GuardOutOfRange { index: 601 })
+        ));
+        // > 512 GiB (> 512 PDs) needs more than one PDPT: 513 PDs' worth of
+        // pages = 513 * 512 * 512.
+        let mut tiny = vec![0u8; 0x1000];
+        assert!(matches!(
+            build_identity_map_4kib_multi(&mut tiny, 0, 513 * 512 * 512, 0, &[]),
+            Err(PagingError::MapTooLarge { .. })
+        ));
+        // Tables do not fit.
+        let mut small = vec![0u8; 0x2000];
+        assert!(matches!(
+            build_identity_map_4kib_multi(&mut small, 0, 600, 0, &[]),
+            Err(PagingError::TablesExceedMemory { .. })
         ));
     }
 }
