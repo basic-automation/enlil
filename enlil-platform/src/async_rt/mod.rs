@@ -141,6 +141,52 @@ impl Executor {
     pub fn is_idle(&self) -> bool {
         self.queue.is_empty()
     }
+
+    /// Run the executor as a full I/O event loop over a [`Reactor`] and the
+    /// Linux [`EpollPoller`](epoll::EpollPoller).
+    ///
+    /// Each round drains every task that can make progress now
+    /// ([`run`](Self::run)); then, while any task is still parked on a source
+    /// registered with the reactor, it blocks in
+    /// [`EpollPoller::poll`](epoll::EpollPoller::poll), which marks the ready
+    /// descriptors' tokens and fires the waiting tasks' wakers (re-enqueuing
+    /// them), and loops. It returns once every task has completed and the
+    /// reactor holds no sources.
+    ///
+    /// This is item 1.6's "wire `EpollPoller::poll` into the executor's run
+    /// loop": the epoll source replaces the sourceless
+    /// [`Reactor::wait`](Reactor::wait) sleep fallback, so tasks block in the
+    /// kernel until real I/O readiness rather than polling on a timer.
+    ///
+    /// The call blocks the current thread. A task that parks on a source that
+    /// never becomes ready blocks here indefinitely, as any epoll event loop
+    /// does; a task must deregister its source from the reactor when it finishes
+    /// so the loop can terminate (the reactor emptying is the exit condition).
+    ///
+    /// # Errors
+    /// Propagates [`EpollPoller::poll`](epoll::EpollPoller::poll) errors (an
+    /// `epoll_wait` failure other than `EINTR`).
+    ///
+    /// # Panics
+    /// Panics if a task's [`Mutex`] is poisoned.
+    #[cfg(all(feature = "platform-linux", target_os = "linux"))]
+    pub fn run_with_poller(
+        &self,
+        reactor: &Reactor,
+        poller: &epoll::EpollPoller,
+    ) -> std::io::Result<()> {
+        loop {
+            // Drain every task that can run right now.
+            self.run();
+            // No task is parked on I/O → all work is complete.
+            if reactor.is_empty() {
+                return Ok(());
+            }
+            // Block in the kernel until a descriptor is ready; poll() fires the
+            // parked tasks' wakers, re-enqueuing them for the next drain.
+            poller.poll(reactor, None)?;
+        }
+    }
 }
 
 impl Default for Executor {
@@ -736,5 +782,79 @@ mod tests {
             vec!["high-1", "high-2", "normal-1", "normal-2", "low-1", "low-2"]
         );
         drop(result);
+    }
+
+    /// The epoll event loop: a task parks on a not-yet-readable pipe, the
+    /// executor blocks in `EpollPoller::poll`, and a byte written from another
+    /// thread wakes the task through the reactor so it completes — proving
+    /// `run_with_poller` drives real I/O readiness rather than the sourceless
+    /// sleep fallback.
+    #[cfg(all(feature = "platform-linux", target_os = "linux"))]
+    #[test]
+    fn run_with_poller_parks_on_epoll_and_resumes_on_readiness() {
+        use super::epoll::EpollPoller;
+        use std::os::unix::io::RawFd;
+        use std::task::Poll;
+
+        // A nonblocking pipe: the read returns EAGAIN until a byte is written,
+        // so the task genuinely parks (rather than completing on first poll).
+        let mut fds = [0 as RawFd; 2];
+        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+        assert_eq!(rc, 0, "pipe2: {}", std::io::Error::last_os_error());
+        let rd = fds[0];
+        let wr = fds[1];
+
+        let reactor = Arc::new(Reactor::new());
+        let poller = EpollPoller::new().expect("epoll");
+        let executor = Executor::new();
+        let done = Arc::new(AtomicBool::new(false));
+
+        // Register the read end before running so the first poll can park on it.
+        let token = reactor.register(usize::try_from(rd).expect("fd non-negative"));
+        poller.add_reader(rd, token).expect("add reader");
+
+        {
+            let reactor = reactor.clone();
+            let done = done.clone();
+            executor.spawn(async move {
+                std::future::poll_fn(move |cx| {
+                    let mut buf = [0u8; 1];
+                    // SAFETY: reading one byte into a stack buffer from our fd.
+                    let n = unsafe { libc::read(rd, buf.as_mut_ptr().cast(), 1) };
+                    if n == 1 {
+                        reactor.deregister(token);
+                        done.store(true, Ordering::SeqCst);
+                        Poll::Ready(())
+                    } else {
+                        // EAGAIN: arm the waker and wait for epoll readiness.
+                        reactor.set_waker(token, cx.waker().clone());
+                        Poll::Pending
+                    }
+                })
+                .await;
+            });
+        }
+
+        // Make the pipe readable shortly after the loop parks in epoll_wait.
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert_eq!(unsafe { libc::write(wr, [7u8].as_ptr().cast(), 1) }, 1);
+            unsafe { libc::close(wr) };
+        });
+
+        executor
+            .run_with_poller(&reactor, &poller)
+            .expect("event loop");
+        writer.join().unwrap();
+
+        assert!(
+            done.load(Ordering::SeqCst),
+            "task resumed and completed after the epoll wakeup"
+        );
+        assert!(
+            reactor.is_empty(),
+            "task deregistered its source on completion"
+        );
+        unsafe { libc::close(rd) };
     }
 }

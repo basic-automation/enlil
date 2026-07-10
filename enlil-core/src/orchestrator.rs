@@ -573,6 +573,48 @@ mod linux {
                     })?;
             self.resume_from_s3(facs_gpa)
         }
+
+        /// Run the boot vCPU, automatically resuming across ACPI S3
+        /// (suspend-to-RAM) transitions.
+        ///
+        /// Runs like [`run`](Self::run); if the guest commits an S3 suspend
+        /// (`LoopOutcome::Suspend(3)`), this discovers the FACS from the guest's
+        /// ACPI tables at `rsdp_gpa`, re-points the boot vCPU at the OS's waking
+        /// vector via [`resume_from_s3_via_rsdp`](Self::resume_from_s3_via_rsdp),
+        /// and runs again — up to `max_resumes` S3 cycles. This closes the loop
+        /// the run loop's `Suspend` return opened (item 5.7): a suspended guest
+        /// resumes itself instead of being torn down, the behavior a Windows
+        /// guest that advertises `_S3` expects.
+        ///
+        /// Any non-S3 outcome (halt, shutdown, reset, S4 hibernate — which
+        /// resumes from disk, not RAM — or the `max_entries` budget) ends the
+        /// run and is returned. `max_resumes` bounds a guest that suspends on
+        /// every wake: once it is hit, the last `Suspend(3)` is returned
+        /// unserviced rather than looping forever.
+        ///
+        /// # Errors
+        /// Propagates [`run`](Self::run) and
+        /// [`resume_from_s3_via_rsdp`](Self::resume_from_s3_via_rsdp).
+        pub fn run_resuming_s3(
+            &mut self,
+            reset_entry: u64,
+            max_entries: usize,
+            rsdp_gpa: u64,
+            max_resumes: usize,
+        ) -> Result<LoopOutcome> {
+            const S3: u8 = 3;
+            let mut outcome = self.run(reset_entry, max_entries)?;
+            let mut resumes = 0;
+            while matches!(outcome, LoopOutcome::Suspend(slp) if slp == S3) {
+                if resumes >= max_resumes {
+                    break;
+                }
+                self.resume_from_s3_via_rsdp(rsdp_gpa)?;
+                resumes += 1;
+                outcome = self.run(reset_entry, max_entries)?;
+            }
+            Ok(outcome)
+        }
     }
 
     /// Boot the first guest defined in `config` from a Linux `bzImage`, running it
@@ -726,6 +768,74 @@ mod tests {
         let outcome = guest.run(0x1000, 100).expect("run guest");
         assert_eq!(outcome, LoopOutcome::Halted, "guest halts after greeting");
         assert_eq!(&*sink.lock().unwrap(), b"K", "guest emitted its greeting");
+    }
+
+    #[test]
+    fn run_resuming_s3_auto_resumes_a_suspended_guest() {
+        use enlil_devices::acpi::facs::FacsBuilder;
+        use enlil_devices::acpi::fadt::FadtBuilder;
+        use enlil_devices::acpi::rsdp::RsdpBuilder;
+        use enlil_devices::acpi::xsdt::XsdtBuilder;
+
+        if !is_kvm_available() {
+            eprintln!("skipping run_resuming_s3_auto_resumes_a_suspended_guest: no /dev/kvm");
+            return;
+        }
+        // Guest RAM (based at gpa 0):
+        //   0x0000: boot payload — commit an S3 suspend via PM1a_CNT (0x604)
+        //   0x0800: resume payload — out 0x3F8,'R'; hlt (the waking vector)
+        //   0x1000: FACS, waking vector = 0x0800
+        //   0x2000: FADT, FIRMWARE_CTRL = 0x1000
+        //   0x4000: XSDT listing the FADT
+        //   0x5000: RSDP pointing at the XSDT
+        let mut image = vec![0u8; 0x5100];
+        // mov dx,0x604; mov ax,0x2C00 (SLP_TYP=3|SLP_EN); out dx,ax; hlt.
+        #[rustfmt::skip]
+        let boot: [u8; 8] = [0xBA, 0x04, 0x06, 0xB8, 0x00, 0x2C, 0xEF, 0xF4];
+        image[0x0..boot.len()].copy_from_slice(&boot);
+        #[rustfmt::skip]
+        let wake: [u8; 7] = [0xB0, 0x52, 0xBA, 0xF8, 0x03, 0xEE, 0xF4]; // mov al,'R'; mov dx,0x3F8; out; hlt
+        image[0x800..0x800 + wake.len()].copy_from_slice(&wake);
+        let mut facs = FacsBuilder::new().build();
+        facs[12..16].copy_from_slice(&0x800u32.to_le_bytes());
+        image[0x1000..0x1000 + facs.len()].copy_from_slice(&facs);
+        let fadt = FadtBuilder::new(0x3000).firmware_ctrl(0x1000).build();
+        image[0x2000..0x2000 + fadt.len()].copy_from_slice(&fadt);
+        let xsdt = XsdtBuilder::new().add_table(0x2000).build();
+        image[0x4000..0x4000 + xsdt.len()].copy_from_slice(&xsdt);
+        let rsdp = RsdpBuilder::new().xsdt_address(0x4000).build();
+        image[0x5000..0x5000 + rsdp.len()].copy_from_slice(&rsdp);
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let spec = GuestBootSpec {
+            name: "s3-auto".into(),
+            serial: SerialOutput::new("s3-auto", SerialOutputMode::Shared(Arc::clone(&sink))),
+            ram_bytes: 0x1_0000,
+            load_base: 0,
+            entry: 0,
+            image,
+            rtc_unix_secs: 0,
+            platform: LbrPlatform::AmdSvm,
+        };
+        let mut guest = match GuestRuntime::prepare_real_mode(spec) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping run_resuming_s3_auto_resumes_a_suspended_guest: {e}");
+                return;
+            }
+        };
+
+        // One call: boot → guest commits S3 → auto-discover FACS → resume at the
+        // waking vector → run to Halted. No manual resume in between.
+        let outcome = guest
+            .run_resuming_s3(0, 100, 0x5000, 4)
+            .expect("run with auto S3 resume");
+        assert_eq!(outcome, LoopOutcome::Halted, "resumed guest halts");
+        assert_eq!(
+            &*sink.lock().unwrap(),
+            b"R",
+            "the auto-resumed guest ran its waking-vector payload"
+        );
     }
 
     #[test]

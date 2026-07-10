@@ -203,6 +203,59 @@ pub fn read_bars(mem: &[u8], alloc: &McfgAllocation, func: &PciFunction) -> Vec<
     bars
 }
 
+/// Decode a 32-bit memory BAR's size from the value read back after writing
+/// all-ones to it (the standard PCI BAR-sizing probe).
+///
+/// The card leaves its decoded-address bits writable and hard-wires the rest to
+/// zero, so after an all-ones write the readback's low bits read zero up to the
+/// region size. Masking off the low 4 info bits, inverting the remaining
+/// writable size bits, and adding one recovers the size in bytes (a power of
+/// two). A readback with no writable size bits (`0` after masking) means the BAR
+/// is unimplemented — size `0`.
+///
+/// This is the pure decode the live bare-metal sizing path calls after its
+/// write-probe; [`read_bars`] itself stays read-only and does not probe.
+#[must_use]
+pub const fn memory_bar_size_32(readback: u32) -> u32 {
+    let masked = readback & 0xFFFF_FFF0;
+    if masked == 0 {
+        0
+    } else {
+        (!masked).wrapping_add(1)
+    }
+}
+
+/// Decode a 64-bit memory BAR's size from the low and high dwords read back
+/// after writing all-ones to both halves.
+///
+/// Like [`memory_bar_size_32`] but the writable size bits span both registers:
+/// the low dword's info bits (bits 3:0) are masked off, the two dwords are
+/// combined, inverted, and incremented. Size `0` if no writable bits remain.
+#[must_use]
+pub fn memory_bar_size_64(low_readback: u32, high_readback: u32) -> u64 {
+    let masked = (u64::from(high_readback) << 32) | u64::from(low_readback & 0xFFFF_FFF0);
+    if masked == 0 {
+        0
+    } else {
+        (!masked).wrapping_add(1)
+    }
+}
+
+/// Decode an I/O BAR's size from the all-ones write-probe readback.
+///
+/// As [`memory_bar_size_32`] but only bits 1:0 are info bits (the low bit marks
+/// I/O space). I/O BARs decode at most a 32-bit port range; size `0` if no
+/// writable size bits remain.
+#[must_use]
+pub const fn io_bar_size(readback: u32) -> u32 {
+    let masked = readback & 0xFFFF_FFFC;
+    if masked == 0 {
+        0
+    } else {
+        (!masked).wrapping_add(1)
+    }
+}
+
 /// The MMIO base address of an xHCI controller's register set — BAR0, the
 /// controller's memory-mapped register window per the xHCI spec.
 ///
@@ -498,6 +551,209 @@ pub fn is_sr_iov_capable(mem: &[u8], alloc: &McfgAllocation, func: &PciFunction)
         .any(|cap| cap.id == ExtendedCapability::SR_IOV)
 }
 
+/// The decoded fields of a Physical Function's SR-IOV extended capability — how
+/// many Virtual Functions it supports and where they land in config space.
+///
+/// This is the register view the VF-enable step (Phases 3.2 NIC, 7.3 GPU) needs
+/// before writing `NumVFs`/`VF Enable`: `total_vfs` caps how many VFs may be
+/// enabled, and `first_vf_offset` + `vf_stride` place each VF's routing ID
+/// relative to the PF (see [`SrIovCapability::vf_routing_id`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SrIovCapability {
+    /// Whether VF Enable (Control bit 0) is currently set.
+    pub vf_enabled: bool,
+    /// `InitialVFs` — the number of VFs initially associated with the PF.
+    pub initial_vfs: u16,
+    /// `TotalVFs` — the maximum number of VFs the PF can support.
+    pub total_vfs: u16,
+    /// `NumVFs` — the number of VFs currently configured to be visible.
+    pub num_vfs: u16,
+    /// First VF Offset — the routing-ID delta from the PF to VF 0.
+    pub first_vf_offset: u16,
+    /// VF Stride — the routing-ID delta between consecutive VFs.
+    pub vf_stride: u16,
+    /// VF Device ID — the Device ID VFs report (the PF's own Device ID applies
+    /// to the PF only).
+    pub vf_device_id: u16,
+    /// Supported Page Sizes bitmask (each bit n → page size 2^(n+12)).
+    pub supported_page_sizes: u32,
+    /// System Page Size bitmask currently programmed (one bit set).
+    pub system_page_size: u32,
+}
+
+impl SrIovCapability {
+    /// The 16-bit routing ID (`bus<<8 | dev<<3 | func`) of the `vf_index`-th VF
+    /// (0-based) of a PF at `pf`, per the `PCIe` SR-IOV addressing formula
+    /// `RID(VF) = RID(PF) + FirstVFOffset + vf_index * VFStride`.
+    ///
+    /// Returns `None` if `vf_index >= total_vfs` (out of the PF's VF range) or
+    /// the computed routing ID would overflow 16 bits.
+    #[must_use]
+    pub fn vf_routing_id(&self, pf: &PciFunction, vf_index: u16) -> Option<u16> {
+        if vf_index >= self.total_vfs {
+            return None;
+        }
+        let pf_rid =
+            (u16::from(pf.bus) << 8) | (u16::from(pf.device) << 3) | u16::from(pf.function);
+        let stride = self.vf_stride.checked_mul(vf_index)?;
+        pf_rid
+            .checked_add(self.first_vf_offset)?
+            .checked_add(stride)
+    }
+}
+
+/// Decode a function's SR-IOV extended capability, if it has one.
+///
+/// Reads the SR-IOV register block (Control/InitialVFs/TotalVFs/NumVFs/First VF
+/// Offset/VF Stride/VF Device ID/page sizes) from extended config space — the
+/// "read the SR-IOV cap's TotalVFs/NumVFs" step (Phase 7.3d) that precedes
+/// writing `NumVFs` to enable VFs. `None` if the function is not SR-IOV capable
+/// or the register block is not backed by `mem`.
+#[must_use]
+pub fn sr_iov_capability(
+    mem: &[u8],
+    alloc: &McfgAllocation,
+    func: &PciFunction,
+) -> Option<SrIovCapability> {
+    let cap = extended_capabilities(mem, alloc, func)
+        .into_iter()
+        .find(|c| c.id == ExtendedCapability::SR_IOV)?;
+    let base = function_base(alloc, func.bus, func.device, func.function)?;
+    let field = base + u64::from(cap.offset);
+    Some(SrIovCapability {
+        vf_enabled: read_u16(mem, field + 0x08)? & 0x1 != 0,
+        initial_vfs: read_u16(mem, field + 0x0C)?,
+        total_vfs: read_u16(mem, field + 0x0E)?,
+        num_vfs: read_u16(mem, field + 0x10)?,
+        first_vf_offset: read_u16(mem, field + 0x14)?,
+        vf_stride: read_u16(mem, field + 0x16)?,
+        vf_device_id: read_u16(mem, field + 0x1A)?,
+        supported_page_sizes: read_u32(mem, field + 0x1C)?,
+        system_page_size: read_u32(mem, field + 0x20)?,
+    })
+}
+
+/// SR-IOV Control-register (offset `0x08`) bit for VF Enable — turns the VFs on.
+pub const SR_IOV_CTRL_VF_ENABLE: u16 = 1 << 0;
+/// SR-IOV Control-register bit for VF Memory Space Enable — lets the VFs' memory
+/// BARs decode; without it the enabled VFs answer no MMIO.
+pub const SR_IOV_CTRL_VF_MSE: u16 = 1 << 3;
+/// Config-space offset of the SR-IOV `NumVFs` register relative to the cap base.
+pub const SR_IOV_OFF_NUM_VFS: u16 = 0x10;
+/// Config-space offset of the SR-IOV Control register relative to the cap base.
+pub const SR_IOV_OFF_CONTROL: u16 = 0x08;
+
+/// Why building an SR-IOV VF-enable plan failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SrIovPlanError {
+    /// `requested_vfs` was zero — enabling zero VFs is a no-op, not a plan.
+    ZeroVfs,
+    /// `requested_vfs` exceeds the PF's `TotalVFs`.
+    ExceedsTotalVfs {
+        /// The requested VF count.
+        requested: u16,
+        /// The PF's maximum (`TotalVFs`).
+        total: u16,
+    },
+    /// A VF's routing ID overflowed 16 bits (a malformed First VF Offset /
+    /// VF Stride against this PF).
+    RoutingOverflow {
+        /// The 0-based VF index whose routing ID overflowed.
+        vf_index: u16,
+    },
+}
+
+/// The config-space writes and resulting VF routing IDs needed to enable
+/// `requested_vfs` Virtual Functions on a PF — the "enable VFs" step (Phase
+/// 7.3d) that follows reading the [`SrIovCapability`].
+///
+/// This is the pure decision layer: it validates the request against `TotalVFs`,
+/// enumerates the VFs' routing IDs, and states the two config writes (set
+/// `NumVFs`, then set VF Enable + VF MSE in Control). The live bare-metal path
+/// performs the writes in order — `NumVFs` first, then the Control bits — and
+/// waits the spec-mandated settle time before touching the VFs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VfEnablePlan {
+    /// Value to write to the `NumVFs` register (config offset
+    /// [`SR_IOV_OFF_NUM_VFS`] from the cap base).
+    pub num_vfs: u16,
+    /// Bits to OR into the SR-IOV Control register (config offset
+    /// [`SR_IOV_OFF_CONTROL`]) — VF Enable and VF MSE.
+    pub control_bits_to_set: u16,
+    /// Routing IDs of the enabled VFs, in VF-index order.
+    pub vf_routing_ids: Vec<u16>,
+}
+
+/// Build the plan to enable `requested_vfs` VFs on the PF at `pf` given its
+/// decoded `cap`.
+///
+/// # Errors
+/// - [`SrIovPlanError::ZeroVfs`] if `requested_vfs == 0`;
+/// - [`SrIovPlanError::ExceedsTotalVfs`] if `requested_vfs > cap.total_vfs`;
+/// - [`SrIovPlanError::RoutingOverflow`] if a VF's routing ID overflows 16 bits.
+pub fn plan_enable_vfs(
+    cap: &SrIovCapability,
+    pf: &PciFunction,
+    requested_vfs: u16,
+) -> Result<VfEnablePlan, SrIovPlanError> {
+    if requested_vfs == 0 {
+        return Err(SrIovPlanError::ZeroVfs);
+    }
+    if requested_vfs > cap.total_vfs {
+        return Err(SrIovPlanError::ExceedsTotalVfs {
+            requested: requested_vfs,
+            total: cap.total_vfs,
+        });
+    }
+    let mut vf_routing_ids = Vec::with_capacity(requested_vfs as usize);
+    for vf_index in 0..requested_vfs {
+        let rid = cap
+            .vf_routing_id(pf, vf_index)
+            .ok_or(SrIovPlanError::RoutingOverflow { vf_index })?;
+        vf_routing_ids.push(rid);
+    }
+    Ok(VfEnablePlan {
+        num_vfs: requested_vfs,
+        control_bits_to_set: SR_IOV_CTRL_VF_ENABLE | SR_IOV_CTRL_VF_MSE,
+        vf_routing_ids,
+    })
+}
+
+/// Config-space offset of the SR-IOV System Page Size register relative to the
+/// cap base.
+pub const SR_IOV_OFF_SYSTEM_PAGE_SIZE: u16 = 0x20;
+
+/// Select the value to program into the SR-IOV System Page Size register from a
+/// PF's `Supported Page Sizes` bitmask.
+///
+/// Each bit `n` of `supported_mask` advertises support for VF page size
+/// `2^(n+12)` (bit 0 = 4 KiB, bit 8 = 1 MiB, …); the System Page Size register
+/// must be written with **exactly one** of those bits set — it sizes the VF BAR
+/// apertures — and must be programmed before VFs are enabled. This prefers the
+/// bit matching `desired_bytes` when the PF supports it, else falls back to the
+/// smallest supported size (bit 0 / 4 KiB is mandatory per the SR-IOV spec).
+///
+/// Returns the single-bit mask to write, or `None` if `supported_mask` is empty
+/// (a malformed capability that advertises no page size at all).
+#[must_use]
+pub const fn select_sr_iov_system_page_size(
+    supported_mask: u32,
+    desired_bytes: u64,
+) -> Option<u32> {
+    if supported_mask == 0 {
+        return None;
+    }
+    // A power-of-two desired size ≥ 4 KiB maps to bit (log2(size) - 12).
+    if desired_bytes.is_power_of_two() && desired_bytes >= 4096 {
+        let bit = desired_bytes.trailing_zeros() - 12;
+        if bit < 32 && supported_mask & (1 << bit) != 0 {
+            return Some(1 << bit);
+        }
+    }
+    // Fall back to the smallest supported page size.
+    Some(1 << supported_mask.trailing_zeros())
+}
+
 /// Discover every xHCI (USB 3.x) host controller across all ECAM windows.
 ///
 /// Pairs each with its BAR0 MMIO base — the "PCI enum to xHCI BARs" step the USB
@@ -710,6 +966,33 @@ mod tests {
     }
 
     #[test]
+    fn decodes_bar_sizes_from_the_write_probe_readback() {
+        // 32-bit memory BAR: a 16 MiB region leaves bits 23:4 writable → after
+        // an all-ones write it reads back 0xFF00_0000 (low 24 bits zero, info
+        // bits included). Size = 0x0100_0000 = 16 MiB.
+        assert_eq!(memory_bar_size_32(0xFF00_0000), 0x0100_0000);
+        // A 16-byte region (the minimum): readback 0xFFFF_FFF0 → 0x10.
+        assert_eq!(memory_bar_size_32(0xFFFF_FFF0), 0x10);
+        // Prefetchable/64-bit info bits (low 4) are ignored: 0xFF00_000C decodes
+        // the same 16 MiB.
+        assert_eq!(memory_bar_size_32(0xFF00_000C), 0x0100_0000);
+        // Unimplemented BAR (no writable bits) → size 0.
+        assert_eq!(memory_bar_size_32(0), 0);
+
+        // 64-bit memory BAR spanning both dwords: a 4 GiB region reads back
+        // low=0x0000_0000, high=0xFFFF_FFFF → size 0x1_0000_0000.
+        assert_eq!(memory_bar_size_64(0x0000_0000, 0xFFFF_FFFF), 0x1_0000_0000);
+        // A 256 MiB 64-bit BAR: low=0xF000_0000, high=0xFFFF_FFFF.
+        assert_eq!(memory_bar_size_64(0xF000_0000, 0xFFFF_FFFF), 0x1000_0000);
+        assert_eq!(memory_bar_size_64(0, 0), 0);
+
+        // I/O BAR: only bits 1:0 are info bits. A 256-byte port range reads back
+        // 0xFFFF_FF01 (bit 0 set = I/O) → mask → 0xFFFF_FF00 → size 0x100.
+        assert_eq!(io_bar_size(0xFFFF_FF01), 0x100);
+        assert_eq!(io_bar_size(0), 0);
+    }
+
+    #[test]
     fn finds_xhci_controllers_with_their_mmio_base() {
         let (mem, alloc) = synthetic_ecam();
         let controllers = find_xhci_controllers(&mem, &[alloc]);
@@ -812,6 +1095,119 @@ mod tests {
             }]
         );
         assert!(is_sr_iov_capable(&mem, &alloc, &func));
+    }
+
+    #[test]
+    fn decodes_the_sr_iov_register_block_and_vf_routing_ids() {
+        // Extended config space large enough to hold the SR-IOV block at 0x100.
+        let mut mem = vec![0u8; 0x160];
+        let header = u32::from(ExtendedCapability::SR_IOV) | (1 << 16); // ver 1, next 0
+        mem[0x100..0x104].copy_from_slice(&header.to_le_bytes());
+        // Control (VF Enable set), InitialVFs, TotalVFs, NumVFs.
+        mem[0x108..0x10A].copy_from_slice(&0x0001u16.to_le_bytes()); // Control
+        mem[0x10C..0x10E].copy_from_slice(&8u16.to_le_bytes()); // InitialVFs
+        mem[0x10E..0x110].copy_from_slice(&16u16.to_le_bytes()); // TotalVFs
+        mem[0x110..0x112].copy_from_slice(&4u16.to_le_bytes()); // NumVFs
+        mem[0x114..0x116].copy_from_slice(&0x80u16.to_le_bytes()); // First VF Offset
+        mem[0x116..0x118].copy_from_slice(&2u16.to_le_bytes()); // VF Stride
+        mem[0x11A..0x11C].copy_from_slice(&0x10EDu16.to_le_bytes()); // VF Device ID
+        mem[0x11C..0x120].copy_from_slice(&0x0000_0553u32.to_le_bytes()); // Supported page sizes
+        mem[0x120..0x124].copy_from_slice(&0x0000_0001u32.to_le_bytes()); // System page size
+
+        let alloc = McfgAllocation::standard(0);
+        let func = plain_function();
+        let cap = sr_iov_capability(&mem, &alloc, &func).expect("SR-IOV cap present");
+        assert!(cap.vf_enabled);
+        assert_eq!(cap.initial_vfs, 8);
+        assert_eq!(cap.total_vfs, 16);
+        assert_eq!(cap.num_vfs, 4);
+        assert_eq!(cap.first_vf_offset, 0x80);
+        assert_eq!(cap.vf_stride, 2);
+        assert_eq!(cap.vf_device_id, 0x10ED);
+        assert_eq!(cap.supported_page_sizes, 0x0000_0553);
+        assert_eq!(cap.system_page_size, 1);
+
+        // plain_function() is at BDF 00:00.0 → PF routing ID 0. VF k lands at
+        // 0x80 + k*2.
+        assert_eq!(func.bdf(), (0, 0, 0));
+        assert_eq!(cap.vf_routing_id(&func, 0), Some(0x80));
+        assert_eq!(cap.vf_routing_id(&func, 1), Some(0x82));
+        assert_eq!(cap.vf_routing_id(&func, 15), Some(0x80 + 15 * 2));
+        // vf_index == total_vfs is out of range.
+        assert_eq!(cap.vf_routing_id(&func, 16), None);
+    }
+
+    #[test]
+    fn plans_a_vf_enable_from_the_capability() {
+        // A PF with 16 TotalVFs, First VF Offset 0x80, stride 2 at BDF 00:00.0.
+        let cap = SrIovCapability {
+            vf_enabled: false,
+            initial_vfs: 8,
+            total_vfs: 16,
+            num_vfs: 0,
+            first_vf_offset: 0x80,
+            vf_stride: 2,
+            vf_device_id: 0x10ED,
+            supported_page_sizes: 0x553,
+            system_page_size: 1,
+        };
+        let pf = plain_function();
+
+        let plan = plan_enable_vfs(&cap, &pf, 4).expect("plan 4 VFs");
+        assert_eq!(plan.num_vfs, 4);
+        assert_eq!(
+            plan.control_bits_to_set,
+            SR_IOV_CTRL_VF_ENABLE | SR_IOV_CTRL_VF_MSE
+        );
+        // VF k routing ID = 0x80 + k*2.
+        assert_eq!(plan.vf_routing_ids, vec![0x80, 0x82, 0x84, 0x86]);
+
+        // Requesting all TotalVFs is allowed; requesting one more is rejected.
+        assert_eq!(
+            plan_enable_vfs(&cap, &pf, 16).unwrap().vf_routing_ids.len(),
+            16
+        );
+        assert_eq!(
+            plan_enable_vfs(&cap, &pf, 17),
+            Err(SrIovPlanError::ExceedsTotalVfs {
+                requested: 17,
+                total: 16,
+            })
+        );
+        assert_eq!(plan_enable_vfs(&cap, &pf, 0), Err(SrIovPlanError::ZeroVfs));
+    }
+
+    #[test]
+    fn selects_the_sr_iov_system_page_size() {
+        // Supported: 4 KiB (bit 0), 8 KiB (bit 1), 64 KiB (bit 4), 1 MiB (bit 8).
+        let mask = (1 << 0) | (1 << 1) | (1 << 4) | (1 << 8);
+        // Desired 64 KiB is supported → its bit.
+        assert_eq!(
+            select_sr_iov_system_page_size(mask, 64 * 1024),
+            Some(1 << 4)
+        );
+        // Desired 4 KiB.
+        assert_eq!(select_sr_iov_system_page_size(mask, 4096), Some(1 << 0));
+        // Desired 2 MiB (bit 9) is not supported → fall back to smallest (4 KiB).
+        assert_eq!(
+            select_sr_iov_system_page_size(mask, 2 * 1024 * 1024),
+            Some(1 << 0)
+        );
+        // A non-power-of-two desired size falls back to the smallest supported.
+        assert_eq!(select_sr_iov_system_page_size(mask, 5000), Some(1 << 0));
+        // If 4 KiB is absent, the smallest supported (here 64 KiB) is chosen.
+        let big_only = (1 << 4) | (1 << 8);
+        assert_eq!(select_sr_iov_system_page_size(big_only, 4096), Some(1 << 4));
+        // An empty mask advertises no page size.
+        assert_eq!(select_sr_iov_system_page_size(0, 4096), None);
+    }
+
+    #[test]
+    fn sr_iov_capability_is_none_without_the_cap() {
+        // Only the base 256 bytes → no extended region, no SR-IOV block.
+        let mem = vec![0u8; 0x100];
+        let alloc = McfgAllocation::standard(0);
+        assert_eq!(sr_iov_capability(&mem, &alloc, &plain_function()), None);
     }
 
     #[test]

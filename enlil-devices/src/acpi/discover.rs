@@ -70,6 +70,84 @@ pub fn find_table(mem: &[u8], rsdp_gpa: u64, signature: &[u8; 4]) -> Option<u64>
     None
 }
 
+/// The 8-bit ACPI checksum of `bytes` — a valid ACPI structure sums (mod 256)
+/// to zero.
+fn acpi_checksum(bytes: &[u8]) -> u8 {
+    bytes.iter().fold(0u8, |acc, &b| acc.wrapping_add(b))
+}
+
+/// Whether a valid RSDP sits at physical `gpa` in `mem`: the `"RSD PTR "`
+/// signature plus a zero ACPI checksum over the first 20 bytes (and, for an ACPI
+/// 2.0+ RSDP, over the full 36 bytes too).
+fn valid_rsdp_at(mem: &[u8], gpa: u64) -> bool {
+    let Ok(start) = usize::try_from(gpa) else {
+        return false;
+    };
+    let Some(rsdp) = start.checked_add(20).and_then(|e| mem.get(start..e)) else {
+        return false;
+    };
+    if &rsdp[0..8] != b"RSD PTR " || acpi_checksum(rsdp) != 0 {
+        return false;
+    }
+    // Revision (offset 15) ≥ 2 → ACPI 2.0+; the extended 36-byte checksum must
+    // also be zero.
+    if rsdp[15] >= 2 {
+        let Some(full) = start.checked_add(36).and_then(|e| mem.get(start..e)) else {
+            return false;
+        };
+        if acpi_checksum(full) != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Scan `[base, base+len)` of `mem` on 16-byte boundaries for a valid RSDP,
+/// returning the physical address of the first one found.
+fn scan_region_for_rsdp(mem: &[u8], base: u64, len: u64) -> Option<u64> {
+    let mut gpa = base;
+    let end = base.saturating_add(len);
+    while gpa < end {
+        if valid_rsdp_at(mem, gpa) {
+            return Some(gpa);
+        }
+        gpa += 16;
+    }
+    None
+}
+
+/// Scan the legacy BIOS memory regions for the ACPI RSDP, returning its physical
+/// address.
+///
+/// This is the bootstrap step that gives the other `host_*` /
+/// `build_device_tree` discovery calls their `rsdp_gpa` on real hardware (Phase
+/// 6.3's "RSDP scan"). Per the ACPI spec the RSDP lives in one of two places on
+/// a BIOS system, each searched on a 16-byte boundary: the first 1 KiB of the
+/// Extended BIOS Data
+/// Area (whose real-mode segment is stored at physical `0x40E`), then the BIOS
+/// read-only region `0xE_0000..=0xF_FFFF`. A candidate is accepted only if its
+/// `"RSD PTR "` signature and ACPI checksum(s) validate — so stray signature
+/// bytes do not yield a false hit. `mem` is host RAM based at physical 0.
+///
+/// On a UEFI boot the RSDP comes from the EFI configuration table instead and is
+/// not scanned; this is the legacy-BIOS / bare-metal path. Returns `None` if no
+/// valid RSDP is present in the scanned regions.
+#[must_use]
+pub fn scan_rsdp(mem: &[u8]) -> Option<u64> {
+    // 1. EBDA: a real-mode segment at physical 0x40E → base = segment << 4.
+    if let Some(seg_bytes) = mem.get(0x40E..0x410) {
+        let seg = u16::from_le_bytes([seg_bytes[0], seg_bytes[1]]);
+        let ebda_base = u64::from(seg) << 4;
+        if ebda_base != 0
+            && let Some(gpa) = scan_region_for_rsdp(mem, ebda_base, 1024)
+        {
+            return Some(gpa);
+        }
+    }
+    // 2. BIOS read-only area 0xE_0000..=0xF_FFFF (128 KiB).
+    scan_region_for_rsdp(mem, 0xE_0000, 0x2_0000)
+}
+
 /// Find a guest's FACS physical address by walking its live ACPI tables.
 ///
 /// Locates the FADT (signature `FACP`) via [`find_table`] and reads its FACS
@@ -345,6 +423,42 @@ mod tests {
         t[0..4].copy_from_slice(&signature);
         t[4..8].copy_from_slice(&36u32.to_le_bytes());
         t
+    }
+
+    #[test]
+    fn scan_rsdp_finds_the_rsdp_in_the_bios_rom_area() {
+        let mut mem = vec![0u8; 0x10_0000]; // 1 MiB
+        let rsdp = RsdpBuilder::new().xsdt_address(0x1000).build();
+        place(&mut mem, 0xE_0000, &rsdp);
+        assert_eq!(scan_rsdp(&mem), Some(0xE_0000));
+    }
+
+    #[test]
+    fn scan_rsdp_prefers_the_ebda_pointer() {
+        let mut mem = vec![0u8; 0x10_0000];
+        // EBDA real-mode segment 0x9FC0 → physical base 0x9_FC00.
+        place(&mut mem, 0x40E, &0x9FC0u16.to_le_bytes());
+        let rsdp = RsdpBuilder::new().xsdt_address(0x1000).build();
+        // 16-aligned, inside the 1 KiB EBDA scan window and below the ROM area,
+        // so only the EBDA branch can find it.
+        place(&mut mem, 0x9_FC10, &rsdp);
+        assert_eq!(scan_rsdp(&mem), Some(0x9_FC10));
+    }
+
+    #[test]
+    fn scan_rsdp_rejects_a_bad_checksum_and_reports_absence() {
+        let mut mem = vec![0u8; 0x10_0000];
+        // Nothing placed → no RSDP found.
+        assert_eq!(scan_rsdp(&mem), None);
+        // A correct signature whose checksum was corrupted must be rejected.
+        let mut rsdp = RsdpBuilder::new().xsdt_address(0x1000).build();
+        rsdp[9] ^= 0xFF; // flip an OEM-ID byte → both checksums no longer zero
+        place(&mut mem, 0xE_0000, &rsdp);
+        assert_eq!(
+            scan_rsdp(&mem),
+            None,
+            "a bad-checksum candidate is not an RSDP"
+        );
     }
 
     #[test]
