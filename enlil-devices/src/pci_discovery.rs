@@ -633,6 +633,92 @@ pub fn sr_iov_capability(
     })
 }
 
+/// SR-IOV Control-register (offset `0x08`) bit for VF Enable — turns the VFs on.
+pub const SR_IOV_CTRL_VF_ENABLE: u16 = 1 << 0;
+/// SR-IOV Control-register bit for VF Memory Space Enable — lets the VFs' memory
+/// BARs decode; without it the enabled VFs answer no MMIO.
+pub const SR_IOV_CTRL_VF_MSE: u16 = 1 << 3;
+/// Config-space offset of the SR-IOV `NumVFs` register relative to the cap base.
+pub const SR_IOV_OFF_NUM_VFS: u16 = 0x10;
+/// Config-space offset of the SR-IOV Control register relative to the cap base.
+pub const SR_IOV_OFF_CONTROL: u16 = 0x08;
+
+/// Why building an SR-IOV VF-enable plan failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SrIovPlanError {
+    /// `requested_vfs` was zero — enabling zero VFs is a no-op, not a plan.
+    ZeroVfs,
+    /// `requested_vfs` exceeds the PF's `TotalVFs`.
+    ExceedsTotalVfs {
+        /// The requested VF count.
+        requested: u16,
+        /// The PF's maximum (`TotalVFs`).
+        total: u16,
+    },
+    /// A VF's routing ID overflowed 16 bits (a malformed First VF Offset /
+    /// VF Stride against this PF).
+    RoutingOverflow {
+        /// The 0-based VF index whose routing ID overflowed.
+        vf_index: u16,
+    },
+}
+
+/// The config-space writes and resulting VF routing IDs needed to enable
+/// `requested_vfs` Virtual Functions on a PF — the "enable VFs" step (Phase
+/// 7.3d) that follows reading the [`SrIovCapability`].
+///
+/// This is the pure decision layer: it validates the request against `TotalVFs`,
+/// enumerates the VFs' routing IDs, and states the two config writes (set
+/// `NumVFs`, then set VF Enable + VF MSE in Control). The live bare-metal path
+/// performs the writes in order — `NumVFs` first, then the Control bits — and
+/// waits the spec-mandated settle time before touching the VFs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VfEnablePlan {
+    /// Value to write to the `NumVFs` register (config offset
+    /// [`SR_IOV_OFF_NUM_VFS`] from the cap base).
+    pub num_vfs: u16,
+    /// Bits to OR into the SR-IOV Control register (config offset
+    /// [`SR_IOV_OFF_CONTROL`]) — VF Enable and VF MSE.
+    pub control_bits_to_set: u16,
+    /// Routing IDs of the enabled VFs, in VF-index order.
+    pub vf_routing_ids: Vec<u16>,
+}
+
+/// Build the plan to enable `requested_vfs` VFs on the PF at `pf` given its
+/// decoded `cap`.
+///
+/// # Errors
+/// - [`SrIovPlanError::ZeroVfs`] if `requested_vfs == 0`;
+/// - [`SrIovPlanError::ExceedsTotalVfs`] if `requested_vfs > cap.total_vfs`;
+/// - [`SrIovPlanError::RoutingOverflow`] if a VF's routing ID overflows 16 bits.
+pub fn plan_enable_vfs(
+    cap: &SrIovCapability,
+    pf: &PciFunction,
+    requested_vfs: u16,
+) -> Result<VfEnablePlan, SrIovPlanError> {
+    if requested_vfs == 0 {
+        return Err(SrIovPlanError::ZeroVfs);
+    }
+    if requested_vfs > cap.total_vfs {
+        return Err(SrIovPlanError::ExceedsTotalVfs {
+            requested: requested_vfs,
+            total: cap.total_vfs,
+        });
+    }
+    let mut vf_routing_ids = Vec::with_capacity(requested_vfs as usize);
+    for vf_index in 0..requested_vfs {
+        let rid = cap
+            .vf_routing_id(pf, vf_index)
+            .ok_or(SrIovPlanError::RoutingOverflow { vf_index })?;
+        vf_routing_ids.push(rid);
+    }
+    Ok(VfEnablePlan {
+        num_vfs: requested_vfs,
+        control_bits_to_set: SR_IOV_CTRL_VF_ENABLE | SR_IOV_CTRL_VF_MSE,
+        vf_routing_ids,
+    })
+}
+
 /// Discover every xHCI (USB 3.x) host controller across all ECAM windows.
 ///
 /// Pairs each with its BAR0 MMIO base — the "PCI enum to xHCI BARs" step the USB
@@ -1014,6 +1100,46 @@ mod tests {
         assert_eq!(cap.vf_routing_id(&func, 15), Some(0x80 + 15 * 2));
         // vf_index == total_vfs is out of range.
         assert_eq!(cap.vf_routing_id(&func, 16), None);
+    }
+
+    #[test]
+    fn plans_a_vf_enable_from_the_capability() {
+        // A PF with 16 TotalVFs, First VF Offset 0x80, stride 2 at BDF 00:00.0.
+        let cap = SrIovCapability {
+            vf_enabled: false,
+            initial_vfs: 8,
+            total_vfs: 16,
+            num_vfs: 0,
+            first_vf_offset: 0x80,
+            vf_stride: 2,
+            vf_device_id: 0x10ED,
+            supported_page_sizes: 0x553,
+            system_page_size: 1,
+        };
+        let pf = plain_function();
+
+        let plan = plan_enable_vfs(&cap, &pf, 4).expect("plan 4 VFs");
+        assert_eq!(plan.num_vfs, 4);
+        assert_eq!(
+            plan.control_bits_to_set,
+            SR_IOV_CTRL_VF_ENABLE | SR_IOV_CTRL_VF_MSE
+        );
+        // VF k routing ID = 0x80 + k*2.
+        assert_eq!(plan.vf_routing_ids, vec![0x80, 0x82, 0x84, 0x86]);
+
+        // Requesting all TotalVFs is allowed; requesting one more is rejected.
+        assert_eq!(
+            plan_enable_vfs(&cap, &pf, 16).unwrap().vf_routing_ids.len(),
+            16
+        );
+        assert_eq!(
+            plan_enable_vfs(&cap, &pf, 17),
+            Err(SrIovPlanError::ExceedsTotalVfs {
+                requested: 17,
+                total: 16,
+            })
+        );
+        assert_eq!(plan_enable_vfs(&cap, &pf, 0), Err(SrIovPlanError::ZeroVfs));
     }
 
     #[test]
