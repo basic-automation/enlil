@@ -128,6 +128,12 @@ pub enum PagingError {
         /// The number of page directories the map would need.
         num_pd: u64,
     },
+    /// The map needs more than one PML4's worth of PDPTs (> 256 TiB), which is
+    /// the whole 48-bit linear-address space a single PML4 can address.
+    MapExceedsAddressSpace {
+        /// The number of page-directory-pointer tables the map would need.
+        num_pdpt: u64,
+    },
     /// A 4-KiB map requested more pages than a single page table holds (> 512,
     /// i.e. > 2 MiB), which the single-PT 4-KiB builder does not lay out yet.
     TooManyPages {
@@ -445,6 +451,98 @@ pub fn build_identity_map_4kib_multi(
     })
 }
 
+/// Build an identity map of `[0, bytes_to_map)` using 2 MiB huge pages spanning
+/// **any number of PDPTs** (up to one full PML4 / 256 TiB).
+///
+/// This is the multi-PML4-entry generalization of [`build_identity_map_2mib`]:
+/// where that primitive stops at a single PDPT (512 GiB), this lays out one PD
+/// per gibibyte and one PDPT per 512 GiB, so it covers a 2 MiB-granular identity
+/// map across the whole 48-bit linear-address space a single PML4 addresses
+/// (512 PDPTs × 512 PDs × 512 leaves × 2 MiB = 256 TiB). The tables are laid out
+/// contiguously as PML4, the PDPTs, then the PDs. `leaf_flags` are OR'd into each
+/// 2 MiB leaf (with `PRESENT` added); intermediate pointers get `PRESENT |
+/// WRITABLE`.
+///
+/// Use this to identity-map a large host RAM (a big-memory server / pooled
+/// node); prefer [`build_identity_map_2mib`] when the map is ≤ 512 GiB, since it
+/// needs one fewer level of fan-out.
+///
+/// # Errors
+/// - [`PagingError::EmptyRegion`] if `bytes_to_map == 0`;
+/// - [`PagingError::UnalignedBase`] if `tables_base_gpa` is not 4-KiB aligned;
+/// - [`PagingError::MapExceedsAddressSpace`] if the map needs more than one PML4
+///   (> 256 TiB);
+/// - [`PagingError::TablesExceedMemory`] if the tables do not fit in `mem`.
+pub fn build_identity_map_2mib_multi(
+    mem: &mut [u8],
+    tables_base_gpa: u64,
+    bytes_to_map: u64,
+    leaf_flags: u64,
+) -> Result<PageTableLayout, PagingError> {
+    if bytes_to_map == 0 {
+        return Err(PagingError::EmptyRegion);
+    }
+    if tables_base_gpa & (PAGE_SIZE - 1) != 0 {
+        return Err(PagingError::UnalignedBase);
+    }
+
+    let num_2mib = bytes_to_map.div_ceil(HUGE_2MIB);
+    let num_page_dirs = num_2mib.div_ceil(TABLE_ENTRIES);
+    let num_pdpt = num_page_dirs.div_ceil(TABLE_ENTRIES);
+    // One PML4 (512 entries) points at up to 512 PDPTs → 256 TiB.
+    if num_pdpt > TABLE_ENTRIES {
+        return Err(PagingError::MapExceedsAddressSpace { num_pdpt });
+    }
+    // All counts are now ≤ their table bounds, so the conversions never hit the
+    // fallback.
+    let num_2mib = usize::try_from(num_2mib).unwrap_or(usize::MAX);
+    let num_page_dirs = usize::try_from(num_page_dirs).unwrap_or(usize::MAX);
+    let num_pdpt = usize::try_from(num_pdpt).unwrap_or(usize::MAX);
+
+    let table_count = 1 + num_pdpt + num_page_dirs; // PML4 + PDPTs + PDs
+    let (base, region_usize, end) = table_region(tables_base_gpa, table_count, mem.len())?;
+    // Unmapped entries must read back not-present.
+    mem[base..end].fill(0);
+
+    let table_flags = flags::PRESENT | flags::WRITABLE;
+    let first_pdpt_gpa = tables_base_gpa + PAGE_SIZE;
+    let first_dir_gpa = first_pdpt_gpa + (num_pdpt as u64) * PAGE_SIZE;
+    let first_pdpt_off = base + PAGE_BYTES;
+    let first_dir_off = first_pdpt_off + num_pdpt * PAGE_BYTES;
+
+    // PML4[k] → PDPT[k], one PDPT per 512 GiB.
+    for k in 0..num_pdpt {
+        let pdpt_gpa = first_pdpt_gpa + (k as u64) * PAGE_SIZE;
+        write_entry(mem, base + k * 8, table_entry(pdpt_gpa, table_flags));
+    }
+
+    // PDPT entries: the d-th page directory (global index) lives in PDPT d/512 at
+    // slot d%512.
+    for d in 0..num_page_dirs {
+        let dir_gpa = first_dir_gpa + (d as u64) * PAGE_SIZE;
+        let pdpt_off = first_pdpt_off + (d / 512) * PAGE_BYTES;
+        write_entry(
+            mem,
+            pdpt_off + (d % 512) * 8,
+            table_entry(dir_gpa, table_flags),
+        );
+    }
+
+    // PD leaves: the m-th 2 MiB frame lives in PD m/512 at slot m%512.
+    let leaf = leaf_flags | flags::PRESENT;
+    for page in 0..num_2mib {
+        let dir_off = first_dir_off + (page / 512) * PAGE_BYTES;
+        let phys = (page as u64) * HUGE_2MIB;
+        write_entry(mem, dir_off + (page % 512) * 8, huge_2mib_entry(phys, leaf));
+    }
+
+    Ok(PageTableLayout {
+        cr3: tables_base_gpa,
+        table_count,
+        bytes: region_usize,
+    })
+}
+
 /// Write a little-endian `u64` entry at byte offset `off` in `mem`. The caller
 /// has validated the whole table region fits in `mem`.
 fn write_entry(mem: &mut [u8], off: usize, entry: u64) {
@@ -746,6 +844,99 @@ mod tests {
         let mut small = vec![0u8; 0x2000];
         assert!(matches!(
             build_identity_map_4kib_multi(&mut small, 0, 600, 0, &[]),
+            Err(PagingError::TablesExceedMemory { .. })
+        ));
+    }
+
+    #[test]
+    fn multi_pml4_2mib_spans_more_than_one_pdpt() {
+        // 513 GiB needs 513 PDs → two PDPTs (512 + 1) under two PML4 entries.
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let base = 0x1_0000u64;
+        // table_count = PML4 + 2 PDPTs + 513 PDs = 516 tables → 516 * 0x1000.
+        let mut mem = vec![0u8; 0x1_0000 + 516 * 0x1000 + 0x1000];
+        let layout = build_identity_map_2mib_multi(&mut mem, base, 513 * GIB, flags::WRITABLE)
+            .expect("513 GiB map");
+        assert_eq!(layout.cr3, base);
+        assert_eq!(layout.table_count, 1 + 2 + 513);
+
+        let pml4 = base;
+        let pdpt0 = base + 0x1000;
+        let pdpt1 = base + 0x2000;
+        let first_pd = base + 3 * 0x1000; // after PML4 + 2 PDPTs
+
+        // PML4[0] → PDPT0, PML4[1] → PDPT1.
+        assert_eq!(
+            read_entry(&mem, pml4, 0),
+            table_entry(pdpt0, flags::PRESENT | flags::WRITABLE)
+        );
+        assert_eq!(
+            read_entry(&mem, pml4, 1),
+            table_entry(pdpt1, flags::PRESENT | flags::WRITABLE)
+        );
+        assert_eq!(read_entry(&mem, pml4, 2) & flags::PRESENT, 0);
+
+        // PDPT0[0] → the first PD; the 513th PD (global index 512) is PDPT1[0].
+        assert_eq!(
+            read_entry(&mem, pdpt0, 0),
+            table_entry(first_pd, flags::PRESENT | flags::WRITABLE)
+        );
+        let pd_512 = first_pd + 512 * 0x1000;
+        assert_eq!(
+            read_entry(&mem, pdpt1, 0),
+            table_entry(pd_512, flags::PRESENT | flags::WRITABLE)
+        );
+        // The very first 2 MiB leaf is an identity huge page at phys 0.
+        assert_eq!(
+            read_entry(&mem, first_pd, 0),
+            huge_2mib_entry(0, flags::PRESENT | flags::WRITABLE)
+        );
+        // The last mapped 2 MiB frame (513 GiB / 2 MiB - 1) is present; the next
+        // slot in that PD is not.
+        let last_page = 513 * GIB / HUGE_2MIB - 1;
+        let last_pd = first_pd + (last_page / 512) * 0x1000;
+        let last_slot = usize::try_from(last_page % 512).unwrap();
+        assert_eq!(
+            read_entry(&mem, last_pd, last_slot),
+            huge_2mib_entry(last_page * HUGE_2MIB, flags::PRESENT | flags::WRITABLE)
+        );
+    }
+
+    #[test]
+    fn multi_pml4_2mib_matches_single_pdpt_for_small_maps() {
+        // For a ≤ 512 GiB map the multi builder produces the same tables as the
+        // single-PDPT primitive.
+        let base = 0x1_0000u64;
+        let mut a = vec![0u8; 0x40_0000];
+        let mut b = vec![0u8; 0x40_0000];
+        let la = build_identity_map_2mib(&mut a, base, 4 * 1024 * 1024, flags::WRITABLE).unwrap();
+        let lb =
+            build_identity_map_2mib_multi(&mut b, base, 4 * 1024 * 1024, flags::WRITABLE).unwrap();
+        assert_eq!(la, lb);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn multi_pml4_2mib_rejects_bad_inputs() {
+        let mut mem = vec![0u8; 0x4000];
+        assert_eq!(
+            build_identity_map_2mib_multi(&mut mem, 0, 0, 0),
+            Err(PagingError::EmptyRegion)
+        );
+        assert_eq!(
+            build_identity_map_2mib_multi(&mut mem, 0x800, HUGE_2MIB, 0),
+            Err(PagingError::UnalignedBase)
+        );
+        // > 256 TiB needs more than one PML4: 513 PDPTs' worth (513 * 512 GiB).
+        let mut tiny = vec![0u8; 0x1000];
+        assert!(matches!(
+            build_identity_map_2mib_multi(&mut tiny, 0, 513 * 512 * 1024 * 1024 * 1024, 0),
+            Err(PagingError::MapExceedsAddressSpace { .. })
+        ));
+        // Tables do not fit for a genuine multi-table map.
+        let mut small = vec![0u8; 0x2000];
+        assert!(matches!(
+            build_identity_map_2mib_multi(&mut small, 0, 2 * 1024 * 1024 * 1024, 0),
             Err(PagingError::TablesExceedMemory { .. })
         ));
     }
