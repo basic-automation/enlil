@@ -203,6 +203,59 @@ pub fn read_bars(mem: &[u8], alloc: &McfgAllocation, func: &PciFunction) -> Vec<
     bars
 }
 
+/// Decode a 32-bit memory BAR's size from the value read back after writing
+/// all-ones to it (the standard PCI BAR-sizing probe).
+///
+/// The card leaves its decoded-address bits writable and hard-wires the rest to
+/// zero, so after an all-ones write the readback's low bits read zero up to the
+/// region size. Masking off the low 4 info bits, inverting the remaining
+/// writable size bits, and adding one recovers the size in bytes (a power of
+/// two). A readback with no writable size bits (`0` after masking) means the BAR
+/// is unimplemented — size `0`.
+///
+/// This is the pure decode the live bare-metal sizing path calls after its
+/// write-probe; [`read_bars`] itself stays read-only and does not probe.
+#[must_use]
+pub const fn memory_bar_size_32(readback: u32) -> u32 {
+    let masked = readback & 0xFFFF_FFF0;
+    if masked == 0 {
+        0
+    } else {
+        (!masked).wrapping_add(1)
+    }
+}
+
+/// Decode a 64-bit memory BAR's size from the low and high dwords read back
+/// after writing all-ones to both halves.
+///
+/// Like [`memory_bar_size_32`] but the writable size bits span both registers:
+/// the low dword's info bits (bits 3:0) are masked off, the two dwords are
+/// combined, inverted, and incremented. Size `0` if no writable bits remain.
+#[must_use]
+pub fn memory_bar_size_64(low_readback: u32, high_readback: u32) -> u64 {
+    let masked = (u64::from(high_readback) << 32) | u64::from(low_readback & 0xFFFF_FFF0);
+    if masked == 0 {
+        0
+    } else {
+        (!masked).wrapping_add(1)
+    }
+}
+
+/// Decode an I/O BAR's size from the all-ones write-probe readback.
+///
+/// As [`memory_bar_size_32`] but only bits 1:0 are info bits (the low bit marks
+/// I/O space). I/O BARs decode at most a 32-bit port range; size `0` if no
+/// writable size bits remain.
+#[must_use]
+pub const fn io_bar_size(readback: u32) -> u32 {
+    let masked = readback & 0xFFFF_FFFC;
+    if masked == 0 {
+        0
+    } else {
+        (!masked).wrapping_add(1)
+    }
+}
+
 /// The MMIO base address of an xHCI controller's register set — BAR0, the
 /// controller's memory-mapped register window per the xHCI spec.
 ///
@@ -789,6 +842,33 @@ mod tests {
         assert_eq!(bars[1], Bar::Io { base: 0xE000 });
         // The remaining four slots are unprogrammed.
         assert_eq!(bars[2..], [Bar::Unimplemented; 4]);
+    }
+
+    #[test]
+    fn decodes_bar_sizes_from_the_write_probe_readback() {
+        // 32-bit memory BAR: a 16 MiB region leaves bits 23:4 writable → after
+        // an all-ones write it reads back 0xFF00_0000 (low 24 bits zero, info
+        // bits included). Size = 0x0100_0000 = 16 MiB.
+        assert_eq!(memory_bar_size_32(0xFF00_0000), 0x0100_0000);
+        // A 16-byte region (the minimum): readback 0xFFFF_FFF0 → 0x10.
+        assert_eq!(memory_bar_size_32(0xFFFF_FFF0), 0x10);
+        // Prefetchable/64-bit info bits (low 4) are ignored: 0xFF00_000C decodes
+        // the same 16 MiB.
+        assert_eq!(memory_bar_size_32(0xFF00_000C), 0x0100_0000);
+        // Unimplemented BAR (no writable bits) → size 0.
+        assert_eq!(memory_bar_size_32(0), 0);
+
+        // 64-bit memory BAR spanning both dwords: a 4 GiB region reads back
+        // low=0x0000_0000, high=0xFFFF_FFFF → size 0x1_0000_0000.
+        assert_eq!(memory_bar_size_64(0x0000_0000, 0xFFFF_FFFF), 0x1_0000_0000);
+        // A 256 MiB 64-bit BAR: low=0xF000_0000, high=0xFFFF_FFFF.
+        assert_eq!(memory_bar_size_64(0xF000_0000, 0xFFFF_FFFF), 0x1000_0000);
+        assert_eq!(memory_bar_size_64(0, 0), 0);
+
+        // I/O BAR: only bits 1:0 are info bits. A 256-byte port range reads back
+        // 0xFFFF_FF01 (bit 0 set = I/O) → mask → 0xFFFF_FF00 → size 0x100.
+        assert_eq!(io_bar_size(0xFFFF_FF01), 0x100);
+        assert_eq!(io_bar_size(0), 0);
     }
 
     #[test]
