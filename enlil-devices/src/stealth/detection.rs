@@ -118,6 +118,59 @@ pub fn is_genuine_cpu_vendor(ebx: u32, edx: u32, ecx: u32) -> bool {
     )
 }
 
+/// A conservative bare-metal ceiling (in TSC cycles) for a single serializing
+/// CPUID bracketed by two RDTSCs.
+///
+/// On real hardware a serializing CPUID costs roughly a few hundred cycles; a
+/// hypervisor that intercepts CPUID pays a VM-exit → emulate → VM-entry round
+/// trip that inflates it into the thousands. `1000` sits above realistic
+/// bare-metal noise yet well below a trapped exit, so a sample median above it
+/// is a strong hypervisor tell. Callers measuring a different serializing
+/// operation should pass their own ceiling to [`timing_reveals_hypervisor`].
+pub const BARE_METAL_CPUID_CYCLE_CEILING: u64 = 1000;
+
+/// The median of a sample of cycle-count deltas, or `None` for an empty sample.
+///
+/// The median (not the mean) is the right central statistic here: a timing
+/// sample is riddled with upward outliers from SMIs, interrupts, and preemption,
+/// which drag the mean up but leave the median — the typical instruction cost —
+/// intact. Used by [`timing_reveals_hypervisor`]; also useful for an in-guest
+/// agent's timing report.
+#[must_use]
+pub fn median_cycles(deltas: &[u64]) -> Option<u64> {
+    if deltas.is_empty() {
+        return None;
+    }
+    let mut sorted = deltas.to_vec();
+    sorted.sort_unstable();
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 1 {
+        Some(sorted[mid])
+    } else {
+        // Average the two central values without overflowing u64.
+        let (lo, hi) = (sorted[mid - 1], sorted[mid]);
+        Some(lo + (hi - lo) / 2)
+    }
+}
+
+/// Whether a sample of cycle-count deltas measured across a serializing,
+/// VM-exit-prone instruction (typically CPUID bracketed by two RDTSCs) reveals a
+/// trapping hypervisor.
+///
+/// Compares the sample's [`median_cycles`] against `bare_metal_ceiling` (see
+/// [`BARE_METAL_CPUID_CYCLE_CEILING`]): a median above the ceiling means the
+/// operation is being intercepted and emulated across a VM boundary. An empty
+/// sample reveals nothing (`false`).
+///
+/// This is the timing check a pafish/al-khaser-style guest agent runs; enlil's
+/// timing stealth (item 5.4 — TSC offsetting + APERF/MPERF shadowing) exists to
+/// keep these deltas in the bare-metal range, and this primitive is what the
+/// in-guest agent uses to confirm it.
+#[must_use]
+pub fn timing_reveals_hypervisor(deltas: &[u64], bare_metal_ceiling: u64) -> bool {
+    median_cycles(deltas).is_some_and(|m| m > bare_metal_ceiling)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,6 +255,44 @@ mod tests {
             u32::from_le_bytes(*b"M\0\0\0"),
         );
         assert!(!is_genuine_cpu_vendor(kvm.0, kvm.1, kvm.2));
+    }
+
+    #[test]
+    fn median_handles_odd_even_and_empty_samples() {
+        assert_eq!(median_cycles(&[]), None);
+        assert_eq!(median_cycles(&[42]), Some(42));
+        // Odd count: middle after sorting.
+        assert_eq!(median_cycles(&[300, 100, 200]), Some(200));
+        // Even count: average of the two central values (250 and 300 → 275).
+        assert_eq!(median_cycles(&[100, 250, 300, 900]), Some(275));
+        // No overflow near u64::MAX for an even sample.
+        assert_eq!(median_cycles(&[u64::MAX, u64::MAX - 2]), Some(u64::MAX - 1));
+    }
+
+    #[test]
+    fn timing_flags_trapped_cpuid_but_not_bare_metal() {
+        // Bare-metal-ish CPUID deltas (hundreds of cycles) with a couple of
+        // SMI/interrupt outliers: the median stays low, so no hypervisor tell.
+        let bare_metal = [180, 200, 190, 8000, 210, 195, 205, 30000, 185];
+        assert!(!timing_reveals_hypervisor(
+            &bare_metal,
+            BARE_METAL_CPUID_CYCLE_CEILING
+        ));
+        assert!(median_cycles(&bare_metal).unwrap() < BARE_METAL_CPUID_CYCLE_CEILING);
+
+        // A trapping hypervisor: every CPUID pays a VM-exit round trip (thousands
+        // of cycles). The median is far above the ceiling → detected.
+        let trapped = [4200, 3900, 4500, 4100, 3800, 4300, 4000];
+        assert!(timing_reveals_hypervisor(
+            &trapped,
+            BARE_METAL_CPUID_CYCLE_CEILING
+        ));
+
+        // An empty sample concludes nothing.
+        assert!(!timing_reveals_hypervisor(
+            &[],
+            BARE_METAL_CPUID_CYCLE_CEILING
+        ));
     }
 
     /// Enlil's own synthesized CPUID must be clean (LOCKED PRINCIPLE 1): the
