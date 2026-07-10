@@ -719,6 +719,41 @@ pub fn plan_enable_vfs(
     })
 }
 
+/// Config-space offset of the SR-IOV System Page Size register relative to the
+/// cap base.
+pub const SR_IOV_OFF_SYSTEM_PAGE_SIZE: u16 = 0x20;
+
+/// Select the value to program into the SR-IOV System Page Size register from a
+/// PF's `Supported Page Sizes` bitmask.
+///
+/// Each bit `n` of `supported_mask` advertises support for VF page size
+/// `2^(n+12)` (bit 0 = 4 KiB, bit 8 = 1 MiB, …); the System Page Size register
+/// must be written with **exactly one** of those bits set — it sizes the VF BAR
+/// apertures — and must be programmed before VFs are enabled. This prefers the
+/// bit matching `desired_bytes` when the PF supports it, else falls back to the
+/// smallest supported size (bit 0 / 4 KiB is mandatory per the SR-IOV spec).
+///
+/// Returns the single-bit mask to write, or `None` if `supported_mask` is empty
+/// (a malformed capability that advertises no page size at all).
+#[must_use]
+pub const fn select_sr_iov_system_page_size(
+    supported_mask: u32,
+    desired_bytes: u64,
+) -> Option<u32> {
+    if supported_mask == 0 {
+        return None;
+    }
+    // A power-of-two desired size ≥ 4 KiB maps to bit (log2(size) - 12).
+    if desired_bytes.is_power_of_two() && desired_bytes >= 4096 {
+        let bit = desired_bytes.trailing_zeros() - 12;
+        if bit < 32 && supported_mask & (1 << bit) != 0 {
+            return Some(1 << bit);
+        }
+    }
+    // Fall back to the smallest supported page size.
+    Some(1 << supported_mask.trailing_zeros())
+}
+
 /// Discover every xHCI (USB 3.x) host controller across all ECAM windows.
 ///
 /// Pairs each with its BAR0 MMIO base — the "PCI enum to xHCI BARs" step the USB
@@ -1140,6 +1175,31 @@ mod tests {
             })
         );
         assert_eq!(plan_enable_vfs(&cap, &pf, 0), Err(SrIovPlanError::ZeroVfs));
+    }
+
+    #[test]
+    fn selects_the_sr_iov_system_page_size() {
+        // Supported: 4 KiB (bit 0), 8 KiB (bit 1), 64 KiB (bit 4), 1 MiB (bit 8).
+        let mask = (1 << 0) | (1 << 1) | (1 << 4) | (1 << 8);
+        // Desired 64 KiB is supported → its bit.
+        assert_eq!(
+            select_sr_iov_system_page_size(mask, 64 * 1024),
+            Some(1 << 4)
+        );
+        // Desired 4 KiB.
+        assert_eq!(select_sr_iov_system_page_size(mask, 4096), Some(1 << 0));
+        // Desired 2 MiB (bit 9) is not supported → fall back to smallest (4 KiB).
+        assert_eq!(
+            select_sr_iov_system_page_size(mask, 2 * 1024 * 1024),
+            Some(1 << 0)
+        );
+        // A non-power-of-two desired size falls back to the smallest supported.
+        assert_eq!(select_sr_iov_system_page_size(mask, 5000), Some(1 << 0));
+        // If 4 KiB is absent, the smallest supported (here 64 KiB) is chosen.
+        let big_only = (1 << 4) | (1 << 8);
+        assert_eq!(select_sr_iov_system_page_size(big_only, 4096), Some(1 << 4));
+        // An empty mask advertises no page size.
+        assert_eq!(select_sr_iov_system_page_size(0, 4096), None);
     }
 
     #[test]
