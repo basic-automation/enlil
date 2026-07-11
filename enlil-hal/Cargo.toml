@@ -4,5 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Hardware Abstraction Layer — architecture-neutral hypervisor backend traits"
 
+# no_std + alloc: builds for both the Linux/KVM dev host and the bare-metal
+# x86_64-unknown-enlil kernel target. No external deps so the HAL seam stays
+# thin and portable.
 [dependencies]
-thiserror = "2"
