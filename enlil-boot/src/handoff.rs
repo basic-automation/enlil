@@ -10,6 +10,36 @@
 //! dev toolchain, and the real UEFI collection code (Phase 6.1) fills them
 //! in with values read from firmware protocols.
 
+/// The pixel layout of a GOP framebuffer, mirroring UEFI's `PixelFormat`.
+///
+/// Kept as a plain enum here (rather than re-exporting the uefi-rs type) so
+/// the bytes-per-pixel logic is host-testable without a UEFI toolchain; the
+/// firmware code maps the real `uefi::proto::console::gop::PixelFormat` onto
+/// this before building a [`Framebuffer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelFormat {
+    /// 32-bit, 8:8:8 RGB with a reserved 4th byte.
+    Rgb,
+    /// 32-bit, 8:8:8 BGR with a reserved 4th byte.
+    Bgr,
+    /// Custom channel layout described by a bitmask (still 32-bit/pixel).
+    Bitmask,
+    /// No linear framebuffer — the mode only supports blt operations.
+    BltOnly,
+}
+
+impl PixelFormat {
+    /// Bytes per pixel for a directly-addressable framebuffer, or `None` for
+    /// a blt-only mode that exposes no linear framebuffer.
+    #[must_use]
+    pub const fn bytes_per_pixel(self) -> Option<u32> {
+        match self {
+            Self::Rgb | Self::Bgr | Self::Bitmask => Some(4),
+            Self::BltOnly => None,
+        }
+    }
+}
+
 /// A linear framebuffer as reported by the UEFI Graphics Output Protocol.
 ///
 /// `stride` is the number of pixels per scanline (which may exceed `width`
@@ -30,6 +60,28 @@ pub struct Framebuffer {
 }
 
 impl Framebuffer {
+    /// Build a framebuffer from the GOP mode parameters, or `None` if the
+    /// mode is blt-only (no linear framebuffer to hand the kernel).
+    #[must_use]
+    pub const fn from_gop(
+        base: u64,
+        width: u32,
+        height: u32,
+        stride: u32,
+        format: PixelFormat,
+    ) -> Option<Self> {
+        match format.bytes_per_pixel() {
+            Some(bytes_per_pixel) => Some(Self {
+                base,
+                width,
+                height,
+                stride,
+                bytes_per_pixel,
+            }),
+            None => None,
+        }
+    }
+
     /// Total size of the framebuffer in bytes (`stride * height * bpp`).
     #[must_use]
     pub const fn size_bytes(&self) -> u64 {
@@ -114,6 +166,28 @@ mod tests {
             stride: 2048,
             bytes_per_pixel: 4,
         }
+    }
+
+    #[test]
+    fn pixel_format_bytes_per_pixel() {
+        assert_eq!(PixelFormat::Rgb.bytes_per_pixel(), Some(4));
+        assert_eq!(PixelFormat::Bgr.bytes_per_pixel(), Some(4));
+        assert_eq!(PixelFormat::Bitmask.bytes_per_pixel(), Some(4));
+        // A blt-only mode has no linear framebuffer to describe.
+        assert_eq!(PixelFormat::BltOnly.bytes_per_pixel(), None);
+    }
+
+    #[test]
+    fn from_gop_builds_addressable_modes_and_rejects_blt_only() {
+        let fb = Framebuffer::from_gop(0x8000_0000, 1280, 720, 1280, PixelFormat::Bgr)
+            .expect("BGR is addressable");
+        assert_eq!(fb.bytes_per_pixel, 4);
+        assert_eq!(fb.size_bytes(), 1280 * 720 * 4);
+        // Blt-only yields no framebuffer.
+        assert_eq!(
+            Framebuffer::from_gop(0, 1280, 720, 1280, PixelFormat::BltOnly),
+            None
+        );
     }
 
     #[test]
