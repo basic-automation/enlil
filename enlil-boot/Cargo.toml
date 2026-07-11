@@ -2,9 +2,18 @@
 name = "enlil-boot"
 version = "0.1.0"
 edition = "2024"
-description = "UEFI boot payload — bare-metal target (Phase 5+)"
+description = "UEFI boot payload — bare-metal target (Phase 6)"
 
 [dependencies]
 log = "0.4"
-# UEFI deps will be added in Phase 5
-# uefi = "0.32"
+
+# The uefi-rs runtime is only pulled in when building for the UEFI firmware
+# target. On the Linux/Windows dev host the crate still compiles (the entry
+# point and firmware code are gated behind cfg(target_os = "uefi")), so the
+# workspace `cargo build/test/clippy` stays green without a UEFI toolchain.
+[target.'cfg(target_os = "uefi")'.dependencies]
+uefi = { version = "0.33", default-features = false, features = [
+    "logger",
+    "global_allocator",
+    "panic_handler",
+] }
