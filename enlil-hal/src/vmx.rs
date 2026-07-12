@@ -335,13 +335,97 @@ impl VmxExitReason {
     }
 }
 
+/// A decoded I/O-instruction VM-exit qualification (Intel SDM Vol. 3,
+/// Table 27-5), read from the exit-qualification field on an
+/// [`IO_INSTRUCTION`](exit_reason::IO_INSTRUCTION) VM exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoExitQualification(u64);
+
+impl IoExitQualification {
+    /// The VMCS field encoding of the exit qualification (natural width,
+    /// read-only).
+    pub const ENCODING: u32 = 0x6400;
+
+    /// Wrap the raw exit-qualification field.
+    #[must_use]
+    pub const fn from_qualification(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// The access size in bytes (bits 2:0): 1, 2, or 4.
+    #[must_use]
+    pub const fn access_size(self) -> u8 {
+        match self.0 & 0x7 {
+            0 => 1,
+            1 => 2,
+            // 3 encodes a 4-byte access; other values are reserved.
+            _ => 4,
+        }
+    }
+
+    /// Whether the instruction is `IN`/`INS` (a guest read) rather than
+    /// `OUT`/`OUTS` (bit 3).
+    #[must_use]
+    pub const fn is_in(self) -> bool {
+        self.0 & (1 << 3) != 0
+    }
+
+    /// Whether this is a string I/O instruction, `INS`/`OUTS` (bit 4).
+    #[must_use]
+    pub const fn is_string(self) -> bool {
+        self.0 & (1 << 4) != 0
+    }
+
+    /// Whether the instruction carried a `REP` prefix (bit 5).
+    #[must_use]
+    pub const fn is_rep(self) -> bool {
+        self.0 & (1 << 5) != 0
+    }
+
+    /// The I/O port number (bits 31:16).
+    #[must_use]
+    pub fn port(self) -> u16 {
+        u16::try_from((self.0 >> 16) & 0xFFFF).unwrap_or(0)
+    }
+}
+
+/// Build the arch-neutral [`VmExit`](crate::VmExit) for an I/O-instruction VM
+/// exit from its qualification and the guest accumulator (`RAX`).
+///
+/// The accumulator supplies the `OUT` data, masked to the access size. String
+/// (`INS`/`OUTS`) I/O returns `None`: it moves data through guest memory and the
+/// backend emulates it separately rather than as a single port access.
+#[must_use]
+pub fn io_exit_to_vmexit(qual: IoExitQualification, rax: u32) -> Option<crate::VmExit> {
+    if qual.is_string() {
+        return None;
+    }
+    let port = qual.port();
+    let size = qual.access_size();
+    if qual.is_in() {
+        Some(crate::VmExit::IoIn { port, size })
+    } else {
+        let mask = match size {
+            1 => 0xFF,
+            2 => 0xFFFF,
+            _ => 0xFFFF_FFFF,
+        };
+        Some(crate::VmExit::IoOut {
+            port,
+            size,
+            data: rax & mask,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         IA32_VMX_BASIC, IA32_VMX_ENTRY_CTLS, IA32_VMX_PINBASED_CTLS, IA32_VMX_PROCBASED_CTLS,
-        IA32_VMX_TRUE_PINBASED_CTLS, VmcsField, VmcsFieldType, VmcsFieldWidth, VmcsMemoryType,
-        VmxBasic, VmxControlCaps, VmxExitReason, exit_reason,
+        IA32_VMX_TRUE_PINBASED_CTLS, IoExitQualification, VmcsField, VmcsFieldType, VmcsFieldWidth,
+        VmcsMemoryType, VmxBasic, VmxControlCaps, VmxExitReason, exit_reason, io_exit_to_vmexit,
     };
+    use crate::VmExit;
 
     #[test]
     fn msr_index_matches_sdm() {
@@ -503,5 +587,63 @@ mod tests {
         assert_eq!(reason.basic_reason(), exit_reason::EPT_VIOLATION);
         assert!(reason.is_vm_entry_failure());
         assert!(reason.in_vmx_root());
+    }
+
+    #[test]
+    fn io_qualification_encoding_is_natural_read_only() {
+        // 0x6400: read-only-data (bits 11:10 = 1), natural width (bits 14:13 = 3).
+        let field = VmcsField::from_encoding(IoExitQualification::ENCODING);
+        assert_eq!(field.field_type(), VmcsFieldType::ReadOnlyData);
+        assert_eq!(field.width(), VmcsFieldWidth::Natural);
+    }
+
+    #[test]
+    fn io_qualification_decodes_out_byte_to_port() {
+        // OUT to port 0x3F8, 1 byte: size bits=0, direction bit 3 clear,
+        // port in bits 31:16.
+        let qual = IoExitQualification::from_qualification(0x03F8 << 16);
+        assert_eq!(qual.access_size(), 1);
+        assert!(!qual.is_in());
+        assert!(!qual.is_string());
+        assert_eq!(qual.port(), 0x3F8);
+    }
+
+    #[test]
+    fn io_qualification_decodes_in_dword() {
+        // IN from port 0xCF8, 4 bytes: size bits=3, direction bit 3 set.
+        let qual = IoExitQualification::from_qualification((0x0CF8 << 16) | 0b1000 | 0b011);
+        assert_eq!(qual.access_size(), 4);
+        assert!(qual.is_in());
+        assert_eq!(qual.port(), 0xCF8);
+    }
+
+    #[test]
+    fn io_exit_maps_out_to_vmexit_masking_data() {
+        // OUT 1 byte to 0x80 with RAX = 0xDEAD_BEEF → only the low byte is data.
+        let qual = IoExitQualification::from_qualification(0x0080 << 16);
+        assert_eq!(
+            io_exit_to_vmexit(qual, 0xDEAD_BEEF),
+            Some(VmExit::IoOut {
+                port: 0x80,
+                size: 1,
+                data: 0xEF,
+            })
+        );
+    }
+
+    #[test]
+    fn io_exit_maps_in_and_skips_string_io() {
+        // IN dword from 0xCFC → IoIn.
+        let in_qual = IoExitQualification::from_qualification((0x0CFC << 16) | 0b1000 | 0b011);
+        assert_eq!(
+            io_exit_to_vmexit(in_qual, 0),
+            Some(VmExit::IoIn {
+                port: 0xCFC,
+                size: 4,
+            })
+        );
+        // A string OUTS (bit 4 set) is not a single-port access.
+        let str_qual = IoExitQualification::from_qualification((0x0070 << 16) | 0b1_0000);
+        assert_eq!(io_exit_to_vmexit(str_qual, 0), None);
     }
 }
