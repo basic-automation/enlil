@@ -381,6 +381,32 @@ pub fn baremetal_heap_ready() -> bool {
     baremetal_heap::is_initialized()
 }
 
+/// Install the global bare-metal heap from the firmware memory map.
+///
+/// Selects a bootstrap heap region of at least `min_size` bytes from the raw
+/// UEFI descriptor array (see [`map::select_bootstrap_heap_region`]) and installs
+/// it as the global allocator via [`init_baremetal_heap`]. This is the first
+/// thing `baremetal_init` does with the [`BootHandoff`](../../enlil_boot) memory
+/// map, before any `Vec`-backed [`MemoryMap`](map::MemoryMap) can be built.
+/// Returns the installed region, or `None` if no usable region is large enough.
+///
+/// # Safety
+///
+/// `descriptors` must describe the live physical memory map, and the selected
+/// region must be otherwise unused and outlive every allocation. Call at most
+/// once, before the first heap allocation.
+#[cfg(not(feature = "platform-linux"))]
+pub unsafe fn init_global_heap_from_uefi(
+    descriptors: &[map::UefiMemoryDescriptor],
+    min_size: u64,
+) -> Option<map::MemoryRegion> {
+    let region = map::select_bootstrap_heap_region(descriptors, min_size)?;
+    let base = usize::try_from(region.base.as_u64()).ok()? as *mut u8;
+    let size = usize::try_from(region.size).ok()?;
+    unsafe { init_baremetal_heap(base, size) };
+    Some(region)
+}
+
 // ---------------------------------------------------------------------------
 // Platform GlobalAlloc wrapper
 // ---------------------------------------------------------------------------
