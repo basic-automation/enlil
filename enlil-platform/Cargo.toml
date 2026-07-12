@@ -7,11 +7,16 @@ description = "Enlil platform abstraction layer — threading, alloc, sync, asyn
 [features]
 default = ["platform-linux"]
 platform-linux = []
-platform-baremetal = []
+# The bare-metal backend backs GlobalAlloc with the audited linked_list_allocator
+# heap rather than the Linux system allocator.
+platform-baremetal = ["dep:linked_list_allocator"]
 
 [dependencies]
 log = "0.4"
 spin = "0.9"
+# Intrusive-free-list heap for the bare-metal GlobalAlloc. Pulled in only under
+# the platform-baremetal feature (no_std, no external OS deps).
+linked_list_allocator = { version = "0.10", optional = true }
 
 # The Linux epoll I/O reactor source (async_rt::epoll) needs raw epoll
 # syscalls; gated to the Linux dev host so the bare-metal target never pulls it.
