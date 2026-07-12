@@ -162,11 +162,116 @@ impl VmxControlCaps {
     }
 }
 
+/// The width class of a VMCS field (component-encoding bits 14:13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmcsFieldWidth {
+    /// 16-bit field.
+    Bits16,
+    /// 64-bit field (has a separate "high" access for its upper 32 bits).
+    Bits64,
+    /// 32-bit field.
+    Bits32,
+    /// Natural-width field (32 or 64 bits, matching the CPU mode).
+    Natural,
+}
+
+/// The class of state a VMCS field belongs to (component-encoding bits 11:10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmcsFieldType {
+    /// A control field.
+    Control,
+    /// A read-only VM-exit information field.
+    ReadOnlyData,
+    /// Guest-state field.
+    GuestState,
+    /// Host-state field.
+    HostState,
+}
+
+/// A VMCS component-field encoding — the operand `VMREAD` / `VMWRITE` take to
+/// address one field within the current VMCS (Intel SDM Vol. 3, Section 24.11.2
+/// and Appendix B).
+///
+/// The 32-bit encoding packs an access type (bit 0: full vs. the high half of a
+/// 64-bit field), an index (bits 9:1), a [`VmcsFieldType`] (bits 11:10), and a
+/// [`VmcsFieldWidth`] (bits 14:13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmcsField(u32);
+
+impl VmcsField {
+    // A curated set of the field encodings the VMX backend programs first.
+    /// Guest CR3 (natural width, guest state).
+    pub const GUEST_CR3: Self = Self(0x6802);
+    /// Guest RSP (natural width, guest state).
+    pub const GUEST_RSP: Self = Self(0x681C);
+    /// Guest RIP (natural width, guest state).
+    pub const GUEST_RIP: Self = Self(0x681E);
+    /// Guest RFLAGS (natural width, guest state).
+    pub const GUEST_RFLAGS: Self = Self(0x6820);
+    /// Host RSP (natural width, host state).
+    pub const HOST_RSP: Self = Self(0x6C14);
+    /// Host RIP (natural width, host state).
+    pub const HOST_RIP: Self = Self(0x6C16);
+    /// The VMCS link pointer (64-bit guest state); set to all-ones when unused.
+    pub const VMCS_LINK_POINTER: Self = Self(0x2800);
+    /// The EPT pointer (64-bit control field).
+    pub const EPT_POINTER: Self = Self(0x201A);
+
+    /// Wrap a raw 32-bit VMCS field encoding.
+    #[must_use]
+    pub const fn from_encoding(encoding: u32) -> Self {
+        Self(encoding)
+    }
+
+    /// The raw 32-bit encoding (the `VMREAD` / `VMWRITE` operand).
+    #[must_use]
+    pub const fn encoding(self) -> u32 {
+        self.0
+    }
+
+    /// Whether this encoding addresses the high 32 bits of a 64-bit field
+    /// (access type, bit 0).
+    #[must_use]
+    pub const fn is_high_access(self) -> bool {
+        self.0 & 1 != 0
+    }
+
+    /// The field index within its (type, width) group (bits 9:1).
+    #[must_use]
+    pub fn index(self) -> u16 {
+        // Nine bits, so the value always fits a u16.
+        u16::try_from((self.0 >> 1) & 0x1FF).unwrap_or(0)
+    }
+
+    /// The field's state class (bits 11:10).
+    #[must_use]
+    pub const fn field_type(self) -> VmcsFieldType {
+        match (self.0 >> 10) & 0x3 {
+            0 => VmcsFieldType::Control,
+            1 => VmcsFieldType::ReadOnlyData,
+            2 => VmcsFieldType::GuestState,
+            _ => VmcsFieldType::HostState,
+        }
+    }
+
+    /// The field's width class (bits 14:13).
+    #[must_use]
+    pub const fn width(self) -> VmcsFieldWidth {
+        match (self.0 >> 13) & 0x3 {
+            0 => VmcsFieldWidth::Bits16,
+            1 => VmcsFieldWidth::Bits64,
+            2 => VmcsFieldWidth::Bits32,
+            _ => VmcsFieldWidth::Natural,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         IA32_VMX_BASIC, IA32_VMX_ENTRY_CTLS, IA32_VMX_PINBASED_CTLS, IA32_VMX_PROCBASED_CTLS,
-        IA32_VMX_TRUE_PINBASED_CTLS, VmcsMemoryType, VmxBasic, VmxControlCaps,
+        IA32_VMX_TRUE_PINBASED_CTLS, VmcsField, VmcsFieldType, VmcsFieldWidth, VmcsMemoryType,
+        VmxBasic, VmxControlCaps,
     };
 
     #[test]
@@ -256,5 +361,49 @@ mod tests {
         // Out-of-range bit indices never claim a constraint.
         assert!(!caps.may_set(40));
         assert!(!caps.must_set(40));
+    }
+
+    #[test]
+    fn vmcs_field_decodes_natural_guest_and_host_state() {
+        // GUEST_RIP: natural width, guest state, full access.
+        let rip = VmcsField::GUEST_RIP;
+        assert_eq!(rip.width(), VmcsFieldWidth::Natural);
+        assert_eq!(rip.field_type(), VmcsFieldType::GuestState);
+        assert!(!rip.is_high_access());
+        assert_eq!(rip.encoding(), 0x681E);
+
+        // HOST_RIP: natural width, host state.
+        let host_rip = VmcsField::HOST_RIP;
+        assert_eq!(host_rip.width(), VmcsFieldWidth::Natural);
+        assert_eq!(host_rip.field_type(), VmcsFieldType::HostState);
+    }
+
+    #[test]
+    fn vmcs_field_decodes_64bit_control_and_guest_fields() {
+        // EPT_POINTER: 64-bit control field.
+        let eptp = VmcsField::EPT_POINTER;
+        assert_eq!(eptp.width(), VmcsFieldWidth::Bits64);
+        assert_eq!(eptp.field_type(), VmcsFieldType::Control);
+
+        // VMCS_LINK_POINTER: 64-bit guest-state field.
+        let link = VmcsField::VMCS_LINK_POINTER;
+        assert_eq!(link.width(), VmcsFieldWidth::Bits64);
+        assert_eq!(link.field_type(), VmcsFieldType::GuestState);
+    }
+
+    #[test]
+    fn vmcs_field_high_access_bit_selects_upper_dword() {
+        // Setting bit 0 of a 64-bit field encoding selects its high half.
+        let link_high = VmcsField::from_encoding(VmcsField::VMCS_LINK_POINTER.encoding() | 1);
+        assert!(link_high.is_high_access());
+        assert_eq!(link_high.width(), VmcsFieldWidth::Bits64);
+    }
+
+    #[test]
+    fn vmcs_field_index_extracts_bits_9_1() {
+        // Encoding 0x681E → index bits 9:1 = 0x0F.
+        assert_eq!(VmcsField::GUEST_RIP.index(), 0x0F);
+        // Encoding 0x681C (GUEST_RSP) → index 0x0E.
+        assert_eq!(VmcsField::GUEST_RSP.index(), 0x0E);
     }
 }
