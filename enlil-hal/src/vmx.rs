@@ -269,6 +269,49 @@ impl VmcsField {
     }
 }
 
+/// The size of a VMXON / VMCS region in bytes (a 4 KiB page). The
+/// processor-reported region size from [`VmxBasic::region_size`] never exceeds
+/// this.
+pub const VMX_REGION_SIZE: usize = 4096;
+
+/// Why [`init_vmx_region`] could not initialize a region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmxRegionError {
+    /// The supplied buffer is smaller than a VMXON / VMCS region.
+    TooSmall {
+        /// The buffer length that was provided.
+        provided: usize,
+        /// The minimum region size required ([`VMX_REGION_SIZE`]).
+        required: usize,
+    },
+}
+
+/// Initialize a VMXON or VMCS region in place, ready for `VMXON` / `VMPTRLD`.
+///
+/// Zeroes the whole region, then writes the VMCS revision identifier (from
+/// [`VmxBasic::revision_id`]) into the first 31 bits of the header with bit 31
+/// clear — the shadow-VMCS indicator, which this backend does not use (Intel
+/// SDM Vol. 3, Sections 24.2 and 31.5). The caller supplies the region as a
+/// 4 KiB-aligned physical page; only the byte-level header layout is handled
+/// here so it stays host-testable.
+///
+/// # Errors
+///
+/// Returns [`VmxRegionError::TooSmall`] if `region` is shorter than
+/// [`VMX_REGION_SIZE`].
+pub fn init_vmx_region(region: &mut [u8], revision_id: u32) -> Result<(), VmxRegionError> {
+    if region.len() < VMX_REGION_SIZE {
+        return Err(VmxRegionError::TooSmall {
+            provided: region.len(),
+            required: VMX_REGION_SIZE,
+        });
+    }
+    region.fill(0);
+    let header = (revision_id & 0x7FFF_FFFF).to_le_bytes();
+    region[..4].copy_from_slice(&header);
+    Ok(())
+}
+
 /// Basic VM-exit reasons (Intel SDM Vol. 3, Appendix C). Only the reasons the
 /// backend routes first are named; any other exit arrives as its raw number.
 pub mod exit_reason {
@@ -516,9 +559,10 @@ impl EptViolationQualification {
 mod tests {
     use super::{
         IA32_VMX_BASIC, IA32_VMX_ENTRY_CTLS, IA32_VMX_PINBASED_CTLS, IA32_VMX_PROCBASED_CTLS,
-        EptViolationQualification, IA32_VMX_TRUE_PINBASED_CTLS, IoExitQualification, VmcsField,
-        VmcsFieldType, VmcsFieldWidth, VmcsMemoryType, VmxBasic, VmxControlCaps, VmxExitReason,
-        exit_reason, io_exit_to_vmexit, simple_exit_to_vmexit,
+        EptViolationQualification, IA32_VMX_TRUE_PINBASED_CTLS, IoExitQualification,
+        VMX_REGION_SIZE, VmcsField, VmcsFieldType, VmcsFieldWidth, VmcsMemoryType, VmxBasic,
+        VmxControlCaps, VmxExitReason, VmxRegionError, exit_reason, init_vmx_region,
+        io_exit_to_vmexit, simple_exit_to_vmexit,
     };
     use crate::VmExit;
 
@@ -782,6 +826,36 @@ mod tests {
         assert!(!qual.ept_writable());
         assert!(qual.guest_linear_valid());
         assert!(qual.is_final_translation());
+    }
+
+    #[test]
+    fn init_vmx_region_stamps_revision_and_zeroes_rest() {
+        let mut region = [0xFF_u8; VMX_REGION_SIZE];
+        init_vmx_region(&mut region, 0x1234_5678).expect("4 KiB region is large enough");
+        // Header holds the revision id, little-endian, bit 31 clear.
+        assert_eq!(&region[..4], &0x1234_5678_u32.to_le_bytes());
+        // Everything past the header is zeroed.
+        assert!(region[4..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn init_vmx_region_clears_shadow_vmcs_bit() {
+        let mut region = [0_u8; VMX_REGION_SIZE];
+        // A revision id with bit 31 set must be masked off in the header.
+        init_vmx_region(&mut region, 0xFFFF_FFFF).unwrap();
+        assert_eq!(&region[..4], &0x7FFF_FFFF_u32.to_le_bytes());
+    }
+
+    #[test]
+    fn init_vmx_region_rejects_undersized_buffer() {
+        let mut small = [0_u8; 2048];
+        assert_eq!(
+            init_vmx_region(&mut small, 1),
+            Err(VmxRegionError::TooSmall {
+                provided: 2048,
+                required: VMX_REGION_SIZE,
+            })
+        );
     }
 
     #[test]
