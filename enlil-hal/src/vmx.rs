@@ -216,6 +216,9 @@ impl VmcsField {
     pub const VMCS_LINK_POINTER: Self = Self(0x2800);
     /// The EPT pointer (64-bit control field).
     pub const EPT_POINTER: Self = Self(0x201A);
+    /// The guest-physical address that caused an EPT violation /
+    /// misconfiguration (64-bit read-only field).
+    pub const GUEST_PHYSICAL_ADDRESS: Self = Self(0x2400);
 
     /// Wrap a raw 32-bit VMCS field encoding.
     #[must_use]
@@ -438,13 +441,84 @@ pub fn simple_exit_to_vmexit(reason: VmxExitReason) -> Option<crate::VmExit> {
     }
 }
 
+/// A decoded EPT-violation exit qualification (Intel SDM Vol. 3, Table 28-7),
+/// read from the exit-qualification field on an
+/// [`EPT_VIOLATION`](exit_reason::EPT_VIOLATION) VM exit.
+///
+/// The faulting guest-physical address is read separately from
+/// [`VmcsField::GUEST_PHYSICAL_ADDRESS`]; the access *size* comes from decoding
+/// the faulting instruction, so producing an [`MmioRead`](crate::VmExit::MmioRead)
+/// / [`MmioWrite`](crate::VmExit::MmioWrite) is left to the caller once it has
+/// both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EptViolationQualification(u64);
+
+impl EptViolationQualification {
+    /// Wrap the raw exit-qualification field (the same VMCS field as
+    /// [`IoExitQualification::ENCODING`], reinterpreted for an EPT violation).
+    #[must_use]
+    pub const fn from_qualification(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Whether the faulting access was a data read (bit 0).
+    #[must_use]
+    pub const fn was_read(self) -> bool {
+        self.0 & 1 != 0
+    }
+
+    /// Whether the faulting access was a data write (bit 1).
+    #[must_use]
+    pub const fn was_write(self) -> bool {
+        self.0 & (1 << 1) != 0
+    }
+
+    /// Whether the faulting access was an instruction fetch (bit 2).
+    #[must_use]
+    pub const fn was_instruction_fetch(self) -> bool {
+        self.0 & (1 << 2) != 0
+    }
+
+    /// Whether the guest-physical page is readable under EPT (bit 3).
+    #[must_use]
+    pub const fn ept_readable(self) -> bool {
+        self.0 & (1 << 3) != 0
+    }
+
+    /// Whether the guest-physical page is writable under EPT (bit 4).
+    #[must_use]
+    pub const fn ept_writable(self) -> bool {
+        self.0 & (1 << 4) != 0
+    }
+
+    /// Whether the guest-physical page is executable under EPT (bit 5).
+    #[must_use]
+    pub const fn ept_executable(self) -> bool {
+        self.0 & (1 << 5) != 0
+    }
+
+    /// Whether the guest-linear-address field is valid (bit 7). It is invalid
+    /// for an EPT violation on a paging-structure walk with no linear address.
+    #[must_use]
+    pub const fn guest_linear_valid(self) -> bool {
+        self.0 & (1 << 7) != 0
+    }
+
+    /// Whether the violation was on the final GPA translation rather than a
+    /// guest paging-structure entry (bit 8 clear, with bit 7 valid).
+    #[must_use]
+    pub const fn is_final_translation(self) -> bool {
+        self.guest_linear_valid() && self.0 & (1 << 8) == 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         IA32_VMX_BASIC, IA32_VMX_ENTRY_CTLS, IA32_VMX_PINBASED_CTLS, IA32_VMX_PROCBASED_CTLS,
-        IA32_VMX_TRUE_PINBASED_CTLS, IoExitQualification, VmcsField, VmcsFieldType, VmcsFieldWidth,
-        VmcsMemoryType, VmxBasic, VmxControlCaps, VmxExitReason, exit_reason, io_exit_to_vmexit,
-        simple_exit_to_vmexit,
+        EptViolationQualification, IA32_VMX_TRUE_PINBASED_CTLS, IoExitQualification, VmcsField,
+        VmcsFieldType, VmcsFieldWidth, VmcsMemoryType, VmxBasic, VmxControlCaps, VmxExitReason,
+        exit_reason, io_exit_to_vmexit, simple_exit_to_vmexit,
     };
     use crate::VmExit;
 
@@ -686,5 +760,39 @@ mod tests {
         let failed_hlt =
             VmxExitReason::from_field(u32::from(exit_reason::HLT) | (1 << 31));
         assert_eq!(simple_exit_to_vmexit(failed_hlt), None);
+    }
+
+    #[test]
+    fn guest_physical_address_field_is_64bit_read_only() {
+        // 0x2400: read-only-data (bits 11:10 = 1), 64-bit width (bits 14:13 = 1).
+        let field = VmcsField::GUEST_PHYSICAL_ADDRESS;
+        assert_eq!(field.field_type(), VmcsFieldType::ReadOnlyData);
+        assert_eq!(field.width(), VmcsFieldWidth::Bits64);
+    }
+
+    #[test]
+    fn ept_violation_decodes_write_to_mapped_readable_page() {
+        // Write access (bit 1), page readable (bit 3) but not writable (bit 4),
+        // guest-linear valid (bit 7) on the final translation (bit 8 clear).
+        let qual = EptViolationQualification::from_qualification(0b1000_1010);
+        assert!(qual.was_write());
+        assert!(!qual.was_read());
+        assert!(!qual.was_instruction_fetch());
+        assert!(qual.ept_readable());
+        assert!(!qual.ept_writable());
+        assert!(qual.guest_linear_valid());
+        assert!(qual.is_final_translation());
+    }
+
+    #[test]
+    fn ept_violation_flags_instruction_fetch_and_paging_walk() {
+        // Instruction fetch (bit 2), page executable (bit 5), guest-linear
+        // valid (bit 7), but the access was to a paging-structure entry (bit 8).
+        let qual = EptViolationQualification::from_qualification(0b1_1010_0100);
+        assert!(qual.was_instruction_fetch());
+        assert!(qual.ept_executable());
+        assert!(qual.guest_linear_valid());
+        // Bit 8 set → not the final translation.
+        assert!(!qual.is_final_translation());
     }
 }
