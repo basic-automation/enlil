@@ -418,12 +418,33 @@ pub fn io_exit_to_vmexit(qual: IoExitQualification, rax: u32) -> Option<crate::V
     }
 }
 
+/// Map a VM-exit reason that needs no further VMCS reads onto the arch-neutral
+/// [`VmExit`](crate::VmExit).
+///
+/// Returns `None` for reasons that require extra decoding the caller performs
+/// with the exit qualification and guest registers (I/O — see
+/// [`io_exit_to_vmexit`]; EPT violations; `CPUID` / MSR access), or that are
+/// simply not routed yet.
+#[must_use]
+pub fn simple_exit_to_vmexit(reason: VmxExitReason) -> Option<crate::VmExit> {
+    // A VM-entry failure is never a normal guest exit; the caller must abort.
+    if reason.is_vm_entry_failure() {
+        return None;
+    }
+    match reason.basic_reason() {
+        exit_reason::HLT => Some(crate::VmExit::Hlt),
+        exit_reason::TRIPLE_FAULT => Some(crate::VmExit::Shutdown),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         IA32_VMX_BASIC, IA32_VMX_ENTRY_CTLS, IA32_VMX_PINBASED_CTLS, IA32_VMX_PROCBASED_CTLS,
         IA32_VMX_TRUE_PINBASED_CTLS, IoExitQualification, VmcsField, VmcsFieldType, VmcsFieldWidth,
         VmcsMemoryType, VmxBasic, VmxControlCaps, VmxExitReason, exit_reason, io_exit_to_vmexit,
+        simple_exit_to_vmexit,
     };
     use crate::VmExit;
 
@@ -645,5 +666,25 @@ mod tests {
         // A string OUTS (bit 4 set) is not a single-port access.
         let str_qual = IoExitQualification::from_qualification((0x0070 << 16) | 0b1_0000);
         assert_eq!(io_exit_to_vmexit(str_qual, 0), None);
+    }
+
+    #[test]
+    fn simple_exit_maps_hlt_and_triple_fault() {
+        let hlt = VmxExitReason::from_field(u32::from(exit_reason::HLT));
+        assert_eq!(simple_exit_to_vmexit(hlt), Some(VmExit::Hlt));
+
+        let triple = VmxExitReason::from_field(u32::from(exit_reason::TRIPLE_FAULT));
+        assert_eq!(simple_exit_to_vmexit(triple), Some(VmExit::Shutdown));
+    }
+
+    #[test]
+    fn simple_exit_defers_qualification_and_entry_failures() {
+        // I/O needs the qualification, so it is not a "simple" exit.
+        let io = VmxExitReason::from_field(u32::from(exit_reason::IO_INSTRUCTION));
+        assert_eq!(simple_exit_to_vmexit(io), None);
+        // A VM-entry failure, even for HLT, never maps to a normal exit.
+        let failed_hlt =
+            VmxExitReason::from_field(u32::from(exit_reason::HLT) | (1 << 31));
+        assert_eq!(simple_exit_to_vmexit(failed_hlt), None);
     }
 }
