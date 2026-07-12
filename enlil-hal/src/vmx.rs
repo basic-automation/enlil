@@ -266,12 +266,81 @@ impl VmcsField {
     }
 }
 
+/// Basic VM-exit reasons (Intel SDM Vol. 3, Appendix C). Only the reasons the
+/// backend routes first are named; any other exit arrives as its raw number.
+pub mod exit_reason {
+    /// Exception or non-maskable interrupt.
+    pub const EXCEPTION_OR_NMI: u16 = 0;
+    /// External interrupt.
+    pub const EXTERNAL_INTERRUPT: u16 = 1;
+    /// Triple fault.
+    pub const TRIPLE_FAULT: u16 = 2;
+    /// Interrupt window (guest ready to take an interrupt).
+    pub const INTERRUPT_WINDOW: u16 = 7;
+    /// `CPUID` executed by the guest.
+    pub const CPUID: u16 = 10;
+    /// `HLT` executed by the guest.
+    pub const HLT: u16 = 12;
+    /// `VMCALL` executed by the guest (hypercall).
+    pub const VMCALL: u16 = 18;
+    /// Control-register access (`MOV` to/from CR0/CR3/CR4/CR8).
+    pub const CR_ACCESS: u16 = 28;
+    /// I/O instruction (`IN`/`OUT`/`INS`/`OUTS`).
+    pub const IO_INSTRUCTION: u16 = 30;
+    /// `RDMSR` executed by the guest.
+    pub const RDMSR: u16 = 31;
+    /// `WRMSR` executed by the guest.
+    pub const WRMSR: u16 = 32;
+    /// EPT violation (guest access not permitted by the EPT paging structures).
+    pub const EPT_VIOLATION: u16 = 48;
+    /// EPT misconfiguration (malformed EPT entry).
+    pub const EPT_MISCONFIG: u16 = 49;
+}
+
+/// A decoded VMCS VM-exit reason field (Intel SDM Vol. 3, Section 24.9.1).
+///
+/// Bits 15:0 are the basic exit reason; bit 29 flags an exit taken in VMX root
+/// operation (SMM); bit 31 flags a VM-entry failure rather than a genuine VM
+/// exit. The backend reads the field with `VMREAD` of [`Self::ENCODING`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmxExitReason(u32);
+
+impl VmxExitReason {
+    /// The VMCS field encoding of the VM-exit reason (a 32-bit read-only field).
+    pub const ENCODING: u32 = 0x4402;
+
+    /// Wrap the raw exit-reason field read from the VMCS.
+    #[must_use]
+    pub const fn from_field(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    /// The basic exit reason (bits 15:0) — compare against [`exit_reason`].
+    #[must_use]
+    pub fn basic_reason(self) -> u16 {
+        u16::try_from(self.0 & 0xFFFF).unwrap_or(0)
+    }
+
+    /// Whether the exit occurred in VMX root operation (bit 29; SMM only).
+    #[must_use]
+    pub const fn in_vmx_root(self) -> bool {
+        self.0 & (1 << 29) != 0
+    }
+
+    /// Whether this record is a VM-entry failure rather than a true VM exit
+    /// (bit 31). The basic reason then identifies why entry failed.
+    #[must_use]
+    pub const fn is_vm_entry_failure(self) -> bool {
+        self.0 & (1 << 31) != 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         IA32_VMX_BASIC, IA32_VMX_ENTRY_CTLS, IA32_VMX_PINBASED_CTLS, IA32_VMX_PROCBASED_CTLS,
         IA32_VMX_TRUE_PINBASED_CTLS, VmcsField, VmcsFieldType, VmcsFieldWidth, VmcsMemoryType,
-        VmxBasic, VmxControlCaps,
+        VmxBasic, VmxControlCaps, VmxExitReason, exit_reason,
     };
 
     #[test]
@@ -405,5 +474,34 @@ mod tests {
         assert_eq!(VmcsField::GUEST_RIP.index(), 0x0F);
         // Encoding 0x681C (GUEST_RSP) → index 0x0E.
         assert_eq!(VmcsField::GUEST_RSP.index(), 0x0E);
+    }
+
+    #[test]
+    fn exit_reason_encoding_is_read_only_32bit() {
+        // 0x4402: type read-only-data (bits 11:10 = 1), width 32-bit (bits 14:13 = 2).
+        let field = VmcsField::from_encoding(VmxExitReason::ENCODING);
+        assert_eq!(field.field_type(), VmcsFieldType::ReadOnlyData);
+        assert_eq!(field.width(), VmcsFieldWidth::Bits32);
+    }
+
+    #[test]
+    fn exit_reason_decodes_basic_reason() {
+        let hlt = VmxExitReason::from_field(u32::from(exit_reason::HLT));
+        assert_eq!(hlt.basic_reason(), exit_reason::HLT);
+        assert!(!hlt.is_vm_entry_failure());
+        assert!(!hlt.in_vmx_root());
+
+        let io = VmxExitReason::from_field(u32::from(exit_reason::IO_INSTRUCTION));
+        assert_eq!(io.basic_reason(), 30);
+    }
+
+    #[test]
+    fn exit_reason_flags_vm_entry_failure_and_root() {
+        // Bit 31 set with basic reason EPT_VIOLATION, plus the VMX-root bit 29.
+        let raw = u32::from(exit_reason::EPT_VIOLATION) | (1 << 31) | (1 << 29);
+        let reason = VmxExitReason::from_field(raw);
+        assert_eq!(reason.basic_reason(), exit_reason::EPT_VIOLATION);
+        assert!(reason.is_vm_entry_failure());
+        assert!(reason.in_vmx_root());
     }
 }
