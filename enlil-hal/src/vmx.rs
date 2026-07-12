@@ -92,9 +92,82 @@ impl VmxBasic {
     }
 }
 
+/// MSR index of `IA32_VMX_PINBASED_CTLS` (pin-based VM-execution controls).
+pub const IA32_VMX_PINBASED_CTLS: u32 = 0x481;
+/// MSR index of `IA32_VMX_PROCBASED_CTLS` (primary processor-based controls).
+pub const IA32_VMX_PROCBASED_CTLS: u32 = 0x482;
+/// MSR index of `IA32_VMX_EXIT_CTLS` (VM-exit controls).
+pub const IA32_VMX_EXIT_CTLS: u32 = 0x483;
+/// MSR index of `IA32_VMX_ENTRY_CTLS` (VM-entry controls).
+pub const IA32_VMX_ENTRY_CTLS: u32 = 0x484;
+/// MSR index of `IA32_VMX_TRUE_PINBASED_CTLS`.
+pub const IA32_VMX_TRUE_PINBASED_CTLS: u32 = 0x48D;
+/// MSR index of `IA32_VMX_TRUE_PROCBASED_CTLS`.
+pub const IA32_VMX_TRUE_PROCBASED_CTLS: u32 = 0x48E;
+/// MSR index of `IA32_VMX_TRUE_EXIT_CTLS`.
+pub const IA32_VMX_TRUE_EXIT_CTLS: u32 = 0x48F;
+/// MSR index of `IA32_VMX_TRUE_ENTRY_CTLS`.
+pub const IA32_VMX_TRUE_ENTRY_CTLS: u32 = 0x490;
+
+/// A decoded VMX control-capability MSR (pin-based, processor-based, VM-exit,
+/// or VM-entry controls; Intel SDM Vol. 3, Section 24.6.2 / Appendix A.3).
+///
+/// The low dword lists the *allowed 0-settings*: a bit set there means the
+/// corresponding control **must be 1**. The high dword lists the *allowed
+/// 1-settings*: a bit clear there means the control **must be 0**. The backend
+/// runs a desired control word through [`adjust`](Self::adjust) to obtain the
+/// exact value the processor will accept in the VMCS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmxControlCaps {
+    raw: u64,
+}
+
+impl VmxControlCaps {
+    /// Wrap a raw VMX control-capability MSR value.
+    #[must_use]
+    pub const fn from_raw(raw: u64) -> Self {
+        Self { raw }
+    }
+
+    /// The controls that must be 1 (low dword — the allowed 0-settings).
+    #[must_use]
+    pub fn required_ones(self) -> u32 {
+        u32::try_from(self.raw & 0xFFFF_FFFF).unwrap_or(u32::MAX)
+    }
+
+    /// The controls that may be 1 (high dword — the allowed 1-settings).
+    #[must_use]
+    pub fn allowed_ones(self) -> u32 {
+        u32::try_from(self.raw >> 32).unwrap_or(u32::MAX)
+    }
+
+    /// Adjust a desired control word to the exact value the processor accepts:
+    /// force every required-1 control on, then drop every control the processor
+    /// does not allow to be 1.
+    #[must_use]
+    pub fn adjust(self, desired: u32) -> u32 {
+        (desired | self.required_ones()) & self.allowed_ones()
+    }
+
+    /// Whether control `bit` is permitted to be 1.
+    #[must_use]
+    pub fn may_set(self, bit: u32) -> bool {
+        bit < 32 && self.allowed_ones() & (1 << bit) != 0
+    }
+
+    /// Whether control `bit` is forced to 1 (cannot be cleared).
+    #[must_use]
+    pub fn must_set(self, bit: u32) -> bool {
+        bit < 32 && self.required_ones() & (1 << bit) != 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{IA32_VMX_BASIC, VmcsMemoryType, VmxBasic};
+    use super::{
+        IA32_VMX_BASIC, IA32_VMX_ENTRY_CTLS, IA32_VMX_PINBASED_CTLS, IA32_VMX_PROCBASED_CTLS,
+        IA32_VMX_TRUE_PINBASED_CTLS, VmcsMemoryType, VmxBasic, VmxControlCaps,
+    };
 
     #[test]
     fn msr_index_matches_sdm() {
@@ -141,5 +214,47 @@ mod tests {
             VmxBasic::from_raw(raw).memory_type(),
             VmcsMemoryType::Other(5)
         );
+    }
+
+    #[test]
+    fn control_msr_indices_match_sdm() {
+        assert_eq!(IA32_VMX_PINBASED_CTLS, 0x481);
+        assert_eq!(IA32_VMX_PROCBASED_CTLS, 0x482);
+        assert_eq!(IA32_VMX_ENTRY_CTLS, 0x484);
+        assert_eq!(IA32_VMX_TRUE_PINBASED_CTLS, 0x48D);
+    }
+
+    #[test]
+    fn control_caps_split_low_and_high_dwords() {
+        // low dword (required-1) = bit 1; high dword (allowed-1) = bits 1,2,3.
+        let raw = 0b0010_u64 | (0b1110_u64 << 32);
+        let caps = VmxControlCaps::from_raw(raw);
+        assert_eq!(caps.required_ones(), 0b0010);
+        assert_eq!(caps.allowed_ones(), 0b1110);
+    }
+
+    #[test]
+    fn adjust_forces_required_and_drops_disallowed() {
+        let raw = 0b0010_u64 | (0b1110_u64 << 32);
+        let caps = VmxControlCaps::from_raw(raw);
+        // Nothing desired: only the required bit 1 comes back.
+        assert_eq!(caps.adjust(0b0000), 0b0010);
+        // Desiring allowed bit 2 keeps it and still forces bit 1.
+        assert_eq!(caps.adjust(0b0100), 0b0110);
+        // Desiring disallowed bit 0 drops it; bit 1 is still forced.
+        assert_eq!(caps.adjust(0b0001), 0b0010);
+    }
+
+    #[test]
+    fn may_set_and_must_set_report_bit_constraints() {
+        let raw = 0b0010_u64 | (0b1110_u64 << 32);
+        let caps = VmxControlCaps::from_raw(raw);
+        assert!(caps.must_set(1));
+        assert!(!caps.must_set(2));
+        assert!(caps.may_set(2));
+        assert!(!caps.may_set(0));
+        // Out-of-range bit indices never claim a constraint.
+        assert!(!caps.may_set(40));
+        assert!(!caps.must_set(40));
     }
 }
