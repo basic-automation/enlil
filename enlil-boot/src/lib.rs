@@ -13,6 +13,7 @@
 //! model below still builds and is unit-tested on the dev toolchain.
 
 pub mod handoff;
+pub mod serial;
 
 /// Console/serial banner the payload emits once it has taken control.
 ///

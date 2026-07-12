@@ -11,23 +11,27 @@
 #[cfg(target_os = "uefi")]
 #[uefi::entry]
 fn efi_main() -> uefi::Status {
+    use enlil_boot::handoff::BootHandoff;
+    use uefi::boot::MemoryType;
+    use uefi::mem::memory_map::MemoryMap;
+
     // Bring up the uefi-rs helpers (global allocator, logger routed to the
     // active console/serial, and panic handler).
     uefi::helpers::init().unwrap();
 
-    // First live-boot signal: prove the enlil payload is running under
-    // firmware control. The QEMU+OVMF harness asserts this on the serial line.
+    // First live-boot signal, emitted while boot services are still up.
     log::info!("{}", enlil_boot::BOOT_BANNER);
 
-    // Collect the platform resources the kernel needs (Phase 6.1). We read
-    // them here, while boot services are live, so the next slice can pack them
-    // into a `BootHandoff` and pass it across `ExitBootServices()`.
-    match uefi_boot::find_acpi_rsdp() {
+    // Collect the platform resources the kernel needs (Phase 6.1) while boot
+    // services are live, binding them for the post-exit handoff block.
+    let acpi_rsdp = uefi_boot::find_acpi_rsdp();
+    match acpi_rsdp {
         0 => log::warn!("no ACPI RSDP in the UEFI configuration table"),
         addr => log::info!("ACPI RSDP at {addr:#x}"),
     }
 
-    match uefi_boot::collect_framebuffer() {
+    let framebuffer = uefi_boot::collect_framebuffer();
+    match &framebuffer {
         Some(fb) => log::info!(
             "GOP framebuffer: {}x{} stride={} bpp={} base={:#x} ({} bytes)",
             fb.width,
@@ -40,10 +44,43 @@ fn efi_main() -> uefi::Status {
         None => log::warn!("no addressable GOP framebuffer available"),
     }
 
-    // Phase 6.1 next slice: also snapshot the UEFI memory map, call
-    // `ExitBootServices()`, and jump into the kernel with the assembled
-    // `BootHandoff`. Until then, return to firmware cleanly.
-    uefi::Status::SUCCESS
+    // Take full control of the machine. After this returns, the firmware boot
+    // services — including the uefi-rs logger and allocator — are gone, so all
+    // further output must go straight to hardware. The returned map is the
+    // final UEFI memory map, which the kernel re-parses via `enlil-platform`'s
+    // `MemoryMap::from_uefi`.
+    let memory_map = unsafe { uefi::boot::exit_boot_services(MemoryType::LOADER_DATA) };
+
+    let meta = memory_map.meta();
+    let handoff = BootHandoff {
+        memory_map_base: memory_map.buffer().as_ptr() as u64,
+        memory_map_len: meta.map_size,
+        memory_descriptor_size: meta.desc_size,
+        acpi_rsdp,
+        framebuffer,
+    };
+    // Keep the memory-map buffer alive for the kernel: dropping the owned map
+    // would call the now-defunct boot-services `FreePool`. Its base and extent
+    // are already recorded in `handoff`.
+    core::mem::forget(memory_map);
+
+    // Prove we are running under our own control past ExitBootServices: emit
+    // the liveness banner straight to COM1. This is the serial line the
+    // QEMU+OVMF boot harness asserts.
+    let serial = enlil_boot::serial::SerialPort::com1();
+    serial.write_str(enlil_boot::BOOT_BANNER);
+    serial.write_byte(b'\n');
+    if handoff.is_valid() {
+        serial.write_str("handoff: UEFI memory map + ACPI RSDP captured\n");
+    } else {
+        serial.write_str("handoff: INCOMPLETE (missing memory map or RSDP)\n");
+    }
+
+    // No kernel entry to jump to yet (Phase 6.2). Halt rather than return:
+    // boot services are gone, so control cannot go back to the firmware.
+    loop {
+        unsafe { core::arch::asm!("hlt", options(nomem, nostack, preserves_flags)) };
+    }
 }
 
 /// Firmware-protocol readers, isolated so the pure handoff logic they feed
