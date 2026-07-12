@@ -16,6 +16,8 @@
 
 extern crate alloc;
 
+pub mod vmx;
+
 use alloc::string::String;
 use core::fmt;
 
