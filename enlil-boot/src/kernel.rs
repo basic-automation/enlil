@@ -235,7 +235,20 @@ mod hw {
             serial.write_str("enlil kernel: memory: NO MAP in handoff\n");
         }
 
+        bring_up_interrupts(&serial);
+
         park()
+    }
+
+    /// Install the kernel's own IDT (replacing the firmware's, whose handlers
+    /// live in soon-to-be-reclaimed boot-services memory) and prove it
+    /// vectors by taking a breakpoint.
+    fn bring_up_interrupts(serial: &SerialPort) {
+        if crate::idt::init_and_selftest() {
+            serial.write_str("enlil kernel: idt: installed, int3 self-test ok\n");
+        } else {
+            serial.write_str("enlil kernel: idt: self-test FAILED\n");
+        }
     }
 
     /// Install the kernel heap in the largest conventional region and prove

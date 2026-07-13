@@ -1,4 +1,8 @@
 #![cfg_attr(target_os = "uefi", no_std)]
+// The kernel's exception handlers use the `x86-interrupt` ABI, which is still
+// unstable; it is only referenced in the firmware build (the handlers are
+// `cfg(target_os = "uefi")`), so the feature is gated to that target too.
+#![cfg_attr(target_os = "uefi", feature(abi_x86_interrupt))]
 #![deny(clippy::all, clippy::pedantic, clippy::nursery)]
 //! enlil-boot: UEFI boot payload (Phase 6.1).
 //!
@@ -19,6 +23,7 @@ extern crate alloc;
 
 pub mod allocator;
 pub mod handoff;
+pub mod idt;
 pub mod kernel;
 pub mod serial;
 

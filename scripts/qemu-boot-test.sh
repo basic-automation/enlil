@@ -34,6 +34,9 @@ KERNEL_LINE="enlil kernel: memory:"
 # Printed once the kernel's own heap serves allocations with the firmware
 # gone — proves the switching allocator + first post-ExitBootServices alloc.
 HEAP_LINE="alloc test ok"
+# Printed once the kernel loads its own IDT and takes a breakpoint through it
+# — proves interrupt vectoring under enlil's own control.
+IDT_LINE="int3 self-test ok"
 TIMEOUT_SECS=60
 
 mkdir -p "$OUTDIR"
@@ -141,7 +144,7 @@ for _ in $(seq "$TIMEOUT_SECS"); do
         QEMU_RC=$?
         break
     fi
-    if grep -q "$HEAP_LINE" "$SERIAL_LOG" 2>/dev/null; then
+    if grep -q "$IDT_LINE" "$SERIAL_LOG" 2>/dev/null; then
         break
     fi
     sleep 1
@@ -156,10 +159,11 @@ sed 's/^/    /' "$SERIAL_LOG" 2>/dev/null || true
 
 if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$KERNEL_LINE" "$SERIAL_LOG" 2>/dev/null \
-    && grep -q "$HEAP_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: observed banner \"$BANNER\", kernel line \"$KERNEL_LINE\", and heap proof \"$HEAP_LINE\" on serial"
+    && grep -q "$HEAP_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$IDT_LINE" "$SERIAL_LOG" 2>/dev/null; then
+    echo "PASS: observed banner, kernel memory line, heap proof, and IDT self-test on serial"
     exit 0
 fi
 
-echo "FAIL: banner \"$BANNER\" + kernel line \"$KERNEL_LINE\" + heap proof \"$HEAP_LINE\" not all observed (qemu rc=$QEMU_RC)"
+echo "FAIL: not all of banner/kernel-line/heap/idt observed (qemu rc=$QEMU_RC)"
 exit 1
