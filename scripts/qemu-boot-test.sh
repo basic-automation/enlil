@@ -12,7 +12,15 @@
 #   0  boot proof passed (banner observed on serial)
 #   1  build or boot FAILED (banner not observed)
 #   2  SKIPPED: qemu-system-x86_64 and/or OVMF firmware not installed
-#      (install with: sudo apt-get install -y qemu-system-x86 ovmf)
+#      (install with: sudo apt-get install -y qemu-system-x86 ovmf, or point
+#      ENLIL_QEMU / ENLIL_OVMF_CODE at an unpacked user-space install)
+#
+# Environment overrides:
+#   ENLIL_QEMU       path to qemu-system-x86_64 (or a wrapper script)
+#   ENLIL_OVMF_CODE  path to the OVMF code image (OVMF.fd or OVMF_CODE*.fd)
+#   ENLIL_OVMF_VARS  path to the matching OVMF vars template; when set (or
+#                    auto-derived from a CODE_4M image) firmware is loaded as
+#                    split pflash instead of legacy -bios
 #
 # Usage: scripts/qemu-boot-test.sh [output-dir]
 set -uo pipefail
@@ -20,21 +28,61 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUTDIR="${1:-$(mktemp -d)}"
 BANNER="enlil kernel alive"
+# Printed by kernel_entry after the UEFI stage hands off control — proves the
+# payload→kernel transition and the kernel's walk of the handed-off memory map.
+KERNEL_LINE="enlil kernel: memory:"
+# Printed once the kernel's own heap serves allocations with the firmware
+# gone — proves the switching allocator + first post-ExitBootServices alloc.
+HEAP_LINE="alloc test ok"
+# Printed once the kernel loads its own IDT and takes a breakpoint through it
+# — proves interrupt vectoring under enlil's own control.
+IDT_LINE="int3 self-test ok"
+# Printed once the kernel enables the local APIC in x2APIC mode and reads its
+# ID — proves interrupt-controller bring-up under enlil's own control.
+APIC_LINE="x2APIC enabled"
+# Printed once the kernel turns on the CPU virtualization extension (SVM on
+# this AMD host) — the enable gate for running a guest with VMRUN.
+SVM_LINE="svm: enabled"
+# Printed once the kernel allocates + programs the host state-save area into
+# VM_HSAVE_PA (read back) — the last CPU-state step before VMRUN.
+HSAVE_LINE="host-save area at"
+# Printed once the kernel draws to the GOP framebuffer and reads a pixel back
+# — proves the framebuffer I/O backend is wired with the firmware gone.
+GOP_LINE="framebuffer draw ok"
 TIMEOUT_SECS=60
 
 mkdir -p "$OUTDIR"
 
 # --- Prerequisite probe (honest SKIP rather than a fake pass) ---------------
-QEMU="$(command -v qemu-system-x86_64 || true)"
-OVMF=""
-for cand in \
-    /usr/share/OVMF/OVMF_CODE.fd \
-    /usr/share/OVMF/OVMF.fd \
-    /usr/share/ovmf/OVMF.fd \
-    /usr/share/qemu/OVMF.fd \
-    /usr/share/edk2-ovmf/x64/OVMF_CODE.fd; do
-    if [ -f "$cand" ]; then OVMF="$cand"; break; fi
-done
+QEMU="${ENLIL_QEMU:-}"
+if [ -z "$QEMU" ]; then
+    for cand in \
+        "$(command -v qemu-system-x86_64 || true)" \
+        "$HOME/qemu-local/bin/qemu-system-x86_64"; do
+        if [ -n "$cand" ] && [ -x "$cand" ]; then QEMU="$cand"; break; fi
+    done
+fi
+OVMF="${ENLIL_OVMF_CODE:-}"
+if [ -z "$OVMF" ]; then
+    for cand in \
+        /usr/share/OVMF/OVMF_CODE.fd \
+        /usr/share/OVMF/OVMF_CODE_4M.fd \
+        /usr/share/OVMF/OVMF.fd \
+        /usr/share/ovmf/OVMF.fd \
+        /usr/share/qemu/OVMF.fd \
+        /usr/share/edk2-ovmf/x64/OVMF_CODE.fd \
+        "$HOME/qemu-local/root/usr/share/OVMF/OVMF_CODE_4M.fd"; do
+        if [ -f "$cand" ]; then OVMF="$cand"; break; fi
+    done
+fi
+# A CODE-only image needs its VARS template (split pflash); a combined
+# OVMF.fd boots via legacy -bios with no vars file.
+OVMF_VARS="${ENLIL_OVMF_VARS:-}"
+if [ -z "$OVMF_VARS" ] && [[ "$OVMF" == *OVMF_CODE*.fd ]]; then
+    cand="${OVMF/OVMF_CODE/OVMF_VARS}"
+    # e.g. OVMF_CODE_4M.fd -> OVMF_VARS_4M.fd alongside it
+    if [ -f "$cand" ]; then OVMF_VARS="$cand"; fi
+fi
 
 if [ -z "$QEMU" ] || [ -z "$OVMF" ]; then
     echo "SKIP: qemu-system-x86_64=${QEMU:-missing} ovmf=${OVMF:-missing}"
@@ -66,30 +114,72 @@ SERIAL_LOG="$OUTDIR/serial.log"
 echo "==> booting under QEMU (OVMF=$OVMF, timeout=${TIMEOUT_SECS}s)"
 QEMU_ARGS=(
     -machine q35
-    -bios "$OVMF"
     -drive "format=raw,file=fat:rw:$ESP"
     -serial "file:$SERIAL_LOG"
     -display none
     -no-reboot
 )
+if [ -n "$OVMF_VARS" ]; then
+    # Split CODE/VARS firmware: pflash, with a writable per-run vars copy.
+    cp "$OVMF_VARS" "$OUTDIR/OVMF_VARS.fd"
+    QEMU_ARGS+=(
+        -drive "if=pflash,format=raw,readonly=on,file=$OVMF"
+        -drive "if=pflash,format=raw,file=$OUTDIR/OVMF_VARS.fd"
+    )
+else
+    QEMU_ARGS+=(-bios "$OVMF")
+fi
 # Nested-virt acceleration when /dev/kvm is available, so the payload's own
-# VMX/SVM backend (Phase 6.2) can run a nested guest under QEMU.
+# VMX/SVM backend (Phase 6.2) can run a nested guest under QEMU. Expose the
+# virt extension the host actually has (Intel VMX or AMD SVM).
 if [ -w /dev/kvm ]; then
-    QEMU_ARGS+=(-enable-kvm -cpu "host,+vmx")
+    if grep -qw svm /proc/cpuinfo; then
+        QEMU_ARGS+=(-enable-kvm -cpu "host,+svm")
+    else
+        QEMU_ARGS+=(-enable-kvm -cpu "host,+vmx")
+    fi
 else
     QEMU_ARGS+=(-cpu max)
 fi
 
-timeout "$TIMEOUT_SECS" "$QEMU" "${QEMU_ARGS[@]}"
-QEMU_RC=$?
+# The payload halts (hlt loop) after its banner, so QEMU never exits on its
+# own: run it in the background and poll the serial log, killing QEMU as soon
+# as the banner (or the timeout) arrives instead of always burning the full
+# timeout.
+: > "$SERIAL_LOG"
+"$QEMU" "${QEMU_ARGS[@]}" &
+QEMU_PID=$!
+QEMU_RC=0
+for _ in $(seq "$TIMEOUT_SECS"); do
+    if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+        wait "$QEMU_PID"
+        QEMU_RC=$?
+        break
+    fi
+    if grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
+if kill -0 "$QEMU_PID" 2>/dev/null; then
+    kill "$QEMU_PID" 2>/dev/null
+    wait "$QEMU_PID" 2>/dev/null
+fi
 
 echo "==> serial output:"
 sed 's/^/    /' "$SERIAL_LOG" 2>/dev/null || true
 
-if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: observed banner \"$BANNER\" on serial"
+if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$KERNEL_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$HEAP_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$IDT_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$APIC_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$SVM_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$HSAVE_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null; then
+    echo "PASS: banner, kernel memory, heap, IDT, x2APIC, SVM enable + host-save, and GOP draw observed on serial"
     exit 0
 fi
 
-echo "FAIL: banner \"$BANNER\" not observed (qemu rc=$QEMU_RC)"
+echo "FAIL: not all of banner/kernel-line/heap/idt/apic/svm/hsave/gop observed (qemu rc=$QEMU_RC)"
 exit 1

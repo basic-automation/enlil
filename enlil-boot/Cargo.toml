@@ -11,9 +11,16 @@ log = "0.4"
 # target. On the Linux/Windows dev host the crate still compiles (the entry
 # point and firmware code are gated behind cfg(target_os = "uefi")), so the
 # workspace `cargo build/test/clippy` stays green without a UEFI toolchain.
+# NOT uefi-rs's "global_allocator" feature: enlil-boot registers its own
+# switching allocator (src/allocator.rs) that serves from the firmware pool
+# while boot services are up and from the kernel's own linked-list heap after
+# ExitBootServices — the uefi-rs one dies with boot services.
 [target.'cfg(target_os = "uefi")'.dependencies]
 uefi = { version = "0.33", default-features = false, features = [
     "logger",
-    "global_allocator",
     "panic_handler",
 ] }
+# The same audited intrusive-free-list heap enlil-platform's bare-metal
+# GlobalAlloc uses (memory::init_baremetal_heap); the boot binary carries its
+# own instance until Phase 1.2 lets it link enlil-platform directly.
+linked_list_allocator = "0.10"

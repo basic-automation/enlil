@@ -76,11 +76,9 @@ fn efi_main() -> uefi::Status {
         serial.write_str("handoff: INCOMPLETE (missing memory map or RSDP)\n");
     }
 
-    // No kernel entry to jump to yet (Phase 6.2). Halt rather than return:
-    // boot services are gone, so control cannot go back to the firmware.
-    loop {
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack, preserves_flags)) };
-    }
+    // Transition control into the enlil kernel. Never returns: boot services
+    // are gone, so control cannot go back to the firmware.
+    enlil_boot::kernel::kernel_entry(&handoff)
 }
 
 /// Firmware-protocol readers, isolated so the pure handoff logic they feed

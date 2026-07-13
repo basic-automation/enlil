@@ -150,6 +150,16 @@ impl UefiMemoryDescriptor {
     }
 }
 
+/// The `EFI_MEMORY_TYPE` for conventional (truly free) memory.
+///
+/// The only type [`select_bootstrap_heap_region`] may claim: the other
+/// usable-mapped types still hold live boot state when the heap is installed
+/// — loader code/data (1, 2) is the running kernel image, and boot-services
+/// code/data (3, 4) holds the boot stack and the handed-off memory-map
+/// buffer. They become reclaimable only once the kernel has fully taken over
+/// the memory map, long after the bootstrap heap exists.
+pub const EFI_CONVENTIONAL_MEMORY: u32 = 7;
+
 /// Select a bootstrap heap region from a raw UEFI memory descriptor array,
 /// without allocating.
 ///
@@ -157,9 +167,9 @@ impl UefiMemoryDescriptor {
 /// build a `Vec`-backed [`MemoryMap`], so it cannot use [`MemoryMap::from_uefi`]
 /// / [`MemoryMap::largest_usable`] (both allocate) to find that first heap. This
 /// scan runs directly over the firmware descriptor array the boot payload handed
-/// across `ExitBootServices`, returning the largest
-/// [`Usable`](MemoryKind::Usable) region of at least `min_size` bytes, or `None`
-/// if none qualifies.
+/// across `ExitBootServices`, returning the largest conventional-memory
+/// ([`EFI_CONVENTIONAL_MEMORY`] — not merely `Usable`-mapped) region of at
+/// least `min_size` bytes, or `None` if none qualifies.
 #[must_use]
 pub fn select_bootstrap_heap_region(
     descriptors: &[UefiMemoryDescriptor],
@@ -167,8 +177,14 @@ pub fn select_bootstrap_heap_region(
 ) -> Option<MemoryRegion> {
     descriptors
         .iter()
-        .filter(|d| d.page_count != 0 && matches!(d.memory_kind(), MemoryKind::Usable))
-        .map(|d| MemoryRegion::new(PhysAddr::new(d.phys_start), d.length_bytes(), MemoryKind::Usable))
+        .filter(|d| d.page_count != 0 && d.kind == EFI_CONVENTIONAL_MEMORY)
+        .map(|d| {
+            MemoryRegion::new(
+                PhysAddr::new(d.phys_start),
+                d.length_bytes(),
+                MemoryKind::Usable,
+            )
+        })
         .filter(|r| r.size >= min_size)
         .max_by_key(|r| r.size)
 }
@@ -238,7 +254,11 @@ impl MemoryMap {
             .iter()
             .filter(|d| d.page_count != 0)
             .map(|d| {
-                MemoryRegion::new(PhysAddr::new(d.phys_start), d.length_bytes(), d.memory_kind())
+                MemoryRegion::new(
+                    PhysAddr::new(d.phys_start),
+                    d.length_bytes(),
+                    d.memory_kind(),
+                )
             })
             .collect();
         Self::from_regions(regions)
@@ -541,6 +561,33 @@ mod tests {
             uefi(10, 0x10_0000, 0x100), // ACPI NVS
         ];
         assert!(select_bootstrap_heap_region(&descriptors, 0).is_none());
+    }
+
+    #[test]
+    fn select_bootstrap_heap_region_rejects_loader_and_boot_services_memory() {
+        let uefi = |kind, phys_start, page_count| UefiMemoryDescriptor {
+            kind,
+            phys_start,
+            page_count,
+        };
+        // Loader/boot-services regions map to Usable in a MemoryMap, but they
+        // still hold the running image, boot stack, and handed-off map buffer
+        // when the bootstrap heap is installed — the heap must never go there.
+        let live_boot_state = [
+            uefi(1, 0x10_0000, 0x800),  // loader code: the kernel image
+            uefi(2, 0x90_0000, 0x800),  // loader data: the handoff
+            uefi(3, 0x100_0000, 0x800), // boot-services code
+            uefi(4, 0x180_0000, 0x800), // boot-services data: the boot stack
+        ];
+        assert!(select_bootstrap_heap_region(&live_boot_state, 0).is_none());
+
+        // With a smaller conventional region present, it wins over them all.
+        let mut with_conventional = live_boot_state.to_vec();
+        with_conventional.push(uefi(7, 0x200_0000, 0x100));
+        let region =
+            select_bootstrap_heap_region(&with_conventional, 0).expect("the conventional region");
+        assert_eq!(region.base, PhysAddr::new(0x200_0000));
+        assert_eq!(region.size, 0x100 * 4096);
     }
 
     #[test]

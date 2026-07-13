@@ -16,6 +16,8 @@
 
 extern crate alloc;
 
+pub mod region;
+pub mod svm;
 pub mod vmx;
 
 use alloc::string::String;

@@ -558,11 +558,11 @@ impl EptViolationQualification {
 #[cfg(test)]
 mod tests {
     use super::{
-        IA32_VMX_BASIC, IA32_VMX_ENTRY_CTLS, IA32_VMX_PINBASED_CTLS, IA32_VMX_PROCBASED_CTLS,
-        EptViolationQualification, IA32_VMX_TRUE_PINBASED_CTLS, IoExitQualification,
-        VMX_REGION_SIZE, VmcsField, VmcsFieldType, VmcsFieldWidth, VmcsMemoryType, VmxBasic,
-        VmxControlCaps, VmxExitReason, VmxRegionError, exit_reason, init_vmx_region,
-        io_exit_to_vmexit, simple_exit_to_vmexit,
+        EptViolationQualification, IA32_VMX_BASIC, IA32_VMX_ENTRY_CTLS, IA32_VMX_PINBASED_CTLS,
+        IA32_VMX_PROCBASED_CTLS, IA32_VMX_TRUE_PINBASED_CTLS, IoExitQualification, VMX_REGION_SIZE,
+        VmcsField, VmcsFieldType, VmcsFieldWidth, VmcsMemoryType, VmxBasic, VmxControlCaps,
+        VmxExitReason, VmxRegionError, exit_reason, init_vmx_region, io_exit_to_vmexit,
+        simple_exit_to_vmexit,
     };
     use crate::VmExit;
 
@@ -801,8 +801,7 @@ mod tests {
         let io = VmxExitReason::from_field(u32::from(exit_reason::IO_INSTRUCTION));
         assert_eq!(simple_exit_to_vmexit(io), None);
         // A VM-entry failure, even for HLT, never maps to a normal exit.
-        let failed_hlt =
-            VmxExitReason::from_field(u32::from(exit_reason::HLT) | (1 << 31));
+        let failed_hlt = VmxExitReason::from_field(u32::from(exit_reason::HLT) | (1 << 31));
         assert_eq!(simple_exit_to_vmexit(failed_hlt), None);
     }
 
