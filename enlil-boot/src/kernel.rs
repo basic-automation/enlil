@@ -20,6 +20,12 @@
 /// summary agrees with the map the kernel later builds.
 const USABLE_EFI_TYPES: [u32; 5] = [1, 2, 3, 4, 7];
 
+/// EFI conventional memory (type 7) — the only type safe to claim for the
+/// bootstrap kernel heap. The other usable types still hold live boot state
+/// when the kernel enters: the loaded image (1, 2), and the boot stack plus
+/// the handed-off memory-map buffer (3, 4).
+const EFI_CONVENTIONAL: u32 = 7;
+
 // Field offsets inside an EFI_MEMORY_DESCRIPTOR (UEFI spec §7.2): Type is a
 // u32 at +0, PhysicalStart a u64 at +8, NumberOfPages a u64 at +24. The
 // firmware-reported descriptor stride may exceed the struct size, which is
@@ -46,6 +52,11 @@ pub struct MemorySummary {
     pub largest_usable_bytes: u64,
     /// One past the highest usable physical address (0 if none).
     pub highest_usable_end: u64,
+    /// Base of the largest conventional-memory (type 7) region — where the
+    /// bootstrap kernel heap goes (see [`EFI_CONVENTIONAL`]).
+    pub largest_conventional_base: u64,
+    /// Size of that largest conventional region in bytes.
+    pub largest_conventional_bytes: u64,
 }
 
 impl MemorySummary {
@@ -110,8 +121,38 @@ pub fn summarize_memory_map(bytes: &[u8], descriptor_size: usize) -> MemorySumma
         summary.highest_usable_end = summary
             .highest_usable_end
             .max(phys_start.saturating_add(size));
+        if efi_type == EFI_CONVENTIONAL && size > summary.largest_conventional_bytes {
+            summary.largest_conventional_base = phys_start;
+            summary.largest_conventional_bytes = size;
+        }
     }
     summary
+}
+
+/// Cap on the bootstrap kernel heap.
+///
+/// Enough for the kernel's own structures while leaving the bulk of a large
+/// region free for the later carve into guest RAM / DMA windows (Phase 1.3's
+/// `plan_hypervisor_regions`).
+pub const BOOT_HEAP_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Below this a region is too small to be worth installing as the heap.
+pub const BOOT_HEAP_MIN_BYTES: u64 = 1024 * 1024;
+
+/// How much of a conventional region to claim for the bootstrap heap.
+///
+/// Returns the whole region up to [`BOOT_HEAP_MAX_BYTES`], or nothing (0)
+/// when the region is under [`BOOT_HEAP_MIN_BYTES`].
+#[must_use]
+pub const fn boot_heap_size(region_bytes: u64) -> u64 {
+    if region_bytes < BOOT_HEAP_MIN_BYTES {
+        return 0;
+    }
+    if region_bytes > BOOT_HEAP_MAX_BYTES {
+        BOOT_HEAP_MAX_BYTES
+    } else {
+        region_bytes
+    }
 }
 
 /// Format `value` as decimal into `buf`, returning the used suffix.
@@ -133,14 +174,38 @@ pub fn format_u64(value: u64, buf: &mut [u8; 20]) -> &str {
     core::str::from_utf8(&buf[cursor..]).unwrap_or("?")
 }
 
+/// Format `value` as `0x`-prefixed lowercase hex into `buf`, returning the
+/// used suffix. Alloc-free like [`format_u64`]; 18 bytes always fit.
+pub fn format_u64_hex(value: u64, buf: &mut [u8; 18]) -> &str {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut cursor = buf.len();
+    let mut rest = value;
+    loop {
+        cursor -= 1;
+        buf[cursor] = DIGITS[usize::try_from(rest & 0xF).unwrap_or(0)];
+        rest >>= 4;
+        if rest == 0 {
+            break;
+        }
+    }
+    cursor -= 1;
+    buf[cursor] = b'x';
+    cursor -= 1;
+    buf[cursor] = b'0';
+    // The bytes just written are ASCII, so this cannot fail.
+    core::str::from_utf8(&buf[cursor..]).unwrap_or("?")
+}
+
 #[cfg(target_os = "uefi")]
 pub use hw::kernel_entry;
 
 #[cfg(target_os = "uefi")]
 mod hw {
-    use super::{MemorySummary, format_u64, summarize_memory_map};
+    use super::{MemorySummary, boot_heap_size, format_u64, format_u64_hex, summarize_memory_map};
+    use crate::allocator::install_kernel_heap;
     use crate::handoff::BootHandoff;
     use crate::serial::SerialPort;
+    use alloc::vec::Vec;
 
     /// The enlil kernel entry point.
     ///
@@ -165,11 +230,60 @@ mod hw {
             };
             let summary = summarize_memory_map(bytes, handoff.memory_descriptor_size);
             report_memory(&serial, &summary);
+            bring_up_heap(&serial, &summary);
         } else {
             serial.write_str("enlil kernel: memory: NO MAP in handoff\n");
         }
 
         park()
+    }
+
+    /// Install the kernel heap in the largest conventional region and prove
+    /// dynamic allocation works with the firmware gone.
+    fn bring_up_heap(serial: &SerialPort, summary: &MemorySummary) {
+        let size = boot_heap_size(summary.largest_conventional_bytes);
+        if size == 0 {
+            serial.write_str("enlil kernel: heap: NO conventional region large enough\n");
+            return;
+        }
+        let base = summary.largest_conventional_base;
+        let (Ok(base_usize), Ok(size_usize)) = (usize::try_from(base), usize::try_from(size))
+        else {
+            serial.write_str("enlil kernel: heap: region beyond addressable range\n");
+            return;
+        };
+        // SAFETY: the span is conventional memory (nothing of the firmware,
+        // image, stack, or handoff lives there), sized within the region, and
+        // this runs once on the single boot CPU.
+        unsafe {
+            install_kernel_heap(
+                core::ptr::with_exposed_provenance_mut(base_usize),
+                size_usize,
+            );
+        }
+
+        // First dynamic allocation with no firmware alive: grow a Vec across
+        // a few reallocations and check the contents survived.
+        let mut probe: Vec<u8> = Vec::new();
+        for i in 0..4096usize {
+            probe.push(u8::try_from(i % 251).unwrap_or(0));
+        }
+        let intact = probe
+            .iter()
+            .enumerate()
+            .all(|(i, &b)| usize::from(b) == i % 251);
+
+        let mut dec = [0u8; 20];
+        let mut hex = [0u8; 18];
+        serial.write_str("enlil kernel: heap: ");
+        serial.write_str(format_u64(size / (1024 * 1024), &mut dec));
+        serial.write_str(" MiB at ");
+        serial.write_str(format_u64_hex(base, &mut hex));
+        if intact {
+            serial.write_str(", alloc test ok\n");
+        } else {
+            serial.write_str(", alloc test FAILED\n");
+        }
     }
 
     /// Emit the memory summary the QEMU+OVMF harness asserts on.
@@ -276,6 +390,39 @@ mod tests {
         let summary = summarize_memory_map(&bytes, stride);
         assert_eq!(summary.descriptors, 1);
         assert_eq!(summary.usable_regions, 1);
+    }
+
+    #[test]
+    fn tracks_largest_conventional_region_for_the_heap() {
+        let stride = 48;
+        let bytes = map(&[
+            desc(2, 0x10_0000, 1024, stride), // loader data: usable, NOT heap-safe
+            desc(7, 0x100_0000, 256, stride), // conventional: 1 MiB
+            desc(7, 0x800_0000, 768, stride), // conventional: 3 MiB — largest
+        ]);
+        let summary = summarize_memory_map(&bytes, stride);
+        assert_eq!(summary.usable_regions, 3);
+        // The 4 MiB loader-data region must NOT be picked for the heap even
+        // though it is the largest usable region: it holds live boot state.
+        assert_eq!(summary.largest_conventional_base, 0x800_0000);
+        assert_eq!(summary.largest_conventional_bytes, 768 * 4096);
+    }
+
+    #[test]
+    fn boot_heap_size_caps_and_floors() {
+        assert_eq!(boot_heap_size(0), 0);
+        assert_eq!(boot_heap_size(BOOT_HEAP_MIN_BYTES - 1), 0);
+        assert_eq!(boot_heap_size(BOOT_HEAP_MIN_BYTES), BOOT_HEAP_MIN_BYTES);
+        assert_eq!(boot_heap_size(8 * 1024 * 1024), 8 * 1024 * 1024);
+        assert_eq!(boot_heap_size(u64::MAX), BOOT_HEAP_MAX_BYTES);
+    }
+
+    #[test]
+    fn formats_hex_without_alloc() {
+        let mut buf = [0u8; 18];
+        assert_eq!(format_u64_hex(0, &mut buf), "0x0");
+        assert_eq!(format_u64_hex(0x800_0000, &mut buf), "0x8000000");
+        assert_eq!(format_u64_hex(u64::MAX, &mut buf), "0xffffffffffffffff");
     }
 
     #[test]

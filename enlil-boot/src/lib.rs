@@ -12,6 +12,12 @@
 //! gated out behind `cfg(target_os = "uefi")`, so the host-agnostic handoff
 //! model below still builds and is unit-tested on the dev toolchain.
 
+// The firmware build is `no_std` + `alloc`: allocations are served by the
+// switching global allocator in `allocator` (firmware pool → kernel heap).
+#[cfg(target_os = "uefi")]
+extern crate alloc;
+
+pub mod allocator;
 pub mod handoff;
 pub mod kernel;
 pub mod serial;

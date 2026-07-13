@@ -31,6 +31,9 @@ BANNER="enlil kernel alive"
 # Printed by kernel_entry after the UEFI stage hands off control — proves the
 # payload→kernel transition and the kernel's walk of the handed-off memory map.
 KERNEL_LINE="enlil kernel: memory:"
+# Printed once the kernel's own heap serves allocations with the firmware
+# gone — proves the switching allocator + first post-ExitBootServices alloc.
+HEAP_LINE="alloc test ok"
 TIMEOUT_SECS=60
 
 mkdir -p "$OUTDIR"
@@ -138,7 +141,7 @@ for _ in $(seq "$TIMEOUT_SECS"); do
         QEMU_RC=$?
         break
     fi
-    if grep -q "$KERNEL_LINE" "$SERIAL_LOG" 2>/dev/null; then
+    if grep -q "$HEAP_LINE" "$SERIAL_LOG" 2>/dev/null; then
         break
     fi
     sleep 1
@@ -152,10 +155,11 @@ echo "==> serial output:"
 sed 's/^/    /' "$SERIAL_LOG" 2>/dev/null || true
 
 if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
-    && grep -q "$KERNEL_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: observed banner \"$BANNER\" and kernel line \"$KERNEL_LINE\" on serial"
+    && grep -q "$KERNEL_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$HEAP_LINE" "$SERIAL_LOG" 2>/dev/null; then
+    echo "PASS: observed banner \"$BANNER\", kernel line \"$KERNEL_LINE\", and heap proof \"$HEAP_LINE\" on serial"
     exit 0
 fi
 
-echo "FAIL: banner \"$BANNER\" + kernel line \"$KERNEL_LINE\" not both observed (qemu rc=$QEMU_RC)"
+echo "FAIL: banner \"$BANNER\" + kernel line \"$KERNEL_LINE\" + heap proof \"$HEAP_LINE\" not all observed (qemu rc=$QEMU_RC)"
 exit 1
