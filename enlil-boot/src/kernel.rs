@@ -236,8 +236,21 @@ mod hw {
         }
 
         bring_up_interrupts(&serial);
+        bring_up_framebuffer(&serial, handoff);
 
         park()
+    }
+
+    /// Draw the boot indicator on the GOP framebuffer (if the firmware handed
+    /// one over) and self-test that the kernel can drive it.
+    fn bring_up_framebuffer(serial: &SerialPort, handoff: &BootHandoff) {
+        match &handoff.framebuffer {
+            Some(fb) if crate::framebuffer::draw_and_selftest(fb) => {
+                serial.write_str("enlil kernel: gop: framebuffer draw ok\n");
+            }
+            Some(_) => serial.write_str("enlil kernel: gop: framebuffer draw FAILED\n"),
+            None => serial.write_str("enlil kernel: gop: no framebuffer in handoff\n"),
+        }
     }
 
     /// Install the kernel's own IDT (replacing the firmware's, whose handlers

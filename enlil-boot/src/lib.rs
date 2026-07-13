@@ -22,6 +22,7 @@
 extern crate alloc;
 
 pub mod allocator;
+pub mod framebuffer;
 pub mod handoff;
 pub mod idt;
 pub mod kernel;
