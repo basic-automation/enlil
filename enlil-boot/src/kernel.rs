@@ -236,9 +236,24 @@ mod hw {
         }
 
         bring_up_interrupts(&serial);
+        bring_up_apic(&serial);
         bring_up_framebuffer(&serial, handoff);
 
         park()
+    }
+
+    /// Enable the local APIC in x2APIC mode and report its ID — the interrupt
+    /// hardware the LAPIC timer / IPIs / MSI routing build on.
+    fn bring_up_apic(serial: &SerialPort) {
+        match crate::apic::enable_x2apic() {
+            Some(id) => {
+                let mut buf = [0u8; 20];
+                serial.write_str("enlil kernel: apic: x2APIC enabled, id ");
+                serial.write_str(format_u64(u64::from(id), &mut buf));
+                serial.write_str("\n");
+            }
+            None => serial.write_str("enlil kernel: apic: x2APIC unavailable\n"),
+        }
     }
 
     /// Draw the boot indicator on the GOP framebuffer (if the firmware handed
