@@ -28,6 +28,9 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUTDIR="${1:-$(mktemp -d)}"
 BANNER="enlil kernel alive"
+# Printed by kernel_entry after the UEFI stage hands off control — proves the
+# payload→kernel transition and the kernel's walk of the handed-off memory map.
+KERNEL_LINE="enlil kernel: memory:"
 TIMEOUT_SECS=60
 
 mkdir -p "$OUTDIR"
@@ -135,7 +138,7 @@ for _ in $(seq "$TIMEOUT_SECS"); do
         QEMU_RC=$?
         break
     fi
-    if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null; then
+    if grep -q "$KERNEL_LINE" "$SERIAL_LOG" 2>/dev/null; then
         break
     fi
     sleep 1
@@ -148,10 +151,11 @@ fi
 echo "==> serial output:"
 sed 's/^/    /' "$SERIAL_LOG" 2>/dev/null || true
 
-if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: observed banner \"$BANNER\" on serial"
+if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$KERNEL_LINE" "$SERIAL_LOG" 2>/dev/null; then
+    echo "PASS: observed banner \"$BANNER\" and kernel line \"$KERNEL_LINE\" on serial"
     exit 0
 fi
 
-echo "FAIL: banner \"$BANNER\" not observed (qemu rc=$QEMU_RC)"
+echo "FAIL: banner \"$BANNER\" + kernel line \"$KERNEL_LINE\" not both observed (qemu rc=$QEMU_RC)"
 exit 1
