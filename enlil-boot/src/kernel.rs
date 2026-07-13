@@ -250,7 +250,17 @@ mod hw {
         use crate::svm::SvmStatus;
         match crate::svm::enable_svm() {
             SvmStatus::Available => {
-                serial.write_str("enlil kernel: svm: enabled (EFER.SVME set)\n")
+                serial.write_str("enlil kernel: svm: enabled (EFER.SVME set)\n");
+                // Program the host state-save area VMRUN requires.
+                match crate::svm::program_host_save_area() {
+                    Some(pa) => {
+                        let mut buf = [0u8; 18];
+                        serial.write_str("enlil kernel: svm: host-save area at ");
+                        serial.write_str(format_u64_hex(pa, &mut buf));
+                        serial.write_str("\n");
+                    }
+                    None => serial.write_str("enlil kernel: svm: host-save area FAILED\n"),
+                }
             }
             SvmStatus::Unsupported => serial.write_str("enlil kernel: svm: not supported by CPU\n"),
             SvmStatus::DisabledByFirmware => {

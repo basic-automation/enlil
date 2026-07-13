@@ -26,6 +26,20 @@ pub const MSR_EFER: u32 = 0xC000_0080;
 /// `EFER.SVME` (bit 12): the SVM-enable bit `VMRUN` requires.
 pub const EFER_SVME: u64 = 1 << 12;
 
+/// The `VM_HSAVE_PA` MSR: physical base of the 4 KiB host state-save area
+/// `VMRUN` uses (must be programmed before the first `VMRUN`, APM §15.30.4).
+pub const MSR_VM_HSAVE_PA: u32 = 0xC001_0117;
+
+/// The size/alignment of the host state-save area: one 4 KiB page.
+pub const HSAVE_PAGE_SIZE: usize = 4096;
+
+/// Whether `addr` is a valid `VM_HSAVE_PA`: nonzero and 4 KiB-aligned (the
+/// hardware requires a page-aligned host-save area; bits 11:0 are reserved).
+#[must_use]
+pub const fn is_valid_hsave_pa(addr: u64) -> bool {
+    addr != 0 && addr.is_multiple_of(HSAVE_PAGE_SIZE as u64)
+}
+
 /// Why SVM cannot be enabled, or that it can.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SvmStatus {
@@ -72,14 +86,15 @@ pub const fn vm_cr_clear_svmdis(vm_cr: u64) -> u64 {
 }
 
 #[cfg(target_os = "uefi")]
-pub use hw::enable_svm;
+pub use hw::{enable_svm, program_host_save_area};
 
 #[cfg(target_os = "uefi")]
 mod hw {
     use super::{
-        MSR_EFER, MSR_VM_CR, SvmStatus, efer_with_svme, is_svm_enabled, svm_status,
-        vm_cr_clear_svmdis,
+        HSAVE_PAGE_SIZE, MSR_EFER, MSR_VM_CR, MSR_VM_HSAVE_PA, SvmStatus, efer_with_svme,
+        is_svm_enabled, is_valid_hsave_pa, svm_status, vm_cr_clear_svmdis,
     };
+    use alloc::alloc::{Layout, alloc_zeroed};
 
     /// Read a 64-bit MSR.
     ///
@@ -165,6 +180,38 @@ mod hw {
             SvmStatus::Available
         }
     }
+
+    /// A page-sized, page-aligned block, for a `const` 4 KiB-aligned layout.
+    #[repr(C, align(4096))]
+    struct HsavePage([u8; HSAVE_PAGE_SIZE]);
+
+    /// Allocate the host state-save area and program `VM_HSAVE_PA` with its
+    /// address, returning the programmed base if it read back correctly.
+    ///
+    /// The page is intentionally leaked: the host-save area must live for the
+    /// machine's lifetime (every `VMRUN` uses it). The kernel runs
+    /// identity-mapped this early, so the allocation's virtual address is its
+    /// physical address — the value the MSR takes. Returns `None` if the page
+    /// cannot be allocated, is not page-aligned, or the MSR does not hold the
+    /// value after the write.
+    #[must_use]
+    pub fn program_host_save_area() -> Option<u64> {
+        // SAFETY: HSAVE_PAGE_SIZE is a nonzero power of two.
+        let page = unsafe { alloc_zeroed(Layout::new::<HsavePage>()) };
+        if page.is_null() {
+            return None;
+        }
+        let pa = page as u64;
+        if !is_valid_hsave_pa(pa) {
+            return None;
+        }
+        // SAFETY: ring 0; VM_HSAVE_PA is an architectural AMD MSR taking a
+        // page-aligned physical address, which `pa` is.
+        unsafe { wrmsr(MSR_VM_HSAVE_PA, pa) };
+        // Read back: confirm the MSR accepted the address.
+        let readback = unsafe { rdmsr(MSR_VM_HSAVE_PA) };
+        if readback == pa { Some(pa) } else { None }
+    }
 }
 
 #[cfg(test)]
@@ -211,6 +258,15 @@ mod tests {
         assert!(is_svm_enabled(efer));
         // Other bits preserved.
         assert_eq!(efer & 0x0000_0501, 0x0000_0501);
+    }
+
+    #[test]
+    fn hsave_pa_validity() {
+        assert!(!is_valid_hsave_pa(0)); // null
+        assert!(!is_valid_hsave_pa(0x1000_0001)); // not page-aligned
+        assert!(!is_valid_hsave_pa(0xFFF)); // sub-page
+        assert!(is_valid_hsave_pa(0x1000)); // one aligned page
+        assert!(is_valid_hsave_pa(0x1_780_000)); // a real heap-region base
     }
 
     #[test]

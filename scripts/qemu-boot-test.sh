@@ -43,6 +43,9 @@ APIC_LINE="x2APIC enabled"
 # Printed once the kernel turns on the CPU virtualization extension (SVM on
 # this AMD host) — the enable gate for running a guest with VMRUN.
 SVM_LINE="svm: enabled"
+# Printed once the kernel allocates + programs the host state-save area into
+# VM_HSAVE_PA (read back) — the last CPU-state step before VMRUN.
+HSAVE_LINE="host-save area at"
 # Printed once the kernel draws to the GOP framebuffer and reads a pixel back
 # — proves the framebuffer I/O backend is wired with the firmware gone.
 GOP_LINE="framebuffer draw ok"
@@ -172,10 +175,11 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$IDT_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$APIC_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$SVM_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$HSAVE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, IDT, x2APIC, SVM enable, and GOP draw observed on serial"
+    echo "PASS: banner, kernel memory, heap, IDT, x2APIC, SVM enable + host-save, and GOP draw observed on serial"
     exit 0
 fi
 
-echo "FAIL: not all of banner/kernel-line/heap/idt/apic/svm/gop observed (qemu rc=$QEMU_RC)"
+echo "FAIL: not all of banner/kernel-line/heap/idt/apic/svm/hsave/gop observed (qemu rc=$QEMU_RC)"
 exit 1
