@@ -237,9 +237,26 @@ mod hw {
 
         bring_up_interrupts(&serial);
         bring_up_apic(&serial);
+        bring_up_virtualization(&serial);
         bring_up_framebuffer(&serial, handoff);
 
         park()
+    }
+
+    /// Turn on the CPU's virtualization extension (AMD SVM) so the kernel can
+    /// later run a guest with `VMRUN` — the second live-boot sub-milestone's
+    /// enable gate.
+    fn bring_up_virtualization(serial: &SerialPort) {
+        use crate::svm::SvmStatus;
+        match crate::svm::enable_svm() {
+            SvmStatus::Available => {
+                serial.write_str("enlil kernel: svm: enabled (EFER.SVME set)\n")
+            }
+            SvmStatus::Unsupported => serial.write_str("enlil kernel: svm: not supported by CPU\n"),
+            SvmStatus::DisabledByFirmware => {
+                serial.write_str("enlil kernel: svm: disabled by firmware (VM_CR locked)\n");
+            }
+        }
     }
 
     /// Enable the local APIC in x2APIC mode and report its ID — the interrupt
