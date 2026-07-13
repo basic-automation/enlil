@@ -1,3 +1,4 @@
+#![no_std]
 #![deny(clippy::all, clippy::pedantic, clippy::nursery)]
 
 //! # enlil-hal
@@ -6,34 +7,60 @@
 //!
 //! Provides architecture-neutral traits that each platform backend
 //! (KVM, WHP, Hypervisor.framework, …) must implement.
+//!
+//! This crate is `no_std` + `alloc` so the very same traits compile for both
+//! the Linux/KVM dev host and the bare-metal `x86_64-unknown-enlil` kernel
+//! target (LOCKED PRINCIPLE 2 — the HAL is the sole ISA seam). `HalError`'s
+//! `impl core::error::Error` is identical to `std::error::Error` on the host
+//! (std re-exports the core trait), so nothing above the HAL changes.
 
-use std::fmt;
+extern crate alloc;
+
+pub mod vmx;
+
+use alloc::string::String;
+use core::fmt;
 
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
 /// Errors returned by HAL operations.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HalError {
-    #[error("vCPU creation failed: {0}")]
+    /// vCPU creation failed.
     VCpuCreation(String),
 
-    #[error("vCPU run failed: {0}")]
+    /// vCPU run failed.
     VCpuRun(String),
 
-    #[error("memory mapping failed: {0}")]
+    /// Guest memory mapping failed.
     MemoryMap(String),
 
-    #[error("interrupt injection failed: {0}")]
+    /// Interrupt injection failed.
     InterruptInject(String),
 
-    #[error("unsupported operation: {0}")]
+    /// The requested operation is unsupported on this backend.
     Unsupported(String),
 
-    #[error("{0}")]
+    /// Any other backend error.
     Other(String),
 }
+
+impl fmt::Display for HalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::VCpuCreation(m) => write!(f, "vCPU creation failed: {m}"),
+            Self::VCpuRun(m) => write!(f, "vCPU run failed: {m}"),
+            Self::MemoryMap(m) => write!(f, "memory mapping failed: {m}"),
+            Self::InterruptInject(m) => write!(f, "interrupt injection failed: {m}"),
+            Self::Unsupported(m) => write!(f, "unsupported operation: {m}"),
+            Self::Other(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl core::error::Error for HalError {}
 
 pub type HalResult<T> = Result<T, HalError>;
 
@@ -203,6 +230,7 @@ pub trait HypervisorBackend: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
 
     // -- Unit tests for VCpuConfig ------------------------------------------
 

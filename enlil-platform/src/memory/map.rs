@@ -120,6 +120,59 @@ pub struct UefiMemoryDescriptor {
     pub page_count: u64,
 }
 
+impl UefiMemoryDescriptor {
+    /// The UEFI page size in bytes (always 4 KiB).
+    pub const PAGE_SIZE: u64 = 4096;
+
+    /// Classify this descriptor's `EFI_MEMORY_TYPE` into a [`MemoryKind`].
+    ///
+    /// Loader / boot-services / conventional memory (types 1–4, 7) is
+    /// [`Usable`](MemoryKind::Usable) — boot-services memory is reclaimable once
+    /// boot services exit — unusable (8) is [`Bad`](MemoryKind::Bad),
+    /// ACPI-reclaim (9) / ACPI-NVS (10) map through, and everything else
+    /// (reserved, runtime-services, MMIO, …) is conservatively
+    /// [`Reserved`](MemoryKind::Reserved).
+    #[must_use]
+    pub const fn memory_kind(&self) -> MemoryKind {
+        match self.kind {
+            1 | 2 | 3 | 4 | 7 => MemoryKind::Usable,
+            8 => MemoryKind::Bad,
+            9 => MemoryKind::AcpiReclaimable,
+            10 => MemoryKind::AcpiNvs,
+            _ => MemoryKind::Reserved,
+        }
+    }
+
+    /// The region length in bytes (`page_count` UEFI pages).
+    #[must_use]
+    pub const fn length_bytes(&self) -> u64 {
+        self.page_count * Self::PAGE_SIZE
+    }
+}
+
+/// Select a bootstrap heap region from a raw UEFI memory descriptor array,
+/// without allocating.
+///
+/// The bare-metal `baremetal_init` must install the global heap *before* it can
+/// build a `Vec`-backed [`MemoryMap`], so it cannot use [`MemoryMap::from_uefi`]
+/// / [`MemoryMap::largest_usable`] (both allocate) to find that first heap. This
+/// scan runs directly over the firmware descriptor array the boot payload handed
+/// across `ExitBootServices`, returning the largest
+/// [`Usable`](MemoryKind::Usable) region of at least `min_size` bytes, or `None`
+/// if none qualifies.
+#[must_use]
+pub fn select_bootstrap_heap_region(
+    descriptors: &[UefiMemoryDescriptor],
+    min_size: u64,
+) -> Option<MemoryRegion> {
+    descriptors
+        .iter()
+        .filter(|d| d.page_count != 0 && matches!(d.memory_kind(), MemoryKind::Usable))
+        .map(|d| MemoryRegion::new(PhysAddr::new(d.phys_start), d.length_bytes(), MemoryKind::Usable))
+        .filter(|r| r.size >= min_size)
+        .max_by_key(|r| r.size)
+}
+
 /// A physical memory map: a set of contiguous regions kept sorted by base
 /// address, from which the hypervisor carves the regions it needs.
 #[derive(Clone, Debug, Default)]
@@ -181,20 +234,11 @@ impl MemoryMap {
     /// result is sorted by base.
     #[must_use]
     pub fn from_uefi(descriptors: &[UefiMemoryDescriptor]) -> Self {
-        const UEFI_PAGE: u64 = 4096;
         let regions = descriptors
             .iter()
             .filter(|d| d.page_count != 0)
             .map(|d| {
-                let kind = match d.kind {
-                    // EfiLoaderCode/Data, EfiBootServicesCode/Data, EfiConventionalMemory.
-                    1 | 2 | 3 | 4 | 7 => MemoryKind::Usable,
-                    8 => MemoryKind::Bad,             // EfiUnusableMemory
-                    9 => MemoryKind::AcpiReclaimable, // EfiACPIReclaimMemory
-                    10 => MemoryKind::AcpiNvs,        // EfiACPIMemoryNVS
-                    _ => MemoryKind::Reserved,
-                };
-                MemoryRegion::new(PhysAddr::new(d.phys_start), d.page_count * UEFI_PAGE, kind)
+                MemoryRegion::new(PhysAddr::new(d.phys_start), d.length_bytes(), d.memory_kind())
             })
             .collect();
         Self::from_regions(regions)
@@ -444,6 +488,59 @@ mod tests {
         assert_eq!(map.regions()[6].kind, MemoryKind::Reserved); // runtime-services
         // Usable = conventional (1 MiB) + boot-services data (0x9F pages).
         assert_eq!(map.total_usable(), 0x100 * 4096 + 0x9F * 4096);
+    }
+
+    #[test]
+    fn select_bootstrap_heap_region_picks_largest_usable() {
+        let uefi = |kind, phys_start, page_count| UefiMemoryDescriptor {
+            kind,
+            phys_start,
+            page_count,
+        };
+        let descriptors = [
+            uefi(7, 0x10_0000, 0x100),  // usable, 1 MiB
+            uefi(4, 0x0, 0x9F),         // usable, 0x9F pages (smaller)
+            uefi(7, 0x100_0000, 0x400), // usable, 4 MiB — the largest
+            uefi(0, 0x200_0000, 0x800), // reserved (bigger, but not usable)
+            uefi(7, 0x50_0000, 0),      // zero pages → ignored
+        ];
+        let region = select_bootstrap_heap_region(&descriptors, 0).expect("a usable region");
+        assert_eq!(region.base, PhysAddr::new(0x100_0000));
+        assert_eq!(region.size, 0x400 * 4096);
+        assert_eq!(region.kind, MemoryKind::Usable);
+    }
+
+    #[test]
+    fn select_bootstrap_heap_region_honors_min_size() {
+        let uefi = |kind, phys_start, page_count| UefiMemoryDescriptor {
+            kind,
+            phys_start,
+            page_count,
+        };
+        let descriptors = [
+            uefi(7, 0x10_0000, 0x100), // usable, 1 MiB
+            uefi(7, 0x100_0000, 0x10), // usable, 64 KiB
+        ];
+        // A 2 MiB floor rejects both regions.
+        assert!(select_bootstrap_heap_region(&descriptors, 2 * 1024 * 1024).is_none());
+        // A 512 KiB floor leaves only the 1 MiB region.
+        let region =
+            select_bootstrap_heap_region(&descriptors, 512 * 1024).expect("the 1 MiB region");
+        assert_eq!(region.base, PhysAddr::new(0x10_0000));
+    }
+
+    #[test]
+    fn select_bootstrap_heap_region_none_without_usable_memory() {
+        let uefi = |kind, phys_start, page_count| UefiMemoryDescriptor {
+            kind,
+            phys_start,
+            page_count,
+        };
+        let descriptors = [
+            uefi(0, 0x0, 0x100),        // reserved
+            uefi(10, 0x10_0000, 0x100), // ACPI NVS
+        ];
+        assert!(select_bootstrap_heap_region(&descriptors, 0).is_none());
     }
 
     #[test]

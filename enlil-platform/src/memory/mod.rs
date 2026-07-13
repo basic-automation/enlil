@@ -293,13 +293,129 @@ impl SlabCache {
 }
 
 // ---------------------------------------------------------------------------
+// Bare-metal heap backend
+// ---------------------------------------------------------------------------
+
+/// The bare-metal `GlobalAlloc` backing: an intrusive-free-list heap
+/// (`linked_list_allocator`) over a single physical region, behind a spinlock
+/// so `GlobalAlloc`'s `&self` methods can mutate it. Empty until
+/// [`init_baremetal_heap`] hands it a region during `baremetal_init`.
+///
+/// Uses an audited external heap rather than the in-crate `BuddyAllocator`
+/// (whose `Vec`-based free lists would re-enter the allocator when used as the
+/// global heap); the buddy/slab allocators remain available for page-granular
+/// physical allocation above the global heap.
+#[cfg(not(feature = "platform-linux"))]
+mod baremetal_heap {
+    use super::{Ordering, STATS};
+    use core::ptr::NonNull;
+    use core::sync::atomic::AtomicBool;
+    use linked_list_allocator::Heap;
+    use spin::Mutex;
+    use std::alloc::Layout;
+
+    static HEAP: Mutex<Heap> = Mutex::new(Heap::empty());
+    static INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+    /// Whether the heap has been given a region yet.
+    pub fn is_initialized() -> bool {
+        INITIALIZED.load(Ordering::Acquire)
+    }
+
+    /// Install the heap over `[base, base + size)`.
+    ///
+    /// # Safety
+    ///
+    /// `base` must point to `size` bytes of otherwise-unused, writable memory
+    /// that outlives every allocation (typically a region carved from the UEFI
+    /// memory map). Must be called at most once, before the first allocation.
+    pub unsafe fn init(base: *mut u8, size: usize) {
+        unsafe { HEAP.lock().init(base, size) };
+        INITIALIZED.store(true, Ordering::Release);
+    }
+
+    /// Allocate `layout` from the heap, or null if uninitialized / out of
+    /// memory.
+    pub fn alloc(layout: Layout) -> *mut u8 {
+        match HEAP.lock().allocate_first_fit(layout) {
+            Ok(ptr) => {
+                STATS.allocated.fetch_add(layout.size(), Ordering::Relaxed);
+                STATS.alloc_count.fetch_add(1, Ordering::Relaxed);
+                ptr.as_ptr()
+            }
+            Err(()) => core::ptr::null_mut(),
+        }
+    }
+
+    /// Return a block to the heap.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` / `layout` must originate from a prior [`alloc`] on this heap.
+    pub unsafe fn dealloc(ptr: *mut u8, layout: Layout) {
+        if let Some(nn) = NonNull::new(ptr) {
+            unsafe { HEAP.lock().deallocate(nn, layout) };
+            STATS.allocated.fetch_sub(layout.size(), Ordering::Relaxed);
+            STATS.dealloc_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Initialize the bare-metal global heap over `[base, base + size)`.
+///
+/// Called once from `baremetal_init` with a region carved from the UEFI memory
+/// map, before the first heap allocation.
+///
+/// # Safety
+///
+/// The region must be valid, unused, writable, and outlive every allocation.
+#[cfg(not(feature = "platform-linux"))]
+pub unsafe fn init_baremetal_heap(base: *mut u8, size: usize) {
+    unsafe { baremetal_heap::init(base, size) };
+}
+
+/// Whether the bare-metal global heap has been initialized.
+#[cfg(not(feature = "platform-linux"))]
+#[must_use]
+pub fn baremetal_heap_ready() -> bool {
+    baremetal_heap::is_initialized()
+}
+
+/// Install the global bare-metal heap from the firmware memory map.
+///
+/// Selects a bootstrap heap region of at least `min_size` bytes from the raw
+/// UEFI descriptor array (see [`map::select_bootstrap_heap_region`]) and installs
+/// it as the global allocator via [`init_baremetal_heap`]. This is the first
+/// thing `baremetal_init` does with the [`BootHandoff`](../../enlil_boot) memory
+/// map, before any `Vec`-backed [`MemoryMap`](map::MemoryMap) can be built.
+/// Returns the installed region, or `None` if no usable region is large enough.
+///
+/// # Safety
+///
+/// `descriptors` must describe the live physical memory map, and the selected
+/// region must be otherwise unused and outlive every allocation. Call at most
+/// once, before the first heap allocation.
+#[cfg(not(feature = "platform-linux"))]
+pub unsafe fn init_global_heap_from_uefi(
+    descriptors: &[map::UefiMemoryDescriptor],
+    min_size: u64,
+) -> Option<map::MemoryRegion> {
+    let region = map::select_bootstrap_heap_region(descriptors, min_size)?;
+    let base = usize::try_from(region.base.as_u64()).ok()? as *mut u8;
+    let size = usize::try_from(region.size).ok()?;
+    unsafe { init_baremetal_heap(base, size) };
+    Some(region)
+}
+
+// ---------------------------------------------------------------------------
 // Platform GlobalAlloc wrapper
 // ---------------------------------------------------------------------------
 
 /// The platform allocator — dispatches to the appropriate backend.
 ///
 /// On Linux: wraps the system allocator.
-/// On bare-metal: wraps `BuddyAllocator` + `SlabCache`.
+/// On bare-metal: the `linked_list_allocator` heap installed by
+/// [`init_baremetal_heap`].
 pub struct PlatformAllocator;
 
 unsafe impl GlobalAlloc for PlatformAllocator {
@@ -315,10 +431,7 @@ unsafe impl GlobalAlloc for PlatformAllocator {
         }
         #[cfg(not(feature = "platform-linux"))]
         {
-            // Bare-metal: would dispatch to buddy/slab.
-            // Stubbed — real implementation in Phase 6.
-            let _ = layout;
-            std::ptr::null_mut()
+            baremetal_heap::alloc(layout)
         }
     }
 
@@ -331,7 +444,7 @@ unsafe impl GlobalAlloc for PlatformAllocator {
         }
         #[cfg(not(feature = "platform-linux"))]
         {
-            let _ = (ptr, layout);
+            unsafe { baremetal_heap::dealloc(ptr, layout) };
         }
     }
 }
@@ -781,6 +894,7 @@ mod tests {
         assert_eq!(cache.free_count(), objects_per_page);
     }
 
+    #[cfg(feature = "platform-linux")]
     #[test]
     fn platform_allocator_stats() {
         // Reset stats for test isolation isn't possible with statics,
@@ -789,6 +903,39 @@ mod tests {
         let ptr = unsafe { PlatformAllocator.alloc(layout) };
         assert!(!ptr.is_null());
         unsafe { PlatformAllocator.dealloc(ptr, layout) };
+    }
+
+    /// Exercises the bare-metal `GlobalAlloc` path: an uninitialized heap
+    /// returns null, and after `init_baremetal_heap` the platform allocator
+    /// serves real, writable, reusable memory (no longer the null stub).
+    #[cfg(not(feature = "platform-linux"))]
+    #[test]
+    fn baremetal_heap_serves_allocations_after_init() {
+        let layout = Layout::from_size_align(256, 8).unwrap();
+
+        // Before init: honest null, and the readiness flag is false.
+        assert!(!baremetal_heap_ready());
+        let before = unsafe { PlatformAllocator.alloc(layout) };
+        assert!(before.is_null(), "uninitialized heap must return null");
+
+        // Back the heap with a leaked, 8-aligned region.
+        const HEAP_SIZE: usize = 256 * 1024;
+        let mut backing = vec![0u64; HEAP_SIZE / 8];
+        let base = backing.as_mut_ptr().cast::<u8>();
+        core::mem::forget(backing);
+        unsafe { init_baremetal_heap(base, HEAP_SIZE) };
+        assert!(baremetal_heap_ready());
+
+        // After init: real, writable memory.
+        let ptr = unsafe { PlatformAllocator.alloc(layout) };
+        assert!(!ptr.is_null(), "heap returned null after init");
+        unsafe { core::ptr::write_bytes(ptr, 0xAB, layout.size()) };
+        unsafe { PlatformAllocator.dealloc(ptr, layout) };
+
+        // Freed memory is reusable.
+        let ptr2 = unsafe { PlatformAllocator.alloc(layout) };
+        assert!(!ptr2.is_null());
+        unsafe { PlatformAllocator.dealloc(ptr2, layout) };
     }
 
     #[test]

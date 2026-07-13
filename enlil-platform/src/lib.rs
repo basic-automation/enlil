@@ -64,7 +64,12 @@ fn linux_init() {
 
 #[cfg(feature = "platform-baremetal")]
 fn baremetal_init() {
-    // Bare-metal backend: full hardware initialization.
-    // This is stubbed for Phase 1 — real implementation in Phase 6.
+    // Bare-metal backend: full hardware initialization (Phase 6.2).
+    //
+    // The first step, once the boot payload's `BootHandoff` is threaded in, is
+    // to install the global heap from the firmware memory map via
+    // `memory::init_global_heap_from_uefi` — every later step (per-CPU areas,
+    // IDT/APIC, the VMX/SVM backend) needs an allocator. GDT/IDT/page-table/APIC
+    // bring-up follows.
     log::debug!("Bare-metal platform backend: hardware init (stub)");
 }
