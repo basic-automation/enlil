@@ -261,6 +261,20 @@ mod hw {
                     }
                     None => serial.write_str("enlil kernel: svm: host-save area FAILED\n"),
                 }
+                // Allocate + program a VMCB for a minimal guest through the
+                // enlil-hal region/programming layer — the state VMRUN takes.
+                match crate::svm::program_boot_vmcb() {
+                    Some((base, asid)) => {
+                        let mut hex = [0u8; 18];
+                        let mut dec = [0u8; 20];
+                        serial.write_str("enlil kernel: svm: vmcb programmed (asid ");
+                        serial.write_str(format_u64(u64::from(asid), &mut dec));
+                        serial.write_str(") at ");
+                        serial.write_str(format_u64_hex(base, &mut hex));
+                        serial.write_str("\n");
+                    }
+                    None => serial.write_str("enlil kernel: svm: vmcb programming FAILED\n"),
+                }
             }
             SvmStatus::Unsupported => serial.write_str("enlil kernel: svm: not supported by CPU\n"),
             SvmStatus::DisabledByFirmware => {

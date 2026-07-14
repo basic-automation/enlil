@@ -75,7 +75,7 @@ pub const fn vm_cr_clear_svmdis(vm_cr: u64) -> u64 {
 }
 
 #[cfg(target_os = "uefi")]
-pub use hw::{enable_svm, program_host_save_area};
+pub use hw::{enable_svm, program_boot_vmcb, program_host_save_area};
 
 #[cfg(target_os = "uefi")]
 mod hw {
@@ -84,6 +84,8 @@ mod hw {
         is_svm_enabled, is_valid_hsave_pa, svm_status, vm_cr_clear_svmdis,
     };
     use alloc::alloc::{Layout, alloc_zeroed};
+    use enlil_hal::region::Vmcb;
+    use enlil_hal::svm::{MinimalGuestSetup, control, program_minimal_hlt_guest};
 
     /// Read a 64-bit MSR.
     ///
@@ -200,6 +202,39 @@ mod hw {
         // Read back: confirm the MSR accepted the address.
         let readback = unsafe { rdmsr(MSR_VM_HSAVE_PA) };
         if readback == pa { Some(pa) } else { None }
+    }
+
+    /// Allocate and program a VMCB for a minimal real-mode `HLT` guest through
+    /// the `enlil-hal` region + programming layer, returning its base address
+    /// and the ASID read back from the region.
+    ///
+    /// This proves the VMCB allocation + field-programming path works on real
+    /// hardware with the firmware gone: a [`Vmcb`] is allocated from the
+    /// kernel heap, [`program_minimal_hlt_guest`] stamps its control/save area,
+    /// and the guest ASID is read straight back out of the page. The VMCB is
+    /// leaked (it must outlive this call — the eventual `VMRUN` uses it). The
+    /// nested-CR3 is left zero for now; wiring a real guest NPT and the `VMRUN`
+    /// op is the next slice. Returns `None` if the page cannot be allocated or
+    /// the VMCB region is malformed (neither can happen for a fresh page).
+    #[must_use]
+    pub fn program_boot_vmcb() -> Option<(u64, u32)> {
+        let mut vmcb = Vmcb::new().ok()?;
+        let setup = MinimalGuestSetup {
+            asid: 1,
+            nested_cr3: 0, // guest NPT + VMRUN are the next slice
+            entry_ip: 0,
+            code_base: 0,
+            stack_pointer: 0,
+        };
+        program_minimal_hlt_guest(vmcb.as_bytes_mut(), &setup).ok()?;
+        let base = vmcb.base_addr();
+        // Read the ASID straight back from the programmed region.
+        let mut asid_le = [0u8; 4];
+        asid_le.copy_from_slice(&vmcb.as_bytes()[control::GUEST_ASID..control::GUEST_ASID + 4]);
+        let asid = u32::from_le_bytes(asid_le);
+        // The VMCB must live for the machine's lifetime; leak the handle.
+        core::mem::forget(vmcb);
+        Some((base, asid))
     }
 }
 
