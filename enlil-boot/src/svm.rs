@@ -5,30 +5,19 @@
 //! locked it off (`VM_CR.SVMDIS` + `LOCK`), and `EFER.SVME` has to be set (AMD
 //! APM Vol. 2 §15.4). This module is that gate — the enable *decision* is pure
 //! and host-tested; only the `cpuid`/`rdmsr`/`wrmsr` are firmware-gated. The
-//! full VMCB programming and the `VMRUN` op build on top (the `enlil-hal::svm`
-//! decode layer + region types are the authoritative backend seam).
+//! full VMCB programming and the `VMRUN` op build on top.
+//!
+//! The MSR numbers and `VM_CR`/`EFER` bit predicates come from
+//! [`enlil_hal::svm`] — the authoritative ISA seam (LOCKED PRINCIPLE 2) — so
+//! they are defined once for the whole hypervisor; this module keeps only the
+//! boot-specific enable *policy* ([`SvmStatus`], [`svm_status`]) and the
+//! privileged firmware ops.
 
-/// `CPUID Fn8000_0001` ECX bit 2: SVM is supported.
-pub const CPUID_FN8000_0001_ECX_SVM: u32 = 1 << 2;
-
-/// The `VM_CR` MSR (AMD APM §15.30.1).
-pub const MSR_VM_CR: u32 = 0xC001_0114;
-
-/// `VM_CR.SVMDIS` (bit 4): SVM disabled — `EFER.SVME` writes #GP when set.
-pub const VM_CR_SVMDIS: u64 = 1 << 4;
-
-/// `VM_CR.LOCK` (bit 3): the SVMDIS setting is locked until reset.
-pub const VM_CR_LOCK: u64 = 1 << 3;
-
-/// The extended-feature-enable register MSR.
-pub const MSR_EFER: u32 = 0xC000_0080;
-
-/// `EFER.SVME` (bit 12): the SVM-enable bit `VMRUN` requires.
-pub const EFER_SVME: u64 = 1 << 12;
-
-/// The `VM_HSAVE_PA` MSR: physical base of the 4 KiB host state-save area
-/// `VMRUN` uses (must be programmed before the first `VMRUN`, APM §15.30.4).
-pub const MSR_VM_HSAVE_PA: u32 = 0xC001_0117;
+pub use enlil_hal::svm::{
+    CPUID_FN8000_0001_ECX_SVM, EFER_SVME, MSR_EFER, MSR_VM_CR, MSR_VM_HSAVE_PA, VM_CR_LOCK,
+    VM_CR_SVMDIS,
+};
+use enlil_hal::svm::{vm_cr_svm_disabled, vm_cr_svm_locked};
 
 /// The size/alignment of the host state-save area: one 4 KiB page.
 pub const HSAVE_PAGE_SIZE: usize = 4096;
@@ -61,7 +50,7 @@ pub const fn svm_status(cpuid_fn8000_0001_ecx: u32, vm_cr: u64) -> SvmStatus {
     if cpuid_fn8000_0001_ecx & CPUID_FN8000_0001_ECX_SVM == 0 {
         return SvmStatus::Unsupported;
     }
-    if vm_cr & VM_CR_SVMDIS != 0 && vm_cr & VM_CR_LOCK != 0 {
+    if vm_cr_svm_disabled(vm_cr) && vm_cr_svm_locked(vm_cr) {
         return SvmStatus::DisabledByFirmware;
     }
     SvmStatus::Available

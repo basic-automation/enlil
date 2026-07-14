@@ -212,7 +212,7 @@ mod hw {
 mod tests {
     use super::*;
 
-    fn geometry(width: u32, height: u32, stride: u32, bpp: u32) -> Vec<u8> {
+    fn geometry(_width: u32, height: u32, stride: u32, bpp: u32) -> Vec<u8> {
         vec![0u8; (stride * height * bpp) as usize]
     }
 

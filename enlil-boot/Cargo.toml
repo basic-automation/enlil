@@ -6,6 +6,11 @@ description = "UEFI boot payload — bare-metal target (Phase 6)"
 
 [dependencies]
 log = "0.4"
+# The authoritative ISA seam (LOCKED PRINCIPLE 2): SVM/VMX capability + VMCB
+# decode/programming layer and the page-aligned VMX/SVM region types. enlil-hal
+# is no_std + alloc and builds for x86_64-unknown-uefi / x86_64-unknown-enlil,
+# so the boot kernel links it directly rather than re-deriving ISA constants.
+enlil-hal = { path = "../enlil-hal" }
 
 # The uefi-rs runtime is only pulled in when building for the UEFI firmware
 # target. On the Linux/Windows dev host the crate still compiles (the entry
