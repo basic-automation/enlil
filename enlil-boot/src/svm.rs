@@ -84,7 +84,8 @@ mod hw {
         is_svm_enabled, is_valid_hsave_pa, svm_status, vm_cr_clear_svmdis,
     };
     use alloc::alloc::{Layout, alloc_zeroed};
-    use enlil_hal::region::Vmcb;
+    use enlil_hal::npt::build_identity_npt_2mib;
+    use enlil_hal::region::{PageRegion, Vmcb};
     use enlil_hal::svm::{MinimalGuestSetup, control, program_minimal_hlt_guest};
 
     /// Read a 64-bit MSR.
@@ -204,37 +205,69 @@ mod hw {
         if readback == pa { Some(pa) } else { None }
     }
 
-    /// Allocate and program a VMCB for a minimal real-mode `HLT` guest through
-    /// the `enlil-hal` region + programming layer, returning its base address
-    /// and the ASID read back from the region.
+    /// A 3-page buffer (PML4 + PDPT + one PD) for a ≤ 1 GiB nested identity map.
+    #[repr(C, align(4096))]
+    struct NptBuf([u8; 3 * 4096]);
+
+    /// Identity-map the low gibibyte in the guest NPT — this covers the whole
+    /// boot heap (capped at 64 MiB), where the guest code page lives.
+    const NPT_MAP_BYTES: u64 = 1024 * 1024 * 1024;
+
+    /// Build a complete, `VMRUN`-ready VMCB for a minimal real-mode guest that
+    /// executes a single `HLT`, returning `(vmcb_pa, ncr3, guest_code_pa)`.
     ///
-    /// This proves the VMCB allocation + field-programming path works on real
-    /// hardware with the firmware gone: a [`Vmcb`] is allocated from the
-    /// kernel heap, [`program_minimal_hlt_guest`] stamps its control/save area,
-    /// and the guest ASID is read straight back out of the page. The VMCB is
-    /// leaked (it must outlive this call — the eventual `VMRUN` uses it). The
-    /// nested-CR3 is left zero for now; wiring a real guest NPT and the `VMRUN`
-    /// op is the next slice. Returns `None` if the page cannot be allocated or
-    /// the VMCB region is malformed (neither can happen for a fresh page).
+    /// Every piece the second live-boot sub-milestone needs is assembled here
+    /// through the `enlil-hal` layer, with the firmware gone: a guest code page
+    /// holding a `HLT` (`0xF4`), a nested page table identity-mapping the low
+    /// gibibyte (so the guest's `GPA == SPA`), and a [`Vmcb`] programmed via
+    /// [`program_minimal_hlt_guest`] to enter that code under that NPT. The
+    /// programmed nested-CR3 is read straight back out of the VMCB to prove the
+    /// write landed. All three allocations are leaked — they must outlive this
+    /// call for the eventual `VMRUN`. Returns `None` if any allocation fails or
+    /// the NPT/VMCB is malformed (none can happen here). The `VMRUN` op that
+    /// actually runs this guest to `#VMEXIT(HLT)` is the next slice.
     #[must_use]
-    pub fn program_boot_vmcb() -> Option<(u64, u32)> {
+    pub fn program_boot_vmcb() -> Option<(u64, u64, u64)> {
+        // Guest code page: a single `HLT` so the guest #VMEXITs immediately.
+        let mut code = PageRegion::new()?;
+        code.as_bytes_mut()[0] = 0xF4; // HLT
+        let guest_code_pa = code.base_addr();
+        core::mem::forget(code); // the guest's RAM must persist
+
+        // Nested page tables identity-mapping the low GiB (GPA == SPA).
+        // SAFETY: NptBuf has a nonzero size; alloc_zeroed yields a zeroed,
+        // 4 KiB-aligned NptBuf-sized block or null.
+        let npt_raw = unsafe { alloc_zeroed(Layout::new::<NptBuf>()) };
+        if npt_raw.is_null() {
+            return None;
+        }
+        let npt_pa = npt_raw as u64;
+        // SAFETY: npt_raw points at a live, zeroed, exclusively-owned NptBuf;
+        // it is leaked below so the slice never outlives the allocation.
+        let npt_buf = unsafe { core::slice::from_raw_parts_mut(npt_raw, 3 * 4096) };
+        let ncr3 = build_identity_npt_2mib(npt_buf, npt_pa, NPT_MAP_BYTES)
+            .ok()?
+            .ncr3;
+
+        // Program a VMCB to enter the guest code under that NPT.
         let mut vmcb = Vmcb::new().ok()?;
         let setup = MinimalGuestSetup {
             asid: 1,
-            nested_cr3: 0, // guest NPT + VMRUN are the next slice
+            nested_cr3: ncr3,
             entry_ip: 0,
-            code_base: 0,
+            code_base: guest_code_pa,
             stack_pointer: 0,
         };
         program_minimal_hlt_guest(vmcb.as_bytes_mut(), &setup).ok()?;
-        let base = vmcb.base_addr();
-        // Read the ASID straight back from the programmed region.
-        let mut asid_le = [0u8; 4];
-        asid_le.copy_from_slice(&vmcb.as_bytes()[control::GUEST_ASID..control::GUEST_ASID + 4]);
-        let asid = u32::from_le_bytes(asid_le);
-        // The VMCB must live for the machine's lifetime; leak the handle.
-        core::mem::forget(vmcb);
-        Some((base, asid))
+        // Read the nested-CR3 back to confirm the programming landed.
+        let mut ncr3_le = [0u8; 8];
+        ncr3_le.copy_from_slice(&vmcb.as_bytes()[control::NESTED_CR3..control::NESTED_CR3 + 8]);
+        if u64::from_le_bytes(ncr3_le) != ncr3 {
+            return None;
+        }
+        let vmcb_pa = vmcb.base_addr();
+        core::mem::forget(vmcb); // the VMCB must outlive this call for VMRUN
+        Some((vmcb_pa, ncr3, guest_code_pa))
     }
 }
 

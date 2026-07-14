@@ -261,19 +261,23 @@ mod hw {
                     }
                     None => serial.write_str("enlil kernel: svm: host-save area FAILED\n"),
                 }
-                // Allocate + program a VMCB for a minimal guest through the
-                // enlil-hal region/programming layer — the state VMRUN takes.
+                // Assemble a full VMRUN-ready guest (code page + NPT + VMCB)
+                // through the enlil-hal layer — everything VMRUN takes but the
+                // instruction itself.
                 match crate::svm::program_boot_vmcb() {
-                    Some((base, asid)) => {
-                        let mut hex = [0u8; 18];
-                        let mut dec = [0u8; 20];
-                        serial.write_str("enlil kernel: svm: vmcb programmed (asid ");
-                        serial.write_str(format_u64(u64::from(asid), &mut dec));
-                        serial.write_str(") at ");
-                        serial.write_str(format_u64_hex(base, &mut hex));
-                        serial.write_str("\n");
+                    Some((vmcb, ncr3, entry)) => {
+                        let mut a = [0u8; 18];
+                        let mut b = [0u8; 18];
+                        let mut c = [0u8; 18];
+                        serial.write_str("enlil kernel: svm: vmcb VMRUN-ready (nCR3 ");
+                        serial.write_str(format_u64_hex(ncr3, &mut a));
+                        serial.write_str(", guest hlt at ");
+                        serial.write_str(format_u64_hex(entry, &mut b));
+                        serial.write_str(", vmcb ");
+                        serial.write_str(format_u64_hex(vmcb, &mut c));
+                        serial.write_str(")\n");
                     }
-                    None => serial.write_str("enlil kernel: svm: vmcb programming FAILED\n"),
+                    None => serial.write_str("enlil kernel: svm: vmcb VMRUN-ready FAILED\n"),
                 }
             }
             SvmStatus::Unsupported => serial.write_str("enlil kernel: svm: not supported by CPU\n"),

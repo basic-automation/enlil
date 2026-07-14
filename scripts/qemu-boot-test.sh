@@ -46,10 +46,10 @@ SVM_LINE="svm: enabled"
 # Printed once the kernel allocates + programs the host state-save area into
 # VM_HSAVE_PA (read back) — the last CPU-state step before VMRUN.
 HSAVE_LINE="host-save area at"
-# Printed once the kernel allocates + programs a VMCB (via the enlil-hal region
-# + programming layer) for a minimal guest and reads its ASID back — the guest
-# control block VMRUN takes.
-VMCB_LINE="vmcb programmed"
+# Printed once the kernel assembles a full VMRUN-ready guest — a HLT code page,
+# a nested page table identity-mapping the low GiB, and a VMCB programmed to
+# enter it (nested-CR3 read back) — everything VMRUN takes but the instruction.
+VMCB_LINE="vmcb VMRUN-ready"
 # Printed once the kernel draws to the GOP framebuffer and reads a pixel back
 # — proves the framebuffer I/O backend is wired with the firmware gone.
 GOP_LINE="framebuffer draw ok"
@@ -182,7 +182,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$HSAVE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$VMCB_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, IDT, x2APIC, SVM enable + host-save + VMCB program, and GOP draw observed on serial"
+    echo "PASS: banner, kernel memory, heap, IDT, x2APIC, SVM enable + host-save + VMRUN-ready guest, and GOP draw observed on serial"
     exit 0
 fi
 

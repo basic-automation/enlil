@@ -56,7 +56,7 @@ pub struct NptLayout {
 pub enum NptError {
     /// `bytes_to_map` was zero — nothing to map.
     EmptyRegion,
-    /// `tables_base` was not 4 KiB-aligned, so an entry would decode to the
+    /// `phys_base` was not 4 KiB-aligned, so an entry would decode to the
     /// wrong address.
     UnalignedBase,
     /// The map needs more than one PDPT's worth of page directories (> 512 GiB),
@@ -77,31 +77,36 @@ pub enum NptError {
 /// Build a 2 MiB-huge-page identity map of `[0, bytes_to_map)` for use as an
 /// SVM guest's nested page table.
 ///
-/// Writes the tables into `buf` at `tables_base` (a physical address; on the
-/// identity-mapped bare-metal kernel the buffer's virtual address *is* its
-/// physical address).
+/// The tables are written into the **front** of `buf`, which the caller says
+/// begins at physical address `phys_base` — so `buf[0]` is physical `phys_base`
+/// (on the identity-mapped bare-metal kernel a heap allocation's virtual
+/// address *is* its physical address, which is what the caller passes). The
+/// intermediate pointers therefore encode `phys_base`-relative addresses, and
+/// `phys_base` need not be zero (a dedicated heap buffer sits high in RAM). The
+/// KVM/host case where the buffer is guest RAM based at GPA 0 is just
+/// `phys_base == 0`.
 ///
 /// Returns an [`NptLayout`] whose `ncr3` is the value to program into the
-/// VMCB's `NESTED_CR3` field ([`svm::control::NESTED_CR3`](crate::svm::control)).
-/// The mapped region must cover every guest-physical address the guest touches
-/// (its code, stack, and any MMIO), which for a flat bring-up guest is the low
-/// range holding its code and these very tables.
+/// VMCB's `NESTED_CR3` field ([`svm::control::NESTED_CR3`](crate::svm::control))
+/// — it equals `phys_base`, the PML4's physical address. The mapped region must
+/// cover every guest-physical address the guest touches (its code, stack, and
+/// any MMIO), which for a flat bring-up guest is the low range holding its code.
 ///
 /// # Errors
 ///
 /// - [`NptError::EmptyRegion`] if `bytes_to_map == 0`;
-/// - [`NptError::UnalignedBase`] if `tables_base` is not 4 KiB-aligned;
+/// - [`NptError::UnalignedBase`] if `phys_base` is not 4 KiB-aligned;
 /// - [`NptError::MapTooLarge`] if the map exceeds 512 GiB;
 /// - [`NptError::TablesExceedBuffer`] if the tables do not fit in `buf`.
 pub fn build_identity_npt_2mib(
     buf: &mut [u8],
-    tables_base: u64,
+    phys_base: u64,
     bytes_to_map: u64,
 ) -> Result<NptLayout, NptError> {
     if bytes_to_map == 0 {
         return Err(NptError::EmptyRegion);
     }
-    if tables_base & (PAGE_SIZE - 1) != 0 {
+    if phys_base & (PAGE_SIZE - 1) != 0 {
         return Err(NptError::UnalignedBase);
     }
 
@@ -115,39 +120,33 @@ pub fn build_identity_npt_2mib(
     let num_2mib = usize::try_from(num_2mib).unwrap_or(usize::MAX);
 
     let table_count = 2 + num_pd; // PML4 + PDPT + PDs
-    let base = usize::try_from(tables_base).unwrap_or(usize::MAX);
     let region_bytes = table_count
         .checked_mul(4096)
         .ok_or(NptError::TablesExceedBuffer {
             needed: usize::MAX,
             have: buf.len(),
         })?;
-    let end = base
-        .checked_add(region_bytes)
-        .ok_or(NptError::TablesExceedBuffer {
-            needed: usize::MAX,
-            have: buf.len(),
-        })?;
-    if end > buf.len() {
+    if region_bytes > buf.len() {
         return Err(NptError::TablesExceedBuffer {
-            needed: end,
+            needed: region_bytes,
             have: buf.len(),
         });
     }
-    // Unmapped entries must read back not-present.
-    for byte in &mut buf[base..end] {
+    // Tables occupy the front of buf; unmapped entries must read not-present.
+    for byte in &mut buf[..region_bytes] {
         *byte = 0;
     }
 
-    // NPT sets U/S on every level (see module docs).
+    // NPT sets U/S on every level (see module docs). Buffer offsets are counted
+    // from buf[0]; physical addresses are counted from phys_base.
     let table_flags = flags::PRESENT | flags::WRITABLE | flags::USER;
-    let pdpt_pa = tables_base + PAGE_SIZE;
-    let first_pd_pa = tables_base + 2 * PAGE_SIZE;
-    let pdpt_off = base + 4096;
-    let first_pd_off = base + 2 * 4096;
+    let pdpt_pa = phys_base + PAGE_SIZE;
+    let first_pd_pa = phys_base + 2 * PAGE_SIZE;
+    let pdpt_off = 4096;
+    let first_pd_off = 2 * 4096;
 
     // PML4[0] → PDPT (a ≤512 GiB map lives entirely under PML4[0]).
-    write_entry(buf, base, (pdpt_pa & ADDR_MASK) | table_flags);
+    write_entry(buf, 0, (pdpt_pa & ADDR_MASK) | table_flags);
 
     // PDPT[k] → PD[k], one PD per gibibyte.
     for k in 0..num_pd {
@@ -155,7 +154,8 @@ pub fn build_identity_npt_2mib(
         write_entry(buf, pdpt_off + k * 8, (pd_pa & ADDR_MASK) | table_flags);
     }
 
-    // PD[k][j] → the (k*512 + j)-th 2 MiB frame.
+    // PD[k][j] → the (k*512 + j)-th 2 MiB frame (guest-physical == system-
+    // physical == page*2 MiB — an identity map, independent of phys_base).
     let leaf_flags = flags::PRESENT | flags::WRITABLE | flags::USER | flags::HUGE_PAGE;
     for page in 0..num_2mib {
         let k = page / 512;
@@ -166,7 +166,7 @@ pub fn build_identity_npt_2mib(
     }
 
     Ok(NptLayout {
-        ncr3: tables_base,
+        ncr3: phys_base,
         table_count,
         bytes: region_bytes,
     })
@@ -181,8 +181,8 @@ fn write_entry(buf: &mut [u8], offset: usize, entry: u64) {
 mod tests {
     use super::*;
 
-    fn read_entry(buf: &[u8], table_pa: u64, index: usize) -> u64 {
-        let off = usize::try_from(table_pa).expect("test offset fits") + index * 8;
+    fn read_entry(buf: &[u8], table_off: usize, index: usize) -> u64 {
+        let off = table_off + index * 8;
         let mut b = [0u8; 8];
         b.copy_from_slice(&buf[off..off + 8]);
         u64::from_le_bytes(b)
@@ -190,25 +190,35 @@ mod tests {
 
     #[test]
     fn identity_npt_sets_user_on_every_level() {
-        let base = 0x1_0000u64;
+        // A non-zero physical base (a heap buffer high in RAM); ncr3 and the
+        // intermediate pointers must reflect it.
+        let phys_base = 0x1_0000u64;
         let mut buf = alloc::vec![0u8; 0x1_4000];
         // 4 MiB → two 2 MiB leaves in one PD.
-        let layout = build_identity_npt_2mib(&mut buf, base, 4 * 1024 * 1024).unwrap();
-        assert_eq!(layout.ncr3, base);
+        let layout = build_identity_npt_2mib(&mut buf, phys_base, 4 * 1024 * 1024).unwrap();
+        assert_eq!(layout.ncr3, phys_base);
         assert_eq!(layout.table_count, 3); // PML4 + PDPT + 1 PD
         assert_eq!(layout.bytes, 3 * 4096);
 
-        let pml4 = base;
-        let pdpt = base + 0x1000;
-        let pd = base + 0x2000;
+        // Tables live at buf offsets 0 (PML4), 0x1000 (PDPT), 0x2000 (PD); the
+        // pointers encode phys_base + offset.
         let uwp = flags::PRESENT | flags::WRITABLE | flags::USER;
-        assert_eq!(read_entry(&buf, pml4, 0), (pdpt & ADDR_MASK) | uwp);
-        assert_eq!(read_entry(&buf, pdpt, 0), (pd & ADDR_MASK) | uwp);
-        // Leaves: huge page at 0 and at 2 MiB, USER + WRITABLE set.
-        assert_eq!(read_entry(&buf, pd, 0), uwp | flags::HUGE_PAGE);
-        assert_eq!(read_entry(&buf, pd, 1), HUGE_2MIB | uwp | flags::HUGE_PAGE);
+        assert_eq!(
+            read_entry(&buf, 0, 0),
+            ((phys_base + 0x1000) & ADDR_MASK) | uwp
+        );
+        assert_eq!(
+            read_entry(&buf, 0x1000, 0),
+            ((phys_base + 0x2000) & ADDR_MASK) | uwp
+        );
+        // Leaves identity-map GPA 0 and 2 MiB (independent of phys_base).
+        assert_eq!(read_entry(&buf, 0x2000, 0), uwp | flags::HUGE_PAGE);
+        assert_eq!(
+            read_entry(&buf, 0x2000, 1),
+            HUGE_2MIB | uwp | flags::HUGE_PAGE
+        );
         // PD[2] untouched (not present).
-        assert_eq!(read_entry(&buf, pd, 2) & flags::PRESENT, 0);
+        assert_eq!(read_entry(&buf, 0x2000, 2) & flags::PRESENT, 0);
     }
 
     #[test]
@@ -216,9 +226,9 @@ mod tests {
         let mut buf = alloc::vec![0u8; 0x4000];
         let layout = build_identity_npt_2mib(&mut buf, 0, 1024 * 1024 * 1024).unwrap();
         assert_eq!(layout.table_count, 3);
-        let pd = 0x2000u64;
         let uwp = flags::PRESENT | flags::WRITABLE | flags::USER | flags::HUGE_PAGE;
-        assert_eq!(read_entry(&buf, pd, 511), (511 * HUGE_2MIB) | uwp);
+        // PD at buf offset 0x2000; the last leaf maps 511 * 2 MiB.
+        assert_eq!(read_entry(&buf, 0x2000, 511), (511 * HUGE_2MIB) | uwp);
     }
 
     #[test]
