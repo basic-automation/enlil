@@ -596,6 +596,285 @@ pub const fn msr_exit_is_write(exit_info_1: u64) -> bool {
     exit_info_1 & 1 != 0
 }
 
+// ---------------------------------------------------------------------------
+// VMCB field programming
+// ---------------------------------------------------------------------------
+//
+// The decode layer above reads a VMCB the hardware has written; this half
+// *writes* one, encoding the control and state-save fields a `VMRUN` needs.
+// Everything here operates on a plain VMCB byte region (little-endian, per APM
+// Appendix B) so it stays host-testable — the privileged `VMRUN`/`VMSAVE`/
+// `VMLOAD` ops layer on top and are the only non-testable part.
+
+/// `TLB_CONTROL` value 1: flush the guest's entire TLB on the next `VMRUN`
+/// (APM §15.16.1). Used on a guest's first entry / after an ASID reuse.
+pub const TLB_CONTROL_FLUSH_ALL: u8 = 1;
+
+/// x86 reset value of the PAT MSR, programmed into [`save::G_PAT`] so nested
+/// paging has a valid guest PAT (WB/WT/UC-/UC/WB/WT/UC-/UC across the 8 slots).
+pub const DEFAULT_PAT: u64 = 0x0007_0406_0007_0406;
+
+/// The always-set reserved bit 1 of `RFLAGS` — the minimum legal value.
+pub const RFLAGS_RESERVED_ONE: u64 = 1 << 1;
+
+/// A minimal legal guest `CR0` for a real-mode guest.
+///
+/// `ET` is set (bit 4) with paging and protection off, and `CD`/`NW` both clear
+/// (the `NW=1,CD=0` pairing is a `VMRUN` consistency-check failure, so leave
+/// both clear).
+pub const GUEST_CR0_REAL_MODE: u64 = 1 << 4;
+
+/// A guest segment as stored in a 16-byte VMCB save-area slot (APM Table B-2).
+///
+/// The 16 bytes are selector (`u16`), packed attributes (`u16`), limit
+/// (`u32`), base (`u64`). The attribute field is AMD's *compressed* form of the
+/// segment-descriptor attributes: bits 7:0 are descriptor bits 47:40
+/// (Type/S/DPL/P) and bits 11:8 are descriptor bits 55:52 (AVL/L/D-B/G).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VmcbSegment {
+    /// Segment selector.
+    pub selector: u16,
+    /// Packed segment attributes (12 bits used).
+    pub attrib: u16,
+    /// Segment limit.
+    pub limit: u32,
+    /// Segment base address.
+    pub base: u64,
+}
+
+impl VmcbSegment {
+    /// A real-mode code segment at `base` (present, readable/executable,
+    /// byte-granular, 64 KiB limit) — attributes `0x9B`.
+    #[must_use]
+    pub const fn real_mode_code(base: u64) -> Self {
+        Self {
+            selector: 0,
+            attrib: 0x009B,
+            limit: 0xFFFF,
+            base,
+        }
+    }
+
+    /// A real-mode data segment at `base` (present, read/write, byte-granular,
+    /// 64 KiB limit) — attributes `0x93`.
+    #[must_use]
+    pub const fn real_mode_data(base: u64) -> Self {
+        Self {
+            selector: 0,
+            attrib: 0x0093,
+            limit: 0xFFFF,
+            base,
+        }
+    }
+
+    /// A long-mode (64-bit) code segment — the `L` bit set (attributes
+    /// `0x29B`), base and limit ignored by the CPU in 64-bit mode.
+    #[must_use]
+    pub const fn long_mode_code() -> Self {
+        Self {
+            selector: 0x0008,
+            attrib: 0x029B,
+            limit: 0xFFFF,
+            base: 0,
+        }
+    }
+
+    /// A long-mode data segment (attributes `0x93`).
+    #[must_use]
+    pub const fn long_mode_data() -> Self {
+        Self {
+            selector: 0x0010,
+            attrib: 0x0093,
+            limit: 0xFFFF,
+            base: 0,
+        }
+    }
+}
+
+/// The register state for bringing up a minimal guest that runs until it
+/// executes `HLT` — the second live-boot sub-milestone's target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MinimalGuestSetup {
+    /// Guest ASID (must be nonzero; ASID 0 is the host).
+    pub asid: u32,
+    /// Physical base of the guest's nested page-table root (`nCR3`).
+    pub nested_cr3: u64,
+    /// Initial guest `RIP` (offset within `CS`).
+    pub entry_ip: u64,
+    /// Guest `CS` base — the linear address the first instruction lives at.
+    pub code_base: u64,
+    /// Initial guest `RSP`.
+    pub stack_pointer: u64,
+}
+
+/// Program a zeroed VMCB region to run a minimal real-mode guest until it
+/// executes `HLT` (APM §15.5).
+///
+/// This sets the required `VMRUN` intercept plus `HLT`, `SHUTDOWN`, and `CPUID`
+/// (LOCKED PRINCIPLE 1) intercepts, the ASID and a full-TLB flush, nested
+/// paging pointed at `nested_cr3`, and a flat real-mode state-save area
+/// entering at `entry_ip` within a `code_base`-based `CS`.
+///
+/// The guest `EFER.SVME` bit is set because `VMRUN` fails its consistency check
+/// otherwise (APM §15.5.1). The region is left ready for `VMRUN`; the caller
+/// still allocates the nested page tables and provides their root.
+///
+/// # Errors
+///
+/// Returns [`VmcbRegionError::TooSmall`] if `region` is shorter than a VMCB.
+pub fn program_minimal_hlt_guest(
+    region: &mut [u8],
+    setup: &MinimalGuestSetup,
+) -> Result<(), VmcbRegionError> {
+    if region.len() < VMCB_SIZE {
+        return Err(VmcbRegionError::TooSmall {
+            provided: region.len(),
+            required: VMCB_SIZE,
+        });
+    }
+
+    // Control area.
+    put_u32(
+        region,
+        control::INTERCEPT_MISC1,
+        intercept1::HLT | intercept1::SHUTDOWN | intercept1::CPUID,
+    );
+    put_u32(region, control::INTERCEPT_MISC2, intercept2::VMRUN);
+    put_u32(region, control::GUEST_ASID, setup.asid);
+    put_u8(region, control::TLB_CONTROL, TLB_CONTROL_FLUSH_ALL);
+    put_u64(region, control::NESTED_CTL, control::NESTED_CTL_NP_ENABLE);
+    put_u64(region, control::NESTED_CR3, setup.nested_cr3);
+
+    // State-save area: a flat real-mode guest.
+    put_u64(region, save::G_PAT, DEFAULT_PAT);
+    put_u64(region, save::EFER, EFER_SVME);
+    put_u64(region, save::CR0, GUEST_CR0_REAL_MODE);
+    put_u64(region, save::CR3, 0);
+    put_u64(region, save::CR4, 0);
+    put_u64(region, save::RFLAGS, RFLAGS_RESERVED_ONE);
+    put_u64(region, save::RIP, setup.entry_ip);
+    put_u64(region, save::RSP, setup.stack_pointer);
+
+    write_segment(
+        region,
+        save::CS,
+        VmcbSegment::real_mode_code(setup.code_base),
+    );
+    let data = VmcbSegment::real_mode_data(0);
+    write_segment(region, save::DS, data);
+    write_segment(region, save::ES, data);
+    write_segment(region, save::SS, data);
+    write_segment(region, save::FS, data);
+    write_segment(region, save::GS, data);
+
+    Ok(())
+}
+
+/// Write a [`VmcbSegment`] into the 16-byte save-area slot at `offset` (one of
+/// the [`save`] segment offsets).
+pub fn write_segment(region: &mut [u8], offset: usize, seg: VmcbSegment) {
+    put_u16(region, offset, seg.selector);
+    put_u16(region, offset + 2, seg.attrib);
+    put_u32(region, offset + 4, seg.limit);
+    put_u64(region, offset + 8, seg.base);
+}
+
+/// Read the [`VmcbSegment`] from the save-area slot at `offset`.
+#[must_use]
+pub fn read_segment(region: &[u8], offset: usize) -> VmcbSegment {
+    VmcbSegment {
+        selector: get_u16(region, offset),
+        attrib: get_u16(region, offset + 2),
+        limit: get_u32(region, offset + 4),
+        base: get_u64(region, offset + 8),
+    }
+}
+
+/// The #VMEXIT code the hardware wrote to [`control::EXIT_CODE`].
+#[must_use]
+pub fn exit_code(region: &[u8]) -> SvmExitCode {
+    SvmExitCode::from_raw(get_u64(region, control::EXIT_CODE))
+}
+
+/// The first exit-information field ([`control::EXIT_INFO_1`]).
+#[must_use]
+pub fn exit_info_1(region: &[u8]) -> u64 {
+    get_u64(region, control::EXIT_INFO_1)
+}
+
+/// The second exit-information field ([`control::EXIT_INFO_2`]).
+#[must_use]
+pub fn exit_info_2(region: &[u8]) -> u64 {
+    get_u64(region, control::EXIT_INFO_2)
+}
+
+/// The next-sequential-RIP the hardware saved ([`control::NEXT_RIP`]), valid
+/// when [`SvmFeatures::has_nrip_save`].
+#[must_use]
+pub fn next_rip(region: &[u8]) -> u64 {
+    get_u64(region, control::NEXT_RIP)
+}
+
+/// The guest `RAX` from the save area ([`save::RAX`]).
+#[must_use]
+pub fn guest_rax(region: &[u8]) -> u64 {
+    get_u64(region, save::RAX)
+}
+
+/// The guest `RIP` from the save area ([`save::RIP`]).
+#[must_use]
+pub fn guest_rip(region: &[u8]) -> u64 {
+    get_u64(region, save::RIP)
+}
+
+/// Overwrite the guest `RAX` in the save area (e.g. an emulated `IN` result).
+pub fn set_guest_rax(region: &mut [u8], value: u64) {
+    put_u64(region, save::RAX, value);
+}
+
+/// Overwrite the guest `RIP` in the save area (e.g. to advance past an
+/// emulated instruction using [`next_rip`]).
+pub fn set_guest_rip(region: &mut [u8], value: u64) {
+    put_u64(region, save::RIP, value);
+}
+
+// Little-endian field accessors. The VMCB is always a full page here, so the
+// curated Appendix-B offsets are in bounds.
+
+const fn put_u8(region: &mut [u8], offset: usize, value: u8) {
+    region[offset] = value;
+}
+
+fn put_u16(region: &mut [u8], offset: usize, value: u16) {
+    region[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u32(region: &mut [u8], offset: usize, value: u32) {
+    region[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(region: &mut [u8], offset: usize, value: u64) {
+    region[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn get_u16(region: &[u8], offset: usize) -> u16 {
+    let mut buf = [0u8; 2];
+    buf.copy_from_slice(&region[offset..offset + 2]);
+    u16::from_le_bytes(buf)
+}
+
+fn get_u32(region: &[u8], offset: usize) -> u32 {
+    let mut buf = [0u8; 4];
+    buf.copy_from_slice(&region[offset..offset + 4]);
+    u32::from_le_bytes(buf)
+}
+
+fn get_u64(region: &[u8], offset: usize) -> u64 {
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&region[offset..offset + 8]);
+    u64::from_le_bytes(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -751,5 +1030,112 @@ mod tests {
     fn msr_exit_direction() {
         assert!(!msr_exit_is_write(0));
         assert!(msr_exit_is_write(1));
+    }
+
+    #[test]
+    fn segment_round_trips_through_the_save_area() {
+        let mut region = [0u8; VMCB_SIZE];
+        let cs = VmcbSegment::real_mode_code(0xF_0000);
+        write_segment(&mut region, save::CS, cs);
+        assert_eq!(read_segment(&region, save::CS), cs);
+        // The 16-byte on-disk layout: selector, attrib, limit, base.
+        assert_eq!(get_u16(&region, save::CS), 0);
+        assert_eq!(get_u16(&region, save::CS + 2), 0x009B);
+        assert_eq!(get_u32(&region, save::CS + 4), 0xFFFF);
+        assert_eq!(get_u64(&region, save::CS + 8), 0xF_0000);
+    }
+
+    #[test]
+    fn long_mode_segments_set_the_l_bit() {
+        assert_eq!(VmcbSegment::long_mode_code().attrib, 0x029B);
+        assert_eq!(VmcbSegment::long_mode_data().attrib, 0x0093);
+    }
+
+    #[test]
+    fn minimal_guest_programs_the_expected_fields() {
+        let mut region = [0u8; VMCB_SIZE];
+        let setup = MinimalGuestSetup {
+            asid: 1,
+            nested_cr3: 0x200_0000,
+            entry_ip: 0x7C00,
+            code_base: 0,
+            stack_pointer: 0x8000,
+        };
+        program_minimal_hlt_guest(&mut region, &setup).expect("full page programs");
+
+        // Intercepts: HLT + SHUTDOWN + CPUID in vector 1, VMRUN in vector 2.
+        assert_eq!(
+            get_u32(&region, control::INTERCEPT_MISC1),
+            intercept1::HLT | intercept1::SHUTDOWN | intercept1::CPUID
+        );
+        assert_eq!(
+            get_u32(&region, control::INTERCEPT_MISC2),
+            intercept2::VMRUN
+        );
+
+        // ASID, TLB flush, nested paging.
+        assert_eq!(get_u32(&region, control::GUEST_ASID), 1);
+        assert_eq!(region[control::TLB_CONTROL], TLB_CONTROL_FLUSH_ALL);
+        assert_eq!(
+            get_u64(&region, control::NESTED_CTL),
+            control::NESTED_CTL_NP_ENABLE
+        );
+        assert_eq!(get_u64(&region, control::NESTED_CR3), 0x200_0000);
+
+        // Save area: SVME set, real-mode CR0, entry point, stack.
+        assert_eq!(get_u64(&region, save::EFER), EFER_SVME);
+        assert_eq!(get_u64(&region, save::CR0), GUEST_CR0_REAL_MODE);
+        assert_eq!(get_u64(&region, save::CR3), 0);
+        assert_eq!(get_u64(&region, save::CR4), 0);
+        assert_eq!(get_u64(&region, save::RFLAGS), RFLAGS_RESERVED_ONE);
+        assert_eq!(guest_rip(&region), 0x7C00);
+        assert_eq!(get_u64(&region, save::RSP), 0x8000);
+        assert_eq!(get_u64(&region, save::G_PAT), DEFAULT_PAT);
+
+        // Segments: CS is real-mode code, the rest real-mode data.
+        assert_eq!(
+            read_segment(&region, save::CS),
+            VmcbSegment::real_mode_code(0)
+        );
+        for off in [save::DS, save::ES, save::SS, save::FS, save::GS] {
+            assert_eq!(read_segment(&region, off), VmcbSegment::real_mode_data(0));
+        }
+    }
+
+    #[test]
+    fn minimal_guest_rejects_short_regions() {
+        let mut short = [0u8; 512];
+        let setup = MinimalGuestSetup {
+            asid: 1,
+            nested_cr3: 0,
+            entry_ip: 0,
+            code_base: 0,
+            stack_pointer: 0,
+        };
+        assert_eq!(
+            program_minimal_hlt_guest(&mut short, &setup),
+            Err(VmcbRegionError::TooSmall {
+                provided: 512,
+                required: VMCB_SIZE,
+            })
+        );
+    }
+
+    #[test]
+    fn exit_field_and_rax_rip_accessors() {
+        let mut region = [0u8; VMCB_SIZE];
+        put_u64(&mut region, control::EXIT_CODE, exit_code::HLT);
+        put_u64(&mut region, control::EXIT_INFO_1, 0xAABB);
+        put_u64(&mut region, control::EXIT_INFO_2, 0xCCDD);
+        put_u64(&mut region, control::NEXT_RIP, 0x7C02);
+        assert_eq!(exit_code(&region).raw(), exit_code::HLT);
+        assert_eq!(exit_info_1(&region), 0xAABB);
+        assert_eq!(exit_info_2(&region), 0xCCDD);
+        assert_eq!(next_rip(&region), 0x7C02);
+
+        set_guest_rax(&mut region, 0x1234);
+        set_guest_rip(&mut region, 0x7C02);
+        assert_eq!(guest_rax(&region), 0x1234);
+        assert_eq!(guest_rip(&region), 0x7C02);
     }
 }

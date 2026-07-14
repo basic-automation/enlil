@@ -5,30 +5,19 @@
 //! locked it off (`VM_CR.SVMDIS` + `LOCK`), and `EFER.SVME` has to be set (AMD
 //! APM Vol. 2 §15.4). This module is that gate — the enable *decision* is pure
 //! and host-tested; only the `cpuid`/`rdmsr`/`wrmsr` are firmware-gated. The
-//! full VMCB programming and the `VMRUN` op build on top (the `enlil-hal::svm`
-//! decode layer + region types are the authoritative backend seam).
+//! full VMCB programming and the `VMRUN` op build on top.
+//!
+//! The MSR numbers and `VM_CR`/`EFER` bit predicates come from
+//! [`enlil_hal::svm`] — the authoritative ISA seam (LOCKED PRINCIPLE 2) — so
+//! they are defined once for the whole hypervisor; this module keeps only the
+//! boot-specific enable *policy* ([`SvmStatus`], [`svm_status`]) and the
+//! privileged firmware ops.
 
-/// `CPUID Fn8000_0001` ECX bit 2: SVM is supported.
-pub const CPUID_FN8000_0001_ECX_SVM: u32 = 1 << 2;
-
-/// The `VM_CR` MSR (AMD APM §15.30.1).
-pub const MSR_VM_CR: u32 = 0xC001_0114;
-
-/// `VM_CR.SVMDIS` (bit 4): SVM disabled — `EFER.SVME` writes #GP when set.
-pub const VM_CR_SVMDIS: u64 = 1 << 4;
-
-/// `VM_CR.LOCK` (bit 3): the SVMDIS setting is locked until reset.
-pub const VM_CR_LOCK: u64 = 1 << 3;
-
-/// The extended-feature-enable register MSR.
-pub const MSR_EFER: u32 = 0xC000_0080;
-
-/// `EFER.SVME` (bit 12): the SVM-enable bit `VMRUN` requires.
-pub const EFER_SVME: u64 = 1 << 12;
-
-/// The `VM_HSAVE_PA` MSR: physical base of the 4 KiB host state-save area
-/// `VMRUN` uses (must be programmed before the first `VMRUN`, APM §15.30.4).
-pub const MSR_VM_HSAVE_PA: u32 = 0xC001_0117;
+pub use enlil_hal::svm::{
+    CPUID_FN8000_0001_ECX_SVM, EFER_SVME, MSR_EFER, MSR_VM_CR, MSR_VM_HSAVE_PA, VM_CR_LOCK,
+    VM_CR_SVMDIS,
+};
+use enlil_hal::svm::{vm_cr_svm_disabled, vm_cr_svm_locked};
 
 /// The size/alignment of the host state-save area: one 4 KiB page.
 pub const HSAVE_PAGE_SIZE: usize = 4096;
@@ -61,7 +50,7 @@ pub const fn svm_status(cpuid_fn8000_0001_ecx: u32, vm_cr: u64) -> SvmStatus {
     if cpuid_fn8000_0001_ecx & CPUID_FN8000_0001_ECX_SVM == 0 {
         return SvmStatus::Unsupported;
     }
-    if vm_cr & VM_CR_SVMDIS != 0 && vm_cr & VM_CR_LOCK != 0 {
+    if vm_cr_svm_disabled(vm_cr) && vm_cr_svm_locked(vm_cr) {
         return SvmStatus::DisabledByFirmware;
     }
     SvmStatus::Available
@@ -86,7 +75,7 @@ pub const fn vm_cr_clear_svmdis(vm_cr: u64) -> u64 {
 }
 
 #[cfg(target_os = "uefi")]
-pub use hw::{enable_svm, program_host_save_area};
+pub use hw::{enable_svm, program_boot_vmcb, program_host_save_area, run_boot_guest};
 
 #[cfg(target_os = "uefi")]
 mod hw {
@@ -95,6 +84,9 @@ mod hw {
         is_svm_enabled, is_valid_hsave_pa, svm_status, vm_cr_clear_svmdis,
     };
     use alloc::alloc::{Layout, alloc_zeroed};
+    use enlil_hal::npt::build_identity_npt_2mib;
+    use enlil_hal::region::{PageRegion, Vmcb};
+    use enlil_hal::svm::{MinimalGuestSetup, control, program_minimal_hlt_guest};
 
     /// Read a 64-bit MSR.
     ///
@@ -211,6 +203,122 @@ mod hw {
         // Read back: confirm the MSR accepted the address.
         let readback = unsafe { rdmsr(MSR_VM_HSAVE_PA) };
         if readback == pa { Some(pa) } else { None }
+    }
+
+    /// A 3-page buffer (PML4 + PDPT + one PD) for a ≤ 1 GiB nested identity map.
+    #[repr(C, align(4096))]
+    struct NptBuf([u8; 3 * 4096]);
+
+    /// Identity-map the low gibibyte in the guest NPT — this covers the whole
+    /// boot heap (capped at 64 MiB), where the guest code page lives.
+    const NPT_MAP_BYTES: u64 = 1024 * 1024 * 1024;
+
+    /// Build a complete, `VMRUN`-ready VMCB for a minimal real-mode guest that
+    /// executes a single `HLT`, returning `(vmcb_pa, ncr3, guest_code_pa)`.
+    ///
+    /// Every piece the second live-boot sub-milestone needs is assembled here
+    /// through the `enlil-hal` layer, with the firmware gone: a guest code page
+    /// holding a `HLT` (`0xF4`), a nested page table identity-mapping the low
+    /// gibibyte (so the guest's `GPA == SPA`), and a [`Vmcb`] programmed via
+    /// [`program_minimal_hlt_guest`] to enter that code under that NPT. The
+    /// programmed nested-CR3 is read straight back out of the VMCB to prove the
+    /// write landed. All three allocations are leaked — they must outlive this
+    /// call for the eventual `VMRUN`. Returns `None` if any allocation fails or
+    /// the NPT/VMCB is malformed (none can happen here). The `VMRUN` op that
+    /// actually runs this guest to `#VMEXIT(HLT)` is the next slice.
+    #[must_use]
+    pub fn program_boot_vmcb() -> Option<(u64, u64, u64)> {
+        // Guest code page: a single `HLT` so the guest #VMEXITs immediately.
+        let mut code = PageRegion::new()?;
+        code.as_bytes_mut()[0] = 0xF4; // HLT
+        let guest_code_pa = code.base_addr();
+        core::mem::forget(code); // the guest's RAM must persist
+
+        // Nested page tables identity-mapping the low GiB (GPA == SPA).
+        // SAFETY: NptBuf has a nonzero size; alloc_zeroed yields a zeroed,
+        // 4 KiB-aligned NptBuf-sized block or null.
+        let npt_raw = unsafe { alloc_zeroed(Layout::new::<NptBuf>()) };
+        if npt_raw.is_null() {
+            return None;
+        }
+        let npt_pa = npt_raw as u64;
+        // SAFETY: npt_raw points at a live, zeroed, exclusively-owned NptBuf;
+        // it is leaked below so the slice never outlives the allocation.
+        let npt_buf = unsafe { core::slice::from_raw_parts_mut(npt_raw, 3 * 4096) };
+        let ncr3 = build_identity_npt_2mib(npt_buf, npt_pa, NPT_MAP_BYTES)
+            .ok()?
+            .ncr3;
+
+        // Program a VMCB to enter the guest code under that NPT.
+        let mut vmcb = Vmcb::new().ok()?;
+        let setup = MinimalGuestSetup {
+            asid: 1,
+            nested_cr3: ncr3,
+            entry_ip: 0,
+            code_base: guest_code_pa,
+            stack_pointer: 0,
+        };
+        program_minimal_hlt_guest(vmcb.as_bytes_mut(), &setup).ok()?;
+        // Read the nested-CR3 back to confirm the programming landed.
+        let mut ncr3_le = [0u8; 8];
+        ncr3_le.copy_from_slice(&vmcb.as_bytes()[control::NESTED_CR3..control::NESTED_CR3 + 8]);
+        if u64::from_le_bytes(ncr3_le) != ncr3 {
+            return None;
+        }
+        let vmcb_pa = vmcb.base_addr();
+        core::mem::forget(vmcb); // the VMCB must outlive this call for VMRUN
+        Some((vmcb_pa, ncr3, guest_code_pa))
+    }
+
+    /// Run the guest whose VMCB is at `vmcb_pa` with `VMRUN`, returning the
+    /// `#VMEXIT` code the CPU writes back into the VMCB control area
+    /// ([`control::EXIT_CODE`]).
+    ///
+    /// This is the second live-boot sub-milestone's instruction: `clgi` clears
+    /// the global interrupt flag so no host interrupt disturbs the transition,
+    /// `vmrun rax` enters the guest (RAX holds the VMCB physical address) and
+    /// returns here on the guest's `#VMEXIT`, and `stgi` restores the flag. For
+    /// the minimal `HLT` guest the very first instruction is intercepted, so no
+    /// guest code modifies host state; the volatile GPRs are still marked
+    /// clobbered defensively (VMRUN does not save them). The exit code is then
+    /// read straight out of the (identity-mapped) VMCB.
+    ///
+    /// # Safety
+    ///
+    /// `vmcb_pa` must be a `VMRUN`-ready VMCB (from [`program_boot_vmcb`]) with
+    /// SVM enabled ([`enable_svm`]) and `VM_HSAVE_PA` programmed
+    /// ([`program_host_save_area`]).
+    #[must_use]
+    pub unsafe fn run_boot_guest(vmcb_pa: u64) -> u64 {
+        unsafe {
+            core::arch::asm!(
+                // rbx/rbp are reserved by LLVM and cannot be clobber operands,
+                // so preserve rbx across the guest by hand (rbp is untouched by
+                // the HLT guest). The guest runs on its own VMCB RSP, so the
+                // host stack — and this saved rbx — survive the transition.
+                "push rbx",
+                "clgi",
+                "vmrun rax",
+                "stgi",
+                "pop rbx",
+                inout("rax") vmcb_pa => _,
+                out("rcx") _,
+                out("rdx") _,
+                out("rsi") _,
+                out("rdi") _,
+                out("r8") _,
+                out("r9") _,
+                out("r10") _,
+                out("r11") _,
+                out("r12") _,
+                out("r13") _,
+                out("r14") _,
+                out("r15") _,
+            );
+            // The CPU wrote the #VMEXIT reason into the VMCB control area.
+            let exit_code_ptr = (vmcb_pa + control::EXIT_CODE as u64) as *const u64;
+            core::ptr::read_volatile(exit_code_ptr)
+        }
     }
 }
 

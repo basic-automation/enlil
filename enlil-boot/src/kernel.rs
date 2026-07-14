@@ -261,6 +261,43 @@ mod hw {
                     }
                     None => serial.write_str("enlil kernel: svm: host-save area FAILED\n"),
                 }
+                // Assemble a full VMRUN-ready guest (code page + NPT + VMCB)
+                // through the enlil-hal layer — everything VMRUN takes but the
+                // instruction itself.
+                match crate::svm::program_boot_vmcb() {
+                    Some((vmcb, ncr3, entry)) => {
+                        let mut a = [0u8; 18];
+                        let mut b = [0u8; 18];
+                        let mut c = [0u8; 18];
+                        serial.write_str("enlil kernel: svm: vmcb VMRUN-ready (nCR3 ");
+                        serial.write_str(format_u64_hex(ncr3, &mut a));
+                        serial.write_str(", guest hlt at ");
+                        serial.write_str(format_u64_hex(entry, &mut b));
+                        serial.write_str(", vmcb ");
+                        serial.write_str(format_u64_hex(vmcb, &mut c));
+                        serial.write_str(")\n");
+                        // Run the guest with VMRUN — the second live-boot
+                        // sub-milestone — and route its exit through the HAL's
+                        // arch-neutral VmExit model (LOCKED PRINCIPLE 2).
+                        // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and
+                        // `vmcb` is a VMRUN-ready VMCB from program_boot_vmcb.
+                        let exit = unsafe { crate::svm::run_boot_guest(vmcb) };
+                        let decoded = enlil_hal::svm::simple_svm_exit_to_vmexit(
+                            enlil_hal::svm::SvmExitCode::from_raw(exit),
+                        );
+                        if matches!(decoded, Some(enlil_hal::VmExit::Hlt)) {
+                            serial.write_str(
+                                "enlil kernel: svm: guest #VMEXIT HLT (VmExit::Hlt) — VMRUN runs a guest\n",
+                            );
+                        } else {
+                            let mut e = [0u8; 18];
+                            serial.write_str("enlil kernel: svm: guest #VMEXIT code ");
+                            serial.write_str(format_u64_hex(exit, &mut e));
+                            serial.write_str("\n");
+                        }
+                    }
+                    None => serial.write_str("enlil kernel: svm: vmcb VMRUN-ready FAILED\n"),
+                }
             }
             SvmStatus::Unsupported => serial.write_str("enlil kernel: svm: not supported by CPU\n"),
             SvmStatus::DisabledByFirmware => {

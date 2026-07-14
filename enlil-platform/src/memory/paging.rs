@@ -180,6 +180,59 @@ pub fn build_identity_map_2mib(
     bytes_to_map: u64,
     leaf_flags: u64,
 ) -> Result<PageTableLayout, PagingError> {
+    build_identity_map_2mib_with(
+        mem,
+        tables_base_gpa,
+        bytes_to_map,
+        leaf_flags,
+        flags::PRESENT | flags::WRITABLE,
+    )
+}
+
+/// Build a 2 MiB-huge-page identity map suitable for use as an AMD **nested
+/// page table** (NPT) root — the `nCR3` a `VMRUN` guest translates its
+/// guest-physical addresses through (APM §15.25).
+///
+/// NPT entries use the ordinary long-mode page-table format, so this is
+/// [`build_identity_map_2mib`] with the `USER` bit forced on at **every** level
+/// (leaf *and* intermediate pointers): the nested walk is privilege-checked, so
+/// a `U/S = 0` entry anywhere on the path would fault a guest user-mode (CPL 3)
+/// access. `WRITABLE` is likewise forced on so guests can write their own RAM;
+/// pass `flags::NO_CACHE` in `extra_leaf_flags` for an MMIO-backed range.
+///
+/// Returns a [`PageTableLayout`] whose `cr3` is the value to program into the
+/// VMCB's `NESTED_CR3` ([`svm::control::NESTED_CR3`] in `enlil-hal`).
+///
+/// # Errors
+///
+/// Identical to [`build_identity_map_2mib`].
+pub fn build_npt_identity_map_2mib(
+    mem: &mut [u8],
+    tables_base_gpa: u64,
+    bytes_to_map: u64,
+    extra_leaf_flags: u64,
+) -> Result<PageTableLayout, PagingError> {
+    let user_rw = flags::PRESENT | flags::WRITABLE | flags::USER;
+    build_identity_map_2mib_with(
+        mem,
+        tables_base_gpa,
+        bytes_to_map,
+        extra_leaf_flags | flags::WRITABLE | flags::USER,
+        user_rw,
+    )
+}
+
+/// Shared core of the 2 MiB identity-map builders: lays out PML4 → PDPT → PDs
+/// with `table_flags` on the intermediate pointers and `leaf_flags` (plus
+/// `PRESENT`) on the 2 MiB leaves. The host/EPT builder passes
+/// `PRESENT | WRITABLE`; the NPT builder additionally sets `USER`.
+fn build_identity_map_2mib_with(
+    mem: &mut [u8],
+    tables_base_gpa: u64,
+    bytes_to_map: u64,
+    leaf_flags: u64,
+    table_flags: u64,
+) -> Result<PageTableLayout, PagingError> {
     if bytes_to_map == 0 {
         return Err(PagingError::EmptyRegion);
     }
@@ -203,7 +256,6 @@ pub fn build_identity_map_2mib(
     // Unmapped entries must read back not-present.
     mem[base..end].fill(0);
 
-    let table_flags = flags::PRESENT | flags::WRITABLE;
     let pdpt_gpa = tables_base_gpa + PAGE_SIZE;
     let first_pd_gpa = tables_base_gpa + 2 * PAGE_SIZE;
     let pdpt_off = base + PAGE_BYTES;
@@ -604,6 +656,59 @@ mod tests {
         );
         // PD[2] is untouched (not present).
         assert_eq!(read_entry(&mem, pd, 2) & flags::PRESENT, 0);
+    }
+
+    #[test]
+    fn npt_identity_map_sets_user_on_every_level() {
+        let base = 0x1_0000u64;
+        let mut mem = vec![0u8; 0x1_4000];
+        // 4 MiB of guest RAM → PML4 + PDPT + one PD, as the 2 MiB builder.
+        let layout = build_npt_identity_map_2mib(&mut mem, base, 4 * 1024 * 1024, 0).unwrap();
+        assert_eq!(layout.cr3, base); // → VMCB NESTED_CR3
+        assert_eq!(layout.table_count, 3);
+
+        let pml4 = base;
+        let pdpt = base + 0x1000;
+        let pd = base + 0x2000;
+        // Every intermediate pointer must carry USER, or a guest CPL-3 nested
+        // walk would fault before reaching the leaf.
+        assert_eq!(
+            read_entry(&mem, pml4, 0),
+            (pdpt & TABLE_ADDR_MASK) | flags::PRESENT | flags::WRITABLE | flags::USER
+        );
+        assert_eq!(
+            read_entry(&mem, pdpt, 0),
+            (pd & TABLE_ADDR_MASK) | flags::PRESENT | flags::WRITABLE | flags::USER
+        );
+        // Leaves carry USER + WRITABLE too.
+        assert_eq!(
+            read_entry(&mem, pd, 0),
+            flags::HUGE_PAGE | flags::PRESENT | flags::WRITABLE | flags::USER
+        );
+        assert_eq!(
+            read_entry(&mem, pd, 1),
+            HUGE_2MIB | flags::HUGE_PAGE | flags::PRESENT | flags::WRITABLE | flags::USER
+        );
+    }
+
+    #[test]
+    fn npt_identity_map_honors_extra_leaf_flags_and_rejects_bad_input() {
+        // NO_CACHE reaches the leaves (an MMIO-backed nested range) but never
+        // the intermediate pointers.
+        let mut mem = vec![0u8; 0x3000];
+        build_npt_identity_map_2mib(&mut mem, 0, HUGE_2MIB, flags::NO_CACHE).unwrap();
+        let pd = 0x2000u64;
+        assert_ne!(read_entry(&mem, pd, 0) & flags::NO_CACHE, 0);
+        assert_eq!(read_entry(&mem, 0, 0) & flags::NO_CACHE, 0);
+        // Same validation as the host builder.
+        assert_eq!(
+            build_npt_identity_map_2mib(&mut mem, 0, 0, 0),
+            Err(PagingError::EmptyRegion)
+        );
+        assert_eq!(
+            build_npt_identity_map_2mib(&mut mem, 0x800, HUGE_2MIB, 0),
+            Err(PagingError::UnalignedBase)
+        );
     }
 
     #[test]
