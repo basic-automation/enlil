@@ -276,6 +276,21 @@ mod hw {
                         serial.write_str(", vmcb ");
                         serial.write_str(format_u64_hex(vmcb, &mut c));
                         serial.write_str(")\n");
+                        // Run the guest with VMRUN — the second live-boot
+                        // sub-milestone.
+                        // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and
+                        // `vmcb` is a VMRUN-ready VMCB from program_boot_vmcb.
+                        let exit = unsafe { crate::svm::run_boot_guest(vmcb) };
+                        if exit == enlil_hal::svm::exit_code::HLT {
+                            serial.write_str(
+                                "enlil kernel: svm: guest #VMEXIT HLT — VMRUN runs a guest\n",
+                            );
+                        } else {
+                            let mut e = [0u8; 18];
+                            serial.write_str("enlil kernel: svm: guest #VMEXIT code ");
+                            serial.write_str(format_u64_hex(exit, &mut e));
+                            serial.write_str("\n");
+                        }
                     }
                     None => serial.write_str("enlil kernel: svm: vmcb VMRUN-ready FAILED\n"),
                 }

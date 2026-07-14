@@ -75,7 +75,7 @@ pub const fn vm_cr_clear_svmdis(vm_cr: u64) -> u64 {
 }
 
 #[cfg(target_os = "uefi")]
-pub use hw::{enable_svm, program_boot_vmcb, program_host_save_area};
+pub use hw::{enable_svm, program_boot_vmcb, program_host_save_area, run_boot_guest};
 
 #[cfg(target_os = "uefi")]
 mod hw {
@@ -268,6 +268,57 @@ mod hw {
         let vmcb_pa = vmcb.base_addr();
         core::mem::forget(vmcb); // the VMCB must outlive this call for VMRUN
         Some((vmcb_pa, ncr3, guest_code_pa))
+    }
+
+    /// Run the guest whose VMCB is at `vmcb_pa` with `VMRUN`, returning the
+    /// `#VMEXIT` code the CPU writes back into the VMCB control area
+    /// ([`control::EXIT_CODE`]).
+    ///
+    /// This is the second live-boot sub-milestone's instruction: `clgi` clears
+    /// the global interrupt flag so no host interrupt disturbs the transition,
+    /// `vmrun rax` enters the guest (RAX holds the VMCB physical address) and
+    /// returns here on the guest's `#VMEXIT`, and `stgi` restores the flag. For
+    /// the minimal `HLT` guest the very first instruction is intercepted, so no
+    /// guest code modifies host state; the volatile GPRs are still marked
+    /// clobbered defensively (VMRUN does not save them). The exit code is then
+    /// read straight out of the (identity-mapped) VMCB.
+    ///
+    /// # Safety
+    ///
+    /// `vmcb_pa` must be a `VMRUN`-ready VMCB (from [`program_boot_vmcb`]) with
+    /// SVM enabled ([`enable_svm`]) and `VM_HSAVE_PA` programmed
+    /// ([`program_host_save_area`]).
+    #[must_use]
+    pub unsafe fn run_boot_guest(vmcb_pa: u64) -> u64 {
+        unsafe {
+            core::arch::asm!(
+                // rbx/rbp are reserved by LLVM and cannot be clobber operands,
+                // so preserve rbx across the guest by hand (rbp is untouched by
+                // the HLT guest). The guest runs on its own VMCB RSP, so the
+                // host stack — and this saved rbx — survive the transition.
+                "push rbx",
+                "clgi",
+                "vmrun rax",
+                "stgi",
+                "pop rbx",
+                inout("rax") vmcb_pa => _,
+                out("rcx") _,
+                out("rdx") _,
+                out("rsi") _,
+                out("rdi") _,
+                out("r8") _,
+                out("r9") _,
+                out("r10") _,
+                out("r11") _,
+                out("r12") _,
+                out("r13") _,
+                out("r14") _,
+                out("r15") _,
+            );
+            // The CPU wrote the #VMEXIT reason into the VMCB control area.
+            let exit_code_ptr = (vmcb_pa + control::EXIT_CODE as u64) as *const u64;
+            core::ptr::read_volatile(exit_code_ptr)
+        }
     }
 }
 
