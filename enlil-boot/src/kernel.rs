@@ -277,13 +277,17 @@ mod hw {
                         serial.write_str(format_u64_hex(vmcb, &mut c));
                         serial.write_str(")\n");
                         // Run the guest with VMRUN — the second live-boot
-                        // sub-milestone.
+                        // sub-milestone — and route its exit through the HAL's
+                        // arch-neutral VmExit model (LOCKED PRINCIPLE 2).
                         // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and
                         // `vmcb` is a VMRUN-ready VMCB from program_boot_vmcb.
                         let exit = unsafe { crate::svm::run_boot_guest(vmcb) };
-                        if exit == enlil_hal::svm::exit_code::HLT {
+                        let decoded = enlil_hal::svm::simple_svm_exit_to_vmexit(
+                            enlil_hal::svm::SvmExitCode::from_raw(exit),
+                        );
+                        if matches!(decoded, Some(enlil_hal::VmExit::Hlt)) {
                             serial.write_str(
-                                "enlil kernel: svm: guest #VMEXIT HLT — VMRUN runs a guest\n",
+                                "enlil kernel: svm: guest #VMEXIT HLT (VmExit::Hlt) — VMRUN runs a guest\n",
                             );
                         } else {
                             let mut e = [0u8; 18];
