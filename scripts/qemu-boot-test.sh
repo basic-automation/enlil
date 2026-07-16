@@ -75,6 +75,10 @@ STEALTH_LINE="CPUID stealth verified in-guest"
 # intercepted MSR (enlil injects a sentinel, delivered via the GPR shell) and
 # OUTs its low byte, which matches the sentinel — proving MSR exit emulation.
 MSR_LINE="MSR exit emulated"
+# Printed once the guest WRMSRs a value then RDMSRs it back: enlil shadows the
+# write (never touching hardware) and returns it, proving per-guest MSR-state
+# virtualization.
+MSRW_LINE="MSR write virtualized"
 # Printed once the guest reads an unmapped GPA, enlil catches the nested page
 # fault, demand-maps a page with a sentinel, and resumes — the guest reads the
 # sentinel back, proving NPF handling (the basis for demand paging / MMIO).
@@ -216,11 +220,12 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$CPUID_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$STEALTH_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$MSR_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$MSRW_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$NPF_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, IDT, x2APIC, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR emulation + NPF demand-paging, and GOP draw observed on serial"
+    echo "PASS: banner, kernel memory, heap, IDT, x2APIC, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging, and GOP draw observed on serial"
     exit 0
 fi
 
-echo "FAIL: not all of banner/kernel-line/heap/idt/apic/svm/hsave/vmcb/vmrun/dispatch/ioio/cpuid/stealth/msr/npf/gop observed (qemu rc=$QEMU_RC)"
+echo "FAIL: not all of banner/kernel-line/heap/idt/apic/svm/hsave/vmcb/vmrun/dispatch/ioio/cpuid/stealth/msr/msrw/npf/gop observed (qemu rc=$QEMU_RC)"
 exit 1

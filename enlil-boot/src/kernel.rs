@@ -304,8 +304,8 @@ mod hw {
     /// substrings the QEMU+OVMF harness asserts nightly.
     fn report_guest_run(serial: &SerialPort, run: &crate::svm::GuestRunOutcome) {
         use crate::svm::{
-            GUEST_HV_BIT_PORT, GUEST_IO_PORT, GUEST_MSR_PORT, GUEST_MSR_SENTINEL, GUEST_NPF_PORT,
-            GUEST_NPF_SENTINEL, RunStop,
+            GUEST_HV_BIT_PORT, GUEST_IO_PORT, GUEST_MSR_PORT, GUEST_MSR_SENTINEL, GUEST_MSR_W_PORT,
+            GUEST_MSR_W_VALUE, GUEST_NPF_PORT, GUEST_NPF_SENTINEL, RunStop,
         };
         let mut vr = [0u8; 20];
         let mut cp = [0u8; 20];
@@ -356,6 +356,16 @@ mod hw {
                 {
                     serial.write_str(
                         "enlil kernel: svm: guest RDMSR answered by enlil (sentinel via GPR shell) — MSR exit emulated\n",
+                    );
+                }
+                // The guest WRMSR'd a value then RDMSR'd it back; enlil shadowed
+                // the write (never reaching hardware) and returned it — a match
+                // proves per-guest MSR-state virtualization.
+                if let Some(out) = run.io_out_to(u16::from(GUEST_MSR_W_PORT))
+                    && out == u32::from(GUEST_MSR_W_VALUE)
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: guest WRMSR shadowed + read back by enlil — MSR write virtualized\n",
                     );
                 }
                 // The guest read an unmapped GPA; enlil caught the NPF,

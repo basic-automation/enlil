@@ -112,6 +112,78 @@ pub const GUEST_MSR_NUMBER: u32 = 0x10;
 /// and the spoofed value reached the guest.
 pub const GUEST_MSR_SENTINEL: u32 = 0x5A;
 
+/// The MSR the boot guest writes then reads back to prove WRMSR/RDMSR state
+/// virtualization. enlil intercepts both and shadows the written value.
+pub const GUEST_MSR_W_NUMBER: u32 = 0x11;
+
+/// The port the boot guest writes the value it read back from
+/// [`GUEST_MSR_W_NUMBER`] to.
+pub const GUEST_MSR_W_PORT: u8 = 0x84;
+
+/// The `EAX` the boot guest writes to [`GUEST_MSR_W_NUMBER`]; reading it back
+/// through enlil's shadow must return the same value.
+pub const GUEST_MSR_W_VALUE: u8 = 0x99;
+
+/// A small per-guest shadow of MSRs the guest has written with `WRMSR`.
+///
+/// A later `RDMSR` reads back what the guest wrote — MSR-state virtualization
+/// (the guest owns its MSR view; the write never reaches host hardware).
+#[derive(Debug, Clone, Copy)]
+pub struct MsrShadow {
+    entries: [(u32, u64); Self::CAP],
+    count: usize,
+}
+
+impl MsrShadow {
+    /// How many distinct MSRs the shadow holds (a bring-up guest writes few).
+    pub const CAP: usize = 4;
+
+    /// An empty shadow.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            entries: [(0, 0); Self::CAP],
+            count: 0,
+        }
+    }
+
+    /// Store `value` for `msr` (updating an existing entry, else appending;
+    /// dropped silently past [`CAP`](Self::CAP)).
+    pub const fn set(&mut self, msr: u32, value: u64) {
+        let mut i = 0;
+        while i < self.count {
+            if self.entries[i].0 == msr {
+                self.entries[i].1 = value;
+                return;
+            }
+            i += 1;
+        }
+        if self.count < Self::CAP {
+            self.entries[self.count] = (msr, value);
+            self.count += 1;
+        }
+    }
+
+    /// The shadowed value of `msr`, if the guest has written it.
+    #[must_use]
+    pub const fn get(&self, msr: u32) -> Option<u64> {
+        let mut i = 0;
+        while i < self.count {
+            if self.entries[i].0 == msr {
+                return Some(self.entries[i].1);
+            }
+            i += 1;
+        }
+        None
+    }
+}
+
+impl Default for MsrShadow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The stealth value enlil returns for a guest `RDMSR` of `msr`, or `None` to
 /// pass the real MSR through.
 ///
@@ -268,7 +340,7 @@ pub struct GuestRunOutcome {
 
 impl GuestRunOutcome {
     /// Cap on recorded port writes (a bring-up guest does only a handful).
-    pub const MAX_IO_OUTS: usize = 4;
+    pub const MAX_IO_OUTS: usize = 8;
 
     /// A fresh outcome before the first `VMRUN`.
     ///
@@ -504,6 +576,66 @@ mod hw {
     /// Size of the guest's isolated RAM window (2 MiB).
     const GUEST_RAM_BYTES: usize = 2 * 1024 * 1024;
 
+    /// Write the real-mode guest program into `bytes` at offset 0 (see the
+    /// [`program_boot_vmcb`] instruction listing).
+    const fn write_guest_program(bytes: &mut [u8]) {
+        let msr = GUEST_MSR_NUMBER.to_le_bytes();
+        let msr_w = super::GUEST_MSR_W_NUMBER.to_le_bytes();
+        bytes[0] = 0xB8; // mov ax, 0
+        bytes[1] = 0x00;
+        bytes[2] = 0x00;
+        bytes[3] = 0x0F; // CPUID (leaf 0)
+        bytes[4] = 0xA2;
+        bytes[5] = 0x89; // mov ax, bx
+        bytes[6] = 0xD8;
+        bytes[7] = 0xE6; // OUT imm8, AL
+        bytes[8] = GUEST_IO_PORT;
+        bytes[9] = 0xB8; // mov ax, 1
+        bytes[10] = 0x01;
+        bytes[11] = 0x00;
+        bytes[12] = 0x0F; // CPUID (leaf 1)
+        bytes[13] = 0xA2;
+        bytes[14] = 0x66; // shr ecx, 31
+        bytes[15] = 0xC1;
+        bytes[16] = 0xE9;
+        bytes[17] = 0x1F;
+        bytes[18] = 0x89; // mov ax, cx
+        bytes[19] = 0xC8;
+        bytes[20] = 0xE6; // OUT imm8, AL
+        bytes[21] = super::GUEST_HV_BIT_PORT;
+        bytes[22] = 0x66; // mov ecx, imm32 (read-target MSR)
+        bytes[23] = 0xB9;
+        bytes[24] = msr[0];
+        bytes[25] = msr[1];
+        bytes[26] = msr[2];
+        bytes[27] = msr[3];
+        bytes[28] = 0x0F; // RDMSR
+        bytes[29] = 0x32;
+        bytes[30] = 0xE6; // OUT imm8, AL
+        bytes[31] = super::GUEST_MSR_PORT;
+        bytes[32] = 0x66; // mov ecx, imm32 (write-target MSR)
+        bytes[33] = 0xB9;
+        bytes[34] = msr_w[0];
+        bytes[35] = msr_w[1];
+        bytes[36] = msr_w[2];
+        bytes[37] = msr_w[3];
+        bytes[38] = 0xB8; // mov ax, VALUE (EAX low; EDX still 0 from rdmsr)
+        bytes[39] = super::GUEST_MSR_W_VALUE;
+        bytes[40] = 0x00;
+        bytes[41] = 0x0F; // WRMSR (intercepted → shadowed, never hits HW)
+        bytes[42] = 0x30;
+        bytes[43] = 0x0F; // RDMSR (ECX still the write-target → shadow value)
+        bytes[44] = 0x32;
+        bytes[45] = 0xE6; // OUT imm8, AL
+        bytes[46] = super::GUEST_MSR_W_PORT;
+        bytes[47] = 0xA1; // mov ax, [0]  (DS:0 → GPA 2 MiB, NPF)
+        bytes[48] = 0x00;
+        bytes[49] = 0x00;
+        bytes[50] = 0xE6; // OUT imm8, AL
+        bytes[51] = super::GUEST_NPF_PORT;
+        bytes[52] = 0xF4; // HLT
+    }
+
     /// Build a complete, `VMRUN`-ready VMCB for a minimal real-mode guest that
     /// exercises the exit-handling path, returning `(vmcb_pa, ncr3,
     /// guest_code_pa)`.
@@ -544,6 +676,11 @@ mod hw {
         //   mov ecx, 0x10    66 B9 10 00 00 00  (ECX = MSR number, full 32-bit)
         //   rdmsr            0F 32           (intercepted → sentinel injected)
         //   out 0x81, al     E6 81           (IOIO → captured at port 0x81)
+        //   mov ecx, 0x11    66 B9 11 00 00 00  (ECX = write-target MSR)
+        //   mov ax, 0x99     B8 99 00        (EAX = value; EDX still 0)
+        //   wrmsr            0F 30           (intercepted → shadowed, not to HW)
+        //   rdmsr            0F 32           (intercepted → reads the shadow back)
+        //   out 0x84, al     E6 84           (IOIO → the shadowed value)
         //   mov ax, [0]      A1 00 00        (DS:0 = GPA 2 MiB → NPF, demand-mapped)
         //   out 0x83, al     E6 83           (IOIO → the demand-paged sentinel)
         //   hlt              F4              (clean stop)
@@ -554,49 +691,8 @@ mod hw {
             return None;
         }
         let guest_spa = ram_raw as u64;
-        {
-            let msr = GUEST_MSR_NUMBER.to_le_bytes();
-            // SAFETY: ram_raw owns GUEST_RAM_BYTES writable bytes (leaked below).
-            let bytes = unsafe { core::slice::from_raw_parts_mut(ram_raw, GUEST_RAM_BYTES) };
-            bytes[0] = 0xB8; // mov ax, 0
-            bytes[1] = 0x00;
-            bytes[2] = 0x00;
-            bytes[3] = 0x0F; // CPUID (leaf 0)
-            bytes[4] = 0xA2;
-            bytes[5] = 0x89; // mov ax, bx
-            bytes[6] = 0xD8;
-            bytes[7] = 0xE6; // OUT imm8, AL
-            bytes[8] = GUEST_IO_PORT;
-            bytes[9] = 0xB8; // mov ax, 1
-            bytes[10] = 0x01;
-            bytes[11] = 0x00;
-            bytes[12] = 0x0F; // CPUID (leaf 1)
-            bytes[13] = 0xA2;
-            bytes[14] = 0x66; // shr ecx, 31
-            bytes[15] = 0xC1;
-            bytes[16] = 0xE9;
-            bytes[17] = 0x1F;
-            bytes[18] = 0x89; // mov ax, cx
-            bytes[19] = 0xC8;
-            bytes[20] = 0xE6; // OUT imm8, AL
-            bytes[21] = super::GUEST_HV_BIT_PORT;
-            bytes[22] = 0x66; // operand-size prefix (32-bit ECX)
-            bytes[23] = 0xB9; // mov ecx, imm32
-            bytes[24] = msr[0];
-            bytes[25] = msr[1];
-            bytes[26] = msr[2];
-            bytes[27] = msr[3];
-            bytes[28] = 0x0F; // RDMSR
-            bytes[29] = 0x32;
-            bytes[30] = 0xE6; // OUT imm8, AL
-            bytes[31] = super::GUEST_MSR_PORT;
-            bytes[32] = 0xA1; // mov ax, [0]  (DS:0 → GPA 2 MiB, NPF)
-            bytes[33] = 0x00;
-            bytes[34] = 0x00;
-            bytes[35] = 0xE6; // OUT imm8, AL
-            bytes[36] = super::GUEST_NPF_PORT;
-            bytes[37] = 0xF4; // HLT
-        }
+        // SAFETY: ram_raw owns GUEST_RAM_BYTES writable bytes (leaked below).
+        write_guest_program(unsafe { core::slice::from_raw_parts_mut(ram_raw, GUEST_RAM_BYTES) });
         // The guest's own view of its code: GPA 0.
         let guest_code_gpa = 0u64;
 
@@ -655,6 +751,9 @@ mod hw {
         // outlive VMRUN.
         let mut msrpm = MsrPermissionsMap::new().ok()?;
         msrpm.set_intercept(GUEST_MSR_NUMBER, true, false);
+        // Intercept both read and write of the write-target MSR so its WRMSR is
+        // shadowed (never reaches hardware) and its RDMSR reads the shadow.
+        msrpm.set_intercept(super::GUEST_MSR_W_NUMBER, true, true);
         enable_msr_intercept(vmcb.as_bytes_mut(), msrpm.base_addr());
         core::mem::forget(msrpm);
 
@@ -748,6 +847,53 @@ mod hw {
         }
     }
 
+    /// Emulate an intercepted guest `CPUID` (LOCKED PRINCIPLE 1).
+    ///
+    /// Runs the host `CPUID` for the guest's leaf (guest `EAX`) and subleaf
+    /// (shell-carried `gprs.rcx`), stealths it ([`sanitize_cpuid`]), and delivers
+    /// the result — `EAX` via the VMCB, `EBX`/`ECX`/`EDX` via the GPR shell.
+    /// Returns the emulated `EBX` when the leaf was 0 (for the caller's vendor
+    /// proof), else `None`.
+    fn emulate_cpuid(vmcb: &mut [u8], gprs: &mut super::GuestGprs) -> Option<u32> {
+        use enlil_hal::svm::{guest_rax, set_guest_rax};
+
+        let leaf = u32::try_from(guest_rax(vmcb) & 0xFFFF_FFFF).unwrap_or(0);
+        let subleaf = u32::try_from(gprs.rcx & 0xFFFF_FFFF).unwrap_or(0);
+        let regs = super::sanitize_cpuid(leaf, host_cpuid(leaf, subleaf));
+        set_guest_rax(vmcb, u64::from(regs.eax));
+        gprs.rbx = u64::from(regs.ebx);
+        gprs.rcx = u64::from(regs.ecx);
+        gprs.rdx = u64::from(regs.edx);
+        if leaf == 0 { Some(regs.ebx) } else { None }
+    }
+
+    /// Emulate an intercepted guest `RDMSR`/`WRMSR` (LOCKED PRINCIPLE 1).
+    ///
+    /// The MSR number is in the guest `ECX` (shell-carried `gprs.rcx`) and the
+    /// direction in `EXITINFO1`. A `WRMSR` is shadowed per-guest and never
+    /// reaches host hardware; a `RDMSR` returns the shadowed value if the guest
+    /// has written one, else enlil's stealth value ([`stealth_msr_read`]), else
+    /// nothing — delivered `EAX` via the VMCB, `EDX` via the shell.
+    fn emulate_msr(vmcb: &mut [u8], gprs: &mut super::GuestGprs, shadow: &mut super::MsrShadow) {
+        use enlil_hal::svm::{exit_info_1, guest_rax, msr_exit_is_write, set_guest_rax};
+
+        let msr = u32::try_from(gprs.rcx & 0xFFFF_FFFF).unwrap_or(0);
+        if msr_exit_is_write(exit_info_1(vmcb)) {
+            let eax = guest_rax(vmcb) & 0xFFFF_FFFF;
+            let edx = gprs.rdx & 0xFFFF_FFFF;
+            shadow.set(msr, (edx << 32) | eax);
+            return;
+        }
+        // RDMSR: shadow first (what the guest wrote), else the stealth value.
+        let value = shadow.get(msr).or_else(|| {
+            super::stealth_msr_read(msr).map(|(eax, edx)| (u64::from(edx) << 32) | u64::from(eax))
+        });
+        if let Some(v) = value {
+            set_guest_rax(vmcb, v & 0xFFFF_FFFF);
+            gprs.rdx = v >> 32;
+        }
+    }
+
     /// Demand-map the 2 MiB guest page that faulted, reading the faulting GPA
     /// and NPT root from `vmcb`.
     ///
@@ -815,21 +961,17 @@ mod hw {
     /// the CPU's own VMCB memory.
     #[must_use]
     pub unsafe fn run_boot_guest_loop(vmcb_pa: u64) -> super::GuestRunOutcome {
-        use enlil_hal::VmExit;
-        use enlil_hal::svm::{
-            CPUID_INSN_LEN, IoioExitInfo, MSR_INSN_LEN, RunLoopExit, VMCB_SIZE,
-            classify_run_loop_exit, exit_code, exit_info_1, exit_info_2, guest_rax, guest_rip,
-            ioio_to_vmexit, msr_exit_is_write, next_rip, resume_rip_after, set_guest_rax,
-            set_guest_rip,
-        };
+        use enlil_hal::svm::VMCB_SIZE;
 
         /// Bound on total `VMRUN`s so a misbehaving guest cannot spin forever.
         const MAX_VMRUNS: u32 = 32;
 
         // The guest's non-VMCB GPRs, carried across every VMRUN by the shell so
-        // register state survives an intercepted-and-resumed instruction.
-        // Starts zeroed; the guest sets what it uses.
+        // register state survives an intercepted-and-resumed instruction, plus
+        // the per-guest MSR shadow (WRMSR values read back on RDMSR). Both start
+        // zeroed/empty; the guest sets what it uses.
         let mut gprs = super::GuestGprs::default();
+        let mut msr_shadow = super::MsrShadow::new();
         let mut outcome = super::GuestRunOutcome::new();
         loop {
             // SAFETY: the caller guarantees a VMRUN-ready VMCB with SVM on, and
@@ -843,94 +985,91 @@ mod hw {
             // before it.
             // SAFETY: vmcb_pa points at our live, page-sized VMCB.
             let vmcb = unsafe { core::slice::from_raw_parts_mut(vmcb_pa as *mut u8, VMCB_SIZE) };
-            let code = exit_code(vmcb);
-            outcome.final_exit = code.raw();
-
-            match classify_run_loop_exit(code) {
-                RunLoopExit::Halted => {
-                    outcome.stop = super::RunStop::Halted;
-                    break;
-                }
-                RunLoopExit::ShutDown => {
-                    outcome.stop = super::RunStop::ShutDown;
-                    break;
-                }
-                RunLoopExit::Invalid => {
-                    outcome.stop = super::RunStop::Invalid;
-                    break;
-                }
-                RunLoopExit::Unhandled => {
-                    outcome.stop = super::RunStop::Unhandled;
-                    break;
-                }
-                RunLoopExit::Cpuid => {
-                    outcome.cpuid_exits += 1;
-                    // Answer the guest's CPUID ourselves (LOCKED PRINCIPLE 1):
-                    // run the host CPUID for the guest's leaf (guest EAX) and
-                    // subleaf (guest ECX from the shell), stealth it, then
-                    // deliver the result — EAX via the VMCB, EBX/ECX/EDX via the
-                    // GPR shell so the guest reads them on resume.
-                    let leaf = u32::try_from(guest_rax(vmcb) & 0xFFFF_FFFF).unwrap_or(0);
-                    let subleaf = u32::try_from(gprs.rcx & 0xFFFF_FFFF).unwrap_or(0);
-                    let regs = super::sanitize_cpuid(leaf, host_cpuid(leaf, subleaf));
-                    set_guest_rax(vmcb, u64::from(regs.eax));
-                    gprs.rbx = u64::from(regs.ebx);
-                    gprs.rcx = u64::from(regs.ecx);
-                    gprs.rdx = u64::from(regs.edx);
-                    if leaf == 0 {
-                        outcome.cpuid_leaf0_ebx = Some(regs.ebx);
-                    }
-                    let rip = resume_rip_after(next_rip(vmcb), guest_rip(vmcb), CPUID_INSN_LEN);
-                    set_guest_rip(vmcb, rip);
-                }
-                RunLoopExit::Io => {
-                    outcome.io_exits += 1;
-                    let info = IoioExitInfo::from_raw(exit_info_1(vmcb));
-                    // Low 32 bits of guest RAX supply the OUT data; masking
-                    // first makes the narrowing total (never truncating).
-                    let rax = u32::try_from(guest_rax(vmcb) & 0xFFFF_FFFF).unwrap_or(0);
-                    if let Some(VmExit::IoOut { port, data, .. }) = ioio_to_vmexit(info, rax) {
-                        outcome.record_io_out(port, data);
-                    }
-                    // EXITINFO2 carries the RIP just past the IN/OUT.
-                    set_guest_rip(vmcb, exit_info_2(vmcb));
-                }
-                RunLoopExit::Msr => {
-                    outcome.msr_exits += 1;
-                    // MSR number is in guest ECX (via the shell); EXITINFO1 bit 0
-                    // is write(1)/read(0). Answer a RDMSR with our stealth value
-                    // (LOCKED PRINCIPLE 1) — EAX via the VMCB, EDX via the shell.
-                    // A WRMSR is swallowed (the guest cannot change host MSRs).
-                    let msr = u32::try_from(gprs.rcx & 0xFFFF_FFFF).unwrap_or(0);
-                    if !msr_exit_is_write(exit_info_1(vmcb))
-                        && let Some((eax, edx)) = super::stealth_msr_read(msr)
-                    {
-                        set_guest_rax(vmcb, u64::from(eax));
-                        gprs.rdx = u64::from(edx);
-                    }
-                    let rip = resume_rip_after(next_rip(vmcb), guest_rip(vmcb), MSR_INSN_LEN);
-                    set_guest_rip(vmcb, rip);
-                }
-                RunLoopExit::Npf => {
-                    // Demand-map the faulting page and re-VMRUN WITHOUT advancing
-                    // RIP so the access re-executes against the new mapping (the
-                    // VMCB's flush-all TLB control makes the new leaf visible).
-                    // SAFETY: vmcb is our live VMCB; its NPT is identity-mapped.
-                    if unsafe { demand_map_npf(vmcb) } {
-                        outcome.npf_exits += 1;
-                    } else {
-                        outcome.stop = super::RunStop::Unhandled;
-                        break;
-                    }
-                }
+            // SAFETY: the VMCB's NPT root is identity-mapped (for demand paging).
+            if !unsafe { step_guest(vmcb, &mut gprs, &mut msr_shadow, &mut outcome) } {
+                break;
             }
-
             if outcome.vmruns >= MAX_VMRUNS {
                 outcome.stop = super::RunStop::IterationCap;
                 break;
             }
         }
         outcome
+    }
+
+    /// Handle one `#VMEXIT` on `vmcb`, returning `true` to keep running the
+    /// guest or `false` to stop (setting `outcome.stop`).
+    ///
+    /// Classifies the exit through the `enlil-hal` seam
+    /// ([`classify_run_loop_exit`](enlil_hal::svm::classify_run_loop_exit)) onto
+    /// the arch-neutral model (LOCKED PRINCIPLE 2): `HLT`/`SHUTDOWN`/invalid
+    /// stop; `CPUID`/`RDMSR`/`WRMSR` are emulated-and-skipped
+    /// ([`emulate_cpuid`]/[`emulate_msr`]); `IOIO` is decoded + captured and
+    /// resumed at the `EXITINFO2` RIP; `NPF` is demand-mapped ([`demand_map_npf`])
+    /// and resumed *without* advancing RIP so the access re-executes.
+    ///
+    /// # Safety
+    ///
+    /// `vmcb`'s `NESTED_CR3` must point at an identity-mapped NPT (for the NPF
+    /// demand-map path).
+    unsafe fn step_guest(
+        vmcb: &mut [u8],
+        gprs: &mut super::GuestGprs,
+        msr_shadow: &mut super::MsrShadow,
+        outcome: &mut super::GuestRunOutcome,
+    ) -> bool {
+        use enlil_hal::VmExit;
+        use enlil_hal::svm::{
+            CPUID_INSN_LEN, IoioExitInfo, MSR_INSN_LEN, RunLoopExit, classify_run_loop_exit,
+            exit_code, exit_info_1, exit_info_2, guest_rax, guest_rip, ioio_to_vmexit, next_rip,
+            resume_rip_after, set_guest_rip,
+        };
+
+        let code = exit_code(vmcb);
+        outcome.final_exit = code.raw();
+        match classify_run_loop_exit(code) {
+            RunLoopExit::Halted => outcome.stop = super::RunStop::Halted,
+            RunLoopExit::ShutDown => outcome.stop = super::RunStop::ShutDown,
+            RunLoopExit::Invalid => outcome.stop = super::RunStop::Invalid,
+            RunLoopExit::Unhandled => outcome.stop = super::RunStop::Unhandled,
+            RunLoopExit::Cpuid => {
+                outcome.cpuid_exits += 1;
+                if let Some(ebx0) = emulate_cpuid(vmcb, gprs) {
+                    outcome.cpuid_leaf0_ebx = Some(ebx0);
+                }
+                let rip = resume_rip_after(next_rip(vmcb), guest_rip(vmcb), CPUID_INSN_LEN);
+                set_guest_rip(vmcb, rip);
+                return true;
+            }
+            RunLoopExit::Io => {
+                outcome.io_exits += 1;
+                let info = IoioExitInfo::from_raw(exit_info_1(vmcb));
+                // Low 32 bits of guest RAX supply the OUT data; masking first
+                // makes the narrowing total (never truncating).
+                let rax = u32::try_from(guest_rax(vmcb) & 0xFFFF_FFFF).unwrap_or(0);
+                if let Some(VmExit::IoOut { port, data, .. }) = ioio_to_vmexit(info, rax) {
+                    outcome.record_io_out(port, data);
+                }
+                set_guest_rip(vmcb, exit_info_2(vmcb)); // RIP past the IN/OUT
+                return true;
+            }
+            RunLoopExit::Msr => {
+                outcome.msr_exits += 1;
+                emulate_msr(vmcb, gprs, msr_shadow);
+                let rip = resume_rip_after(next_rip(vmcb), guest_rip(vmcb), MSR_INSN_LEN);
+                set_guest_rip(vmcb, rip);
+                return true;
+            }
+            RunLoopExit::Npf => {
+                // SAFETY: the caller guarantees an identity-mapped NPT root.
+                if unsafe { demand_map_npf(vmcb) } {
+                    outcome.npf_exits += 1;
+                    return true; // resume WITHOUT advancing RIP
+                }
+                outcome.stop = super::RunStop::Unhandled;
+            }
+        }
+        false
     }
 }
 
@@ -997,6 +1136,30 @@ mod tests {
         // Any other MSR passes through (None → the loop does not inject).
         assert_eq!(stealth_msr_read(0x1B), None);
         assert_eq!(stealth_msr_read(0xC000_0080), None);
+    }
+
+    #[test]
+    fn msr_shadow_stores_updates_and_reads_back() {
+        let mut s = MsrShadow::new();
+        assert_eq!(s.get(0x11), None);
+        s.set(0x11, 0x99);
+        assert_eq!(s.get(0x11), Some(0x99));
+        // Update in place, not append.
+        s.set(0x11, 0xDEAD_BEEF);
+        assert_eq!(s.get(0x11), Some(0xDEAD_BEEF));
+        // A distinct MSR is a separate slot (slots 0,1 now used).
+        s.set(0x174, 0x1234);
+        assert_eq!(s.get(0x174), Some(0x1234));
+        assert_eq!(s.get(0x11), Some(0xDEAD_BEEF));
+        // Fill the remaining 2 slots, then overflow: the extra writes are
+        // dropped (no panic), earlier entries survive.
+        s.set(0x200, 2);
+        s.set(0x201, 3);
+        s.set(0x202, 4); // past CAP=4 → dropped
+        assert_eq!(s.get(0x200), Some(2));
+        assert_eq!(s.get(0x201), Some(3));
+        assert_eq!(s.get(0x202), None);
+        assert_eq!(s.get(0x11), Some(0xDEAD_BEEF));
     }
 
     #[test]
