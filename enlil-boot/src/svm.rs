@@ -89,6 +89,20 @@ pub const GUEST_MSR_PORT: u8 = 0x81;
 /// enlil hides itself (LOCKED PRINCIPLE 1).
 pub const GUEST_HV_BIT_PORT: u8 = 0x82;
 
+/// The port the boot guest writes the byte it read from the demand-paged page
+/// to — proving the NPF was caught and the mapped page reached the guest.
+pub const GUEST_NPF_PORT: u8 = 0x83;
+
+/// The guest-physical address the boot guest reads to trigger a nested page
+/// fault: 2 MiB, just past its initially-mapped `[0, 2 MiB)` RAM window, so the
+/// access faults and enlil demand-maps it.
+pub const GUEST_NPF_GPA: u64 = 0x0020_0000;
+
+/// The byte enlil writes at the demand-paged page's base; the guest reads and
+/// `OUT`s it, so a match proves the demand-mapped page is the one the guest
+/// sees.
+pub const GUEST_NPF_SENTINEL: u8 = 0x3C;
+
 /// The MSR the boot guest reads to prove MSR interception. enlil intercepts it
 /// and injects [`GUEST_MSR_SENTINEL`] rather than the real value.
 pub const GUEST_MSR_NUMBER: u32 = 0x10;
@@ -235,6 +249,8 @@ pub struct GuestRunOutcome {
     pub io_exits: u32,
     /// Intercepted `RDMSR`/`WRMSR` exits handled.
     pub msr_exits: u32,
+    /// Nested page faults demand-mapped.
+    pub npf_exits: u32,
     /// The `(port, byte)` writes the guest performed, oldest first, up to
     /// [`MAX_IO_OUTS`](Self::MAX_IO_OUTS) — each captured through the
     /// arch-neutral `VmExit::IoOut`. Query with [`io_out_to`](Self::io_out_to).
@@ -263,6 +279,7 @@ impl GuestRunOutcome {
             cpuid_exits: 0,
             io_exits: 0,
             msr_exits: 0,
+            npf_exits: 0,
             io_outs: [(0, 0); Self::MAX_IO_OUTS],
             io_out_count: 0,
             cpuid_leaf0_ebx: None,
@@ -308,7 +325,7 @@ pub use hw::{enable_svm, program_boot_vmcb, program_host_save_area, run_boot_gue
 
 #[cfg(target_os = "uefi")]
 mod hw {
-    use super::{GUEST_IO_PORT, GUEST_MSR_NUMBER};
+    use super::{GUEST_IO_PORT, GUEST_MSR_NUMBER, GUEST_NPF_GPA};
     use super::{
         HSAVE_PAGE_SIZE, MSR_EFER, MSR_VM_CR, MSR_VM_HSAVE_PA, SvmStatus, efer_with_svme,
         is_svm_enabled, is_valid_hsave_pa, svm_status, vm_cr_clear_svmdis,
@@ -317,8 +334,8 @@ mod hw {
     use enlil_hal::npt::build_npt_2mib;
     use enlil_hal::region::{IoPermissionsMap, MsrPermissionsMap, Vmcb};
     use enlil_hal::svm::{
-        MinimalGuestSetup, control, enable_io_intercept, enable_msr_intercept,
-        program_minimal_hlt_guest,
+        MinimalGuestSetup, VmcbSegment, control, enable_io_intercept, enable_msr_intercept,
+        program_minimal_hlt_guest, save, write_segment,
     };
 
     /// Read a 64-bit MSR.
@@ -522,6 +539,8 @@ mod hw {
         //   mov ecx, 0x10    66 B9 10 00 00 00  (ECX = MSR number, full 32-bit)
         //   rdmsr            0F 32           (intercepted → sentinel injected)
         //   out 0x81, al     E6 81           (IOIO → captured at port 0x81)
+        //   mov ax, [0]      A1 00 00        (DS:0 = GPA 2 MiB → NPF, demand-mapped)
+        //   out 0x83, al     E6 83           (IOIO → the demand-paged sentinel)
         //   hlt              F4              (clean stop)
         // SAFETY: GuestRam has a nonzero size; alloc_zeroed yields a zeroed,
         // 2 MiB-aligned GuestRam-sized block or null.
@@ -566,7 +585,12 @@ mod hw {
             bytes[29] = 0x32;
             bytes[30] = 0xE6; // OUT imm8, AL
             bytes[31] = super::GUEST_MSR_PORT;
-            bytes[32] = 0xF4; // HLT
+            bytes[32] = 0xA1; // mov ax, [0]  (DS:0 → GPA 2 MiB, NPF)
+            bytes[33] = 0x00;
+            bytes[34] = 0x00;
+            bytes[35] = 0xE6; // OUT imm8, AL
+            bytes[36] = super::GUEST_NPF_PORT;
+            bytes[37] = 0xF4; // HLT
         }
         // The guest's own view of its code: GPA 0.
         let guest_code_gpa = 0u64;
@@ -597,6 +621,14 @@ mod hw {
             stack_pointer: 0,
         };
         program_minimal_hlt_guest(vmcb.as_bytes_mut(), &setup).ok()?;
+        // Point the guest's DS at the unmapped GPA so its `mov ax, [0]` reads
+        // GPA GUEST_NPF_GPA and takes a nested page fault enlil demand-maps.
+        // (SVM allows an arbitrary real-mode segment base — unreal mode.)
+        write_segment(
+            vmcb.as_bytes_mut(),
+            save::DS,
+            VmcbSegment::real_mode_data(GUEST_NPF_GPA),
+        );
         // Read the nested-CR3 back to confirm the programming landed.
         let mut ncr3_le = [0u8; 8];
         ncr3_le.copy_from_slice(&vmcb.as_bytes()[control::NESTED_CR3..control::NESTED_CR3 + 8]);
@@ -709,6 +741,42 @@ mod hw {
                 out("r15") _,
             );
         }
+    }
+
+    /// Demand-map the 2 MiB guest page that faulted, reading the faulting GPA
+    /// and NPT root from `vmcb`.
+    ///
+    /// Allocates a fresh 2 MiB frame, stamps [`GUEST_NPF_SENTINEL`] at its base,
+    /// and writes the leaf into the guest's NPT (whose `nCR3` — identity-mapped
+    /// — is both the root's physical address and its VA). The frame is leaked so
+    /// it outlives the guest. Returns `false` if allocation or the leaf write
+    /// fails.
+    ///
+    /// # Safety
+    ///
+    /// `vmcb` must be a live VMCB whose `NESTED_CR3` points at an
+    /// identity-mapped NPT built by [`build_npt_2mib`].
+    unsafe fn demand_map_npf(vmcb: &[u8]) -> bool {
+        use enlil_hal::npt::{HUGE_2MIB, map_npt_2mib_leaf};
+        use enlil_hal::svm::{control, exit_info_2};
+
+        let fault_gpa = exit_info_2(vmcb) & !(HUGE_2MIB - 1);
+        // SAFETY: GuestRam has a nonzero size; alloc_zeroed yields a zeroed
+        // 2 MiB-aligned block or null.
+        let frame = unsafe { alloc_zeroed(Layout::new::<GuestRam>()) };
+        if frame.is_null() {
+            return false;
+        }
+        // SAFETY: frame owns the page; we stamp one byte, then leak it below.
+        unsafe { frame.write(super::GUEST_NPF_SENTINEL) };
+        let frame_spa = frame as u64;
+
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&vmcb[control::NESTED_CR3..control::NESTED_CR3 + 8]);
+        let ncr3 = u64::from_le_bytes(b);
+        // SAFETY: ncr3 is the identity-mapped NPT root (3 pages).
+        let npt = unsafe { core::slice::from_raw_parts_mut(ncr3 as *mut u8, 3 * 4096) };
+        map_npt_2mib_leaf(npt, ncr3, fault_gpa, frame_spa).is_ok()
     }
 
     /// Drive the guest at `vmcb_pa` through a real `#VMEXIT` dispatch loop,
@@ -837,6 +905,18 @@ mod hw {
                     }
                     let rip = resume_rip_after(next_rip(vmcb), guest_rip(vmcb), MSR_INSN_LEN);
                     set_guest_rip(vmcb, rip);
+                }
+                RunLoopExit::Npf => {
+                    // Demand-map the faulting page and re-VMRUN WITHOUT advancing
+                    // RIP so the access re-executes against the new mapping (the
+                    // VMCB's flush-all TLB control makes the new leaf visible).
+                    // SAFETY: vmcb is our live VMCB; its NPT is identity-mapped.
+                    if unsafe { demand_map_npf(vmcb) } {
+                        outcome.npf_exits += 1;
+                    } else {
+                        outcome.stop = super::RunStop::Unhandled;
+                        break;
+                    }
                 }
             }
 

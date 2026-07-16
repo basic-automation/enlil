@@ -304,7 +304,8 @@ mod hw {
     /// substrings the QEMU+OVMF harness asserts nightly.
     fn report_guest_run(serial: &SerialPort, run: &crate::svm::GuestRunOutcome) {
         use crate::svm::{
-            GUEST_HV_BIT_PORT, GUEST_IO_PORT, GUEST_MSR_PORT, GUEST_MSR_SENTINEL, RunStop,
+            GUEST_HV_BIT_PORT, GUEST_IO_PORT, GUEST_MSR_PORT, GUEST_MSR_SENTINEL, GUEST_NPF_PORT,
+            GUEST_NPF_SENTINEL, RunStop,
         };
         let mut vr = [0u8; 20];
         let mut cp = [0u8; 20];
@@ -355,6 +356,18 @@ mod hw {
                 {
                     serial.write_str(
                         "enlil kernel: svm: guest RDMSR answered by enlil (sentinel via GPR shell) — MSR exit emulated\n",
+                    );
+                }
+                // The guest read an unmapped GPA; enlil caught the NPF,
+                // demand-mapped a page with a sentinel, and resumed. A matching
+                // OUT proves the fault was handled and the mapped page reached
+                // the guest — the basis for demand paging and MMIO.
+                if run.npf_exits > 0
+                    && let Some(out) = run.io_out_to(u16::from(GUEST_NPF_PORT))
+                    && out == u32::from(GUEST_NPF_SENTINEL)
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: guest NPF demand-mapped by enlil — nested page fault handled\n",
                     );
                 }
             }
