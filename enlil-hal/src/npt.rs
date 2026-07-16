@@ -51,7 +51,7 @@ pub struct NptLayout {
     pub bytes: usize,
 }
 
-/// Why building a nested identity map failed.
+/// Why building a nested map failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NptError {
     /// `bytes_to_map` was zero — nothing to map.
@@ -59,6 +59,9 @@ pub enum NptError {
     /// `phys_base` was not 4 KiB-aligned, so an entry would decode to the
     /// wrong address.
     UnalignedBase,
+    /// `spa_base` (the system-physical base the guest's GPA 0 maps to) was not
+    /// 2 MiB-aligned, so a huge-page leaf would decode to the wrong frame.
+    UnalignedSpaBase,
     /// The map needs more than one PDPT's worth of page directories (> 512 GiB),
     /// which this single-PML4-entry builder does not lay out.
     MapTooLarge {
@@ -103,11 +106,49 @@ pub fn build_identity_npt_2mib(
     phys_base: u64,
     bytes_to_map: u64,
 ) -> Result<NptLayout, NptError> {
+    // An identity map is the general builder with the guest's GPA 0 mapped to
+    // system-physical 0.
+    build_npt_2mib(buf, phys_base, 0, bytes_to_map)
+}
+
+/// Build a 2 MiB-huge-page nested page table mapping guest-physical
+/// `[0, bytes_to_map)` onto **system-physical** `[spa_base, spa_base + …)` for
+/// an SVM guest.
+///
+/// This is the general form of [`build_identity_npt_2mib`] (which is this with
+/// `spa_base == 0`): it lets a guest see its RAM at GPA 0 while that RAM lives
+/// at an arbitrary 2 MiB-aligned system-physical `spa_base` — the memory-
+/// isolation model (LOCKED PRINCIPLE 5), where each guest's GPA space is a
+/// disjoint window of host RAM rather than the hypervisor's own addresses.
+///
+/// The tables themselves are written into the front of `buf`, which begins at
+/// physical `phys_base` (see [`build_identity_npt_2mib`] for the `phys_base`
+/// contract); `spa_base` is independent — it is where the *mapped guest RAM*
+/// lives, not where the tables live. Every level sets `U/S = 1` (see module
+/// docs). Returns an [`NptLayout`] whose `ncr3` (`== phys_base`) is the VMCB
+/// `NESTED_CR3` value.
+///
+/// # Errors
+///
+/// - [`NptError::EmptyRegion`] if `bytes_to_map == 0`;
+/// - [`NptError::UnalignedBase`] if `phys_base` is not 4 KiB-aligned;
+/// - [`NptError::UnalignedSpaBase`] if `spa_base` is not 2 MiB-aligned;
+/// - [`NptError::MapTooLarge`] if the map exceeds 512 GiB;
+/// - [`NptError::TablesExceedBuffer`] if the tables do not fit in `buf`.
+pub fn build_npt_2mib(
+    buf: &mut [u8],
+    phys_base: u64,
+    spa_base: u64,
+    bytes_to_map: u64,
+) -> Result<NptLayout, NptError> {
     if bytes_to_map == 0 {
         return Err(NptError::EmptyRegion);
     }
     if phys_base & (PAGE_SIZE - 1) != 0 {
         return Err(NptError::UnalignedBase);
+    }
+    if spa_base & (HUGE_2MIB - 1) != 0 {
+        return Err(NptError::UnalignedSpaBase);
     }
 
     let num_2mib = bytes_to_map.div_ceil(HUGE_2MIB);
@@ -154,14 +195,14 @@ pub fn build_identity_npt_2mib(
         write_entry(buf, pdpt_off + k * 8, (pd_pa & ADDR_MASK) | table_flags);
     }
 
-    // PD[k][j] → the (k*512 + j)-th 2 MiB frame (guest-physical == system-
-    // physical == page*2 MiB — an identity map, independent of phys_base).
+    // PD[k][j] → the (k*512 + j)-th 2 MiB frame: guest-physical page*2 MiB maps
+    // to system-physical spa_base + page*2 MiB (identity when spa_base == 0).
     let leaf_flags = flags::PRESENT | flags::WRITABLE | flags::USER | flags::HUGE_PAGE;
     for page in 0..num_2mib {
         let k = page / 512;
         let j = page % 512;
         let pd_off = first_pd_off + k * 4096;
-        let phys = (page as u64) * HUGE_2MIB;
+        let phys = spa_base + (page as u64) * HUGE_2MIB;
         write_entry(buf, pd_off + j * 8, (phys & ADDR_MASK) | leaf_flags);
     }
 
@@ -232,6 +273,42 @@ mod tests {
     }
 
     #[test]
+    fn non_identity_map_points_leaves_at_the_spa_window() {
+        // Guest GPA [0, 4 MiB) → system-physical [0x40_0000, 0x60_0000): the
+        // guest sees its RAM at GPA 0 but it lives at a disjoint SPA window.
+        let phys_base = 0x1_0000u64;
+        let spa_base = 0x40_0000u64; // 4 MiB, 2 MiB-aligned
+        let mut buf = alloc::vec![0u8; 0x3000];
+        let layout = build_npt_2mib(&mut buf, phys_base, spa_base, 4 * 1024 * 1024).unwrap();
+        assert_eq!(layout.ncr3, phys_base);
+        let uwp = flags::PRESENT | flags::WRITABLE | flags::USER | flags::HUGE_PAGE;
+        // GPA 0 → SPA spa_base; GPA 2 MiB → SPA spa_base + 2 MiB.
+        assert_eq!(read_entry(&buf, 0x2000, 0), (spa_base & ADDR_MASK) | uwp);
+        assert_eq!(
+            read_entry(&buf, 0x2000, 1),
+            ((spa_base + HUGE_2MIB) & ADDR_MASK) | uwp
+        );
+        // Intermediate pointers still encode phys_base (where the tables live),
+        // not spa_base (where the guest RAM lives).
+        let uwp_ptr = flags::PRESENT | flags::WRITABLE | flags::USER;
+        assert_eq!(
+            read_entry(&buf, 0, 0),
+            ((phys_base + 0x1000) & ADDR_MASK) | uwp_ptr
+        );
+    }
+
+    #[test]
+    fn identity_map_equals_non_identity_with_zero_spa_base() {
+        // build_identity_npt_2mib must be byte-identical to build_npt_2mib with
+        // spa_base == 0 (it delegates).
+        let mut a = alloc::vec![0u8; 0x3000];
+        let mut b = alloc::vec![0u8; 0x3000];
+        build_identity_npt_2mib(&mut a, 0x1_0000, 4 * 1024 * 1024).unwrap();
+        build_npt_2mib(&mut b, 0x1_0000, 0, 4 * 1024 * 1024).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
     fn rejects_bad_inputs() {
         let mut buf = alloc::vec![0u8; 0x4000];
         assert_eq!(
@@ -241,6 +318,11 @@ mod tests {
         assert_eq!(
             build_identity_npt_2mib(&mut buf, 0x800, HUGE_2MIB),
             Err(NptError::UnalignedBase)
+        );
+        // A non-2 MiB-aligned SPA base is rejected (a huge-page leaf needs it).
+        assert_eq!(
+            build_npt_2mib(&mut buf, 0, 0x1000, HUGE_2MIB),
+            Err(NptError::UnalignedSpaBase)
         );
         // A 4 MiB map needs 3 tables (12 KiB); a 2-page buffer is too small.
         let mut tiny = alloc::vec![0u8; 0x2000];
