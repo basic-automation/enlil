@@ -298,9 +298,9 @@ mod hw {
 
     /// Report what the guest #VMEXIT dispatch loop observed.
     ///
-    /// On a clean `HLT` after skipping the intercepted `CPUID` and emulating
-    /// the guest's `OUT`, this proves the loop re-`VMRUN`ed the guest through
-    /// more than one instruction and routed its port I/O end to end. The
+    /// On a clean `HLT` after emulating the intercepted `CPUID` and the guest's
+    /// `OUT`, this proves the loop re-`VMRUN`ed the guest through more than one
+    /// instruction, answered its CPUID, and routed its port I/O end to end. The
     /// success lines keep the substrings the QEMU+OVMF harness asserts nightly.
     fn report_guest_run(serial: &SerialPort, run: &crate::svm::GuestRunOutcome) {
         use crate::svm::RunStop;
@@ -313,7 +313,7 @@ mod hw {
                 serial.write_str(" VMRUNs (");
                 serial.write_str(format_u64(u64::from(run.cpuid_exits), &mut cp));
                 serial
-                    .write_str(" cpuid skipped) — dispatch loop runs a multi-instruction guest\n");
+                    .write_str(" cpuid emulated) — dispatch loop runs a multi-instruction guest\n");
                 // The emulated port write proves the IOIO exit path end to end.
                 if let Some((port, data)) = run.last_io_out {
                     let mut p = [0u8; 18];
@@ -323,12 +323,15 @@ mod hw {
                     serial.write_str(" = ");
                     serial.write_str(format_u64_hex(u64::from(data), &mut d));
                     serial.write_str(" (emulated) — IOIO exit-handling path end to end\n");
-                    // The guest computed that byte from BX, which it set before
-                    // the CPUID exit — so a match proves the GPR shell carried
-                    // BX across the intercepted-and-resumed instruction.
-                    if data == u32::from(crate::svm::GUEST_EXPECTED_OUT) {
+                    // The guest read that byte from BX = the EBX enlil emulated
+                    // for CPUID leaf 0 and delivered via the GPR shell. A match
+                    // proves the CPUID exit was answered by enlil and the result
+                    // reached the guest (the shell's host→guest path).
+                    if let Some(ebx) = run.cpuid_leaf0_ebx
+                        && data == ebx & 0xFF
+                    {
                         serial.write_str(
-                            "enlil kernel: svm: guest carried BX across the CPUID exit — GPR save/restore shell works\n",
+                            "enlil kernel: svm: guest CPUID leaf 0 answered by enlil (vendor byte via GPR shell) — CPUID exit emulated\n",
                         );
                     }
                 }

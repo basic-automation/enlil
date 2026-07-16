@@ -62,10 +62,12 @@ DISPATCH_LINE="dispatch loop runs a multi-instruction guest"
 # path and the captured byte read back — the exit-handling path proven end to
 # end (guest OUT 0x80 = 0x42).
 IOIO_LINE="IOIO exit-handling path end to end"
-# Printed once the guest carries a register value (BX) across the intercepted
-# CPUID exit: the emulated OUT byte matches what the guest stashed in BX before
-# the exit, proving the VMRUN GPR save/restore shell.
-GPR_LINE="GPR save/restore shell works"
+# Printed once enlil answers the guest's intercepted CPUID: the guest reads
+# leaf-0 EBX (delivered via the GPR shell) and OUTs its low byte, which matches
+# the EBX enlil emulated — proving CPUID exit emulation + the shell's host→guest
+# delivery. (The shell's guest→exit→guest path is covered by an earlier run's
+# BX-carry proof + the GuestGprs layout test.)
+CPUID_LINE="CPUID exit emulated"
 # Printed once the kernel draws to the GOP framebuffer and reads a pixel back
 # — proves the framebuffer I/O backend is wired with the firmware gone.
 GOP_LINE="framebuffer draw ok"
@@ -200,11 +202,11 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$VMRUN_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$DISPATCH_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$IOIO_LINE" "$SERIAL_LOG" 2>/dev/null \
-    && grep -q "$GPR_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$CPUID_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, IDT, x2APIC, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + GPR shell, and GOP draw observed on serial"
+    echo "PASS: banner, kernel memory, heap, IDT, x2APIC, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation, and GOP draw observed on serial"
     exit 0
 fi
 
-echo "FAIL: not all of banner/kernel-line/heap/idt/apic/svm/hsave/vmcb/vmrun/dispatch/ioio/gpr/gop observed (qemu rc=$QEMU_RC)"
+echo "FAIL: not all of banner/kernel-line/heap/idt/apic/svm/hsave/vmcb/vmrun/dispatch/ioio/cpuid/gop observed (qemu rc=$QEMU_RC)"
 exit 1

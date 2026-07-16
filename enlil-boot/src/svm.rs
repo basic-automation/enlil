@@ -79,17 +79,50 @@ pub const fn vm_cr_clear_svmdis(vm_cr: u64) -> u64 {
 /// `OUT imm8, AL` takes an 8-bit port immediate.
 pub const GUEST_IO_PORT: u8 = 0x80;
 
-/// The value the boot guest stashes in `BX` *before* the CPUID exit.
-///
-/// It then copies `BX` into `AX` and `OUT`s `BL`. If the GPR shell preserves
-/// `BX` across the exit, the emulated `OUT` carries this value's low byte
-/// ([`GUEST_EXPECTED_OUT`]) — the shell's end-to-end proof.
-pub const GUEST_BX_STASH: u16 = 0x1234;
+/// The four registers `CPUID` returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CpuidRegs {
+    /// EAX result.
+    pub eax: u32,
+    /// EBX result.
+    pub ebx: u32,
+    /// ECX result.
+    pub ecx: u32,
+    /// EDX result.
+    pub edx: u32,
+}
 
-/// The byte the guest is expected to `OUT` — `BL`, the low byte of
-/// [`GUEST_BX_STASH`]. `report_guest_run` checks the emulated `OUT` against
-/// this to confirm the GPR shell preserved `BX`.
-pub const GUEST_EXPECTED_OUT: u8 = GUEST_BX_STASH.to_le_bytes()[0];
+/// CPUID leaf 1 ECX bit 31 — "hypervisor present". Cleared for stealth.
+const CPUID_1_ECX_HYPERVISOR: u32 = 1 << 31;
+/// Base of the hypervisor CPUID vendor range (`0x4000_0000..=0x4000_00FF`).
+const CPUID_HV_RANGE_BASE: u32 = 0x4000_0000;
+/// End of the hypervisor CPUID vendor range.
+const CPUID_HV_RANGE_END: u32 = 0x4000_00FF;
+
+/// Apply enlil's bare-metal CPUID stealth to a raw host `CPUID` result.
+///
+/// LOCKED PRINCIPLE 1 — the guest must not see that it runs under enlil. Clears
+/// `CPUID.1:ECX[31]` (hypervisor-present) and zeros the whole hypervisor vendor
+/// leaf range `0x4000_0000..=0x4000_00FF`. Other leaves pass through unchanged;
+/// the topology/PMU/frequency stealth is the `enlil-core` `CpuidStealthTable`'s
+/// job, with which this minimal bare-metal surface should later converge
+/// (ROADMAP 6.2).
+#[must_use]
+pub const fn sanitize_cpuid(leaf: u32, regs: CpuidRegs) -> CpuidRegs {
+    if leaf >= CPUID_HV_RANGE_BASE && leaf <= CPUID_HV_RANGE_END {
+        return CpuidRegs {
+            eax: 0,
+            ebx: 0,
+            ecx: 0,
+            edx: 0,
+        };
+    }
+    let mut regs = regs;
+    if leaf == 1 {
+        regs.ecx &= !CPUID_1_ECX_HYPERVISOR;
+    }
+    regs
+}
 
 /// The guest general-purpose registers `VMRUN` does **not** carry.
 ///
@@ -168,6 +201,11 @@ pub struct GuestRunOutcome {
     /// The last `OUT` the guest performed, as `(port, byte)` — the value enlil
     /// captured through the arch-neutral `VmExit::IoOut`.
     pub last_io_out: Option<(u16, u32)>,
+    /// The `EBX` enlil emulated for a guest `CPUID` leaf 0, if the guest ran
+    /// one — the host vendor string's first word, delivered to the guest via
+    /// the GPR shell. Lets the caller confirm the guest received exactly what
+    /// enlil computed.
+    pub cpuid_leaf0_ebx: Option<u32>,
     /// Raw #VMEXIT code of the final (stopping) exit.
     pub final_exit: u64,
 }
@@ -182,6 +220,7 @@ impl GuestRunOutcome {
             cpuid_exits: 0,
             io_exits: 0,
             last_io_out: None,
+            cpuid_leaf0_ebx: None,
             final_exit: 0,
         }
     }
@@ -192,7 +231,7 @@ pub use hw::{enable_svm, program_boot_vmcb, program_host_save_area, run_boot_gue
 
 #[cfg(target_os = "uefi")]
 mod hw {
-    use super::{GUEST_BX_STASH, GUEST_IO_PORT};
+    use super::GUEST_IO_PORT;
     use super::{
         HSAVE_PAGE_SIZE, MSR_EFER, MSR_VM_CR, MSR_VM_HSAVE_PA, SvmStatus, efer_with_svme,
         is_svm_enabled, is_valid_hsave_pa, svm_status, vm_cr_clear_svmdis,
@@ -259,6 +298,36 @@ mod hw {
             );
         }
         ecx
+    }
+
+    /// Execute the host `CPUID` for `leaf`/`subleaf`, returning all four result
+    /// registers.
+    ///
+    /// The enlil kernel runs this on the guest's behalf when it intercepts a
+    /// guest `CPUID` (LOCKED PRINCIPLE 1), then stealths the result with
+    /// [`sanitize_cpuid`](super::sanitize_cpuid) before delivering it. `rbx` is
+    /// hand-preserved (LLVM-reserved) via a scratch register.
+    fn host_cpuid(leaf: u32, subleaf: u32) -> super::CpuidRegs {
+        let eax: u32;
+        let ebx: u32;
+        let ecx: u32;
+        let edx: u32;
+        // SAFETY: CPUID is unprivileged and has no memory or side effects; the
+        // caller passes a leaf the guest requested.
+        unsafe {
+            core::arch::asm!(
+                "push rbx",
+                "cpuid",
+                "mov {ebx_out:e}, ebx",
+                "pop rbx",
+                inout("eax") leaf => eax,
+                inout("ecx") subleaf => ecx,
+                out("edx") edx,
+                ebx_out = out(reg) ebx,
+                options(nostack, preserves_flags),
+            );
+        }
+        super::CpuidRegs { eax, ebx, ecx, edx }
     }
 
     /// Turn SVM on if the CPU allows it, returning the resulting status.
@@ -333,35 +402,37 @@ mod hw {
     /// exercises the exit-handling path, returning `(vmcb_pa, ncr3,
     /// guest_code_pa)`.
     ///
-    /// The guest stashes a value in `BX`, then runs `CPUID; MOV AX,BX; OUT; HLT`
-    /// — so the dispatch loop routes all three exit classes (`CPUID` skipped,
-    /// `IOIO` decoded + emulated, `HLT` stop) *and* the GPR shell must preserve
-    /// `BX` across the CPUID exit for the emulated `OUT` to carry
-    /// [`GUEST_EXPECTED_OUT`]. Assembled through the `enlil-hal` layer with the
-    /// firmware gone: the code page, a nested page table identity-mapping the
-    /// low gibibyte (so `GPA == SPA`), a [`Vmcb`] programmed via
-    /// [`program_minimal_hlt_guest`] then armed for port I/O
+    /// The guest runs `CPUID` leaf 0, then `MOV AX,BX; OUT; HLT` — so the
+    /// dispatch loop routes all three exit classes (`CPUID` *emulated*, `IOIO`
+    /// decoded + emulated, `HLT` stop). enlil answers the intercepted `CPUID`
+    /// by running the host `CPUID`, stealthing it, and delivering `EBX` (the
+    /// vendor word) to the guest through the GPR shell; the guest then `OUT`s
+    /// `BL`, so a match against enlil's own emulated `EBX` proves both the
+    /// emulation and the shell's host→guest delivery. Assembled through the
+    /// `enlil-hal` layer with the firmware gone: the code page, a nested page
+    /// table identity-mapping the low gibibyte (so `GPA == SPA`), a [`Vmcb`]
+    /// programmed via [`program_minimal_hlt_guest`] then armed for port I/O
     /// ([`enable_io_intercept`] + an intercept-all [`IoPermissionsMap`]). The
     /// nested-CR3 is read back to prove the write landed. All allocations are
     /// leaked — they must outlive the `VMRUN`. Returns `None` if any allocation
     /// fails or the NPT/VMCB is malformed (none can happen here).
     #[must_use]
     pub fn program_boot_vmcb() -> Option<(u64, u64, u64)> {
-        // Guest code page (real-mode, 16-bit): stash a value in BX, take the
-        // CPUID exit, then copy BX→AX and OUT it. If the GPR shell preserves BX
-        // across the intercepted CPUID, the emulated OUT carries BL.
-        //   mov bx, 0x1234   BB lo hi
-        //   cpuid            0F A2     (intercepted → skipped by the loop)
-        //   mov ax, bx       89 D8
+        // Guest code page (real-mode, 16-bit): request CPUID leaf 0, then copy
+        // the emulated BX (vendor word) into AX and OUT its low byte. AX starts
+        // 0 (guest RAX = 0), so `mov ax, 0` is unneeded — but kept explicit for
+        // clarity that leaf 0 is requested.
+        //   mov ax, 0        B8 00 00  (EAX = 0 → CPUID leaf 0)
+        //   cpuid            0F A2     (intercepted → emulated by the loop)
+        //   mov ax, bx       89 D8     (AX = emulated EBX low word)
         //   out 0x80, al     E6 80     (IOIO #VMEXIT → decoded + emulated)
         //   hlt              F4        (clean stop)
         let mut code = PageRegion::new()?;
         {
-            let stash = GUEST_BX_STASH.to_le_bytes();
             let bytes = code.as_bytes_mut();
-            bytes[0] = 0xBB; // mov bx, imm16
-            bytes[1] = stash[0];
-            bytes[2] = stash[1];
+            bytes[0] = 0xB8; // mov ax, imm16
+            bytes[1] = 0x00;
+            bytes[2] = 0x00;
             bytes[3] = 0x0F; // CPUID
             bytes[4] = 0xA2;
             bytes[5] = 0x89; // mov ax, bx
@@ -511,11 +582,13 @@ mod hw {
     /// PRINCIPLE 2). `HLT`/`SHUTDOWN`/invalid state stop the loop; the two
     /// emulate-and-skip exits resume it:
     ///
-    /// - **CPUID** — intercepted for stealth (LOCKED PRINCIPLE 1). The minimal
-    ///   guest does not consume its result, so the loop only advances guest RIP
-    ///   past the instruction ([`resume_rip_after`] — hardware `NEXT_RIP`, or
-    ///   `RIP + CPUID_INSN_LEN` when NRIP-save is absent) and re-`VMRUN`s. The
-    ///   stealth CPUID table plugs in here later.
+    /// - **CPUID** — intercepted for stealth (LOCKED PRINCIPLE 1). The loop
+    ///   runs the host `CPUID` for the guest's leaf/subleaf, stealths it
+    ///   ([`sanitize_cpuid`](super::sanitize_cpuid) — clears the
+    ///   hypervisor-present bit, hides the hypervisor vendor range), delivers
+    ///   EAX via the VMCB and EBX/ECX/EDX via the GPR shell, then advances guest
+    ///   RIP past the instruction ([`resume_rip_after`] — hardware `NEXT_RIP`,
+    ///   or `RIP + CPUID_INSN_LEN` when NRIP-save is absent) and re-`VMRUN`s.
     /// - **IOIO** — decode `EXITINFO1` ([`IoioExitInfo`]) with the guest `RAX`
     ///   onto [`VmExit::IoOut`]/`IoIn`, capture an `OUT` byte, then advance to
     ///   the `EXITINFO2` RIP the hardware saved past the `IN`/`OUT`.
@@ -536,7 +609,7 @@ mod hw {
         use enlil_hal::svm::{
             CPUID_INSN_LEN, IoioExitInfo, RunLoopExit, VMCB_SIZE, classify_run_loop_exit,
             exit_code, exit_info_1, exit_info_2, guest_rax, guest_rip, ioio_to_vmexit, next_rip,
-            resume_rip_after, set_guest_rip,
+            resume_rip_after, set_guest_rax, set_guest_rip,
         };
 
         /// Bound on total `VMRUN`s so a misbehaving guest cannot spin forever.
@@ -581,6 +654,21 @@ mod hw {
                 }
                 RunLoopExit::Cpuid => {
                     outcome.cpuid_exits += 1;
+                    // Answer the guest's CPUID ourselves (LOCKED PRINCIPLE 1):
+                    // run the host CPUID for the guest's leaf (guest EAX) and
+                    // subleaf (guest ECX from the shell), stealth it, then
+                    // deliver the result — EAX via the VMCB, EBX/ECX/EDX via the
+                    // GPR shell so the guest reads them on resume.
+                    let leaf = u32::try_from(guest_rax(vmcb) & 0xFFFF_FFFF).unwrap_or(0);
+                    let subleaf = u32::try_from(gprs.rcx & 0xFFFF_FFFF).unwrap_or(0);
+                    let regs = super::sanitize_cpuid(leaf, host_cpuid(leaf, subleaf));
+                    set_guest_rax(vmcb, u64::from(regs.eax));
+                    gprs.rbx = u64::from(regs.ebx);
+                    gprs.rcx = u64::from(regs.ecx);
+                    gprs.rdx = u64::from(regs.edx);
+                    if leaf == 0 {
+                        outcome.cpuid_leaf0_ebx = Some(regs.ebx);
+                    }
                     let rip = resume_rip_after(next_rip(vmcb), guest_rip(vmcb), CPUID_INSN_LEN);
                     set_guest_rip(vmcb, rip);
                 }
@@ -634,9 +722,44 @@ mod tests {
     }
 
     #[test]
-    fn guest_expected_out_is_the_low_byte_of_the_stash() {
-        assert_eq!(GUEST_EXPECTED_OUT, 0x34);
-        assert_eq!(u16::from(GUEST_EXPECTED_OUT), GUEST_BX_STASH & 0xFF);
+    fn sanitize_cpuid_clears_the_hypervisor_present_bit_on_leaf_1() {
+        let raw = CpuidRegs {
+            eax: 0x0010_0F10,
+            ebx: 0x0080_0800,
+            ecx: 0x8000_0201, // bit 31 (hypervisor) set, plus real feature bits
+            edx: 0x1783_FBFF,
+        };
+        let out = sanitize_cpuid(1, raw);
+        // Hypervisor-present bit cleared; every other bit preserved.
+        assert_eq!(out.ecx, 0x0000_0201);
+        assert_eq!(out.eax, raw.eax);
+        assert_eq!(out.ebx, raw.ebx);
+        assert_eq!(out.edx, raw.edx);
+    }
+
+    #[test]
+    fn sanitize_cpuid_zeros_the_hypervisor_vendor_range() {
+        let raw = CpuidRegs {
+            eax: 0x4000_0001,
+            ebx: 0x7263_694D, // "Micr..." — a hypervisor signature
+            ecx: 0x666F_736F,
+            edx: 0x76482074,
+        };
+        assert_eq!(sanitize_cpuid(0x4000_0000, raw), CpuidRegs::default());
+        assert_eq!(sanitize_cpuid(0x4000_00FF, raw), CpuidRegs::default());
+    }
+
+    #[test]
+    fn sanitize_cpuid_passes_other_leaves_through() {
+        let raw = CpuidRegs {
+            eax: 0x10,
+            ebx: 0x6874_7541, // "Auth" (AMD vendor word)
+            ecx: 0x444D_4163,
+            edx: 0x6974_6E65,
+        };
+        // Leaf 0 (vendor) and a normal feature leaf are untouched.
+        assert_eq!(sanitize_cpuid(0, raw), raw);
+        assert_eq!(sanitize_cpuid(7, raw), raw);
     }
 
     #[test]
