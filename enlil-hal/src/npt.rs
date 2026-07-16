@@ -75,6 +75,9 @@ pub enum NptError {
         /// The buffer length.
         have: usize,
     },
+    /// A `PML4`/`PDPT`/`PD` entry on the path to a demand-mapped leaf was
+    /// absent, or pointed outside the table buffer ([`map_npt_2mib_leaf`]).
+    IntermediateNotPresent,
 }
 
 /// Build a 2 MiB-huge-page identity map of `[0, bytes_to_map)` for use as an
@@ -213,6 +216,84 @@ pub fn build_npt_2mib(
     })
 }
 
+/// Map a single 2 MiB guest page — `gpa` → `spa` — into an NPT that already
+/// exists (built by [`build_npt_2mib`]), by writing the leaf into its
+/// page directory.
+///
+/// This is the demand-paging / MMIO-backing step: on a nested page fault the
+/// backend allocates a frame and calls this to fill in the missing leaf, then
+/// re-`VMRUN`s so the faulting instruction re-executes against the new mapping.
+/// The covering `PML4`/`PDPT`/`PD` must already be present — they are for any
+/// `gpa` within the reach of the originally-built map's tables (its `PDPT` spans
+/// 512 GiB and its `PD` one gibibyte), so a leaf anywhere in the built `PD`'s
+/// gibibyte just fills a not-present slot.
+///
+/// `buf`/`phys_base` are the same table buffer and physical base passed to
+/// [`build_npt_2mib`]; the walk converts each level's physical pointer back to a
+/// `buf` offset via `phys_base`.
+///
+/// # Errors
+///
+/// - [`NptError::UnalignedBase`] if `gpa` or `spa` is not 2 MiB-aligned;
+/// - [`NptError::IntermediateNotPresent`] if the `PML4`/`PDPT`/`PD` entry on the
+///   path is absent (the covering table was never built) or points outside
+///   `buf` (below `phys_base` or past its end).
+pub fn map_npt_2mib_leaf(
+    buf: &mut [u8],
+    phys_base: u64,
+    gpa: u64,
+    spa: u64,
+) -> Result<(), NptError> {
+    if gpa & (HUGE_2MIB - 1) != 0 || spa & (HUGE_2MIB - 1) != 0 {
+        return Err(NptError::UnalignedBase);
+    }
+    let pml4_i = ((gpa >> 39) & 0x1FF) as usize;
+    let pdpt_i = ((gpa >> 30) & 0x1FF) as usize;
+    let pd_i = ((gpa >> 21) & 0x1FF) as usize;
+
+    // PML4[pml4_i] → PDPT.
+    let pdpt_off = child_offset(buf, phys_base, 0, pml4_i)?;
+    // PDPT[pdpt_i] → PD.
+    let pd_off = child_offset(buf, phys_base, pdpt_off, pdpt_i)?;
+    // Write the 2 MiB leaf into PD[pd_i].
+    let leaf_flags = flags::PRESENT | flags::WRITABLE | flags::USER | flags::HUGE_PAGE;
+    write_entry(buf, pd_off + pd_i * 8, (spa & ADDR_MASK) | leaf_flags);
+    Ok(())
+}
+
+/// Read the present table entry at `table_off + index*8` and return the `buf`
+/// offset of the table it points at (its physical address minus `phys_base`).
+fn child_offset(
+    buf: &[u8],
+    phys_base: u64,
+    table_off: usize,
+    index: usize,
+) -> Result<usize, NptError> {
+    let entry = read_entry(buf, table_off + index * 8)?;
+    if entry & flags::PRESENT == 0 {
+        return Err(NptError::IntermediateNotPresent);
+    }
+    let child_pa = entry & ADDR_MASK;
+    let off = child_pa
+        .checked_sub(phys_base)
+        .and_then(|d| usize::try_from(d).ok())
+        .ok_or(NptError::IntermediateNotPresent)?;
+    // The child table must lie fully within the buffer.
+    if off.checked_add(4096).is_none_or(|end| end > buf.len()) {
+        return Err(NptError::IntermediateNotPresent);
+    }
+    Ok(off)
+}
+
+/// Read a little-endian `u64` page-table entry at byte `offset`, or an error if
+/// it runs past `buf`.
+fn read_entry(buf: &[u8], offset: usize) -> Result<u64, NptError> {
+    let raw = buf
+        .get(offset..offset + 8)
+        .ok_or(NptError::IntermediateNotPresent)?;
+    Ok(u64::from_le_bytes(raw.try_into().unwrap_or([0; 8])))
+}
+
 /// Write a little-endian `u64` page-table entry at byte `offset` in `buf`.
 fn write_entry(buf: &mut [u8], offset: usize, entry: u64) {
     buf[offset..offset + 8].copy_from_slice(&entry.to_le_bytes());
@@ -306,6 +387,38 @@ mod tests {
         build_identity_npt_2mib(&mut a, 0x1_0000, 4 * 1024 * 1024).unwrap();
         build_npt_2mib(&mut b, 0x1_0000, 0, 4 * 1024 * 1024).unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn demand_map_fills_a_not_present_leaf() {
+        // Build a 2 MiB map (only PD[0] present), then demand-map GPA 2 MiB.
+        let phys_base = 0x1_0000u64;
+        let mut buf = alloc::vec![0u8; 0x3000];
+        build_npt_2mib(&mut buf, phys_base, 0x40_0000, 2 * 1024 * 1024).unwrap();
+        // GPA 2 MiB → PD[1], currently not present.
+        assert_eq!(read_entry(&buf, 0x2000, 1) & flags::PRESENT, 0);
+        let uwp = flags::PRESENT | flags::WRITABLE | flags::USER | flags::HUGE_PAGE;
+        map_npt_2mib_leaf(&mut buf, phys_base, 0x20_0000, 0x80_0000).unwrap();
+        // PD[1] now maps GPA 2 MiB → SPA 8 MiB; PD[0] is untouched.
+        assert_eq!(read_entry(&buf, 0x2000, 1), (0x80_0000 & ADDR_MASK) | uwp);
+        assert_eq!(read_entry(&buf, 0x2000, 0), (0x40_0000 & ADDR_MASK) | uwp);
+    }
+
+    #[test]
+    fn demand_map_rejects_unaligned_and_missing_intermediates() {
+        let phys_base = 0x1_0000u64;
+        let mut buf = alloc::vec![0u8; 0x3000];
+        build_npt_2mib(&mut buf, phys_base, 0, 2 * 1024 * 1024).unwrap();
+        // Unaligned GPA/SPA.
+        assert_eq!(
+            map_npt_2mib_leaf(&mut buf, phys_base, 0x1000, 0x40_0000),
+            Err(NptError::UnalignedBase)
+        );
+        // GPA 1 GiB → PDPT[1], which was never built (not present).
+        assert_eq!(
+            map_npt_2mib_leaf(&mut buf, phys_base, 1024 * 1024 * 1024, 0x40_0000),
+            Err(NptError::IntermediateNotPresent)
+        );
     }
 
     #[test]

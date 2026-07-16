@@ -723,6 +723,12 @@ pub enum RunLoopExit {
     /// read/write direction in `EXITINFO1` ([`msr_exit_is_write`]); emulate the
     /// stealth value, then resume past the fixed-length instruction.
     Msr,
+    /// Nested page fault — the guest touched a guest-physical address the NPT
+    /// does not map. `EXITINFO1` is the fault error code ([`NptFaultInfo`]),
+    /// `EXITINFO2` the faulting guest-physical address; the caller maps the page
+    /// (demand paging) or emulates MMIO, then resumes *without* advancing RIP so
+    /// the faulting instruction re-executes.
+    Npf,
     /// An exit the minimal loop does not route yet — stop and report the raw
     /// code to the caller.
     Unhandled,
@@ -751,6 +757,7 @@ pub const fn classify_run_loop_exit(code: SvmExitCode) -> RunLoopExit {
         exit_code::CPUID => RunLoopExit::Cpuid,
         exit_code::IOIO => RunLoopExit::Io,
         exit_code::MSR => RunLoopExit::Msr,
+        exit_code::NPF => RunLoopExit::Npf,
         _ => RunLoopExit::Unhandled,
     }
 }
@@ -1355,9 +1362,14 @@ mod tests {
             classify_run_loop_exit(SvmExitCode::from_raw(exit_code::INVALID)),
             RunLoopExit::Invalid
         );
-        // An NPF (not routed by the minimal loop yet) is Unhandled, not Invalid.
+        // NPF is routed to demand-map the page; distinct from Invalid.
         assert_eq!(
             classify_run_loop_exit(SvmExitCode::from_raw(exit_code::NPF)),
+            RunLoopExit::Npf
+        );
+        // A genuinely-unrouted code (VMMCALL here) is Unhandled.
+        assert_eq!(
+            classify_run_loop_exit(SvmExitCode::from_raw(exit_code::VMMCALL)),
             RunLoopExit::Unhandled
         );
     }
