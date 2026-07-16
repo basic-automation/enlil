@@ -323,6 +323,14 @@ mod hw {
                     serial.write_str(" = ");
                     serial.write_str(format_u64_hex(u64::from(data), &mut d));
                     serial.write_str(" (emulated) — IOIO exit-handling path end to end\n");
+                    // The guest computed that byte from BX, which it set before
+                    // the CPUID exit — so a match proves the GPR shell carried
+                    // BX across the intercepted-and-resumed instruction.
+                    if data == u32::from(crate::svm::GUEST_EXPECTED_OUT) {
+                        serial.write_str(
+                            "enlil kernel: svm: guest carried BX across the CPUID exit — GPR save/restore shell works\n",
+                        );
+                    }
                 }
             }
             RunStop::ShutDown => serial.write_str("enlil kernel: svm: guest SHUTDOWN\n"),

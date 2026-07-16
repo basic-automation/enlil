@@ -74,6 +74,68 @@ pub const fn vm_cr_clear_svmdis(vm_cr: u64) -> u64 {
     vm_cr & !VM_CR_SVMDIS
 }
 
+/// The port the boot guest writes to prove the I/O exit path — an unused
+/// legacy "POST" port so nothing else contends for it. A `u8` because
+/// `OUT imm8, AL` takes an 8-bit port immediate.
+pub const GUEST_IO_PORT: u8 = 0x80;
+
+/// The value the boot guest stashes in `BX` *before* the CPUID exit.
+///
+/// It then copies `BX` into `AX` and `OUT`s `BL`. If the GPR shell preserves
+/// `BX` across the exit, the emulated `OUT` carries this value's low byte
+/// ([`GUEST_EXPECTED_OUT`]) — the shell's end-to-end proof.
+pub const GUEST_BX_STASH: u16 = 0x1234;
+
+/// The byte the guest is expected to `OUT` — `BL`, the low byte of
+/// [`GUEST_BX_STASH`]. `report_guest_run` checks the emulated `OUT` against
+/// this to confirm the GPR shell preserved `BX`.
+pub const GUEST_EXPECTED_OUT: u8 = GUEST_BX_STASH.to_le_bytes()[0];
+
+/// The guest general-purpose registers `VMRUN` does **not** carry.
+///
+/// `VMRUN` swaps only `RAX`, `RSP`, `RIP`, and `RFLAGS` through the VMCB save
+/// area; the other 14 GPRs are shared with the host. The [`run_boot_guest_loop`]
+/// shell loads these into the CPU before `VMRUN` and stores them back on
+/// `#VMEXIT`, so the guest keeps register state across an intercepted-and-
+/// resumed instruction — the enabling step for real guest code and for a
+/// faithful CPUID emulation (which must write guest EBX/ECX/EDX).
+///
+/// Field order and `#[repr(C)]` are load-bearing: the run shell's inline asm
+/// indexes this struct by fixed byte offset (`rbx` at 0, each field +8). The
+/// `guest_gprs_layout_is_stable_for_the_asm_shell` test pins that contract.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GuestGprs {
+    /// RBX — offset 0x00.
+    pub rbx: u64,
+    /// RCX — offset 0x08.
+    pub rcx: u64,
+    /// RDX — offset 0x10.
+    pub rdx: u64,
+    /// RSI — offset 0x18.
+    pub rsi: u64,
+    /// RDI — offset 0x20.
+    pub rdi: u64,
+    /// RBP — offset 0x28.
+    pub rbp: u64,
+    /// R8 — offset 0x30.
+    pub r8: u64,
+    /// R9 — offset 0x38.
+    pub r9: u64,
+    /// R10 — offset 0x40.
+    pub r10: u64,
+    /// R11 — offset 0x48.
+    pub r11: u64,
+    /// R12 — offset 0x50.
+    pub r12: u64,
+    /// R13 — offset 0x58.
+    pub r13: u64,
+    /// R14 — offset 0x60.
+    pub r14: u64,
+    /// R15 — offset 0x68.
+    pub r15: u64,
+}
+
 /// How the boot guest's #VMEXIT dispatch loop ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunStop {
@@ -130,6 +192,7 @@ pub use hw::{enable_svm, program_boot_vmcb, program_host_save_area, run_boot_gue
 
 #[cfg(target_os = "uefi")]
 mod hw {
+    use super::{GUEST_BX_STASH, GUEST_IO_PORT};
     use super::{
         HSAVE_PAGE_SIZE, MSR_EFER, MSR_VM_CR, MSR_VM_HSAVE_PA, SvmStatus, efer_with_svme,
         is_svm_enabled, is_valid_hsave_pa, svm_status, vm_cr_clear_svmdis,
@@ -138,16 +201,8 @@ mod hw {
     use enlil_hal::npt::build_identity_npt_2mib;
     use enlil_hal::region::{IoPermissionsMap, PageRegion, Vmcb};
     use enlil_hal::svm::{
-        MinimalGuestSetup, control, enable_io_intercept, program_minimal_hlt_guest, set_guest_rax,
+        MinimalGuestSetup, control, enable_io_intercept, program_minimal_hlt_guest,
     };
-
-    /// The port the boot guest writes to prove the I/O exit path — an unused
-    /// legacy "POST" port so nothing else contends for it. A `u8` because
-    /// `OUT imm8, AL` takes an 8-bit port immediate.
-    pub(super) const GUEST_IO_PORT: u8 = 0x80;
-    /// The byte the boot guest sends to [`GUEST_IO_PORT`], preloaded into guest
-    /// `RAX` so its `OUT 0x80, AL` carries it.
-    pub(super) const GUEST_IO_BYTE: u8 = 0x42;
 
     /// Read a 64-bit MSR.
     ///
@@ -278,32 +333,42 @@ mod hw {
     /// exercises the exit-handling path, returning `(vmcb_pa, ncr3,
     /// guest_code_pa)`.
     ///
-    /// The guest runs three instructions — `CPUID`, `OUT 0x80, AL`, `HLT` — so
-    /// the dispatch loop routes all three exit classes: `CPUID` (intercepted
-    /// for stealth, skipped), `IOIO` (the `OUT`, decoded + emulated), and
-    /// `HLT` (the clean stop). Assembled through the `enlil-hal` layer with the
+    /// The guest stashes a value in `BX`, then runs `CPUID; MOV AX,BX; OUT; HLT`
+    /// — so the dispatch loop routes all three exit classes (`CPUID` skipped,
+    /// `IOIO` decoded + emulated, `HLT` stop) *and* the GPR shell must preserve
+    /// `BX` across the CPUID exit for the emulated `OUT` to carry
+    /// [`GUEST_EXPECTED_OUT`]. Assembled through the `enlil-hal` layer with the
     /// firmware gone: the code page, a nested page table identity-mapping the
     /// low gibibyte (so `GPA == SPA`), a [`Vmcb`] programmed via
     /// [`program_minimal_hlt_guest`] then armed for port I/O
-    /// ([`enable_io_intercept`] + an intercept-all [`IoPermissionsMap`]) with
-    /// guest `RAX` preloaded so `OUT` carries [`GUEST_IO_BYTE`]. The nested-CR3
-    /// is read back to prove the write landed. All allocations are leaked — they
-    /// must outlive the `VMRUN`. Returns `None` if any allocation fails or the
-    /// NPT/VMCB is malformed (none can happen here).
+    /// ([`enable_io_intercept`] + an intercept-all [`IoPermissionsMap`]). The
+    /// nested-CR3 is read back to prove the write landed. All allocations are
+    /// leaked — they must outlive the `VMRUN`. Returns `None` if any allocation
+    /// fails or the NPT/VMCB is malformed (none can happen here).
     #[must_use]
     pub fn program_boot_vmcb() -> Option<(u64, u64, u64)> {
-        // Guest code page: `CPUID` (0F A2), `OUT 0x80, AL` (E6 80), `HLT` (F4).
-        // CPUID is intercepted (LOCKED PRINCIPLE 1) and skipped; the OUT takes
-        // an IOIO #VMEXIT the loop decodes + emulates; then the guest reaches
-        // HLT — a multi-instruction guest whose exits route end to end.
+        // Guest code page (real-mode, 16-bit): stash a value in BX, take the
+        // CPUID exit, then copy BX→AX and OUT it. If the GPR shell preserves BX
+        // across the intercepted CPUID, the emulated OUT carries BL.
+        //   mov bx, 0x1234   BB lo hi
+        //   cpuid            0F A2     (intercepted → skipped by the loop)
+        //   mov ax, bx       89 D8
+        //   out 0x80, al     E6 80     (IOIO #VMEXIT → decoded + emulated)
+        //   hlt              F4        (clean stop)
         let mut code = PageRegion::new()?;
         {
+            let stash = GUEST_BX_STASH.to_le_bytes();
             let bytes = code.as_bytes_mut();
-            bytes[0] = 0x0F; // CPUID
-            bytes[1] = 0xA2;
-            bytes[2] = 0xE6; // OUT imm8, AL
-            bytes[3] = GUEST_IO_PORT;
-            bytes[4] = 0xF4; // HLT
+            bytes[0] = 0xBB; // mov bx, imm16
+            bytes[1] = stash[0];
+            bytes[2] = stash[1];
+            bytes[3] = 0x0F; // CPUID
+            bytes[4] = 0xA2;
+            bytes[5] = 0x89; // mov ax, bx
+            bytes[6] = 0xD8;
+            bytes[7] = 0xE6; // OUT imm8, AL
+            bytes[8] = GUEST_IO_PORT;
+            bytes[9] = 0xF4; // HLT
         }
         let guest_code_pa = code.base_addr();
         core::mem::forget(code); // the guest's RAM must persist
@@ -340,52 +405,92 @@ mod hw {
             return None;
         }
 
-        // Arm port-I/O interception so the guest's OUT takes an IOIO #VMEXIT,
-        // and preload guest RAX so `OUT 0x80, AL` sends GUEST_IO_BYTE (AL is
-        // RAX's low byte). The IOPM intercepts every port; it is leaked so it
-        // outlives the VMRUN the CPU checks it against.
+        // Arm port-I/O interception so the guest's OUT takes an IOIO #VMEXIT.
+        // The guest loads AL itself (from BX), so no RAX preload is needed. The
+        // IOPM intercepts every port; it is leaked so it outlives the VMRUN the
+        // CPU checks it against.
         let iopm = IoPermissionsMap::intercept_all().ok()?;
         enable_io_intercept(vmcb.as_bytes_mut(), iopm.base_addr());
         core::mem::forget(iopm);
-        set_guest_rax(vmcb.as_bytes_mut(), u64::from(GUEST_IO_BYTE));
 
         let vmcb_pa = vmcb.base_addr();
         core::mem::forget(vmcb); // the VMCB must outlive this call for VMRUN
         Some((vmcb_pa, ncr3, guest_code_pa))
     }
 
-    /// Execute one `VMRUN` on the VMCB at `vmcb_pa`, entering the guest and
-    /// returning on its `#VMEXIT`.
+    /// Execute one `VMRUN` on the VMCB at `vmcb_pa`, swapping the guest's
+    /// general-purpose registers (`*gprs`) in around the guest and back out on
+    /// `#VMEXIT`.
     ///
-    /// `clgi` clears the global interrupt flag so no host interrupt disturbs
-    /// the transition, `vmrun rax` enters the guest (RAX holds the VMCB
-    /// physical address) and returns here on `#VMEXIT`, and `stgi` restores the
-    /// flag. VMRUN does not save the volatile GPRs, so they are marked
-    /// clobbered; the guest runs on its own VMCB RSP, so the host stack — and
-    /// the hand-saved rbx — survive. The CPU writes the exit reason into the
-    /// VMCB control area, which the caller reads.
+    /// `VMRUN` carries only `RAX`/`RSP`/`RIP`/`RFLAGS` through the VMCB; the
+    /// other 14 GPRs are shared with the host. This shell loads them from
+    /// `*gprs` before `vmrun` and stores the guest's values back after, so the
+    /// guest keeps register state across an intercepted-and-resumed
+    /// instruction. `clgi`/`stgi` bracket the transition so no host interrupt
+    /// disturbs it; the CPU writes the exit reason into the VMCB control area,
+    /// which the caller reads.
+    ///
+    /// The `RDI`-held `gprs` pointer is pushed before the guest overwrites RDI,
+    /// then recovered from the stack after `#VMEXIT` (host `RSP` is restored by
+    /// `VMRUN`). `RBX`/`RBP` are LLVM-reserved and hand-preserved; the other
+    /// GPRs are marked clobbered. The stack is balanced (three pushes, three
+    /// pops).
     ///
     /// # Safety
     ///
     /// `vmcb_pa` must be a `VMRUN`-ready VMCB with SVM enabled and
-    /// `VM_HSAVE_PA` programmed (see [`run_boot_guest_loop`]).
-    unsafe fn vmrun(vmcb_pa: u64) {
+    /// `VM_HSAVE_PA` programmed (see [`run_boot_guest_loop`]); `gprs` must point
+    /// at a live [`GuestGprs`](super::GuestGprs).
+    unsafe fn vmrun(vmcb_pa: u64, gprs: *mut super::GuestGprs) {
         unsafe {
             core::arch::asm!(
-                // rbx/rbp are reserved by LLVM and cannot be clobber operands,
-                // so preserve rbx across the guest by hand (rbp is untouched by
-                // these guests). The guest runs on its own VMCB RSP, so the
-                // host stack — and this saved rbx — survive the transition.
-                "push rbx",
+                "push rbx",             // preserve host rbx (callee-saved)
+                "push rbp",             // preserve host rbp (callee-saved)
+                "push rdi",             // keep the gprs pointer across VMRUN
+                // Load guest GPRs from *gprs (rdi); load rbp and rdi last since
+                // rdi still holds the struct pointer for the earlier loads.
+                "mov rbx, [rdi + 0x00]",
+                "mov rcx, [rdi + 0x08]",
+                "mov rdx, [rdi + 0x10]",
+                "mov rsi, [rdi + 0x18]",
+                "mov rbp, [rdi + 0x28]",
+                "mov r8,  [rdi + 0x30]",
+                "mov r9,  [rdi + 0x38]",
+                "mov r10, [rdi + 0x40]",
+                "mov r11, [rdi + 0x48]",
+                "mov r12, [rdi + 0x50]",
+                "mov r13, [rdi + 0x58]",
+                "mov r14, [rdi + 0x60]",
+                "mov r15, [rdi + 0x68]",
+                "mov rdi, [rdi + 0x20]", // guest rdi last (pointer now on stack)
                 "clgi",
                 "vmrun rax",
                 "stgi",
-                "pop rbx",
+                // Guest GPRs are live in the registers. Recover the struct
+                // pointer from the stack into rax (host rax is dead here) and
+                // store the guest values back.
+                "pop rax",
+                "mov [rax + 0x00], rbx",
+                "mov [rax + 0x08], rcx",
+                "mov [rax + 0x10], rdx",
+                "mov [rax + 0x18], rsi",
+                "mov [rax + 0x20], rdi",
+                "mov [rax + 0x28], rbp",
+                "mov [rax + 0x30], r8",
+                "mov [rax + 0x38], r9",
+                "mov [rax + 0x40], r10",
+                "mov [rax + 0x48], r11",
+                "mov [rax + 0x50], r12",
+                "mov [rax + 0x58], r13",
+                "mov [rax + 0x60], r14",
+                "mov [rax + 0x68], r15",
+                "pop rbp",              // restore host rbp
+                "pop rbx",              // restore host rbx
                 inout("rax") vmcb_pa => _,
+                inout("rdi") gprs => _,
                 out("rcx") _,
                 out("rdx") _,
                 out("rsi") _,
-                out("rdi") _,
                 out("r8") _,
                 out("r9") _,
                 out("r10") _,
@@ -437,10 +542,15 @@ mod hw {
         /// Bound on total `VMRUN`s so a misbehaving guest cannot spin forever.
         const MAX_VMRUNS: u32 = 32;
 
+        // The guest's non-VMCB GPRs, carried across every VMRUN by the shell so
+        // register state survives an intercepted-and-resumed instruction.
+        // Starts zeroed; the guest sets what it uses.
+        let mut gprs = super::GuestGprs::default();
         let mut outcome = super::GuestRunOutcome::new();
         loop {
-            // SAFETY: the caller guarantees a VMRUN-ready VMCB with SVM on.
-            unsafe { vmrun(vmcb_pa) };
+            // SAFETY: the caller guarantees a VMRUN-ready VMCB with SVM on, and
+            // `gprs` is a live local.
+            unsafe { vmrun(vmcb_pa, &raw mut gprs) };
             outcome.vmruns += 1;
 
             // The VMCB is identity-mapped and exclusively owned (leaked by
@@ -500,6 +610,34 @@ mod hw {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_gprs_layout_is_stable_for_the_asm_shell() {
+        use core::mem::{offset_of, size_of};
+        // The run shell's inline asm indexes GuestGprs by these fixed offsets;
+        // this test is the contract that pins them.
+        assert_eq!(offset_of!(GuestGprs, rbx), 0x00);
+        assert_eq!(offset_of!(GuestGprs, rcx), 0x08);
+        assert_eq!(offset_of!(GuestGprs, rdx), 0x10);
+        assert_eq!(offset_of!(GuestGprs, rsi), 0x18);
+        assert_eq!(offset_of!(GuestGprs, rdi), 0x20);
+        assert_eq!(offset_of!(GuestGprs, rbp), 0x28);
+        assert_eq!(offset_of!(GuestGprs, r8), 0x30);
+        assert_eq!(offset_of!(GuestGprs, r9), 0x38);
+        assert_eq!(offset_of!(GuestGprs, r10), 0x40);
+        assert_eq!(offset_of!(GuestGprs, r11), 0x48);
+        assert_eq!(offset_of!(GuestGprs, r12), 0x50);
+        assert_eq!(offset_of!(GuestGprs, r13), 0x58);
+        assert_eq!(offset_of!(GuestGprs, r14), 0x60);
+        assert_eq!(offset_of!(GuestGprs, r15), 0x68);
+        assert_eq!(size_of::<GuestGprs>(), 0x70);
+    }
+
+    #[test]
+    fn guest_expected_out_is_the_low_byte_of_the_stash() {
+        assert_eq!(GUEST_EXPECTED_OUT, 0x34);
+        assert_eq!(u16::from(GUEST_EXPECTED_OUT), GUEST_BX_STASH & 0xFF);
+    }
 
     #[test]
     fn unsupported_when_cpuid_bit_clear() {
