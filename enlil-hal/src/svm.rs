@@ -525,6 +525,56 @@ pub const fn ioio_to_vmexit(info: IoioExitInfo, rax: u32) -> Option<crate::VmExi
     }
 }
 
+// ---------------------------------------------------------------------------
+// I/O permissions map (IOPM)
+// ---------------------------------------------------------------------------
+
+/// Size of the SVM I/O permissions map: 12 KiB (three 4 KiB pages), APM
+/// §15.10.1.
+///
+/// The map is a bitmap of the 65536 ports (8 KiB) plus a guard tail so a
+/// multi-byte access near port `0xFFFF` cannot read past the region. A set bit
+/// means "intercept this port"; `IOPM_BASE_PA` in the VMCB points at it and the
+/// `IOIO_PROT` intercept ([`intercept1::IOIO_PROT`]) arms the check.
+pub const IOPM_SIZE: usize = 3 * 4096;
+
+/// The `(byte index, bit mask)` of `port` in the IOPM bitmap — bit `port`, i.e.
+/// byte `port / 8`, bit `port % 8` (APM §15.10.1).
+#[must_use]
+pub const fn iopm_bit(port: u16) -> (usize, u8) {
+    let p = port as usize;
+    (p / 8, 1u8 << (p % 8))
+}
+
+/// Set the intercept bit for `port` in the IOPM `map`, so a guest access to it
+/// takes an `IOIO` #VMEXIT. No-op if `map` is too short to hold the bit.
+pub fn set_iopm_intercept(map: &mut [u8], port: u16) {
+    let (byte, mask) = iopm_bit(port);
+    if let Some(cell) = map.get_mut(byte) {
+        *cell |= mask;
+    }
+}
+
+/// Whether `port` is currently intercepted in the IOPM `map` (bit set). A
+/// too-short map reads as not-intercepted.
+#[must_use]
+pub fn iopm_intercepts(map: &[u8], port: u16) -> bool {
+    let (byte, mask) = iopm_bit(port);
+    map.get(byte).is_some_and(|&cell| cell & mask != 0)
+}
+
+/// Arm port-I/O interception on a programmed VMCB.
+///
+/// Sets the `IOIO_PROT` intercept bit (preserving the other misc-1 intercepts)
+/// and points `IOPM_BASE_PA` at `iopm_base_pa` (the physical base of an
+/// [`IOPM_SIZE`] permissions map). With this set, a guest port access whose
+/// IOPM bit is set takes an [`IOIO`](exit_code::IOIO) #VMEXIT.
+pub fn enable_io_intercept(region: &mut [u8], iopm_base_pa: u64) {
+    let misc1 = get_u32(region, control::INTERCEPT_MISC1) | intercept1::IOIO_PROT;
+    put_u32(region, control::INTERCEPT_MISC1, misc1);
+    put_u64(region, control::IOPM_BASE_PA, iopm_base_pa);
+}
+
 /// Map a #VMEXIT code that needs no further VMCB reads onto the arch-neutral
 /// [`VmExit`](crate::VmExit).
 ///
@@ -1068,6 +1118,51 @@ mod tests {
         assert!(outs.is_string());
         assert!(outs.is_rep());
         assert_eq!(ioio_to_vmexit(outs, 0), None);
+    }
+
+    #[test]
+    fn iopm_bit_addresses_the_right_byte_and_bit() {
+        assert_eq!(iopm_bit(0), (0, 0b0000_0001));
+        assert_eq!(iopm_bit(7), (0, 0b1000_0000));
+        assert_eq!(iopm_bit(8), (1, 0b0000_0001));
+        assert_eq!(iopm_bit(0x80), (16, 0b0000_0001));
+        // Top port lands in the 8 KiB bitmap, inside the 12 KiB region.
+        assert_eq!(iopm_bit(0xFFFF), (8191, 0b1000_0000));
+    }
+
+    #[test]
+    fn set_and_query_iopm_intercept() {
+        let mut map = [0u8; IOPM_SIZE];
+        assert!(!iopm_intercepts(&map, 0x80));
+        set_iopm_intercept(&mut map, 0x80);
+        assert!(iopm_intercepts(&map, 0x80));
+        // Only that port's bit flipped; a neighbor in the same byte is clear.
+        assert!(!iopm_intercepts(&map, 0x81));
+        // A too-short map neither panics nor reports an intercept.
+        let mut tiny = [0u8; 4];
+        set_iopm_intercept(&mut tiny, 0xFFFF);
+        assert!(!iopm_intercepts(&tiny, 0xFFFF));
+    }
+
+    #[test]
+    fn enable_io_intercept_arms_ioio_without_disturbing_other_intercepts() {
+        let mut region = [0u8; VMCB_SIZE];
+        let setup = MinimalGuestSetup {
+            asid: 1,
+            nested_cr3: 0x2000,
+            entry_ip: 0,
+            code_base: 0x1000,
+            stack_pointer: 0,
+        };
+        program_minimal_hlt_guest(&mut region, &setup).unwrap();
+        enable_io_intercept(&mut region, 0x9_000);
+        let misc1 = get_u32(&region, control::INTERCEPT_MISC1);
+        assert_ne!(misc1 & intercept1::IOIO_PROT, 0);
+        // The minimal guest's HLT/SHUTDOWN/CPUID intercepts are preserved.
+        assert_ne!(misc1 & intercept1::HLT, 0);
+        assert_ne!(misc1 & intercept1::SHUTDOWN, 0);
+        assert_ne!(misc1 & intercept1::CPUID, 0);
+        assert_eq!(get_u64(&region, control::IOPM_BASE_PA), 0x9_000);
     }
 
     #[test]

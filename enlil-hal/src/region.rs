@@ -14,7 +14,7 @@
 //! above the HAL (LOCKED PRINCIPLE 2/3). It is `no_std` + `alloc`, so the same
 //! type serves the Linux dev host and the bare-metal kernel target.
 
-use crate::svm::{VMCB_SIZE, VmcbRegionError, init_vmcb_region};
+use crate::svm::{IOPM_SIZE, VMCB_SIZE, VmcbRegionError, init_vmcb_region};
 use crate::vmx::{VMX_REGION_SIZE, VmxRegionError, init_vmx_region};
 use alloc::alloc::{Layout, alloc_zeroed, dealloc};
 use core::ptr::NonNull;
@@ -219,6 +219,95 @@ impl HostSaveArea {
     }
 }
 
+/// A page-sized, 12 KiB, page-aligned block backing an [`IoPermissionsMap`].
+#[repr(C, align(4096))]
+struct IopmPages([u8; IOPM_SIZE]);
+
+/// The SVM I/O permissions map (IOPM) — 12 KiB (three 4 KiB pages), page-aligned,
+/// whose physical base goes in the VMCB `IOPM_BASE_PA` (AMD APM §15.10.1).
+///
+/// A set bit intercepts a port; [`intercept_all`](IoPermissionsMap::intercept_all)
+/// allocates a map with every port intercepted, and
+/// [`set_intercept`](IoPermissionsMap::set_intercept) arms an individual port on
+/// a zeroed map. The handle owns its 12 KiB and frees it on drop, so the map
+/// stays valid for exactly as long as the hypervisor holds it (LOCKED PRINCIPLE
+/// 2/3).
+pub struct IoPermissionsMap {
+    ptr: NonNull<u8>,
+}
+
+// SAFETY: like `PageRegion`, `IoPermissionsMap` uniquely owns its allocation
+// and holds only the owning pointer, so it is sound to move across threads.
+unsafe impl Send for IoPermissionsMap {}
+
+impl IoPermissionsMap {
+    /// The `Layout` the IOPM is allocated with (12 KiB, 4 KiB-aligned).
+    #[must_use]
+    const fn layout() -> Layout {
+        Layout::new::<IopmPages>()
+    }
+
+    /// Allocate a zeroed IOPM — every port *permitted* (no interception).
+    /// Arm ports with [`set_intercept`](Self::set_intercept).
+    ///
+    /// # Errors
+    ///
+    /// [`RegionError::OutOfMemory`] if the allocator is exhausted.
+    pub fn new() -> Result<Self, RegionError> {
+        // SAFETY: the layout has nonzero size (IOPM_SIZE).
+        let raw = unsafe { alloc_zeroed(Self::layout()) };
+        NonNull::new(raw)
+            .map(|ptr| Self { ptr })
+            .ok_or(RegionError::OutOfMemory)
+    }
+
+    /// Allocate an IOPM with **every** port intercepted (all bits set) — the
+    /// simplest map for a guest that should trap on any I/O.
+    ///
+    /// # Errors
+    ///
+    /// [`RegionError::OutOfMemory`] if the allocator is exhausted.
+    pub fn intercept_all() -> Result<Self, RegionError> {
+        let mut map = Self::new()?;
+        map.as_bytes_mut().fill(0xFF);
+        Ok(map)
+    }
+
+    /// Arm interception of a single `port`.
+    pub fn set_intercept(&mut self, port: u16) {
+        crate::svm::set_iopm_intercept(self.as_bytes_mut(), port);
+    }
+
+    /// The IOPM physical/linear base for the VMCB `IOPM_BASE_PA` field
+    /// (identity-mapped on the bare-metal kernel, so VA == PA).
+    #[must_use]
+    pub fn base_addr(&self) -> u64 {
+        self.ptr.as_ptr() as u64
+    }
+
+    /// The map as a byte slice.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8] {
+        // SAFETY: we own IOPM_SIZE valid, initialized (zeroed) bytes.
+        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), IOPM_SIZE) }
+    }
+
+    /// The map as a mutable byte slice.
+    #[must_use]
+    pub const fn as_bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: we own IOPM_SIZE valid bytes and hold `&mut self`.
+        unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), IOPM_SIZE) }
+    }
+}
+
+impl Drop for IoPermissionsMap {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` came from `alloc_zeroed` with exactly this layout and
+        // is freed once (Drop runs at most once).
+        unsafe { dealloc(self.ptr.as_ptr(), Self::layout()) };
+    }
+}
+
 /// Errors allocating or initializing a VMX/SVM region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegionError {
@@ -304,5 +393,25 @@ mod tests {
         let a = Vmcb::new().expect("a");
         let b = Vmcb::new().expect("b");
         assert_ne!(a.base_addr(), b.base_addr());
+    }
+
+    #[test]
+    fn iopm_intercept_all_sets_every_bit_and_is_aligned() {
+        let map = IoPermissionsMap::intercept_all().expect("allocate IOPM");
+        assert_eq!(map.as_bytes().len(), IOPM_SIZE);
+        assert!(map.base_addr().is_multiple_of(PAGE_SIZE as u64));
+        assert!(map.as_bytes().iter().all(|&b| b == 0xFF));
+        // Every port reads as intercepted.
+        assert!(crate::svm::iopm_intercepts(map.as_bytes(), 0x80));
+        assert!(crate::svm::iopm_intercepts(map.as_bytes(), 0xFFFF));
+    }
+
+    #[test]
+    fn iopm_new_is_zeroed_and_set_intercept_arms_one_port() {
+        let mut map = IoPermissionsMap::new().expect("allocate IOPM");
+        assert!(map.as_bytes().iter().all(|&b| b == 0));
+        map.set_intercept(0x3F8);
+        assert!(crate::svm::iopm_intercepts(map.as_bytes(), 0x3F8));
+        assert!(!crate::svm::iopm_intercepts(map.as_bytes(), 0x80));
     }
 }
