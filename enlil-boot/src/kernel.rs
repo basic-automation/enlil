@@ -304,7 +304,9 @@ mod hw {
     /// captured through the guest's port writes. The success lines keep the
     /// substrings the QEMU+OVMF harness asserts nightly.
     fn report_guest_run(serial: &SerialPort, run: &crate::svm::GuestRunOutcome) {
-        use crate::svm::{GUEST_IO_PORT, GUEST_MSR_PORT, GUEST_MSR_SENTINEL, RunStop};
+        use crate::svm::{
+            GUEST_HV_BIT_PORT, GUEST_IO_PORT, GUEST_MSR_PORT, GUEST_MSR_SENTINEL, RunStop,
+        };
         let mut vr = [0u8; 20];
         let mut cp = [0u8; 20];
         match run.stop {
@@ -334,6 +336,16 @@ mod hw {
                 {
                     serial.write_str(
                         "enlil kernel: svm: guest CPUID leaf 0 answered by enlil (vendor byte via GPR shell) — CPUID exit emulated\n",
+                    );
+                }
+                // The guest read CPUID.1:ECX[31] (hypervisor-present) after
+                // enlil's stealth and OUT it — a 0 proves the guest cannot see
+                // it runs under enlil (LOCKED PRINCIPLE 1), in-guest.
+                if let Some(out) = run.io_out_to(u16::from(GUEST_HV_BIT_PORT))
+                    && out == 0
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: guest sees hypervisor-present bit clear — CPUID stealth verified in-guest\n",
                     );
                 }
                 // The guest's OUT to the MSR port carried the sentinel enlil

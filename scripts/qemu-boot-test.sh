@@ -68,6 +68,9 @@ IOIO_LINE="IOIO exit-handling path end to end"
 # delivery. (The shell's guest→exit→guest path is covered by an earlier run's
 # BX-carry proof + the GuestGprs layout test.)
 CPUID_LINE="CPUID exit emulated"
+# Printed once the guest reads CPUID.1:ECX[31] after enlil's stealth and sees 0
+# — the in-guest proof that enlil hides the hypervisor-present bit.
+STEALTH_LINE="CPUID stealth verified in-guest"
 # Printed once enlil answers the guest's intercepted RDMSR: the guest reads the
 # intercepted MSR (enlil injects a sentinel, delivered via the GPR shell) and
 # OUTs its low byte, which matches the sentinel — proving MSR exit emulation.
@@ -207,11 +210,12 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$DISPATCH_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$IOIO_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$CPUID_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$STEALTH_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$MSR_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, IDT, x2APIC, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + MSR emulation, and GOP draw observed on serial"
+    echo "PASS: banner, kernel memory, heap, IDT, x2APIC, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR emulation, and GOP draw observed on serial"
     exit 0
 fi
 
-echo "FAIL: not all of banner/kernel-line/heap/idt/apic/svm/hsave/vmcb/vmrun/dispatch/ioio/cpuid/msr/gop observed (qemu rc=$QEMU_RC)"
+echo "FAIL: not all of banner/kernel-line/heap/idt/apic/svm/hsave/vmcb/vmrun/dispatch/ioio/cpuid/stealth/msr/gop observed (qemu rc=$QEMU_RC)"
 exit 1

@@ -84,6 +84,11 @@ pub const GUEST_IO_PORT: u8 = 0x80;
 /// [`GuestRunOutcome`].
 pub const GUEST_MSR_PORT: u8 = 0x81;
 
+/// The port the boot guest writes `CPUID.1:ECX[31]` (the hypervisor-present
+/// bit) to. With enlil's stealth it must read `0` — the in-guest proof that
+/// enlil hides itself (LOCKED PRINCIPLE 1).
+pub const GUEST_HV_BIT_PORT: u8 = 0x82;
+
 /// The MSR the boot guest reads to prove MSR interception. enlil intercepts it
 /// and injects [`GUEST_MSR_SENTINEL`] rather than the real value.
 pub const GUEST_MSR_NUMBER: u32 = 0x10;
@@ -497,6 +502,11 @@ mod hw {
         //   cpuid            0F A2           (intercepted → emulated)
         //   mov ax, bx       89 D8           (AX = emulated EBX low word)
         //   out 0x80, al     E6 80           (IOIO → captured at port 0x80)
+        //   mov ax, 1        B8 01 00        (EAX = 1 → CPUID leaf 1)
+        //   cpuid            0F A2           (intercepted → stealthed)
+        //   shr ecx, 31      66 C1 E9 1F     (ECX bit 0 = hypervisor-present)
+        //   mov ax, cx       89 C8
+        //   out 0x82, al     E6 82           (IOIO → 0 if enlil is hidden)
         //   mov ecx, 0x10    66 B9 10 00 00 00  (ECX = MSR number, full 32-bit)
         //   rdmsr            0F 32           (intercepted → sentinel injected)
         //   out 0x81, al     E6 81           (IOIO → captured at port 0x81)
@@ -505,26 +515,39 @@ mod hw {
         {
             let msr = GUEST_MSR_NUMBER.to_le_bytes();
             let bytes = code.as_bytes_mut();
-            bytes[0] = 0xB8; // mov ax, imm16
+            bytes[0] = 0xB8; // mov ax, 0
             bytes[1] = 0x00;
             bytes[2] = 0x00;
-            bytes[3] = 0x0F; // CPUID
+            bytes[3] = 0x0F; // CPUID (leaf 0)
             bytes[4] = 0xA2;
             bytes[5] = 0x89; // mov ax, bx
             bytes[6] = 0xD8;
             bytes[7] = 0xE6; // OUT imm8, AL
             bytes[8] = GUEST_IO_PORT;
-            bytes[9] = 0x66; // operand-size prefix (32-bit ECX)
-            bytes[10] = 0xB9; // mov ecx, imm32
-            bytes[11] = msr[0];
-            bytes[12] = msr[1];
-            bytes[13] = msr[2];
-            bytes[14] = msr[3];
-            bytes[15] = 0x0F; // RDMSR
-            bytes[16] = 0x32;
-            bytes[17] = 0xE6; // OUT imm8, AL
-            bytes[18] = super::GUEST_MSR_PORT;
-            bytes[19] = 0xF4; // HLT
+            bytes[9] = 0xB8; // mov ax, 1
+            bytes[10] = 0x01;
+            bytes[11] = 0x00;
+            bytes[12] = 0x0F; // CPUID (leaf 1)
+            bytes[13] = 0xA2;
+            bytes[14] = 0x66; // shr ecx, 31
+            bytes[15] = 0xC1;
+            bytes[16] = 0xE9;
+            bytes[17] = 0x1F;
+            bytes[18] = 0x89; // mov ax, cx
+            bytes[19] = 0xC8;
+            bytes[20] = 0xE6; // OUT imm8, AL
+            bytes[21] = super::GUEST_HV_BIT_PORT;
+            bytes[22] = 0x66; // operand-size prefix (32-bit ECX)
+            bytes[23] = 0xB9; // mov ecx, imm32
+            bytes[24] = msr[0];
+            bytes[25] = msr[1];
+            bytes[26] = msr[2];
+            bytes[27] = msr[3];
+            bytes[28] = 0x0F; // RDMSR
+            bytes[29] = 0x32;
+            bytes[30] = 0xE6; // OUT imm8, AL
+            bytes[31] = super::GUEST_MSR_PORT;
+            bytes[32] = 0xF4; // HLT
         }
         let guest_code_pa = code.base_addr();
         core::mem::forget(code); // the guest's RAM must persist
