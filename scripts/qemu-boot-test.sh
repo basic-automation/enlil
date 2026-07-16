@@ -54,6 +54,39 @@ VMCB_LINE="vmcb VMRUN-ready"
 # first instruction (HLT) takes a #VMEXIT back into the hypervisor — the second
 # live-boot sub-milestone: bare-metal enlil running a guest under nested SVM.
 VMRUN_LINE="guest #VMEXIT HLT"
+# Printed once the kernel drives the guest through the real #VMEXIT dispatch
+# loop: the guest runs CPUID (intercepted, skipped by the loop) then HLT, so it
+# executes more than one instruction with exits routed through the HAL model.
+DISPATCH_LINE="dispatch loop runs a multi-instruction guest"
+# Printed once the guest's OUT is decoded + emulated through the IOIO #VMEXIT
+# path and the captured byte read back — the exit-handling path proven end to
+# end (guest OUT 0x80 = 0x42).
+IOIO_LINE="IOIO exit-handling path end to end"
+# Printed once enlil answers the guest's intercepted CPUID: the guest reads
+# leaf-0 EBX (delivered via the GPR shell) and OUTs its low byte, which matches
+# the EBX enlil emulated — proving CPUID exit emulation + the shell's host→guest
+# delivery. (The shell's guest→exit→guest path is covered by an earlier run's
+# BX-carry proof + the GuestGprs layout test.)
+CPUID_LINE="CPUID exit emulated"
+# Printed once the guest reads CPUID.1:ECX[31] after enlil's stealth and sees 0
+# — the in-guest proof that enlil hides the hypervisor-present bit.
+STEALTH_LINE="CPUID stealth verified in-guest"
+# Printed once enlil answers the guest's intercepted RDMSR: the guest reads the
+# intercepted MSR (enlil injects a sentinel, delivered via the GPR shell) and
+# OUTs its low byte, which matches the sentinel — proving MSR exit emulation.
+MSR_LINE="MSR exit emulated"
+# Printed once the guest WRMSRs a value then RDMSRs it back: enlil shadows the
+# write (never touching hardware) and returns it, proving per-guest MSR-state
+# virtualization.
+MSRW_LINE="MSR write virtualized"
+# Printed once the guest reads an unmapped GPA, enlil catches the nested page
+# fault, demand-maps a page with a sentinel, and resumes — the guest reads the
+# sentinel back, proving NPF handling (the basis for demand paging / MMIO).
+NPF_LINE="nested page fault handled"
+# Printed once the guest runs a native arithmetic loop (a taken branch, no
+# #VMEXIT until the OUT) and produces the correct sum — proving near-native
+# guest execution under enlil.
+COMPUTE_LINE="near-native execution"
 # Printed once the kernel draws to the GOP framebuffer and reads a pixel back
 # — proves the framebuffer I/O backend is wired with the firmware gone.
 GOP_LINE="framebuffer draw ok"
@@ -186,10 +219,18 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$HSAVE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$VMCB_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$VMRUN_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$DISPATCH_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$IOIO_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$CPUID_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$STEALTH_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$MSR_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$MSRW_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$NPF_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$COMPUTE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, IDT, x2APIC, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT), and GOP draw observed on serial"
+    echo "PASS: banner, kernel memory, heap, IDT, x2APIC, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop, and GOP draw observed on serial"
     exit 0
 fi
 
-echo "FAIL: not all of banner/kernel-line/heap/idt/apic/svm/hsave/vmcb/vmrun/gop observed (qemu rc=$QEMU_RC)"
+echo "FAIL: not all of banner/kernel-line/heap/idt/apic/svm/hsave/vmcb/vmrun/dispatch/ioio/cpuid/stealth/msr/msrw/npf/compute/gop observed (qemu rc=$QEMU_RC)"
 exit 1

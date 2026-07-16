@@ -271,30 +271,19 @@ mod hw {
                         let mut c = [0u8; 18];
                         serial.write_str("enlil kernel: svm: vmcb VMRUN-ready (nCR3 ");
                         serial.write_str(format_u64_hex(ncr3, &mut a));
-                        serial.write_str(", guest hlt at ");
+                        serial.write_str(", guest code at GPA ");
                         serial.write_str(format_u64_hex(entry, &mut b));
                         serial.write_str(", vmcb ");
                         serial.write_str(format_u64_hex(vmcb, &mut c));
                         serial.write_str(")\n");
-                        // Run the guest with VMRUN — the second live-boot
-                        // sub-milestone — and route its exit through the HAL's
-                        // arch-neutral VmExit model (LOCKED PRINCIPLE 2).
+                        // Drive the guest through the real #VMEXIT dispatch loop
+                        // — the guest (in its own isolated RAM at GPA 0) runs
+                        // CPUID/RDMSR/OUT/HLT, all routed through the HAL's
+                        // arch-neutral model (LOCKED PRINCIPLE 2).
                         // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and
                         // `vmcb` is a VMRUN-ready VMCB from program_boot_vmcb.
-                        let exit = unsafe { crate::svm::run_boot_guest(vmcb) };
-                        let decoded = enlil_hal::svm::simple_svm_exit_to_vmexit(
-                            enlil_hal::svm::SvmExitCode::from_raw(exit),
-                        );
-                        if matches!(decoded, Some(enlil_hal::VmExit::Hlt)) {
-                            serial.write_str(
-                                "enlil kernel: svm: guest #VMEXIT HLT (VmExit::Hlt) — VMRUN runs a guest\n",
-                            );
-                        } else {
-                            let mut e = [0u8; 18];
-                            serial.write_str("enlil kernel: svm: guest #VMEXIT code ");
-                            serial.write_str(format_u64_hex(exit, &mut e));
-                            serial.write_str("\n");
-                        }
+                        let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                        report_guest_run(serial, &run);
                     }
                     None => serial.write_str("enlil kernel: svm: vmcb VMRUN-ready FAILED\n"),
                 }
@@ -302,6 +291,117 @@ mod hw {
             SvmStatus::Unsupported => serial.write_str("enlil kernel: svm: not supported by CPU\n"),
             SvmStatus::DisabledByFirmware => {
                 serial.write_str("enlil kernel: svm: disabled by firmware (VM_CR locked)\n");
+            }
+        }
+    }
+
+    /// Report what the guest #VMEXIT dispatch loop observed.
+    ///
+    /// On a clean `HLT`, this proves the loop ran the guest through more than
+    /// one instruction and answered each intercepted instruction: CPUID and
+    /// RDMSR emulated, their results delivered via the GPR shell, and both
+    /// captured through the guest's port writes. The success lines keep the
+    /// substrings the QEMU+OVMF harness asserts nightly.
+    fn report_guest_run(serial: &SerialPort, run: &crate::svm::GuestRunOutcome) {
+        use crate::svm::{
+            GUEST_COMPUTE_PORT, GUEST_COMPUTE_SUM, GUEST_HV_BIT_PORT, GUEST_IO_PORT,
+            GUEST_MSR_PORT, GUEST_MSR_SENTINEL, GUEST_MSR_W_PORT, GUEST_MSR_W_VALUE,
+            GUEST_NPF_PORT, GUEST_NPF_SENTINEL, RunStop,
+        };
+        let mut vr = [0u8; 20];
+        let mut cp = [0u8; 20];
+        match run.stop {
+            RunStop::Halted => {
+                serial.write_str("enlil kernel: svm: guest #VMEXIT HLT after ");
+                serial.write_str(format_u64(u64::from(run.vmruns), &mut vr));
+                serial.write_str(" VMRUNs (");
+                serial.write_str(format_u64(u64::from(run.cpuid_exits), &mut cp));
+                serial
+                    .write_str(" cpuid emulated) — dispatch loop runs a multi-instruction guest\n");
+                // The emulated port write proves the IOIO exit path end to end.
+                if let Some((port, data)) = run.last_io_out() {
+                    let mut p = [0u8; 18];
+                    let mut d = [0u8; 18];
+                    serial.write_str("enlil kernel: svm: guest OUT port ");
+                    serial.write_str(format_u64_hex(u64::from(port), &mut p));
+                    serial.write_str(" = ");
+                    serial.write_str(format_u64_hex(u64::from(data), &mut d));
+                    serial.write_str(" (emulated) — IOIO exit-handling path end to end\n");
+                }
+                // The guest's OUT to the CPUID port carried the EBX enlil
+                // emulated for leaf 0 (delivered via the GPR shell) — a match
+                // proves the CPUID exit was answered and reached the guest.
+                if let (Some(ebx), Some(out)) =
+                    (run.cpuid_leaf0_ebx, run.io_out_to(u16::from(GUEST_IO_PORT)))
+                    && out == ebx & 0xFF
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: guest CPUID leaf 0 answered by enlil (vendor byte via GPR shell) — CPUID exit emulated\n",
+                    );
+                }
+                // The guest read CPUID.1:ECX[31] (hypervisor-present) after
+                // enlil's stealth and OUT it — a 0 proves the guest cannot see
+                // it runs under enlil (LOCKED PRINCIPLE 1), in-guest.
+                if let Some(out) = run.io_out_to(u16::from(GUEST_HV_BIT_PORT))
+                    && out == 0
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: guest sees hypervisor-present bit clear — CPUID stealth verified in-guest\n",
+                    );
+                }
+                // The guest's OUT to the MSR port carried the sentinel enlil
+                // injected for the intercepted RDMSR — a match proves the MSR
+                // exit was answered and the spoofed value reached the guest.
+                if let Some(out) = run.io_out_to(u16::from(GUEST_MSR_PORT))
+                    && out == GUEST_MSR_SENTINEL & 0xFF
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: guest RDMSR answered by enlil (sentinel via GPR shell) — MSR exit emulated\n",
+                    );
+                }
+                // The guest WRMSR'd a value then RDMSR'd it back; enlil shadowed
+                // the write (never reaching hardware) and returned it — a match
+                // proves per-guest MSR-state virtualization.
+                if let Some(out) = run.io_out_to(u16::from(GUEST_MSR_W_PORT))
+                    && out == u32::from(GUEST_MSR_W_VALUE)
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: guest WRMSR shadowed + read back by enlil — MSR write virtualized\n",
+                    );
+                }
+                // The guest read an unmapped GPA; enlil caught the NPF,
+                // demand-mapped a page with a sentinel, and resumed. A matching
+                // OUT proves the fault was handled and the mapped page reached
+                // the guest — the basis for demand paging and MMIO.
+                if run.npf_exits > 0
+                    && let Some(out) = run.io_out_to(u16::from(GUEST_NPF_PORT))
+                    && out == u32::from(GUEST_NPF_SENTINEL)
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: guest NPF demand-mapped by enlil — nested page fault handled\n",
+                    );
+                }
+                // The guest ran a native arithmetic loop (a taken branch, no
+                // #VMEXIT) and OUT the correct sum — proving it executes real
+                // code at native speed under enlil.
+                if let Some(out) = run.io_out_to(u16::from(GUEST_COMPUTE_PORT))
+                    && out == u32::from(GUEST_COMPUTE_SUM)
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: guest native loop computed the right sum — near-native execution\n",
+                    );
+                }
+            }
+            RunStop::ShutDown => serial.write_str("enlil kernel: svm: guest SHUTDOWN\n"),
+            RunStop::Invalid => serial.write_str("enlil kernel: svm: guest INVALID state\n"),
+            RunStop::IterationCap => {
+                serial.write_str("enlil kernel: svm: guest hit VMRUN cap (runaway)\n");
+            }
+            RunStop::Unhandled => {
+                let mut e = [0u8; 18];
+                serial.write_str("enlil kernel: svm: guest #VMEXIT unhandled code ");
+                serial.write_str(format_u64_hex(run.final_exit, &mut e));
+                serial.write_str("\n");
             }
         }
     }

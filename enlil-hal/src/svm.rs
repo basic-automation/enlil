@@ -525,6 +525,126 @@ pub const fn ioio_to_vmexit(info: IoioExitInfo, rax: u32) -> Option<crate::VmExi
     }
 }
 
+// ---------------------------------------------------------------------------
+// I/O permissions map (IOPM)
+// ---------------------------------------------------------------------------
+
+/// Size of the SVM I/O permissions map: 12 KiB (three 4 KiB pages), APM
+/// §15.10.1.
+///
+/// The map is a bitmap of the 65536 ports (8 KiB) plus a guard tail so a
+/// multi-byte access near port `0xFFFF` cannot read past the region. A set bit
+/// means "intercept this port"; `IOPM_BASE_PA` in the VMCB points at it and the
+/// `IOIO_PROT` intercept ([`intercept1::IOIO_PROT`]) arms the check.
+pub const IOPM_SIZE: usize = 3 * 4096;
+
+/// The `(byte index, bit mask)` of `port` in the IOPM bitmap — bit `port`, i.e.
+/// byte `port / 8`, bit `port % 8` (APM §15.10.1).
+#[must_use]
+pub const fn iopm_bit(port: u16) -> (usize, u8) {
+    let p = port as usize;
+    (p / 8, 1u8 << (p % 8))
+}
+
+/// Set the intercept bit for `port` in the IOPM `map`, so a guest access to it
+/// takes an `IOIO` #VMEXIT. No-op if `map` is too short to hold the bit.
+pub fn set_iopm_intercept(map: &mut [u8], port: u16) {
+    let (byte, mask) = iopm_bit(port);
+    if let Some(cell) = map.get_mut(byte) {
+        *cell |= mask;
+    }
+}
+
+/// Whether `port` is currently intercepted in the IOPM `map` (bit set). A
+/// too-short map reads as not-intercepted.
+#[must_use]
+pub fn iopm_intercepts(map: &[u8], port: u16) -> bool {
+    let (byte, mask) = iopm_bit(port);
+    map.get(byte).is_some_and(|&cell| cell & mask != 0)
+}
+
+/// Arm port-I/O interception on a programmed VMCB.
+///
+/// Sets the `IOIO_PROT` intercept bit (preserving the other misc-1 intercepts)
+/// and points `IOPM_BASE_PA` at `iopm_base_pa` (the physical base of an
+/// [`IOPM_SIZE`] permissions map). With this set, a guest port access whose
+/// IOPM bit is set takes an [`IOIO`](exit_code::IOIO) #VMEXIT.
+pub fn enable_io_intercept(region: &mut [u8], iopm_base_pa: u64) {
+    let misc1 = get_u32(region, control::INTERCEPT_MISC1) | intercept1::IOIO_PROT;
+    put_u32(region, control::INTERCEPT_MISC1, misc1);
+    put_u64(region, control::IOPM_BASE_PA, iopm_base_pa);
+}
+
+// ---------------------------------------------------------------------------
+// MSR permissions map (MSRPM)
+// ---------------------------------------------------------------------------
+
+/// Size of the SVM MSR permissions map: 8 KiB (two 4 KiB pages), APM §15.11.
+///
+/// The map holds two bits per MSR — read (even) then write (odd) — for three
+/// MSR windows: `0x0000_0000..=0x0000_1FFF` at byte 0, `0xC000_0000..=0xC000_1FFF`
+/// at byte 0x800, and `0xC001_0000..=0xC001_1FFF` at byte 0x1000. A set bit
+/// intercepts that access; `MSRPM_BASE_PA` in the VMCB points at it and the
+/// `MSR_PROT` intercept ([`intercept1::MSR_PROT`]) arms the check.
+pub const MSRPM_SIZE: usize = 2 * 4096;
+
+/// The bit index of `msr`'s **read** permission in the MSRPM (its write bit is
+/// the next one), or `None` if `msr` is outside the three mapped windows.
+#[must_use]
+pub const fn msrpm_read_bit(msr: u32) -> Option<usize> {
+    let (region_byte, offset) = if msr <= 0x0000_1FFF {
+        (0usize, msr)
+    } else if msr >= 0xC000_0000 && msr <= 0xC000_1FFF {
+        (0x800, msr - 0xC000_0000)
+    } else if msr >= 0xC001_0000 && msr <= 0xC001_1FFF {
+        (0x1000, msr - 0xC001_0000)
+    } else {
+        return None;
+    };
+    Some(region_byte * 8 + (offset as usize) * 2)
+}
+
+/// Set the read and/or write intercept bits for `msr` in the MSRPM `map`.
+///
+/// A set bit makes a guest `RDMSR`/`WRMSR` of `msr` take an
+/// [`MSR`](exit_code::MSR) #VMEXIT. A no-op for an MSR outside the mapped
+/// windows or a map too short to hold the bit.
+pub fn set_msr_intercept(map: &mut [u8], msr: u32, read: bool, write: bool) {
+    let Some(bit) = msrpm_read_bit(msr) else {
+        return;
+    };
+    let byte = bit / 8;
+    if let Some(cell) = map.get_mut(byte) {
+        if read {
+            *cell |= 1 << (bit % 8);
+        }
+        if write {
+            *cell |= 1 << ((bit + 1) % 8);
+        }
+    }
+}
+
+/// Whether `msr`'s read access is currently intercepted in the MSRPM `map`.
+#[must_use]
+pub fn msr_read_intercepted(map: &[u8], msr: u32) -> bool {
+    msrpm_read_bit(msr).is_some_and(|bit| {
+        map.get(bit / 8)
+            .is_some_and(|&cell| cell & (1 << (bit % 8)) != 0)
+    })
+}
+
+/// Arm MSR interception on a programmed VMCB.
+///
+/// Sets the `MSR_PROT` intercept bit (preserving the other misc-1 intercepts)
+/// and points `MSRPM_BASE_PA` at `msrpm_base_pa` (the physical base of an
+/// [`MSRPM_SIZE`] permissions map). With this set, a guest `RDMSR`/`WRMSR` whose
+/// MSRPM bit is set takes an [`MSR`](exit_code::MSR) #VMEXIT.
+pub fn enable_msr_intercept(region: &mut [u8], msrpm_base_pa: u64) {
+    let misc1 = get_u32(region, control::INTERCEPT_MISC1) | intercept1::MSR_PROT;
+    put_u32(region, control::INTERCEPT_MISC1, misc1);
+    put_u64(region, control::MSRPM_BASE_PA, msrpm_base_pa);
+}
+
 /// Map a #VMEXIT code that needs no further VMCB reads onto the arch-neutral
 /// [`VmExit`](crate::VmExit).
 ///
@@ -542,6 +662,103 @@ pub const fn simple_svm_exit_to_vmexit(code: SvmExitCode) -> Option<crate::VmExi
         exit_code::HLT => Some(crate::VmExit::Hlt),
         exit_code::SHUTDOWN => Some(crate::VmExit::Shutdown),
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #VMEXIT dispatch-loop control
+// ---------------------------------------------------------------------------
+
+/// Length of the `CPUID` instruction in bytes (opcode `0F A2`).
+///
+/// The amount to advance guest `RIP` past an intercepted `CPUID` when the CPU
+/// does not save `NEXT_RIP` (NRIP-save absent — see [`resume_rip_after`]).
+pub const CPUID_INSN_LEN: u64 = 2;
+
+/// Resolve the guest `RIP` to resume at after emulating-and-skipping a
+/// fixed-length intercepted instruction.
+///
+/// The hardware-saved [`next_rip`] is authoritative when present (NRIP-save,
+/// [`SvmFeatures::has_nrip_save`]); the CPU leaves it `0` otherwise, and the
+/// caller falls back to `guest_rip + insn_len` for the known-length
+/// instructions the minimal loop skips (APM §15.9). Wrapping-add so a guest
+/// `RIP` near the top of the address space cannot panic.
+#[must_use]
+pub const fn resume_rip_after(next_rip: u64, guest_rip: u64, insn_len: u64) -> u64 {
+    if next_rip != 0 {
+        next_rip
+    } else {
+        guest_rip.wrapping_add(insn_len)
+    }
+}
+
+/// How enlil's minimal guest-run loop should treat a #VMEXIT: stop (and why),
+/// or resume the guest after emulating-and-skipping the intercepted
+/// instruction.
+///
+/// This is the single control-flow decision the [`run`-loop](exit_code) makes
+/// per exit — kept pure and host-tested here (the ISA seam, LOCKED PRINCIPLE
+/// 2) so the privileged `VMRUN` driver above it stays a thin dispatcher. The
+/// two resumable variants differ in how the loop advances RIP:
+/// [`Cpuid`](RunLoopExit::Cpuid) skips a fixed-length instruction via
+/// [`resume_rip_after`]; [`Io`](RunLoopExit::Io) advances to the `EXITINFO2`
+/// RIP the hardware saved past the `IN`/`OUT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunLoopExit {
+    /// Guest executed `HLT` — the minimal guest's expected clean stop.
+    Halted,
+    /// Guest triggered `SHUTDOWN` (triple fault) — stop without resetting the
+    /// host (the intercept is what keeps it contained).
+    ShutDown,
+    /// `VMRUN` reported [`INVALID`](exit_code::INVALID) guest state — a failed
+    /// consistency check; the loop must abort rather than re-`VMRUN`.
+    Invalid,
+    /// Intercepted `CPUID` (LOCKED PRINCIPLE 1) — emulate the stealth answer,
+    /// then resume past the fixed-length instruction.
+    Cpuid,
+    /// Intercepted port I/O — decode `EXITINFO1`/[`IoioExitInfo`], emulate the
+    /// access, then resume at the `EXITINFO2` RIP.
+    Io,
+    /// Intercepted `RDMSR`/`WRMSR` — the MSR number is in guest `RCX`, the
+    /// read/write direction in `EXITINFO1` ([`msr_exit_is_write`]); emulate the
+    /// stealth value, then resume past the fixed-length instruction.
+    Msr,
+    /// Nested page fault — the guest touched a guest-physical address the NPT
+    /// does not map. `EXITINFO1` is the fault error code ([`NptFaultInfo`]),
+    /// `EXITINFO2` the faulting guest-physical address; the caller maps the page
+    /// (demand paging) or emulates MMIO, then resumes *without* advancing RIP so
+    /// the faulting instruction re-executes.
+    Npf,
+    /// An exit the minimal loop does not route yet — stop and report the raw
+    /// code to the caller.
+    Unhandled,
+}
+
+/// Length of the `RDMSR`/`WRMSR` instructions in bytes (opcodes `0F 32`/`0F 30`).
+///
+/// The amount to advance guest `RIP` past an intercepted MSR access when the
+/// CPU does not save `NEXT_RIP` (see [`resume_rip_after`]).
+pub const MSR_INSN_LEN: u64 = 2;
+
+/// Classify a #VMEXIT code for the minimal guest-run loop (see
+/// [`RunLoopExit`]).
+///
+/// An [`INVALID`](exit_code::INVALID) code maps to [`RunLoopExit::Invalid`];
+/// `HLT`/`SHUTDOWN` to their terminal variants; `CPUID`/`IOIO`/`MSR` to their
+/// resumable variants; everything else to [`RunLoopExit::Unhandled`].
+#[must_use]
+pub const fn classify_run_loop_exit(code: SvmExitCode) -> RunLoopExit {
+    if code.is_invalid() {
+        return RunLoopExit::Invalid;
+    }
+    match code.raw() {
+        exit_code::HLT => RunLoopExit::Halted,
+        exit_code::SHUTDOWN => RunLoopExit::ShutDown,
+        exit_code::CPUID => RunLoopExit::Cpuid,
+        exit_code::IOIO => RunLoopExit::Io,
+        exit_code::MSR => RunLoopExit::Msr,
+        exit_code::NPF => RunLoopExit::Npf,
+        _ => RunLoopExit::Unhandled,
     }
 }
 
@@ -838,6 +1055,55 @@ pub fn set_guest_rip(region: &mut [u8], value: u64) {
     put_u64(region, save::RIP, value);
 }
 
+// ---------------------------------------------------------------------------
+// Event injection
+// ---------------------------------------------------------------------------
+
+/// `EVENTINJ` event types (VMCB control offset [`control::EVENT_INJ`], APM
+/// §15.20).
+pub mod event_type {
+    /// External (maskable) interrupt.
+    pub const EXTERNAL_INTERRUPT: u8 = 0;
+    /// Non-maskable interrupt.
+    pub const NMI: u8 = 2;
+    /// Hardware exception (fault/trap), e.g. `#PF`, `#GP`.
+    pub const EXCEPTION: u8 = 3;
+    /// Software interrupt (`INT n`).
+    pub const SOFTWARE_INTERRUPT: u8 = 4;
+}
+
+/// Encode a VMCB `EVENTINJ` value that injects `vector` of `event_type` into
+/// the guest on the next `VMRUN` (AMD APM Vol. 2 §15.20).
+///
+/// Layout: bits 7:0 vector, bits 10:8 type, bit 11 error-code-valid, bit 31
+/// valid, bits 63:32 error code. `error_code` is `Some` for the exceptions that
+/// push one (`#PF`, `#GP`, `#DF`, …) and `None` otherwise; the CPU delivers the
+/// event through the guest's IDT/IVT as if the hardware raised it — the
+/// mechanism for handing a guest a timer tick or a device interrupt.
+#[must_use]
+pub const fn encode_event_inj(vector: u8, event_type: u8, error_code: Option<u32>) -> u64 {
+    const VALID: u64 = 1 << 31;
+    const ERROR_CODE_VALID: u64 = 1 << 11;
+    let mut value = vector as u64 | ((event_type as u64 & 0x7) << 8) | VALID;
+    if let Some(ec) = error_code {
+        value |= ERROR_CODE_VALID | ((ec as u64) << 32);
+    }
+    value
+}
+
+/// Program the VMCB `EVENTINJ` field ([`control::EVENT_INJ`]) so the next
+/// `VMRUN` injects the encoded event (see [`encode_event_inj`]). Writing 0
+/// clears any pending injection.
+pub fn set_event_inj(region: &mut [u8], value: u64) {
+    put_u64(region, control::EVENT_INJ, value);
+}
+
+/// Read back the VMCB `EVENTINJ` field.
+#[must_use]
+pub fn event_inj(region: &[u8]) -> u64 {
+    get_u64(region, control::EVENT_INJ)
+}
+
 // Little-endian field accessors. The VMCB is always a full page here, so the
 // curated Appendix-B offsets are in bounds.
 
@@ -992,6 +1258,101 @@ mod tests {
     }
 
     #[test]
+    fn iopm_bit_addresses_the_right_byte_and_bit() {
+        assert_eq!(iopm_bit(0), (0, 0b0000_0001));
+        assert_eq!(iopm_bit(7), (0, 0b1000_0000));
+        assert_eq!(iopm_bit(8), (1, 0b0000_0001));
+        assert_eq!(iopm_bit(0x80), (16, 0b0000_0001));
+        // Top port lands in the 8 KiB bitmap, inside the 12 KiB region.
+        assert_eq!(iopm_bit(0xFFFF), (8191, 0b1000_0000));
+    }
+
+    #[test]
+    fn set_and_query_iopm_intercept() {
+        let mut map = [0u8; IOPM_SIZE];
+        assert!(!iopm_intercepts(&map, 0x80));
+        set_iopm_intercept(&mut map, 0x80);
+        assert!(iopm_intercepts(&map, 0x80));
+        // Only that port's bit flipped; a neighbor in the same byte is clear.
+        assert!(!iopm_intercepts(&map, 0x81));
+        // A too-short map neither panics nor reports an intercept.
+        let mut tiny = [0u8; 4];
+        set_iopm_intercept(&mut tiny, 0xFFFF);
+        assert!(!iopm_intercepts(&tiny, 0xFFFF));
+    }
+
+    #[test]
+    fn enable_io_intercept_arms_ioio_without_disturbing_other_intercepts() {
+        let mut region = [0u8; VMCB_SIZE];
+        let setup = MinimalGuestSetup {
+            asid: 1,
+            nested_cr3: 0x2000,
+            entry_ip: 0,
+            code_base: 0x1000,
+            stack_pointer: 0,
+        };
+        program_minimal_hlt_guest(&mut region, &setup).unwrap();
+        enable_io_intercept(&mut region, 0x9_000);
+        let misc1 = get_u32(&region, control::INTERCEPT_MISC1);
+        assert_ne!(misc1 & intercept1::IOIO_PROT, 0);
+        // The minimal guest's HLT/SHUTDOWN/CPUID intercepts are preserved.
+        assert_ne!(misc1 & intercept1::HLT, 0);
+        assert_ne!(misc1 & intercept1::SHUTDOWN, 0);
+        assert_ne!(misc1 & intercept1::CPUID, 0);
+        assert_eq!(get_u64(&region, control::IOPM_BASE_PA), 0x9_000);
+    }
+
+    #[test]
+    fn msrpm_read_bit_maps_the_three_windows() {
+        // Low window (byte 0): 2 bits per MSR.
+        assert_eq!(msrpm_read_bit(0x0000_0000), Some(0));
+        assert_eq!(msrpm_read_bit(0x0000_0001), Some(2));
+        // High window at byte 0x800 (bit 0x4000).
+        assert_eq!(msrpm_read_bit(0xC000_0000), Some(0x800 * 8));
+        assert_eq!(msrpm_read_bit(0xC000_0080), Some(0x800 * 8 + 0x80 * 2)); // EFER
+        // Extended window at byte 0x1000.
+        assert_eq!(msrpm_read_bit(0xC001_0000), Some(0x1000 * 8));
+        // Outside all three windows.
+        assert_eq!(msrpm_read_bit(0x0000_2000), None);
+        assert_eq!(msrpm_read_bit(0xC000_2000), None);
+    }
+
+    #[test]
+    fn set_and_query_msr_intercept() {
+        let mut map = [0u8; MSRPM_SIZE];
+        assert!(!msr_read_intercepted(&map, 0x10));
+        set_msr_intercept(&mut map, 0x10, true, false);
+        assert!(msr_read_intercepted(&map, 0x10));
+        // The write bit was not set; a neighbor MSR is untouched.
+        assert!(!msr_read_intercepted(&map, 0x11));
+        // Read + write both arm from a high-window MSR without panicking.
+        set_msr_intercept(&mut map, 0xC000_0100, true, true);
+        assert!(msr_read_intercepted(&map, 0xC000_0100));
+        // An out-of-window MSR is a no-op, not a panic.
+        set_msr_intercept(&mut map, 0xDEAD_BEEF, true, true);
+        assert!(!msr_read_intercepted(&map, 0xDEAD_BEEF));
+    }
+
+    #[test]
+    fn enable_msr_intercept_arms_msr_prot_without_disturbing_other_intercepts() {
+        let mut region = [0u8; VMCB_SIZE];
+        let setup = MinimalGuestSetup {
+            asid: 1,
+            nested_cr3: 0x2000,
+            entry_ip: 0,
+            code_base: 0x1000,
+            stack_pointer: 0,
+        };
+        program_minimal_hlt_guest(&mut region, &setup).unwrap();
+        enable_msr_intercept(&mut region, 0xA_000);
+        let misc1 = get_u32(&region, control::INTERCEPT_MISC1);
+        assert_ne!(misc1 & intercept1::MSR_PROT, 0);
+        assert_ne!(misc1 & intercept1::HLT, 0);
+        assert_ne!(misc1 & intercept1::CPUID, 0);
+        assert_eq!(get_u64(&region, control::MSRPM_BASE_PA), 0xA_000);
+    }
+
+    #[test]
     fn simple_exits_route_hlt_and_shutdown() {
         assert_eq!(
             simple_svm_exit_to_vmexit(SvmExitCode::from_raw(exit_code::HLT)),
@@ -1009,6 +1370,88 @@ mod tests {
             simple_svm_exit_to_vmexit(SvmExitCode::from_raw(exit_code::INVALID)),
             None
         );
+    }
+
+    #[test]
+    fn resume_rip_prefers_next_rip_else_advances() {
+        // NRIP-save present: NEXT_RIP is authoritative regardless of length.
+        assert_eq!(resume_rip_after(0x7C05, 0x7C00, CPUID_INSN_LEN), 0x7C05);
+        // NRIP-save absent (NEXT_RIP == 0): fall back to guest_rip + insn_len.
+        assert_eq!(resume_rip_after(0, 0x7C00, CPUID_INSN_LEN), 0x7C02);
+        // Wrapping-add cannot panic at the top of the address space.
+        assert_eq!(resume_rip_after(0, u64::MAX, 2), 1);
+    }
+
+    #[test]
+    fn classify_run_loop_exit_covers_the_control_flow() {
+        use exit_code::{CPUID, HLT, IOIO, SHUTDOWN};
+        assert_eq!(
+            classify_run_loop_exit(SvmExitCode::from_raw(HLT)),
+            RunLoopExit::Halted
+        );
+        assert_eq!(
+            classify_run_loop_exit(SvmExitCode::from_raw(SHUTDOWN)),
+            RunLoopExit::ShutDown
+        );
+        assert_eq!(
+            classify_run_loop_exit(SvmExitCode::from_raw(CPUID)),
+            RunLoopExit::Cpuid
+        );
+        assert_eq!(
+            classify_run_loop_exit(SvmExitCode::from_raw(IOIO)),
+            RunLoopExit::Io
+        );
+        assert_eq!(
+            classify_run_loop_exit(SvmExitCode::from_raw(exit_code::MSR)),
+            RunLoopExit::Msr
+        );
+        // Invalid guest state is distinct from an unrouted exit — the loop
+        // aborts rather than re-VMRUNs.
+        assert_eq!(
+            classify_run_loop_exit(SvmExitCode::from_raw(exit_code::INVALID)),
+            RunLoopExit::Invalid
+        );
+        // NPF is routed to demand-map the page; distinct from Invalid.
+        assert_eq!(
+            classify_run_loop_exit(SvmExitCode::from_raw(exit_code::NPF)),
+            RunLoopExit::Npf
+        );
+        // A genuinely-unrouted code (VMMCALL here) is Unhandled.
+        assert_eq!(
+            classify_run_loop_exit(SvmExitCode::from_raw(exit_code::VMMCALL)),
+            RunLoopExit::Unhandled
+        );
+    }
+
+    #[test]
+    fn event_inj_encodes_interrupts_and_exceptions() {
+        // A maskable interrupt, vector 0x20 (e.g. a timer), no error code.
+        let intr = encode_event_inj(0x20, event_type::EXTERNAL_INTERRUPT, None);
+        assert_eq!(intr & 0xFF, 0x20); // vector
+        assert_eq!((intr >> 8) & 0x7, u64::from(event_type::EXTERNAL_INTERRUPT));
+        assert_ne!(intr & (1 << 31), 0); // valid
+        assert_eq!(intr & (1 << 11), 0); // no error code
+        assert_eq!(intr >> 32, 0);
+
+        // A #GP (vector 13, exception) with an error code.
+        let gp = encode_event_inj(13, event_type::EXCEPTION, Some(0xABCD));
+        assert_eq!(gp & 0xFF, 13);
+        assert_eq!((gp >> 8) & 0x7, u64::from(event_type::EXCEPTION));
+        assert_ne!(gp & (1 << 31), 0);
+        assert_ne!(gp & (1 << 11), 0); // error code valid
+        assert_eq!(gp >> 32, 0xABCD);
+    }
+
+    #[test]
+    fn event_inj_round_trips_through_the_vmcb() {
+        let mut region = [0u8; VMCB_SIZE];
+        assert_eq!(event_inj(&region), 0);
+        let value = encode_event_inj(2, event_type::NMI, None);
+        set_event_inj(&mut region, value);
+        assert_eq!(event_inj(&region), value);
+        // Writing 0 clears a pending injection.
+        set_event_inj(&mut region, 0);
+        assert_eq!(event_inj(&region), 0);
     }
 
     #[test]
