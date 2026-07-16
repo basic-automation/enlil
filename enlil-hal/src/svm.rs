@@ -545,6 +545,85 @@ pub const fn simple_svm_exit_to_vmexit(code: SvmExitCode) -> Option<crate::VmExi
     }
 }
 
+// ---------------------------------------------------------------------------
+// #VMEXIT dispatch-loop control
+// ---------------------------------------------------------------------------
+
+/// Length of the `CPUID` instruction in bytes (opcode `0F A2`).
+///
+/// The amount to advance guest `RIP` past an intercepted `CPUID` when the CPU
+/// does not save `NEXT_RIP` (NRIP-save absent — see [`resume_rip_after`]).
+pub const CPUID_INSN_LEN: u64 = 2;
+
+/// Resolve the guest `RIP` to resume at after emulating-and-skipping a
+/// fixed-length intercepted instruction.
+///
+/// The hardware-saved [`next_rip`] is authoritative when present (NRIP-save,
+/// [`SvmFeatures::has_nrip_save`]); the CPU leaves it `0` otherwise, and the
+/// caller falls back to `guest_rip + insn_len` for the known-length
+/// instructions the minimal loop skips (APM §15.9). Wrapping-add so a guest
+/// `RIP` near the top of the address space cannot panic.
+#[must_use]
+pub const fn resume_rip_after(next_rip: u64, guest_rip: u64, insn_len: u64) -> u64 {
+    if next_rip != 0 {
+        next_rip
+    } else {
+        guest_rip.wrapping_add(insn_len)
+    }
+}
+
+/// How enlil's minimal guest-run loop should treat a #VMEXIT: stop (and why),
+/// or resume the guest after emulating-and-skipping the intercepted
+/// instruction.
+///
+/// This is the single control-flow decision the [`run`-loop](exit_code) makes
+/// per exit — kept pure and host-tested here (the ISA seam, LOCKED PRINCIPLE
+/// 2) so the privileged `VMRUN` driver above it stays a thin dispatcher. The
+/// two resumable variants differ in how the loop advances RIP:
+/// [`Cpuid`](RunLoopExit::Cpuid) skips a fixed-length instruction via
+/// [`resume_rip_after`]; [`Io`](RunLoopExit::Io) advances to the `EXITINFO2`
+/// RIP the hardware saved past the `IN`/`OUT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunLoopExit {
+    /// Guest executed `HLT` — the minimal guest's expected clean stop.
+    Halted,
+    /// Guest triggered `SHUTDOWN` (triple fault) — stop without resetting the
+    /// host (the intercept is what keeps it contained).
+    ShutDown,
+    /// `VMRUN` reported [`INVALID`](exit_code::INVALID) guest state — a failed
+    /// consistency check; the loop must abort rather than re-`VMRUN`.
+    Invalid,
+    /// Intercepted `CPUID` (LOCKED PRINCIPLE 1) — emulate the stealth answer,
+    /// then resume past the fixed-length instruction.
+    Cpuid,
+    /// Intercepted port I/O — decode `EXITINFO1`/[`IoioExitInfo`], emulate the
+    /// access, then resume at the `EXITINFO2` RIP.
+    Io,
+    /// An exit the minimal loop does not route yet — stop and report the raw
+    /// code to the caller.
+    Unhandled,
+}
+
+/// Classify a #VMEXIT code for the minimal guest-run loop (see
+/// [`RunLoopExit`]).
+///
+/// An [`INVALID`](exit_code::INVALID) code maps to [`RunLoopExit::Invalid`];
+/// `HLT`/`SHUTDOWN` to their terminal variants; `CPUID`/`IOIO` to their
+/// resumable variants; everything else to [`RunLoopExit::Unhandled`].
+#[must_use]
+pub const fn classify_run_loop_exit(code: SvmExitCode) -> RunLoopExit {
+    if code.is_invalid() {
+        return RunLoopExit::Invalid;
+    }
+    match code.raw() {
+        exit_code::HLT => RunLoopExit::Halted,
+        exit_code::SHUTDOWN => RunLoopExit::ShutDown,
+        exit_code::CPUID => RunLoopExit::Cpuid,
+        exit_code::IOIO => RunLoopExit::Io,
+        _ => RunLoopExit::Unhandled,
+    }
+}
+
 /// Decoded `EXITINFO1` for an [`NPF`](exit_code::NPF) exit — a page-fault
 /// error code (APM §15.25.6). `EXITINFO2` carries the faulting guest-physical
 /// address.
@@ -1008,6 +1087,48 @@ mod tests {
         assert_eq!(
             simple_svm_exit_to_vmexit(SvmExitCode::from_raw(exit_code::INVALID)),
             None
+        );
+    }
+
+    #[test]
+    fn resume_rip_prefers_next_rip_else_advances() {
+        // NRIP-save present: NEXT_RIP is authoritative regardless of length.
+        assert_eq!(resume_rip_after(0x7C05, 0x7C00, CPUID_INSN_LEN), 0x7C05);
+        // NRIP-save absent (NEXT_RIP == 0): fall back to guest_rip + insn_len.
+        assert_eq!(resume_rip_after(0, 0x7C00, CPUID_INSN_LEN), 0x7C02);
+        // Wrapping-add cannot panic at the top of the address space.
+        assert_eq!(resume_rip_after(0, u64::MAX, 2), 1);
+    }
+
+    #[test]
+    fn classify_run_loop_exit_covers_the_control_flow() {
+        use exit_code::{CPUID, HLT, IOIO, SHUTDOWN};
+        assert_eq!(
+            classify_run_loop_exit(SvmExitCode::from_raw(HLT)),
+            RunLoopExit::Halted
+        );
+        assert_eq!(
+            classify_run_loop_exit(SvmExitCode::from_raw(SHUTDOWN)),
+            RunLoopExit::ShutDown
+        );
+        assert_eq!(
+            classify_run_loop_exit(SvmExitCode::from_raw(CPUID)),
+            RunLoopExit::Cpuid
+        );
+        assert_eq!(
+            classify_run_loop_exit(SvmExitCode::from_raw(IOIO)),
+            RunLoopExit::Io
+        );
+        // Invalid guest state is distinct from an unrouted exit — the loop
+        // aborts rather than re-VMRUNs.
+        assert_eq!(
+            classify_run_loop_exit(SvmExitCode::from_raw(exit_code::INVALID)),
+            RunLoopExit::Invalid
+        );
+        // An NPF (not routed by the minimal loop yet) is Unhandled, not Invalid.
+        assert_eq!(
+            classify_run_loop_exit(SvmExitCode::from_raw(exit_code::NPF)),
+            RunLoopExit::Unhandled
         );
     }
 
