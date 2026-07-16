@@ -719,16 +719,26 @@ pub enum RunLoopExit {
     /// Intercepted port I/O — decode `EXITINFO1`/[`IoioExitInfo`], emulate the
     /// access, then resume at the `EXITINFO2` RIP.
     Io,
+    /// Intercepted `RDMSR`/`WRMSR` — the MSR number is in guest `RCX`, the
+    /// read/write direction in `EXITINFO1` ([`msr_exit_is_write`]); emulate the
+    /// stealth value, then resume past the fixed-length instruction.
+    Msr,
     /// An exit the minimal loop does not route yet — stop and report the raw
     /// code to the caller.
     Unhandled,
 }
 
+/// Length of the `RDMSR`/`WRMSR` instructions in bytes (opcodes `0F 32`/`0F 30`).
+///
+/// The amount to advance guest `RIP` past an intercepted MSR access when the
+/// CPU does not save `NEXT_RIP` (see [`resume_rip_after`]).
+pub const MSR_INSN_LEN: u64 = 2;
+
 /// Classify a #VMEXIT code for the minimal guest-run loop (see
 /// [`RunLoopExit`]).
 ///
 /// An [`INVALID`](exit_code::INVALID) code maps to [`RunLoopExit::Invalid`];
-/// `HLT`/`SHUTDOWN` to their terminal variants; `CPUID`/`IOIO` to their
+/// `HLT`/`SHUTDOWN` to their terminal variants; `CPUID`/`IOIO`/`MSR` to their
 /// resumable variants; everything else to [`RunLoopExit::Unhandled`].
 #[must_use]
 pub const fn classify_run_loop_exit(code: SvmExitCode) -> RunLoopExit {
@@ -740,6 +750,7 @@ pub const fn classify_run_loop_exit(code: SvmExitCode) -> RunLoopExit {
         exit_code::SHUTDOWN => RunLoopExit::ShutDown,
         exit_code::CPUID => RunLoopExit::Cpuid,
         exit_code::IOIO => RunLoopExit::Io,
+        exit_code::MSR => RunLoopExit::Msr,
         _ => RunLoopExit::Unhandled,
     }
 }
@@ -1333,6 +1344,10 @@ mod tests {
         assert_eq!(
             classify_run_loop_exit(SvmExitCode::from_raw(IOIO)),
             RunLoopExit::Io
+        );
+        assert_eq!(
+            classify_run_loop_exit(SvmExitCode::from_raw(exit_code::MSR)),
+            RunLoopExit::Msr
         );
         // Invalid guest state is distinct from an unrouted exit — the loop
         // aborts rather than re-VMRUNs.

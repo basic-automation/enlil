@@ -79,6 +79,36 @@ pub const fn vm_cr_clear_svmdis(vm_cr: u64) -> u64 {
 /// `OUT imm8, AL` takes an 8-bit port immediate.
 pub const GUEST_IO_PORT: u8 = 0x80;
 
+/// The port the boot guest writes the byte it read from an emulated MSR to —
+/// distinct from [`GUEST_IO_PORT`] so both the CPUID and MSR proofs survive in
+/// [`GuestRunOutcome`].
+pub const GUEST_MSR_PORT: u8 = 0x81;
+
+/// The MSR the boot guest reads to prove MSR interception. enlil intercepts it
+/// and injects [`GUEST_MSR_SENTINEL`] rather than the real value.
+pub const GUEST_MSR_NUMBER: u32 = 0x10;
+
+/// The `EAX` value enlil injects for a guest read of [`GUEST_MSR_NUMBER`] — a
+/// sentinel whose low byte the guest `OUT`s, proving the RDMSR was intercepted
+/// and the spoofed value reached the guest.
+pub const GUEST_MSR_SENTINEL: u32 = 0x5A;
+
+/// The stealth value enlil returns for a guest `RDMSR` of `msr`, or `None` to
+/// pass the real MSR through.
+///
+/// Minimal bare-metal MSR stealth (LOCKED PRINCIPLE 1): only the demo MSR
+/// [`GUEST_MSR_NUMBER`] is spoofed today (to `EDX:EAX = 0:sentinel`); the real
+/// per-MSR policy (offset TSC, hidden hypervisor MSRs, shadowed PMCs) converges
+/// with `enlil-core`'s stealth later (ROADMAP 6.2). Returns `(eax, edx)`.
+#[must_use]
+pub const fn stealth_msr_read(msr: u32) -> Option<(u32, u32)> {
+    if msr == GUEST_MSR_NUMBER {
+        Some((GUEST_MSR_SENTINEL, 0))
+    } else {
+        None
+    }
+}
+
 /// The four registers `CPUID` returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CpuidRegs {
@@ -198,9 +228,14 @@ pub struct GuestRunOutcome {
     pub cpuid_exits: u32,
     /// Intercepted port-I/O exits handled.
     pub io_exits: u32,
-    /// The last `OUT` the guest performed, as `(port, byte)` — the value enlil
-    /// captured through the arch-neutral `VmExit::IoOut`.
-    pub last_io_out: Option<(u16, u32)>,
+    /// Intercepted `RDMSR`/`WRMSR` exits handled.
+    pub msr_exits: u32,
+    /// The `(port, byte)` writes the guest performed, oldest first, up to
+    /// [`MAX_IO_OUTS`](Self::MAX_IO_OUTS) — each captured through the
+    /// arch-neutral `VmExit::IoOut`. Query with [`io_out_to`](Self::io_out_to).
+    pub io_outs: [(u16, u32); Self::MAX_IO_OUTS],
+    /// How many entries of [`io_outs`](Self::io_outs) are valid.
+    pub io_out_count: usize,
     /// The `EBX` enlil emulated for a guest `CPUID` leaf 0, if the guest ran
     /// one — the host vendor string's first word, delivered to the guest via
     /// the GPR shell. Lets the caller confirm the guest received exactly what
@@ -211,6 +246,9 @@ pub struct GuestRunOutcome {
 }
 
 impl GuestRunOutcome {
+    /// Cap on recorded port writes (a bring-up guest does only a handful).
+    pub const MAX_IO_OUTS: usize = 4;
+
     /// A fresh outcome before the first `VMRUN`.
     #[must_use]
     const fn new() -> Self {
@@ -219,9 +257,43 @@ impl GuestRunOutcome {
             vmruns: 0,
             cpuid_exits: 0,
             io_exits: 0,
-            last_io_out: None,
+            msr_exits: 0,
+            io_outs: [(0, 0); Self::MAX_IO_OUTS],
+            io_out_count: 0,
             cpuid_leaf0_ebx: None,
             final_exit: 0,
+        }
+    }
+
+    /// Record a guest `OUT` (dropped silently past the cap).
+    const fn record_io_out(&mut self, port: u16, data: u32) {
+        if self.io_out_count < Self::MAX_IO_OUTS {
+            self.io_outs[self.io_out_count] = (port, data);
+            self.io_out_count += 1;
+        }
+    }
+
+    /// The data of the last recorded `OUT` to `port`, or `None`.
+    #[must_use]
+    pub const fn io_out_to(&self, port: u16) -> Option<u32> {
+        let mut found = None;
+        let mut i = 0;
+        while i < self.io_out_count {
+            if self.io_outs[i].0 == port {
+                found = Some(self.io_outs[i].1);
+            }
+            i += 1;
+        }
+        found
+    }
+
+    /// The last recorded `OUT`, as `(port, data)`, or `None`.
+    #[must_use]
+    pub const fn last_io_out(&self) -> Option<(u16, u32)> {
+        if self.io_out_count == 0 {
+            None
+        } else {
+            Some(self.io_outs[self.io_out_count - 1])
         }
     }
 }
@@ -231,16 +303,17 @@ pub use hw::{enable_svm, program_boot_vmcb, program_host_save_area, run_boot_gue
 
 #[cfg(target_os = "uefi")]
 mod hw {
-    use super::GUEST_IO_PORT;
+    use super::{GUEST_IO_PORT, GUEST_MSR_NUMBER};
     use super::{
         HSAVE_PAGE_SIZE, MSR_EFER, MSR_VM_CR, MSR_VM_HSAVE_PA, SvmStatus, efer_with_svme,
         is_svm_enabled, is_valid_hsave_pa, svm_status, vm_cr_clear_svmdis,
     };
     use alloc::alloc::{Layout, alloc_zeroed};
     use enlil_hal::npt::build_identity_npt_2mib;
-    use enlil_hal::region::{IoPermissionsMap, PageRegion, Vmcb};
+    use enlil_hal::region::{IoPermissionsMap, MsrPermissionsMap, PageRegion, Vmcb};
     use enlil_hal::svm::{
-        MinimalGuestSetup, control, enable_io_intercept, program_minimal_hlt_guest,
+        MinimalGuestSetup, control, enable_io_intercept, enable_msr_intercept,
+        program_minimal_hlt_guest,
     };
 
     /// Read a 64-bit MSR.
@@ -402,33 +475,35 @@ mod hw {
     /// exercises the exit-handling path, returning `(vmcb_pa, ncr3,
     /// guest_code_pa)`.
     ///
-    /// The guest runs `CPUID` leaf 0, then `MOV AX,BX; OUT; HLT` — so the
-    /// dispatch loop routes all three exit classes (`CPUID` *emulated*, `IOIO`
-    /// decoded + emulated, `HLT` stop). enlil answers the intercepted `CPUID`
-    /// by running the host `CPUID`, stealthing it, and delivering `EBX` (the
-    /// vendor word) to the guest through the GPR shell; the guest then `OUT`s
-    /// `BL`, so a match against enlil's own emulated `EBX` proves both the
-    /// emulation and the shell's host→guest delivery. Assembled through the
-    /// `enlil-hal` layer with the firmware gone: the code page, a nested page
-    /// table identity-mapping the low gibibyte (so `GPA == SPA`), a [`Vmcb`]
-    /// programmed via [`program_minimal_hlt_guest`] then armed for port I/O
-    /// ([`enable_io_intercept`] + an intercept-all [`IoPermissionsMap`]). The
+    /// The guest exercises every routed exit class: it runs `CPUID` leaf 0 and
+    /// `OUT`s the emulated vendor byte, then `RDMSR` and `OUT`s the emulated MSR
+    /// byte, then `HLT`s — so the dispatch loop routes `CPUID` (emulated),
+    /// `IOIO` (twice), `MSR` (emulated), and `HLT`. enlil answers the CPUID by
+    /// running the host CPUID + stealthing it, and answers the RDMSR by
+    /// injecting a sentinel; both results reach the guest through the GPR shell,
+    /// and the two `OUT`s (to distinct ports) let the kernel confirm each. All
+    /// assembled through `enlil-hal`: the code page, a nested page table
+    /// identity-mapping the low gibibyte (so `GPA == SPA`), a [`Vmcb`] programmed
+    /// via [`program_minimal_hlt_guest`] then armed for port I/O
+    /// ([`enable_io_intercept`] + an intercept-all [`IoPermissionsMap`]) and MSR
+    /// access ([`enable_msr_intercept`] + an [`MsrPermissionsMap`]). The
     /// nested-CR3 is read back to prove the write landed. All allocations are
     /// leaked — they must outlive the `VMRUN`. Returns `None` if any allocation
     /// fails or the NPT/VMCB is malformed (none can happen here).
     #[must_use]
     pub fn program_boot_vmcb() -> Option<(u64, u64, u64)> {
-        // Guest code page (real-mode, 16-bit): request CPUID leaf 0, then copy
-        // the emulated BX (vendor word) into AX and OUT its low byte. AX starts
-        // 0 (guest RAX = 0), so `mov ax, 0` is unneeded — but kept explicit for
-        // clarity that leaf 0 is requested.
-        //   mov ax, 0        B8 00 00  (EAX = 0 → CPUID leaf 0)
-        //   cpuid            0F A2     (intercepted → emulated by the loop)
-        //   mov ax, bx       89 D8     (AX = emulated EBX low word)
-        //   out 0x80, al     E6 80     (IOIO #VMEXIT → decoded + emulated)
-        //   hlt              F4        (clean stop)
+        // Guest code page (real-mode, 16-bit):
+        //   mov ax, 0        B8 00 00        (EAX = 0 → CPUID leaf 0)
+        //   cpuid            0F A2           (intercepted → emulated)
+        //   mov ax, bx       89 D8           (AX = emulated EBX low word)
+        //   out 0x80, al     E6 80           (IOIO → captured at port 0x80)
+        //   mov ecx, 0x10    66 B9 10 00 00 00  (ECX = MSR number, full 32-bit)
+        //   rdmsr            0F 32           (intercepted → sentinel injected)
+        //   out 0x81, al     E6 81           (IOIO → captured at port 0x81)
+        //   hlt              F4              (clean stop)
         let mut code = PageRegion::new()?;
         {
+            let msr = GUEST_MSR_NUMBER.to_le_bytes();
             let bytes = code.as_bytes_mut();
             bytes[0] = 0xB8; // mov ax, imm16
             bytes[1] = 0x00;
@@ -439,7 +514,17 @@ mod hw {
             bytes[6] = 0xD8;
             bytes[7] = 0xE6; // OUT imm8, AL
             bytes[8] = GUEST_IO_PORT;
-            bytes[9] = 0xF4; // HLT
+            bytes[9] = 0x66; // operand-size prefix (32-bit ECX)
+            bytes[10] = 0xB9; // mov ecx, imm32
+            bytes[11] = msr[0];
+            bytes[12] = msr[1];
+            bytes[13] = msr[2];
+            bytes[14] = msr[3];
+            bytes[15] = 0x0F; // RDMSR
+            bytes[16] = 0x32;
+            bytes[17] = 0xE6; // OUT imm8, AL
+            bytes[18] = super::GUEST_MSR_PORT;
+            bytes[19] = 0xF4; // HLT
         }
         let guest_code_pa = code.base_addr();
         core::mem::forget(code); // the guest's RAM must persist
@@ -477,12 +562,21 @@ mod hw {
         }
 
         // Arm port-I/O interception so the guest's OUT takes an IOIO #VMEXIT.
-        // The guest loads AL itself (from BX), so no RAX preload is needed. The
-        // IOPM intercepts every port; it is leaked so it outlives the VMRUN the
-        // CPU checks it against.
+        // The guest loads AL itself, so no RAX preload is needed. The IOPM
+        // intercepts every port; it is leaked so it outlives the VMRUN the CPU
+        // checks it against.
         let iopm = IoPermissionsMap::intercept_all().ok()?;
         enable_io_intercept(vmcb.as_bytes_mut(), iopm.base_addr());
         core::mem::forget(iopm);
+
+        // Arm MSR interception for the one MSR the guest reads, so its RDMSR
+        // takes an MSR #VMEXIT enlil answers with a sentinel. Only that MSR is
+        // intercepted, so nothing else the guest might touch traps. Leaked to
+        // outlive VMRUN.
+        let mut msrpm = MsrPermissionsMap::new().ok()?;
+        msrpm.set_intercept(GUEST_MSR_NUMBER, true, false);
+        enable_msr_intercept(vmcb.as_bytes_mut(), msrpm.base_addr());
+        core::mem::forget(msrpm);
 
         let vmcb_pa = vmcb.base_addr();
         core::mem::forget(vmcb); // the VMCB must outlive this call for VMRUN
@@ -607,9 +701,10 @@ mod hw {
     pub unsafe fn run_boot_guest_loop(vmcb_pa: u64) -> super::GuestRunOutcome {
         use enlil_hal::VmExit;
         use enlil_hal::svm::{
-            CPUID_INSN_LEN, IoioExitInfo, RunLoopExit, VMCB_SIZE, classify_run_loop_exit,
-            exit_code, exit_info_1, exit_info_2, guest_rax, guest_rip, ioio_to_vmexit, next_rip,
-            resume_rip_after, set_guest_rax, set_guest_rip,
+            CPUID_INSN_LEN, IoioExitInfo, MSR_INSN_LEN, RunLoopExit, VMCB_SIZE,
+            classify_run_loop_exit, exit_code, exit_info_1, exit_info_2, guest_rax, guest_rip,
+            ioio_to_vmexit, msr_exit_is_write, next_rip, resume_rip_after, set_guest_rax,
+            set_guest_rip,
         };
 
         /// Bound on total `VMRUN`s so a misbehaving guest cannot spin forever.
@@ -679,10 +774,26 @@ mod hw {
                     // first makes the narrowing total (never truncating).
                     let rax = u32::try_from(guest_rax(vmcb) & 0xFFFF_FFFF).unwrap_or(0);
                     if let Some(VmExit::IoOut { port, data, .. }) = ioio_to_vmexit(info, rax) {
-                        outcome.last_io_out = Some((port, data));
+                        outcome.record_io_out(port, data);
                     }
                     // EXITINFO2 carries the RIP just past the IN/OUT.
                     set_guest_rip(vmcb, exit_info_2(vmcb));
+                }
+                RunLoopExit::Msr => {
+                    outcome.msr_exits += 1;
+                    // MSR number is in guest ECX (via the shell); EXITINFO1 bit 0
+                    // is write(1)/read(0). Answer a RDMSR with our stealth value
+                    // (LOCKED PRINCIPLE 1) — EAX via the VMCB, EDX via the shell.
+                    // A WRMSR is swallowed (the guest cannot change host MSRs).
+                    let msr = u32::try_from(gprs.rcx & 0xFFFF_FFFF).unwrap_or(0);
+                    if !msr_exit_is_write(exit_info_1(vmcb))
+                        && let Some((eax, edx)) = super::stealth_msr_read(msr)
+                    {
+                        set_guest_rax(vmcb, u64::from(eax));
+                        gprs.rdx = u64::from(edx);
+                    }
+                    let rip = resume_rip_after(next_rip(vmcb), guest_rip(vmcb), MSR_INSN_LEN);
+                    set_guest_rip(vmcb, rip);
                 }
             }
 
@@ -747,6 +858,30 @@ mod tests {
         };
         assert_eq!(sanitize_cpuid(0x4000_0000, raw), CpuidRegs::default());
         assert_eq!(sanitize_cpuid(0x4000_00FF, raw), CpuidRegs::default());
+    }
+
+    #[test]
+    fn stealth_msr_read_spoofs_only_the_demo_msr() {
+        assert_eq!(
+            stealth_msr_read(GUEST_MSR_NUMBER),
+            Some((GUEST_MSR_SENTINEL, 0))
+        );
+        // Any other MSR passes through (None → the loop does not inject).
+        assert_eq!(stealth_msr_read(0x1B), None);
+        assert_eq!(stealth_msr_read(0xC000_0080), None);
+    }
+
+    #[test]
+    fn io_out_log_records_and_queries_by_port() {
+        let mut o = GuestRunOutcome::new();
+        assert_eq!(o.last_io_out(), None);
+        o.record_io_out(0x80, 0x41);
+        o.record_io_out(0x81, 0x5A);
+        assert_eq!(o.io_out_count, 2);
+        assert_eq!(o.io_out_to(0x80), Some(0x41));
+        assert_eq!(o.io_out_to(0x81), Some(0x5A));
+        assert_eq!(o.io_out_to(0x99), None);
+        assert_eq!(o.last_io_out(), Some((0x81, 0x5A)));
     }
 
     #[test]

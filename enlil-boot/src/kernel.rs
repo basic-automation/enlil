@@ -298,12 +298,13 @@ mod hw {
 
     /// Report what the guest #VMEXIT dispatch loop observed.
     ///
-    /// On a clean `HLT` after emulating the intercepted `CPUID` and the guest's
-    /// `OUT`, this proves the loop re-`VMRUN`ed the guest through more than one
-    /// instruction, answered its CPUID, and routed its port I/O end to end. The
-    /// success lines keep the substrings the QEMU+OVMF harness asserts nightly.
+    /// On a clean `HLT`, this proves the loop ran the guest through more than
+    /// one instruction and answered each intercepted instruction: CPUID and
+    /// RDMSR emulated, their results delivered via the GPR shell, and both
+    /// captured through the guest's port writes. The success lines keep the
+    /// substrings the QEMU+OVMF harness asserts nightly.
     fn report_guest_run(serial: &SerialPort, run: &crate::svm::GuestRunOutcome) {
-        use crate::svm::RunStop;
+        use crate::svm::{GUEST_IO_PORT, GUEST_MSR_PORT, GUEST_MSR_SENTINEL, RunStop};
         let mut vr = [0u8; 20];
         let mut cp = [0u8; 20];
         match run.stop {
@@ -315,7 +316,7 @@ mod hw {
                 serial
                     .write_str(" cpuid emulated) — dispatch loop runs a multi-instruction guest\n");
                 // The emulated port write proves the IOIO exit path end to end.
-                if let Some((port, data)) = run.last_io_out {
+                if let Some((port, data)) = run.last_io_out() {
                     let mut p = [0u8; 18];
                     let mut d = [0u8; 18];
                     serial.write_str("enlil kernel: svm: guest OUT port ");
@@ -323,17 +324,27 @@ mod hw {
                     serial.write_str(" = ");
                     serial.write_str(format_u64_hex(u64::from(data), &mut d));
                     serial.write_str(" (emulated) — IOIO exit-handling path end to end\n");
-                    // The guest read that byte from BX = the EBX enlil emulated
-                    // for CPUID leaf 0 and delivered via the GPR shell. A match
-                    // proves the CPUID exit was answered by enlil and the result
-                    // reached the guest (the shell's host→guest path).
-                    if let Some(ebx) = run.cpuid_leaf0_ebx
-                        && data == ebx & 0xFF
-                    {
-                        serial.write_str(
-                            "enlil kernel: svm: guest CPUID leaf 0 answered by enlil (vendor byte via GPR shell) — CPUID exit emulated\n",
-                        );
-                    }
+                }
+                // The guest's OUT to the CPUID port carried the EBX enlil
+                // emulated for leaf 0 (delivered via the GPR shell) — a match
+                // proves the CPUID exit was answered and reached the guest.
+                if let (Some(ebx), Some(out)) =
+                    (run.cpuid_leaf0_ebx, run.io_out_to(u16::from(GUEST_IO_PORT)))
+                    && out == ebx & 0xFF
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: guest CPUID leaf 0 answered by enlil (vendor byte via GPR shell) — CPUID exit emulated\n",
+                    );
+                }
+                // The guest's OUT to the MSR port carried the sentinel enlil
+                // injected for the intercepted RDMSR — a match proves the MSR
+                // exit was answered and the spoofed value reached the guest.
+                if let Some(out) = run.io_out_to(u16::from(GUEST_MSR_PORT))
+                    && out == GUEST_MSR_SENTINEL & 0xFF
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: guest RDMSR answered by enlil (sentinel via GPR shell) — MSR exit emulated\n",
+                    );
                 }
             }
             RunStop::ShutDown => serial.write_str("enlil kernel: svm: guest SHUTDOWN\n"),
