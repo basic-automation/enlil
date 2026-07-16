@@ -298,9 +298,10 @@ mod hw {
 
     /// Report what the guest #VMEXIT dispatch loop observed.
     ///
-    /// On a clean `HLT` after skipping the intercepted `CPUID`, this proves the
-    /// loop re-`VMRUN`ed the guest through more than one instruction. The
-    /// success line keeps the substring the QEMU+OVMF harness asserts nightly.
+    /// On a clean `HLT` after skipping the intercepted `CPUID` and emulating
+    /// the guest's `OUT`, this proves the loop re-`VMRUN`ed the guest through
+    /// more than one instruction and routed its port I/O end to end. The
+    /// success lines keep the substrings the QEMU+OVMF harness asserts nightly.
     fn report_guest_run(serial: &SerialPort, run: &crate::svm::GuestRunOutcome) {
         use crate::svm::RunStop;
         let mut vr = [0u8; 20];
@@ -313,6 +314,16 @@ mod hw {
                 serial.write_str(format_u64(u64::from(run.cpuid_exits), &mut cp));
                 serial
                     .write_str(" cpuid skipped) — dispatch loop runs a multi-instruction guest\n");
+                // The emulated port write proves the IOIO exit path end to end.
+                if let Some((port, data)) = run.last_io_out {
+                    let mut p = [0u8; 18];
+                    let mut d = [0u8; 18];
+                    serial.write_str("enlil kernel: svm: guest OUT port ");
+                    serial.write_str(format_u64_hex(u64::from(port), &mut p));
+                    serial.write_str(" = ");
+                    serial.write_str(format_u64_hex(u64::from(data), &mut d));
+                    serial.write_str(" (emulated) — IOIO exit-handling path end to end\n");
+                }
             }
             RunStop::ShutDown => serial.write_str("enlil kernel: svm: guest SHUTDOWN\n"),
             RunStop::Invalid => serial.write_str("enlil kernel: svm: guest INVALID state\n"),

@@ -136,8 +136,18 @@ mod hw {
     };
     use alloc::alloc::{Layout, alloc_zeroed};
     use enlil_hal::npt::build_identity_npt_2mib;
-    use enlil_hal::region::{PageRegion, Vmcb};
-    use enlil_hal::svm::{MinimalGuestSetup, control, program_minimal_hlt_guest};
+    use enlil_hal::region::{IoPermissionsMap, PageRegion, Vmcb};
+    use enlil_hal::svm::{
+        MinimalGuestSetup, control, enable_io_intercept, program_minimal_hlt_guest, set_guest_rax,
+    };
+
+    /// The port the boot guest writes to prove the I/O exit path — an unused
+    /// legacy "POST" port so nothing else contends for it. A `u8` because
+    /// `OUT imm8, AL` takes an 8-bit port immediate.
+    pub(super) const GUEST_IO_PORT: u8 = 0x80;
+    /// The byte the boot guest sends to [`GUEST_IO_PORT`], preloaded into guest
+    /// `RAX` so its `OUT 0x80, AL` carries it.
+    pub(super) const GUEST_IO_BYTE: u8 = 0x42;
 
     /// Read a 64-bit MSR.
     ///
@@ -265,30 +275,35 @@ mod hw {
     const NPT_MAP_BYTES: u64 = 1024 * 1024 * 1024;
 
     /// Build a complete, `VMRUN`-ready VMCB for a minimal real-mode guest that
-    /// executes a single `HLT`, returning `(vmcb_pa, ncr3, guest_code_pa)`.
+    /// exercises the exit-handling path, returning `(vmcb_pa, ncr3,
+    /// guest_code_pa)`.
     ///
-    /// Every piece the second live-boot sub-milestone needs is assembled here
-    /// through the `enlil-hal` layer, with the firmware gone: a guest code page
-    /// holding a `HLT` (`0xF4`), a nested page table identity-mapping the low
-    /// gibibyte (so the guest's `GPA == SPA`), and a [`Vmcb`] programmed via
-    /// [`program_minimal_hlt_guest`] to enter that code under that NPT. The
-    /// programmed nested-CR3 is read straight back out of the VMCB to prove the
-    /// write landed. All three allocations are leaked — they must outlive this
-    /// call for the eventual `VMRUN`. Returns `None` if any allocation fails or
-    /// the NPT/VMCB is malformed (none can happen here). The `VMRUN` op that
-    /// actually runs this guest to `#VMEXIT(HLT)` is the next slice.
+    /// The guest runs three instructions — `CPUID`, `OUT 0x80, AL`, `HLT` — so
+    /// the dispatch loop routes all three exit classes: `CPUID` (intercepted
+    /// for stealth, skipped), `IOIO` (the `OUT`, decoded + emulated), and
+    /// `HLT` (the clean stop). Assembled through the `enlil-hal` layer with the
+    /// firmware gone: the code page, a nested page table identity-mapping the
+    /// low gibibyte (so `GPA == SPA`), a [`Vmcb`] programmed via
+    /// [`program_minimal_hlt_guest`] then armed for port I/O
+    /// ([`enable_io_intercept`] + an intercept-all [`IoPermissionsMap`]) with
+    /// guest `RAX` preloaded so `OUT` carries [`GUEST_IO_BYTE`]. The nested-CR3
+    /// is read back to prove the write landed. All allocations are leaked — they
+    /// must outlive the `VMRUN`. Returns `None` if any allocation fails or the
+    /// NPT/VMCB is malformed (none can happen here).
     #[must_use]
     pub fn program_boot_vmcb() -> Option<(u64, u64, u64)> {
-        // Guest code page: `CPUID` (0F A2) then `HLT` (F4). CPUID is
-        // intercepted (LOCKED PRINCIPLE 1), so the guest takes a #VMEXIT the
-        // dispatch loop skips past, then runs its *second* instruction (HLT) —
-        // proving the loop re-VMRUNs a guest through more than one instruction.
+        // Guest code page: `CPUID` (0F A2), `OUT 0x80, AL` (E6 80), `HLT` (F4).
+        // CPUID is intercepted (LOCKED PRINCIPLE 1) and skipped; the OUT takes
+        // an IOIO #VMEXIT the loop decodes + emulates; then the guest reaches
+        // HLT — a multi-instruction guest whose exits route end to end.
         let mut code = PageRegion::new()?;
         {
             let bytes = code.as_bytes_mut();
             bytes[0] = 0x0F; // CPUID
             bytes[1] = 0xA2;
-            bytes[2] = 0xF4; // HLT
+            bytes[2] = 0xE6; // OUT imm8, AL
+            bytes[3] = GUEST_IO_PORT;
+            bytes[4] = 0xF4; // HLT
         }
         let guest_code_pa = code.base_addr();
         core::mem::forget(code); // the guest's RAM must persist
@@ -324,6 +339,16 @@ mod hw {
         if u64::from_le_bytes(ncr3_le) != ncr3 {
             return None;
         }
+
+        // Arm port-I/O interception so the guest's OUT takes an IOIO #VMEXIT,
+        // and preload guest RAX so `OUT 0x80, AL` sends GUEST_IO_BYTE (AL is
+        // RAX's low byte). The IOPM intercepts every port; it is leaked so it
+        // outlives the VMRUN the CPU checks it against.
+        let iopm = IoPermissionsMap::intercept_all().ok()?;
+        enable_io_intercept(vmcb.as_bytes_mut(), iopm.base_addr());
+        core::mem::forget(iopm);
+        set_guest_rax(vmcb.as_bytes_mut(), u64::from(GUEST_IO_BYTE));
+
         let vmcb_pa = vmcb.base_addr();
         core::mem::forget(vmcb); // the VMCB must outlive this call for VMRUN
         Some((vmcb_pa, ncr3, guest_code_pa))

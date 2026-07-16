@@ -58,6 +58,10 @@ VMRUN_LINE="guest #VMEXIT HLT"
 # loop: the guest runs CPUID (intercepted, skipped by the loop) then HLT, so it
 # executes more than one instruction with exits routed through the HAL model.
 DISPATCH_LINE="dispatch loop runs a multi-instruction guest"
+# Printed once the guest's OUT is decoded + emulated through the IOIO #VMEXIT
+# path and the captured byte read back — the exit-handling path proven end to
+# end (guest OUT 0x80 = 0x42).
+IOIO_LINE="IOIO exit-handling path end to end"
 # Printed once the kernel draws to the GOP framebuffer and reads a pixel back
 # — proves the framebuffer I/O backend is wired with the firmware gone.
 GOP_LINE="framebuffer draw ok"
@@ -191,10 +195,11 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$VMCB_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$VMRUN_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$DISPATCH_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$IOIO_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, IDT, x2APIC, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop, and GOP draw observed on serial"
+    echo "PASS: banner, kernel memory, heap, IDT, x2APIC, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling, and GOP draw observed on serial"
     exit 0
 fi
 
-echo "FAIL: not all of banner/kernel-line/heap/idt/apic/svm/hsave/vmcb/vmrun/dispatch/gop observed (qemu rc=$QEMU_RC)"
+echo "FAIL: not all of banner/kernel-line/heap/idt/apic/svm/hsave/vmcb/vmrun/dispatch/ioio/gop observed (qemu rc=$QEMU_RC)"
 exit 1
