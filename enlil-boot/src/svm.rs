@@ -271,6 +271,10 @@ impl GuestRunOutcome {
     pub const MAX_IO_OUTS: usize = 4;
 
     /// A fresh outcome before the first `VMRUN`.
+    ///
+    /// Only the firmware run loop (and host tests) construct one, so it is gated
+    /// to those configs to stay dead-code-clean on the plain host build.
+    #[cfg(any(target_os = "uefi", test))]
     #[must_use]
     const fn new() -> Self {
         Self {
@@ -288,6 +292,7 @@ impl GuestRunOutcome {
     }
 
     /// Record a guest `OUT` (dropped silently past the cap).
+    #[cfg(any(target_os = "uefi", test))]
     const fn record_io_out(&mut self, port: u16, data: u32) {
         if self.io_out_count < Self::MAX_IO_OUTS {
             self.io_outs[self.io_out_count] = (port, data);
