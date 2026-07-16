@@ -271,15 +271,14 @@ mod hw {
                         let mut c = [0u8; 18];
                         serial.write_str("enlil kernel: svm: vmcb VMRUN-ready (nCR3 ");
                         serial.write_str(format_u64_hex(ncr3, &mut a));
-                        serial.write_str(", guest hlt at ");
+                        serial.write_str(", guest code at GPA ");
                         serial.write_str(format_u64_hex(entry, &mut b));
                         serial.write_str(", vmcb ");
                         serial.write_str(format_u64_hex(vmcb, &mut c));
                         serial.write_str(")\n");
-                        // Drive the guest through the real #VMEXIT dispatch
-                        // loop — the guest runs CPUID (intercepted, skipped by
-                        // the loop) then HLT, so it executes more than one
-                        // instruction and exits are routed through the HAL's
+                        // Drive the guest through the real #VMEXIT dispatch loop
+                        // — the guest (in its own isolated RAM at GPA 0) runs
+                        // CPUID/RDMSR/OUT/HLT, all routed through the HAL's
                         // arch-neutral model (LOCKED PRINCIPLE 2).
                         // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and
                         // `vmcb` is a VMRUN-ready VMCB from program_boot_vmcb.

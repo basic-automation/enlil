@@ -314,8 +314,8 @@ mod hw {
         is_svm_enabled, is_valid_hsave_pa, svm_status, vm_cr_clear_svmdis,
     };
     use alloc::alloc::{Layout, alloc_zeroed};
-    use enlil_hal::npt::build_identity_npt_2mib;
-    use enlil_hal::region::{IoPermissionsMap, MsrPermissionsMap, PageRegion, Vmcb};
+    use enlil_hal::npt::build_npt_2mib;
+    use enlil_hal::region::{IoPermissionsMap, MsrPermissionsMap, Vmcb};
     use enlil_hal::svm::{
         MinimalGuestSetup, control, enable_io_intercept, enable_msr_intercept,
         program_minimal_hlt_guest,
@@ -468,13 +468,19 @@ mod hw {
         if readback == pa { Some(pa) } else { None }
     }
 
-    /// A 3-page buffer (PML4 + PDPT + one PD) for a ≤ 1 GiB nested identity map.
+    /// A 3-page buffer (PML4 + PDPT + one PD) for a ≤ 1 GiB nested map.
     #[repr(C, align(4096))]
     struct NptBuf([u8; 3 * 4096]);
 
-    /// Identity-map the low gibibyte in the guest NPT — this covers the whole
-    /// boot heap (capped at 64 MiB), where the guest code page lives.
-    const NPT_MAP_BYTES: u64 = 1024 * 1024 * 1024;
+    /// The guest's RAM: one 2 MiB huge page, 2 MiB-aligned so a single NPT
+    /// huge-page leaf maps it (`build_npt_2mib`). The guest sees it at GPA 0
+    /// though it lives at this region's system-physical base — the isolation
+    /// model (LOCKED PRINCIPLE 5).
+    #[repr(C, align(0x20_0000))]
+    struct GuestRam([u8; GUEST_RAM_BYTES]);
+
+    /// Size of the guest's isolated RAM window (2 MiB).
+    const GUEST_RAM_BYTES: usize = 2 * 1024 * 1024;
 
     /// Build a complete, `VMRUN`-ready VMCB for a minimal real-mode guest that
     /// exercises the exit-handling path, returning `(vmcb_pa, ncr3,
@@ -495,9 +501,15 @@ mod hw {
     /// nested-CR3 is read back to prove the write landed. All allocations are
     /// leaked — they must outlive the `VMRUN`. Returns `None` if any allocation
     /// fails or the NPT/VMCB is malformed (none can happen here).
+    ///
+    /// The guest runs in its own isolated [`GuestRam`] window (LOCKED PRINCIPLE
+    /// 5): it sees its code at GPA 0, but that RAM lives at a disjoint
+    /// system-physical base the NPT ([`build_npt_2mib`]) maps GPA 0 onto — not
+    /// the hypervisor's own heap addresses.
     #[must_use]
     pub fn program_boot_vmcb() -> Option<(u64, u64, u64)> {
-        // Guest code page (real-mode, 16-bit):
+        // Allocate the guest's isolated RAM (2 MiB, 2 MiB-aligned) and write the
+        // real-mode guest program into it at GPA 0:
         //   mov ax, 0        B8 00 00        (EAX = 0 → CPUID leaf 0)
         //   cpuid            0F A2           (intercepted → emulated)
         //   mov ax, bx       89 D8           (AX = emulated EBX low word)
@@ -511,10 +523,17 @@ mod hw {
         //   rdmsr            0F 32           (intercepted → sentinel injected)
         //   out 0x81, al     E6 81           (IOIO → captured at port 0x81)
         //   hlt              F4              (clean stop)
-        let mut code = PageRegion::new()?;
+        // SAFETY: GuestRam has a nonzero size; alloc_zeroed yields a zeroed,
+        // 2 MiB-aligned GuestRam-sized block or null.
+        let ram_raw = unsafe { alloc_zeroed(Layout::new::<GuestRam>()) };
+        if ram_raw.is_null() {
+            return None;
+        }
+        let guest_spa = ram_raw as u64;
         {
             let msr = GUEST_MSR_NUMBER.to_le_bytes();
-            let bytes = code.as_bytes_mut();
+            // SAFETY: ram_raw owns GUEST_RAM_BYTES writable bytes (leaked below).
+            let bytes = unsafe { core::slice::from_raw_parts_mut(ram_raw, GUEST_RAM_BYTES) };
             bytes[0] = 0xB8; // mov ax, 0
             bytes[1] = 0x00;
             bytes[2] = 0x00;
@@ -549,10 +568,11 @@ mod hw {
             bytes[31] = super::GUEST_MSR_PORT;
             bytes[32] = 0xF4; // HLT
         }
-        let guest_code_pa = code.base_addr();
-        core::mem::forget(code); // the guest's RAM must persist
+        // The guest's own view of its code: GPA 0.
+        let guest_code_gpa = 0u64;
 
-        // Nested page tables identity-mapping the low GiB (GPA == SPA).
+        // Nested page tables mapping guest GPA [0, 2 MiB) onto the isolated RAM
+        // window at `guest_spa` (GPA 0 → guest_spa) — not an identity map.
         // SAFETY: NptBuf has a nonzero size; alloc_zeroed yields a zeroed,
         // 4 KiB-aligned NptBuf-sized block or null.
         let npt_raw = unsafe { alloc_zeroed(Layout::new::<NptBuf>()) };
@@ -563,17 +583,17 @@ mod hw {
         // SAFETY: npt_raw points at a live, zeroed, exclusively-owned NptBuf;
         // it is leaked below so the slice never outlives the allocation.
         let npt_buf = unsafe { core::slice::from_raw_parts_mut(npt_raw, 3 * 4096) };
-        let ncr3 = build_identity_npt_2mib(npt_buf, npt_pa, NPT_MAP_BYTES)
+        let ncr3 = build_npt_2mib(npt_buf, npt_pa, guest_spa, GUEST_RAM_BYTES as u64)
             .ok()?
             .ncr3;
 
-        // Program a VMCB to enter the guest code under that NPT.
+        // Program a VMCB to enter the guest code at GPA 0 under that NPT.
         let mut vmcb = Vmcb::new().ok()?;
         let setup = MinimalGuestSetup {
             asid: 1,
             nested_cr3: ncr3,
             entry_ip: 0,
-            code_base: guest_code_pa,
+            code_base: guest_code_gpa,
             stack_pointer: 0,
         };
         program_minimal_hlt_guest(vmcb.as_bytes_mut(), &setup).ok()?;
@@ -603,7 +623,7 @@ mod hw {
 
         let vmcb_pa = vmcb.base_addr();
         core::mem::forget(vmcb); // the VMCB must outlive this call for VMRUN
-        Some((vmcb_pa, ncr3, guest_code_pa))
+        Some((vmcb_pa, ncr3, guest_code_gpa))
     }
 
     /// Execute one `VMRUN` on the VMCB at `vmcb_pa`, swapping the guest's
