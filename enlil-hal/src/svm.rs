@@ -1055,6 +1055,55 @@ pub fn set_guest_rip(region: &mut [u8], value: u64) {
     put_u64(region, save::RIP, value);
 }
 
+// ---------------------------------------------------------------------------
+// Event injection
+// ---------------------------------------------------------------------------
+
+/// `EVENTINJ` event types (VMCB control offset [`control::EVENT_INJ`], APM
+/// §15.20).
+pub mod event_type {
+    /// External (maskable) interrupt.
+    pub const EXTERNAL_INTERRUPT: u8 = 0;
+    /// Non-maskable interrupt.
+    pub const NMI: u8 = 2;
+    /// Hardware exception (fault/trap), e.g. `#PF`, `#GP`.
+    pub const EXCEPTION: u8 = 3;
+    /// Software interrupt (`INT n`).
+    pub const SOFTWARE_INTERRUPT: u8 = 4;
+}
+
+/// Encode a VMCB `EVENTINJ` value that injects `vector` of `event_type` into
+/// the guest on the next `VMRUN` (AMD APM Vol. 2 §15.20).
+///
+/// Layout: bits 7:0 vector, bits 10:8 type, bit 11 error-code-valid, bit 31
+/// valid, bits 63:32 error code. `error_code` is `Some` for the exceptions that
+/// push one (`#PF`, `#GP`, `#DF`, …) and `None` otherwise; the CPU delivers the
+/// event through the guest's IDT/IVT as if the hardware raised it — the
+/// mechanism for handing a guest a timer tick or a device interrupt.
+#[must_use]
+pub const fn encode_event_inj(vector: u8, event_type: u8, error_code: Option<u32>) -> u64 {
+    const VALID: u64 = 1 << 31;
+    const ERROR_CODE_VALID: u64 = 1 << 11;
+    let mut value = vector as u64 | ((event_type as u64 & 0x7) << 8) | VALID;
+    if let Some(ec) = error_code {
+        value |= ERROR_CODE_VALID | ((ec as u64) << 32);
+    }
+    value
+}
+
+/// Program the VMCB `EVENTINJ` field ([`control::EVENT_INJ`]) so the next
+/// `VMRUN` injects the encoded event (see [`encode_event_inj`]). Writing 0
+/// clears any pending injection.
+pub fn set_event_inj(region: &mut [u8], value: u64) {
+    put_u64(region, control::EVENT_INJ, value);
+}
+
+/// Read back the VMCB `EVENTINJ` field.
+#[must_use]
+pub fn event_inj(region: &[u8]) -> u64 {
+    get_u64(region, control::EVENT_INJ)
+}
+
 // Little-endian field accessors. The VMCB is always a full page here, so the
 // curated Appendix-B offsets are in bounds.
 
@@ -1372,6 +1421,37 @@ mod tests {
             classify_run_loop_exit(SvmExitCode::from_raw(exit_code::VMMCALL)),
             RunLoopExit::Unhandled
         );
+    }
+
+    #[test]
+    fn event_inj_encodes_interrupts_and_exceptions() {
+        // A maskable interrupt, vector 0x20 (e.g. a timer), no error code.
+        let intr = encode_event_inj(0x20, event_type::EXTERNAL_INTERRUPT, None);
+        assert_eq!(intr & 0xFF, 0x20); // vector
+        assert_eq!((intr >> 8) & 0x7, u64::from(event_type::EXTERNAL_INTERRUPT));
+        assert_ne!(intr & (1 << 31), 0); // valid
+        assert_eq!(intr & (1 << 11), 0); // no error code
+        assert_eq!(intr >> 32, 0);
+
+        // A #GP (vector 13, exception) with an error code.
+        let gp = encode_event_inj(13, event_type::EXCEPTION, Some(0xABCD));
+        assert_eq!(gp & 0xFF, 13);
+        assert_eq!((gp >> 8) & 0x7, u64::from(event_type::EXCEPTION));
+        assert_ne!(gp & (1 << 31), 0);
+        assert_ne!(gp & (1 << 11), 0); // error code valid
+        assert_eq!(gp >> 32, 0xABCD);
+    }
+
+    #[test]
+    fn event_inj_round_trips_through_the_vmcb() {
+        let mut region = [0u8; VMCB_SIZE];
+        assert_eq!(event_inj(&region), 0);
+        let value = encode_event_inj(2, event_type::NMI, None);
+        set_event_inj(&mut region, value);
+        assert_eq!(event_inj(&region), value);
+        // Writing 0 clears a pending injection.
+        set_event_inj(&mut region, 0);
+        assert_eq!(event_inj(&region), 0);
     }
 
     #[test]
