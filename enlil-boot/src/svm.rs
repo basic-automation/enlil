@@ -124,6 +124,18 @@ pub const GUEST_MSR_W_PORT: u8 = 0x84;
 /// through enlil's shadow must return the same value.
 pub const GUEST_MSR_W_VALUE: u8 = 0x99;
 
+/// The port the boot guest writes the result of a native compute loop to —
+/// proving it runs real code (arithmetic + a taken branch) at native speed with
+/// no #VMEXIT until the `OUT`.
+pub const GUEST_COMPUTE_PORT: u8 = 0x85;
+
+/// The loop count the compute loop runs; it sums `1..=N`, so the result is
+/// `N*(N+1)/2` ([`GUEST_COMPUTE_SUM`]).
+pub const GUEST_COMPUTE_N: u8 = 5;
+
+/// The expected compute-loop result — `sum(1..=GUEST_COMPUTE_N)`.
+pub const GUEST_COMPUTE_SUM: u8 = GUEST_COMPUTE_N * (GUEST_COMPUTE_N + 1) / 2;
+
 /// A small per-guest shadow of MSRs the guest has written with `WRMSR`.
 ///
 /// A later `RDMSR` reads back what the guest wrote — MSR-state virtualization
@@ -633,7 +645,20 @@ mod hw {
         bytes[49] = 0x00;
         bytes[50] = 0xE6; // OUT imm8, AL
         bytes[51] = super::GUEST_NPF_PORT;
-        bytes[52] = 0xF4; // HLT
+        // Native compute loop: sum 1..=N with a taken branch and NO #VMEXIT
+        // until the OUT — proving near-native guest execution.
+        bytes[52] = 0x31; // xor ax, ax     (accumulator = 0)
+        bytes[53] = 0xC0;
+        bytes[54] = 0xB9; // mov cx, N       (counter)
+        bytes[55] = super::GUEST_COMPUTE_N;
+        bytes[56] = 0x00;
+        bytes[57] = 0x01; // add ax, cx      ← loop target
+        bytes[58] = 0xC8;
+        bytes[59] = 0xE2; // loop -4         (dec cx; jump to add while cx != 0)
+        bytes[60] = 0xFC;
+        bytes[61] = 0xE6; // OUT imm8, AL     (= sum(1..=N))
+        bytes[62] = super::GUEST_COMPUTE_PORT;
+        bytes[63] = 0xF4; // HLT
     }
 
     /// Build a complete, `VMRUN`-ready VMCB for a minimal real-mode guest that
@@ -683,6 +708,8 @@ mod hw {
         //   out 0x84, al     E6 84           (IOIO → the shadowed value)
         //   mov ax, [0]      A1 00 00        (DS:0 = GPA 2 MiB → NPF, demand-mapped)
         //   out 0x83, al     E6 83           (IOIO → the demand-paged sentinel)
+        //   xor ax, ax / mov cx, N / add ax, cx / loop -4  (native sum 1..=N, no exit)
+        //   out 0x85, al     E6 85           (IOIO → the computed sum)
         //   hlt              F4              (clean stop)
         // SAFETY: GuestRam has a nonzero size; alloc_zeroed yields a zeroed,
         // 2 MiB-aligned GuestRam-sized block or null.

@@ -304,8 +304,9 @@ mod hw {
     /// substrings the QEMU+OVMF harness asserts nightly.
     fn report_guest_run(serial: &SerialPort, run: &crate::svm::GuestRunOutcome) {
         use crate::svm::{
-            GUEST_HV_BIT_PORT, GUEST_IO_PORT, GUEST_MSR_PORT, GUEST_MSR_SENTINEL, GUEST_MSR_W_PORT,
-            GUEST_MSR_W_VALUE, GUEST_NPF_PORT, GUEST_NPF_SENTINEL, RunStop,
+            GUEST_COMPUTE_PORT, GUEST_COMPUTE_SUM, GUEST_HV_BIT_PORT, GUEST_IO_PORT,
+            GUEST_MSR_PORT, GUEST_MSR_SENTINEL, GUEST_MSR_W_PORT, GUEST_MSR_W_VALUE,
+            GUEST_NPF_PORT, GUEST_NPF_SENTINEL, RunStop,
         };
         let mut vr = [0u8; 20];
         let mut cp = [0u8; 20];
@@ -378,6 +379,16 @@ mod hw {
                 {
                     serial.write_str(
                         "enlil kernel: svm: guest NPF demand-mapped by enlil — nested page fault handled\n",
+                    );
+                }
+                // The guest ran a native arithmetic loop (a taken branch, no
+                // #VMEXIT) and OUT the correct sum — proving it executes real
+                // code at native speed under enlil.
+                if let Some(out) = run.io_out_to(u16::from(GUEST_COMPUTE_PORT))
+                    && out == u32::from(GUEST_COMPUTE_SUM)
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: guest native loop computed the right sum — near-native execution\n",
                     );
                 }
             }
