@@ -1,5 +1,13 @@
 /target
 /scratch
+# Signed-boot build outputs + signing material (scripts/make-signed-iso.sh).
+# Never commit signing keys or generated boot images.
+/dist
+*.iso
+*.efi
+*.key
+*.crt
+*.cer
 **/*.rs.bk
 *.swp
 *.swo
