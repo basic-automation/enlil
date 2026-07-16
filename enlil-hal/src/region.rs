@@ -14,7 +14,7 @@
 //! above the HAL (LOCKED PRINCIPLE 2/3). It is `no_std` + `alloc`, so the same
 //! type serves the Linux dev host and the bare-metal kernel target.
 
-use crate::svm::{IOPM_SIZE, VMCB_SIZE, VmcbRegionError, init_vmcb_region};
+use crate::svm::{IOPM_SIZE, MSRPM_SIZE, VMCB_SIZE, VmcbRegionError, init_vmcb_region};
 use crate::vmx::{VMX_REGION_SIZE, VmxRegionError, init_vmx_region};
 use alloc::alloc::{Layout, alloc_zeroed, dealloc};
 use core::ptr::NonNull;
@@ -308,6 +308,80 @@ impl Drop for IoPermissionsMap {
     }
 }
 
+/// A page-sized, 8 KiB, page-aligned block backing an [`MsrPermissionsMap`].
+#[repr(C, align(4096))]
+struct MsrpmPages([u8; MSRPM_SIZE]);
+
+/// The SVM MSR permissions map (MSRPM) — 8 KiB (two 4 KiB pages), page-aligned,
+/// whose physical base goes in the VMCB `MSRPM_BASE_PA` (AMD APM §15.11).
+///
+/// A set bit intercepts an MSR read/write; [`set_intercept`](Self::set_intercept)
+/// arms an individual MSR on the zeroed map. The handle owns its 8 KiB and frees
+/// it on drop (LOCKED PRINCIPLE 2/3).
+pub struct MsrPermissionsMap {
+    ptr: NonNull<u8>,
+}
+
+// SAFETY: like `PageRegion`, `MsrPermissionsMap` uniquely owns its allocation
+// and holds only the owning pointer, so it is sound to move across threads.
+unsafe impl Send for MsrPermissionsMap {}
+
+impl MsrPermissionsMap {
+    /// The `Layout` the MSRPM is allocated with (8 KiB, 4 KiB-aligned).
+    #[must_use]
+    const fn layout() -> Layout {
+        Layout::new::<MsrpmPages>()
+    }
+
+    /// Allocate a zeroed MSRPM — every MSR *permitted* (no interception). Arm
+    /// MSRs with [`set_intercept`](Self::set_intercept).
+    ///
+    /// # Errors
+    ///
+    /// [`RegionError::OutOfMemory`] if the allocator is exhausted.
+    pub fn new() -> Result<Self, RegionError> {
+        // SAFETY: the layout has nonzero size (MSRPM_SIZE).
+        let raw = unsafe { alloc_zeroed(Self::layout()) };
+        NonNull::new(raw)
+            .map(|ptr| Self { ptr })
+            .ok_or(RegionError::OutOfMemory)
+    }
+
+    /// Arm interception of a single `msr`'s read and/or write access.
+    pub fn set_intercept(&mut self, msr: u32, read: bool, write: bool) {
+        crate::svm::set_msr_intercept(self.as_bytes_mut(), msr, read, write);
+    }
+
+    /// The MSRPM physical/linear base for the VMCB `MSRPM_BASE_PA` field
+    /// (identity-mapped on the bare-metal kernel, so VA == PA).
+    #[must_use]
+    pub fn base_addr(&self) -> u64 {
+        self.ptr.as_ptr() as u64
+    }
+
+    /// The map as a byte slice.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8] {
+        // SAFETY: we own MSRPM_SIZE valid, initialized (zeroed) bytes.
+        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), MSRPM_SIZE) }
+    }
+
+    /// The map as a mutable byte slice.
+    #[must_use]
+    pub const fn as_bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: we own MSRPM_SIZE valid bytes and hold `&mut self`.
+        unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), MSRPM_SIZE) }
+    }
+}
+
+impl Drop for MsrPermissionsMap {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` came from `alloc_zeroed` with exactly this layout and
+        // is freed once (Drop runs at most once).
+        unsafe { dealloc(self.ptr.as_ptr(), Self::layout()) };
+    }
+}
+
 /// Errors allocating or initializing a VMX/SVM region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegionError {
@@ -413,5 +487,16 @@ mod tests {
         map.set_intercept(0x3F8);
         assert!(crate::svm::iopm_intercepts(map.as_bytes(), 0x3F8));
         assert!(!crate::svm::iopm_intercepts(map.as_bytes(), 0x80));
+    }
+
+    #[test]
+    fn msrpm_new_is_zeroed_aligned_and_set_intercept_arms_one_msr() {
+        let mut map = MsrPermissionsMap::new().expect("allocate MSRPM");
+        assert_eq!(map.as_bytes().len(), MSRPM_SIZE);
+        assert!(map.base_addr().is_multiple_of(PAGE_SIZE as u64));
+        assert!(map.as_bytes().iter().all(|&b| b == 0));
+        map.set_intercept(0x10, true, false);
+        assert!(crate::svm::msr_read_intercepted(map.as_bytes(), 0x10));
+        assert!(!crate::svm::msr_read_intercepted(map.as_bytes(), 0x11));
     }
 }

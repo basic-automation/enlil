@@ -575,6 +575,76 @@ pub fn enable_io_intercept(region: &mut [u8], iopm_base_pa: u64) {
     put_u64(region, control::IOPM_BASE_PA, iopm_base_pa);
 }
 
+// ---------------------------------------------------------------------------
+// MSR permissions map (MSRPM)
+// ---------------------------------------------------------------------------
+
+/// Size of the SVM MSR permissions map: 8 KiB (two 4 KiB pages), APM §15.11.
+///
+/// The map holds two bits per MSR — read (even) then write (odd) — for three
+/// MSR windows: `0x0000_0000..=0x0000_1FFF` at byte 0, `0xC000_0000..=0xC000_1FFF`
+/// at byte 0x800, and `0xC001_0000..=0xC001_1FFF` at byte 0x1000. A set bit
+/// intercepts that access; `MSRPM_BASE_PA` in the VMCB points at it and the
+/// `MSR_PROT` intercept ([`intercept1::MSR_PROT`]) arms the check.
+pub const MSRPM_SIZE: usize = 2 * 4096;
+
+/// The bit index of `msr`'s **read** permission in the MSRPM (its write bit is
+/// the next one), or `None` if `msr` is outside the three mapped windows.
+#[must_use]
+pub const fn msrpm_read_bit(msr: u32) -> Option<usize> {
+    let (region_byte, offset) = if msr <= 0x0000_1FFF {
+        (0usize, msr)
+    } else if msr >= 0xC000_0000 && msr <= 0xC000_1FFF {
+        (0x800, msr - 0xC000_0000)
+    } else if msr >= 0xC001_0000 && msr <= 0xC001_1FFF {
+        (0x1000, msr - 0xC001_0000)
+    } else {
+        return None;
+    };
+    Some(region_byte * 8 + (offset as usize) * 2)
+}
+
+/// Set the read and/or write intercept bits for `msr` in the MSRPM `map`.
+///
+/// A set bit makes a guest `RDMSR`/`WRMSR` of `msr` take an
+/// [`MSR`](exit_code::MSR) #VMEXIT. A no-op for an MSR outside the mapped
+/// windows or a map too short to hold the bit.
+pub fn set_msr_intercept(map: &mut [u8], msr: u32, read: bool, write: bool) {
+    let Some(bit) = msrpm_read_bit(msr) else {
+        return;
+    };
+    let byte = bit / 8;
+    if let Some(cell) = map.get_mut(byte) {
+        if read {
+            *cell |= 1 << (bit % 8);
+        }
+        if write {
+            *cell |= 1 << ((bit + 1) % 8);
+        }
+    }
+}
+
+/// Whether `msr`'s read access is currently intercepted in the MSRPM `map`.
+#[must_use]
+pub fn msr_read_intercepted(map: &[u8], msr: u32) -> bool {
+    msrpm_read_bit(msr).is_some_and(|bit| {
+        map.get(bit / 8)
+            .is_some_and(|&cell| cell & (1 << (bit % 8)) != 0)
+    })
+}
+
+/// Arm MSR interception on a programmed VMCB.
+///
+/// Sets the `MSR_PROT` intercept bit (preserving the other misc-1 intercepts)
+/// and points `MSRPM_BASE_PA` at `msrpm_base_pa` (the physical base of an
+/// [`MSRPM_SIZE`] permissions map). With this set, a guest `RDMSR`/`WRMSR` whose
+/// MSRPM bit is set takes an [`MSR`](exit_code::MSR) #VMEXIT.
+pub fn enable_msr_intercept(region: &mut [u8], msrpm_base_pa: u64) {
+    let misc1 = get_u32(region, control::INTERCEPT_MISC1) | intercept1::MSR_PROT;
+    put_u32(region, control::INTERCEPT_MISC1, misc1);
+    put_u64(region, control::MSRPM_BASE_PA, msrpm_base_pa);
+}
+
 /// Map a #VMEXIT code that needs no further VMCB reads onto the arch-neutral
 /// [`VmExit`](crate::VmExit).
 ///
@@ -1163,6 +1233,56 @@ mod tests {
         assert_ne!(misc1 & intercept1::SHUTDOWN, 0);
         assert_ne!(misc1 & intercept1::CPUID, 0);
         assert_eq!(get_u64(&region, control::IOPM_BASE_PA), 0x9_000);
+    }
+
+    #[test]
+    fn msrpm_read_bit_maps_the_three_windows() {
+        // Low window (byte 0): 2 bits per MSR.
+        assert_eq!(msrpm_read_bit(0x0000_0000), Some(0));
+        assert_eq!(msrpm_read_bit(0x0000_0001), Some(2));
+        // High window at byte 0x800 (bit 0x4000).
+        assert_eq!(msrpm_read_bit(0xC000_0000), Some(0x800 * 8));
+        assert_eq!(msrpm_read_bit(0xC000_0080), Some(0x800 * 8 + 0x80 * 2)); // EFER
+        // Extended window at byte 0x1000.
+        assert_eq!(msrpm_read_bit(0xC001_0000), Some(0x1000 * 8));
+        // Outside all three windows.
+        assert_eq!(msrpm_read_bit(0x0000_2000), None);
+        assert_eq!(msrpm_read_bit(0xC000_2000), None);
+    }
+
+    #[test]
+    fn set_and_query_msr_intercept() {
+        let mut map = [0u8; MSRPM_SIZE];
+        assert!(!msr_read_intercepted(&map, 0x10));
+        set_msr_intercept(&mut map, 0x10, true, false);
+        assert!(msr_read_intercepted(&map, 0x10));
+        // The write bit was not set; a neighbor MSR is untouched.
+        assert!(!msr_read_intercepted(&map, 0x11));
+        // Read + write both arm from a high-window MSR without panicking.
+        set_msr_intercept(&mut map, 0xC000_0100, true, true);
+        assert!(msr_read_intercepted(&map, 0xC000_0100));
+        // An out-of-window MSR is a no-op, not a panic.
+        set_msr_intercept(&mut map, 0xDEAD_BEEF, true, true);
+        assert!(!msr_read_intercepted(&map, 0xDEAD_BEEF));
+    }
+
+    #[test]
+    fn enable_msr_intercept_arms_msr_prot_without_disturbing_other_intercepts() {
+        let mut region = [0u8; VMCB_SIZE];
+        let setup = MinimalGuestSetup {
+            asid: 1,
+            nested_cr3: 0x2000,
+            entry_ip: 0,
+            code_base: 0x1000,
+            stack_pointer: 0,
+        };
+        program_minimal_hlt_guest(&mut region, &setup).unwrap();
+        enable_msr_intercept(&mut region, 0xA_000);
+        let misc1 = get_u32(&region, control::INTERCEPT_MISC1);
+        assert_ne!(misc1 & intercept1::MSR_PROT, 0);
+        assert_ne!(misc1 & intercept1::HLT, 0);
+        assert_ne!(misc1 & intercept1::CPUID, 0);
+        assert_eq!(get_u64(&region, control::MSRPM_BASE_PA), 0xA_000);
     }
 
     #[test]
