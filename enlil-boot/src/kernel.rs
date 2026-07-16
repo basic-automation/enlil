@@ -276,25 +276,15 @@ mod hw {
                         serial.write_str(", vmcb ");
                         serial.write_str(format_u64_hex(vmcb, &mut c));
                         serial.write_str(")\n");
-                        // Run the guest with VMRUN — the second live-boot
-                        // sub-milestone — and route its exit through the HAL's
-                        // arch-neutral VmExit model (LOCKED PRINCIPLE 2).
+                        // Drive the guest through the real #VMEXIT dispatch
+                        // loop — the guest runs CPUID (intercepted, skipped by
+                        // the loop) then HLT, so it executes more than one
+                        // instruction and exits are routed through the HAL's
+                        // arch-neutral model (LOCKED PRINCIPLE 2).
                         // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and
                         // `vmcb` is a VMRUN-ready VMCB from program_boot_vmcb.
-                        let exit = unsafe { crate::svm::run_boot_guest(vmcb) };
-                        let decoded = enlil_hal::svm::simple_svm_exit_to_vmexit(
-                            enlil_hal::svm::SvmExitCode::from_raw(exit),
-                        );
-                        if matches!(decoded, Some(enlil_hal::VmExit::Hlt)) {
-                            serial.write_str(
-                                "enlil kernel: svm: guest #VMEXIT HLT (VmExit::Hlt) — VMRUN runs a guest\n",
-                            );
-                        } else {
-                            let mut e = [0u8; 18];
-                            serial.write_str("enlil kernel: svm: guest #VMEXIT code ");
-                            serial.write_str(format_u64_hex(exit, &mut e));
-                            serial.write_str("\n");
-                        }
+                        let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                        report_guest_run(serial, &run);
                     }
                     None => serial.write_str("enlil kernel: svm: vmcb VMRUN-ready FAILED\n"),
                 }
@@ -302,6 +292,38 @@ mod hw {
             SvmStatus::Unsupported => serial.write_str("enlil kernel: svm: not supported by CPU\n"),
             SvmStatus::DisabledByFirmware => {
                 serial.write_str("enlil kernel: svm: disabled by firmware (VM_CR locked)\n");
+            }
+        }
+    }
+
+    /// Report what the guest #VMEXIT dispatch loop observed.
+    ///
+    /// On a clean `HLT` after skipping the intercepted `CPUID`, this proves the
+    /// loop re-`VMRUN`ed the guest through more than one instruction. The
+    /// success line keeps the substring the QEMU+OVMF harness asserts nightly.
+    fn report_guest_run(serial: &SerialPort, run: &crate::svm::GuestRunOutcome) {
+        use crate::svm::RunStop;
+        let mut vr = [0u8; 20];
+        let mut cp = [0u8; 20];
+        match run.stop {
+            RunStop::Halted => {
+                serial.write_str("enlil kernel: svm: guest #VMEXIT HLT after ");
+                serial.write_str(format_u64(u64::from(run.vmruns), &mut vr));
+                serial.write_str(" VMRUNs (");
+                serial.write_str(format_u64(u64::from(run.cpuid_exits), &mut cp));
+                serial
+                    .write_str(" cpuid skipped) — dispatch loop runs a multi-instruction guest\n");
+            }
+            RunStop::ShutDown => serial.write_str("enlil kernel: svm: guest SHUTDOWN\n"),
+            RunStop::Invalid => serial.write_str("enlil kernel: svm: guest INVALID state\n"),
+            RunStop::IterationCap => {
+                serial.write_str("enlil kernel: svm: guest hit VMRUN cap (runaway)\n");
+            }
+            RunStop::Unhandled => {
+                let mut e = [0u8; 18];
+                serial.write_str("enlil kernel: svm: guest #VMEXIT unhandled code ");
+                serial.write_str(format_u64_hex(run.final_exit, &mut e));
+                serial.write_str("\n");
             }
         }
     }
