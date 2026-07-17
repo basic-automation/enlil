@@ -24,6 +24,9 @@ pub const XSDT_SIGNATURE: &[u8; 4] = b"XSDT";
 /// The MADT (APIC) table signature.
 pub const MADT_SIGNATURE: &[u8; 4] = b"APIC";
 
+/// The `MCFG` (PCI Express `ECAM`) table signature.
+pub const MCFG_SIGNATURE: &[u8; 4] = b"MCFG";
+
 /// Length of an ACPI System Description Table header.
 pub const SDT_HEADER_LEN: usize = 36;
 
@@ -138,6 +141,25 @@ pub fn madt_enabled_cpu_count(madt: &[u8]) -> u32 {
     count
 }
 
+/// The first `ECAM` allocation in an `MCFG`: `(base, segment, start_bus, end_bus)`.
+///
+/// The `MCFG` body is an 8-byte reserved field then 16-byte allocation entries:
+/// `ECAM` base (`u64`) @0, PCI segment group (`u16`) @8, start bus @10, end bus
+/// @11. Returns the first entry, or `None` if the table has none.
+#[must_use]
+pub fn mcfg_first_allocation(mcfg: &[u8]) -> Option<(u64, u16, u8, u8)> {
+    const MCFG_ALLOCS_OFFSET: usize = SDT_HEADER_LEN + 8;
+    let base = read_u64(mcfg, MCFG_ALLOCS_OFFSET)?;
+    let segment = u16::from_le_bytes(
+        mcfg.get(MCFG_ALLOCS_OFFSET + 8..MCFG_ALLOCS_OFFSET + 10)?
+            .try_into()
+            .ok()?,
+    );
+    let start_bus = *mcfg.get(MCFG_ALLOCS_OFFSET + 10)?;
+    let end_bus = *mcfg.get(MCFG_ALLOCS_OFFSET + 11)?;
+    Some((base, segment, start_bus, end_bus))
+}
+
 /// What the kernel discovered from the firmware ACPI tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AcpiSummary {
@@ -145,6 +167,10 @@ pub struct AcpiSummary {
     pub tables: usize,
     /// Enabled processors counted in the MADT (0 if no MADT was found).
     pub enabled_cpus: u32,
+    /// PCI Express `ECAM` base physical address from the `MCFG` (0 if absent).
+    pub ecam_base: u64,
+    /// Highest PCI bus number the `ECAM` window covers (from the `MCFG`).
+    pub ecam_end_bus: u8,
 }
 
 #[cfg(target_os = "uefi")]
@@ -153,8 +179,9 @@ pub use hw::discover;
 #[cfg(target_os = "uefi")]
 mod hw {
     use super::{
-        AcpiSummary, MADT_SIGNATURE, SDT_HEADER_LEN, madt_enabled_cpu_count, rsdp_xsdt_address,
-        sdt_length, sdt_signature, xsdt_entry, xsdt_entry_count,
+        AcpiSummary, MADT_SIGNATURE, MCFG_SIGNATURE, SDT_HEADER_LEN, madt_enabled_cpu_count,
+        mcfg_first_allocation, rsdp_xsdt_address, sdt_length, sdt_signature, xsdt_entry,
+        xsdt_entry_count,
     };
 
     /// View `len` bytes of identity-mapped physical memory at `phys`.
@@ -196,19 +223,31 @@ mod hw {
         let mut summary = AcpiSummary {
             tables: xsdt_entry_count(xsdt_len),
             enabled_cpus: 0,
+            ecam_base: 0,
+            ecam_end_bus: 0,
         };
 
-        // Scan the referenced tables for the MADT and count its enabled CPUs.
+        // Scan the referenced tables for the MADT (enabled CPUs) and the MCFG
+        // (PCIe ECAM window).
         let mut i = 0;
         while let Some(table_phys) = xsdt_entry(xsdt, i) {
             // SAFETY: each XSDT entry points at a mapped SDT; read its header.
             let hdr = unsafe { phys_slice(table_phys, SDT_HEADER_LEN) };
-            if sdt_signature(hdr) == Some(*MADT_SIGNATURE)
-                && let Some(len) = sdt_length(hdr)
-            {
-                // SAFETY: the MADT spans `len` mapped bytes from table_phys.
-                let madt = unsafe { phys_slice(table_phys, len as usize) };
-                summary.enabled_cpus = madt_enabled_cpu_count(madt);
+            let Some(sig) = sdt_signature(hdr) else {
+                i += 1;
+                continue;
+            };
+            if let Some(len) = sdt_length(hdr) {
+                // SAFETY: the table spans `len` mapped bytes from table_phys.
+                let table = unsafe { phys_slice(table_phys, len as usize) };
+                if sig == *MADT_SIGNATURE {
+                    summary.enabled_cpus = madt_enabled_cpu_count(table);
+                } else if sig == *MCFG_SIGNATURE
+                    && let Some((base, _seg, _start, end)) = mcfg_first_allocation(table)
+                {
+                    summary.ecam_base = base;
+                    summary.ecam_end_bus = end;
+                }
             }
             i += 1;
         }
@@ -306,6 +345,28 @@ mod tests {
         // An unrelated structure (I/O APIC, type 1) is ignored.
         madt.extend_from_slice(&[1, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(madt_enabled_cpu_count(&madt), 2);
+    }
+
+    #[test]
+    fn mcfg_reads_the_first_ecam_allocation() {
+        let mut mcfg = sdt_header(MCFG_SIGNATURE, 0).to_vec();
+        mcfg.extend_from_slice(&[0u8; 8]); // reserved
+        // Allocation: base 0xB000_0000, segment 0, start bus 0, end bus 0xFF.
+        mcfg.extend_from_slice(&0xB000_0000u64.to_le_bytes());
+        mcfg.extend_from_slice(&0u16.to_le_bytes()); // segment
+        mcfg.push(0x00); // start bus
+        mcfg.push(0xFF); // end bus
+        mcfg.extend_from_slice(&[0u8; 4]); // reserved
+        assert_eq!(
+            mcfg_first_allocation(&mcfg),
+            Some((0xB000_0000, 0, 0x00, 0xFF))
+        );
+    }
+
+    #[test]
+    fn mcfg_rejects_a_truncated_table() {
+        let mcfg = sdt_header(MCFG_SIGNATURE, 0).to_vec();
+        assert_eq!(mcfg_first_allocation(&mcfg), None);
     }
 
     #[test]

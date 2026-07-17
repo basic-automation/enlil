@@ -286,6 +286,15 @@ mod hw {
                 serial.write_str(" tables, ");
                 serial.write_str(format_u64(u64::from(summary.enabled_cpus), &mut c));
                 serial.write_str(" enabled CPUs (MADT)\n");
+                if summary.ecam_base != 0 {
+                    let mut e = [0u8; 18];
+                    let mut b = [0u8; 20];
+                    serial.write_str("enlil kernel: acpi: PCIe ECAM base ");
+                    serial.write_str(format_u64_hex(summary.ecam_base, &mut e));
+                    serial.write_str(", buses 0-");
+                    serial.write_str(format_u64(u64::from(summary.ecam_end_bus), &mut b));
+                    serial.write_str(" (MCFG)\n");
+                }
             }
             None => serial.write_str("enlil kernel: acpi: no valid RSDP in handoff\n"),
         }

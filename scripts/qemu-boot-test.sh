@@ -55,6 +55,9 @@ TSC_LINE="TSC calibrated"
 # Printed once the kernel walks the firmware ACPI tables (RSDP→XSDT→MADT) and
 # reports the table + enabled-CPU counts — real hardware discovery on metal.
 ACPI_LINE="acpi: discovered"
+# Printed once the kernel finds the MCFG and reports the PCIe ECAM base + bus
+# range — the window for extended config space + full multi-bus PCI topology.
+ECAM_LINE="PCIe ECAM base"
 # Printed once the kernel enumerates PCI bus 0 via the legacy config mechanism
 # (0xCF8/0xCFC), reading the host bridge identity + present-function count.
 PCI_LINE="functions on bus 0"
@@ -260,6 +263,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$TIMER_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$TSC_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ACPI_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$ECAM_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PCI_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PCI_CLASS_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PAGING_LINE" "$SERIAL_LOG" 2>/dev/null \
