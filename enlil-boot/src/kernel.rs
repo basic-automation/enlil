@@ -218,6 +218,7 @@ mod hw {
         let serial = SerialPort::com1();
         serial.write_str("enlil kernel: entered via BootHandoff\n");
 
+        let mut highest_usable_end = 0u64;
         if handoff.memory_map_base != 0 && handoff.memory_map_len != 0 {
             // SAFETY: the UEFI stage recorded the base/extent of the final
             // memory map it received from ExitBootServices() and forgot the
@@ -229,6 +230,7 @@ mod hw {
                 )
             };
             let summary = summarize_memory_map(bytes, handoff.memory_descriptor_size);
+            highest_usable_end = summary.highest_usable_end;
             report_memory(&serial, &summary);
             bring_up_heap(&serial, &summary);
         } else {
@@ -243,7 +245,7 @@ mod hw {
         bring_up_time(&serial);
         bring_up_acpi(&serial, handoff);
         bring_up_pci(&serial);
-        bring_up_paging(&serial);
+        bring_up_paging(&serial, handoff, highest_usable_end);
         bring_up_virtualization(&serial);
         bring_up_framebuffer(&serial, handoff);
 
@@ -296,15 +298,25 @@ mod hw {
     /// Reaching the report line proves the map is correct: the kernel's code,
     /// stack, heap, ACPI region, and framebuffer are all covered, or the `CR3`
     /// reload would have faulted. Every later step runs on these tables.
-    fn bring_up_paging(serial: &SerialPort) {
-        // SAFETY: install_identity_map builds a low-4-GiB identity map that
-        // covers everything the kernel touches next (sub-4-GiB layout), so the
-        // CR3 reload continues execution seamlessly.
-        match unsafe { crate::paging::install_identity_map() } {
+    ///
+    /// The span is derived from the real memory map (highest usable RAM) and the
+    /// framebuffer, floored at 4 GiB — so it stays correct on hosts with RAM or
+    /// MMIO above 4 GiB, not just this QEMU layout.
+    fn bring_up_paging(serial: &SerialPort, handoff: &BootHandoff, highest_usable_end: u64) {
+        let (fb_base, fb_size) = handoff
+            .framebuffer
+            .map_or((0, 0), |fb| (fb.base, fb.size_bytes()));
+        let span = crate::paging::required_map_bytes(highest_usable_end, fb_base, fb_size);
+        // SAFETY: `span` covers the highest usable RAM and the framebuffer
+        // (floored at 4 GiB), so the CR3 reload continues execution seamlessly.
+        match unsafe { crate::paging::install_identity_map(span) } {
             Some(cr3) => {
-                let mut buf = [0u8; 18];
-                serial.write_str("enlil kernel: paging: own identity tables installed, CR3=");
-                serial.write_str(format_u64_hex(cr3, &mut buf));
+                let mut c = [0u8; 18];
+                let mut g = [0u8; 20];
+                serial.write_str("enlil kernel: paging: own identity tables (");
+                serial.write_str(format_u64(crate::paging::map_gib(span), &mut g));
+                serial.write_str(" GiB) installed, CR3=");
+                serial.write_str(format_u64_hex(cr3, &mut c));
                 serial.write_str(" — off firmware page tables\n");
             }
             None => serial.write_str("enlil kernel: paging: page-table build FAILED\n"),
