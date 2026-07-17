@@ -287,6 +287,9 @@ mod hw {
                         // Second guest: prove EVENTINJ delivers an injected
                         // interrupt through the guest's real-mode IVT.
                         run_event_inj_guest(serial);
+                        // Third guest: prove a 64-bit long-mode guest runs (the
+                        // mode a real OS boots in).
+                        run_long_mode_guest(serial);
                     }
                     None => serial.write_str("enlil kernel: svm: vmcb VMRUN-ready FAILED\n"),
                 }
@@ -450,6 +453,38 @@ mod hw {
                 }
             }
             None => serial.write_str("enlil kernel: svm: event-inj vmcb build FAILED\n"),
+        }
+    }
+
+    /// Build and run a 64-bit long-mode guest, reporting whether it executed.
+    ///
+    /// enlil programs a VMCB for long mode (paging on, `CR3` walking the guest's
+    /// own identity page tables, an `L`-bit code segment) and runs a guest whose
+    /// code `OUT`s [`GUEST_LM_SENTINEL`](crate::svm::GUEST_LM_SENTINEL). A
+    /// matching `OUT` proves a guest ran in the mode a real x86-64 OS boots in;
+    /// a `VMEXIT_INVALID` stop instead means a long-mode consistency check
+    /// failed (ROADMAP 6.2).
+    fn run_long_mode_guest(serial: &SerialPort) {
+        use crate::svm::{GUEST_LM_PORT, GUEST_LM_SENTINEL};
+        match crate::svm::program_long_mode_vmcb() {
+            Some((vmcb, _cr3)) => {
+                // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
+                // is a VMRUN-ready long-mode VMCB from program_long_mode_vmcb.
+                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                if run.io_out_to(u16::from(GUEST_LM_PORT)) == Some(u32::from(GUEST_LM_SENTINEL)) {
+                    serial.write_str(
+                        "enlil kernel: svm: 64-bit long-mode guest ran to its OUT — long-mode guest works\n",
+                    );
+                } else {
+                    let mut e = [0u8; 18];
+                    serial.write_str(
+                        "enlil kernel: svm: long-mode guest did NOT reach its OUT (final exit ",
+                    );
+                    serial.write_str(format_u64_hex(run.final_exit, &mut e));
+                    serial.write_str(")\n");
+                }
+            }
+            None => serial.write_str("enlil kernel: svm: long-mode vmcb build FAILED\n"),
         }
     }
 

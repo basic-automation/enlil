@@ -179,6 +179,25 @@ pub const GUEST_EVENT_PORT: u8 = 0x87;
 /// I/O record iff [`GUEST_EVENT_VECTOR`] was injected and the handler ran.
 pub const GUEST_EVENT_SENTINEL: u8 = 0x7E;
 
+/// The port the 64-bit long-mode guest `OUT`s its sentinel to. A capture here
+/// proves a guest ran in long mode (paging on, `CR3` walked through the NPT)
+/// under enlil.
+pub const GUEST_LM_PORT: u8 = 0x88;
+
+/// The byte the long-mode guest `OUT`s — present in the run's I/O record iff the
+/// guest entered long mode and ran to its `OUT`.
+pub const GUEST_LM_SENTINEL: u8 = 0x6D;
+
+/// Guest-physical address of the long-mode guest's own page-table root (loaded
+/// into guest `CR3`), as a RAM offset. Past the code + stack, inside the
+/// `[0, 2 MiB)` window so the NPT resolves the page-table walk.
+#[cfg(target_os = "uefi")]
+const GUEST_LM_PT_GPA: usize = 0x0001_0000;
+
+/// The long-mode guest's initial `RSP` — below the page tables, above the code.
+#[cfg(target_os = "uefi")]
+const GUEST_LM_STACK: u64 = 0x0000_8000;
+
 /// A small per-guest shadow of MSRs the guest has written with `WRMSR`.
 ///
 /// A later `RDMSR` reads back what the guest wrote — MSR-state virtualization
@@ -455,7 +474,7 @@ impl GuestRunOutcome {
 #[cfg(target_os = "uefi")]
 pub use hw::{
     enable_svm, program_boot_vmcb, program_event_inj_vmcb, program_host_save_area,
-    run_boot_guest_loop,
+    program_long_mode_vmcb, run_boot_guest_loop,
 };
 
 #[cfg(target_os = "uefi")]
@@ -466,12 +485,12 @@ mod hw {
         is_svm_enabled, is_valid_hsave_pa, svm_status, vm_cr_clear_svmdis,
     };
     use alloc::alloc::{Layout, alloc_zeroed};
-    use enlil_hal::npt::build_npt_2mib;
+    use enlil_hal::npt::{build_identity_npt_2mib, build_npt_2mib};
     use enlil_hal::region::{IoPermissionsMap, MsrPermissionsMap, Vmcb};
     use enlil_hal::svm::{
-        MinimalGuestSetup, VmcbSegment, control, enable_io_intercept, enable_msr_intercept,
-        encode_event_inj, event_type, program_minimal_hlt_guest, save, set_event_inj,
-        write_segment,
+        LongModeGuestSetup, MinimalGuestSetup, VmcbSegment, control, enable_io_intercept,
+        enable_msr_intercept, encode_event_inj, event_type, program_long_mode_hlt_guest,
+        program_minimal_hlt_guest, save, set_event_inj, write_segment,
     };
 
     /// Read a 64-bit MSR.
@@ -962,6 +981,91 @@ mod hw {
         let vmcb_pa = vmcb.base_addr();
         core::mem::forget(vmcb); // must outlive VMRUN
         Some((vmcb_pa, handler_gpa))
+    }
+
+    /// Build a `VMRUN`-ready VMCB for a **64-bit long-mode** guest, returning
+    /// `(vmcb_pa, guest_cr3)`.
+    ///
+    /// This is the mode a real x86-64 OS boots in. The guest runs with paging on
+    /// (`CR0.PG`, `CR4.PAE`, `EFER.LMA|LME`) walking its own page tables via
+    /// `CR3` — which the NPT in turn resolves to system-physical — under an
+    /// `L`-bit code segment. Its code (`mov al, SENTINEL; out PORT, al; hlt`)
+    /// runs at GVA 0 and the dispatch loop captures the `OUT`, so a sentinel in
+    /// the run record proves a guest executed in long mode under enlil.
+    ///
+    /// Layout in the guest's isolated `[0, 2 MiB)` RAM: code at GPA 0, stack at
+    /// [`GUEST_LM_STACK`](super::GUEST_LM_STACK), and the guest's own identity
+    /// page tables at [`GUEST_LM_PT_GPA`](super::GUEST_LM_PT_GPA) (built with
+    /// [`build_identity_npt_2mib`] — the x86-64 table format the guest walk and
+    /// the NPT share). The NPT ([`build_npt_2mib`]) maps that GPA window onto a
+    /// disjoint system-physical window (LOCKED PRINCIPLE 5). All allocations are
+    /// leaked to outlive `VMRUN`. Returns `None` on any allocation/programming
+    /// failure.
+    #[must_use]
+    pub fn program_long_mode_vmcb() -> Option<(u64, u64)> {
+        use super::{GUEST_LM_PORT, GUEST_LM_PT_GPA, GUEST_LM_SENTINEL, GUEST_LM_STACK};
+
+        // Allocate + populate the guest's isolated RAM.
+        // SAFETY: GuestRam is nonzero, 2 MiB-aligned; alloc_zeroed yields it or null.
+        let ram_raw = unsafe { alloc_zeroed(Layout::new::<GuestRam>()) };
+        if ram_raw.is_null() {
+            return None;
+        }
+        let guest_spa = ram_raw as u64;
+        // SAFETY: ram_raw owns GUEST_RAM_BYTES writable bytes (leaked below).
+        let ram = unsafe { core::slice::from_raw_parts_mut(ram_raw, GUEST_RAM_BYTES) };
+        // 64-bit guest code at GVA/GPA 0: mov al, SENTINEL; out PORT, al; hlt
+        // (these opcodes encode identically in long mode).
+        ram[0] = 0xB0; // MOV AL, imm8
+        ram[1] = GUEST_LM_SENTINEL;
+        ram[2] = 0xE6; // OUT imm8, AL
+        ram[3] = GUEST_LM_PORT;
+        ram[4] = 0xF4; // HLT
+
+        // The guest's own page tables (identity GVA→GPA over [0, 2 MiB)) at
+        // GUEST_LM_PT_GPA — CR3 points here; the NPT resolves the GPAs the walk
+        // reads. build_identity_npt_2mib emits the shared x86-64 table format.
+        let pt = GUEST_LM_PT_GPA;
+        let guest_cr3 = build_identity_npt_2mib(
+            &mut ram[pt..pt + 3 * 4096],
+            GUEST_LM_PT_GPA as u64,
+            GUEST_RAM_BYTES as u64,
+        )
+        .ok()?
+        .ncr3;
+
+        // NPT mapping guest GPA [0, 2 MiB) onto the isolated RAM window.
+        // SAFETY: NptBuf is nonzero, 4 KiB-aligned; alloc_zeroed yields it or null.
+        let npt_raw = unsafe { alloc_zeroed(Layout::new::<NptBuf>()) };
+        if npt_raw.is_null() {
+            return None;
+        }
+        let npt_pa = npt_raw as u64;
+        // SAFETY: npt_raw owns a live, zeroed NptBuf, leaked below.
+        let npt_buf = unsafe { core::slice::from_raw_parts_mut(npt_raw, 3 * 4096) };
+        let ncr3 = build_npt_2mib(npt_buf, npt_pa, guest_spa, GUEST_RAM_BYTES as u64)
+            .ok()?
+            .ncr3;
+
+        // Program the VMCB for long mode entering the code at GVA 0.
+        let mut vmcb = Vmcb::new().ok()?;
+        let setup = LongModeGuestSetup {
+            asid: 1,
+            nested_cr3: ncr3,
+            guest_cr3,
+            entry_ip: 0,
+            stack_pointer: GUEST_LM_STACK,
+        };
+        program_long_mode_hlt_guest(vmcb.as_bytes_mut(), &setup).ok()?;
+
+        // Arm port-I/O interception so the guest's OUT takes an IOIO #VMEXIT.
+        let iopm = IoPermissionsMap::intercept_all().ok()?;
+        enable_io_intercept(vmcb.as_bytes_mut(), iopm.base_addr());
+        core::mem::forget(iopm);
+
+        let vmcb_pa = vmcb.base_addr();
+        core::mem::forget(vmcb); // must outlive VMRUN
+        Some((vmcb_pa, guest_cr3))
     }
 
     /// Execute one `VMRUN` on the VMCB at `vmcb_pa`, swapping the guest's

@@ -834,6 +834,24 @@ pub const DEFAULT_PAT: u64 = 0x0007_0406_0007_0406;
 /// The always-set reserved bit 1 of `RFLAGS` — the minimum legal value.
 pub const RFLAGS_RESERVED_ONE: u64 = 1 << 1;
 
+/// `EFER.LME` (bit 8) — Long Mode Enable.
+pub const EFER_LME: u64 = 1 << 8;
+
+/// `EFER.LMA` (bit 10) — Long Mode Active (set once paging turns long mode on).
+pub const EFER_LMA: u64 = 1 << 10;
+
+/// A legal guest `EFER` for a 64-bit guest: `SVME` (required for `VMRUN`) plus
+/// `LME | LMA` (long mode enabled and active).
+pub const GUEST_EFER_LONG_MODE: u64 = EFER_SVME | EFER_LME | EFER_LMA;
+
+/// A legal guest `CR0` for a 64-bit guest: `PE` (bit 0, protected mode) and `PG`
+/// (bit 31, paging) — both required for long mode; `CD`/`NW` clear.
+pub const GUEST_CR0_LONG_MODE: u64 = (1 << 0) | (1 << 31);
+
+/// A legal guest `CR4` for a 64-bit guest: `PAE` (bit 5), required for the
+/// 4-level page-table walk long mode uses.
+pub const GUEST_CR4_LONG_MODE: u64 = 1 << 5;
+
 /// A minimal legal guest `CR0` for a real-mode guest.
 ///
 /// `ET` is set (bit 4) with paging and protection off, and `CD`/`NW` both clear
@@ -978,6 +996,89 @@ pub fn program_minimal_hlt_guest(
         VmcbSegment::real_mode_code(setup.code_base),
     );
     let data = VmcbSegment::real_mode_data(0);
+    write_segment(region, save::DS, data);
+    write_segment(region, save::ES, data);
+    write_segment(region, save::SS, data);
+    write_segment(region, save::FS, data);
+    write_segment(region, save::GS, data);
+
+    Ok(())
+}
+
+/// The register state for bringing up a minimal 64-bit (long-mode) guest that
+/// runs until it executes `HLT` — the step past [`MinimalGuestSetup`] toward a
+/// real OS guest (which boots in long mode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LongModeGuestSetup {
+    /// Guest ASID (must be nonzero; ASID 0 is the host).
+    pub asid: u32,
+    /// Physical base of the guest's nested page-table root (VMCB `nCR3`).
+    pub nested_cr3: u64,
+    /// The guest's own page-table root, loaded into guest `CR3` — a guest
+    /// physical address the `nCR3` map then resolves to system physical.
+    pub guest_cr3: u64,
+    /// Initial 64-bit guest `RIP`.
+    pub entry_ip: u64,
+    /// Initial guest `RSP`.
+    pub stack_pointer: u64,
+}
+
+/// Program a zeroed VMCB region to run a minimal 64-bit long-mode guest until
+/// it executes `HLT` (APM §15.5).
+///
+/// Like [`program_minimal_hlt_guest`] but the state-save area is set up for long
+/// mode: `EFER = SVME|LME|LMA` ([`GUEST_EFER_LONG_MODE`]), `CR0 = PE|PG`
+/// ([`GUEST_CR0_LONG_MODE`]), `CR4 = PAE` ([`GUEST_CR4_LONG_MODE`]), `CR3 =
+/// guest_cr3` (the guest's own page tables), an `L`-bit code segment
+/// ([`VmcbSegment::long_mode_code`]) and flat 64-bit data segments. The same
+/// `HLT`/`SHUTDOWN`/`CPUID`/`VMRUN` intercepts, ASID + full-TLB flush, and
+/// nested paging (`nCR3`) as the real-mode variant are programmed. The caller
+/// still builds the guest page tables (whose root is `guest_cr3`) and the NPT
+/// (whose root is `nested_cr3`).
+///
+/// The combination `EFER.LMA|LME` + `CR0.PG|PE` + `CR4.PAE` + `CS.L` is what
+/// `VMRUN`'s long-mode consistency check requires (APM §15.5.1); getting any one
+/// wrong yields `VMEXIT_INVALID` rather than a running guest.
+///
+/// # Errors
+///
+/// Returns [`VmcbRegionError::TooSmall`] if `region` is shorter than
+/// [`VMCB_SIZE`].
+pub fn program_long_mode_hlt_guest(
+    region: &mut [u8],
+    setup: &LongModeGuestSetup,
+) -> Result<(), VmcbRegionError> {
+    if region.len() < VMCB_SIZE {
+        return Err(VmcbRegionError::TooSmall {
+            provided: region.len(),
+            required: VMCB_SIZE,
+        });
+    }
+
+    // Control area — identical to the real-mode minimal guest.
+    put_u32(
+        region,
+        control::INTERCEPT_MISC1,
+        intercept1::HLT | intercept1::SHUTDOWN | intercept1::CPUID,
+    );
+    put_u32(region, control::INTERCEPT_MISC2, intercept2::VMRUN);
+    put_u32(region, control::GUEST_ASID, setup.asid);
+    put_u8(region, control::TLB_CONTROL, TLB_CONTROL_FLUSH_ALL);
+    put_u64(region, control::NESTED_CTL, control::NESTED_CTL_NP_ENABLE);
+    put_u64(region, control::NESTED_CR3, setup.nested_cr3);
+
+    // State-save area: a flat 64-bit long-mode guest.
+    put_u64(region, save::G_PAT, DEFAULT_PAT);
+    put_u64(region, save::EFER, GUEST_EFER_LONG_MODE);
+    put_u64(region, save::CR0, GUEST_CR0_LONG_MODE);
+    put_u64(region, save::CR3, setup.guest_cr3);
+    put_u64(region, save::CR4, GUEST_CR4_LONG_MODE);
+    put_u64(region, save::RFLAGS, RFLAGS_RESERVED_ONE);
+    put_u64(region, save::RIP, setup.entry_ip);
+    put_u64(region, save::RSP, setup.stack_pointer);
+
+    write_segment(region, save::CS, VmcbSegment::long_mode_code());
+    let data = VmcbSegment::long_mode_data();
     write_segment(region, save::DS, data);
     write_segment(region, save::ES, data);
     write_segment(region, save::SS, data);
@@ -1543,6 +1644,75 @@ mod tests {
         for off in [save::DS, save::ES, save::SS, save::FS, save::GS] {
             assert_eq!(read_segment(&region, off), VmcbSegment::real_mode_data(0));
         }
+    }
+
+    #[test]
+    fn long_mode_guest_programs_the_expected_fields() {
+        let mut region = [0u8; VMCB_SIZE];
+        let setup = LongModeGuestSetup {
+            asid: 2,
+            nested_cr3: 0x400_0000,
+            guest_cr3: 0x4000,
+            entry_ip: 0x1_0000,
+            stack_pointer: 0x2_0000,
+        };
+        program_long_mode_hlt_guest(&mut region, &setup).expect("full page programs");
+
+        // Same intercepts + nested paging as the real-mode minimal guest.
+        assert_eq!(
+            get_u32(&region, control::INTERCEPT_MISC1),
+            intercept1::HLT | intercept1::SHUTDOWN | intercept1::CPUID
+        );
+        assert_eq!(
+            get_u32(&region, control::INTERCEPT_MISC2),
+            intercept2::VMRUN
+        );
+        assert_eq!(get_u32(&region, control::GUEST_ASID), 2);
+        assert_eq!(region[control::TLB_CONTROL], TLB_CONTROL_FLUSH_ALL);
+        assert_eq!(get_u64(&region, control::NESTED_CR3), 0x400_0000);
+
+        // Save area: long-mode EFER/CR0/CR4, guest CR3, entry point + stack.
+        assert_eq!(get_u64(&region, save::EFER), GUEST_EFER_LONG_MODE);
+        assert_eq!(get_u64(&region, save::CR0), GUEST_CR0_LONG_MODE);
+        assert_eq!(get_u64(&region, save::CR4), GUEST_CR4_LONG_MODE);
+        assert_eq!(get_u64(&region, save::CR3), 0x4000);
+        assert_eq!(guest_rip(&region), 0x1_0000);
+        assert_eq!(get_u64(&region, save::RSP), 0x2_0000);
+        assert_eq!(get_u64(&region, save::G_PAT), DEFAULT_PAT);
+
+        // EFER carries all three of SVME, LME, LMA.
+        let efer = get_u64(&region, save::EFER);
+        assert_ne!(efer & EFER_SVME, 0);
+        assert_ne!(efer & EFER_LME, 0);
+        assert_ne!(efer & EFER_LMA, 0);
+
+        // Segments: CS is a long-mode (L-bit) code segment, the rest 64-bit data.
+        assert_eq!(
+            read_segment(&region, save::CS),
+            VmcbSegment::long_mode_code()
+        );
+        for off in [save::DS, save::ES, save::SS, save::FS, save::GS] {
+            assert_eq!(read_segment(&region, off), VmcbSegment::long_mode_data());
+        }
+    }
+
+    #[test]
+    fn long_mode_guest_rejects_short_regions() {
+        let mut short = [0u8; 512];
+        let setup = LongModeGuestSetup {
+            asid: 1,
+            nested_cr3: 0,
+            guest_cr3: 0,
+            entry_ip: 0,
+            stack_pointer: 0,
+        };
+        assert_eq!(
+            program_long_mode_hlt_guest(&mut short, &setup),
+            Err(VmcbRegionError::TooSmall {
+                provided: 512,
+                required: VMCB_SIZE,
+            })
+        );
     }
 
     #[test]
