@@ -96,6 +96,31 @@ pub const CLASS_NETWORK: u8 = 0x02;
 /// PCI base class: display controller (VGA/GPU).
 pub const CLASS_DISPLAY: u8 = 0x03;
 
+/// Capability id: MSI-X (message-signaled interrupts, table form).
+pub const CAP_ID_MSIX: u8 = 0x11;
+
+/// The PCI `STATUS` register's "capabilities list present" bit (bit 4).
+pub const STATUS_CAP_LIST: u16 = 1 << 4;
+
+/// Whether a `STATUS` word advertises a capabilities list.
+#[must_use]
+pub const fn status_has_caps(status: u16) -> bool {
+    status & STATUS_CAP_LIST != 0
+}
+
+/// A capability entry's id (its low byte).
+#[must_use]
+pub const fn cap_id_of(cap_dword: u32) -> u8 {
+    (cap_dword & 0xFF) as u8
+}
+
+/// A capability entry's "next pointer" (config offset of the next cap, or 0 to
+/// end the chain) — the second byte, masked to a dword-aligned offset.
+#[must_use]
+pub const fn cap_next_of(cap_dword: u32) -> u8 {
+    ((cap_dword >> 8) & 0xFC) as u8
+}
+
 /// What the kernel discovered from a PCI bus-0 scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PciScan {
@@ -111,6 +136,8 @@ pub struct PciScan {
     pub network: u32,
     /// Display controllers (class 0x03) on bus 0.
     pub display: u32,
+    /// Functions advertising an MSI-X capability (message-signaled interrupts).
+    pub msix_capable: u32,
 }
 
 impl PciScan {
@@ -132,8 +159,9 @@ pub use hw::{scan_bus0, scan_ecam};
 #[cfg(target_os = "uefi")]
 mod hw {
     use super::{
-        EcamScan, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA, PciScan, class_of, config_address,
-        device_of, ecam_config_address, vendor_of, vendor_present,
+        CAP_ID_MSIX, EcamScan, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA, PciScan, cap_id_of,
+        cap_next_of, class_of, config_address, device_of, ecam_config_address, status_has_caps,
+        vendor_of, vendor_present,
     };
 
     /// Write a 32-bit `value` to `port`.
@@ -173,6 +201,36 @@ mod hw {
         }
     }
 
+    /// Whether `bus:device.function` advertises an MSI-X capability.
+    ///
+    /// Walks the capability chain from config `0x34` when the `STATUS` register
+    /// (config `0x06`) marks a cap list present, cycle-guarded (a bounded number
+    /// of steps) against a malformed chain. Read-only — no config writes.
+    fn has_msix(bus: u8, device: u8, function: u8) -> bool {
+        /// Config offset of the Command/Status dword (STATUS is the high half).
+        const STATUS_DWORD: u8 = 0x04;
+        /// Config offset of the capabilities pointer.
+        const CAP_PTR_OFFSET: u8 = 0x34;
+        /// Bound on the walk (48 * 4 B covers the 256 B legacy config space).
+        const MAX_CAPS: u8 = 48;
+
+        let status = (config_read(bus, device, function, STATUS_DWORD) >> 16) as u16;
+        if !status_has_caps(status) {
+            return false;
+        }
+        let mut ptr = (config_read(bus, device, function, CAP_PTR_OFFSET) & 0xFC) as u8;
+        let mut steps = 0;
+        while ptr != 0 && steps < MAX_CAPS {
+            let cap = config_read(bus, device, function, ptr);
+            if cap_id_of(cap) == CAP_ID_MSIX {
+                return true;
+            }
+            ptr = cap_next_of(cap);
+            steps += 1;
+        }
+        false
+    }
+
     /// Enumerate the present functions on PCI bus 0 and read the host bridge's
     /// identity.
     ///
@@ -201,6 +259,9 @@ mod hw {
             }
             scan.functions += 1;
             scan.count_class(class_of(config_read(0, device, 0, CLASS_OFFSET)));
+            if has_msix(0, device, 0) {
+                scan.msix_capable += 1;
+            }
             // Probe the other functions only if device 0 is multifunction.
             let multifunction =
                 config_read(0, device, 0, HEADER_TYPE_OFFSET) & HEADER_MULTIFUNCTION != 0;
@@ -209,6 +270,9 @@ mod hw {
                     if vendor_present(vendor_of(config_read(0, device, function, 0))) {
                         scan.functions += 1;
                         scan.count_class(class_of(config_read(0, device, function, CLASS_OFFSET)));
+                        if has_msix(0, device, function) {
+                            scan.msix_capable += 1;
+                        }
                     }
                 }
             }
@@ -350,6 +414,21 @@ mod tests {
             ecam_config_address(0xE000_0000, 0, 0, 0, 0xFFF) & 0xFFF,
             0xFFF
         );
+    }
+
+    #[test]
+    fn capability_chain_decode() {
+        // STATUS with the cap-list bit set is detected.
+        assert!(status_has_caps(STATUS_CAP_LIST | 0x0010));
+        assert!(!status_has_caps(0));
+        // A cap dword: id in the low byte, next pointer in the second byte.
+        let cap = 0x0000_5011; // next 0x50, id 0x11 (MSI-X)
+        assert_eq!(cap_id_of(cap), CAP_ID_MSIX);
+        assert_eq!(cap_next_of(cap), 0x50);
+        // The next pointer is dword-aligned (low two bits dropped).
+        assert_eq!(cap_next_of(0x0000_5311), 0x50);
+        // A zero next pointer ends the chain.
+        assert_eq!(cap_next_of(0x0000_0005), 0);
     }
 
     #[test]

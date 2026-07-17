@@ -381,7 +381,10 @@ mod hw {
         serial.write_str(format_u64(u64::from(scan.network), &mut net));
         serial.write_str(" network, ");
         serial.write_str(format_u64(u64::from(scan.display), &mut dsp));
-        serial.write_str(" display\n");
+        serial.write_str(" display, ");
+        let mut mx = [0u8; 20];
+        serial.write_str(format_u64(u64::from(scan.msix_capable), &mut mx));
+        serial.write_str(" MSI-X-capable\n");
     }
 
     /// Arm the LAPIC timer once and prove it fires an interrupt into the kernel.
