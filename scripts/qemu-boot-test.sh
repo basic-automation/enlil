@@ -37,6 +37,9 @@ HEAP_LINE="alloc test ok"
 # Printed once the kernel loads its own IDT and takes a breakpoint through it
 # — proves interrupt vectoring under enlil's own control.
 IDT_LINE="int3 self-test ok"
+# Printed once the kernel's bare-metal spinlock passes its acquire/hold-rejects/
+# release self-test — the mutual exclusion for shared state under SMP.
+SPINLOCK_LINE="spinlock acquire/release self-test ok"
 # Printed once the kernel enables the local APIC in x2APIC mode and reads its
 # ID — proves interrupt-controller bring-up under enlil's own control.
 APIC_LINE="x2APIC enabled"
@@ -244,6 +247,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$KERNEL_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$HEAP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$IDT_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$SPINLOCK_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$APIC_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PERCPU_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$TIMER_LINE" "$SERIAL_LOG" 2>/dev/null \
@@ -267,7 +271,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$EVENTINJ_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$LONGMODE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, IDT, x2APIC, per-CPU GS-base TLS, LAPIC timer, TSC calibration, ACPI discovery, PCI enumeration, own page tables, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + event injection + 64-bit long-mode guest, and GOP draw observed on serial"
+    echo "PASS: banner, kernel memory, heap, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, TSC calibration, ACPI discovery, PCI enumeration, own page tables, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + event injection + 64-bit long-mode guest, and GOP draw observed on serial"
     exit 0
 fi
 

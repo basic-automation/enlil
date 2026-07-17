@@ -236,6 +236,7 @@ mod hw {
         }
 
         bring_up_interrupts(&serial);
+        bring_up_locks(&serial);
         let apic_id = bring_up_apic(&serial);
         bring_up_percpu(&serial, apic_id.unwrap_or(0));
         bring_up_timer(&serial);
@@ -629,6 +630,16 @@ mod hw {
                 Some(id)
             },
         )
+    }
+
+    /// Self-test the bare-metal spinlock primitive — the mutual exclusion the
+    /// kernel guards shared state with once SMP brings up more cores (6.2).
+    fn bring_up_locks(serial: &SerialPort) {
+        if crate::spinlock::selftest() {
+            serial.write_str("enlil kernel: sync: spinlock acquire/release self-test ok\n");
+        } else {
+            serial.write_str("enlil kernel: sync: spinlock self-test FAILED\n");
+        }
     }
 
     /// Install this CPU's per-CPU data block as the `GS`-base TLS pointer and
