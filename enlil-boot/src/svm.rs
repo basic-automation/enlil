@@ -159,6 +159,26 @@ pub const GUEST_GS_BASE: u64 = GUEST_GS_BASE_OFF as u64;
 /// VMCB (a value `VMRUN` alone never installs).
 pub const GUEST_GS_SENTINEL: u8 = 0x5E;
 
+/// The interrupt vector enlil injects into the event-injection guest.
+///
+/// Delivered via the VMCB `EVENTINJ` field. Chosen above the guest program so
+/// its real-mode IVT slot (`4 * vector`) does not overlap the code at GPA 0.
+pub const GUEST_EVENT_VECTOR: u8 = 0x20;
+
+/// Guest RAM offset (a 16-bit real-mode offset) of the handler.
+///
+/// The IVT slot for [`GUEST_EVENT_VECTOR`] points at segment 0, this offset.
+pub const GUEST_EVENT_HANDLER_OFF: u16 = 0x0200;
+
+/// The port the event-injection guest's handler writes its sentinel to. A
+/// capture here proves the injected interrupt was delivered and vectored
+/// through the guest's IVT to the handler.
+pub const GUEST_EVENT_PORT: u8 = 0x87;
+
+/// The byte the event-injection guest's handler `OUT`s. Present in the run's
+/// I/O record iff [`GUEST_EVENT_VECTOR`] was injected and the handler ran.
+pub const GUEST_EVENT_SENTINEL: u8 = 0x7E;
+
 /// A small per-guest shadow of MSRs the guest has written with `WRMSR`.
 ///
 /// A later `RDMSR` reads back what the guest wrote — MSR-state virtualization
@@ -433,7 +453,10 @@ impl GuestRunOutcome {
 }
 
 #[cfg(target_os = "uefi")]
-pub use hw::{enable_svm, program_boot_vmcb, program_host_save_area, run_boot_guest_loop};
+pub use hw::{
+    enable_svm, program_boot_vmcb, program_event_inj_vmcb, program_host_save_area,
+    run_boot_guest_loop,
+};
 
 #[cfg(target_os = "uefi")]
 mod hw {
@@ -447,7 +470,8 @@ mod hw {
     use enlil_hal::region::{IoPermissionsMap, MsrPermissionsMap, Vmcb};
     use enlil_hal::svm::{
         MinimalGuestSetup, VmcbSegment, control, enable_io_intercept, enable_msr_intercept,
-        program_minimal_hlt_guest, save, write_segment,
+        encode_event_inj, event_type, program_minimal_hlt_guest, save, set_event_inj,
+        write_segment,
     };
 
     /// Read a 64-bit MSR.
@@ -832,6 +856,114 @@ mod hw {
         Some((vmcb_pa, ncr3, guest_code_gpa))
     }
 
+    /// Build a `VMRUN`-ready VMCB that proves **event injection**, returning
+    /// `(vmcb_pa, handler_gpa)`.
+    ///
+    /// The VMCB `EVENTINJ` field is armed so `VMRUN` delivers
+    /// [`GUEST_EVENT_VECTOR`](super::GUEST_EVENT_VECTOR) as an external
+    /// interrupt before the guest's first instruction (APM §15.20). The guest's
+    /// real-mode IVT slot for that vector (`4 * vector`) points at a handler
+    /// that `OUT`s [`GUEST_EVENT_SENTINEL`](super::GUEST_EVENT_SENTINEL) and
+    /// `HLT`s. The dispatch loop clears `EVENTINJ` after the first entry so the
+    /// event fires exactly once.
+    ///
+    /// The entry code at GPA 0 is a bare `HLT` — the "injection did not fire"
+    /// path. If injection works the CPU never runs it: it reads the IVT slot,
+    /// pushes FLAGS/CS/IP, and jumps to the handler, whose `OUT` the loop
+    /// captures. A sentinel in the run's I/O record therefore means the
+    /// injected interrupt was delivered and handled; its absence means it was
+    /// not. Assembled entirely through `enlil-hal` (RAM + IVT + handler bytes,
+    /// an NPT mapping the low GiB, a [`Vmcb`] with the I/O intercept and
+    /// `EVENTINJ` armed via [`encode_event_inj`]); allocations are leaked to
+    /// outlive `VMRUN`. Returns `None` on any allocation/programming failure.
+    #[must_use]
+    pub fn program_event_inj_vmcb() -> Option<(u64, u64)> {
+        use super::{
+            GUEST_EVENT_HANDLER_OFF, GUEST_EVENT_PORT, GUEST_EVENT_SENTINEL, GUEST_EVENT_VECTOR,
+        };
+
+        // Allocate + populate the guest's isolated RAM.
+        // SAFETY: GuestRam is a nonzero, 2 MiB-aligned block; alloc_zeroed
+        // yields it zeroed or null.
+        let ram_raw = unsafe { alloc_zeroed(Layout::new::<GuestRam>()) };
+        if ram_raw.is_null() {
+            return None;
+        }
+        let guest_spa = ram_raw as u64;
+        // SAFETY: ram_raw owns GUEST_RAM_BYTES writable bytes (leaked below).
+        let ram = unsafe { core::slice::from_raw_parts_mut(ram_raw, GUEST_RAM_BYTES) };
+        // Entry code at GPA 0: a bare HLT (the injection-did-not-fire path).
+        ram[0] = 0xF4;
+        // Real-mode IVT slot for the vector: offset (u16 LE) then segment (u16
+        // LE), pointing at segment 0, offset GUEST_EVENT_HANDLER_OFF.
+        let ivt = (GUEST_EVENT_VECTOR as usize) * 4;
+        let off = GUEST_EVENT_HANDLER_OFF.to_le_bytes();
+        ram[ivt] = off[0];
+        ram[ivt + 1] = off[1];
+        ram[ivt + 2] = 0x00; // segment low
+        ram[ivt + 3] = 0x00; // segment high
+        // Handler: mov al, SENTINEL; out PORT, al; hlt.
+        let h = GUEST_EVENT_HANDLER_OFF as usize;
+        ram[h] = 0xB0; // MOV AL, imm8
+        ram[h + 1] = GUEST_EVENT_SENTINEL;
+        ram[h + 2] = 0xE6; // OUT imm8, AL
+        ram[h + 3] = GUEST_EVENT_PORT;
+        ram[h + 4] = 0xF4; // HLT
+
+        // NPT mapping guest GPA [0, 2 MiB) onto the isolated RAM window.
+        // SAFETY: NptBuf is nonzero, 4 KiB-aligned; alloc_zeroed yields it or null.
+        let npt_raw = unsafe { alloc_zeroed(Layout::new::<NptBuf>()) };
+        if npt_raw.is_null() {
+            return None;
+        }
+        let npt_pa = npt_raw as u64;
+        // SAFETY: npt_raw owns a live, zeroed NptBuf, leaked below.
+        let npt_buf = unsafe { core::slice::from_raw_parts_mut(npt_raw, 3 * 4096) };
+        let ncr3 = build_npt_2mib(npt_buf, npt_pa, guest_spa, GUEST_RAM_BYTES as u64)
+            .ok()?
+            .ncr3;
+
+        // Program a VMCB entering the bare-HLT at GPA 0 under that NPT.
+        let mut vmcb = Vmcb::new().ok()?;
+        let setup = MinimalGuestSetup {
+            asid: 1,
+            nested_cr3: ncr3,
+            entry_ip: 0,
+            code_base: 0,
+            stack_pointer: 0,
+        };
+        program_minimal_hlt_guest(vmcb.as_bytes_mut(), &setup).ok()?;
+        // program_minimal_hlt_guest zeroes the VMCB, leaving IDTR limit 0 — the
+        // real-mode IVT would then not cover GUEST_EVENT_VECTOR's slot and the
+        // injected interrupt would fault instead of vectoring. Install the
+        // standard real-mode IVT (base 0, limit 0x3FF covers all 256 vectors).
+        write_segment(
+            vmcb.as_bytes_mut(),
+            save::IDTR,
+            VmcbSegment {
+                selector: 0,
+                attrib: 0,
+                limit: 0x03FF,
+                base: 0,
+            },
+        );
+
+        // Arm port-I/O interception so the handler's OUT takes an IOIO #VMEXIT.
+        let iopm = IoPermissionsMap::intercept_all().ok()?;
+        enable_io_intercept(vmcb.as_bytes_mut(), iopm.base_addr());
+        core::mem::forget(iopm);
+
+        // Arm EVENTINJ: VMRUN injects GUEST_EVENT_VECTOR as an external interrupt
+        // before the first guest instruction; the run loop clears it after entry.
+        let inj = encode_event_inj(GUEST_EVENT_VECTOR, event_type::EXTERNAL_INTERRUPT, None);
+        set_event_inj(vmcb.as_bytes_mut(), inj);
+
+        let handler_gpa = u64::from(GUEST_EVENT_HANDLER_OFF);
+        let vmcb_pa = vmcb.base_addr();
+        core::mem::forget(vmcb); // must outlive VMRUN
+        Some((vmcb_pa, handler_gpa))
+    }
+
     /// Execute one `VMRUN` on the VMCB at `vmcb_pa`, swapping the guest's
     /// general-purpose registers (`*gprs`) in around the guest and back out on
     /// `#VMEXIT`.
@@ -1096,6 +1228,10 @@ mod hw {
             // before it.
             // SAFETY: vmcb_pa points at our live, page-sized VMCB.
             let vmcb = unsafe { core::slice::from_raw_parts_mut(vmcb_pa as *mut u8, VMCB_SIZE) };
+            // Consume any armed EVENTINJ so an injected event fires exactly once:
+            // VMRUN just delivered it, and leaving the valid bit set would
+            // re-inject on every re-entry. A no-op when nothing was armed.
+            set_event_inj(vmcb, 0);
             // SAFETY: the VMCB's NPT root is identity-mapped (for demand paging).
             if !unsafe { step_guest(vmcb, &mut gprs, &mut msr_shadow, &mut outcome) } {
                 break;

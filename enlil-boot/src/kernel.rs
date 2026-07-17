@@ -284,6 +284,9 @@ mod hw {
                         // `vmcb` is a VMRUN-ready VMCB from program_boot_vmcb.
                         let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
                         report_guest_run(serial, &run);
+                        // Second guest: prove EVENTINJ delivers an injected
+                        // interrupt through the guest's real-mode IVT.
+                        run_event_inj_guest(serial);
                     }
                     None => serial.write_str("enlil kernel: svm: vmcb VMRUN-ready FAILED\n"),
                 }
@@ -414,6 +417,39 @@ mod hw {
                 serial.write_str(format_u64_hex(run.final_exit, &mut e));
                 serial.write_str("\n");
             }
+        }
+    }
+
+    /// Build and run the event-injection guest, reporting whether the injected
+    /// interrupt was delivered and handled.
+    ///
+    /// enlil arms the VMCB `EVENTINJ` field so `VMRUN` injects
+    /// [`GUEST_EVENT_VECTOR`](crate::svm::GUEST_EVENT_VECTOR) before the guest's
+    /// first instruction; the guest's real-mode IVT vectors it to a handler that
+    /// `OUT`s [`GUEST_EVENT_SENTINEL`](crate::svm::GUEST_EVENT_SENTINEL). A
+    /// matching `OUT` in the run's I/O record proves the injection was delivered
+    /// and handled — the enabling step for virtual-timer and virtual-device
+    /// interrupts (ROADMAP 6.2).
+    fn run_event_inj_guest(serial: &SerialPort) {
+        use crate::svm::{GUEST_EVENT_PORT, GUEST_EVENT_SENTINEL};
+        match crate::svm::program_event_inj_vmcb() {
+            Some((vmcb, _handler)) => {
+                // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
+                // is a VMRUN-ready VMCB from program_event_inj_vmcb.
+                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                if run.io_out_to(u16::from(GUEST_EVENT_PORT))
+                    == Some(u32::from(GUEST_EVENT_SENTINEL))
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: injected interrupt vectored to guest handler — event injection works\n",
+                    );
+                } else {
+                    serial.write_str(
+                        "enlil kernel: svm: event injection NOT observed (guest took the bare-HLT path)\n",
+                    );
+                }
+            }
+            None => serial.write_str("enlil kernel: svm: event-inj vmcb build FAILED\n"),
         }
     }
 
