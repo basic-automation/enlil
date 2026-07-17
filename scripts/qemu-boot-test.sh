@@ -37,9 +37,46 @@ HEAP_LINE="alloc test ok"
 # Printed once the kernel loads its own IDT and takes a breakpoint through it
 # — proves interrupt vectoring under enlil's own control.
 IDT_LINE="int3 self-test ok"
+# Printed once the kernel loads its own GDT + TSS, points #DF at an IST stack,
+# and a self-test interrupt confirms the IST switch — fault-handling robustness.
+GDT_LINE="IST self-test ok"
+# Printed once the kernel's bare-metal spinlock passes its acquire/hold-rejects/
+# release self-test — the mutual exclusion for shared state under SMP.
+SPINLOCK_LINE="spinlock acquire/release self-test ok"
 # Printed once the kernel enables the local APIC in x2APIC mode and reads its
 # ID — proves interrupt-controller bring-up under enlil's own control.
 APIC_LINE="x2APIC enabled"
+# Printed once the kernel installs its per-CPU block as the GS-base TLS pointer
+# and gs:[0] reads it back — the foundation for SMP per-core data.
+PERCPU_LINE="GS-base TLS installed"
+# Printed once the kernel arms a one-shot LAPIC timer, enables interrupts, and
+# its handler runs — the interrupt-preemption clock every scheduler needs.
+TIMER_LINE="LAPIC timer fired"
+# Printed once the kernel calibrates the TSC against the fixed-rate PIT — the
+# monotonic time source the bare-metal kernel runs on.
+TSC_LINE="TSC calibrated"
+# Printed once the kernel walks the firmware ACPI tables (RSDP→XSDT→MADT) and
+# reports the table + enabled-CPU counts — real hardware discovery on metal.
+ACPI_LINE="acpi: discovered"
+# Printed once the kernel finds the MCFG and reports the PCIe ECAM base + bus
+# range — the window for extended config space + full multi-bus PCI topology.
+ECAM_LINE="PCIe ECAM base"
+# Printed once the kernel classifies the firmware IOMMU (DMAR=VT-d / IVRS=AMD-Vi
+# / none) — Phase 6.4's prerequisite. Plain QEMU has no vIOMMU, so this is
+# "none" here; the DMAR/IVRS decode is proven by host unit tests.
+IOMMU_LINE="acpi: IOMMU"
+# Printed once the kernel enumerates PCI bus 0 via the legacy config mechanism
+# (0xCF8/0xCFC), reading the host bridge identity + present-function count.
+PCI_LINE="functions on bus 0"
+# Printed once the kernel classifies bus-0 functions by PCI base class — the
+# storage/network/display inventory driver bring-up + passthrough consume.
+PCI_CLASS_LINE="pci: classes"
+# Printed once the kernel enumerates the full PCIe topology through the ECAM
+# window (all buses, extended config space) — the mechanism passthrough needs.
+ECAM_SCAN_LINE="ECAM scan"
+# Printed once the kernel builds its own identity page tables and reloads CR3
+# off the firmware's — reaching this line proves the map covers the kernel.
+PAGING_LINE="off firmware page tables"
 # Printed once the kernel turns on the CPU virtualization extension (SVM on
 # this AMD host) — the enable gate for running a guest with VMRUN.
 SVM_LINE="svm: enabled"
@@ -87,9 +124,28 @@ NPF_LINE="nested page fault handled"
 # #VMEXIT until the OUT) and produces the correct sum — proving near-native
 # guest execution under enlil.
 COMPUTE_LINE="near-native execution"
+# Printed once the guest reads a byte through its GS segment, whose base VMRUN
+# never loads — only the run shell's VMLOAD does. Proves the VMSAVE/VMLOAD
+# extended-state (FS/GS/TR/LDTR + SYSENTER) swap around VMRUN.
+VMLOAD_LINE="VMSAVE/VMLOAD extended-state swap works"
+# Printed once the guest issues a VMMCALL hypercall, enlil services it and
+# writes the result into guest RAX, and the guest OUTs it — the paravirt
+# enlil<->guest hypercall channel.
+VMMCALL_LINE="hypercall channel works"
+# Printed once enlil arms the VMCB EVENTINJ field, VMRUN injects an interrupt
+# before the guest's first instruction, and the guest's real-mode IVT vectors
+# it to a handler whose OUT enlil captures — proving event injection.
+EVENTINJ_LINE="event injection works"
+# Printed once a 64-bit long-mode guest (paging on, CR3 walking its own tables
+# through the NPT, L-bit code segment) runs to its OUT — the mode a real
+# x86-64 OS boots in.
+LONGMODE_LINE="long-mode guest works"
 # Printed once the kernel draws to the GOP framebuffer and reads a pixel back
 # — proves the framebuffer I/O backend is wired with the firmware gone.
 GOP_LINE="framebuffer draw ok"
+# Printed once the kernel draws its 8x8 text banner over the framebuffer and
+# verifies the blit — visible on-screen output without a serial cable.
+GOP_TEXT_LINE="text console banner drawn"
 TIMEOUT_SECS=60
 
 mkdir -p "$OUTDIR"
@@ -214,7 +270,19 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$KERNEL_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$HEAP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$IDT_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$SPINLOCK_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$GDT_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$APIC_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$PERCPU_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$TIMER_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$TSC_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$ACPI_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$ECAM_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$IOMMU_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$PCI_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$PCI_CLASS_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$ECAM_SCAN_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$PAGING_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$SVM_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$HSAVE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$VMCB_LINE" "$SERIAL_LOG" 2>/dev/null \
@@ -227,8 +295,13 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$MSRW_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$NPF_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$COMPUTE_LINE" "$SERIAL_LOG" 2>/dev/null \
-    && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, IDT, x2APIC, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop, and GOP draw observed on serial"
+    && grep -q "$VMLOAD_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$VMMCALL_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$EVENTINJ_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$LONGMODE_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$GOP_TEXT_LINE" "$SERIAL_LOG" 2>/dev/null; then
+    echo "PASS: banner, kernel memory, heap, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, TSC calibration, ACPI discovery, PCI enumeration, own page tables, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + 64-bit long-mode guest, and GOP draw observed on serial"
     exit 0
 fi
 

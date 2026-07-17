@@ -218,6 +218,7 @@ mod hw {
         let serial = SerialPort::com1();
         serial.write_str("enlil kernel: entered via BootHandoff\n");
 
+        let mut highest_usable_end = 0u64;
         if handoff.memory_map_base != 0 && handoff.memory_map_len != 0 {
             // SAFETY: the UEFI stage recorded the base/extent of the final
             // memory map it received from ExitBootServices() and forgot the
@@ -229,6 +230,7 @@ mod hw {
                 )
             };
             let summary = summarize_memory_map(bytes, handoff.memory_descriptor_size);
+            highest_usable_end = summary.highest_usable_end;
             report_memory(&serial, &summary);
             bring_up_heap(&serial, &summary);
         } else {
@@ -236,11 +238,192 @@ mod hw {
         }
 
         bring_up_interrupts(&serial);
-        bring_up_apic(&serial);
+        bring_up_locks(&serial);
+        let apic_id = bring_up_apic(&serial);
+        bring_up_percpu(&serial, apic_id.unwrap_or(0));
+        bring_up_gdt(&serial);
+        bring_up_timer(&serial);
+        bring_up_time(&serial);
+        let ecam = bring_up_acpi(&serial, handoff);
+        bring_up_pci(&serial);
+        bring_up_paging(&serial, handoff, highest_usable_end);
+        // ECAM reads need the identity map installed above (its window is < 4 GiB).
+        if let Some((ecam_base, end_bus)) = ecam {
+            bring_up_ecam(&serial, ecam_base, end_bus);
+        }
         bring_up_virtualization(&serial);
         bring_up_framebuffer(&serial, handoff);
 
         park()
+    }
+
+    /// Calibrate the TSC against the PIT and report its frequency — the
+    /// monotonic time source the bare-metal kernel runs on (ROADMAP 6.2).
+    ///
+    /// Runs with interrupts masked (the boot path has not enabled them since
+    /// `bring_up_timer` re-masked) so nothing perturbs the calibration window.
+    fn bring_up_time(serial: &SerialPort) {
+        use crate::tsc::hz_to_mhz_rounded;
+        match crate::tsc::calibrate_tsc_hz() {
+            Some(hz) if hz > 0 => {
+                let mut buf = [0u8; 20];
+                serial.write_str("enlil kernel: time: TSC calibrated ");
+                serial.write_str(format_u64(hz_to_mhz_rounded(hz), &mut buf));
+                serial.write_str(" MHz (via PIT) — monotonic clock live\n");
+            }
+            _ => serial.write_str("enlil kernel: time: TSC calibration FAILED (PIT silent)\n"),
+        }
+    }
+
+    /// Discover physical hardware from the firmware ACPI tables and report it.
+    ///
+    /// Walks the handed-off RSDP → XSDT → MADT (the minimal `no_std` walker in
+    /// [`crate::acpi`], since the full `enlil-devices` readers are `std`-only)
+    /// and reports the table count and enabled-CPU count — the first real
+    /// hardware discovery from firmware tables on bare metal (ROADMAP 6.3).
+    fn bring_up_acpi(serial: &SerialPort, handoff: &BootHandoff) -> Option<(u64, u8)> {
+        let summary = crate::acpi::discover(handoff.acpi_rsdp)?;
+        let mut t = [0u8; 20];
+        let mut c = [0u8; 20];
+        serial.write_str("enlil kernel: acpi: discovered ");
+        serial.write_str(format_u64(summary.tables as u64, &mut t));
+        serial.write_str(" tables, ");
+        serial.write_str(format_u64(u64::from(summary.enabled_cpus), &mut c));
+        serial.write_str(" enabled CPUs (MADT)\n");
+        serial.write_str("enlil kernel: acpi: IOMMU ");
+        serial.write_str(summary.iommu.name());
+        serial.write_str(" (DMAR/IVRS)\n");
+        if summary.ecam_base == 0 {
+            return None;
+        }
+        let mut e = [0u8; 18];
+        let mut b = [0u8; 20];
+        serial.write_str("enlil kernel: acpi: PCIe ECAM base ");
+        serial.write_str(format_u64_hex(summary.ecam_base, &mut e));
+        serial.write_str(", buses 0-");
+        serial.write_str(format_u64(u64::from(summary.ecam_end_bus), &mut b));
+        serial.write_str(" (MCFG)\n");
+        Some((summary.ecam_base, summary.ecam_end_bus))
+    }
+
+    /// Enumerate the full PCI Express topology through the `ECAM` window (all
+    /// buses, extended config space) — reads MMIO the kernel's identity map
+    /// covers (the `ECAM` window is below 4 GiB), the mechanism passthrough
+    /// needs.
+    fn bring_up_ecam(serial: &SerialPort, ecam_base: u64, end_bus: u8) {
+        // SAFETY: ecam_base is the firmware ECAM base from the MCFG and its
+        // window is identity-mapped by bring_up_paging (installed above).
+        let scan = unsafe { crate::pci::scan_ecam(ecam_base, end_bus) };
+        let mut f = [0u8; 20];
+        let mut b = [0u8; 20];
+        serial.write_str("enlil kernel: pci: ECAM scan ");
+        serial.write_str(format_u64(u64::from(scan.functions), &mut f));
+        serial.write_str(" functions across ");
+        serial.write_str(format_u64(u64::from(scan.buses_in_use), &mut b));
+        serial.write_str(" buses\n");
+    }
+
+    /// Install the kernel's own identity page tables and switch `CR3` off the
+    /// firmware's (which live in reclaimable boot-services memory) — host
+    /// page-table management (ROADMAP 6.2).
+    ///
+    /// Reaching the report line proves the map is correct: the kernel's code,
+    /// stack, heap, ACPI region, and framebuffer are all covered, or the `CR3`
+    /// reload would have faulted. Every later step runs on these tables.
+    ///
+    /// The span is derived from the real memory map (highest usable RAM) and the
+    /// framebuffer, floored at 4 GiB — so it stays correct on hosts with RAM or
+    /// MMIO above 4 GiB, not just this QEMU layout.
+    fn bring_up_paging(serial: &SerialPort, handoff: &BootHandoff, highest_usable_end: u64) {
+        let (fb_base, fb_size) = handoff
+            .framebuffer
+            .map_or((0, 0), |fb| (fb.base, fb.size_bytes()));
+        let span = crate::paging::required_map_bytes(highest_usable_end, fb_base, fb_size);
+        // SAFETY: `span` covers the highest usable RAM and the framebuffer
+        // (floored at 4 GiB), so the CR3 reload continues execution seamlessly.
+        match unsafe { crate::paging::install_identity_map(span) } {
+            Some(cr3) => {
+                let mut c = [0u8; 18];
+                let mut g = [0u8; 20];
+                serial.write_str("enlil kernel: paging: own identity tables (");
+                serial.write_str(format_u64(crate::paging::map_gib(span), &mut g));
+                serial.write_str(" GiB) installed, CR3=");
+                serial.write_str(format_u64_hex(cr3, &mut c));
+                serial.write_str(" — off firmware page tables\n");
+            }
+            None => serial.write_str("enlil kernel: paging: page-table build FAILED\n"),
+        }
+    }
+
+    /// Enumerate PCI bus 0 via the legacy config mechanism and report it — the
+    /// device discovery every passthrough/IOMMU step builds on (ROADMAP 6.3).
+    ///
+    /// Reads the host bridge (00:00.0) identity as a proof the config reads
+    /// reach real hardware and counts the present functions on bus 0.
+    fn bring_up_pci(serial: &SerialPort) {
+        let scan = crate::pci::scan_bus0();
+        let mut ven = [0u8; 18];
+        let mut dev = [0u8; 18];
+        let mut fns = [0u8; 20];
+        serial.write_str("enlil kernel: pci: host bridge ");
+        serial.write_str(format_u64_hex(u64::from(scan.host_vendor), &mut ven));
+        serial.write_str(":");
+        serial.write_str(format_u64_hex(u64::from(scan.host_device), &mut dev));
+        serial.write_str(", ");
+        serial.write_str(format_u64(u64::from(scan.functions), &mut fns));
+        serial.write_str(" functions on bus 0\n");
+        // Device classes discovered — the input to driver bring-up + passthrough.
+        let mut sto = [0u8; 20];
+        let mut net = [0u8; 20];
+        let mut dsp = [0u8; 20];
+        serial.write_str("enlil kernel: pci: classes ");
+        serial.write_str(format_u64(u64::from(scan.storage), &mut sto));
+        serial.write_str(" storage, ");
+        serial.write_str(format_u64(u64::from(scan.network), &mut net));
+        serial.write_str(" network, ");
+        serial.write_str(format_u64(u64::from(scan.display), &mut dsp));
+        serial.write_str(" display, ");
+        let mut mx = [0u8; 20];
+        serial.write_str(format_u64(u64::from(scan.msix_capable), &mut mx));
+        serial.write_str(" MSI-X-capable\n");
+    }
+
+    /// Arm the LAPIC timer once and prove it fires an interrupt into the kernel.
+    ///
+    /// The interrupt-preemption clock every later scheduler needs (ROADMAP 6.2).
+    /// Installs the timer handler at [`TIMER_VECTOR`], arms a one-shot count,
+    /// enables interrupts, and waits (bounded) for the tick — then disables
+    /// interrupts again and reports. A bounded wait means a timer that never
+    /// fires is reported, not a hang.
+    fn bring_up_timer(serial: &SerialPort) {
+        /// The IDT vector the LAPIC timer delivers on (above the 0x20 legacy
+        /// range, clear of exceptions).
+        const TIMER_VECTOR: u8 = 0x40;
+        /// One-shot countdown (divide-by-16). Small enough to fire fast under
+        /// QEMU, large enough not to fire before interrupts are enabled.
+        const TIMER_COUNT: u32 = 0x0010_0000;
+        /// Cap on the wait spins so a non-firing timer is reported, not hung.
+        const WAIT_SPINS: u32 = 200_000_000;
+
+        crate::idt::install_timer_gate(TIMER_VECTOR);
+        let before = crate::idt::timer_ticks();
+        crate::apic::arm_oneshot_timer(TIMER_VECTOR, TIMER_COUNT);
+        // SAFETY: the timer gate is installed and the handler signals EOI; sti
+        // only enables delivery of the interrupt we just armed.
+        unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)) };
+        let mut spun = 0u32;
+        while crate::idt::timer_ticks() == before && spun < WAIT_SPINS {
+            spun += 1;
+            core::hint::spin_loop();
+        }
+        // SAFETY: re-mask interrupts before continuing the single-threaded boot.
+        unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)) };
+
+        if crate::idt::timer_ticks() > before {
+            serial.write_str("enlil kernel: apic: LAPIC timer fired — preemption clock live\n");
+        } else {
+            serial.write_str("enlil kernel: apic: LAPIC timer did NOT fire\n");
+        }
     }
 
     /// Turn on the CPU's virtualization extension (AMD SVM) so the kernel can
@@ -284,6 +467,12 @@ mod hw {
                         // `vmcb` is a VMRUN-ready VMCB from program_boot_vmcb.
                         let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
                         report_guest_run(serial, &run);
+                        // Second guest: prove EVENTINJ delivers an injected
+                        // interrupt through the guest's real-mode IVT.
+                        run_event_inj_guest(serial);
+                        // Third guest: prove a 64-bit long-mode guest runs (the
+                        // mode a real OS boots in).
+                        run_long_mode_guest(serial);
                     }
                     None => serial.write_str("enlil kernel: svm: vmcb VMRUN-ready FAILED\n"),
                 }
@@ -304,9 +493,10 @@ mod hw {
     /// substrings the QEMU+OVMF harness asserts nightly.
     fn report_guest_run(serial: &SerialPort, run: &crate::svm::GuestRunOutcome) {
         use crate::svm::{
-            GUEST_COMPUTE_PORT, GUEST_COMPUTE_SUM, GUEST_HV_BIT_PORT, GUEST_IO_PORT,
-            GUEST_MSR_PORT, GUEST_MSR_SENTINEL, GUEST_MSR_W_PORT, GUEST_MSR_W_VALUE,
-            GUEST_NPF_PORT, GUEST_NPF_SENTINEL, RunStop,
+            GUEST_COMPUTE_PORT, GUEST_COMPUTE_SUM, GUEST_GS_PORT, GUEST_GS_SENTINEL,
+            GUEST_HV_BIT_PORT, GUEST_IO_PORT, GUEST_MSR_PORT, GUEST_MSR_SENTINEL, GUEST_MSR_W_PORT,
+            GUEST_MSR_W_VALUE, GUEST_NPF_PORT, GUEST_NPF_SENTINEL, GUEST_VMMCALL_PORT,
+            GUEST_VMMCALL_RESULT, RunStop,
         };
         let mut vr = [0u8; 20];
         let mut cp = [0u8; 20];
@@ -391,6 +581,28 @@ mod hw {
                         "enlil kernel: svm: guest native loop computed the right sum — near-native execution\n",
                     );
                 }
+                // The guest issued a VMMCALL hypercall; enlil serviced it and
+                // wrote the result into guest RAX, which the guest OUT'd. A
+                // match proves the paravirt enlil↔guest hypercall channel.
+                if run.vmmcall_exits > 0
+                    && let Some(out) = run.io_out_to(u16::from(GUEST_VMMCALL_PORT))
+                    && out == u32::from(GUEST_VMMCALL_RESULT)
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: guest VMMCALL serviced by enlil (result via RAX) — hypercall channel works\n",
+                    );
+                }
+                // The guest read a byte through its GS segment, whose base VMRUN
+                // never loads — only the run shell's VMLOAD does. A matching OUT
+                // proves the VMSAVE/VMLOAD extended-state swap loaded the guest's
+                // FS/GS/TR/LDTR before entry (a guest using segmentation is safe).
+                if let Some(out) = run.io_out_to(u16::from(GUEST_GS_PORT))
+                    && out == u32::from(GUEST_GS_SENTINEL)
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: guest GS-relative read via VMLOAD'd base — VMSAVE/VMLOAD extended-state swap works\n",
+                    );
+                }
             }
             RunStop::ShutDown => serial.write_str("enlil kernel: svm: guest SHUTDOWN\n"),
             RunStop::Invalid => serial.write_str("enlil kernel: svm: guest INVALID state\n"),
@@ -406,17 +618,121 @@ mod hw {
         }
     }
 
+    /// Build and run the event-injection guest, reporting whether the injected
+    /// interrupt was delivered and handled.
+    ///
+    /// enlil arms the VMCB `EVENTINJ` field so `VMRUN` injects
+    /// [`GUEST_EVENT_VECTOR`](crate::svm::GUEST_EVENT_VECTOR) before the guest's
+    /// first instruction; the guest's real-mode IVT vectors it to a handler that
+    /// `OUT`s [`GUEST_EVENT_SENTINEL`](crate::svm::GUEST_EVENT_SENTINEL). A
+    /// matching `OUT` in the run's I/O record proves the injection was delivered
+    /// and handled — the enabling step for virtual-timer and virtual-device
+    /// interrupts (ROADMAP 6.2).
+    fn run_event_inj_guest(serial: &SerialPort) {
+        use crate::svm::{GUEST_EVENT_PORT, GUEST_EVENT_SENTINEL};
+        match crate::svm::program_event_inj_vmcb() {
+            Some((vmcb, _handler)) => {
+                // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
+                // is a VMRUN-ready VMCB from program_event_inj_vmcb.
+                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                if run.io_out_to(u16::from(GUEST_EVENT_PORT))
+                    == Some(u32::from(GUEST_EVENT_SENTINEL))
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: injected interrupt vectored to guest handler — event injection works\n",
+                    );
+                } else {
+                    serial.write_str(
+                        "enlil kernel: svm: event injection NOT observed (guest took the bare-HLT path)\n",
+                    );
+                }
+            }
+            None => serial.write_str("enlil kernel: svm: event-inj vmcb build FAILED\n"),
+        }
+    }
+
+    /// Build and run a 64-bit long-mode guest, reporting whether it executed.
+    ///
+    /// enlil programs a VMCB for long mode (paging on, `CR3` walking the guest's
+    /// own identity page tables, an `L`-bit code segment) and runs a guest whose
+    /// code `OUT`s [`GUEST_LM_SENTINEL`](crate::svm::GUEST_LM_SENTINEL). A
+    /// matching `OUT` proves a guest ran in the mode a real x86-64 OS boots in;
+    /// a `VMEXIT_INVALID` stop instead means a long-mode consistency check
+    /// failed (ROADMAP 6.2).
+    fn run_long_mode_guest(serial: &SerialPort) {
+        use crate::svm::{GUEST_LM_PORT, GUEST_LM_SENTINEL};
+        match crate::svm::program_long_mode_vmcb() {
+            Some((vmcb, _cr3)) => {
+                // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
+                // is a VMRUN-ready long-mode VMCB from program_long_mode_vmcb.
+                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                if run.io_out_to(u16::from(GUEST_LM_PORT)) == Some(u32::from(GUEST_LM_SENTINEL)) {
+                    serial.write_str(
+                        "enlil kernel: svm: 64-bit long-mode guest ran to its OUT — long-mode guest works\n",
+                    );
+                } else {
+                    let mut e = [0u8; 18];
+                    serial.write_str(
+                        "enlil kernel: svm: long-mode guest did NOT reach its OUT (final exit ",
+                    );
+                    serial.write_str(format_u64_hex(run.final_exit, &mut e));
+                    serial.write_str(")\n");
+                }
+            }
+            None => serial.write_str("enlil kernel: svm: long-mode vmcb build FAILED\n"),
+        }
+    }
+
     /// Enable the local APIC in x2APIC mode and report its ID — the interrupt
-    /// hardware the LAPIC timer / IPIs / MSI routing build on.
-    fn bring_up_apic(serial: &SerialPort) {
-        match crate::apic::enable_x2apic() {
-            Some(id) => {
+    /// hardware the LAPIC timer / IPIs / MSI routing build on. Returns the APIC
+    /// id (or `None` if x2APIC is unavailable) for the per-CPU block.
+    fn bring_up_apic(serial: &SerialPort) -> Option<u32> {
+        crate::apic::enable_x2apic().map_or_else(
+            || {
+                serial.write_str("enlil kernel: apic: x2APIC unavailable\n");
+                None
+            },
+            |id| {
                 let mut buf = [0u8; 20];
                 serial.write_str("enlil kernel: apic: x2APIC enabled, id ");
                 serial.write_str(format_u64(u64::from(id), &mut buf));
                 serial.write_str("\n");
-            }
-            None => serial.write_str("enlil kernel: apic: x2APIC unavailable\n"),
+                Some(id)
+            },
+        )
+    }
+
+    /// Install the kernel's own GDT + TSS with an IST stack and self-test that
+    /// an IST-routed interrupt switches to it — so a fault (e.g. a kernel-stack
+    /// overflow) runs on a good stack instead of triple-faulting (6.2).
+    fn bring_up_gdt(serial: &SerialPort) {
+        if crate::gdt::install_and_selftest() {
+            serial.write_str(
+                "enlil kernel: gdt: own GDT+TSS loaded, #DF on IST1, IST self-test ok\n",
+            );
+        } else {
+            serial.write_str("enlil kernel: gdt: GDT+TSS/IST self-test FAILED\n");
+        }
+    }
+
+    /// Self-test the bare-metal spinlock primitive — the mutual exclusion the
+    /// kernel guards shared state with once SMP brings up more cores (6.2).
+    fn bring_up_locks(serial: &SerialPort) {
+        if crate::spinlock::selftest() {
+            serial.write_str("enlil kernel: sync: spinlock acquire/release self-test ok\n");
+        } else {
+            serial.write_str("enlil kernel: sync: spinlock self-test FAILED\n");
+        }
+    }
+
+    /// Install this CPU's per-CPU data block as the `GS`-base TLS pointer and
+    /// prove `gs:[0]` reads it back — the foundation for SMP per-core data
+    /// (run queue, current vCPU) reached through `GS` (ROADMAP 6.2).
+    fn bring_up_percpu(serial: &SerialPort, apic_id: u32) {
+        if crate::percpu::install_and_selftest(apic_id) {
+            serial.write_str("enlil kernel: percpu: GS-base TLS installed, gs:[0] self-test ok\n");
+        } else {
+            serial.write_str("enlil kernel: percpu: GS-base TLS self-test FAILED\n");
         }
     }
 
@@ -426,6 +742,14 @@ mod hw {
         match &handoff.framebuffer {
             Some(fb) if crate::framebuffer::draw_and_selftest(fb) => {
                 serial.write_str("enlil kernel: gop: framebuffer draw ok\n");
+                // Draw the on-screen text banner over the framebuffer and
+                // verify the 8x8 text console blits correctly (visible output
+                // without a serial cable — the console the service VM will use).
+                if crate::framebuffer::draw_text_banner(fb) {
+                    serial.write_str("enlil kernel: gop: text console banner drawn + verified\n");
+                } else {
+                    serial.write_str("enlil kernel: gop: text console self-test FAILED\n");
+                }
             }
             Some(_) => serial.write_str("enlil kernel: gop: framebuffer draw FAILED\n"),
             None => serial.write_str("enlil kernel: gop: no framebuffer in handoff\n"),

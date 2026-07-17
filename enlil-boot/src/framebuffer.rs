@@ -172,15 +172,90 @@ impl<'a> Canvas<'a> {
     pub const fn height(&self) -> u32 {
         self.height
     }
+
+    /// Blit an 8x8 `glyph` at `(x, y)`: set pixels for `1` bits to `fg`, `0`
+    /// bits to `bg`. Each glyph byte is a row, bit 7 the leftmost pixel.
+    pub fn draw_glyph(&mut self, x: u32, y: u32, glyph: &[u8; GLYPH_HEIGHT], fg: Gray, bg: Gray) {
+        for (&bits, row) in glyph.iter().zip(0u32..) {
+            for col in 0..GLYPH_WIDTH {
+                let color = if glyph_row_bit(bits, col) { fg } else { bg };
+                self.put_pixel(x + col, y + row, color);
+            }
+        }
+    }
+
+    /// Draw `text` (ASCII) starting at `(x, y)`, one 8x8 glyph per character
+    /// advancing by [`GLYPH_WIDTH`]. Unknown characters render blank.
+    pub fn draw_text(&mut self, x: u32, y: u32, text: &[u8], fg: Gray, bg: Gray) {
+        let mut gx = x;
+        for &c in text {
+            self.draw_glyph(gx, y, &font_glyph(c), fg, bg);
+            gx += GLYPH_WIDTH;
+        }
+    }
+}
+
+/// Glyph cell width in pixels.
+pub const GLYPH_WIDTH: u32 = 8;
+/// Glyph cell height in pixels (rows in the bitmap).
+pub const GLYPH_HEIGHT: usize = 8;
+
+/// Whether column `col` (0 = leftmost) of an 8-pixel glyph row `bits` is set.
+#[must_use]
+pub const fn glyph_row_bit(bits: u8, col: u32) -> bool {
+    (bits >> (7 - col)) & 1 != 0
+}
+
+/// The 8x8 bitmap for an ASCII character, or a blank cell for unsupported ones.
+///
+/// A minimal font — enough to render the kernel's on-screen banner; the full
+/// ASCII set waits until a font resource replaces this hand-rolled table.
+#[must_use]
+pub const fn font_glyph(c: u8) -> [u8; GLYPH_HEIGHT] {
+    match c {
+        b'E' => [0xFE, 0xC0, 0xC0, 0xFC, 0xC0, 0xC0, 0xFE, 0x00],
+        b'N' => [0xC6, 0xE6, 0xF6, 0xDE, 0xCE, 0xC6, 0xC6, 0x00],
+        b'L' => [0xC0, 0xC0, 0xC0, 0xC0, 0xC0, 0xC0, 0xFE, 0x00],
+        b'I' => [0xFE, 0x30, 0x30, 0x30, 0x30, 0x30, 0xFE, 0x00],
+        b'K' => [0xC6, 0xCC, 0xD8, 0xF0, 0xD8, 0xCC, 0xC6, 0x00],
+        b'R' => [0xFC, 0xC6, 0xC6, 0xFC, 0xD8, 0xCC, 0xC6, 0x00],
+        _ => [0; GLYPH_HEIGHT], // space + unsupported → blank
+    }
 }
 
 #[cfg(target_os = "uefi")]
-pub use hw::draw_and_selftest;
+pub use hw::{draw_and_selftest, draw_text_banner};
 
 #[cfg(target_os = "uefi")]
 mod hw {
-    use super::{Canvas, Gray};
+    use super::{Canvas, GLYPH_WIDTH, Gray, font_glyph, glyph_row_bit};
     use crate::handoff::Framebuffer;
+
+    /// Draw the kernel banner text on the framebuffer and self-test it by
+    /// reading back a pixel the glyph bitmap says must be lit.
+    ///
+    /// Returns whether the read-back matched — proof the 8x8 text console blits
+    /// correctly into the live framebuffer. Draws "ENLIL" in black on the white
+    /// top band `draw_and_selftest` laid down.
+    #[must_use]
+    pub fn draw_text_banner(fb: &Framebuffer) -> bool {
+        const BANNER: &[u8] = b"ENLIL";
+        // SAFETY: `fb` describes the live GOP framebuffer (see draw_and_selftest).
+        let Some(mut canvas) = (unsafe { Canvas::from_framebuffer(fb) }) else {
+            return false;
+        };
+        let (tx, ty) = (8, 4);
+        canvas.draw_text(tx, ty, BANNER, Gray::BLACK, Gray::WHITE);
+
+        // Verify a pixel the 'E' glyph (first char) sets: its top row is 0xFE,
+        // so column 0 of row 0 is lit → black foreground.
+        let lit = glyph_row_bit(font_glyph(b'E')[0], 0);
+        let px = canvas.read_pixel(tx, ty);
+        // And a definitely-blank cell to the right of the banner stays white.
+        let blank_x = tx + u32::try_from(BANNER.len()).unwrap_or(0) * GLYPH_WIDTH;
+        let blank = canvas.read_pixel(blank_x, ty);
+        lit && matches!(px, Some([0, 0, 0, _])) && matches!(blank, Some([255, 255, 255, _]))
+    }
 
     /// Draw a boot indicator on the GOP framebuffer and self-test the backend
     /// by writing a known pixel and reading it back.
@@ -256,6 +331,39 @@ mod tests {
         canvas.fill_rect(3, 3, 10, 10, Gray::WHITE);
         assert_eq!(canvas.read_pixel(3, 3), Some([255, 255, 255, 0]));
         assert_eq!(canvas.read_pixel(2, 2), Some([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn glyph_row_bit_reads_left_to_right() {
+        // 0x80 = only the leftmost pixel; 0x01 = only the rightmost.
+        assert!(glyph_row_bit(0x80, 0));
+        assert!(!glyph_row_bit(0x80, 1));
+        assert!(glyph_row_bit(0x01, 7));
+        assert!(!glyph_row_bit(0x01, 0));
+        // 0xFE (E's top row) is lit across columns 0..=6, blank at 7.
+        assert!(glyph_row_bit(0xFE, 0));
+        assert!(!glyph_row_bit(0xFE, 7));
+    }
+
+    #[test]
+    fn font_glyph_blank_for_unsupported() {
+        assert_eq!(font_glyph(b' '), [0; GLYPH_HEIGHT]);
+        assert_eq!(font_glyph(b'?'), [0; GLYPH_HEIGHT]);
+        assert_ne!(font_glyph(b'E'), [0; GLYPH_HEIGHT]);
+    }
+
+    #[test]
+    fn draw_text_blits_glyph_pixels() {
+        // A canvas big enough for one glyph.
+        let mut buf = geometry(8, 8, 8, 4);
+        let mut canvas = Canvas::new(&mut buf, 8, 8, 8, 4).expect("valid");
+        canvas.draw_text(0, 0, b"E", Gray::WHITE, Gray::BLACK);
+        // E's top row (0xFE): column 0 lit (white), column 7 blank (black).
+        assert_eq!(canvas.read_pixel(0, 0), Some([255, 255, 255, 0]));
+        assert_eq!(canvas.read_pixel(7, 0), Some([0, 0, 0, 0]));
+        // Row 1 (0xC0): column 0 lit, column 2 blank.
+        assert_eq!(canvas.read_pixel(0, 1), Some([255, 255, 255, 0]));
+        assert_eq!(canvas.read_pixel(2, 1), Some([0, 0, 0, 0]));
     }
 
     #[test]

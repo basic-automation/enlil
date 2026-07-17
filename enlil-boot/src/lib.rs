@@ -21,14 +21,21 @@
 #[cfg(target_os = "uefi")]
 extern crate alloc;
 
+pub mod acpi;
 pub mod allocator;
 pub mod apic;
 pub mod framebuffer;
+pub mod gdt;
 pub mod handoff;
 pub mod idt;
 pub mod kernel;
+pub mod paging;
+pub mod pci;
+pub mod percpu;
 pub mod serial;
+pub mod spinlock;
 pub mod svm;
+pub mod tsc;
 
 /// Console/serial banner the payload emits once it has taken control.
 ///

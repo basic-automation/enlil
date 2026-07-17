@@ -136,6 +136,81 @@ pub const GUEST_COMPUTE_N: u8 = 5;
 /// The expected compute-loop result — `sum(1..=GUEST_COMPUTE_N)`.
 pub const GUEST_COMPUTE_SUM: u8 = GUEST_COMPUTE_N * (GUEST_COMPUTE_N + 1) / 2;
 
+/// The port the boot guest writes its `VMMCALL` hypercall result to. A capture
+/// here proves the guest's paravirt hypercall reached enlil and its result
+/// reached the guest.
+pub const GUEST_VMMCALL_PORT: u8 = 0x89;
+
+/// The hypercall number the boot guest passes in `AX` to `VMMCALL` (0 — a
+/// "get version" style call enlil answers with [`GUEST_VMMCALL_RESULT`]).
+pub const GUEST_VMMCALL_NUMBER: u16 = 0;
+
+/// The byte enlil returns (in guest `RAX`) for the guest's
+/// [`GUEST_VMMCALL_NUMBER`] hypercall; the guest `OUT`s its low byte.
+pub const GUEST_VMMCALL_RESULT: u8 = 0x2A;
+
+/// The port the boot guest writes the byte it read through its `GS` segment to.
+///
+/// `VMRUN` does not load `FS`/`GS`/`TR`/`LDTR` — only `VMLOAD` does — so a
+/// correct read here proves the run shell's `VMSAVE`/`VMLOAD` swap loaded the
+/// guest's extended segment state before entry (ROADMAP 6.2).
+pub const GUEST_GS_PORT: u8 = 0x86;
+
+/// Byte offset within guest RAM where the `GS` sentinel is planted — the `usize`
+/// form of [`GUEST_GS_BASE`] used to index the RAM slice.
+const GUEST_GS_BASE_OFF: usize = 0x1000;
+
+/// The guest-physical address the boot guest's `GS` base is programmed to.
+///
+/// Also where [`GUEST_GS_SENTINEL`] is planted: inside the guest's `[0, 2 MiB)`
+/// RAM window and past the program, so the `GS`-relative read hits a mapped,
+/// known byte.
+pub const GUEST_GS_BASE: u64 = GUEST_GS_BASE_OFF as u64;
+
+/// The byte planted at [`GUEST_GS_BASE`]; the guest reads it via `GS:[0]` and
+/// `OUT`s it, so a match proves `VMLOAD` loaded the guest `GS` base from the
+/// VMCB (a value `VMRUN` alone never installs).
+pub const GUEST_GS_SENTINEL: u8 = 0x5E;
+
+/// The interrupt vector enlil injects into the event-injection guest.
+///
+/// Delivered via the VMCB `EVENTINJ` field. Chosen above the guest program so
+/// its real-mode IVT slot (`4 * vector`) does not overlap the code at GPA 0.
+pub const GUEST_EVENT_VECTOR: u8 = 0x20;
+
+/// Guest RAM offset (a 16-bit real-mode offset) of the handler.
+///
+/// The IVT slot for [`GUEST_EVENT_VECTOR`] points at segment 0, this offset.
+pub const GUEST_EVENT_HANDLER_OFF: u16 = 0x0200;
+
+/// The port the event-injection guest's handler writes its sentinel to. A
+/// capture here proves the injected interrupt was delivered and vectored
+/// through the guest's IVT to the handler.
+pub const GUEST_EVENT_PORT: u8 = 0x87;
+
+/// The byte the event-injection guest's handler `OUT`s. Present in the run's
+/// I/O record iff [`GUEST_EVENT_VECTOR`] was injected and the handler ran.
+pub const GUEST_EVENT_SENTINEL: u8 = 0x7E;
+
+/// The port the 64-bit long-mode guest `OUT`s its sentinel to. A capture here
+/// proves a guest ran in long mode (paging on, `CR3` walked through the NPT)
+/// under enlil.
+pub const GUEST_LM_PORT: u8 = 0x88;
+
+/// The byte the long-mode guest `OUT`s — present in the run's I/O record iff the
+/// guest entered long mode and ran to its `OUT`.
+pub const GUEST_LM_SENTINEL: u8 = 0x6D;
+
+/// Guest-physical address of the long-mode guest's own page-table root (loaded
+/// into guest `CR3`), as a RAM offset. Past the code + stack, inside the
+/// `[0, 2 MiB)` window so the NPT resolves the page-table walk.
+#[cfg(target_os = "uefi")]
+const GUEST_LM_PT_GPA: usize = 0x0001_0000;
+
+/// The long-mode guest's initial `RSP` — below the page tables, above the code.
+#[cfg(target_os = "uefi")]
+const GUEST_LM_STACK: u64 = 0x0000_8000;
+
 /// A small per-guest shadow of MSRs the guest has written with `WRMSR`.
 ///
 /// A later `RDMSR` reads back what the guest wrote — MSR-state virtualization
@@ -335,6 +410,8 @@ pub struct GuestRunOutcome {
     pub msr_exits: u32,
     /// Nested page faults demand-mapped.
     pub npf_exits: u32,
+    /// Intercepted `VMMCALL` hypercalls serviced.
+    pub vmmcall_exits: u32,
     /// The `(port, byte)` writes the guest performed, oldest first, up to
     /// [`MAX_IO_OUTS`](Self::MAX_IO_OUTS) — each captured through the
     /// arch-neutral `VmExit::IoOut`. Query with [`io_out_to`](Self::io_out_to).
@@ -372,6 +449,7 @@ impl GuestRunOutcome {
             io_out_count: 0,
             cpuid_leaf0_ebx: None,
             final_exit: 0,
+            vmmcall_exits: 0,
         }
     }
 
@@ -410,7 +488,10 @@ impl GuestRunOutcome {
 }
 
 #[cfg(target_os = "uefi")]
-pub use hw::{enable_svm, program_boot_vmcb, program_host_save_area, run_boot_guest_loop};
+pub use hw::{
+    enable_svm, program_boot_vmcb, program_event_inj_vmcb, program_host_save_area,
+    program_long_mode_vmcb, run_boot_guest_loop,
+};
 
 #[cfg(target_os = "uefi")]
 mod hw {
@@ -420,11 +501,12 @@ mod hw {
         is_svm_enabled, is_valid_hsave_pa, svm_status, vm_cr_clear_svmdis,
     };
     use alloc::alloc::{Layout, alloc_zeroed};
-    use enlil_hal::npt::build_npt_2mib;
+    use enlil_hal::npt::{build_identity_npt_2mib, build_npt_2mib};
     use enlil_hal::region::{IoPermissionsMap, MsrPermissionsMap, Vmcb};
     use enlil_hal::svm::{
-        MinimalGuestSetup, VmcbSegment, control, enable_io_intercept, enable_msr_intercept,
-        program_minimal_hlt_guest, save, write_segment,
+        LongModeGuestSetup, MinimalGuestSetup, VmcbSegment, control, enable_io_intercept,
+        enable_msr_intercept, encode_event_inj, event_type, intercept_vmmcall,
+        program_long_mode_hlt_guest, program_minimal_hlt_guest, save, set_event_inj, write_segment,
     };
 
     /// Read a 64-bit MSR.
@@ -658,7 +740,28 @@ mod hw {
         bytes[60] = 0xFC;
         bytes[61] = 0xE6; // OUT imm8, AL     (= sum(1..=N))
         bytes[62] = super::GUEST_COMPUTE_PORT;
-        bytes[63] = 0xF4; // HLT
+        // Paravirt hypercall: VMMCALL with a hypercall number in AX; enlil
+        // answers by writing the result into guest RAX, which the guest OUTs.
+        let hc = super::GUEST_VMMCALL_NUMBER.to_le_bytes();
+        bytes[63] = 0xB8; // mov ax, GUEST_VMMCALL_NUMBER
+        bytes[64] = hc[0];
+        bytes[65] = hc[1];
+        bytes[66] = 0x0F; // VMMCALL (0F 01 D9)
+        bytes[67] = 0x01;
+        bytes[68] = 0xD9;
+        bytes[69] = 0xE6; // OUT imm8, AL     (= enlil's hypercall result)
+        bytes[70] = super::GUEST_VMMCALL_PORT;
+        // Read a byte through GS (base loaded from the VMCB by VMLOAD only) and
+        // OUT it — proving the run shell's VMSAVE/VMLOAD extended-state swap.
+        bytes[71] = 0x65; // GS segment override
+        bytes[72] = 0xA0; // MOV AL, moffs16
+        bytes[73] = 0x00; // offset 0x0000 (16-bit) → GS:[0]
+        bytes[74] = 0x00;
+        bytes[75] = 0xE6; // OUT imm8, AL
+        bytes[76] = super::GUEST_GS_PORT;
+        bytes[77] = 0xF4; // HLT
+        // Plant the sentinel the GS-relative read expects at GUEST_GS_BASE.
+        bytes[super::GUEST_GS_BASE_OFF] = super::GUEST_GS_SENTINEL;
     }
 
     /// Build a complete, `VMRUN`-ready VMCB for a minimal real-mode guest that
@@ -710,6 +813,11 @@ mod hw {
         //   out 0x83, al     E6 83           (IOIO → the demand-paged sentinel)
         //   xor ax, ax / mov cx, N / add ax, cx / loop -4  (native sum 1..=N, no exit)
         //   out 0x85, al     E6 85           (IOIO → the computed sum)
+        //   mov ax, 0        B8 00 00        (hypercall number)
+        //   vmmcall          0F 01 D9        (intercepted → enlil sets RAX)
+        //   out 0x89, al     E6 89           (IOIO → the hypercall result)
+        //   mov al, gs:[0]   65 A0 00 00     (GS.base loaded by VMLOAD only)
+        //   out 0x86, al     E6 86           (IOIO → the GS sentinel)
         //   hlt              F4              (clean stop)
         // SAFETY: GuestRam has a nonzero size; alloc_zeroed yields a zeroed,
         // 2 MiB-aligned GuestRam-sized block or null.
@@ -757,6 +865,14 @@ mod hw {
             save::DS,
             VmcbSegment::real_mode_data(GUEST_NPF_GPA),
         );
+        // Point the guest's GS at GUEST_GS_BASE. VMRUN never loads FS/GS/TR/LDTR;
+        // only the run shell's VMLOAD does, so the guest reading the sentinel at
+        // GS:[0] proves the extended-state swap ran.
+        write_segment(
+            vmcb.as_bytes_mut(),
+            save::GS,
+            VmcbSegment::real_mode_data(super::GUEST_GS_BASE),
+        );
         // Read the nested-CR3 back to confirm the programming landed.
         let mut ncr3_le = [0u8; 8];
         ncr3_le.copy_from_slice(&vmcb.as_bytes()[control::NESTED_CR3..control::NESTED_CR3 + 8]);
@@ -784,9 +900,205 @@ mod hw {
         enable_msr_intercept(vmcb.as_bytes_mut(), msrpm.base_addr());
         core::mem::forget(msrpm);
 
+        // Arm the VMMCALL intercept so the guest's hypercall traps to enlil.
+        intercept_vmmcall(vmcb.as_bytes_mut());
+
         let vmcb_pa = vmcb.base_addr();
         core::mem::forget(vmcb); // the VMCB must outlive this call for VMRUN
         Some((vmcb_pa, ncr3, guest_code_gpa))
+    }
+
+    /// Build a `VMRUN`-ready VMCB that proves **event injection**, returning
+    /// `(vmcb_pa, handler_gpa)`.
+    ///
+    /// The VMCB `EVENTINJ` field is armed so `VMRUN` delivers
+    /// [`GUEST_EVENT_VECTOR`](super::GUEST_EVENT_VECTOR) as an external
+    /// interrupt before the guest's first instruction (APM §15.20). The guest's
+    /// real-mode IVT slot for that vector (`4 * vector`) points at a handler
+    /// that `OUT`s [`GUEST_EVENT_SENTINEL`](super::GUEST_EVENT_SENTINEL) and
+    /// `HLT`s. The dispatch loop clears `EVENTINJ` after the first entry so the
+    /// event fires exactly once.
+    ///
+    /// The entry code at GPA 0 is a bare `HLT` — the "injection did not fire"
+    /// path. If injection works the CPU never runs it: it reads the IVT slot,
+    /// pushes FLAGS/CS/IP, and jumps to the handler, whose `OUT` the loop
+    /// captures. A sentinel in the run's I/O record therefore means the
+    /// injected interrupt was delivered and handled; its absence means it was
+    /// not. Assembled entirely through `enlil-hal` (RAM + IVT + handler bytes,
+    /// an NPT mapping the low GiB, a [`Vmcb`] with the I/O intercept and
+    /// `EVENTINJ` armed via [`encode_event_inj`]); allocations are leaked to
+    /// outlive `VMRUN`. Returns `None` on any allocation/programming failure.
+    #[must_use]
+    pub fn program_event_inj_vmcb() -> Option<(u64, u64)> {
+        use super::{
+            GUEST_EVENT_HANDLER_OFF, GUEST_EVENT_PORT, GUEST_EVENT_SENTINEL, GUEST_EVENT_VECTOR,
+        };
+
+        // Allocate + populate the guest's isolated RAM.
+        // SAFETY: GuestRam is a nonzero, 2 MiB-aligned block; alloc_zeroed
+        // yields it zeroed or null.
+        let ram_raw = unsafe { alloc_zeroed(Layout::new::<GuestRam>()) };
+        if ram_raw.is_null() {
+            return None;
+        }
+        let guest_spa = ram_raw as u64;
+        // SAFETY: ram_raw owns GUEST_RAM_BYTES writable bytes (leaked below).
+        let ram = unsafe { core::slice::from_raw_parts_mut(ram_raw, GUEST_RAM_BYTES) };
+        // Entry code at GPA 0: a bare HLT (the injection-did-not-fire path).
+        ram[0] = 0xF4;
+        // Real-mode IVT slot for the vector: offset (u16 LE) then segment (u16
+        // LE), pointing at segment 0, offset GUEST_EVENT_HANDLER_OFF.
+        let ivt = (GUEST_EVENT_VECTOR as usize) * 4;
+        let off = GUEST_EVENT_HANDLER_OFF.to_le_bytes();
+        ram[ivt] = off[0];
+        ram[ivt + 1] = off[1];
+        ram[ivt + 2] = 0x00; // segment low
+        ram[ivt + 3] = 0x00; // segment high
+        // Handler: mov al, SENTINEL; out PORT, al; hlt.
+        let h = GUEST_EVENT_HANDLER_OFF as usize;
+        ram[h] = 0xB0; // MOV AL, imm8
+        ram[h + 1] = GUEST_EVENT_SENTINEL;
+        ram[h + 2] = 0xE6; // OUT imm8, AL
+        ram[h + 3] = GUEST_EVENT_PORT;
+        ram[h + 4] = 0xF4; // HLT
+
+        // NPT mapping guest GPA [0, 2 MiB) onto the isolated RAM window.
+        // SAFETY: NptBuf is nonzero, 4 KiB-aligned; alloc_zeroed yields it or null.
+        let npt_raw = unsafe { alloc_zeroed(Layout::new::<NptBuf>()) };
+        if npt_raw.is_null() {
+            return None;
+        }
+        let npt_pa = npt_raw as u64;
+        // SAFETY: npt_raw owns a live, zeroed NptBuf, leaked below.
+        let npt_buf = unsafe { core::slice::from_raw_parts_mut(npt_raw, 3 * 4096) };
+        let ncr3 = build_npt_2mib(npt_buf, npt_pa, guest_spa, GUEST_RAM_BYTES as u64)
+            .ok()?
+            .ncr3;
+
+        // Program a VMCB entering the bare-HLT at GPA 0 under that NPT.
+        let mut vmcb = Vmcb::new().ok()?;
+        let setup = MinimalGuestSetup {
+            asid: 1,
+            nested_cr3: ncr3,
+            entry_ip: 0,
+            code_base: 0,
+            stack_pointer: 0,
+        };
+        program_minimal_hlt_guest(vmcb.as_bytes_mut(), &setup).ok()?;
+        // program_minimal_hlt_guest zeroes the VMCB, leaving IDTR limit 0 — the
+        // real-mode IVT would then not cover GUEST_EVENT_VECTOR's slot and the
+        // injected interrupt would fault instead of vectoring. Install the
+        // standard real-mode IVT (base 0, limit 0x3FF covers all 256 vectors).
+        write_segment(
+            vmcb.as_bytes_mut(),
+            save::IDTR,
+            VmcbSegment {
+                selector: 0,
+                attrib: 0,
+                limit: 0x03FF,
+                base: 0,
+            },
+        );
+
+        // Arm port-I/O interception so the handler's OUT takes an IOIO #VMEXIT.
+        let iopm = IoPermissionsMap::intercept_all().ok()?;
+        enable_io_intercept(vmcb.as_bytes_mut(), iopm.base_addr());
+        core::mem::forget(iopm);
+
+        // Arm EVENTINJ: VMRUN injects GUEST_EVENT_VECTOR as an external interrupt
+        // before the first guest instruction; the run loop clears it after entry.
+        let inj = encode_event_inj(GUEST_EVENT_VECTOR, event_type::EXTERNAL_INTERRUPT, None);
+        set_event_inj(vmcb.as_bytes_mut(), inj);
+
+        let handler_gpa = u64::from(GUEST_EVENT_HANDLER_OFF);
+        let vmcb_pa = vmcb.base_addr();
+        core::mem::forget(vmcb); // must outlive VMRUN
+        Some((vmcb_pa, handler_gpa))
+    }
+
+    /// Build a `VMRUN`-ready VMCB for a **64-bit long-mode** guest, returning
+    /// `(vmcb_pa, guest_cr3)`.
+    ///
+    /// This is the mode a real x86-64 OS boots in. The guest runs with paging on
+    /// (`CR0.PG`, `CR4.PAE`, `EFER.LMA|LME`) walking its own page tables via
+    /// `CR3` — which the NPT in turn resolves to system-physical — under an
+    /// `L`-bit code segment. Its code (`mov al, SENTINEL; out PORT, al; hlt`)
+    /// runs at GVA 0 and the dispatch loop captures the `OUT`, so a sentinel in
+    /// the run record proves a guest executed in long mode under enlil.
+    ///
+    /// Layout in the guest's isolated `[0, 2 MiB)` RAM: code at GPA 0, stack at
+    /// [`GUEST_LM_STACK`](super::GUEST_LM_STACK), and the guest's own identity
+    /// page tables at [`GUEST_LM_PT_GPA`](super::GUEST_LM_PT_GPA) (built with
+    /// [`build_identity_npt_2mib`] — the x86-64 table format the guest walk and
+    /// the NPT share). The NPT ([`build_npt_2mib`]) maps that GPA window onto a
+    /// disjoint system-physical window (LOCKED PRINCIPLE 5). All allocations are
+    /// leaked to outlive `VMRUN`. Returns `None` on any allocation/programming
+    /// failure.
+    #[must_use]
+    pub fn program_long_mode_vmcb() -> Option<(u64, u64)> {
+        use super::{GUEST_LM_PORT, GUEST_LM_PT_GPA, GUEST_LM_SENTINEL, GUEST_LM_STACK};
+
+        // Allocate + populate the guest's isolated RAM.
+        // SAFETY: GuestRam is nonzero, 2 MiB-aligned; alloc_zeroed yields it or null.
+        let ram_raw = unsafe { alloc_zeroed(Layout::new::<GuestRam>()) };
+        if ram_raw.is_null() {
+            return None;
+        }
+        let guest_spa = ram_raw as u64;
+        // SAFETY: ram_raw owns GUEST_RAM_BYTES writable bytes (leaked below).
+        let ram = unsafe { core::slice::from_raw_parts_mut(ram_raw, GUEST_RAM_BYTES) };
+        // 64-bit guest code at GVA/GPA 0: mov al, SENTINEL; out PORT, al; hlt
+        // (these opcodes encode identically in long mode).
+        ram[0] = 0xB0; // MOV AL, imm8
+        ram[1] = GUEST_LM_SENTINEL;
+        ram[2] = 0xE6; // OUT imm8, AL
+        ram[3] = GUEST_LM_PORT;
+        ram[4] = 0xF4; // HLT
+
+        // The guest's own page tables (identity GVA→GPA over [0, 2 MiB)) at
+        // GUEST_LM_PT_GPA — CR3 points here; the NPT resolves the GPAs the walk
+        // reads. build_identity_npt_2mib emits the shared x86-64 table format.
+        let pt = GUEST_LM_PT_GPA;
+        let guest_cr3 = build_identity_npt_2mib(
+            &mut ram[pt..pt + 3 * 4096],
+            GUEST_LM_PT_GPA as u64,
+            GUEST_RAM_BYTES as u64,
+        )
+        .ok()?
+        .ncr3;
+
+        // NPT mapping guest GPA [0, 2 MiB) onto the isolated RAM window.
+        // SAFETY: NptBuf is nonzero, 4 KiB-aligned; alloc_zeroed yields it or null.
+        let npt_raw = unsafe { alloc_zeroed(Layout::new::<NptBuf>()) };
+        if npt_raw.is_null() {
+            return None;
+        }
+        let npt_pa = npt_raw as u64;
+        // SAFETY: npt_raw owns a live, zeroed NptBuf, leaked below.
+        let npt_buf = unsafe { core::slice::from_raw_parts_mut(npt_raw, 3 * 4096) };
+        let ncr3 = build_npt_2mib(npt_buf, npt_pa, guest_spa, GUEST_RAM_BYTES as u64)
+            .ok()?
+            .ncr3;
+
+        // Program the VMCB for long mode entering the code at GVA 0.
+        let mut vmcb = Vmcb::new().ok()?;
+        let setup = LongModeGuestSetup {
+            asid: 1,
+            nested_cr3: ncr3,
+            guest_cr3,
+            entry_ip: 0,
+            stack_pointer: GUEST_LM_STACK,
+        };
+        program_long_mode_hlt_guest(vmcb.as_bytes_mut(), &setup).ok()?;
+
+        // Arm port-I/O interception so the guest's OUT takes an IOIO #VMEXIT.
+        let iopm = IoPermissionsMap::intercept_all().ok()?;
+        enable_io_intercept(vmcb.as_bytes_mut(), iopm.base_addr());
+        core::mem::forget(iopm);
+
+        let vmcb_pa = vmcb.base_addr();
+        core::mem::forget(vmcb); // must outlive VMRUN
+        Some((vmcb_pa, guest_cr3))
     }
 
     /// Execute one `VMRUN` on the VMCB at `vmcb_pa`, swapping the guest's
@@ -811,15 +1123,36 @@ mod hw {
     ///
     /// `vmcb_pa` must be a `VMRUN`-ready VMCB with SVM enabled and
     /// `VM_HSAVE_PA` programmed (see [`run_boot_guest_loop`]); `gprs` must point
-    /// at a live [`GuestGprs`](super::GuestGprs).
-    unsafe fn vmrun(vmcb_pa: u64, gprs: *mut super::GuestGprs) {
+    /// at a live [`GuestGprs`](super::GuestGprs); `host_save_pa` must be a
+    /// distinct, zeroed 4 KiB-aligned VMCB-format page owned for `VMSAVE`.
+    ///
+    /// `VMRUN` swaps only `RAX`/`RSP`/`RIP`/`RFLAGS` plus `CS`/`DS`/`ES`/`SS`
+    /// through the VMCB; it does **not** touch `FS`/`GS`/`TR`/`LDTR`,
+    /// `KernelGSBase`, `STAR`/`LSTAR`/`CSTAR`/`SFMASK`, or the `SYSENTER` MSRs —
+    /// those are `VMLOAD`/`VMSAVE`'s domain (APM §15.5.2). So the shell brackets
+    /// `VMRUN` with the canonical swap: `VMSAVE` the host's extended state to
+    /// `host_save_pa`, `VMLOAD` the guest's from the VMCB, run, then `VMSAVE`
+    /// the guest's back and `VMLOAD` the host's — a guest using segmentation or
+    /// syscalls is now safe, and the host's `FS`/`GS`/`TR`/`LDTR` survive.
+    ///
+    /// `vmcb_pa`, `host_save_pa`, and the `gprs` pointer are pushed to the stack
+    /// first because the guest clobbers every GPR and `VMRUN` only restores host
+    /// `RAX`/`RSP`; they are reloaded from `[rsp+N]` after `#VMEXIT`.
+    unsafe fn vmrun(vmcb_pa: u64, host_save_pa: u64, gprs: *mut super::GuestGprs) {
         unsafe {
             core::arch::asm!(
                 "push rbx",             // preserve host rbx (callee-saved)
                 "push rbp",             // preserve host rbp (callee-saved)
-                "push rdi",             // keep the gprs pointer across VMRUN
-                // Load guest GPRs from *gprs (rdi); load rbp and rdi last since
-                // rdi still holds the struct pointer for the earlier loads.
+                "push rax",             // [rsp+16] vmcb_pa
+                "push rsi",             // [rsp+8]  host_save_pa
+                "push rdi",             // [rsp+0]  gprs pointer
+                // Swap extended state in: save the host's, load the guest's.
+                "mov rax, [rsp + 8]",   // host_save_pa
+                "vmsave rax",
+                "mov rax, [rsp + 16]",  // vmcb_pa
+                "vmload rax",
+                // Load guest GPRs from *gprs; guest rdi last (it holds the ptr).
+                "mov rdi, [rsp]",
                 "mov rbx, [rdi + 0x00]",
                 "mov rcx, [rdi + 0x08]",
                 "mov rdx, [rdi + 0x10]",
@@ -833,14 +1166,14 @@ mod hw {
                 "mov r13, [rdi + 0x58]",
                 "mov r14, [rdi + 0x60]",
                 "mov r15, [rdi + 0x68]",
-                "mov rdi, [rdi + 0x20]", // guest rdi last (pointer now on stack)
+                "mov rdi, [rdi + 0x20]", // guest rdi last
+                "mov rax, [rsp + 16]",   // vmcb_pa for VMRUN
                 "clgi",
                 "vmrun rax",
                 "stgi",
-                // Guest GPRs are live in the registers. Recover the struct
-                // pointer from the stack into rax (host rax is dead here) and
-                // store the guest values back.
-                "pop rax",
+                // Guest GPRs are live in the registers; VMRUN restored host RSP,
+                // so the stack slots are intact. Store the guest values back.
+                "mov rax, [rsp]",        // gprs pointer
                 "mov [rax + 0x00], rbx",
                 "mov [rax + 0x08], rcx",
                 "mov [rax + 0x10], rdx",
@@ -855,13 +1188,19 @@ mod hw {
                 "mov [rax + 0x58], r13",
                 "mov [rax + 0x60], r14",
                 "mov [rax + 0x68], r15",
-                "pop rbp",              // restore host rbp
-                "pop rbx",              // restore host rbx
+                // Swap extended state back: save the guest's, restore the host's.
+                "mov rax, [rsp + 16]",   // vmcb_pa
+                "vmsave rax",
+                "mov rax, [rsp + 8]",    // host_save_pa
+                "vmload rax",
+                "add rsp, 24",           // drop gprs ptr, host_save_pa, vmcb_pa
+                "pop rbp",               // restore host rbp
+                "pop rbx",               // restore host rbx
                 inout("rax") vmcb_pa => _,
+                inout("rsi") host_save_pa => _,
                 inout("rdi") gprs => _,
                 out("rcx") _,
                 out("rdx") _,
-                out("rsi") _,
                 out("r8") _,
                 out("r9") _,
                 out("r10") _,
@@ -918,6 +1257,23 @@ mod hw {
         if let Some(v) = value {
             set_guest_rax(vmcb, v & 0xFFFF_FFFF);
             gprs.rdx = v >> 32;
+        }
+    }
+
+    /// Service an intercepted guest `VMMCALL` (a paravirt hypercall).
+    ///
+    /// The hypercall number is in the guest's `AX` (low 16 bits of the
+    /// VMCB-carried `RAX`). For [`GUEST_VMMCALL_NUMBER`](super::GUEST_VMMCALL_NUMBER)
+    /// enlil writes [`GUEST_VMMCALL_RESULT`](super::GUEST_VMMCALL_RESULT) back
+    /// into guest `RAX` (the ABI: result in `RAX`); an unknown number leaves
+    /// `RAX` unchanged. This is the enlil↔guest channel a real paravirt guest
+    /// uses (event signaling, fast MMIO, etc.).
+    fn emulate_vmmcall(vmcb: &mut [u8]) {
+        use enlil_hal::svm::{guest_rax, set_guest_rax};
+
+        let number = u16::try_from(guest_rax(vmcb) & 0xFFFF).unwrap_or(u16::MAX);
+        if number == super::GUEST_VMMCALL_NUMBER {
+            set_guest_rax(vmcb, u64::from(super::GUEST_VMMCALL_RESULT));
         }
     }
 
@@ -1000,10 +1356,24 @@ mod hw {
         let mut gprs = super::GuestGprs::default();
         let mut msr_shadow = super::MsrShadow::new();
         let mut outcome = super::GuestRunOutcome::new();
+
+        // A distinct, zeroed VMCB-format page for the run shell's VMSAVE of the
+        // host's extended state (FS/GS/TR/LDTR + SYSENTER/STAR MSRs) — kept
+        // separate from VM_HSAVE_PA, which VMRUN uses for its own host save. If
+        // it cannot be allocated, fall back to a run without the swap by
+        // reporting a failed outcome rather than running with a null page.
+        // SAFETY: HsavePage is a nonzero 4 KiB page; alloc_zeroed yields a
+        // zeroed, page-aligned block or null.
+        let host_save = unsafe { alloc_zeroed(Layout::new::<HsavePage>()) };
+        if host_save.is_null() {
+            outcome.stop = super::RunStop::Invalid;
+            return outcome;
+        }
+        let host_save_pa = host_save as u64;
         loop {
-            // SAFETY: the caller guarantees a VMRUN-ready VMCB with SVM on, and
-            // `gprs` is a live local.
-            unsafe { vmrun(vmcb_pa, &raw mut gprs) };
+            // SAFETY: the caller guarantees a VMRUN-ready VMCB with SVM on,
+            // `gprs` is a live local, and `host_save_pa` is our owned zeroed page.
+            unsafe { vmrun(vmcb_pa, host_save_pa, &raw mut gprs) };
             outcome.vmruns += 1;
 
             // The VMCB is identity-mapped and exclusively owned (leaked by
@@ -1012,6 +1382,10 @@ mod hw {
             // before it.
             // SAFETY: vmcb_pa points at our live, page-sized VMCB.
             let vmcb = unsafe { core::slice::from_raw_parts_mut(vmcb_pa as *mut u8, VMCB_SIZE) };
+            // Consume any armed EVENTINJ so an injected event fires exactly once:
+            // VMRUN just delivered it, and leaving the valid bit set would
+            // re-inject on every re-entry. A no-op when nothing was armed.
+            set_event_inj(vmcb, 0);
             // SAFETY: the VMCB's NPT root is identity-mapped (for demand paging).
             if !unsafe { step_guest(vmcb, &mut gprs, &mut msr_shadow, &mut outcome) } {
                 break;
@@ -1047,9 +1421,9 @@ mod hw {
     ) -> bool {
         use enlil_hal::VmExit;
         use enlil_hal::svm::{
-            CPUID_INSN_LEN, IoioExitInfo, MSR_INSN_LEN, RunLoopExit, classify_run_loop_exit,
-            exit_code, exit_info_1, exit_info_2, guest_rax, guest_rip, ioio_to_vmexit, next_rip,
-            resume_rip_after, set_guest_rip,
+            CPUID_INSN_LEN, IoioExitInfo, MSR_INSN_LEN, RunLoopExit, VMMCALL_INSN_LEN,
+            classify_run_loop_exit, exit_code, exit_info_1, exit_info_2, guest_rax, guest_rip,
+            ioio_to_vmexit, next_rip, resume_rip_after, set_guest_rip,
         };
 
         let code = exit_code(vmcb);
@@ -1094,6 +1468,13 @@ mod hw {
                     return true; // resume WITHOUT advancing RIP
                 }
                 outcome.stop = super::RunStop::Unhandled;
+            }
+            RunLoopExit::Vmmcall => {
+                outcome.vmmcall_exits += 1;
+                emulate_vmmcall(vmcb);
+                let rip = resume_rip_after(next_rip(vmcb), guest_rip(vmcb), VMMCALL_INSN_LEN);
+                set_guest_rip(vmcb, rip);
+                return true;
             }
         }
         false

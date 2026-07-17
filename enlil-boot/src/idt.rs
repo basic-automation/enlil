@@ -111,7 +111,10 @@ pub struct IdtPointer {
 }
 
 #[cfg(target_os = "uefi")]
-pub use hw::{breakpoint_hits, init_and_selftest};
+pub use hw::{
+    InterruptStackFrame, breakpoint_hits, init_and_selftest, install_interrupt_gate,
+    install_timer_gate, repoint_df_to_ist, timer_ticks,
+};
 
 #[cfg(target_os = "uefi")]
 mod hw {
@@ -142,14 +145,77 @@ mod hw {
     /// Breakpoint-handler hit counter — the self-test's observable.
     static BREAKPOINT_HITS: AtomicU32 = AtomicU32::new(0);
 
+    /// LAPIC-timer-handler tick counter — the timer self-test's observable.
+    static TIMER_TICKS: AtomicU32 = AtomicU32::new(0);
+
     /// How many times the breakpoint handler has run.
     pub fn breakpoint_hits() -> u32 {
         BREAKPOINT_HITS.load(Ordering::Acquire)
     }
 
+    /// How many times the LAPIC timer handler has run.
+    pub fn timer_ticks() -> u32 {
+        TIMER_TICKS.load(Ordering::Acquire)
+    }
+
     extern "x86-interrupt" fn breakpoint_handler(_frame: InterruptStackFrame) {
         // A trap gate: return continues at the instruction after `int3`.
         BREAKPOINT_HITS.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// LAPIC timer interrupt handler: count the tick and acknowledge the APIC.
+    ///
+    /// An interrupt gate (IF cleared on entry), so it is not re-entered; it
+    /// signals EOI so the LAPIC can deliver further interrupts, then `IRET`s
+    /// back to the interrupted code (the kernel's wait loop).
+    extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
+        TIMER_TICKS.fetch_add(1, Ordering::AcqRel);
+        crate::apic::signal_eoi();
+    }
+
+    /// Install the LAPIC timer handler at `vector` (an interrupt gate).
+    ///
+    /// Written into the live IDT after `lidt`; the CPU re-reads the table per
+    /// interrupt, so a post-load gate write takes effect. Call with interrupts
+    /// disabled on the single boot CPU (as `kernel_entry` does) so no interrupt
+    /// races the write.
+    pub fn install_timer_gate(vector: u8) {
+        type Handler = extern "x86-interrupt" fn(InterruptStackFrame);
+        let addr = |h: Handler| h as usize as u64;
+        let cs = current_cs();
+        // SAFETY: single boot CPU with interrupts disabled; the IDT static is
+        // live but no interrupt vectors through `vector` until the timer arms.
+        let idt = unsafe { &mut *IDT.0.get() };
+        idt[vector as usize] = IdtEntry::new(addr(timer_handler), cs, 0, GATE_TYPE_INTERRUPT);
+    }
+
+    /// Install an interrupt gate at `vector` for `handler_addr`, using IST index
+    /// `ist`.
+    ///
+    /// `ist` is 0 for the current stack or 1–7 for the TSS's `IST` stack — the
+    /// seam the `gdt` module uses to route a vector onto its IST stack for the
+    /// self-test. Written into the live IDT (post-`lidt`); call with interrupts
+    /// disabled.
+    pub fn install_interrupt_gate(vector: u8, handler_addr: u64, ist: u8) {
+        let cs = current_cs();
+        // SAFETY: single boot CPU, interrupts disabled; the IDT is live but
+        // nothing vectors through `vector` until the caller triggers it.
+        let idt = unsafe { &mut *IDT.0.get() };
+        idt[vector as usize] = IdtEntry::new(handler_addr, cs, ist, GATE_TYPE_INTERRUPT);
+    }
+
+    /// Re-point the `#DF` (double-fault, vector 8) gate at IST index `ist`, so a
+    /// double fault runs on a known-good stack instead of the faulting one.
+    ///
+    /// Written into the live IDT; call with interrupts disabled after the TSS
+    /// (whose `IST` stack this names) is loaded.
+    pub fn repoint_df_to_ist(ist: u8) {
+        type HandlerErr = extern "x86-interrupt" fn(InterruptStackFrame, u64);
+        let addr = |h: HandlerErr| h as usize as u64;
+        let cs = current_cs();
+        // SAFETY: single boot CPU, interrupts disabled; rewriting one live gate.
+        let idt = unsafe { &mut *IDT.0.get() };
+        idt[8] = IdtEntry::new(addr(double_fault_handler), cs, ist, GATE_TYPE_INTERRUPT);
     }
 
     /// Report-and-park handler for faults without an error code.
