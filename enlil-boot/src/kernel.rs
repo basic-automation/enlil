@@ -318,16 +318,27 @@ mod hw {
     /// reach real hardware and counts the present functions on bus 0.
     fn bring_up_pci(serial: &SerialPort) {
         let scan = crate::pci::scan_bus0();
-        let mut v = [0u8; 18];
-        let mut d = [0u8; 18];
-        let mut f = [0u8; 20];
+        let mut ven = [0u8; 18];
+        let mut dev = [0u8; 18];
+        let mut fns = [0u8; 20];
         serial.write_str("enlil kernel: pci: host bridge ");
-        serial.write_str(format_u64_hex(u64::from(scan.host_vendor), &mut v));
+        serial.write_str(format_u64_hex(u64::from(scan.host_vendor), &mut ven));
         serial.write_str(":");
-        serial.write_str(format_u64_hex(u64::from(scan.host_device), &mut d));
+        serial.write_str(format_u64_hex(u64::from(scan.host_device), &mut dev));
         serial.write_str(", ");
-        serial.write_str(format_u64(u64::from(scan.functions), &mut f));
+        serial.write_str(format_u64(u64::from(scan.functions), &mut fns));
         serial.write_str(" functions on bus 0\n");
+        // Device classes discovered — the input to driver bring-up + passthrough.
+        let mut sto = [0u8; 20];
+        let mut net = [0u8; 20];
+        let mut dsp = [0u8; 20];
+        serial.write_str("enlil kernel: pci: classes ");
+        serial.write_str(format_u64(u64::from(scan.storage), &mut sto));
+        serial.write_str(" storage, ");
+        serial.write_str(format_u64(u64::from(scan.network), &mut net));
+        serial.write_str(" network, ");
+        serial.write_str(format_u64(u64::from(scan.display), &mut dsp));
+        serial.write_str(" display\n");
     }
 
     /// Arm the LAPIC timer once and prove it fires an interrupt into the kernel.

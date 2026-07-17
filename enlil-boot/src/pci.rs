@@ -51,6 +51,19 @@ pub const fn vendor_present(vendor: u16) -> bool {
     vendor != PCI_VENDOR_ABSENT
 }
 
+/// The base-class code (high byte of the class dword at config offset 0x08).
+#[must_use]
+pub const fn class_of(config_dword_at_08: u32) -> u8 {
+    (config_dword_at_08 >> 24) as u8
+}
+
+/// PCI base class: mass-storage controller (SATA/NVMe/SCSI/IDE).
+pub const CLASS_STORAGE: u8 = 0x01;
+/// PCI base class: network controller.
+pub const CLASS_NETWORK: u8 = 0x02;
+/// PCI base class: display controller (VGA/GPU).
+pub const CLASS_DISPLAY: u8 = 0x03;
+
 /// What the kernel discovered from a PCI bus-0 scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PciScan {
@@ -60,6 +73,25 @@ pub struct PciScan {
     pub host_vendor: u16,
     /// The host bridge (00:00.0) device id.
     pub host_device: u16,
+    /// Mass-storage controllers (class 0x01) on bus 0.
+    pub storage: u32,
+    /// Network controllers (class 0x02) on bus 0.
+    pub network: u32,
+    /// Display controllers (class 0x03) on bus 0.
+    pub display: u32,
+}
+
+impl PciScan {
+    /// Fold a present function's class code into the per-class counters.
+    #[cfg(any(target_os = "uefi", test))]
+    const fn count_class(&mut self, class: u8) {
+        match class {
+            CLASS_STORAGE => self.storage += 1,
+            CLASS_NETWORK => self.network += 1,
+            CLASS_DISPLAY => self.display += 1,
+            _ => {}
+        }
+    }
 }
 
 #[cfg(target_os = "uefi")]
@@ -68,8 +100,8 @@ pub use hw::scan_bus0;
 #[cfg(target_os = "uefi")]
 mod hw {
     use super::{
-        PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA, PciScan, config_address, device_of, vendor_of,
-        vendor_present,
+        PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA, PciScan, class_of, config_address, device_of,
+        vendor_of, vendor_present,
     };
 
     /// Write a 32-bit `value` to `port`.
@@ -122,6 +154,8 @@ mod hw {
         /// Config offset of the header-type byte (bits: 7 = multifunction).
         const HEADER_TYPE_OFFSET: u8 = 0x0C;
         const HEADER_MULTIFUNCTION: u32 = 0x0080_0000; // bit 23 (byte 0x0E)
+        /// Config offset of the class-code dword (revision/prog-if/subclass/class).
+        const CLASS_OFFSET: u8 = 0x08;
 
         let mut scan = PciScan::default();
         let host = config_read(0, 0, 0, 0);
@@ -134,6 +168,7 @@ mod hw {
                 continue;
             }
             scan.functions += 1;
+            scan.count_class(class_of(config_read(0, device, 0, CLASS_OFFSET)));
             // Probe the other functions only if device 0 is multifunction.
             let multifunction =
                 config_read(0, device, 0, HEADER_TYPE_OFFSET) & HEADER_MULTIFUNCTION != 0;
@@ -141,6 +176,7 @@ mod hw {
                 for function in 1u8..8 {
                     if vendor_present(vendor_of(config_read(0, device, function, 0))) {
                         scan.functions += 1;
+                        scan.count_class(class_of(config_read(0, device, function, CLASS_OFFSET)));
                     }
                 }
             }
@@ -193,5 +229,26 @@ mod tests {
     fn absent_vendor_is_not_present() {
         assert!(!vendor_present(PCI_VENDOR_ABSENT));
         assert_eq!(vendor_of(0xFFFF_FFFF), PCI_VENDOR_ABSENT);
+    }
+
+    #[test]
+    fn class_of_reads_the_high_byte() {
+        // class dword = class:subclass:progif:revision.
+        assert_eq!(class_of(0x0106_0001), CLASS_STORAGE); // SATA (01:06)
+        assert_eq!(class_of(0x0200_0000), CLASS_NETWORK);
+        assert_eq!(class_of(0x0300_0000), CLASS_DISPLAY);
+        assert_eq!(class_of(0x0600_0000), 0x06); // host bridge
+    }
+
+    #[test]
+    fn count_class_tallies_by_base_class() {
+        let mut scan = PciScan::default();
+        scan.count_class(CLASS_STORAGE);
+        scan.count_class(CLASS_STORAGE);
+        scan.count_class(CLASS_NETWORK);
+        scan.count_class(0x06); // bridge — not tallied
+        assert_eq!(scan.storage, 2);
+        assert_eq!(scan.network, 1);
+        assert_eq!(scan.display, 0);
     }
 }

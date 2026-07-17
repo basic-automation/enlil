@@ -58,6 +58,9 @@ ACPI_LINE="acpi: discovered"
 # Printed once the kernel enumerates PCI bus 0 via the legacy config mechanism
 # (0xCF8/0xCFC), reading the host bridge identity + present-function count.
 PCI_LINE="functions on bus 0"
+# Printed once the kernel classifies bus-0 functions by PCI base class — the
+# storage/network/display inventory driver bring-up + passthrough consume.
+PCI_CLASS_LINE="pci: classes"
 # Printed once the kernel builds its own identity page tables and reloads CR3
 # off the firmware's — reaching this line proves the map covers the kernel.
 PAGING_LINE="off firmware page tables"
@@ -258,6 +261,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$TSC_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ACPI_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PCI_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$PCI_CLASS_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PAGING_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$SVM_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$HSAVE_LINE" "$SERIAL_LOG" 2>/dev/null \
