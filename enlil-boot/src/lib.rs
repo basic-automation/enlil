@@ -27,6 +27,7 @@ pub mod framebuffer;
 pub mod handoff;
 pub mod idt;
 pub mod kernel;
+pub mod percpu;
 pub mod serial;
 pub mod svm;
 pub mod tsc;

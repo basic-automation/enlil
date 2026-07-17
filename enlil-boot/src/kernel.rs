@@ -236,7 +236,8 @@ mod hw {
         }
 
         bring_up_interrupts(&serial);
-        bring_up_apic(&serial);
+        let apic_id = bring_up_apic(&serial);
+        bring_up_percpu(&serial, apic_id.unwrap_or(0));
         bring_up_timer(&serial);
         bring_up_time(&serial);
         bring_up_virtualization(&serial);
@@ -547,16 +548,32 @@ mod hw {
     }
 
     /// Enable the local APIC in x2APIC mode and report its ID — the interrupt
-    /// hardware the LAPIC timer / IPIs / MSI routing build on.
-    fn bring_up_apic(serial: &SerialPort) {
-        match crate::apic::enable_x2apic() {
-            Some(id) => {
+    /// hardware the LAPIC timer / IPIs / MSI routing build on. Returns the APIC
+    /// id (or `None` if x2APIC is unavailable) for the per-CPU block.
+    fn bring_up_apic(serial: &SerialPort) -> Option<u32> {
+        crate::apic::enable_x2apic().map_or_else(
+            || {
+                serial.write_str("enlil kernel: apic: x2APIC unavailable\n");
+                None
+            },
+            |id| {
                 let mut buf = [0u8; 20];
                 serial.write_str("enlil kernel: apic: x2APIC enabled, id ");
                 serial.write_str(format_u64(u64::from(id), &mut buf));
                 serial.write_str("\n");
-            }
-            None => serial.write_str("enlil kernel: apic: x2APIC unavailable\n"),
+                Some(id)
+            },
+        )
+    }
+
+    /// Install this CPU's per-CPU data block as the `GS`-base TLS pointer and
+    /// prove `gs:[0]` reads it back — the foundation for SMP per-core data
+    /// (run queue, current vCPU) reached through `GS` (ROADMAP 6.2).
+    fn bring_up_percpu(serial: &SerialPort, apic_id: u32) {
+        if crate::percpu::install_and_selftest(apic_id) {
+            serial.write_str("enlil kernel: percpu: GS-base TLS installed, gs:[0] self-test ok\n");
+        } else {
+            serial.write_str("enlil kernel: percpu: GS-base TLS self-test FAILED\n");
         }
     }
 
