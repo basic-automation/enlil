@@ -87,6 +87,10 @@ NPF_LINE="nested page fault handled"
 # #VMEXIT until the OUT) and produces the correct sum — proving near-native
 # guest execution under enlil.
 COMPUTE_LINE="near-native execution"
+# Printed once the guest reads a byte through its GS segment, whose base VMRUN
+# never loads — only the run shell's VMLOAD does. Proves the VMSAVE/VMLOAD
+# extended-state (FS/GS/TR/LDTR + SYSENTER) swap around VMRUN.
+VMLOAD_LINE="VMSAVE/VMLOAD extended-state swap works"
 # Printed once the kernel draws to the GOP framebuffer and reads a pixel back
 # — proves the framebuffer I/O backend is wired with the firmware gone.
 GOP_LINE="framebuffer draw ok"
@@ -227,8 +231,9 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$MSRW_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$NPF_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$COMPUTE_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$VMLOAD_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, IDT, x2APIC, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop, and GOP draw observed on serial"
+    echo "PASS: banner, kernel memory, heap, IDT, x2APIC, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap, and GOP draw observed on serial"
     exit 0
 fi
 

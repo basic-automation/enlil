@@ -304,9 +304,9 @@ mod hw {
     /// substrings the QEMU+OVMF harness asserts nightly.
     fn report_guest_run(serial: &SerialPort, run: &crate::svm::GuestRunOutcome) {
         use crate::svm::{
-            GUEST_COMPUTE_PORT, GUEST_COMPUTE_SUM, GUEST_HV_BIT_PORT, GUEST_IO_PORT,
-            GUEST_MSR_PORT, GUEST_MSR_SENTINEL, GUEST_MSR_W_PORT, GUEST_MSR_W_VALUE,
-            GUEST_NPF_PORT, GUEST_NPF_SENTINEL, RunStop,
+            GUEST_COMPUTE_PORT, GUEST_COMPUTE_SUM, GUEST_GS_PORT, GUEST_GS_SENTINEL,
+            GUEST_HV_BIT_PORT, GUEST_IO_PORT, GUEST_MSR_PORT, GUEST_MSR_SENTINEL, GUEST_MSR_W_PORT,
+            GUEST_MSR_W_VALUE, GUEST_NPF_PORT, GUEST_NPF_SENTINEL, RunStop,
         };
         let mut vr = [0u8; 20];
         let mut cp = [0u8; 20];
@@ -389,6 +389,17 @@ mod hw {
                 {
                     serial.write_str(
                         "enlil kernel: svm: guest native loop computed the right sum — near-native execution\n",
+                    );
+                }
+                // The guest read a byte through its GS segment, whose base VMRUN
+                // never loads — only the run shell's VMLOAD does. A matching OUT
+                // proves the VMSAVE/VMLOAD extended-state swap loaded the guest's
+                // FS/GS/TR/LDTR before entry (a guest using segmentation is safe).
+                if let Some(out) = run.io_out_to(u16::from(GUEST_GS_PORT))
+                    && out == u32::from(GUEST_GS_SENTINEL)
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: guest GS-relative read via VMLOAD'd base — VMSAVE/VMLOAD extended-state swap works\n",
                     );
                 }
             }

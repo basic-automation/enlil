@@ -136,6 +136,29 @@ pub const GUEST_COMPUTE_N: u8 = 5;
 /// The expected compute-loop result — `sum(1..=GUEST_COMPUTE_N)`.
 pub const GUEST_COMPUTE_SUM: u8 = GUEST_COMPUTE_N * (GUEST_COMPUTE_N + 1) / 2;
 
+/// The port the boot guest writes the byte it read through its `GS` segment to.
+///
+/// `VMRUN` does not load `FS`/`GS`/`TR`/`LDTR` — only `VMLOAD` does — so a
+/// correct read here proves the run shell's `VMSAVE`/`VMLOAD` swap loaded the
+/// guest's extended segment state before entry (ROADMAP 6.2).
+pub const GUEST_GS_PORT: u8 = 0x86;
+
+/// Byte offset within guest RAM where the `GS` sentinel is planted — the `usize`
+/// form of [`GUEST_GS_BASE`] used to index the RAM slice.
+const GUEST_GS_BASE_OFF: usize = 0x1000;
+
+/// The guest-physical address the boot guest's `GS` base is programmed to.
+///
+/// Also where [`GUEST_GS_SENTINEL`] is planted: inside the guest's `[0, 2 MiB)`
+/// RAM window and past the program, so the `GS`-relative read hits a mapped,
+/// known byte.
+pub const GUEST_GS_BASE: u64 = GUEST_GS_BASE_OFF as u64;
+
+/// The byte planted at [`GUEST_GS_BASE`]; the guest reads it via `GS:[0]` and
+/// `OUT`s it, so a match proves `VMLOAD` loaded the guest `GS` base from the
+/// VMCB (a value `VMRUN` alone never installs).
+pub const GUEST_GS_SENTINEL: u8 = 0x5E;
+
 /// A small per-guest shadow of MSRs the guest has written with `WRMSR`.
 ///
 /// A later `RDMSR` reads back what the guest wrote — MSR-state virtualization
@@ -658,7 +681,17 @@ mod hw {
         bytes[60] = 0xFC;
         bytes[61] = 0xE6; // OUT imm8, AL     (= sum(1..=N))
         bytes[62] = super::GUEST_COMPUTE_PORT;
-        bytes[63] = 0xF4; // HLT
+        // Read a byte through GS (base loaded from the VMCB by VMLOAD only) and
+        // OUT it — proving the run shell's VMSAVE/VMLOAD extended-state swap.
+        bytes[63] = 0x65; // GS segment override
+        bytes[64] = 0xA0; // MOV AL, moffs16
+        bytes[65] = 0x00; // offset 0x0000 (16-bit) → GS:[0]
+        bytes[66] = 0x00;
+        bytes[67] = 0xE6; // OUT imm8, AL
+        bytes[68] = super::GUEST_GS_PORT;
+        bytes[69] = 0xF4; // HLT
+        // Plant the sentinel the GS-relative read expects at GUEST_GS_BASE.
+        bytes[super::GUEST_GS_BASE_OFF] = super::GUEST_GS_SENTINEL;
     }
 
     /// Build a complete, `VMRUN`-ready VMCB for a minimal real-mode guest that
@@ -710,6 +743,8 @@ mod hw {
         //   out 0x83, al     E6 83           (IOIO → the demand-paged sentinel)
         //   xor ax, ax / mov cx, N / add ax, cx / loop -4  (native sum 1..=N, no exit)
         //   out 0x85, al     E6 85           (IOIO → the computed sum)
+        //   mov al, gs:[0]   65 A0 00 00     (GS.base loaded by VMLOAD only)
+        //   out 0x86, al     E6 86           (IOIO → the GS sentinel)
         //   hlt              F4              (clean stop)
         // SAFETY: GuestRam has a nonzero size; alloc_zeroed yields a zeroed,
         // 2 MiB-aligned GuestRam-sized block or null.
@@ -756,6 +791,14 @@ mod hw {
             vmcb.as_bytes_mut(),
             save::DS,
             VmcbSegment::real_mode_data(GUEST_NPF_GPA),
+        );
+        // Point the guest's GS at GUEST_GS_BASE. VMRUN never loads FS/GS/TR/LDTR;
+        // only the run shell's VMLOAD does, so the guest reading the sentinel at
+        // GS:[0] proves the extended-state swap ran.
+        write_segment(
+            vmcb.as_bytes_mut(),
+            save::GS,
+            VmcbSegment::real_mode_data(super::GUEST_GS_BASE),
         );
         // Read the nested-CR3 back to confirm the programming landed.
         let mut ncr3_le = [0u8; 8];
@@ -811,15 +854,36 @@ mod hw {
     ///
     /// `vmcb_pa` must be a `VMRUN`-ready VMCB with SVM enabled and
     /// `VM_HSAVE_PA` programmed (see [`run_boot_guest_loop`]); `gprs` must point
-    /// at a live [`GuestGprs`](super::GuestGprs).
-    unsafe fn vmrun(vmcb_pa: u64, gprs: *mut super::GuestGprs) {
+    /// at a live [`GuestGprs`](super::GuestGprs); `host_save_pa` must be a
+    /// distinct, zeroed 4 KiB-aligned VMCB-format page owned for `VMSAVE`.
+    ///
+    /// `VMRUN` swaps only `RAX`/`RSP`/`RIP`/`RFLAGS` plus `CS`/`DS`/`ES`/`SS`
+    /// through the VMCB; it does **not** touch `FS`/`GS`/`TR`/`LDTR`,
+    /// `KernelGSBase`, `STAR`/`LSTAR`/`CSTAR`/`SFMASK`, or the `SYSENTER` MSRs —
+    /// those are `VMLOAD`/`VMSAVE`'s domain (APM §15.5.2). So the shell brackets
+    /// `VMRUN` with the canonical swap: `VMSAVE` the host's extended state to
+    /// `host_save_pa`, `VMLOAD` the guest's from the VMCB, run, then `VMSAVE`
+    /// the guest's back and `VMLOAD` the host's — a guest using segmentation or
+    /// syscalls is now safe, and the host's `FS`/`GS`/`TR`/`LDTR` survive.
+    ///
+    /// `vmcb_pa`, `host_save_pa`, and the `gprs` pointer are pushed to the stack
+    /// first because the guest clobbers every GPR and `VMRUN` only restores host
+    /// `RAX`/`RSP`; they are reloaded from `[rsp+N]` after `#VMEXIT`.
+    unsafe fn vmrun(vmcb_pa: u64, host_save_pa: u64, gprs: *mut super::GuestGprs) {
         unsafe {
             core::arch::asm!(
                 "push rbx",             // preserve host rbx (callee-saved)
                 "push rbp",             // preserve host rbp (callee-saved)
-                "push rdi",             // keep the gprs pointer across VMRUN
-                // Load guest GPRs from *gprs (rdi); load rbp and rdi last since
-                // rdi still holds the struct pointer for the earlier loads.
+                "push rax",             // [rsp+16] vmcb_pa
+                "push rsi",             // [rsp+8]  host_save_pa
+                "push rdi",             // [rsp+0]  gprs pointer
+                // Swap extended state in: save the host's, load the guest's.
+                "mov rax, [rsp + 8]",   // host_save_pa
+                "vmsave rax",
+                "mov rax, [rsp + 16]",  // vmcb_pa
+                "vmload rax",
+                // Load guest GPRs from *gprs; guest rdi last (it holds the ptr).
+                "mov rdi, [rsp]",
                 "mov rbx, [rdi + 0x00]",
                 "mov rcx, [rdi + 0x08]",
                 "mov rdx, [rdi + 0x10]",
@@ -833,14 +897,14 @@ mod hw {
                 "mov r13, [rdi + 0x58]",
                 "mov r14, [rdi + 0x60]",
                 "mov r15, [rdi + 0x68]",
-                "mov rdi, [rdi + 0x20]", // guest rdi last (pointer now on stack)
+                "mov rdi, [rdi + 0x20]", // guest rdi last
+                "mov rax, [rsp + 16]",   // vmcb_pa for VMRUN
                 "clgi",
                 "vmrun rax",
                 "stgi",
-                // Guest GPRs are live in the registers. Recover the struct
-                // pointer from the stack into rax (host rax is dead here) and
-                // store the guest values back.
-                "pop rax",
+                // Guest GPRs are live in the registers; VMRUN restored host RSP,
+                // so the stack slots are intact. Store the guest values back.
+                "mov rax, [rsp]",        // gprs pointer
                 "mov [rax + 0x00], rbx",
                 "mov [rax + 0x08], rcx",
                 "mov [rax + 0x10], rdx",
@@ -855,13 +919,19 @@ mod hw {
                 "mov [rax + 0x58], r13",
                 "mov [rax + 0x60], r14",
                 "mov [rax + 0x68], r15",
-                "pop rbp",              // restore host rbp
-                "pop rbx",              // restore host rbx
+                // Swap extended state back: save the guest's, restore the host's.
+                "mov rax, [rsp + 16]",   // vmcb_pa
+                "vmsave rax",
+                "mov rax, [rsp + 8]",    // host_save_pa
+                "vmload rax",
+                "add rsp, 24",           // drop gprs ptr, host_save_pa, vmcb_pa
+                "pop rbp",               // restore host rbp
+                "pop rbx",               // restore host rbx
                 inout("rax") vmcb_pa => _,
+                inout("rsi") host_save_pa => _,
                 inout("rdi") gprs => _,
                 out("rcx") _,
                 out("rdx") _,
-                out("rsi") _,
                 out("r8") _,
                 out("r9") _,
                 out("r10") _,
@@ -1000,10 +1070,24 @@ mod hw {
         let mut gprs = super::GuestGprs::default();
         let mut msr_shadow = super::MsrShadow::new();
         let mut outcome = super::GuestRunOutcome::new();
+
+        // A distinct, zeroed VMCB-format page for the run shell's VMSAVE of the
+        // host's extended state (FS/GS/TR/LDTR + SYSENTER/STAR MSRs) — kept
+        // separate from VM_HSAVE_PA, which VMRUN uses for its own host save. If
+        // it cannot be allocated, fall back to a run without the swap by
+        // reporting a failed outcome rather than running with a null page.
+        // SAFETY: HsavePage is a nonzero 4 KiB page; alloc_zeroed yields a
+        // zeroed, page-aligned block or null.
+        let host_save = unsafe { alloc_zeroed(Layout::new::<HsavePage>()) };
+        if host_save.is_null() {
+            outcome.stop = super::RunStop::Invalid;
+            return outcome;
+        }
+        let host_save_pa = host_save as u64;
         loop {
-            // SAFETY: the caller guarantees a VMRUN-ready VMCB with SVM on, and
-            // `gprs` is a live local.
-            unsafe { vmrun(vmcb_pa, &raw mut gprs) };
+            // SAFETY: the caller guarantees a VMRUN-ready VMCB with SVM on,
+            // `gprs` is a live local, and `host_save_pa` is our owned zeroed page.
+            unsafe { vmrun(vmcb_pa, host_save_pa, &raw mut gprs) };
             outcome.vmruns += 1;
 
             // The VMCB is identity-mapped and exclusively owned (leaked by
