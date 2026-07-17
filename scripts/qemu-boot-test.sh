@@ -40,6 +40,9 @@ IDT_LINE="int3 self-test ok"
 # Printed once the kernel enables the local APIC in x2APIC mode and reads its
 # ID — proves interrupt-controller bring-up under enlil's own control.
 APIC_LINE="x2APIC enabled"
+# Printed once the kernel arms a one-shot LAPIC timer, enables interrupts, and
+# its handler runs — the interrupt-preemption clock every scheduler needs.
+TIMER_LINE="LAPIC timer fired"
 # Printed once the kernel turns on the CPU virtualization extension (SVM on
 # this AMD host) — the enable gate for running a guest with VMRUN.
 SVM_LINE="svm: enabled"
@@ -227,6 +230,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$HEAP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$IDT_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$APIC_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$TIMER_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$SVM_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$HSAVE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$VMCB_LINE" "$SERIAL_LOG" 2>/dev/null \
@@ -243,7 +247,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$EVENTINJ_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$LONGMODE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, IDT, x2APIC, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + event injection + 64-bit long-mode guest, and GOP draw observed on serial"
+    echo "PASS: banner, kernel memory, heap, IDT, x2APIC, LAPIC timer, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + event injection + 64-bit long-mode guest, and GOP draw observed on serial"
     exit 0
 fi
 

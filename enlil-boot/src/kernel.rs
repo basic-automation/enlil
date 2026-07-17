@@ -237,10 +237,49 @@ mod hw {
 
         bring_up_interrupts(&serial);
         bring_up_apic(&serial);
+        bring_up_timer(&serial);
         bring_up_virtualization(&serial);
         bring_up_framebuffer(&serial, handoff);
 
         park()
+    }
+
+    /// Arm the LAPIC timer once and prove it fires an interrupt into the kernel.
+    ///
+    /// The interrupt-preemption clock every later scheduler needs (ROADMAP 6.2).
+    /// Installs the timer handler at [`TIMER_VECTOR`], arms a one-shot count,
+    /// enables interrupts, and waits (bounded) for the tick — then disables
+    /// interrupts again and reports. A bounded wait means a timer that never
+    /// fires is reported, not a hang.
+    fn bring_up_timer(serial: &SerialPort) {
+        /// The IDT vector the LAPIC timer delivers on (above the 0x20 legacy
+        /// range, clear of exceptions).
+        const TIMER_VECTOR: u8 = 0x40;
+        /// One-shot countdown (divide-by-16). Small enough to fire fast under
+        /// QEMU, large enough not to fire before interrupts are enabled.
+        const TIMER_COUNT: u32 = 0x0010_0000;
+        /// Cap on the wait spins so a non-firing timer is reported, not hung.
+        const WAIT_SPINS: u32 = 200_000_000;
+
+        crate::idt::install_timer_gate(TIMER_VECTOR);
+        let before = crate::idt::timer_ticks();
+        crate::apic::arm_oneshot_timer(TIMER_VECTOR, TIMER_COUNT);
+        // SAFETY: the timer gate is installed and the handler signals EOI; sti
+        // only enables delivery of the interrupt we just armed.
+        unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)) };
+        let mut spun = 0u32;
+        while crate::idt::timer_ticks() == before && spun < WAIT_SPINS {
+            spun += 1;
+            core::hint::spin_loop();
+        }
+        // SAFETY: re-mask interrupts before continuing the single-threaded boot.
+        unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)) };
+
+        if crate::idt::timer_ticks() > before {
+            serial.write_str("enlil kernel: apic: LAPIC timer fired — preemption clock live\n");
+        } else {
+            serial.write_str("enlil kernel: apic: LAPIC timer did NOT fire\n");
+        }
     }
 
     /// Turn on the CPU's virtualization extension (AMD SVM) so the kernel can
