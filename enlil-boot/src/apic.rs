@@ -65,6 +65,43 @@ pub const fn sivr_value(spurious_vector: u8) -> u64 {
     spurious_vector as u64 | SIVR_APIC_ENABLE
 }
 
+/// `IA32_X2APIC_ICR` MSR: the Interrupt Command Register.
+///
+/// A single 64-bit MSR in x2APIC mode — destination APIC id in the high dword,
+/// no delivery-status poll needed, unlike xAPIC's two 32-bit MMIO registers.
+pub const IA32_X2APIC_ICR: u32 = 0x830;
+
+/// ICR delivery mode INIT (bits 10:8 = `0b101`) — the IPI that resets a target
+/// AP to its wait-for-SIPI state (SMP startup, SDM Vol. 3 §10.6.1).
+pub const ICR_DELIVERY_INIT: u64 = 0b101 << 8;
+
+/// ICR delivery mode STARTUP/SIPI (bits 10:8 = `0b110`) — vectors an AP to a
+/// real-mode trampoline at `vector << 12`.
+pub const ICR_DELIVERY_STARTUP: u64 = 0b110 << 8;
+
+/// ICR level = assert (bit 14). Required set for an INIT-assert IPI.
+pub const ICR_LEVEL_ASSERT: u64 = 1 << 14;
+
+/// The x2APIC ICR value for an **INIT (assert)** IPI to `apic_id`.
+///
+/// Destination APIC id in the high dword, delivery mode INIT, physical
+/// destination, level asserted — the first step of the SMP INIT-SIPI-SIPI
+/// wake sequence.
+#[must_use]
+pub const fn icr_init_assert(apic_id: u32) -> u64 {
+    ((apic_id as u64) << 32) | ICR_DELIVERY_INIT | ICR_LEVEL_ASSERT
+}
+
+/// The x2APIC ICR value for a **STARTUP (SIPI)** IPI to `apic_id`, vectoring the
+/// AP to the real-mode trampoline at physical `start_page << 12`.
+///
+/// `start_page` is the 4 KiB page number of the trampoline (so a trampoline at
+/// `0x8000` is page `0x08`); it must be below 1 MiB (a real-mode address).
+#[must_use]
+pub const fn icr_startup(apic_id: u32, start_page: u8) -> u64 {
+    ((apic_id as u64) << 32) | ICR_DELIVERY_STARTUP | (start_page as u64)
+}
+
 /// The `LVT_TIMER` value for an unmasked one-shot timer delivering `vector`.
 #[must_use]
 pub const fn lvt_timer_oneshot(vector: u8) -> u64 {
@@ -289,5 +326,22 @@ mod tests {
         assert_eq!(lvt & LVT_MASKED, 0); // unmasked
         // One-shot mode: the timer-mode bits (18:17) are 0.
         assert_eq!((lvt >> 17) & 0b11, 0);
+    }
+
+    #[test]
+    fn icr_init_targets_the_ap_with_init_assert() {
+        let icr = icr_init_assert(3);
+        assert_eq!(icr >> 32, 3); // destination APIC id
+        assert_eq!((icr >> 8) & 0b111, 0b101); // delivery mode INIT
+        assert_ne!(icr & ICR_LEVEL_ASSERT, 0); // level asserted
+    }
+
+    #[test]
+    fn icr_startup_vectors_the_ap_to_the_trampoline_page() {
+        // Trampoline at physical 0x8000 → page 0x08.
+        let icr = icr_startup(3, 0x08);
+        assert_eq!(icr >> 32, 3); // destination APIC id
+        assert_eq!((icr >> 8) & 0b111, 0b110); // delivery mode STARTUP
+        assert_eq!(icr & 0xFF, 0x08); // start page (vector) → 0x8000
     }
 }
