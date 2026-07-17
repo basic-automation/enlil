@@ -37,6 +37,9 @@ HEAP_LINE="alloc test ok"
 # Printed once the kernel loads its own IDT and takes a breakpoint through it
 # — proves interrupt vectoring under enlil's own control.
 IDT_LINE="int3 self-test ok"
+# Printed once the kernel loads its own GDT + TSS, points #DF at an IST stack,
+# and a self-test interrupt confirms the IST switch — fault-handling robustness.
+GDT_LINE="IST self-test ok"
 # Printed once the kernel's bare-metal spinlock passes its acquire/hold-rejects/
 # release self-test — the mutual exclusion for shared state under SMP.
 SPINLOCK_LINE="spinlock acquire/release self-test ok"
@@ -265,6 +268,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$HEAP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$IDT_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$SPINLOCK_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$GDT_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$APIC_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PERCPU_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$TIMER_LINE" "$SERIAL_LOG" 2>/dev/null \

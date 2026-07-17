@@ -241,6 +241,7 @@ mod hw {
         bring_up_locks(&serial);
         let apic_id = bring_up_apic(&serial);
         bring_up_percpu(&serial, apic_id.unwrap_or(0));
+        bring_up_gdt(&serial);
         bring_up_timer(&serial);
         bring_up_time(&serial);
         let ecam = bring_up_acpi(&serial, handoff);
@@ -699,6 +700,19 @@ mod hw {
                 Some(id)
             },
         )
+    }
+
+    /// Install the kernel's own GDT + TSS with an IST stack and self-test that
+    /// an IST-routed interrupt switches to it — so a fault (e.g. a kernel-stack
+    /// overflow) runs on a good stack instead of triple-faulting (6.2).
+    fn bring_up_gdt(serial: &SerialPort) {
+        if crate::gdt::install_and_selftest() {
+            serial.write_str(
+                "enlil kernel: gdt: own GDT+TSS loaded, #DF on IST1, IST self-test ok\n",
+            );
+        } else {
+            serial.write_str("enlil kernel: gdt: GDT+TSS/IST self-test FAILED\n");
+        }
     }
 
     /// Self-test the bare-metal spinlock primitive — the mutual exclusion the
