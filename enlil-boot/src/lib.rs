@@ -28,6 +28,7 @@ pub mod framebuffer;
 pub mod handoff;
 pub mod idt;
 pub mod kernel;
+pub mod paging;
 pub mod pci;
 pub mod percpu;
 pub mod serial;

@@ -242,6 +242,7 @@ mod hw {
         bring_up_time(&serial);
         bring_up_acpi(&serial, handoff);
         bring_up_pci(&serial);
+        bring_up_paging(&serial);
         bring_up_virtualization(&serial);
         bring_up_framebuffer(&serial, handoff);
 
@@ -284,6 +285,28 @@ mod hw {
                 serial.write_str(" enabled CPUs (MADT)\n");
             }
             None => serial.write_str("enlil kernel: acpi: no valid RSDP in handoff\n"),
+        }
+    }
+
+    /// Install the kernel's own identity page tables and switch `CR3` off the
+    /// firmware's (which live in reclaimable boot-services memory) — host
+    /// page-table management (ROADMAP 6.2).
+    ///
+    /// Reaching the report line proves the map is correct: the kernel's code,
+    /// stack, heap, ACPI region, and framebuffer are all covered, or the `CR3`
+    /// reload would have faulted. Every later step runs on these tables.
+    fn bring_up_paging(serial: &SerialPort) {
+        // SAFETY: install_identity_map builds a low-4-GiB identity map that
+        // covers everything the kernel touches next (sub-4-GiB layout), so the
+        // CR3 reload continues execution seamlessly.
+        match unsafe { crate::paging::install_identity_map() } {
+            Some(cr3) => {
+                let mut buf = [0u8; 18];
+                serial.write_str("enlil kernel: paging: own identity tables installed, CR3=");
+                serial.write_str(format_u64_hex(cr3, &mut buf));
+                serial.write_str(" — off firmware page tables\n");
+            }
+            None => serial.write_str("enlil kernel: paging: page-table build FAILED\n"),
         }
     }
 
