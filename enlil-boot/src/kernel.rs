@@ -289,6 +289,9 @@ mod hw {
         serial.write_str(" tables, ");
         serial.write_str(format_u64(u64::from(summary.enabled_cpus), &mut c));
         serial.write_str(" enabled CPUs (MADT)\n");
+        serial.write_str("enlil kernel: acpi: IOMMU ");
+        serial.write_str(summary.iommu.name());
+        serial.write_str(" (DMAR/IVRS)\n");
         if summary.ecam_base == 0 {
             return None;
         }

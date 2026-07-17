@@ -27,6 +27,49 @@ pub const MADT_SIGNATURE: &[u8; 4] = b"APIC";
 /// The `MCFG` (PCI Express `ECAM`) table signature.
 pub const MCFG_SIGNATURE: &[u8; 4] = b"MCFG";
 
+/// The `DMAR` table signature — Intel VT-d DMA remapping.
+pub const DMAR_SIGNATURE: &[u8; 4] = b"DMAR";
+
+/// The `IVRS` table signature — AMD-Vi (I/O virtualization) remapping.
+pub const IVRS_SIGNATURE: &[u8; 4] = b"IVRS";
+
+/// Which IOMMU the firmware advertises (the DMA-remapping engine Phase 6.4
+/// programs for per-guest device isolation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IommuKind {
+    /// No IOMMU table found.
+    #[default]
+    None,
+    /// Intel VT-d (a `DMAR` table).
+    IntelVtd,
+    /// AMD-Vi (an `IVRS` table).
+    AmdVi,
+}
+
+impl IommuKind {
+    /// A short human name for the serial report.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::IntelVtd => "Intel VT-d",
+            Self::AmdVi => "AMD-Vi",
+        }
+    }
+}
+
+/// Classify an SDT signature as an IOMMU table (or [`IommuKind::None`]).
+#[must_use]
+pub fn iommu_kind_from_signature(sig: [u8; 4]) -> IommuKind {
+    if &sig == DMAR_SIGNATURE {
+        IommuKind::IntelVtd
+    } else if &sig == IVRS_SIGNATURE {
+        IommuKind::AmdVi
+    } else {
+        IommuKind::None
+    }
+}
+
 /// Length of an ACPI System Description Table header.
 pub const SDT_HEADER_LEN: usize = 36;
 
@@ -171,6 +214,8 @@ pub struct AcpiSummary {
     pub ecam_base: u64,
     /// Highest PCI bus number the `ECAM` window covers (from the `MCFG`).
     pub ecam_end_bus: u8,
+    /// The IOMMU the firmware advertises (`DMAR`/`IVRS`), or `None`.
+    pub iommu: IommuKind,
 }
 
 #[cfg(target_os = "uefi")]
@@ -179,9 +224,9 @@ pub use hw::discover;
 #[cfg(target_os = "uefi")]
 mod hw {
     use super::{
-        AcpiSummary, MADT_SIGNATURE, MCFG_SIGNATURE, SDT_HEADER_LEN, madt_enabled_cpu_count,
-        mcfg_first_allocation, rsdp_xsdt_address, sdt_length, sdt_signature, xsdt_entry,
-        xsdt_entry_count,
+        AcpiSummary, IommuKind, MADT_SIGNATURE, MCFG_SIGNATURE, SDT_HEADER_LEN,
+        iommu_kind_from_signature, madt_enabled_cpu_count, mcfg_first_allocation,
+        rsdp_xsdt_address, sdt_length, sdt_signature, xsdt_entry, xsdt_entry_count,
     };
 
     /// View `len` bytes of identity-mapped physical memory at `phys`.
@@ -225,6 +270,7 @@ mod hw {
             enabled_cpus: 0,
             ecam_base: 0,
             ecam_end_bus: 0,
+            iommu: IommuKind::None,
         };
 
         // Scan the referenced tables for the MADT (enabled CPUs) and the MCFG
@@ -237,6 +283,10 @@ mod hw {
                 i += 1;
                 continue;
             };
+            match iommu_kind_from_signature(sig) {
+                IommuKind::None => {}
+                kind => summary.iommu = kind,
+            }
             if let Some(len) = sdt_length(hdr) {
                 // SAFETY: the table spans `len` mapped bytes from table_phys.
                 let table = unsafe { phys_slice(table_phys, len as usize) };
@@ -361,6 +411,17 @@ mod tests {
             mcfg_first_allocation(&mcfg),
             Some((0xB000_0000, 0, 0x00, 0xFF))
         );
+    }
+
+    #[test]
+    fn iommu_kind_classifies_dmar_and_ivrs() {
+        assert_eq!(
+            iommu_kind_from_signature(*DMAR_SIGNATURE),
+            IommuKind::IntelVtd
+        );
+        assert_eq!(iommu_kind_from_signature(*IVRS_SIGNATURE), IommuKind::AmdVi);
+        assert_eq!(iommu_kind_from_signature(*MADT_SIGNATURE), IommuKind::None);
+        assert_eq!(IommuKind::default(), IommuKind::None);
     }
 
     #[test]
