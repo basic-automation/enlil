@@ -437,7 +437,8 @@ mod hw {
         use crate::svm::{
             GUEST_COMPUTE_PORT, GUEST_COMPUTE_SUM, GUEST_GS_PORT, GUEST_GS_SENTINEL,
             GUEST_HV_BIT_PORT, GUEST_IO_PORT, GUEST_MSR_PORT, GUEST_MSR_SENTINEL, GUEST_MSR_W_PORT,
-            GUEST_MSR_W_VALUE, GUEST_NPF_PORT, GUEST_NPF_SENTINEL, RunStop,
+            GUEST_MSR_W_VALUE, GUEST_NPF_PORT, GUEST_NPF_SENTINEL, GUEST_VMMCALL_PORT,
+            GUEST_VMMCALL_RESULT, RunStop,
         };
         let mut vr = [0u8; 20];
         let mut cp = [0u8; 20];
@@ -520,6 +521,17 @@ mod hw {
                 {
                     serial.write_str(
                         "enlil kernel: svm: guest native loop computed the right sum — near-native execution\n",
+                    );
+                }
+                // The guest issued a VMMCALL hypercall; enlil serviced it and
+                // wrote the result into guest RAX, which the guest OUT'd. A
+                // match proves the paravirt enlil↔guest hypercall channel.
+                if run.vmmcall_exits > 0
+                    && let Some(out) = run.io_out_to(u16::from(GUEST_VMMCALL_PORT))
+                    && out == u32::from(GUEST_VMMCALL_RESULT)
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: guest VMMCALL serviced by enlil (result via RAX) — hypercall channel works\n",
                     );
                 }
                 // The guest read a byte through its GS segment, whose base VMRUN

@@ -729,10 +729,21 @@ pub enum RunLoopExit {
     /// (demand paging) or emulates MMIO, then resumes *without* advancing RIP so
     /// the faulting instruction re-executes.
     Npf,
+    /// Intercepted `VMMCALL` — a paravirt hypercall from an enlightened guest.
+    /// The hypercall number is in guest `RAX` (VMCB-carried); the caller
+    /// services it, writes the result back to guest `RAX`, then resumes past the
+    /// fixed-length instruction.
+    Vmmcall,
     /// An exit the minimal loop does not route yet — stop and report the raw
     /// code to the caller.
     Unhandled,
 }
+
+/// Length of the `VMMCALL` instruction in bytes (opcode `0F 01 D9`).
+///
+/// The amount to advance guest `RIP` past an intercepted `VMMCALL` when the CPU
+/// does not save `NEXT_RIP` (see [`resume_rip_after`]).
+pub const VMMCALL_INSN_LEN: u64 = 3;
 
 /// Length of the `RDMSR`/`WRMSR` instructions in bytes (opcodes `0F 32`/`0F 30`).
 ///
@@ -758,6 +769,7 @@ pub const fn classify_run_loop_exit(code: SvmExitCode) -> RunLoopExit {
         exit_code::IOIO => RunLoopExit::Io,
         exit_code::MSR => RunLoopExit::Msr,
         exit_code::NPF => RunLoopExit::Npf,
+        exit_code::VMMCALL => RunLoopExit::Vmmcall,
         _ => RunLoopExit::Unhandled,
     }
 }
@@ -1086,6 +1098,18 @@ pub fn program_long_mode_hlt_guest(
     write_segment(region, save::GS, data);
 
     Ok(())
+}
+
+/// Add the `VMMCALL` intercept to a programmed VMCB (OR it into
+/// [`control::INTERCEPT_MISC2`]) so a guest's `VMMCALL` takes a `#VMEXIT` the
+/// run loop routes as a hypercall ([`RunLoopExit::Vmmcall`]).
+pub fn intercept_vmmcall(region: &mut [u8]) {
+    let misc2 = get_u32(region, control::INTERCEPT_MISC2);
+    put_u32(
+        region,
+        control::INTERCEPT_MISC2,
+        misc2 | intercept2::VMMCALL,
+    );
 }
 
 /// Write a [`VmcbSegment`] into the 16-byte save-area slot at `offset` (one of
@@ -1517,10 +1541,33 @@ mod tests {
             classify_run_loop_exit(SvmExitCode::from_raw(exit_code::NPF)),
             RunLoopExit::Npf
         );
-        // A genuinely-unrouted code (VMMCALL here) is Unhandled.
+        // VMMCALL is routed as a hypercall.
         assert_eq!(
             classify_run_loop_exit(SvmExitCode::from_raw(exit_code::VMMCALL)),
+            RunLoopExit::Vmmcall
+        );
+        // A genuinely-unrouted code (PAUSE here) is Unhandled.
+        assert_eq!(
+            classify_run_loop_exit(SvmExitCode::from_raw(exit_code::PAUSE)),
             RunLoopExit::Unhandled
+        );
+    }
+
+    #[test]
+    fn intercept_vmmcall_sets_the_bit_without_disturbing_vmrun() {
+        let mut region = [0u8; VMCB_SIZE];
+        let setup = MinimalGuestSetup {
+            asid: 1,
+            nested_cr3: 0,
+            entry_ip: 0,
+            code_base: 0,
+            stack_pointer: 0,
+        };
+        program_minimal_hlt_guest(&mut region, &setup).expect("programs");
+        intercept_vmmcall(&mut region);
+        assert_eq!(
+            get_u32(&region, control::INTERCEPT_MISC2),
+            intercept2::VMRUN | intercept2::VMMCALL
         );
     }
 

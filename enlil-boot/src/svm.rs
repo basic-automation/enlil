@@ -136,6 +136,19 @@ pub const GUEST_COMPUTE_N: u8 = 5;
 /// The expected compute-loop result — `sum(1..=GUEST_COMPUTE_N)`.
 pub const GUEST_COMPUTE_SUM: u8 = GUEST_COMPUTE_N * (GUEST_COMPUTE_N + 1) / 2;
 
+/// The port the boot guest writes its `VMMCALL` hypercall result to. A capture
+/// here proves the guest's paravirt hypercall reached enlil and its result
+/// reached the guest.
+pub const GUEST_VMMCALL_PORT: u8 = 0x89;
+
+/// The hypercall number the boot guest passes in `AX` to `VMMCALL` (0 — a
+/// "get version" style call enlil answers with [`GUEST_VMMCALL_RESULT`]).
+pub const GUEST_VMMCALL_NUMBER: u16 = 0;
+
+/// The byte enlil returns (in guest `RAX`) for the guest's
+/// [`GUEST_VMMCALL_NUMBER`] hypercall; the guest `OUT`s its low byte.
+pub const GUEST_VMMCALL_RESULT: u8 = 0x2A;
+
 /// The port the boot guest writes the byte it read through its `GS` segment to.
 ///
 /// `VMRUN` does not load `FS`/`GS`/`TR`/`LDTR` — only `VMLOAD` does — so a
@@ -397,6 +410,8 @@ pub struct GuestRunOutcome {
     pub msr_exits: u32,
     /// Nested page faults demand-mapped.
     pub npf_exits: u32,
+    /// Intercepted `VMMCALL` hypercalls serviced.
+    pub vmmcall_exits: u32,
     /// The `(port, byte)` writes the guest performed, oldest first, up to
     /// [`MAX_IO_OUTS`](Self::MAX_IO_OUTS) — each captured through the
     /// arch-neutral `VmExit::IoOut`. Query with [`io_out_to`](Self::io_out_to).
@@ -434,6 +449,7 @@ impl GuestRunOutcome {
             io_out_count: 0,
             cpuid_leaf0_ebx: None,
             final_exit: 0,
+            vmmcall_exits: 0,
         }
     }
 
@@ -489,8 +505,8 @@ mod hw {
     use enlil_hal::region::{IoPermissionsMap, MsrPermissionsMap, Vmcb};
     use enlil_hal::svm::{
         LongModeGuestSetup, MinimalGuestSetup, VmcbSegment, control, enable_io_intercept,
-        enable_msr_intercept, encode_event_inj, event_type, program_long_mode_hlt_guest,
-        program_minimal_hlt_guest, save, set_event_inj, write_segment,
+        enable_msr_intercept, encode_event_inj, event_type, intercept_vmmcall,
+        program_long_mode_hlt_guest, program_minimal_hlt_guest, save, set_event_inj, write_segment,
     };
 
     /// Read a 64-bit MSR.
@@ -724,15 +740,26 @@ mod hw {
         bytes[60] = 0xFC;
         bytes[61] = 0xE6; // OUT imm8, AL     (= sum(1..=N))
         bytes[62] = super::GUEST_COMPUTE_PORT;
+        // Paravirt hypercall: VMMCALL with a hypercall number in AX; enlil
+        // answers by writing the result into guest RAX, which the guest OUTs.
+        let hc = super::GUEST_VMMCALL_NUMBER.to_le_bytes();
+        bytes[63] = 0xB8; // mov ax, GUEST_VMMCALL_NUMBER
+        bytes[64] = hc[0];
+        bytes[65] = hc[1];
+        bytes[66] = 0x0F; // VMMCALL (0F 01 D9)
+        bytes[67] = 0x01;
+        bytes[68] = 0xD9;
+        bytes[69] = 0xE6; // OUT imm8, AL     (= enlil's hypercall result)
+        bytes[70] = super::GUEST_VMMCALL_PORT;
         // Read a byte through GS (base loaded from the VMCB by VMLOAD only) and
         // OUT it — proving the run shell's VMSAVE/VMLOAD extended-state swap.
-        bytes[63] = 0x65; // GS segment override
-        bytes[64] = 0xA0; // MOV AL, moffs16
-        bytes[65] = 0x00; // offset 0x0000 (16-bit) → GS:[0]
-        bytes[66] = 0x00;
-        bytes[67] = 0xE6; // OUT imm8, AL
-        bytes[68] = super::GUEST_GS_PORT;
-        bytes[69] = 0xF4; // HLT
+        bytes[71] = 0x65; // GS segment override
+        bytes[72] = 0xA0; // MOV AL, moffs16
+        bytes[73] = 0x00; // offset 0x0000 (16-bit) → GS:[0]
+        bytes[74] = 0x00;
+        bytes[75] = 0xE6; // OUT imm8, AL
+        bytes[76] = super::GUEST_GS_PORT;
+        bytes[77] = 0xF4; // HLT
         // Plant the sentinel the GS-relative read expects at GUEST_GS_BASE.
         bytes[super::GUEST_GS_BASE_OFF] = super::GUEST_GS_SENTINEL;
     }
@@ -786,6 +813,9 @@ mod hw {
         //   out 0x83, al     E6 83           (IOIO → the demand-paged sentinel)
         //   xor ax, ax / mov cx, N / add ax, cx / loop -4  (native sum 1..=N, no exit)
         //   out 0x85, al     E6 85           (IOIO → the computed sum)
+        //   mov ax, 0        B8 00 00        (hypercall number)
+        //   vmmcall          0F 01 D9        (intercepted → enlil sets RAX)
+        //   out 0x89, al     E6 89           (IOIO → the hypercall result)
         //   mov al, gs:[0]   65 A0 00 00     (GS.base loaded by VMLOAD only)
         //   out 0x86, al     E6 86           (IOIO → the GS sentinel)
         //   hlt              F4              (clean stop)
@@ -869,6 +899,9 @@ mod hw {
         msrpm.set_intercept(super::GUEST_MSR_W_NUMBER, true, true);
         enable_msr_intercept(vmcb.as_bytes_mut(), msrpm.base_addr());
         core::mem::forget(msrpm);
+
+        // Arm the VMMCALL intercept so the guest's hypercall traps to enlil.
+        intercept_vmmcall(vmcb.as_bytes_mut());
 
         let vmcb_pa = vmcb.base_addr();
         core::mem::forget(vmcb); // the VMCB must outlive this call for VMRUN
@@ -1227,6 +1260,23 @@ mod hw {
         }
     }
 
+    /// Service an intercepted guest `VMMCALL` (a paravirt hypercall).
+    ///
+    /// The hypercall number is in the guest's `AX` (low 16 bits of the
+    /// VMCB-carried `RAX`). For [`GUEST_VMMCALL_NUMBER`](super::GUEST_VMMCALL_NUMBER)
+    /// enlil writes [`GUEST_VMMCALL_RESULT`](super::GUEST_VMMCALL_RESULT) back
+    /// into guest `RAX` (the ABI: result in `RAX`); an unknown number leaves
+    /// `RAX` unchanged. This is the enlil↔guest channel a real paravirt guest
+    /// uses (event signaling, fast MMIO, etc.).
+    fn emulate_vmmcall(vmcb: &mut [u8]) {
+        use enlil_hal::svm::{guest_rax, set_guest_rax};
+
+        let number = u16::try_from(guest_rax(vmcb) & 0xFFFF).unwrap_or(u16::MAX);
+        if number == super::GUEST_VMMCALL_NUMBER {
+            set_guest_rax(vmcb, u64::from(super::GUEST_VMMCALL_RESULT));
+        }
+    }
+
     /// Demand-map the 2 MiB guest page that faulted, reading the faulting GPA
     /// and NPT root from `vmcb`.
     ///
@@ -1371,9 +1421,9 @@ mod hw {
     ) -> bool {
         use enlil_hal::VmExit;
         use enlil_hal::svm::{
-            CPUID_INSN_LEN, IoioExitInfo, MSR_INSN_LEN, RunLoopExit, classify_run_loop_exit,
-            exit_code, exit_info_1, exit_info_2, guest_rax, guest_rip, ioio_to_vmexit, next_rip,
-            resume_rip_after, set_guest_rip,
+            CPUID_INSN_LEN, IoioExitInfo, MSR_INSN_LEN, RunLoopExit, VMMCALL_INSN_LEN,
+            classify_run_loop_exit, exit_code, exit_info_1, exit_info_2, guest_rax, guest_rip,
+            ioio_to_vmexit, next_rip, resume_rip_after, set_guest_rip,
         };
 
         let code = exit_code(vmcb);
@@ -1418,6 +1468,13 @@ mod hw {
                     return true; // resume WITHOUT advancing RIP
                 }
                 outcome.stop = super::RunStop::Unhandled;
+            }
+            RunLoopExit::Vmmcall => {
+                outcome.vmmcall_exits += 1;
+                emulate_vmmcall(vmcb);
+                let rip = resume_rip_after(next_rip(vmcb), guest_rip(vmcb), VMMCALL_INSN_LEN);
+                set_guest_rip(vmcb, rip);
+                return true;
             }
         }
         false

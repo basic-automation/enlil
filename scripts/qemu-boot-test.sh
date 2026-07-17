@@ -112,6 +112,10 @@ COMPUTE_LINE="near-native execution"
 # never loads — only the run shell's VMLOAD does. Proves the VMSAVE/VMLOAD
 # extended-state (FS/GS/TR/LDTR + SYSENTER) swap around VMRUN.
 VMLOAD_LINE="VMSAVE/VMLOAD extended-state swap works"
+# Printed once the guest issues a VMMCALL hypercall, enlil services it and
+# writes the result into guest RAX, and the guest OUTs it — the paravirt
+# enlil<->guest hypercall channel.
+VMMCALL_LINE="hypercall channel works"
 # Printed once enlil arms the VMCB EVENTINJ field, VMRUN injects an interrupt
 # before the guest's first instruction, and the guest's real-mode IVT vectors
 # it to a handler whose OUT enlil captures — proving event injection.
@@ -268,10 +272,11 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$NPF_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$COMPUTE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$VMLOAD_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$VMMCALL_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$EVENTINJ_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$LONGMODE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, TSC calibration, ACPI discovery, PCI enumeration, own page tables, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + event injection + 64-bit long-mode guest, and GOP draw observed on serial"
+    echo "PASS: banner, kernel memory, heap, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, TSC calibration, ACPI discovery, PCI enumeration, own page tables, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + 64-bit long-mode guest, and GOP draw observed on serial"
     exit 0
 fi
 
