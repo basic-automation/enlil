@@ -240,6 +240,7 @@ mod hw {
         bring_up_percpu(&serial, apic_id.unwrap_or(0));
         bring_up_timer(&serial);
         bring_up_time(&serial);
+        bring_up_acpi(&serial, handoff);
         bring_up_virtualization(&serial);
         bring_up_framebuffer(&serial, handoff);
 
@@ -261,6 +262,27 @@ mod hw {
                 serial.write_str(" MHz (via PIT) — monotonic clock live\n");
             }
             _ => serial.write_str("enlil kernel: time: TSC calibration FAILED (PIT silent)\n"),
+        }
+    }
+
+    /// Discover physical hardware from the firmware ACPI tables and report it.
+    ///
+    /// Walks the handed-off RSDP → XSDT → MADT (the minimal `no_std` walker in
+    /// [`crate::acpi`], since the full `enlil-devices` readers are `std`-only)
+    /// and reports the table count and enabled-CPU count — the first real
+    /// hardware discovery from firmware tables on bare metal (ROADMAP 6.3).
+    fn bring_up_acpi(serial: &SerialPort, handoff: &BootHandoff) {
+        match crate::acpi::discover(handoff.acpi_rsdp) {
+            Some(summary) => {
+                let mut t = [0u8; 20];
+                let mut c = [0u8; 20];
+                serial.write_str("enlil kernel: acpi: discovered ");
+                serial.write_str(format_u64(summary.tables as u64, &mut t));
+                serial.write_str(" tables, ");
+                serial.write_str(format_u64(u64::from(summary.enabled_cpus), &mut c));
+                serial.write_str(" enabled CPUs (MADT)\n");
+            }
+            None => serial.write_str("enlil kernel: acpi: no valid RSDP in handoff\n"),
         }
     }
 

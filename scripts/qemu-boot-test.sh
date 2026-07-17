@@ -49,6 +49,9 @@ TIMER_LINE="LAPIC timer fired"
 # Printed once the kernel calibrates the TSC against the fixed-rate PIT — the
 # monotonic time source the bare-metal kernel runs on.
 TSC_LINE="TSC calibrated"
+# Printed once the kernel walks the firmware ACPI tables (RSDP→XSDT→MADT) and
+# reports the table + enabled-CPU counts — real hardware discovery on metal.
+ACPI_LINE="acpi: discovered"
 # Printed once the kernel turns on the CPU virtualization extension (SVM on
 # this AMD host) — the enable gate for running a guest with VMRUN.
 SVM_LINE="svm: enabled"
@@ -239,6 +242,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PERCPU_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$TIMER_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$TSC_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$ACPI_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$SVM_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$HSAVE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$VMCB_LINE" "$SERIAL_LOG" 2>/dev/null \
@@ -255,7 +259,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$EVENTINJ_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$LONGMODE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, IDT, x2APIC, per-CPU GS-base TLS, LAPIC timer, TSC calibration, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + event injection + 64-bit long-mode guest, and GOP draw observed on serial"
+    echo "PASS: banner, kernel memory, heap, IDT, x2APIC, per-CPU GS-base TLS, LAPIC timer, TSC calibration, ACPI discovery, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + event injection + 64-bit long-mode guest, and GOP draw observed on serial"
     exit 0
 fi
 
