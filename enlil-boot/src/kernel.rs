@@ -241,6 +241,7 @@ mod hw {
         bring_up_timer(&serial);
         bring_up_time(&serial);
         bring_up_acpi(&serial, handoff);
+        bring_up_pci(&serial);
         bring_up_virtualization(&serial);
         bring_up_framebuffer(&serial, handoff);
 
@@ -284,6 +285,25 @@ mod hw {
             }
             None => serial.write_str("enlil kernel: acpi: no valid RSDP in handoff\n"),
         }
+    }
+
+    /// Enumerate PCI bus 0 via the legacy config mechanism and report it — the
+    /// device discovery every passthrough/IOMMU step builds on (ROADMAP 6.3).
+    ///
+    /// Reads the host bridge (00:00.0) identity as a proof the config reads
+    /// reach real hardware and counts the present functions on bus 0.
+    fn bring_up_pci(serial: &SerialPort) {
+        let scan = crate::pci::scan_bus0();
+        let mut v = [0u8; 18];
+        let mut d = [0u8; 18];
+        let mut f = [0u8; 20];
+        serial.write_str("enlil kernel: pci: host bridge ");
+        serial.write_str(format_u64_hex(u64::from(scan.host_vendor), &mut v));
+        serial.write_str(":");
+        serial.write_str(format_u64_hex(u64::from(scan.host_device), &mut d));
+        serial.write_str(", ");
+        serial.write_str(format_u64(u64::from(scan.functions), &mut f));
+        serial.write_str(" functions on bus 0\n");
     }
 
     /// Arm the LAPIC timer once and prove it fires an interrupt into the kernel.
