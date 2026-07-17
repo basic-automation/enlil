@@ -29,6 +29,7 @@ pub mod idt;
 pub mod kernel;
 pub mod serial;
 pub mod svm;
+pub mod tsc;
 
 /// Console/serial banner the payload emits once it has taken control.
 ///

@@ -238,10 +238,29 @@ mod hw {
         bring_up_interrupts(&serial);
         bring_up_apic(&serial);
         bring_up_timer(&serial);
+        bring_up_time(&serial);
         bring_up_virtualization(&serial);
         bring_up_framebuffer(&serial, handoff);
 
         park()
+    }
+
+    /// Calibrate the TSC against the PIT and report its frequency — the
+    /// monotonic time source the bare-metal kernel runs on (ROADMAP 6.2).
+    ///
+    /// Runs with interrupts masked (the boot path has not enabled them since
+    /// `bring_up_timer` re-masked) so nothing perturbs the calibration window.
+    fn bring_up_time(serial: &SerialPort) {
+        use crate::tsc::hz_to_mhz_rounded;
+        match crate::tsc::calibrate_tsc_hz() {
+            Some(hz) if hz > 0 => {
+                let mut buf = [0u8; 20];
+                serial.write_str("enlil kernel: time: TSC calibrated ");
+                serial.write_str(format_u64(hz_to_mhz_rounded(hz), &mut buf));
+                serial.write_str(" MHz (via PIT) — monotonic clock live\n");
+            }
+            _ => serial.write_str("enlil kernel: time: TSC calibration FAILED (PIT silent)\n"),
+        }
     }
 
     /// Arm the LAPIC timer once and prove it fires an interrupt into the kernel.
