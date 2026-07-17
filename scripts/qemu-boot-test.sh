@@ -143,6 +143,9 @@ LONGMODE_LINE="long-mode guest works"
 # Printed once the kernel draws to the GOP framebuffer and reads a pixel back
 # — proves the framebuffer I/O backend is wired with the firmware gone.
 GOP_LINE="framebuffer draw ok"
+# Printed once the kernel draws its 8x8 text banner over the framebuffer and
+# verifies the blit — visible on-screen output without a serial cable.
+GOP_TEXT_LINE="text console banner drawn"
 TIMEOUT_SECS=60
 
 mkdir -p "$OUTDIR"
@@ -296,7 +299,8 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$VMMCALL_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$EVENTINJ_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$LONGMODE_LINE" "$SERIAL_LOG" 2>/dev/null \
-    && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null; then
+    && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$GOP_TEXT_LINE" "$SERIAL_LOG" 2>/dev/null; then
     echo "PASS: banner, kernel memory, heap, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, TSC calibration, ACPI discovery, PCI enumeration, own page tables, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + 64-bit long-mode guest, and GOP draw observed on serial"
     exit 0
 fi

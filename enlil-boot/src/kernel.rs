@@ -742,6 +742,14 @@ mod hw {
         match &handoff.framebuffer {
             Some(fb) if crate::framebuffer::draw_and_selftest(fb) => {
                 serial.write_str("enlil kernel: gop: framebuffer draw ok\n");
+                // Draw the on-screen text banner over the framebuffer and
+                // verify the 8x8 text console blits correctly (visible output
+                // without a serial cable — the console the service VM will use).
+                if crate::framebuffer::draw_text_banner(fb) {
+                    serial.write_str("enlil kernel: gop: text console banner drawn + verified\n");
+                } else {
+                    serial.write_str("enlil kernel: gop: text console self-test FAILED\n");
+                }
             }
             Some(_) => serial.write_str("enlil kernel: gop: framebuffer draw FAILED\n"),
             None => serial.write_str("enlil kernel: gop: no framebuffer in handoff\n"),
