@@ -243,9 +243,13 @@ mod hw {
         bring_up_percpu(&serial, apic_id.unwrap_or(0));
         bring_up_timer(&serial);
         bring_up_time(&serial);
-        bring_up_acpi(&serial, handoff);
+        let ecam = bring_up_acpi(&serial, handoff);
         bring_up_pci(&serial);
         bring_up_paging(&serial, handoff, highest_usable_end);
+        // ECAM reads need the identity map installed above (its window is < 4 GiB).
+        if let Some((ecam_base, end_bus)) = ecam {
+            bring_up_ecam(&serial, ecam_base, end_bus);
+        }
         bring_up_virtualization(&serial);
         bring_up_framebuffer(&serial, handoff);
 
@@ -276,28 +280,43 @@ mod hw {
     /// [`crate::acpi`], since the full `enlil-devices` readers are `std`-only)
     /// and reports the table count and enabled-CPU count — the first real
     /// hardware discovery from firmware tables on bare metal (ROADMAP 6.3).
-    fn bring_up_acpi(serial: &SerialPort, handoff: &BootHandoff) {
-        match crate::acpi::discover(handoff.acpi_rsdp) {
-            Some(summary) => {
-                let mut t = [0u8; 20];
-                let mut c = [0u8; 20];
-                serial.write_str("enlil kernel: acpi: discovered ");
-                serial.write_str(format_u64(summary.tables as u64, &mut t));
-                serial.write_str(" tables, ");
-                serial.write_str(format_u64(u64::from(summary.enabled_cpus), &mut c));
-                serial.write_str(" enabled CPUs (MADT)\n");
-                if summary.ecam_base != 0 {
-                    let mut e = [0u8; 18];
-                    let mut b = [0u8; 20];
-                    serial.write_str("enlil kernel: acpi: PCIe ECAM base ");
-                    serial.write_str(format_u64_hex(summary.ecam_base, &mut e));
-                    serial.write_str(", buses 0-");
-                    serial.write_str(format_u64(u64::from(summary.ecam_end_bus), &mut b));
-                    serial.write_str(" (MCFG)\n");
-                }
-            }
-            None => serial.write_str("enlil kernel: acpi: no valid RSDP in handoff\n"),
+    fn bring_up_acpi(serial: &SerialPort, handoff: &BootHandoff) -> Option<(u64, u8)> {
+        let summary = crate::acpi::discover(handoff.acpi_rsdp)?;
+        let mut t = [0u8; 20];
+        let mut c = [0u8; 20];
+        serial.write_str("enlil kernel: acpi: discovered ");
+        serial.write_str(format_u64(summary.tables as u64, &mut t));
+        serial.write_str(" tables, ");
+        serial.write_str(format_u64(u64::from(summary.enabled_cpus), &mut c));
+        serial.write_str(" enabled CPUs (MADT)\n");
+        if summary.ecam_base == 0 {
+            return None;
         }
+        let mut e = [0u8; 18];
+        let mut b = [0u8; 20];
+        serial.write_str("enlil kernel: acpi: PCIe ECAM base ");
+        serial.write_str(format_u64_hex(summary.ecam_base, &mut e));
+        serial.write_str(", buses 0-");
+        serial.write_str(format_u64(u64::from(summary.ecam_end_bus), &mut b));
+        serial.write_str(" (MCFG)\n");
+        Some((summary.ecam_base, summary.ecam_end_bus))
+    }
+
+    /// Enumerate the full PCI Express topology through the `ECAM` window (all
+    /// buses, extended config space) — reads MMIO the kernel's identity map
+    /// covers (the `ECAM` window is below 4 GiB), the mechanism passthrough
+    /// needs.
+    fn bring_up_ecam(serial: &SerialPort, ecam_base: u64, end_bus: u8) {
+        // SAFETY: ecam_base is the firmware ECAM base from the MCFG and its
+        // window is identity-mapped by bring_up_paging (installed above).
+        let scan = unsafe { crate::pci::scan_ecam(ecam_base, end_bus) };
+        let mut f = [0u8; 20];
+        let mut b = [0u8; 20];
+        serial.write_str("enlil kernel: pci: ECAM scan ");
+        serial.write_str(format_u64(u64::from(scan.functions), &mut f));
+        serial.write_str(" functions across ");
+        serial.write_str(format_u64(u64::from(scan.buses_in_use), &mut b));
+        serial.write_str(" buses\n");
     }
 
     /// Install the kernel's own identity page tables and switch `CR3` off the

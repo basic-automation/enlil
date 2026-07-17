@@ -57,6 +57,38 @@ pub const fn class_of(config_dword_at_08: u32) -> u8 {
     (config_dword_at_08 >> 24) as u8
 }
 
+/// The MMIO address of `offset` in `bus:device.function`'s config space within
+/// an ECAM window based at `ecam_base`.
+///
+/// The PCI Express firmware-spec formula:
+/// `ecam_base + (bus << 20) + (device << 15) + (function << 12) + offset`.
+/// Unlike the legacy `0xCF8`/`0xCFC` mechanism this reaches the full 4 KiB
+/// extended config space and all 256 buses. `device`/`function` are masked to
+/// their 5-/3-bit fields.
+#[must_use]
+pub const fn ecam_config_address(
+    ecam_base: u64,
+    bus: u8,
+    device: u8,
+    function: u8,
+    offset: u16,
+) -> u64 {
+    ecam_base
+        + ((bus as u64) << 20)
+        + (((device as u64) & 0x1F) << 15)
+        + (((function as u64) & 0x07) << 12)
+        + (offset as u64)
+}
+
+/// What an ECAM full-bus scan discovered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EcamScan {
+    /// Present functions found across every scanned bus.
+    pub functions: u32,
+    /// Distinct buses that carried at least one present function.
+    pub buses_in_use: u32,
+}
+
 /// PCI base class: mass-storage controller (SATA/NVMe/SCSI/IDE).
 pub const CLASS_STORAGE: u8 = 0x01;
 /// PCI base class: network controller.
@@ -95,13 +127,13 @@ impl PciScan {
 }
 
 #[cfg(target_os = "uefi")]
-pub use hw::scan_bus0;
+pub use hw::{scan_bus0, scan_ecam};
 
 #[cfg(target_os = "uefi")]
 mod hw {
     use super::{
-        PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA, PciScan, class_of, config_address, device_of,
-        vendor_of, vendor_present,
+        EcamScan, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA, PciScan, class_of, config_address,
+        device_of, ecam_config_address, vendor_of, vendor_present,
     };
 
     /// Write a 32-bit `value` to `port`.
@@ -183,6 +215,70 @@ mod hw {
         }
         scan
     }
+
+    /// Read config dword `offset` of `bus:device.function` through the ECAM
+    /// window at `ecam_base` (MMIO).
+    ///
+    /// # Safety
+    ///
+    /// `ecam_base` must be the firmware ECAM base and the addressed dword must
+    /// lie in a mapped ECAM page (covered by the kernel's identity map).
+    unsafe fn ecam_read(ecam_base: u64, bus: u8, device: u8, function: u8, offset: u16) -> u32 {
+        let addr = ecam_config_address(ecam_base, bus, device, function, offset);
+        // SAFETY: the caller guarantees a mapped ECAM dword; config reads have no
+        // side effects and absent functions read back all-ones.
+        unsafe { core::ptr::read_volatile(addr as *const u32) }
+    }
+
+    /// Enumerate every present function across buses `0..=end_bus` through the
+    /// `ECAM` window — the full topology the legacy bus-0 scan cannot reach.
+    ///
+    /// Probes function 0 of each device, then functions 1–7 only when device 0
+    /// is multifunction. Counts present functions and the buses that carry any.
+    ///
+    /// # Safety
+    ///
+    /// `ecam_base` must be the firmware ECAM base, its window identity-mapped by
+    /// the kernel's page tables (`< 4 GiB` on this layout).
+    #[must_use]
+    pub unsafe fn scan_ecam(ecam_base: u64, end_bus: u8) -> EcamScan {
+        const HEADER_TYPE_OFFSET: u16 = 0x0C;
+        const HEADER_MULTIFUNCTION: u32 = 0x0080_0000;
+
+        let mut scan = EcamScan::default();
+        for bus in 0..=end_bus {
+            let mut bus_used = false;
+            for device in 0u8..32 {
+                // SAFETY: caller guarantees the ECAM window is mapped.
+                if !vendor_present(vendor_of(unsafe {
+                    ecam_read(ecam_base, bus, device, 0, 0)
+                })) {
+                    continue;
+                }
+                scan.functions += 1;
+                bus_used = true;
+                // SAFETY: same mapped ECAM window.
+                let multifunction = unsafe {
+                    ecam_read(ecam_base, bus, device, 0, HEADER_TYPE_OFFSET) & HEADER_MULTIFUNCTION
+                        != 0
+                };
+                if multifunction {
+                    for function in 1u8..8 {
+                        // SAFETY: same mapped ECAM window.
+                        if vendor_present(vendor_of(unsafe {
+                            ecam_read(ecam_base, bus, device, function, 0)
+                        })) {
+                            scan.functions += 1;
+                        }
+                    }
+                }
+            }
+            if bus_used {
+                scan.buses_in_use += 1;
+            }
+        }
+        scan
+    }
 }
 
 #[cfg(test)]
@@ -238,6 +334,22 @@ mod tests {
         assert_eq!(class_of(0x0200_0000), CLASS_NETWORK);
         assert_eq!(class_of(0x0300_0000), CLASS_DISPLAY);
         assert_eq!(class_of(0x0600_0000), 0x06); // host bridge
+    }
+
+    #[test]
+    fn ecam_address_matches_the_pcie_layout() {
+        // base + bus<<20 + dev<<15 + fn<<12 + offset.
+        assert_eq!(ecam_config_address(0xE000_0000, 0, 0, 0, 0), 0xE000_0000);
+        // bus 1, device 2, function 3, extended offset 0x100.
+        assert_eq!(
+            ecam_config_address(0xE000_0000, 1, 2, 3, 0x100),
+            0xE000_0000 + (1 << 20) + (2 << 15) + (3 << 12) + 0x100
+        );
+        // Extended config space (offset > 0xFF) is reachable, unlike legacy.
+        assert_eq!(
+            ecam_config_address(0xE000_0000, 0, 0, 0, 0xFFF) & 0xFFF,
+            0xFFF
+        );
     }
 
     #[test]
