@@ -54,12 +54,40 @@ pub const fn hz_to_mhz_rounded(hz: u64) -> u64 {
     (hz + 500_000) / 1_000_000
 }
 
+/// Nanoseconds elapsed for a `ticks` TSC delta at `tsc_hz`.
+///
+/// `ns = ticks * 1e9 / tsc_hz`, carried through `u128` so a large delta does
+/// not overflow. Returns 0 for an uncalibrated clock (`tsc_hz == 0`) rather
+/// than dividing by zero — the monotonic clock the bare-metal kernel reads time
+/// from once the TSC is calibrated.
+#[must_use]
+pub fn ticks_to_ns(ticks: u64, tsc_hz: u64) -> u64 {
+    if tsc_hz == 0 {
+        return 0;
+    }
+    let ns = u128::from(ticks) * 1_000_000_000 / u128::from(tsc_hz);
+    u64::try_from(ns).unwrap_or(u64::MAX)
+}
+
+/// The TSC-tick delta spanning `ns` nanoseconds at `tsc_hz`.
+///
+/// The inverse of [`ticks_to_ns`] (`ticks = ns * tsc_hz / 1e9`): how many ticks
+/// to spin for a `ns` delay. Returns 0 for an uncalibrated clock.
+#[must_use]
+pub fn ns_to_ticks(ns: u64, tsc_hz: u64) -> u64 {
+    if tsc_hz == 0 {
+        return 0;
+    }
+    let ticks = u128::from(ns) * u128::from(tsc_hz) / 1_000_000_000;
+    u64::try_from(ticks).unwrap_or(u64::MAX)
+}
+
 #[cfg(target_os = "uefi")]
-pub use hw::calibrate_tsc_hz;
+pub use hw::{busy_sleep_ns, calibrate_tsc_hz, read_tsc};
 
 #[cfg(target_os = "uefi")]
 mod hw {
-    use super::{pit_count_for_micros, pit_delay_ns, tsc_hz_from_delta};
+    use super::{ns_to_ticks, pit_count_for_micros, pit_delay_ns, tsc_hz_from_delta};
 
     /// PIT mode/command port.
     const PIT_COMMAND: u16 = 0x43;
@@ -107,8 +135,10 @@ mod hw {
     }
 
     /// Read the TSC, serialized so surrounding loads/stores do not reorder
-    /// across it (`lfence` before and after `rdtsc`).
-    fn read_tsc() -> u64 {
+    /// across it (`lfence` before and after `rdtsc`) — the raw monotonic
+    /// counter the kernel's time source reads.
+    #[must_use]
+    pub fn read_tsc() -> u64 {
         let (lo, hi): (u32, u32);
         // SAFETY: rdtsc is unprivileged; lfence bounds it against reordering.
         unsafe {
@@ -122,6 +152,25 @@ mod hw {
             );
         }
         (u64::from(hi) << 32) | u64::from(lo)
+    }
+
+    /// Busy-wait until at least `ns` nanoseconds have elapsed on the calibrated
+    /// TSC clock (`tsc_hz` from [`calibrate_tsc_hz`]).
+    ///
+    /// The bare-metal monotonic sleep: converts `ns` to a TSC-tick delta
+    /// ([`ns_to_ticks`]) and spins reading [`read_tsc`] until the deadline. A
+    /// spin (not a `hlt`) so it works before the scheduler exists and with
+    /// interrupts masked; wrap-safe via `wrapping_sub`. An uncalibrated clock
+    /// (`tsc_hz == 0`) returns immediately.
+    pub fn busy_sleep_ns(tsc_hz: u64, ns: u64) {
+        let ticks = ns_to_ticks(ns, tsc_hz);
+        if ticks == 0 {
+            return;
+        }
+        let start = read_tsc();
+        while read_tsc().wrapping_sub(start) < ticks {
+            core::hint::spin_loop();
+        }
     }
 
     /// Calibrate the TSC frequency in hertz against the PIT, or `None` if the
@@ -200,6 +249,24 @@ mod tests {
         assert_eq!(tsc_hz_from_delta(40_000_000, 10_000_000), 4_000_000_000);
         // A zero interval is a failed measurement, not a divide-by-zero.
         assert_eq!(tsc_hz_from_delta(123, 0), 0);
+    }
+
+    #[test]
+    fn ticks_and_ns_round_trip() {
+        let hz = 4_000_000_000; // 4 GHz
+        // 4e9 ticks = 1 second = 1e9 ns.
+        assert_eq!(ticks_to_ns(4_000_000_000, hz), 1_000_000_000);
+        // 10 ms → 40e6 ticks.
+        assert_eq!(ns_to_ticks(10_000_000, hz), 40_000_000);
+        // Round-trip a 5 ms interval.
+        assert_eq!(ticks_to_ns(ns_to_ticks(5_000_000, hz), hz), 5_000_000);
+    }
+
+    #[test]
+    fn ticks_ns_handle_uncalibrated_clock() {
+        // A zero frequency (uncalibrated) is not a divide-by-zero.
+        assert_eq!(ticks_to_ns(123, 0), 0);
+        assert_eq!(ns_to_ticks(123, 0), 0);
     }
 
     #[test]

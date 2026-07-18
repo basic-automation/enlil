@@ -52,12 +52,27 @@ PERCPU_LINE="GS-base TLS installed"
 # Printed once the kernel arms a one-shot LAPIC timer, enables interrupts, and
 # its handler runs — the interrupt-preemption clock every scheduler needs.
 TIMER_LINE="LAPIC timer fired"
+# Printed once the kernel arms the LAPIC timer in TSC-deadline mode (an absolute
+# TSC deadline, not a divided count-down) and its handler runs — the precise
+# preemption clock a scheduler quantizes on.
+DEADLINE_LINE="TSC-deadline timer fired"
 # Printed once the kernel calibrates the TSC against the fixed-rate PIT — the
 # monotonic time source the bare-metal kernel runs on.
 TSC_LINE="TSC calibrated"
+# Printed once the kernel reads a monotonic ns clock across a busy-sleep over
+# the calibrated TSC — the bare-metal time source timeouts + scheduler read.
+MONOTONIC_LINE="monotonic clock advanced"
+# Printed once the kernel arms the TSC-deadline timer at an ns deadline derived
+# from the calibrated clock and the monotonic clock confirms it fired on time —
+# ns-precise preemption, exactly how the scheduler arms a quantum.
+NS_DEADLINE_LINE="ns-precise preemption"
 # Printed once the kernel walks the firmware ACPI tables (RSDP→XSDT→MADT) and
 # reports the table + enabled-CPU counts — real hardware discovery on metal.
 ACPI_LINE="acpi: discovered"
+# Printed once the kernel enumerates the enabled processors' APIC IDs from the
+# MADT — the AP inventory SMP bring-up (INIT-SIPI-SIPI) targets. Booted with
+# -smp 2 so this is a real multi-CPU inventory.
+APIC_INVENTORY_LINE="SMP AP inventory"
 # Printed once the kernel finds the MCFG and reports the PCIe ECAM base + bus
 # range — the window for extended config space + full multi-bus PCI topology.
 ECAM_LINE="PCIe ECAM base"
@@ -74,6 +89,9 @@ PCI_CLASS_LINE="pci: classes"
 # Printed once the kernel enumerates the full PCIe topology through the ECAM
 # window (all buses, extended config space) — the mechanism passthrough needs.
 ECAM_SCAN_LINE="ECAM scan"
+# Printed once the kernel reads the first memory BAR on bus 0 — the MMIO window
+# a driver / passthrough claims. Read-only decode (base + 32/64-bit), no sizing.
+PCI_BAR_LINE="pci: BAR"
 # Printed once the kernel builds its own identity page tables and reloads CR3
 # off the firmware's — reaching this line proves the map covers the kernel.
 PAGING_LINE="off firmware page tables"
@@ -211,6 +229,9 @@ SERIAL_LOG="$OUTDIR/serial.log"
 echo "==> booting under QEMU (OVMF=$OVMF, timeout=${TIMEOUT_SECS}s)"
 QEMU_ARGS=(
     -machine q35
+    # Two CPUs so the MADT carries a real AP inventory (the kernel enumerates
+    # the enabled APIC IDs); the AP stays in wait-for-SIPI until SMP bring-up.
+    -smp 2
     -drive "format=raw,file=fat:rw:$ESP"
     -serial "file:$SERIAL_LOG"
     -display none
@@ -275,13 +296,18 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$APIC_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PERCPU_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$TIMER_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$DEADLINE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$TSC_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$MONOTONIC_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$NS_DEADLINE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ACPI_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$APIC_INVENTORY_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ECAM_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$IOMMU_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PCI_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PCI_CLASS_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ECAM_SCAN_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$PCI_BAR_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PAGING_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$SVM_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$HSAVE_LINE" "$SERIAL_LOG" 2>/dev/null \
@@ -301,7 +327,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$LONGMODE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_TEXT_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, TSC calibration, ACPI discovery, PCI enumeration, own page tables, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + 64-bit long-mode guest, and GOP draw observed on serial"
+    echo "PASS: banner, kernel memory, heap, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery, PCI enumeration, own page tables, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + 64-bit long-mode guest, and GOP draw observed on serial"
     exit 0
 fi
 

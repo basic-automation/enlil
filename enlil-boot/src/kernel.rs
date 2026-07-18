@@ -243,7 +243,10 @@ mod hw {
         bring_up_percpu(&serial, apic_id.unwrap_or(0));
         bring_up_gdt(&serial);
         bring_up_timer(&serial);
-        bring_up_time(&serial);
+        bring_up_deadline_timer(&serial);
+        if let Some(hz) = bring_up_time(&serial) {
+            bring_up_deadline_ns(&serial, hz);
+        }
         let ecam = bring_up_acpi(&serial, handoff);
         bring_up_pci(&serial);
         bring_up_paging(&serial, handoff, highest_usable_end);
@@ -262,7 +265,7 @@ mod hw {
     ///
     /// Runs with interrupts masked (the boot path has not enabled them since
     /// `bring_up_timer` re-masked) so nothing perturbs the calibration window.
-    fn bring_up_time(serial: &SerialPort) {
+    fn bring_up_time(serial: &SerialPort) -> Option<u64> {
         use crate::tsc::hz_to_mhz_rounded;
         match crate::tsc::calibrate_tsc_hz() {
             Some(hz) if hz > 0 => {
@@ -270,8 +273,94 @@ mod hw {
                 serial.write_str("enlil kernel: time: TSC calibrated ");
                 serial.write_str(format_u64(hz_to_mhz_rounded(hz), &mut buf));
                 serial.write_str(" MHz (via PIT) — monotonic clock live\n");
+                bring_up_monotonic(serial, hz);
+                Some(hz)
             }
-            _ => serial.write_str("enlil kernel: time: TSC calibration FAILED (PIT silent)\n"),
+            _ => {
+                serial.write_str("enlil kernel: time: TSC calibration FAILED (PIT silent)\n");
+                None
+            }
+        }
+    }
+
+    /// Arm the LAPIC TSC-deadline timer at a **precise nanosecond deadline**
+    /// derived from the calibrated clock, and measure — via the monotonic clock
+    /// — that it fired on time. This is exactly how the scheduler arms a quantum
+    /// ("preempt me in N µs"): a real-time deadline, not a raw tick count.
+    ///
+    /// Converts the requested ns to a TSC-tick offset with the calibrated `hz`
+    /// ([`ns_to_ticks`]), arms the deadline timer, waits (bounded) for the tick,
+    /// then checks the elapsed ns (measured independently across the wait) lands
+    /// in a wide plausibility band — proving the ns→deadline→fire→measure path
+    /// end to end (ROADMAP 6.2).
+    fn bring_up_deadline_ns(serial: &SerialPort, hz: u64) {
+        use crate::tsc::{ns_to_ticks, read_tsc, ticks_to_ns};
+        /// The scheduler-quantum-sized deadline to arm and measure (2 ms).
+        const DEADLINE_NS: u64 = 2_000_000;
+        /// Wide acceptance band — only a grossly wrong clock/timer fails.
+        const MIN_NS: u64 = DEADLINE_NS / 2;
+        const MAX_NS: u64 = DEADLINE_NS * 20;
+        /// Cap on the wait spins so a non-firing timer is reported, not hung.
+        const WAIT_SPINS: u32 = 200_000_000;
+        /// Same vector + handler as the other timer tests.
+        const TIMER_VECTOR: u8 = 0x40;
+
+        if !crate::apic::tsc_deadline_available() {
+            return; // reported already by bring_up_deadline_timer
+        }
+        crate::idt::install_timer_gate(TIMER_VECTOR);
+        let before = crate::idt::timer_ticks();
+        let t0 = read_tsc();
+        crate::apic::arm_tsc_deadline_timer(TIMER_VECTOR, ns_to_ticks(DEADLINE_NS, hz));
+        // SAFETY: the timer gate is installed and the handler signals EOI.
+        unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)) };
+        let mut spun = 0u32;
+        while crate::idt::timer_ticks() == before && spun < WAIT_SPINS {
+            spun += 1;
+            core::hint::spin_loop();
+        }
+        // SAFETY: re-mask interrupts before continuing the single-threaded boot.
+        unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)) };
+        let elapsed = ticks_to_ns(read_tsc().wrapping_sub(t0), hz);
+
+        if crate::idt::timer_ticks() > before && (MIN_NS..=MAX_NS).contains(&elapsed) {
+            let mut buf = [0u8; 20];
+            serial.write_str("enlil kernel: apic: TSC-deadline fired after ");
+            serial.write_str(format_u64(elapsed / 1000, &mut buf));
+            serial.write_str(" us for a 2 ms ns-deadline — ns-precise preemption\n");
+        } else {
+            serial.write_str("enlil kernel: apic: ns-precise TSC-deadline self-test FAILED\n");
+        }
+    }
+
+    /// Prove the calibrated TSC drives a monotonic ns clock + busy-sleep — the
+    /// bare-metal time source timeouts and the scheduler read (ROADMAP 6.2).
+    ///
+    /// Reads the clock, busy-sleeps a fixed interval, reads again, and checks
+    /// the elapsed ns is monotonic and lands in a wide plausibility band around
+    /// the request (so a mis-scaled clock or a broken `rdtsc` is caught, without
+    /// flaking on the emulator's timing jitter). Interrupts are masked here, so
+    /// nothing perturbs the sleep.
+    fn bring_up_monotonic(serial: &SerialPort, hz: u64) {
+        use crate::tsc::{read_tsc, ticks_to_ns};
+        /// The interval to sleep and measure (5 ms).
+        const SLEEP_NS: u64 = 5_000_000;
+        /// Accept anything from ~half to 20x the request — a loose band that
+        /// only fails on a grossly mis-scaled clock, not emulator jitter.
+        const MIN_NS: u64 = SLEEP_NS / 2;
+        const MAX_NS: u64 = SLEEP_NS * 20;
+
+        let t0 = read_tsc();
+        crate::tsc::busy_sleep_ns(hz, SLEEP_NS);
+        let t1 = read_tsc();
+        let elapsed = ticks_to_ns(t1.wrapping_sub(t0), hz);
+        if t1 != t0 && (MIN_NS..=MAX_NS).contains(&elapsed) {
+            let mut buf = [0u8; 20];
+            serial.write_str("enlil kernel: time: monotonic clock advanced ");
+            serial.write_str(format_u64(elapsed / 1000, &mut buf));
+            serial.write_str(" us over a 5 ms busy-sleep — TSC clock live\n");
+        } else {
+            serial.write_str("enlil kernel: time: monotonic clock self-test FAILED\n");
         }
     }
 
@@ -290,6 +379,15 @@ mod hw {
         serial.write_str(" tables, ");
         serial.write_str(format_u64(u64::from(summary.enabled_cpus), &mut c));
         serial.write_str(" enabled CPUs (MADT)\n");
+        // The AP inventory SMP bring-up (INIT-SIPI-SIPI) targets: the enabled
+        // processors' APIC IDs, BSP included.
+        serial.write_str("enlil kernel: acpi: APIC IDs");
+        for i in 0..summary.apic_id_count {
+            let mut id = [0u8; 20];
+            serial.write_str(" ");
+            serial.write_str(format_u64(u64::from(summary.apic_ids[i]), &mut id));
+        }
+        serial.write_str(" (SMP AP inventory)\n");
         serial.write_str("enlil kernel: acpi: IOMMU ");
         serial.write_str(summary.iommu.name());
         serial.write_str(" (DMAR/IVRS)\n");
@@ -386,6 +484,34 @@ mod hw {
         let mut mx = [0u8; 20];
         serial.write_str(format_u64(u64::from(scan.msix_capable), &mut mx));
         serial.write_str(" MSI-X-capable\n");
+
+        // The first memory BAR on bus 0 — the MMIO window a driver / passthrough
+        // claims (read-only; no BAR sizing yet).
+        let bar = crate::pci::first_memory_bar();
+        if bar.base != 0 {
+            let mut d = [0u8; 20];
+            let mut f = [0u8; 20];
+            let mut idx = [0u8; 20];
+            let mut base = [0u8; 18];
+            serial.write_str("enlil kernel: pci: BAR mem window at 00:");
+            serial.write_str(format_u64(u64::from(bar.device), &mut d));
+            serial.write_str(".");
+            serial.write_str(format_u64(u64::from(bar.function), &mut f));
+            serial.write_str(" BAR");
+            serial.write_str(format_u64(u64::from(bar.index), &mut idx));
+            serial.write_str(" base ");
+            serial.write_str(format_u64_hex(bar.base, &mut base));
+            let mut size = [0u8; 18];
+            serial.write_str(" size ");
+            serial.write_str(format_u64_hex(bar.size, &mut size));
+            serial.write_str(if bar.is_64 {
+                " (64-bit)\n"
+            } else {
+                " (32-bit)\n"
+            });
+        } else {
+            serial.write_str("enlil kernel: pci: BAR scan — no memory BAR on bus 0\n");
+        }
     }
 
     /// Arm the LAPIC timer once and prove it fires an interrupt into the kernel.
@@ -423,6 +549,54 @@ mod hw {
             serial.write_str("enlil kernel: apic: LAPIC timer fired — preemption clock live\n");
         } else {
             serial.write_str("enlil kernel: apic: LAPIC timer did NOT fire\n");
+        }
+    }
+
+    /// Arm the LAPIC timer in **TSC-deadline** mode and prove it fires — the
+    /// precise-preemption clock a scheduler quantizes on (ROADMAP 6.2).
+    ///
+    /// Where [`bring_up_timer`] proves the divided count-down path, this proves
+    /// the absolute-deadline path: the next tick is a TSC value, not a divided
+    /// count, so preemption lands at a precise point on the monotonic clock. If
+    /// the CPU lacks the mode (`CPUID.1:ECX[24]` clear) it is reported, not
+    /// treated as a failure. Runs the same bounded sti/wait/cli dance as the
+    /// one-shot test, reusing the timer gate + tick counter at [`TIMER_VECTOR`].
+    fn bring_up_deadline_timer(serial: &SerialPort) {
+        /// Same vector + handler as the one-shot timer test (installed here in
+        /// case ordering ever changes); the handler counts ticks + signals EOI.
+        const TIMER_VECTOR: u8 = 0x40;
+        /// TSC ticks until the deadline. At multi-GHz this is a few ms — long
+        /// enough not to fire before `sti`, short enough to land in the wait.
+        const DEADLINE_OFFSET: u64 = 50_000_000;
+        /// Cap on the wait spins so a non-firing timer is reported, not hung.
+        const WAIT_SPINS: u32 = 200_000_000;
+
+        if !crate::apic::tsc_deadline_available() {
+            serial.write_str(
+                "enlil kernel: apic: TSC-deadline timer mode unavailable (CPUID.1:ECX[24] clear)\n",
+            );
+            return;
+        }
+        crate::idt::install_timer_gate(TIMER_VECTOR);
+        let before = crate::idt::timer_ticks();
+        crate::apic::arm_tsc_deadline_timer(TIMER_VECTOR, DEADLINE_OFFSET);
+        // SAFETY: the timer gate is installed and the handler signals EOI; sti
+        // only enables delivery of the deadline interrupt we just armed.
+        unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)) };
+        let mut spun = 0u32;
+        while crate::idt::timer_ticks() == before && spun < WAIT_SPINS {
+            spun += 1;
+            core::hint::spin_loop();
+        }
+        // SAFETY: re-mask interrupts before continuing the single-threaded boot.
+        unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)) };
+
+        if crate::idt::timer_ticks() > before {
+            serial.write_str(
+                "enlil kernel: apic: LAPIC TSC-deadline timer fired — precise preemption clock live\n",
+            );
+        } else {
+            serial.write_str("enlil kernel: apic: LAPIC TSC-deadline timer did NOT fire\n");
         }
     }
 
@@ -708,7 +882,7 @@ mod hw {
     fn bring_up_gdt(serial: &SerialPort) {
         if crate::gdt::install_and_selftest() {
             serial.write_str(
-                "enlil kernel: gdt: own GDT+TSS loaded, #DF on IST1, IST self-test ok\n",
+                "enlil kernel: gdt: own GDT+TSS loaded, #DF/#PF/#GP on IST1/2/3, IST self-test ok\n",
             );
         } else {
             serial.write_str("enlil kernel: gdt: GDT+TSS/IST self-test FAILED\n");

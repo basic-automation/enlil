@@ -78,6 +78,18 @@ pub enum NptError {
     /// A `PML4`/`PDPT`/`PD` entry on the path to a demand-mapped leaf was
     /// absent, or pointed outside the table buffer ([`map_npt_2mib_leaf`]).
     IntermediateNotPresent,
+    /// A requested guard-page index was `>= num_pages` — outside the mapped
+    /// range ([`build_identity_npt_4kib`]).
+    GuardPageOutOfRange {
+        /// The offending guard-page index.
+        index: u64,
+        /// The number of pages the map covers.
+        num_pages: u64,
+    },
+    /// A `PD` entry on the path to a demand-mapped 4 KiB leaf was a 2 MiB
+    /// huge-page leaf, not a page-table pointer — the map is huge-page-granular
+    /// there and cannot take a 4 KiB leaf without a split ([`map_npt_4kib_leaf`]).
+    HugePageOnPath,
 }
 
 /// Build a 2 MiB-huge-page identity map of `[0, bytes_to_map)` for use as an
@@ -261,6 +273,172 @@ pub fn map_npt_2mib_leaf(
     Ok(())
 }
 
+/// Build a **4 KiB-granular** identity map of `num_pages` pages, leaving each
+/// index in `guard_pages` **not present** so a touch of it faults.
+///
+/// Serves as a host page table or a fine-grained nested page table. Where
+/// [`build_identity_npt_2mib`] maps at 2 MiB huge-page granularity, this
+/// lays a full `PML4 → PDPT → PD → PT` hierarchy with 4 KiB leaves — the
+/// granularity a guard page needs (a single unmapped 4 KiB page inside an
+/// otherwise-mapped region) and the granularity fine-grained MMIO trapping
+/// needs. It covers up to one page directory (512 page tables → 1 GiB), which
+/// is ample for the small regions 4 KiB granularity is used for (stacks with
+/// guard pages, MMIO windows); the bulk of a host map stays 2 MiB.
+///
+/// The tables are written into the front of `buf`, which begins at physical
+/// `phys_base` (same contract as [`build_identity_npt_2mib`]); leaves identity-
+/// map guest/host-physical `page * 4 KiB` to the same physical address. Every
+/// level sets `U/S = 1` (see module docs), harmless for a host/CPL-0 walk and
+/// required for a guest CPL-3 nested walk. Returns an [`NptLayout`] whose `ncr3`
+/// (`== phys_base`) is the value to load into `CR3` (host) or `NESTED_CR3`
+/// (guest).
+///
+/// # Errors
+///
+/// - [`NptError::EmptyRegion`] if `num_pages == 0`;
+/// - [`NptError::UnalignedBase`] if `phys_base` is not 4 KiB-aligned;
+/// - [`NptError::MapTooLarge`] if `num_pages` exceeds one PD (> 1 GiB);
+/// - [`NptError::GuardPageOutOfRange`] if a guard index is `>= num_pages`;
+/// - [`NptError::TablesExceedBuffer`] if the tables do not fit in `buf`.
+pub fn build_identity_npt_4kib(
+    buf: &mut [u8],
+    phys_base: u64,
+    num_pages: u64,
+    guard_pages: &[u64],
+) -> Result<NptLayout, NptError> {
+    if num_pages == 0 {
+        return Err(NptError::EmptyRegion);
+    }
+    if phys_base & (PAGE_SIZE - 1) != 0 {
+        return Err(NptError::UnalignedBase);
+    }
+    for &g in guard_pages {
+        if g >= num_pages {
+            return Err(NptError::GuardPageOutOfRange {
+                index: g,
+                num_pages,
+            });
+        }
+    }
+
+    let num_pt = num_pages.div_ceil(TABLE_ENTRIES);
+    if num_pt > TABLE_ENTRIES {
+        return Err(NptError::MapTooLarge { num_pd: num_pt });
+    }
+    let num_pt = usize::try_from(num_pt).unwrap_or(usize::MAX);
+    let num_pages_us = usize::try_from(num_pages).unwrap_or(usize::MAX);
+
+    let table_count = 3 + num_pt; // PML4 + PDPT + PD + PTs
+    let region_bytes = table_count
+        .checked_mul(4096)
+        .ok_or(NptError::TablesExceedBuffer {
+            needed: usize::MAX,
+            have: buf.len(),
+        })?;
+    if region_bytes > buf.len() {
+        return Err(NptError::TablesExceedBuffer {
+            needed: region_bytes,
+            have: buf.len(),
+        });
+    }
+    for byte in &mut buf[..region_bytes] {
+        *byte = 0;
+    }
+
+    let table_flags = flags::PRESENT | flags::WRITABLE | flags::USER;
+    let pdpt_off = 4096;
+    let directory_off = 2 * 4096;
+    let first_pt_off = 3 * 4096;
+    let pdpt_pa = phys_base + PAGE_SIZE;
+    let directory_pa = phys_base + 2 * PAGE_SIZE;
+    let first_pt_pa = phys_base + 3 * PAGE_SIZE;
+
+    // PML4[0] → PDPT, PDPT[0] → PD (a ≤1 GiB map lives under PML4[0]/PDPT[0]).
+    write_entry(buf, 0, (pdpt_pa & ADDR_MASK) | table_flags);
+    write_entry(buf, pdpt_off, (directory_pa & ADDR_MASK) | table_flags);
+
+    // PD[k] → PT[k], one PT per 512 pages.
+    for k in 0..num_pt {
+        let pt_pa = first_pt_pa + (k as u64) * PAGE_SIZE;
+        write_entry(
+            buf,
+            directory_off + k * 8,
+            (pt_pa & ADDR_MASK) | table_flags,
+        );
+    }
+
+    // PT[k][j] → the (k*512 + j)-th 4 KiB frame, identity-mapped — unless the
+    // page is a guard page, left not-present (zeroed above).
+    let leaf_flags = flags::PRESENT | flags::WRITABLE | flags::USER;
+    for page in 0..num_pages_us {
+        if guard_pages.contains(&(page as u64)) {
+            continue;
+        }
+        let k = page / 512;
+        let j = page % 512;
+        let pt_off = first_pt_off + k * 4096;
+        let phys = (page as u64) * PAGE_SIZE;
+        write_entry(buf, pt_off + j * 8, (phys & ADDR_MASK) | leaf_flags);
+    }
+
+    Ok(NptLayout {
+        ncr3: phys_base,
+        table_count,
+        bytes: region_bytes,
+    })
+}
+
+/// Map a single **4 KiB** guest/host page — `gpa` → `spa` — into a 4 KiB-
+/// granular map that already exists (built by [`build_identity_npt_4kib`]), by
+/// writing the leaf into its page table.
+///
+/// The 4 KiB analogue of [`map_npt_2mib_leaf`]: the demand-paging / MMIO-backing
+/// step at page granularity. On a nested page fault (or to back an MMIO page)
+/// the backend fills the missing `PT` leaf and re-`VMRUN`s so the faulting
+/// access re-executes against the new mapping. The covering `PML4`/`PDPT`/`PD`/
+/// `PT` must already be present — they are for any `gpa` within the reach of the
+/// originally-built map (its `PD` spans 1 GiB and each `PT` 2 MiB), so a leaf
+/// anywhere in a built `PT`'s 2 MiB just fills a not-present slot (e.g. a page
+/// left out as a guard).
+///
+/// `buf`/`phys_base` are the same table buffer and physical base passed to
+/// [`build_identity_npt_4kib`].
+///
+/// # Errors
+///
+/// - [`NptError::UnalignedBase`] if `gpa` or `spa` is not 4 KiB-aligned;
+/// - [`NptError::HugePageOnPath`] if the `PD` entry is a 2 MiB huge-page leaf
+///   (the map is huge-page-granular there — a 4 KiB leaf needs a split);
+/// - [`NptError::IntermediateNotPresent`] if a `PML4`/`PDPT`/`PD` entry on the
+///   path is absent or points outside `buf`.
+pub fn map_npt_4kib_leaf(
+    buf: &mut [u8],
+    phys_base: u64,
+    gpa: u64,
+    spa: u64,
+) -> Result<(), NptError> {
+    if gpa & (PAGE_SIZE - 1) != 0 || spa & (PAGE_SIZE - 1) != 0 {
+        return Err(NptError::UnalignedBase);
+    }
+    let pml4_i = ((gpa >> 39) & 0x1FF) as usize;
+    let pdpt_i = ((gpa >> 30) & 0x1FF) as usize;
+    let pd_i = ((gpa >> 21) & 0x1FF) as usize;
+    let leaf_i = ((gpa >> 12) & 0x1FF) as usize;
+
+    // PML4[pml4_i] → PDPT → PD → PT, following present table pointers.
+    let pdpt_off = child_offset(buf, phys_base, 0, pml4_i)?;
+    let pd_off = child_offset(buf, phys_base, pdpt_off, pdpt_i)?;
+    let leaf_table_off = child_offset(buf, phys_base, pd_off, pd_i)?;
+    // Write the 4 KiB leaf into PT[leaf_i] (no HUGE_PAGE bit).
+    let leaf_flags = flags::PRESENT | flags::WRITABLE | flags::USER;
+    write_entry(
+        buf,
+        leaf_table_off + leaf_i * 8,
+        (spa & ADDR_MASK) | leaf_flags,
+    );
+    Ok(())
+}
+
 /// Read the present table entry at `table_off + index*8` and return the `buf`
 /// offset of the table it points at (its physical address minus `phys_base`).
 fn child_offset(
@@ -272,6 +450,11 @@ fn child_offset(
     let entry = read_entry(buf, table_off + index * 8)?;
     if entry & flags::PRESENT == 0 {
         return Err(NptError::IntermediateNotPresent);
+    }
+    // A table pointer must not be a huge-page leaf — descending into one would
+    // treat a 2 MiB frame address as a table base.
+    if entry & flags::HUGE_PAGE != 0 {
+        return Err(NptError::HugePageOnPath);
     }
     let child_pa = entry & ADDR_MASK;
     let off = child_pa
@@ -419,6 +602,129 @@ mod tests {
             map_npt_2mib_leaf(&mut buf, phys_base, 1024 * 1024 * 1024, 0x40_0000),
             Err(NptError::IntermediateNotPresent)
         );
+    }
+
+    #[test]
+    fn npt_4kib_maps_pages_and_leaves_guards_not_present() {
+        let phys_base = 0x1_0000u64;
+        // 3 pages, page 1 a guard.
+        let mut buf = alloc::vec![0u8; 0x4000];
+        let layout = build_identity_npt_4kib(&mut buf, phys_base, 3, &[1]).unwrap();
+        assert_eq!(layout.ncr3, phys_base);
+        assert_eq!(layout.table_count, 4); // PML4 + PDPT + PD + 1 PT
+        assert_eq!(layout.bytes, 4 * 4096);
+
+        let uw = flags::PRESENT | flags::WRITABLE | flags::USER;
+        // PML4[0] → PDPT, PDPT[0] → PD, PD[0] → PT — all at phys_base + offset.
+        assert_eq!(
+            read_entry(&buf, 0, 0),
+            ((phys_base + 0x1000) & ADDR_MASK) | uw
+        );
+        assert_eq!(
+            read_entry(&buf, 0x1000, 0),
+            ((phys_base + 0x2000) & ADDR_MASK) | uw
+        );
+        assert_eq!(
+            read_entry(&buf, 0x2000, 0),
+            ((phys_base + 0x3000) & ADDR_MASK) | uw
+        );
+        // PT (buf offset 0x3000): page 0 and 2 present, page 1 (guard) absent.
+        // 4 KiB leaves carry no HUGE_PAGE bit.
+        assert_eq!(read_entry(&buf, 0x3000, 0), uw); // GPA 0 → 0
+        assert_eq!(read_entry(&buf, 0x3000, 1) & flags::PRESENT, 0); // guard
+        assert_eq!(read_entry(&buf, 0x3000, 2), (2 * PAGE_SIZE) | uw);
+        assert_eq!(read_entry(&buf, 0x3000, 2) & flags::HUGE_PAGE, 0);
+    }
+
+    #[test]
+    fn npt_4kib_spans_multiple_page_tables() {
+        // 513 pages → two PTs (one full, one with a single page).
+        let mut buf = alloc::vec![0u8; 0x6000];
+        let layout = build_identity_npt_4kib(&mut buf, 0, 513, &[]).unwrap();
+        assert_eq!(layout.table_count, 5); // PML4 + PDPT + PD + 2 PTs
+        let uw = flags::PRESENT | flags::WRITABLE | flags::USER;
+        // PD[0] → PT0, PD[1] → PT1 (buf offsets 0x3000, 0x4000).
+        assert_eq!(read_entry(&buf, 0x2000, 0), (0x3000 & ADDR_MASK) | uw);
+        assert_eq!(read_entry(&buf, 0x2000, 1), (0x4000 & ADDR_MASK) | uw);
+        // Last page (512) is PT1[0] → 512 * 4 KiB.
+        assert_eq!(read_entry(&buf, 0x4000, 0), (512 * PAGE_SIZE) | uw);
+        // PT1[1] is beyond num_pages → not present.
+        assert_eq!(read_entry(&buf, 0x4000, 1) & flags::PRESENT, 0);
+    }
+
+    #[test]
+    fn demand_map_4kib_fills_a_guard_page() {
+        // Build a 4-page map with page 2 a guard, then demand-map it in.
+        let phys_base = 0x1_0000u64;
+        let mut buf = alloc::vec![0u8; 0x4000];
+        build_identity_npt_4kib(&mut buf, phys_base, 4, &[2]).unwrap();
+        // PT (buf 0x3000): page 2 currently not present.
+        assert_eq!(read_entry(&buf, 0x3000, 2) & flags::PRESENT, 0);
+        // Demand-map GPA 2*4KiB → SPA 0x50_0000.
+        let uw = flags::PRESENT | flags::WRITABLE | flags::USER;
+        map_npt_4kib_leaf(&mut buf, phys_base, 2 * PAGE_SIZE, 0x50_0000).unwrap();
+        assert_eq!(read_entry(&buf, 0x3000, 2), (0x50_0000 & ADDR_MASK) | uw);
+        assert_eq!(read_entry(&buf, 0x3000, 2) & flags::HUGE_PAGE, 0);
+        // Neighbours untouched.
+        assert_eq!(read_entry(&buf, 0x3000, 1), (PAGE_SIZE) | uw);
+    }
+
+    #[test]
+    fn demand_map_4kib_rejects_unaligned_missing_and_huge_path() {
+        let phys_base = 0x1_0000u64;
+        // 4 KiB map: PD points at a PT, so the path is page-table-granular.
+        let mut buf = alloc::vec![0u8; 0x4000];
+        build_identity_npt_4kib(&mut buf, phys_base, 4, &[]).unwrap();
+        // Unaligned GPA.
+        assert_eq!(
+            map_npt_4kib_leaf(&mut buf, phys_base, 0x800, 0x1000),
+            Err(NptError::UnalignedBase)
+        );
+        // GPA 1 GiB → PDPT[1], never built.
+        assert_eq!(
+            map_npt_4kib_leaf(&mut buf, phys_base, 1024 * 1024 * 1024, 0x1000),
+            Err(NptError::IntermediateNotPresent)
+        );
+
+        // A 2 MiB map's PD entry is a huge-page leaf → a 4 KiB leaf can't descend.
+        let mut huge = alloc::vec![0u8; 0x3000];
+        build_npt_2mib(&mut huge, phys_base, 0, 2 * 1024 * 1024).unwrap();
+        assert_eq!(
+            map_npt_4kib_leaf(&mut huge, phys_base, 0x1000, 0x1000),
+            Err(NptError::HugePageOnPath)
+        );
+    }
+
+    #[test]
+    fn npt_4kib_rejects_bad_inputs() {
+        let mut buf = alloc::vec![0u8; 0x6000];
+        assert_eq!(
+            build_identity_npt_4kib(&mut buf, 0, 0, &[]),
+            Err(NptError::EmptyRegion)
+        );
+        assert_eq!(
+            build_identity_npt_4kib(&mut buf, 0x800, 1, &[]),
+            Err(NptError::UnalignedBase)
+        );
+        // A guard index outside the mapped range is rejected.
+        assert_eq!(
+            build_identity_npt_4kib(&mut buf, 0, 4, &[4]),
+            Err(NptError::GuardPageOutOfRange {
+                index: 4,
+                num_pages: 4
+            })
+        );
+        // > 1 GiB (one PD's worth of PTs) is refused.
+        assert!(matches!(
+            build_identity_npt_4kib(&mut buf, 0, 512 * 512 + 1, &[]),
+            Err(NptError::MapTooLarge { .. })
+        ));
+        // A 3-page map needs 4 tables (16 KiB); a 3-page buffer is too small.
+        let mut tiny = alloc::vec![0u8; 0x3000];
+        assert!(matches!(
+            build_identity_npt_4kib(&mut tiny, 0, 3, &[]),
+            Err(NptError::TablesExceedBuffer { .. })
+        ));
     }
 
     #[test]

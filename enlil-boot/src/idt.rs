@@ -113,7 +113,7 @@ pub struct IdtPointer {
 #[cfg(target_os = "uefi")]
 pub use hw::{
     InterruptStackFrame, breakpoint_hits, init_and_selftest, install_interrupt_gate,
-    install_timer_gate, repoint_df_to_ist, timer_ticks,
+    install_timer_gate, repoint_df_to_ist, repoint_gp_to_ist, repoint_pf_to_ist, timer_ticks,
 };
 
 #[cfg(target_os = "uefi")]
@@ -216,6 +216,40 @@ mod hw {
         // SAFETY: single boot CPU, interrupts disabled; rewriting one live gate.
         let idt = unsafe { &mut *IDT.0.get() };
         idt[8] = IdtEntry::new(addr(double_fault_handler), cs, ist, GATE_TYPE_INTERRUPT);
+    }
+
+    /// Re-point the `#PF` (page-fault, vector 14) gate at IST index `ist`, so a
+    /// page fault runs on a known-good stack.
+    ///
+    /// This protects the handler from a fault taken on an already-corrupt or
+    /// overflowed kernel stack. Written into the live IDT; call with interrupts
+    /// disabled after the TSS (whose `IST` stack this names) is loaded.
+    pub fn repoint_pf_to_ist(ist: u8) {
+        type HandlerErr = extern "x86-interrupt" fn(InterruptStackFrame, u64);
+        let addr = |h: HandlerErr| h as usize as u64;
+        let cs = current_cs();
+        // SAFETY: single boot CPU, interrupts disabled; rewriting one live gate.
+        let idt = unsafe { &mut *IDT.0.get() };
+        idt[14] = IdtEntry::new(addr(page_fault_handler), cs, ist, GATE_TYPE_INTERRUPT);
+    }
+
+    /// Re-point the `#GP` (general-protection, vector 13) gate at IST index
+    /// `ist`, so a general-protection fault runs on a known-good stack.
+    ///
+    /// Written into the live IDT; call with interrupts disabled after the TSS
+    /// (whose `IST` stack this names) is loaded.
+    pub fn repoint_gp_to_ist(ist: u8) {
+        type HandlerErr = extern "x86-interrupt" fn(InterruptStackFrame, u64);
+        let addr = |h: HandlerErr| h as usize as u64;
+        let cs = current_cs();
+        // SAFETY: single boot CPU, interrupts disabled; rewriting one live gate.
+        let idt = unsafe { &mut *IDT.0.get() };
+        idt[13] = IdtEntry::new(
+            addr(general_protection_handler),
+            cs,
+            ist,
+            GATE_TYPE_INTERRUPT,
+        );
     }
 
     /// Report-and-park handler for faults without an error code.

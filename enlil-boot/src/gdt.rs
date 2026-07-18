@@ -109,6 +109,18 @@ impl Tss {
     pub const fn set_ist1(&mut self, stack_top: u64) {
         self.ist[0] = stack_top;
     }
+
+    /// Set `IST`_n_ (1-based, matching the gate's IST index) to `stack_top`.
+    ///
+    /// `ist_index` must be 1..=7; out-of-range indices are ignored (a gate can
+    /// only name IST 1–7, so a bad index here is a caller bug, not a fault).
+    pub const fn set_ist(&mut self, ist_index: usize, stack_top: u64) {
+        // The IST array is `[u64; 7]`; a literal length avoids a reference to
+        // the packed field (`self.ist.len()` would be an unaligned borrow).
+        if ist_index >= 1 && ist_index <= 7 {
+            self.ist[ist_index - 1] = stack_top;
+        }
+    }
 }
 
 impl Default for Tss {
@@ -133,7 +145,7 @@ pub use hw::install_and_selftest;
 mod hw {
     use super::{GdtPointer, Tss, code_segment_64, data_segment, tss_descriptor};
     use core::cell::UnsafeCell;
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::{AtomicU64, Ordering};
 
     /// GDT slots. The firmware code selector's slot is overwritten with our own
     /// (matching) 64-bit code descriptor, and the TSS descriptor (16 bytes = 2
@@ -148,9 +160,12 @@ mod hw {
     const TSS_SELECTOR: u16 = 0xF0;
     const _: () = assert!(GDT_ENTRIES * 8 - 1 == GDT_LIMIT as usize);
     const _: () = assert!(TSS_INDEX << 3 == TSS_SELECTOR as usize);
-    /// The self-test interrupt vector routed onto `IST1`.
-    const IST_TEST_VECTOR: u8 = 0x41;
-    /// Size of the dedicated IST stack (16 KiB).
+    /// Self-test interrupt vectors routed onto IST1/IST2/IST3 — one throwaway
+    /// vector per IST slot so the switch to each dedicated stack is proven.
+    const IST1_TEST_VECTOR: u8 = 0x41;
+    const IST2_TEST_VECTOR: u8 = 0x42;
+    const IST3_TEST_VECTOR: u8 = 0x43;
+    /// Size of each dedicated IST stack (16 KiB).
     const IST_STACK_SIZE: usize = 16 * 1024;
 
     /// The `x86-interrupt` handler type — a typed fn pointer avoids a direct
@@ -169,16 +184,23 @@ mod hw {
 
     #[repr(C, align(16))]
     struct IstStack(UnsafeCell<[u8; IST_STACK_SIZE]>);
-    // SAFETY: used only as the CPU's IST1 stack (the CPU writes it on an
-    // IST-routed interrupt); never shared as data.
+    // SAFETY: used only as a CPU IST stack (the CPU writes it on an IST-routed
+    // interrupt); never shared as data.
     unsafe impl Sync for IstStack {}
 
     static GDT: GdtStore = GdtStore(UnsafeCell::new([0; GDT_ENTRIES]));
     static TSS: TssStore = TssStore(UnsafeCell::new(Tss::new()));
-    static IST_STACK: IstStack = IstStack(UnsafeCell::new([0; IST_STACK_SIZE]));
+    /// One dedicated stack per IST slot in use: IST1 (#DF), IST2 (#PF), IST3
+    /// (#GP) — a fault taken while another IST handler runs still has a clean
+    /// stack because the vectors use distinct slots.
+    static IST_STACK1: IstStack = IstStack(UnsafeCell::new([0; IST_STACK_SIZE]));
+    static IST_STACK2: IstStack = IstStack(UnsafeCell::new([0; IST_STACK_SIZE]));
+    static IST_STACK3: IstStack = IstStack(UnsafeCell::new([0; IST_STACK_SIZE]));
 
-    /// Set by the self-test handler when it confirms it ran on the IST stack.
-    static IST_PROBE_OK: AtomicBool = AtomicBool::new(false);
+    /// The `RSP` the most recent IST-probe interrupt ran on — the self-test
+    /// fires one probe vector at a time and checks this lands on that slot's
+    /// dedicated stack.
+    static LAST_IST_RSP: AtomicU64 = AtomicU64::new(0);
 
     /// The current code-segment selector.
     fn current_cs() -> u16 {
@@ -210,33 +232,39 @@ mod hw {
         tr
     }
 
-    /// The `IST1` self-test handler: confirm the CPU switched to the IST stack.
+    /// The IST self-test handler: record the `RSP` the CPU switched to.
     ///
-    /// Reads `RSP` and checks it lies inside [`IST_STACK`]; if so the IST switch
-    /// worked. Returns via the `x86-interrupt` `IRETQ`, so triggering it does
-    /// not hang (unlike the real park-on-fault handlers).
+    /// The self-test fires one probe vector (each routed to a distinct IST slot)
+    /// at a time and checks the recorded `RSP` lands on that slot's dedicated
+    /// stack. Returns via the `x86-interrupt` `IRETQ`, so triggering it does not
+    /// hang (unlike the real park-on-fault handlers).
     extern "x86-interrupt" fn ist_probe_handler(_frame: crate::idt::InterruptStackFrame) {
         let rsp: u64;
         // SAFETY: reading RSP is side-effect-free.
         unsafe {
             core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags));
         }
-        let base = IST_STACK.0.get() as u64;
-        let top = base + IST_STACK_SIZE as u64;
-        if rsp > base && rsp <= top {
-            IST_PROBE_OK.store(true, Ordering::Release);
-        }
+        LAST_IST_RSP.store(rsp, Ordering::Release);
     }
 
-    /// Install the kernel's own GDT + TSS with an IST stack and prove the IST
-    /// switch works.
+    /// Whether the last probe's `RSP` lies inside `stack`.
+    fn last_rsp_on(stack: &IstStack) -> bool {
+        let base = stack.0.get() as u64;
+        let top = base + IST_STACK_SIZE as u64;
+        let rsp = LAST_IST_RSP.load(Ordering::Acquire);
+        rsp > base && rsp <= top
+    }
+
+    /// Install the kernel's own GDT + TSS with three IST stacks and prove each
+    /// IST switch works.
     ///
     /// Returns whether every step behaved. Builds a GDT that keeps the firmware
-    /// code selector valid (so the loaded
-    /// IDT gates keep working — no CS reload) and adds a TSS descriptor, loads
-    /// it (`lgdt`), loads the task register (`ltr`), points the `#DF` gate and a
-    /// self-test vector at `IST1`, then fires the self-test vector and checks it
-    /// ran on the IST stack. Single boot CPU, interrupts masked by the caller.
+    /// code selector valid (so the loaded IDT gates keep working — no CS reload)
+    /// and adds a TSS descriptor, loads it (`lgdt`), loads the task register
+    /// (`ltr`), points the `#DF`/`#PF`/`#GP` gates at IST1/IST2/IST3 (plus a
+    /// throwaway self-test vector per slot), then fires each self-test vector and
+    /// checks it ran on that slot's dedicated stack. Single boot CPU, interrupts
+    /// masked by the caller.
     #[must_use]
     pub fn install_and_selftest() -> bool {
         let cs_index = (current_cs() >> 3) as usize;
@@ -245,11 +273,15 @@ mod hw {
             return false; // firmware CS/SS selector out of our GDT's usable range
         }
 
-        // Program the TSS: IST1 = top of the dedicated stack (grows down).
-        let ist_top = IST_STACK.0.get() as u64 + IST_STACK_SIZE as u64;
+        // Program the TSS: IST1/2/3 = top of each dedicated stack (grows down).
+        let ist1_top = IST_STACK1.0.get() as u64 + IST_STACK_SIZE as u64;
+        let ist2_top = IST_STACK2.0.get() as u64 + IST_STACK_SIZE as u64;
+        let ist3_top = IST_STACK3.0.get() as u64 + IST_STACK_SIZE as u64;
         // SAFETY: single-CPU init; the TSS is not yet loaded.
         let tss = unsafe { &mut *TSS.0.get() };
-        tss.set_ist1(ist_top);
+        tss.set_ist(1, ist1_top);
+        tss.set_ist(2, ist2_top);
+        tss.set_ist(3, ist3_top);
         let tss_addr = TSS.0.get() as u64;
 
         // Build the GDT: our code descriptor at the firmware CS index, the TSS
@@ -284,20 +316,37 @@ mod hw {
             core::arch::asm!("ltr {0:x}", in(reg) TSS_SELECTOR, options(nomem, nostack, preserves_flags));
         }
 
-        // Route the self-test vector and the real #DF gate onto IST1. Take the
-        // handler address via a typed fn pointer (not a direct item cast).
+        // Route a throwaway self-test vector onto each IST slot, and the real
+        // #DF/#PF/#GP gates onto IST1/IST2/IST3. Take the handler address via a
+        // typed fn pointer (not a direct item cast).
         let probe: IstHandler = ist_probe_handler;
-        crate::idt::install_interrupt_gate(IST_TEST_VECTOR, probe as usize as u64, 1);
+        let probe_addr = probe as usize as u64;
+        crate::idt::install_interrupt_gate(IST1_TEST_VECTOR, probe_addr, 1);
+        crate::idt::install_interrupt_gate(IST2_TEST_VECTOR, probe_addr, 2);
+        crate::idt::install_interrupt_gate(IST3_TEST_VECTOR, probe_addr, 3);
         crate::idt::repoint_df_to_ist(1);
+        crate::idt::repoint_pf_to_ist(2);
+        crate::idt::repoint_gp_to_ist(3);
 
-        // Fire the self-test: a software interrupt switches to IST1, the handler
-        // checks RSP is on that stack and IRETs. `int` is unaffected by IF.
-        // SAFETY: the gate is installed with a handler that returns cleanly.
+        // Fire each self-test: a software interrupt switches to that slot's IST
+        // stack, the handler records RSP and IRETs. `int` is unaffected by IF.
+        // SAFETY: each gate is installed with a handler that returns cleanly.
         unsafe {
             core::arch::asm!("int 0x41", options(nomem, nostack));
         }
+        let ist1_ok = last_rsp_on(&IST_STACK1);
+        // SAFETY: as above — the IST2 probe vector returns cleanly.
+        unsafe {
+            core::arch::asm!("int 0x42", options(nomem, nostack));
+        }
+        let ist2_ok = last_rsp_on(&IST_STACK2);
+        // SAFETY: as above — the IST3 probe vector returns cleanly.
+        unsafe {
+            core::arch::asm!("int 0x43", options(nomem, nostack));
+        }
+        let ist3_ok = last_rsp_on(&IST_STACK3);
 
-        IST_PROBE_OK.load(Ordering::Acquire) && task_register() == TSS_SELECTOR
+        ist1_ok && ist2_ok && ist3_ok && task_register() == TSS_SELECTOR
     }
 }
 
@@ -342,6 +391,24 @@ mod tests {
         assert_eq!(size_of::<Tss>(), 104);
         assert_eq!(offset_of!(Tss, rsp), 4); // RSP0
         assert_eq!(offset_of!(Tss, ist), 36); // IST1
+    }
+
+    #[test]
+    fn set_ist_writes_the_indexed_slot_and_ignores_out_of_range() {
+        let mut tss = Tss::new();
+        tss.set_ist(1, 0x1111);
+        tss.set_ist(2, 0x2222);
+        tss.set_ist(7, 0x7777);
+        // Out of range (0 and 8) must not write any slot.
+        tss.set_ist(0, 0xDEAD);
+        tss.set_ist(8, 0xBEEF);
+        let ist = tss.ist;
+        assert_eq!(ist[0], 0x1111); // IST1
+        assert_eq!(ist[1], 0x2222); // IST2
+        assert_eq!(ist[6], 0x7777); // IST7
+        // No stray write past the array from the ignored indices.
+        assert_eq!(ist[2], 0);
+        assert_eq!(ist[3], 0);
     }
 
     #[test]
