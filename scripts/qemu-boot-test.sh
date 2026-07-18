@@ -52,6 +52,10 @@ PERCPU_LINE="GS-base TLS installed"
 # Printed once the kernel arms a one-shot LAPIC timer, enables interrupts, and
 # its handler runs — the interrupt-preemption clock every scheduler needs.
 TIMER_LINE="LAPIC timer fired"
+# Printed once the kernel arms the LAPIC timer in TSC-deadline mode (an absolute
+# TSC deadline, not a divided count-down) and its handler runs — the precise
+# preemption clock a scheduler quantizes on.
+DEADLINE_LINE="TSC-deadline timer fired"
 # Printed once the kernel calibrates the TSC against the fixed-rate PIT — the
 # monotonic time source the bare-metal kernel runs on.
 TSC_LINE="TSC calibrated"
@@ -275,6 +279,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$APIC_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PERCPU_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$TIMER_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$DEADLINE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$TSC_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ACPI_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ECAM_LINE" "$SERIAL_LOG" 2>/dev/null \
@@ -301,7 +306,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$LONGMODE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_TEXT_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, TSC calibration, ACPI discovery, PCI enumeration, own page tables, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + 64-bit long-mode guest, and GOP draw observed on serial"
+    echo "PASS: banner, kernel memory, heap, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery, PCI enumeration, own page tables, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + 64-bit long-mode guest, and GOP draw observed on serial"
     exit 0
 fi
 

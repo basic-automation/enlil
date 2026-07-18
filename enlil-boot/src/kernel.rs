@@ -243,6 +243,7 @@ mod hw {
         bring_up_percpu(&serial, apic_id.unwrap_or(0));
         bring_up_gdt(&serial);
         bring_up_timer(&serial);
+        bring_up_deadline_timer(&serial);
         bring_up_time(&serial);
         let ecam = bring_up_acpi(&serial, handoff);
         bring_up_pci(&serial);
@@ -423,6 +424,54 @@ mod hw {
             serial.write_str("enlil kernel: apic: LAPIC timer fired — preemption clock live\n");
         } else {
             serial.write_str("enlil kernel: apic: LAPIC timer did NOT fire\n");
+        }
+    }
+
+    /// Arm the LAPIC timer in **TSC-deadline** mode and prove it fires — the
+    /// precise-preemption clock a scheduler quantizes on (ROADMAP 6.2).
+    ///
+    /// Where [`bring_up_timer`] proves the divided count-down path, this proves
+    /// the absolute-deadline path: the next tick is a TSC value, not a divided
+    /// count, so preemption lands at a precise point on the monotonic clock. If
+    /// the CPU lacks the mode (`CPUID.1:ECX[24]` clear) it is reported, not
+    /// treated as a failure. Runs the same bounded sti/wait/cli dance as the
+    /// one-shot test, reusing the timer gate + tick counter at [`TIMER_VECTOR`].
+    fn bring_up_deadline_timer(serial: &SerialPort) {
+        /// Same vector + handler as the one-shot timer test (installed here in
+        /// case ordering ever changes); the handler counts ticks + signals EOI.
+        const TIMER_VECTOR: u8 = 0x40;
+        /// TSC ticks until the deadline. At multi-GHz this is a few ms — long
+        /// enough not to fire before `sti`, short enough to land in the wait.
+        const DEADLINE_OFFSET: u64 = 50_000_000;
+        /// Cap on the wait spins so a non-firing timer is reported, not hung.
+        const WAIT_SPINS: u32 = 200_000_000;
+
+        if !crate::apic::tsc_deadline_available() {
+            serial.write_str(
+                "enlil kernel: apic: TSC-deadline timer mode unavailable (CPUID.1:ECX[24] clear)\n",
+            );
+            return;
+        }
+        crate::idt::install_timer_gate(TIMER_VECTOR);
+        let before = crate::idt::timer_ticks();
+        crate::apic::arm_tsc_deadline_timer(TIMER_VECTOR, DEADLINE_OFFSET);
+        // SAFETY: the timer gate is installed and the handler signals EOI; sti
+        // only enables delivery of the deadline interrupt we just armed.
+        unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)) };
+        let mut spun = 0u32;
+        while crate::idt::timer_ticks() == before && spun < WAIT_SPINS {
+            spun += 1;
+            core::hint::spin_loop();
+        }
+        // SAFETY: re-mask interrupts before continuing the single-threaded boot.
+        unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)) };
+
+        if crate::idt::timer_ticks() > before {
+            serial.write_str(
+                "enlil kernel: apic: LAPIC TSC-deadline timer fired — precise preemption clock live\n",
+            );
+        } else {
+            serial.write_str("enlil kernel: apic: LAPIC TSC-deadline timer did NOT fire\n");
         }
     }
 

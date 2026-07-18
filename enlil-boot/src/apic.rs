@@ -55,6 +55,25 @@ pub const LVT_MASKED: u64 = 1 << 16;
 /// reaches 0). Periodic is 01, TSC-deadline 10.
 pub const TIMER_MODE_ONESHOT: u64 = 0b00 << 17;
 
+/// `LVT_TIMER` bits 18:17 = 10 — TSC-deadline mode.
+///
+/// The timer fires once when the TSC reaches the value written to
+/// `IA32_TSC_DEADLINE`, an absolute deadline rather than a divided countdown
+/// (SDM Vol. 3 §10.5.4.1). This is the precise-preemption mode a scheduler
+/// wants: the next quantum is a TSC value, immune to the divide-configuration
+/// rounding a count-down timer carries.
+pub const TIMER_MODE_TSC_DEADLINE: u64 = 0b10 << 17;
+
+/// `IA32_TSC_DEADLINE` MSR — arms the LAPIC timer at an absolute TSC value.
+///
+/// Writing a non-zero TSC value arms the timer to fire when the TSC reaches it;
+/// writing 0 disarms it. Only meaningful while the `LVT_TIMER` is in
+/// TSC-deadline mode (SDM Vol. 3 §10.5.4.1).
+pub const IA32_TSC_DEADLINE: u32 = 0x6E0;
+
+/// `CPUID.1:ECX[24]` — the processor supports the LAPIC TSC-deadline timer.
+pub const CPUID_1_ECX_TSC_DEADLINE: u32 = 1 << 24;
+
 /// `DIV_CONF` value for divide-by-16 (bits {3,1,0} = 0b0011; SDM Vol. 3
 /// §10.5.4).
 pub const TIMER_DIV_16: u64 = 0b0011;
@@ -109,6 +128,22 @@ pub const fn lvt_timer_oneshot(vector: u8) -> u64 {
     (vector as u64) | TIMER_MODE_ONESHOT
 }
 
+/// The `LVT_TIMER` value for an unmasked TSC-deadline timer delivering `vector`.
+///
+/// The timer fires when the TSC reaches `IA32_TSC_DEADLINE`; the divide
+/// configuration is ignored in this mode, so no `DIV_CONF` write is needed.
+#[must_use]
+pub const fn lvt_timer_tsc_deadline(vector: u8) -> u64 {
+    // Mode TSC-deadline, unmasked (mask bit clear), interrupt vector in bits 7:0.
+    (vector as u64) | TIMER_MODE_TSC_DEADLINE
+}
+
+/// Whether `CPUID.1:ECX` advertises the LAPIC TSC-deadline timer mode.
+#[must_use]
+pub const fn tsc_deadline_supported(cpuid_1_ecx: u32) -> bool {
+    cpuid_1_ecx & CPUID_1_ECX_TSC_DEADLINE != 0
+}
+
 /// Whether `CPUID.1:ECX` advertises x2APIC support.
 #[must_use]
 pub const fn x2apic_supported(cpuid_1_ecx: u32) -> bool {
@@ -140,14 +175,18 @@ pub const fn x2apic_id_from_msr(msr_value: u64) -> u32 {
 }
 
 #[cfg(target_os = "uefi")]
-pub use hw::{arm_oneshot_timer, enable_x2apic, signal_eoi, timer_current_count};
+pub use hw::{
+    arm_oneshot_timer, arm_tsc_deadline_timer, enable_x2apic, signal_eoi, timer_current_count,
+    tsc_deadline_available,
+};
 
 #[cfg(target_os = "uefi")]
 mod hw {
     use super::{
-        IA32_APIC_BASE, IA32_X2APIC_APICID, IA32_X2APIC_CUR_COUNT, IA32_X2APIC_DIV_CONF,
-        IA32_X2APIC_EOI, IA32_X2APIC_INIT_COUNT, IA32_X2APIC_LVT_TIMER, IA32_X2APIC_SIVR,
-        TIMER_DIV_16, apic_base_enable_x2apic, is_x2apic_enabled, lvt_timer_oneshot, sivr_value,
+        IA32_APIC_BASE, IA32_TSC_DEADLINE, IA32_X2APIC_APICID, IA32_X2APIC_CUR_COUNT,
+        IA32_X2APIC_DIV_CONF, IA32_X2APIC_EOI, IA32_X2APIC_INIT_COUNT, IA32_X2APIC_LVT_TIMER,
+        IA32_X2APIC_SIVR, TIMER_DIV_16, apic_base_enable_x2apic, is_x2apic_enabled,
+        lvt_timer_oneshot, lvt_timer_tsc_deadline, sivr_value, tsc_deadline_supported,
         x2apic_id_from_msr, x2apic_supported,
     };
 
@@ -247,6 +286,54 @@ mod hw {
         }
     }
 
+    /// Read the TSC, `lfence`-bounded so surrounding accesses do not reorder
+    /// across it — the "now" the TSC-deadline arm adds its offset to.
+    fn rdtsc() -> u64 {
+        let (lo, hi): (u32, u32);
+        // SAFETY: rdtsc is unprivileged; lfence bounds it against reordering.
+        unsafe {
+            core::arch::asm!(
+                "lfence",
+                "rdtsc",
+                "lfence",
+                out("eax") lo,
+                out("edx") hi,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        (u64::from(hi) << 32) | u64::from(lo)
+    }
+
+    /// Whether this CPU advertises the LAPIC TSC-deadline timer mode.
+    #[must_use]
+    pub fn tsc_deadline_available() -> bool {
+        tsc_deadline_supported(cpuid_1_ecx())
+    }
+
+    /// Software-enable the APIC and arm the LAPIC timer in **TSC-deadline**
+    /// mode to deliver `vector` once the TSC has advanced by `tsc_offset` from
+    /// now.
+    ///
+    /// Unlike [`arm_oneshot_timer`], the deadline is an absolute TSC value, so
+    /// preemption lands at a precise point on the monotonic clock rather than
+    /// after a divided count-down. Programs `SIVR` (software enable), sets the
+    /// `LVT_TIMER` to TSC-deadline mode, then — after fencing so the mode write
+    /// is ordered ahead of the arm (SDM Vol. 3 §10.5.4.1) — writes
+    /// `IA32_TSC_DEADLINE = rdtsc() + tsc_offset`, which starts the timer.
+    pub fn arm_tsc_deadline_timer(vector: u8, tsc_offset: u64) {
+        // SAFETY: ring 0 after ExitBootServices; these are architectural x2APIC
+        // and TSC MSRs and the values are legal (software-enable + a
+        // TSC-deadline timer). The mfence/lfence orders the LVT-mode change
+        // ahead of the deadline write the SDM requires.
+        unsafe {
+            wrmsr(IA32_X2APIC_SIVR, sivr_value(0xFF));
+            wrmsr(IA32_X2APIC_LVT_TIMER, lvt_timer_tsc_deadline(vector));
+            core::arch::asm!("mfence", "lfence", options(nomem, nostack, preserves_flags));
+            let deadline = rdtsc().wrapping_add(tsc_offset);
+            wrmsr(IA32_TSC_DEADLINE, deadline);
+        }
+    }
+
     /// Signal end-of-interrupt to the local APIC (write 0 to `EOI`). Called
     /// from an interrupt handler before it returns.
     pub fn signal_eoi() {
@@ -326,6 +413,25 @@ mod tests {
         assert_eq!(lvt & LVT_MASKED, 0); // unmasked
         // One-shot mode: the timer-mode bits (18:17) are 0.
         assert_eq!((lvt >> 17) & 0b11, 0);
+    }
+
+    #[test]
+    fn tsc_deadline_support_bit() {
+        assert!(!tsc_deadline_supported(0));
+        assert!(tsc_deadline_supported(CPUID_1_ECX_TSC_DEADLINE));
+        // Other ECX bits set but not 24 → unsupported.
+        assert!(!tsc_deadline_supported(0xFEFF_FFFF));
+    }
+
+    #[test]
+    fn lvt_timer_tsc_deadline_carries_vector_in_deadline_mode() {
+        let lvt = lvt_timer_tsc_deadline(0x40);
+        assert_eq!(lvt & 0xFF, 0x40); // interrupt vector
+        assert_eq!(lvt & LVT_MASKED, 0); // unmasked
+        // TSC-deadline mode: the timer-mode bits (18:17) are 0b10.
+        assert_eq!((lvt >> 17) & 0b11, 0b10);
+        // Distinct from one-shot mode (mode bits 0b00) at the same vector.
+        assert_ne!(lvt, lvt_timer_oneshot(0x40));
     }
 
     #[test]
