@@ -757,7 +757,7 @@ mod hw {
     fn bring_up_gdt(serial: &SerialPort) {
         if crate::gdt::install_and_selftest() {
             serial.write_str(
-                "enlil kernel: gdt: own GDT+TSS loaded, #DF on IST1, IST self-test ok\n",
+                "enlil kernel: gdt: own GDT+TSS loaded, #DF/#PF/#GP on IST1/2/3, IST self-test ok\n",
             );
         } else {
             serial.write_str("enlil kernel: gdt: GDT+TSS/IST self-test FAILED\n");
