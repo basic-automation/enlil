@@ -168,8 +168,32 @@ pub const fn bar_io_base(bar: u32) -> u16 {
     (bar & 0xFFFC) as u16
 }
 
+/// The size of a 32-bit memory BAR from its all-ones write-probe read-back.
+///
+/// After writing `0xFFFF_FFFF` to a BAR, the address bits read back as
+/// `~(size − 1)`; the region size is `~(readback & mask) + 1` (PCI spec §6.2.5.1).
+/// The low 4 flag bits are masked off first. Returns 0 for an unimplemented BAR
+/// (reads back 0 after masking).
+#[must_use]
+pub const fn bar_mem_size(probe_readback: u32) -> u64 {
+    let masked = probe_readback & 0xFFFF_FFF0;
+    if masked == 0 { 0 } else { (!masked as u64) + 1 }
+}
+
+/// The size of a 64-bit memory BAR from the all-ones write-probe read-back of
+/// its low and high dwords (the 64-bit analogue of [`bar_mem_size`]).
+#[must_use]
+pub const fn bar_mem_size_64(probe_low: u32, probe_high: u32) -> u64 {
+    let masked = ((probe_high as u64) << 32) | ((probe_low & 0xFFFF_FFF0) as u64);
+    if masked == 0 {
+        0
+    } else {
+        (!masked).wrapping_add(1)
+    }
+}
+
 /// A decoded memory BAR located on a bus scan: which function carries it, its
-/// base address, and whether it is a 64-bit BAR.
+/// base address, size, and whether it is a 64-bit BAR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryBar {
     /// PCI bus number.
@@ -182,6 +206,8 @@ pub struct MemoryBar {
     pub index: u8,
     /// The decoded base physical address.
     pub base: u64,
+    /// The region size in bytes (from the write-probe), 0 if unsized.
+    pub size: u64,
     /// Whether it is a 64-bit BAR.
     pub is_64: bool,
 }
@@ -225,9 +251,9 @@ pub use hw::{first_memory_bar, scan_bus0, scan_ecam};
 mod hw {
     use super::{
         BAR0_OFFSET, CAP_ID_MSIX, EcamScan, MemoryBar, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA,
-        PciScan, bar_is_io, bar_is_mem_64, bar_mem_base, bar_mem_base_64, cap_id_of, cap_next_of,
-        class_of, config_address, device_of, ecam_config_address, status_has_caps, vendor_of,
-        vendor_present,
+        PciScan, bar_is_io, bar_is_mem_64, bar_mem_base, bar_mem_base_64, bar_mem_size,
+        bar_mem_size_64, cap_id_of, cap_next_of, class_of, config_address, device_of,
+        ecam_config_address, status_has_caps, vendor_of, vendor_present,
     };
 
     /// Write a 32-bit `value` to `port`.
@@ -264,6 +290,45 @@ mod hw {
                 config_address(bus, device, function, offset),
             );
             inl(PCI_CONFIG_DATA)
+        }
+    }
+
+    /// Write config dword `offset` of `bus:device.function` via mechanism #1.
+    ///
+    /// Used only for the BAR write-probe sizing below, which always restores the
+    /// original value — config space is never left modified.
+    fn config_write(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
+        // SAFETY: 0xCF8/0xCFC are the architectural PCI config ports; select
+        // then data write is the mechanism-#1 protocol.
+        unsafe {
+            outl(
+                PCI_CONFIG_ADDRESS,
+                config_address(bus, device, function, offset),
+            );
+            outl(PCI_CONFIG_DATA, value);
+        }
+    }
+
+    /// Size a memory BAR at config `off` by the standard write-probe: save the
+    /// BAR, write all-ones, read back the size mask, and **restore the original**.
+    ///
+    /// For a 64-bit BAR (`is_64`) both dwords are probed and combined. Config
+    /// space is left exactly as found.
+    fn size_memory_bar(device: u8, function: u8, off: u8, is_64: bool) -> u64 {
+        let orig_lo = config_read(0, device, function, off);
+        config_write(0, device, function, off, 0xFFFF_FFFF);
+        let probe_lo = config_read(0, device, function, off);
+        if is_64 {
+            let orig_hi = config_read(0, device, function, off + 4);
+            config_write(0, device, function, off + 4, 0xFFFF_FFFF);
+            let probe_hi = config_read(0, device, function, off + 4);
+            // Restore both dwords.
+            config_write(0, device, function, off, orig_lo);
+            config_write(0, device, function, off + 4, orig_hi);
+            bar_mem_size_64(probe_lo, probe_hi)
+        } else {
+            config_write(0, device, function, off, orig_lo);
+            bar_mem_size(probe_lo)
         }
     }
 
@@ -362,6 +427,7 @@ mod hw {
             function: 0,
             index: 0,
             base: 0,
+            size: 0,
             is_64: false,
         })
     }
@@ -406,6 +472,7 @@ mod hw {
                                 function,
                                 index: i,
                                 base,
+                                size: size_memory_bar(device, function, off, true),
                                 is_64: true,
                             });
                         }
@@ -419,6 +486,7 @@ mod hw {
                                 function,
                                 index: i,
                                 base: u64::from(base),
+                                size: size_memory_bar(device, function, off, false),
                                 is_64: false,
                             });
                         }
@@ -596,6 +664,25 @@ mod tests {
         let io = 0x0000_C001;
         assert!(bar_is_io(io));
         assert_eq!(bar_io_base(io), 0xC000);
+    }
+
+    #[test]
+    fn bar_size_from_write_probe() {
+        // A 16 MiB BAR reads back ~(16 MiB - 1) = 0xFF00_0000 in the addr bits.
+        assert_eq!(bar_mem_size(0xFF00_0000), 16 * 1024 * 1024);
+        // A 256-byte BAR: ~(0xFF) = 0xFFFF_FF00 → 0x100.
+        assert_eq!(bar_mem_size(0xFFFF_FF00), 0x100);
+        // An unimplemented BAR (reads back 0) has size 0.
+        assert_eq!(bar_mem_size(0), 0);
+        // Low flag bits are ignored (prefetchable/type bits set → same size).
+        assert_eq!(bar_mem_size(0xFF00_000C), 16 * 1024 * 1024);
+        // 64-bit: high dword extends the mask. 8 GiB region.
+        // ~(8 GiB - 1) = 0xFFFF_FFFE_0000_0000 → low 0x0000_0000, high 0xFFFF_FFFE.
+        assert_eq!(
+            bar_mem_size_64(0x0000_0000, 0xFFFF_FFFE),
+            8 * 1024 * 1024 * 1024
+        );
+        assert_eq!(bar_mem_size_64(0, 0), 0);
     }
 
     #[test]

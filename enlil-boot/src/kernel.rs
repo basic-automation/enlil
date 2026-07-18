@@ -501,6 +501,9 @@ mod hw {
             serial.write_str(format_u64(u64::from(bar.index), &mut idx));
             serial.write_str(" base ");
             serial.write_str(format_u64_hex(bar.base, &mut base));
+            let mut size = [0u8; 18];
+            serial.write_str(" size ");
+            serial.write_str(format_u64_hex(bar.size, &mut size));
             serial.write_str(if bar.is_64 {
                 " (64-bit)\n"
             } else {
