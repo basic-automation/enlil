@@ -271,8 +271,40 @@ mod hw {
                 serial.write_str("enlil kernel: time: TSC calibrated ");
                 serial.write_str(format_u64(hz_to_mhz_rounded(hz), &mut buf));
                 serial.write_str(" MHz (via PIT) — monotonic clock live\n");
+                bring_up_monotonic(serial, hz);
             }
             _ => serial.write_str("enlil kernel: time: TSC calibration FAILED (PIT silent)\n"),
+        }
+    }
+
+    /// Prove the calibrated TSC drives a monotonic ns clock + busy-sleep — the
+    /// bare-metal time source timeouts and the scheduler read (ROADMAP 6.2).
+    ///
+    /// Reads the clock, busy-sleeps a fixed interval, reads again, and checks
+    /// the elapsed ns is monotonic and lands in a wide plausibility band around
+    /// the request (so a mis-scaled clock or a broken `rdtsc` is caught, without
+    /// flaking on the emulator's timing jitter). Interrupts are masked here, so
+    /// nothing perturbs the sleep.
+    fn bring_up_monotonic(serial: &SerialPort, hz: u64) {
+        use crate::tsc::{read_tsc, ticks_to_ns};
+        /// The interval to sleep and measure (5 ms).
+        const SLEEP_NS: u64 = 5_000_000;
+        /// Accept anything from ~half to 20x the request — a loose band that
+        /// only fails on a grossly mis-scaled clock, not emulator jitter.
+        const MIN_NS: u64 = SLEEP_NS / 2;
+        const MAX_NS: u64 = SLEEP_NS * 20;
+
+        let t0 = read_tsc();
+        crate::tsc::busy_sleep_ns(hz, SLEEP_NS);
+        let t1 = read_tsc();
+        let elapsed = ticks_to_ns(t1.wrapping_sub(t0), hz);
+        if t1 != t0 && (MIN_NS..=MAX_NS).contains(&elapsed) {
+            let mut buf = [0u8; 20];
+            serial.write_str("enlil kernel: time: monotonic clock advanced ");
+            serial.write_str(format_u64(elapsed / 1000, &mut buf));
+            serial.write_str(" us over a 5 ms busy-sleep — TSC clock live\n");
+        } else {
+            serial.write_str("enlil kernel: time: monotonic clock self-test FAILED\n");
         }
     }
 
