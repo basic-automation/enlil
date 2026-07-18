@@ -62,6 +62,10 @@ TSC_LINE="TSC calibrated"
 # Printed once the kernel walks the firmware ACPI tables (RSDP→XSDT→MADT) and
 # reports the table + enabled-CPU counts — real hardware discovery on metal.
 ACPI_LINE="acpi: discovered"
+# Printed once the kernel enumerates the enabled processors' APIC IDs from the
+# MADT — the AP inventory SMP bring-up (INIT-SIPI-SIPI) targets. Booted with
+# -smp 2 so this is a real multi-CPU inventory.
+APIC_INVENTORY_LINE="SMP AP inventory"
 # Printed once the kernel finds the MCFG and reports the PCIe ECAM base + bus
 # range — the window for extended config space + full multi-bus PCI topology.
 ECAM_LINE="PCIe ECAM base"
@@ -215,6 +219,9 @@ SERIAL_LOG="$OUTDIR/serial.log"
 echo "==> booting under QEMU (OVMF=$OVMF, timeout=${TIMEOUT_SECS}s)"
 QEMU_ARGS=(
     -machine q35
+    # Two CPUs so the MADT carries a real AP inventory (the kernel enumerates
+    # the enabled APIC IDs); the AP stays in wait-for-SIPI until SMP bring-up.
+    -smp 2
     -drive "format=raw,file=fat:rw:$ESP"
     -serial "file:$SERIAL_LOG"
     -display none
@@ -282,6 +289,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$DEADLINE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$TSC_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ACPI_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$APIC_INVENTORY_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ECAM_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$IOMMU_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PCI_LINE" "$SERIAL_LOG" 2>/dev/null \

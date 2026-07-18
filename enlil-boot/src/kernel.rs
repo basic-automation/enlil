@@ -291,6 +291,15 @@ mod hw {
         serial.write_str(" tables, ");
         serial.write_str(format_u64(u64::from(summary.enabled_cpus), &mut c));
         serial.write_str(" enabled CPUs (MADT)\n");
+        // The AP inventory SMP bring-up (INIT-SIPI-SIPI) targets: the enabled
+        // processors' APIC IDs, BSP included.
+        serial.write_str("enlil kernel: acpi: APIC IDs");
+        for i in 0..summary.apic_id_count {
+            let mut id = [0u8; 20];
+            serial.write_str(" ");
+            serial.write_str(format_u64(u64::from(summary.apic_ids[i]), &mut id));
+        }
+        serial.write_str(" (SMP AP inventory)\n");
         serial.write_str("enlil kernel: acpi: IOMMU ");
         serial.write_str(summary.iommu.name());
         serial.write_str(" (DMAR/IVRS)\n");
