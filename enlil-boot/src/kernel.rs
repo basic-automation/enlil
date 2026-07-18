@@ -244,7 +244,9 @@ mod hw {
         bring_up_gdt(&serial);
         bring_up_timer(&serial);
         bring_up_deadline_timer(&serial);
-        bring_up_time(&serial);
+        if let Some(hz) = bring_up_time(&serial) {
+            bring_up_deadline_ns(&serial, hz);
+        }
         let ecam = bring_up_acpi(&serial, handoff);
         bring_up_pci(&serial);
         bring_up_paging(&serial, handoff, highest_usable_end);
@@ -263,7 +265,7 @@ mod hw {
     ///
     /// Runs with interrupts masked (the boot path has not enabled them since
     /// `bring_up_timer` re-masked) so nothing perturbs the calibration window.
-    fn bring_up_time(serial: &SerialPort) {
+    fn bring_up_time(serial: &SerialPort) -> Option<u64> {
         use crate::tsc::hz_to_mhz_rounded;
         match crate::tsc::calibrate_tsc_hz() {
             Some(hz) if hz > 0 => {
@@ -272,8 +274,62 @@ mod hw {
                 serial.write_str(format_u64(hz_to_mhz_rounded(hz), &mut buf));
                 serial.write_str(" MHz (via PIT) — monotonic clock live\n");
                 bring_up_monotonic(serial, hz);
+                Some(hz)
             }
-            _ => serial.write_str("enlil kernel: time: TSC calibration FAILED (PIT silent)\n"),
+            _ => {
+                serial.write_str("enlil kernel: time: TSC calibration FAILED (PIT silent)\n");
+                None
+            }
+        }
+    }
+
+    /// Arm the LAPIC TSC-deadline timer at a **precise nanosecond deadline**
+    /// derived from the calibrated clock, and measure — via the monotonic clock
+    /// — that it fired on time. This is exactly how the scheduler arms a quantum
+    /// ("preempt me in N µs"): a real-time deadline, not a raw tick count.
+    ///
+    /// Converts the requested ns to a TSC-tick offset with the calibrated `hz`
+    /// ([`ns_to_ticks`]), arms the deadline timer, waits (bounded) for the tick,
+    /// then checks the elapsed ns (measured independently across the wait) lands
+    /// in a wide plausibility band — proving the ns→deadline→fire→measure path
+    /// end to end (ROADMAP 6.2).
+    fn bring_up_deadline_ns(serial: &SerialPort, hz: u64) {
+        use crate::tsc::{ns_to_ticks, read_tsc, ticks_to_ns};
+        /// The scheduler-quantum-sized deadline to arm and measure (2 ms).
+        const DEADLINE_NS: u64 = 2_000_000;
+        /// Wide acceptance band — only a grossly wrong clock/timer fails.
+        const MIN_NS: u64 = DEADLINE_NS / 2;
+        const MAX_NS: u64 = DEADLINE_NS * 20;
+        /// Cap on the wait spins so a non-firing timer is reported, not hung.
+        const WAIT_SPINS: u32 = 200_000_000;
+        /// Same vector + handler as the other timer tests.
+        const TIMER_VECTOR: u8 = 0x40;
+
+        if !crate::apic::tsc_deadline_available() {
+            return; // reported already by bring_up_deadline_timer
+        }
+        crate::idt::install_timer_gate(TIMER_VECTOR);
+        let before = crate::idt::timer_ticks();
+        let t0 = read_tsc();
+        crate::apic::arm_tsc_deadline_timer(TIMER_VECTOR, ns_to_ticks(DEADLINE_NS, hz));
+        // SAFETY: the timer gate is installed and the handler signals EOI.
+        unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)) };
+        let mut spun = 0u32;
+        while crate::idt::timer_ticks() == before && spun < WAIT_SPINS {
+            spun += 1;
+            core::hint::spin_loop();
+        }
+        // SAFETY: re-mask interrupts before continuing the single-threaded boot.
+        unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)) };
+        let elapsed = ticks_to_ns(read_tsc().wrapping_sub(t0), hz);
+
+        if crate::idt::timer_ticks() > before && (MIN_NS..=MAX_NS).contains(&elapsed) {
+            let mut buf = [0u8; 20];
+            serial.write_str("enlil kernel: apic: TSC-deadline fired after ");
+            serial.write_str(format_u64(elapsed / 1000, &mut buf));
+            serial.write_str(" us for a 2 ms ns-deadline — ns-precise preemption\n");
+        } else {
+            serial.write_str("enlil kernel: apic: ns-precise TSC-deadline self-test FAILED\n");
         }
     }
 

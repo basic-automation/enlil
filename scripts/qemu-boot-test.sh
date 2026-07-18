@@ -62,6 +62,10 @@ TSC_LINE="TSC calibrated"
 # Printed once the kernel reads a monotonic ns clock across a busy-sleep over
 # the calibrated TSC — the bare-metal time source timeouts + scheduler read.
 MONOTONIC_LINE="monotonic clock advanced"
+# Printed once the kernel arms the TSC-deadline timer at an ns deadline derived
+# from the calibrated clock and the monotonic clock confirms it fired on time —
+# ns-precise preemption, exactly how the scheduler arms a quantum.
+NS_DEADLINE_LINE="ns-precise preemption"
 # Printed once the kernel walks the firmware ACPI tables (RSDP→XSDT→MADT) and
 # reports the table + enabled-CPU counts — real hardware discovery on metal.
 ACPI_LINE="acpi: discovered"
@@ -292,6 +296,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$DEADLINE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$TSC_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$MONOTONIC_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$NS_DEADLINE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ACPI_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$APIC_INVENTORY_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ECAM_LINE" "$SERIAL_LOG" 2>/dev/null \
