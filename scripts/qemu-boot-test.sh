@@ -89,6 +89,9 @@ PCI_CLASS_LINE="pci: classes"
 # Printed once the kernel enumerates the full PCIe topology through the ECAM
 # window (all buses, extended config space) — the mechanism passthrough needs.
 ECAM_SCAN_LINE="ECAM scan"
+# Printed once the kernel reads the first memory BAR on bus 0 — the MMIO window
+# a driver / passthrough claims. Read-only decode (base + 32/64-bit), no sizing.
+PCI_BAR_LINE="pci: BAR"
 # Printed once the kernel builds its own identity page tables and reloads CR3
 # off the firmware's — reaching this line proves the map covers the kernel.
 PAGING_LINE="off firmware page tables"
@@ -304,6 +307,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PCI_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PCI_CLASS_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ECAM_SCAN_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$PCI_BAR_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PAGING_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$SVM_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$HSAVE_LINE" "$SERIAL_LOG" 2>/dev/null \

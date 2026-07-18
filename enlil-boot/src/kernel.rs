@@ -484,6 +484,31 @@ mod hw {
         let mut mx = [0u8; 20];
         serial.write_str(format_u64(u64::from(scan.msix_capable), &mut mx));
         serial.write_str(" MSI-X-capable\n");
+
+        // The first memory BAR on bus 0 — the MMIO window a driver / passthrough
+        // claims (read-only; no BAR sizing yet).
+        let bar = crate::pci::first_memory_bar();
+        if bar.base != 0 {
+            let mut d = [0u8; 20];
+            let mut f = [0u8; 20];
+            let mut idx = [0u8; 20];
+            let mut base = [0u8; 18];
+            serial.write_str("enlil kernel: pci: BAR mem window at 00:");
+            serial.write_str(format_u64(u64::from(bar.device), &mut d));
+            serial.write_str(".");
+            serial.write_str(format_u64(u64::from(bar.function), &mut f));
+            serial.write_str(" BAR");
+            serial.write_str(format_u64(u64::from(bar.index), &mut idx));
+            serial.write_str(" base ");
+            serial.write_str(format_u64_hex(bar.base, &mut base));
+            serial.write_str(if bar.is_64 {
+                " (64-bit)\n"
+            } else {
+                " (32-bit)\n"
+            });
+        } else {
+            serial.write_str("enlil kernel: pci: BAR scan — no memory BAR on bus 0\n");
+        }
     }
 
     /// Arm the LAPIC timer once and prove it fires an interrupt into the kernel.

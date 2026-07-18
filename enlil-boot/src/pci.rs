@@ -121,6 +121,71 @@ pub const fn cap_next_of(cap_dword: u32) -> u8 {
     ((cap_dword >> 8) & 0xFC) as u8
 }
 
+/// Config offset of Base Address Register 0. BARs 0–5 are the six dwords at
+/// `0x10, 0x14, … 0x24`.
+pub const BAR0_OFFSET: u8 = 0x10;
+
+/// BAR bit 0 — address space: 1 = I/O space, 0 = memory space.
+pub const BAR_SPACE_IO: u32 = 1 << 0;
+
+/// BAR memory-type field (bits 2:1) mask.
+pub const BAR_MEM_TYPE_MASK: u32 = 0b11 << 1;
+
+/// BAR memory type 10b — a 64-bit BAR (its high half is the next dword).
+pub const BAR_MEM_TYPE_64: u32 = 0b10 << 1;
+
+/// Whether a BAR maps I/O space (bit 0 set) rather than memory.
+#[must_use]
+pub const fn bar_is_io(bar: u32) -> bool {
+    bar & BAR_SPACE_IO != 0
+}
+
+/// Whether a BAR is a 64-bit memory BAR (memory space, type field 10b) — its
+/// upper 32 bits live in the following BAR dword.
+#[must_use]
+pub const fn bar_is_mem_64(bar: u32) -> bool {
+    bar & BAR_SPACE_IO == 0 && bar & BAR_MEM_TYPE_MASK == BAR_MEM_TYPE_64
+}
+
+/// The 32-bit memory base a memory BAR encodes (low 4 flag bits cleared).
+#[must_use]
+pub const fn bar_mem_base(bar: u32) -> u32 {
+    bar & 0xFFFF_FFF0
+}
+
+/// Combine a 64-bit BAR's low and high dwords into the full base address.
+#[must_use]
+pub const fn bar_mem_base_64(low: u32, high: u32) -> u64 {
+    ((high as u64) << 32) | (bar_mem_base(low) as u64)
+}
+
+/// The I/O port base an I/O BAR encodes (low 2 flag bits cleared).
+///
+/// x86 I/O ports are 16-bit, so only the low word is meaningful; the mask keeps
+/// the cast lossless.
+#[must_use]
+pub const fn bar_io_base(bar: u32) -> u16 {
+    (bar & 0xFFFC) as u16
+}
+
+/// A decoded memory BAR located on a bus scan: which function carries it, its
+/// base address, and whether it is a 64-bit BAR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryBar {
+    /// PCI bus number.
+    pub bus: u8,
+    /// PCI device number.
+    pub device: u8,
+    /// PCI function number.
+    pub function: u8,
+    /// Which BAR index (0–5) it is.
+    pub index: u8,
+    /// The decoded base physical address.
+    pub base: u64,
+    /// Whether it is a 64-bit BAR.
+    pub is_64: bool,
+}
+
 /// What the kernel discovered from a PCI bus-0 scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PciScan {
@@ -154,14 +219,15 @@ impl PciScan {
 }
 
 #[cfg(target_os = "uefi")]
-pub use hw::{scan_bus0, scan_ecam};
+pub use hw::{first_memory_bar, scan_bus0, scan_ecam};
 
 #[cfg(target_os = "uefi")]
 mod hw {
     use super::{
-        CAP_ID_MSIX, EcamScan, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA, PciScan, cap_id_of,
-        cap_next_of, class_of, config_address, device_of, ecam_config_address, status_has_caps,
-        vendor_of, vendor_present,
+        BAR0_OFFSET, CAP_ID_MSIX, EcamScan, MemoryBar, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA,
+        PciScan, bar_is_io, bar_is_mem_64, bar_mem_base, bar_mem_base_64, cap_id_of, cap_next_of,
+        class_of, config_address, device_of, ecam_config_address, status_has_caps, vendor_of,
+        vendor_present,
     };
 
     /// Write a 32-bit `value` to `port`.
@@ -278,6 +344,90 @@ mod hw {
             }
         }
         scan
+    }
+
+    /// Find the first memory BAR on bus 0 (in device/function/BAR-index order)
+    /// and decode it — the MMIO window a driver or passthrough would claim.
+    ///
+    /// Read-only: reads each present function's BARs 0–5 (skipping the second
+    /// dword of a 64-bit BAR), returning the first memory BAR with a non-zero
+    /// base. A 64-bit BAR's high half is read from the following dword. Returns
+    /// `None` if no function on bus 0 exposes a memory BAR (e.g. a bare q35 with
+    /// only bridges). No BAR sizing (that needs a write-probe) — just the base.
+    #[must_use]
+    pub fn first_memory_bar() -> MemoryBar {
+        find_first_memory_bar().unwrap_or(MemoryBar {
+            bus: 0,
+            device: 0,
+            function: 0,
+            index: 0,
+            base: 0,
+            is_64: false,
+        })
+    }
+
+    /// The inner search — `None` when bus 0 has no memory BAR.
+    fn find_first_memory_bar() -> Option<MemoryBar> {
+        const HEADER_TYPE_OFFSET: u8 = 0x0C;
+        const HEADER_MULTIFUNCTION: u32 = 0x0080_0000;
+        /// Only header-type-0 (endpoint) functions have BARs 0–5; a PCI-to-PCI
+        /// bridge (header type 1) has just BARs 0–1, but the layout byte below
+        /// bounds that. We simply read up to 6 dwords and skip 64-bit high halves.
+        const BAR_COUNT: u8 = 6;
+
+        for device in 0u8..32 {
+            let dword0 = config_read(0, device, 0, 0);
+            if !vendor_present(vendor_of(dword0)) {
+                continue;
+            }
+            let multifunction =
+                config_read(0, device, 0, HEADER_TYPE_OFFSET) & HEADER_MULTIFUNCTION != 0;
+            let last_fn = if multifunction { 7 } else { 0 };
+            for function in 0u8..=last_fn {
+                if function != 0 && !vendor_present(vendor_of(config_read(0, device, function, 0)))
+                {
+                    continue;
+                }
+                let mut i = 0u8;
+                while i < BAR_COUNT {
+                    let off = BAR0_OFFSET + i * 4;
+                    let bar = config_read(0, device, function, off);
+                    if bar_is_io(bar) {
+                        i += 1;
+                        continue;
+                    }
+                    if bar_is_mem_64(bar) {
+                        let high = config_read(0, device, function, off + 4);
+                        let base = bar_mem_base_64(bar, high);
+                        if base != 0 {
+                            return Some(MemoryBar {
+                                bus: 0,
+                                device,
+                                function,
+                                index: i,
+                                base,
+                                is_64: true,
+                            });
+                        }
+                        i += 2; // a 64-bit BAR consumes this dword and the next
+                    } else {
+                        let base = bar_mem_base(bar);
+                        if base != 0 {
+                            return Some(MemoryBar {
+                                bus: 0,
+                                device,
+                                function,
+                                index: i,
+                                base: u64::from(base),
+                                is_64: false,
+                            });
+                        }
+                        i += 1;
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Read config dword `offset` of `bus:device.function` through the ECAM
@@ -429,6 +579,23 @@ mod tests {
         assert_eq!(cap_next_of(0x0000_5311), 0x50);
         // A zero next pointer ends the chain.
         assert_eq!(cap_next_of(0x0000_0005), 0);
+    }
+
+    #[test]
+    fn bar_decodes_io_memory_and_width() {
+        // A 32-bit prefetchable memory BAR at 0xFE00_0000 (flags in low bits).
+        let mem32 = 0xFE00_0008; // bit 3 prefetchable, type 00 (32-bit), mem
+        assert!(!bar_is_io(mem32));
+        assert!(!bar_is_mem_64(mem32));
+        assert_eq!(bar_mem_base(mem32), 0xFE00_0000);
+        // A 64-bit memory BAR (type 10b) with a high dword.
+        let mem64_lo = 0xF000_000C; // type 10b (bits 2:1 = 10), mem
+        assert!(bar_is_mem_64(mem64_lo));
+        assert_eq!(bar_mem_base_64(mem64_lo, 0x0000_0001), 0x1_F000_0000);
+        // An I/O BAR (bit 0 set).
+        let io = 0x0000_C001;
+        assert!(bar_is_io(io));
+        assert_eq!(bar_io_base(io), 0xC000);
     }
 
     #[test]
