@@ -5,9 +5,14 @@
 //! - Work-stealing between idle and busy cores
 //! - Priority levels: Critical (vCPU) > High (device I/O) > Normal (compute) > Low (management)
 
-use std::collections::VecDeque;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use crate::sync::Mutex;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+#[cfg(feature = "platform-linux")]
+use std::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
+
+#[cfg(feature = "platform-baremetal")]
+use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
 
 /// Task priority levels, ordered from highest to lowest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -52,8 +57,8 @@ impl SchedulerTask {
     }
 }
 
-impl std::fmt::Debug for SchedulerTask {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for SchedulerTask {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SchedulerTask")
             .field("id", &self.id)
             .field("priority", &self.priority)
@@ -67,7 +72,7 @@ impl std::fmt::Debug for SchedulerTask {
 /// Critical first, then High, Normal, Low.
 pub struct RunQueue {
     /// One deque per priority level.
-    queues: [std::sync::Mutex<VecDeque<SchedulerTask>>; Priority::COUNT],
+    queues: [Mutex<VecDeque<SchedulerTask>>; Priority::COUNT],
     /// Number of tasks across all priority levels.
     len: AtomicUsize,
     /// CPU core ID this queue belongs to.
@@ -80,10 +85,10 @@ impl RunQueue {
     pub const fn new(cpu_id: usize) -> Self {
         Self {
             queues: [
-                std::sync::Mutex::new(VecDeque::new()),
-                std::sync::Mutex::new(VecDeque::new()),
-                std::sync::Mutex::new(VecDeque::new()),
-                std::sync::Mutex::new(VecDeque::new()),
+                Mutex::new(VecDeque::new()),
+                Mutex::new(VecDeque::new()),
+                Mutex::new(VecDeque::new()),
+                Mutex::new(VecDeque::new()),
             ],
             len: AtomicUsize::new(0),
             cpu_id,
@@ -97,7 +102,7 @@ impl RunQueue {
     /// Panics if a queue mutex is poisoned.
     pub fn push(&self, task: SchedulerTask) {
         let idx = task.priority.as_index();
-        self.queues[idx].lock().unwrap().push_back(task);
+        self.queues[idx].lock().push_back(task);
         self.len.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -109,7 +114,7 @@ impl RunQueue {
     pub fn pop(&self) -> Option<SchedulerTask> {
         for queue in &self.queues {
             let task = {
-                let mut q = queue.lock().unwrap();
+                let mut q = queue.lock();
                 q.pop_front()
             };
             if let Some(task) = task {
@@ -131,7 +136,7 @@ impl RunQueue {
     pub fn steal(&self) -> Option<SchedulerTask> {
         for queue in self.queues.iter().rev() {
             let task = {
-                let mut q = queue.lock().unwrap();
+                let mut q = queue.lock();
                 q.pop_back()
             };
             if let Some(task) = task {
@@ -226,7 +231,7 @@ impl Scheduler {
             .collect();
 
         // Sort by load descending — steal from busiest first.
-        candidates.sort_by_key(|a| std::cmp::Reverse(a.1));
+        candidates.sort_by_key(|a| core::cmp::Reverse(a.1));
 
         for (cpu, _) in candidates {
             if let Some(task) = self.run_queues[cpu].steal() {

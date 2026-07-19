@@ -34,14 +34,13 @@ extern crate alloc;
 
 pub mod memory;
 pub mod sync;
+pub mod threading;
 pub mod time;
 
 #[cfg(feature = "platform-linux")]
 pub mod async_rt;
 #[cfg(feature = "platform-linux")]
 pub mod io;
-#[cfg(feature = "platform-linux")]
-pub mod threading;
 
 /// Platform initialization — must be called before any other platform services.
 ///
