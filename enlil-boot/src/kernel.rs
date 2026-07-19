@@ -201,7 +201,11 @@ pub use hw::kernel_entry;
 
 #[cfg(target_os = "uefi")]
 mod hw {
-    use super::{MemorySummary, boot_heap_size, format_u64, format_u64_hex, summarize_memory_map};
+    use super::{
+        DESC_MIN_SIZE, DESC_NUM_PAGES_OFFSET, DESC_PHYS_START_OFFSET, DESC_TYPE_OFFSET,
+        MemorySummary, boot_heap_size, format_u64, format_u64_hex, read_u32_le, read_u64_le,
+        summarize_memory_map,
+    };
     use crate::allocator::install_kernel_heap;
     use crate::handoff::BootHandoff;
     use crate::serial::SerialPort;
@@ -235,6 +239,7 @@ mod hw {
             bring_up_heap(&serial, &summary);
             // The heap is live, so enlil-platform's heap-backed primitives work.
             bring_up_scheduler(&serial);
+            bring_up_memory_plan(&serial, bytes, handoff.memory_descriptor_size, &summary);
         } else {
             serial.write_str("enlil kernel: memory: NO MAP in handoff\n");
         }
@@ -1054,6 +1059,97 @@ mod hw {
             );
         } else {
             serial.write_str("enlil kernel: sched: scheduler self-test FAILED\n");
+        }
+    }
+
+    /// Build enlil-platform's `MemoryMap` from the real firmware map and carve
+    /// the hypervisor's physical regions — roadmap 1.3 "wire the boot payload to
+    /// collect the real UEFI map and feed it".
+    ///
+    /// Rebuilds the typed `UefiMemoryDescriptor` array from the same raw firmware
+    /// bytes the kernel's own alloc-free [`summarize_memory_map`] walked, feeds it
+    /// to [`MemoryMap::from_uefi`], and cross-checks the two independent readers
+    /// agree on total usable RAM. Then runs `plan_hypervisor_regions` to carve a
+    /// low DMA window, the hypervisor heap, and one disjoint per-guest RAM span
+    /// (LOCKED PRINCIPLE 5 — isolation), reporting their bases. Conservative sizes
+    /// so the plan fits QEMU's default RAM as well as real hardware.
+    fn bring_up_memory_plan(
+        serial: &SerialPort,
+        bytes: &[u8],
+        descriptor_size: usize,
+        summary: &MemorySummary,
+    ) {
+        use enlil_platform::memory::map::{MemoryMap, MemoryPlanRequest, UefiMemoryDescriptor};
+
+        const MIB: u64 = 1024 * 1024;
+
+        let mut descriptors: Vec<UefiMemoryDescriptor> = Vec::new();
+        if descriptor_size >= DESC_MIN_SIZE {
+            for desc in bytes.chunks_exact(descriptor_size) {
+                let (Some(kind), Some(phys_start), Some(page_count)) = (
+                    read_u32_le(desc, DESC_TYPE_OFFSET),
+                    read_u64_le(desc, DESC_PHYS_START_OFFSET),
+                    read_u64_le(desc, DESC_NUM_PAGES_OFFSET),
+                ) else {
+                    break;
+                };
+                descriptors.push(UefiMemoryDescriptor {
+                    kind,
+                    phys_start,
+                    page_count,
+                });
+            }
+        }
+
+        let mut map = MemoryMap::from_uefi(&descriptors);
+        let total_usable = map.total_usable();
+        let largest = map.largest_usable().map_or(0, |r| r.size);
+        // Two independent readers of the same firmware map must agree.
+        let agrees = total_usable == summary.usable_bytes;
+
+        let mut dcnt = [0u8; 20];
+        let mut umib = [0u8; 20];
+        let mut lmib = [0u8; 20];
+        serial.write_str("enlil kernel: memplan: enlil-platform MemoryMap from ");
+        serial.write_str(format_u64(
+            u64::try_from(descriptors.len()).unwrap_or(u64::MAX),
+            &mut dcnt,
+        ));
+        serial.write_str(" UEFI descriptors — ");
+        serial.write_str(format_u64(total_usable / MIB, &mut umib));
+        serial.write_str(" MiB usable (largest ");
+        serial.write_str(format_u64(largest / MIB, &mut lmib));
+        serial.write_str(if agrees {
+            " MiB), agrees with kernel summary\n"
+        } else {
+            " MiB), DISAGREES with kernel summary\n"
+        });
+
+        let req = MemoryPlanRequest {
+            heap_size: 8 * MIB,
+            dma_size: 2 * MIB,
+            guest_ram_sizes: alloc::vec![16 * MIB],
+            align: 2 * MIB,
+        };
+        match map.plan_hypervisor_regions(&req) {
+            Some(regions) => {
+                let mut dma_buf = [0u8; 18];
+                let mut heap_buf = [0u8; 18];
+                let mut guest_buf = [0u8; 18];
+                serial.write_str("enlil kernel: memplan: carved DMA@");
+                serial.write_str(format_u64_hex(regions.dma.base.as_u64(), &mut dma_buf));
+                serial.write_str(" heap@");
+                serial.write_str(format_u64_hex(regions.heap.base.as_u64(), &mut heap_buf));
+                serial.write_str(" guest0@");
+                serial.write_str(format_u64_hex(
+                    regions.guest_ram.first().map_or(0, |r| r.base.as_u64()),
+                    &mut guest_buf,
+                ));
+                serial.write_str(" — disjoint per-guest RAM (LOCKED PRINCIPLE 5)\n");
+            }
+            None => {
+                serial.write_str("enlil kernel: memplan: region plan did not fit the usable map\n");
+            }
         }
     }
 
