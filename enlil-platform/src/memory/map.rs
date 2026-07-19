@@ -9,6 +9,9 @@
 
 use super::PhysAddr;
 
+#[cfg(feature = "platform-baremetal")]
+use alloc::vec::Vec;
+
 /// The nature of a physical region, as a firmware map reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryKind {

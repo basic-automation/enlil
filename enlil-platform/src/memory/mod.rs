@@ -12,8 +12,11 @@
 pub mod map;
 pub mod paging;
 
-use std::alloc::{GlobalAlloc, Layout};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use core::alloc::{GlobalAlloc, Layout};
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(feature = "platform-baremetal")]
+use alloc::{vec, vec::Vec};
 
 /// Platform memory allocator statistics.
 #[derive(Debug, Default)]
@@ -265,7 +268,10 @@ impl SlabCache {
     fn grow(&mut self) -> Option<()> {
         let page_size = 4096;
         let layout = Layout::from_size_align(page_size, page_size).ok()?;
+        #[cfg(feature = "platform-linux")]
         let page = unsafe { std::alloc::alloc(layout) };
+        #[cfg(feature = "platform-baremetal")]
+        let page = unsafe { alloc::alloc::alloc(layout) };
         if page.is_null() {
             return None;
         }
@@ -308,11 +314,11 @@ impl SlabCache {
 #[cfg(not(feature = "platform-linux"))]
 mod baremetal_heap {
     use super::{Ordering, STATS};
+    use core::alloc::Layout;
     use core::ptr::NonNull;
     use core::sync::atomic::AtomicBool;
     use linked_list_allocator::Heap;
     use spin::Mutex;
-    use std::alloc::Layout;
 
     static HEAP: Mutex<Heap> = Mutex::new(Heap::empty());
     static INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -396,6 +402,7 @@ pub fn baremetal_heap_ready() -> bool {
 /// region must be otherwise unused and outlive every allocation. Call at most
 /// once, before the first heap allocation.
 #[cfg(not(feature = "platform-linux"))]
+#[must_use]
 pub unsafe fn init_global_heap_from_uefi(
     descriptors: &[map::UefiMemoryDescriptor],
     min_size: u64,
@@ -453,9 +460,9 @@ unsafe impl GlobalAlloc for PlatformAllocator {
 // Physical / Virtual Address Types
 // ---------------------------------------------------------------------------
 
-use std::fmt;
-use std::hash::Hash;
-use std::ops::{Add, Sub};
+use core::fmt;
+use core::hash::Hash;
+use core::ops::{Add, Sub};
 
 /// Page size constant (4KB).
 const PAGE_SIZE: u64 = 4096;

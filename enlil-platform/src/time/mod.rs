@@ -7,7 +7,7 @@
 //! - **Linux:** Delegates to `std::time` (backed by `clock_gettime`).
 //! - **Bare-metal:** TSC-based monotonic clock with HPET/APIC calibration.
 
-use std::time::Duration;
+use core::time::Duration;
 
 /// A monotonic instant in time.
 ///
@@ -69,7 +69,7 @@ impl Instant {
     }
 }
 
-impl std::ops::Add<Duration> for Instant {
+impl core::ops::Add<Duration> for Instant {
     type Output = Self;
 
     fn add(self, dur: Duration) -> Self::Output {
@@ -93,7 +93,7 @@ impl std::ops::Add<Duration> for Instant {
     }
 }
 
-impl std::ops::Sub for Instant {
+impl core::ops::Sub for Instant {
     type Output = Duration;
 
     fn sub(self, other: Self) -> Duration {
@@ -122,13 +122,13 @@ impl PartialEq for Instant {
 impl Eq for Instant {}
 
 impl PartialOrd for Instant {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for Instant {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
         #[cfg(feature = "platform-linux")]
         {
             self.inner.cmp(&other.inner)
@@ -140,7 +140,7 @@ impl Ord for Instant {
         #[cfg(not(any(feature = "platform-linux", feature = "platform-baremetal")))]
         {
             let _ = other;
-            std::cmp::Ordering::Equal
+            core::cmp::Ordering::Equal
         }
     }
 }
@@ -151,16 +151,16 @@ impl Ord for Instant {
 
 /// TSC frequency in Hz. Calibrated at boot time on bare-metal.
 /// On Linux this is unused (we delegate to `clock_gettime`).
-static TSC_FREQ_HZ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TSC_FREQ_HZ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Set the TSC frequency (called during bare-metal boot calibration).
 pub fn set_tsc_frequency(hz: u64) {
-    TSC_FREQ_HZ.store(hz, std::sync::atomic::Ordering::Relaxed);
+    TSC_FREQ_HZ.store(hz, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Get the calibrated TSC frequency.
 pub fn tsc_frequency() -> u64 {
-    TSC_FREQ_HZ.load(std::sync::atomic::Ordering::Relaxed)
+    TSC_FREQ_HZ.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Derive the TSC frequency in Hz from raw CPUID leaf `0x15` / `0x16` values.
@@ -278,8 +278,10 @@ fn tsc_ticks_to_duration(ticks: u64) -> Duration {
     }
     let secs = ticks / freq;
     let remaining = ticks % freq;
-    let nanos = (remaining as u128 * 1_000_000_000u128 / freq as u128) as u64;
-    Duration::new(secs, nanos as u32)
+    // `remaining < freq`, so the quotient is `< 1_000_000_000` and always fits a
+    // `u32`; the `u128` intermediate avoids overflow in `remaining * 1e9`.
+    let nanos = u128::from(remaining) * 1_000_000_000u128 / u128::from(freq);
+    Duration::new(secs, u32::try_from(nanos).unwrap_or(0))
 }
 
 /// Convert Duration to TSC ticks.
@@ -290,7 +292,8 @@ fn duration_to_tsc_ticks(dur: Duration) -> u64 {
         return 0;
     }
     let total_nanos = dur.as_nanos();
-    (total_nanos as u64 * freq) / 1_000_000_000
+    let ticks = total_nanos * u128::from(freq) / 1_000_000_000u128;
+    u64::try_from(ticks).unwrap_or(u64::MAX)
 }
 
 /// Sleep for the given duration.
