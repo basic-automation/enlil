@@ -233,6 +233,8 @@ mod hw {
             highest_usable_end = summary.highest_usable_end;
             report_memory(&serial, &summary);
             bring_up_heap(&serial, &summary);
+            // The heap is live, so enlil-platform's heap-backed primitives work.
+            bring_up_scheduler(&serial);
         } else {
             serial.write_str("enlil kernel: memory: NO MAP in handoff\n");
         }
@@ -986,6 +988,72 @@ mod hw {
             serial.write_str(", alloc test ok\n");
         } else {
             serial.write_str(", alloc test FAILED\n");
+        }
+    }
+
+    /// Run enlil-platform's bare-metal work-stealing scheduler on real hardware
+    /// — the Phase 1.2 payoff.
+    ///
+    /// The boot kernel now LINKS `enlil-platform` (`no_std` under
+    /// `platform-baremetal`) and drives its `BareMetalScheduler` instead of
+    /// re-deriving a scheduler, proving both the crate linkage and roadmap 6.2's
+    /// "per-CPU work-stealing scheduler as the bare-metal threading backend".
+    ///
+    /// Submits four tasks out of priority order — each closure heap-boxed via the
+    /// kernel's own global allocator, so this also exercises `enlil-platform`'s
+    /// `alloc` use across the crate boundary — then drains the queue and checks
+    /// all four ran in `Critical`→`Low` priority order (the run queue re-orders
+    /// them), the scheduling invariant that lets a vCPU task pre-empt housekeeping.
+    fn bring_up_scheduler(serial: &SerialPort) {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        use enlil_platform::threading::{BareMetalScheduler, CpuAffinity, Priority, Task};
+
+        /// Priority discriminant each task records as it runs, in run order.
+        static ORDER: [AtomicUsize; 4] = [
+            AtomicUsize::new(usize::MAX),
+            AtomicUsize::new(usize::MAX),
+            AtomicUsize::new(usize::MAX),
+            AtomicUsize::new(usize::MAX),
+        ];
+        /// Next free slot in `ORDER`.
+        static CURSOR: AtomicUsize = AtomicUsize::new(0);
+
+        let sched = BareMetalScheduler::new(1);
+        // Submitted out of priority order; a correct run queue dispatches them
+        // Critical(0) → High(1) → Normal(2) → Low(3) regardless.
+        let prios = [
+            Priority::Low,
+            Priority::Critical,
+            Priority::Normal,
+            Priority::High,
+        ];
+        for prio in prios {
+            let task = Task::new("boot-sched-probe", prio, CpuAffinity::Any, move || {
+                let slot = CURSOR.fetch_add(1, Ordering::Relaxed);
+                if let Some(cell) = ORDER.get(slot) {
+                    cell.store(prio as usize, Ordering::Relaxed);
+                }
+            });
+            if sched.submit(task).is_err() {
+                serial.write_str("enlil kernel: sched: submit FAILED\n");
+                return;
+            }
+        }
+        let mut ran = 0u32;
+        while sched.run_one(0) {
+            ran += 1;
+        }
+        // A correct priority dispatch records discriminant `i` in slot `i`.
+        let ordered = ORDER
+            .iter()
+            .enumerate()
+            .all(|(i, cell)| cell.load(Ordering::Relaxed) == i);
+        if ran == 4 && ordered {
+            serial.write_str(
+                "enlil kernel: sched: enlil-platform BareMetalScheduler ran 4 tasks in Critical->Low order — Phase 1.2 linkage + bare-metal scheduler live\n",
+            );
+        } else {
+            serial.write_str("enlil kernel: sched: scheduler self-test FAILED\n");
         }
     }
 

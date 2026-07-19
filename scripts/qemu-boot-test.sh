@@ -34,6 +34,11 @@ KERNEL_LINE="enlil kernel: memory:"
 # Printed once the kernel's own heap serves allocations with the firmware
 # gone — proves the switching allocator + first post-ExitBootServices alloc.
 HEAP_LINE="alloc test ok"
+# Printed once the kernel drives enlil-platform's BareMetalScheduler (linked in
+# now that the crate is no_std under platform-baremetal — the Phase 1.2 payoff):
+# four priority-ordered tasks run Critical->Low on real hardware, their closures
+# heap-boxed via the kernel's own allocator across the crate boundary.
+SCHED_LINE="BareMetalScheduler ran 4 tasks"
 # Printed once the kernel loads its own IDT and takes a breakpoint through it
 # — proves interrupt vectoring under enlil's own control.
 IDT_LINE="int3 self-test ok"
@@ -290,6 +295,7 @@ sed 's/^/    /' "$SERIAL_LOG" 2>/dev/null || true
 if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$KERNEL_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$HEAP_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$SCHED_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$IDT_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$SPINLOCK_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GDT_LINE" "$SERIAL_LOG" 2>/dev/null \
@@ -327,7 +333,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$LONGMODE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_TEXT_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery, PCI enumeration, own page tables, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + 64-bit long-mode guest, and GOP draw observed on serial"
+    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery, PCI enumeration, own page tables, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + 64-bit long-mode guest, and GOP draw observed on serial"
     exit 0
 fi
 
