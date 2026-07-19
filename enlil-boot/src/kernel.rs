@@ -253,6 +253,7 @@ mod hw {
         bring_up_deadline_timer(&serial);
         if let Some(hz) = bring_up_time(&serial) {
             bring_up_deadline_ns(&serial, hz);
+            bring_up_platform_time(&serial, hz);
         }
         let ecam = bring_up_acpi(&serial, handoff);
         bring_up_pci(&serial);
@@ -368,6 +369,38 @@ mod hw {
             serial.write_str(" us over a 5 ms busy-sleep — TSC clock live\n");
         } else {
             serial.write_str("enlil kernel: time: monotonic clock self-test FAILED\n");
+        }
+    }
+
+    /// Prove enlil-platform's time backend (`Instant` + calibrated-TSC
+    /// `Duration`) runs on real hardware — the third `no_std` enlil-platform
+    /// module driven from the live boot path, after the scheduler and the
+    /// `MemoryMap` carver.
+    ///
+    /// Feeds the kernel's PIT-calibrated TSC frequency to `enlil_platform::time`,
+    /// then times a fixed busy-sleep with the platform `Instant::now()` /
+    /// `elapsed()` and checks the elapsed `Duration` lands in a wide plausibility
+    /// band (so a mis-scaled clock is caught without flaking on emulator jitter).
+    fn bring_up_platform_time(serial: &SerialPort, hz: u64) {
+        use enlil_platform::time::{Instant, set_tsc_frequency};
+
+        /// Interval to sleep and measure (5 ms).
+        const SLEEP_NS: u64 = 5_000_000;
+        /// Accept ~half to 20x the request — only a grossly wrong clock fails.
+        const MIN_MS: u128 = 2;
+        const MAX_MS: u128 = 100;
+
+        set_tsc_frequency(hz);
+        let start = Instant::now();
+        crate::tsc::busy_sleep_ns(hz, SLEEP_NS);
+        let ms = start.elapsed().as_millis();
+        if (MIN_MS..=MAX_MS).contains(&ms) {
+            let mut buf = [0u8; 20];
+            serial.write_str("enlil kernel: time: enlil-platform Instant measured ");
+            serial.write_str(format_u64(u64::try_from(ms).unwrap_or(u64::MAX), &mut buf));
+            serial.write_str(" ms over a 5 ms sleep — platform time backend live\n");
+        } else {
+            serial.write_str("enlil kernel: time: enlil-platform Instant self-test FAILED\n");
         }
     }
 

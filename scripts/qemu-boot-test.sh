@@ -44,6 +44,10 @@ SCHED_LINE="BareMetalScheduler ran 4 tasks"
 # and carves the hypervisor's DMA/heap/per-guest regions — roadmap 1.3 wiring
 # the boot payload's real UEFI map into the platform region carver.
 MEMPLAN_LINE="enlil-platform MemoryMap from"
+# Printed once the kernel feeds its PIT-calibrated TSC frequency to
+# enlil-platform's time backend and measures a busy-sleep with the platform
+# Instant/Duration — the third no_std enlil-platform module proven on hardware.
+PLATFORM_TIME_LINE="enlil-platform Instant measured"
 # Printed once the kernel loads its own IDT and takes a breakpoint through it
 # — proves interrupt vectoring under enlil's own control.
 IDT_LINE="int3 self-test ok"
@@ -302,6 +306,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$HEAP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$SCHED_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$MEMPLAN_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$PLATFORM_TIME_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$IDT_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$SPINLOCK_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GDT_LINE" "$SERIAL_LOG" 2>/dev/null \
