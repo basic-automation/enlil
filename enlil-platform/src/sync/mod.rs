@@ -320,6 +320,7 @@ impl Condvar {
 
     /// Blocks the current thread until notified (bare-metal: spin-wait, returns immediately).
     #[cfg(feature = "platform-baremetal")]
+    #[must_use]
     pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
         // Phase 1: immediately return the guard.
         // Callers must use wait in a loop checking a predicate.
@@ -346,16 +347,25 @@ impl Condvar {
     }
 
     /// Wakes one waiting thread.
+    #[cfg(feature = "platform-linux")]
     pub fn notify_one(&self) {
-        #[cfg(feature = "platform-linux")]
         self.inner.notify_one();
     }
 
+    /// Wakes one waiting thread (bare-metal: no-op — the spin-wait `Condvar`
+    /// keeps no wait queue, so waiters re-check their predicate on their own).
+    #[cfg(feature = "platform-baremetal")]
+    pub const fn notify_one(&self) {}
+
     /// Wakes all waiting threads.
+    #[cfg(feature = "platform-linux")]
     pub fn notify_all(&self) {
-        #[cfg(feature = "platform-linux")]
         self.inner.notify_all();
     }
+
+    /// Wakes all waiting threads (bare-metal: no-op — see [`Self::notify_one`]).
+    #[cfg(feature = "platform-baremetal")]
+    pub const fn notify_all(&self) {}
 }
 
 impl Default for Condvar {
@@ -368,9 +378,13 @@ impl Default for Condvar {
 // Channel — Bounded MPSC
 // ===========================================================================
 
-use std::collections::VecDeque;
-use std::fmt;
-use std::sync::Arc;
+use core::fmt;
+
+#[cfg(feature = "platform-linux")]
+use std::{collections::VecDeque, sync::Arc};
+
+#[cfg(feature = "platform-baremetal")]
+use alloc::{collections::VecDeque, sync::Arc};
 
 /// Internal shared state for a bounded channel.
 struct ChannelInner<T> {

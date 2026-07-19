@@ -23,8 +23,9 @@
 //! Under the `platform-baremetal` feature the crate is `#![no_std]` + `alloc`
 //! so it cross-compiles for the custom `x86_64-unknown-enlil` target (Phase
 //! 1.2). The modules whose backend is already host-agnostic — [`memory`]
-//! (buddy/slab/heap + the `map`/`paging` builders) and [`time`] — build for
-//! bare metal today; the OS-backed modules ([`io`], [`sync`], [`threading`],
+//! (buddy/slab/heap + the `map`/`paging` builders), [`sync`] (spin-backed
+//! Mutex/RwLock/Condvar + the bounded MPSC channel), and [`time`] — build for
+//! bare metal today; the remaining OS-backed modules ([`io`], [`threading`],
 //! [`async_rt`]) stay gated to `platform-linux` until their bare-metal backends
 //! land (their bare-metal seams live in `enlil-boot` for now).
 
@@ -32,14 +33,13 @@
 extern crate alloc;
 
 pub mod memory;
+pub mod sync;
 pub mod time;
 
 #[cfg(feature = "platform-linux")]
 pub mod async_rt;
 #[cfg(feature = "platform-linux")]
 pub mod io;
-#[cfg(feature = "platform-linux")]
-pub mod sync;
 #[cfg(feature = "platform-linux")]
 pub mod threading;
 
