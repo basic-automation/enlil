@@ -29,3 +29,12 @@ uefi = { version = "0.33", default-features = false, features = [
 # GlobalAlloc uses (memory::init_baremetal_heap); the boot binary carries its
 # own instance until Phase 1.2 lets it link enlil-platform directly.
 linked_list_allocator = "0.10"
+# Phase 1.2 payoff: enlil-platform is now no_std under platform-baremetal, so
+# the boot kernel links its host-agnostic primitives (the work-stealing
+# scheduler, memory map/paging builders, calibrated-TSC time) directly instead
+# of re-deriving them. Gated to the uefi target so the host `cargo build
+# --workspace` (where enlil-core pulls enlil-platform with platform-linux) never
+# unifies the two mutually-exclusive backend features into one build.
+enlil-platform = { path = "../enlil-platform", default-features = false, features = [
+    "platform-baremetal",
+] }

@@ -18,9 +18,14 @@
 
 pub mod scheduler;
 
-use std::collections::VecDeque;
-use std::fmt;
-use std::sync::{Arc, Mutex};
+use crate::sync::Mutex;
+use core::fmt;
+
+#[cfg(feature = "platform-linux")]
+use std::{boxed::Box, collections::VecDeque, string::String, sync::Arc, vec::Vec};
+
+#[cfg(feature = "platform-baremetal")]
+use alloc::{boxed::Box, collections::VecDeque, string::String, sync::Arc, vec::Vec};
 
 // Re-exports
 pub use scheduler::Scheduler;
@@ -235,10 +240,7 @@ impl RunQueue {
     /// Total number of pending tasks across all priority levels.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.queues
-            .iter()
-            .map(std::collections::VecDeque::len)
-            .sum()
+        self.queues.iter().map(VecDeque::len).sum()
     }
 
     /// Returns `true` if there are no pending tasks.
@@ -284,12 +286,16 @@ impl CpuLocal {
     }
 }
 
-// Hosted fallback: ordinary thread-local.
+// Hosted fallback: ordinary thread-local. On bare metal the per-CPU block lives
+// at the GS-segment base (enlil-boot::percpu writes IA32_GS_BASE), so these
+// std::thread_local!-backed accessors are gated to the hosted backend.
+#[cfg(feature = "platform-linux")]
 thread_local! {
     static CPU_LOCAL: std::cell::RefCell<CpuLocal> = const { std::cell::RefCell::new(CpuLocal::new(0)) };
 }
 
 /// Initialise thread-local CPU context for the calling thread.
+#[cfg(feature = "platform-linux")]
 pub fn init_cpu_local(cpu_id: usize) {
     CPU_LOCAL.with(|c| {
         let mut local = c.borrow_mut();
@@ -300,12 +306,14 @@ pub fn init_cpu_local(cpu_id: usize) {
 }
 
 /// Read the current CPU id from thread-local storage.
+#[cfg(feature = "platform-linux")]
 #[must_use]
 pub fn current_cpu_id() -> usize {
     CPU_LOCAL.with(|c| c.borrow().cpu_id)
 }
 
 /// Increment the tick counter and return the new value.
+#[cfg(feature = "platform-linux")]
 #[must_use]
 pub fn tick() -> u64 {
     CPU_LOCAL.with(|c| {
@@ -327,6 +335,7 @@ pub fn tick() -> u64 {
 /// # Panics
 ///
 /// Panics if the OS thread cannot be spawned.
+#[cfg(feature = "platform-linux")]
 #[must_use]
 pub fn spawn_hosted(task: Task) -> std::thread::JoinHandle<()> {
     let name = task.name.clone();
@@ -391,7 +400,7 @@ impl BareMetalScheduler {
                     if cpu >= self.queues.len() {
                         continue;
                     }
-                    let len = self.queues[cpu].lock().unwrap().len();
+                    let len = self.queues[cpu].lock().len();
                     match best {
                         None => best = Some((cpu, len)),
                         Some((_, best_len)) if len < best_len => best = Some((cpu, len)),
@@ -406,7 +415,7 @@ impl BareMetalScheduler {
                 self.queues
                     .iter()
                     .enumerate()
-                    .min_by_key(|(_, q)| q.lock().unwrap().len())
+                    .min_by_key(|(_, q)| q.lock().len())
                     .map(|(i, _)| i)
                     .unwrap()
             }
@@ -418,7 +427,7 @@ impl BareMetalScheduler {
             target,
             task.priority
         );
-        self.queues[target].lock().unwrap().push(task);
+        self.queues[target].lock().push(task);
         Ok(())
     }
 
@@ -434,7 +443,7 @@ impl BareMetalScheduler {
     pub fn run_one(&self, cpu: usize) -> bool {
         // Try local queue first.
         {
-            let mut q = self.queues[cpu].lock().unwrap();
+            let mut q = self.queues[cpu].lock();
             if let Some(mut task) = q.pop() {
                 log::trace!("cpu{}: local run '{}'", cpu, task.name);
                 task.run();
@@ -449,7 +458,7 @@ impl BareMetalScheduler {
             if i == cpu {
                 continue;
             }
-            let len = q.lock().unwrap().len();
+            let len = q.lock().len();
             if len > victim_len {
                 victim = Some(i);
                 victim_len = len;
@@ -457,7 +466,7 @@ impl BareMetalScheduler {
         }
 
         if let Some(v) = victim {
-            let mut vq = self.queues[v].lock().unwrap();
+            let mut vq = self.queues[v].lock();
             if let Some(mut task) = vq.steal() {
                 log::trace!("cpu{}: stole '{}' from cpu{}", cpu, task.name, v);
                 task.run();
@@ -481,7 +490,7 @@ impl BareMetalScheduler {
     /// Panics if a queue mutex is poisoned.
     #[must_use]
     pub fn total_pending(&self) -> usize {
-        self.queues.iter().map(|q| q.lock().unwrap().len()).sum()
+        self.queues.iter().map(|q| q.lock().len()).sum()
     }
 }
 
@@ -687,7 +696,7 @@ mod tests {
 
         // Only cpu 2 should have work.
         for i in 0..4 {
-            let len = sched.queues[i].lock().unwrap().len();
+            let len = sched.queues[i].lock().len();
             if i == 2 {
                 assert_eq!(len, 1);
             } else {
@@ -728,7 +737,7 @@ mod tests {
         sched.submit(task).unwrap();
 
         // cpu 3 should have the task (less loaded than cpu 1).
-        let len3 = sched.queues[3].lock().unwrap().len();
+        let len3 = sched.queues[3].lock().len();
         assert_eq!(len3, 1);
     }
 

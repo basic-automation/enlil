@@ -316,6 +316,7 @@ name = "enlil-boot"
 version = "0.1.0"
 dependencies = [
  "enlil-hal",
+ "enlil-platform",
  "linked_list_allocator",
  "log",
  "uefi",
