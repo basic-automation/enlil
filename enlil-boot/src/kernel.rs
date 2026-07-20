@@ -740,6 +740,37 @@ mod hw {
                 }
             }
             serial.write_str("\n");
+
+            // Which devices that unit governs — what can be put in a per-guest
+            // DMA domain (LOCKED PRINCIPLE 5). A device no unit covers cannot
+            // be isolated, so passthrough must not be offered for it.
+            if summary.device_scope_count > 0 {
+                let mut n = [0u8; 20];
+                serial.write_str("enlil kernel: iommu: unit 0 scoped to ");
+                serial.write_str(format_u64(
+                    u64::try_from(summary.device_scope_count).unwrap_or(u64::MAX),
+                    &mut n,
+                ));
+                serial.write_str(" device(s):");
+                for scope in summary
+                    .device_scopes
+                    .iter()
+                    .take(summary.device_scope_count)
+                {
+                    let mut bus = [0u8; 20];
+                    let mut dev = [0u8; 20];
+                    let mut func = [0u8; 20];
+                    serial.write_str(" ");
+                    serial.write_str(scope.kind.name());
+                    serial.write_str("@");
+                    serial.write_str(format_u64(u64::from(scope.start_bus), &mut bus));
+                    serial.write_str(":");
+                    serial.write_str(format_u64(u64::from(scope.device), &mut dev));
+                    serial.write_str(".");
+                    serial.write_str(format_u64(u64::from(scope.function), &mut func));
+                }
+                serial.write_str("\n");
+            }
         }
         if summary.ecam_base == 0 {
             return None;

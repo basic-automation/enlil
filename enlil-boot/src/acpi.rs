@@ -103,6 +103,117 @@ pub struct RemappingUnit {
     /// Bytes of device-scope entries following the fixed `DRHD` fields, i.e. how
     /// many specific devices the unit is scoped to (0 when `covers_all`).
     pub device_scope_bytes: usize,
+    /// Byte offset of this unit's first device-scope entry within the `DMAR`
+    /// table — where [`dmar_device_scopes`] reads from.
+    pub scope_offset: usize,
+}
+
+/// What kind of device a `DRHD` device-scope entry names (VT-d spec §8.3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScopeKind {
+    /// A PCI endpoint device.
+    PciEndpoint,
+    /// A PCI sub-hierarchy (a bridge and everything below it).
+    PciSubHierarchy,
+    /// An I/O APIC.
+    IoApic,
+    /// An HPET or other MSI-capable timer block.
+    Hpet,
+    /// An ACPI namespace device.
+    AcpiNamespace,
+    /// A type this decoder does not recognise.
+    #[default]
+    Unknown,
+}
+
+impl ScopeKind {
+    /// Decode the device-scope type byte.
+    #[must_use]
+    pub const fn from_type(raw: u8) -> Self {
+        match raw {
+            1 => Self::PciEndpoint,
+            2 => Self::PciSubHierarchy,
+            3 => Self::IoApic,
+            4 => Self::Hpet,
+            5 => Self::AcpiNamespace,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// A short human name for the serial report.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::PciEndpoint => "endpoint",
+            Self::PciSubHierarchy => "bridge",
+            Self::IoApic => "ioapic",
+            Self::Hpet => "hpet",
+            Self::AcpiNamespace => "acpi",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// One device a remapping unit is scoped to (VT-d spec §8.3.1).
+///
+/// Says *which* devices an IOMMU governs — the input to assigning a
+/// passed-through device to a per-guest DMA domain (LOCKED PRINCIPLE 5). A
+/// device not covered by any unit cannot be isolated, so this has to be read
+/// before passthrough can be offered for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DeviceScope {
+    /// What kind of device the entry names.
+    pub kind: ScopeKind,
+    /// The I/O APIC or HPET number, for those kinds (0 otherwise).
+    pub enumeration_id: u8,
+    /// PCI bus the path starts from.
+    pub start_bus: u8,
+    /// Device number of the first path hop.
+    pub device: u8,
+    /// Function number of the first path hop.
+    pub function: u8,
+}
+
+/// Parse the device-scope entries of one remapping unit into `out`, returning
+/// how many were found.
+///
+/// `dmar` is the whole table and `unit` a [`RemappingUnit`] from
+/// [`dmar_remapping_units`]. Each entry is `type(1) len(1) rsvd(2)
+/// enum_id(1) start_bus(1)` followed by 2-byte `(device, function)` path hops;
+/// the first hop is decoded, which for the overwhelmingly common
+/// directly-attached case is the whole path. A malformed (too short) entry ends
+/// the walk rather than looping.
+#[must_use]
+pub fn dmar_device_scopes(dmar: &[u8], unit: &RemappingUnit, out: &mut [DeviceScope]) -> usize {
+    /// type(1) len(1) reserved(2) enumeration id(1) start bus(1).
+    const SCOPE_HEADER_LEN: usize = 6;
+
+    let end = unit
+        .scope_offset
+        .saturating_add(unit.device_scope_bytes)
+        .min(dmar.len());
+    let mut off = unit.scope_offset;
+    let mut found = 0usize;
+
+    while off + SCOPE_HEADER_LEN <= end {
+        let entry_len = usize::from(dmar[off + 1]);
+        if entry_len < SCOPE_HEADER_LEN || off + entry_len > end {
+            break;
+        }
+        if let Some(slot) = out.get_mut(found) {
+            *slot = DeviceScope {
+                kind: ScopeKind::from_type(dmar[off]),
+                enumeration_id: dmar[off + 4],
+                start_bus: dmar[off + 5],
+                // The first path hop, when the entry carries one.
+                device: dmar.get(off + 6).copied().unwrap_or(0),
+                function: dmar.get(off + 7).copied().unwrap_or(0),
+            };
+        }
+        found += 1;
+        off += entry_len;
+    }
+    found
 }
 
 /// The `DRHD` remapping-structure type in a `DMAR` table.
@@ -160,6 +271,7 @@ pub fn dmar_remapping_units(dmar: &[u8], out: &mut [RemappingUnit]) -> usize {
                     segment,
                     covers_all: flags & 1 != 0,
                     device_scope_bytes: struct_len - DRHD_FIXED_LEN,
+                    scope_offset: off + DRHD_FIXED_LEN,
                 };
             }
             found += 1;
@@ -366,7 +478,15 @@ pub struct AcpiSummary {
     pub remapping_units: [RemappingUnit; MAX_REPORTED_REMAPPING_UNITS],
     /// How many remapping units the `DMAR` declared (may exceed the array).
     pub remapping_unit_count: usize,
+    /// The devices the **first** remapping unit is scoped to — which hardware
+    /// that IOMMU governs, and so what can be isolated for passthrough.
+    pub device_scopes: [DeviceScope; MAX_REPORTED_DEVICE_SCOPES],
+    /// How many device scopes the first unit declared (may exceed the array).
+    pub device_scope_count: usize,
 }
+
+/// How many device-scope entries the summary keeps for the first unit.
+pub const MAX_REPORTED_DEVICE_SCOPES: usize = 4;
 
 /// How many DMA-remapping hardware units the summary keeps.
 ///
@@ -380,8 +500,8 @@ pub use hw::discover;
 #[cfg(target_os = "uefi")]
 mod hw {
     use super::{
-        AcpiSummary, DMAR_SIGNATURE, IommuKind, MADT_SIGNATURE, MAX_REPORTED_APIC_IDS,
-        MCFG_SIGNATURE, RemappingUnit, SDT_HEADER_LEN, dmar_remapping_units,
+        AcpiSummary, DMAR_SIGNATURE, DeviceScope, IommuKind, MADT_SIGNATURE, MAX_REPORTED_APIC_IDS,
+        MCFG_SIGNATURE, RemappingUnit, SDT_HEADER_LEN, dmar_device_scopes, dmar_remapping_units,
         iommu_kind_from_signature, madt_enabled_apic_ids, madt_enabled_cpu_count,
         mcfg_first_allocation, rsdp_xsdt_address, sdt_length, sdt_signature, xsdt_entry,
         xsdt_entry_count,
@@ -433,6 +553,8 @@ mod hw {
             iommu: IommuKind::None,
             remapping_units: [RemappingUnit::default(); super::MAX_REPORTED_REMAPPING_UNITS],
             remapping_unit_count: 0,
+            device_scopes: [DeviceScope::default(); super::MAX_REPORTED_DEVICE_SCOPES],
+            device_scope_count: 0,
         };
 
         // Scan the referenced tables for the MADT (enabled CPUs) and the MCFG
@@ -462,9 +584,17 @@ mod hw {
                     summary.ecam_base = base;
                     summary.ecam_end_bus = end;
                 } else if sig == *DMAR_SIGNATURE {
-                    // The register blocks DMA remapping is programmed through.
+                    // The register blocks DMA remapping is programmed through,
+                    // and which devices the first unit governs.
                     summary.remapping_unit_count =
                         dmar_remapping_units(table, &mut summary.remapping_units);
+                    if summary.remapping_unit_count > 0 {
+                        summary.device_scope_count = dmar_device_scopes(
+                            table,
+                            &summary.remapping_units[0],
+                            &mut summary.device_scopes,
+                        );
+                    }
                 }
             }
             i += 1;
@@ -576,6 +706,79 @@ mod tests {
 
         assert_eq!(units[2].segment, 3);
         assert_eq!(units[2].register_base, 0xFED9_2000);
+    }
+
+    /// A device-scope entry with one path hop.
+    fn scope(kind: u8, enum_id: u8, bus: u8, dev: u8, func: u8) -> Vec<u8> {
+        vec![kind, 8, 0, 0, enum_id, bus, dev, func]
+    }
+
+    #[test]
+    fn dmar_decodes_the_devices_a_unit_is_scoped_to() {
+        let scopes: Vec<u8> = [
+            scope(1, 0, 0, 0x1D, 0), // PCI endpoint 00:1d.0
+            scope(3, 2, 0, 0x1F, 7), // I/O APIC number 2
+            scope(4, 0, 1, 0x00, 1), // HPET on bus 1
+        ]
+        .concat();
+        let table = dmar_table(&[{
+            let mut d = drhd(0, 0, 0xFED9_0000, 0);
+            // Extend the DRHD to carry the scopes.
+            let len = u16::try_from(16 + scopes.len()).unwrap();
+            d[2..4].copy_from_slice(&len.to_le_bytes());
+            d.extend_from_slice(&scopes);
+            d
+        }]);
+
+        let mut units = [RemappingUnit::default(); 2];
+        assert_eq!(dmar_remapping_units(&table, &mut units), 1);
+        assert_eq!(units[0].device_scope_bytes, scopes.len());
+
+        let mut found = [DeviceScope::default(); 4];
+        assert_eq!(dmar_device_scopes(&table, &units[0], &mut found), 3);
+
+        assert_eq!(found[0].kind, ScopeKind::PciEndpoint);
+        assert_eq!(
+            (found[0].start_bus, found[0].device, found[0].function),
+            (0, 0x1D, 0)
+        );
+        assert_eq!(found[1].kind, ScopeKind::IoApic);
+        assert_eq!(found[1].enumeration_id, 2);
+        assert_eq!(found[2].kind, ScopeKind::Hpet);
+        assert_eq!(found[2].start_bus, 1);
+    }
+
+    #[test]
+    fn dmar_device_scopes_handles_no_scopes_and_malformed_entries() {
+        // An INCLUDE_PCI_ALL unit has no scopes at all.
+        let table = dmar_table(&[drhd(1, 0, 0xFED9_0000, 0)]);
+        let mut units = [RemappingUnit::default(); 1];
+        assert_eq!(dmar_remapping_units(&table, &mut units), 1);
+        let mut found = [DeviceScope::default(); 4];
+        assert!(units[0].covers_all);
+        assert_eq!(dmar_device_scopes(&table, &units[0], &mut found), 0);
+
+        // A zero-length scope entry ends the walk instead of spinning.
+        let bad: Vec<u8> = vec![1, 0, 0, 0, 0, 0, 0, 0];
+        let table = dmar_table(&[{
+            let mut d = drhd(0, 0, 0x1000, 0);
+            let len = u16::try_from(16 + bad.len()).unwrap();
+            d[2..4].copy_from_slice(&len.to_le_bytes());
+            d.extend_from_slice(&bad);
+            d
+        }]);
+        assert_eq!(dmar_remapping_units(&table, &mut units), 1);
+        assert_eq!(dmar_device_scopes(&table, &units[0], &mut found), 0);
+    }
+
+    #[test]
+    fn scope_kind_decodes_the_vtd_type_codes() {
+        assert_eq!(ScopeKind::from_type(1), ScopeKind::PciEndpoint);
+        assert_eq!(ScopeKind::from_type(2), ScopeKind::PciSubHierarchy);
+        assert_eq!(ScopeKind::from_type(3), ScopeKind::IoApic);
+        assert_eq!(ScopeKind::from_type(4), ScopeKind::Hpet);
+        assert_eq!(ScopeKind::from_type(5), ScopeKind::AcpiNamespace);
+        assert_eq!(ScopeKind::from_type(9), ScopeKind::Unknown);
     }
 
     #[test]

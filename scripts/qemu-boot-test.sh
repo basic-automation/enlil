@@ -108,6 +108,10 @@ IOMMU_LINE="acpi: IOMMU Intel VT-d"
 # hardware unit's register block — the addresses per-guest DMA isolation is
 # programmed through (ROADMAP 6.4). Read from a real firmware DMAR, not a stub.
 DMAR_LINE="DMA-remapping unit(s):"
+# Printed once the kernel decodes that unit's device-scope entries — which
+# hardware the IOMMU governs, and so what can be placed in a per-guest DMA
+# domain. A device no unit covers cannot be isolated for passthrough.
+DMAR_SCOPE_LINE="scoped to"
 # Printed once the kernel enumerates PCI bus 0 via the legacy config mechanism
 # (0xCF8/0xCFC), reading the host bridge identity + present-function count.
 PCI_LINE="functions on bus 0"
@@ -353,6 +357,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ECAM_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$IOMMU_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$DMAR_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$DMAR_SCOPE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PCI_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PCI_CLASS_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ECAM_SCAN_LINE" "$SERIAL_LOG" 2>/dev/null \
@@ -379,7 +384,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$LONGMODE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_TEXT_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery incl. real VT-d DMAR remapping units, SMP AP bring-up (INIT-SIPI-SIPI), PCI enumeration, own page tables + 4 KiB split + kernel-owned guarded stack (bring-up continues on it), SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + 64-bit long-mode guest, and GOP draw observed on serial"
+    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery incl. real VT-d DMAR remapping units + device scopes, SMP AP bring-up (INIT-SIPI-SIPI), PCI enumeration, own page tables + 4 KiB split + kernel-owned guarded stack (bring-up continues on it), SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + 64-bit long-mode guest, and GOP draw observed on serial"
     exit 0
 fi
 
