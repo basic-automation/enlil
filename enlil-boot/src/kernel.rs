@@ -129,6 +129,71 @@ pub fn summarize_memory_map(bytes: &[u8], descriptor_size: usize) -> MemorySumma
     summary
 }
 
+/// The ceiling for an AP trampoline page.
+///
+/// A `SIPI`'s vector byte encodes the AP's real-mode start address as
+/// `vector << 12`, so a woken AP can only begin executing in the low 1 MiB,
+/// page-aligned (SDM Vol. 3 §9.4.4). Wherever the trampoline lands, it must be
+/// below this.
+pub const AP_TRAMPOLINE_LIMIT: u64 = 1024 * 1024;
+
+/// Lowest address an AP trampoline may use.
+///
+/// The real-mode IVT (0–0x400) and the BIOS data area (0x400–0x500) live at the
+/// bottom of memory; page 0 is also where a null-pointer write lands, which
+/// should keep faulting. Start above all of it.
+pub const AP_TRAMPOLINE_MIN: u64 = 0x1000;
+
+/// Find a page below 1 MiB that an AP trampoline can be placed in.
+///
+/// SMP bring-up sends `INIT`-`SIPI`-`SIPI` to each application processor, and
+/// the `SIPI` vector can only point at a page-aligned address in the low 1 MiB —
+/// so before an AP can be started at all, the kernel needs a page *there* that
+/// the firmware says is genuinely free. Hard-coding a traditional address (0x8000
+/// and friends) is a guess; under UEFI the low megabyte's layout is the
+/// firmware's business, and a wrong guess means the AP executes garbage and
+/// triple-faults.
+///
+/// Scans the raw firmware descriptor array for [`EFI_CONVENTIONAL`] memory —
+/// not merely `Usable`-mapped, since loader and boot-services regions still hold
+/// live boot state — and returns the **highest** qualifying page in
+/// `[AP_TRAMPOLINE_MIN, AP_TRAMPOLINE_LIMIT)`, keeping away from the very bottom
+/// of memory where legacy structures cluster. Alloc-free, so it runs before any
+/// `MemoryMap` exists. `None` if the firmware left no conventional page down
+/// there.
+#[must_use]
+pub fn find_ap_trampoline_page(bytes: &[u8], descriptor_size: usize) -> Option<u64> {
+    if descriptor_size < DESC_MIN_SIZE {
+        return None;
+    }
+    let mut best: Option<u64> = None;
+    for desc in bytes.chunks_exact(descriptor_size) {
+        let (Some(efi_type), Some(phys_start), Some(pages)) = (
+            read_u32_le(desc, DESC_TYPE_OFFSET),
+            read_u64_le(desc, DESC_PHYS_START_OFFSET),
+            read_u64_le(desc, DESC_NUM_PAGES_OFFSET),
+        ) else {
+            break;
+        };
+        if pages == 0 || efi_type != EFI_CONVENTIONAL {
+            continue;
+        }
+        let region_end = phys_start.saturating_add(pages.saturating_mul(UEFI_PAGE_SIZE));
+        // Clip the region to the window a SIPI vector can reach.
+        let start = phys_start.max(AP_TRAMPOLINE_MIN);
+        let end = region_end.min(AP_TRAMPOLINE_LIMIT);
+        if start >= end || end - start < UEFI_PAGE_SIZE {
+            continue;
+        }
+        // The highest whole page fully inside the clipped span.
+        let page = (end - UEFI_PAGE_SIZE) & !(UEFI_PAGE_SIZE - 1);
+        if page >= start {
+            best = Some(best.map_or(page, |b| b.max(page)));
+        }
+    }
+    best
+}
+
 /// Cap on the bootstrap kernel heap.
 ///
 /// Enough for the kernel's own structures while leaving the bulk of a large
@@ -212,6 +277,42 @@ pub mod guest_ram {
                 Err(actual) => cur = actual,
             }
         }
+    }
+}
+
+/// The low-memory page reserved for the AP startup trampoline.
+///
+/// Found from the firmware map at boot ([`find_ap_trampoline_page`]) and kept
+/// here because the `SIPI` that starts an application processor encodes its
+/// start address as a vector byte — the page has to be known before any AP can
+/// be woken.
+pub mod ap_trampoline {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// The claimed page's physical address (0 = none claimed).
+    static PAGE: AtomicU64 = AtomicU64::new(0);
+
+    /// Record the page claimed for the trampoline.
+    pub fn publish(page: u64) {
+        PAGE.store(page, Ordering::Release);
+    }
+
+    /// The claimed trampoline page, if one was found.
+    #[must_use]
+    pub fn page() -> Option<u64> {
+        match PAGE.load(Ordering::Acquire) {
+            0 => None,
+            p => Some(p),
+        }
+    }
+
+    /// The `SIPI` vector byte that starts an AP at the claimed page.
+    ///
+    /// A `SIPI`'s vector is the start address shifted right by 12, so this is
+    /// `None` unless a page was claimed and it lies in the reachable low 1 MiB.
+    #[must_use]
+    pub fn sipi_vector() -> Option<u8> {
+        u8::try_from(page()? >> 12).ok()
     }
 }
 
@@ -307,6 +408,7 @@ mod hw {
                 &summary,
                 heap_span,
             );
+            bring_up_ap_trampoline_page(&serial, bytes, handoff.memory_descriptor_size);
         } else {
             serial.write_str("enlil kernel: memory: NO MAP in handoff\n");
         }
@@ -647,6 +749,56 @@ mod hw {
                 None
             }
         }
+    }
+
+    /// Claim the low-memory page an AP trampoline will be placed in, and prove
+    /// it is writable on real hardware (ROADMAP 6.2, SMP).
+    ///
+    /// Bringing up the application processors starts with `INIT`-`SIPI`-`SIPI`,
+    /// and a `SIPI` can only start an AP at a page-aligned address in the low
+    /// 1 MiB — so the first unbuilt piece is a page *there* that the firmware
+    /// agrees is free. This finds one from the real firmware map rather than
+    /// guessing a traditional address (a wrong guess means the AP executes
+    /// garbage and triple-faults, which is the open risk on this item), records
+    /// it for the bring-up step, and writes/reads a sentinel through it so the
+    /// page is known good before an AP is ever pointed at it.
+    ///
+    /// Sending the IPIs and running a real trampoline is the next slice.
+    fn bring_up_ap_trampoline_page(serial: &SerialPort, bytes: &[u8], descriptor_size: usize) {
+        let Some(page) = crate::kernel::find_ap_trampoline_page(bytes, descriptor_size) else {
+            serial.write_str(
+                "enlil kernel: smp: NO conventional page below 1 MiB for an AP trampoline\n",
+            );
+            return;
+        };
+
+        // Prove the page is real, writable memory before an AP runs from it.
+        let ptr: *mut u64 =
+            core::ptr::with_exposed_provenance_mut(usize::try_from(page).unwrap_or(0));
+        const SENTINEL: u64 = 0x5350_1AB0_0757_2A11;
+        // SAFETY: `page` is a whole 4 KiB page the firmware map reports as
+        // conventional (free) memory, identity-mapped like all low memory, and
+        // claimed here for the kernel's exclusive use.
+        let readback = unsafe {
+            ptr.write_volatile(SENTINEL);
+            ptr.read_volatile()
+        };
+        if readback != SENTINEL {
+            serial.write_str("enlil kernel: smp: AP trampoline page NOT WRITABLE\n");
+            return;
+        }
+        // SAFETY: same page, exclusively owned; leave it zeroed for the
+        // trampoline that will be copied in.
+        unsafe { ptr.write_volatile(0) };
+
+        crate::kernel::ap_trampoline::publish(page);
+        let mut p = [0u8; 18];
+        let mut v = [0u8; 20];
+        serial.write_str("enlil kernel: smp: AP trampoline page at ");
+        serial.write_str(format_u64_hex(page, &mut p));
+        serial.write_str(" (SIPI vector ");
+        serial.write_str(format_u64(page >> 12, &mut v));
+        serial.write_str("), writable — reachable by a SIPI\n");
     }
 
     /// Build the kernel's own stack with a guard page (ROADMAP 6.2).
@@ -1559,6 +1711,52 @@ mod tests {
 
     fn map(descriptors: &[Vec<u8>]) -> Vec<u8> {
         descriptors.concat()
+    }
+
+    #[test]
+    fn ap_trampoline_page_comes_from_conventional_low_memory() {
+        let stride = 48;
+        let bytes = map(&[
+            desc(7, 0x1000, 8, stride),      // conventional 0x1000-0x9000
+            desc(7, 0x10_0000, 256, stride), // conventional, but above 1 MiB
+            desc(2, 0x2_0000, 16, stride),   // loader data below 1 MiB: not free
+        ]);
+        // The highest whole page inside the low conventional span.
+        assert_eq!(find_ap_trampoline_page(&bytes, stride), Some(0x8000));
+    }
+
+    #[test]
+    fn ap_trampoline_page_is_clipped_to_the_sipi_reachable_window() {
+        let stride = 48;
+        // A region straddling 1 MiB: only the part below the limit is usable,
+        // and the chosen page must lie entirely within it.
+        let bytes = map(&[desc(7, 0xF_0000, 64, stride)]); // 0xF0000-0x130000
+        let page = find_ap_trampoline_page(&bytes, stride).unwrap();
+        assert_eq!(page, 0xF_F000);
+        assert!(page >= AP_TRAMPOLINE_MIN);
+        assert!(page + 4096 <= AP_TRAMPOLINE_LIMIT, "past a SIPI's reach");
+        assert_eq!(page % 4096, 0, "a SIPI vector is a page number");
+    }
+
+    #[test]
+    fn ap_trampoline_page_avoids_the_ivt_and_bios_data_area() {
+        let stride = 48;
+        // Conventional memory starting at 0: the IVT/BDA at the bottom is
+        // skipped, so nothing below AP_TRAMPOLINE_MIN is ever chosen.
+        let bytes = map(&[desc(7, 0, 1, stride)]); // only page 0
+        assert_eq!(find_ap_trampoline_page(&bytes, stride), None);
+    }
+
+    #[test]
+    fn ap_trampoline_page_absent_when_no_low_conventional_memory() {
+        let stride = 48;
+        let bytes = map(&[
+            desc(7, 0x10_0000, 256, stride), // all conventional memory is high
+            desc(0, 0x1000, 8, stride),      // low memory is reserved
+        ]);
+        assert_eq!(find_ap_trampoline_page(&bytes, stride), None);
+        // A malformed stride is refused rather than misread.
+        assert_eq!(find_ap_trampoline_page(&bytes, 4), None);
     }
 
     #[test]

@@ -89,6 +89,10 @@ ACPI_LINE="acpi: discovered"
 # MADT — the AP inventory SMP bring-up (INIT-SIPI-SIPI) targets. Booted with
 # -smp 2 so this is a real multi-CPU inventory.
 APIC_INVENTORY_LINE="SMP AP inventory"
+# Printed once the kernel finds a conventional page below 1 MiB for the AP
+# startup trampoline (a SIPI can only start an AP page-aligned in low memory) and
+# proves it writable — found from the firmware map, not a hardcoded address.
+AP_TRAMPOLINE_LINE="AP trampoline page at"
 # Printed once the kernel finds the MCFG and reports the PCIe ECAM base + bus
 # range — the window for extended config space + full multi-bus PCI topology.
 ECAM_LINE="PCIe ECAM base"
@@ -331,6 +335,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$NS_DEADLINE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ACPI_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$APIC_INVENTORY_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$AP_TRAMPOLINE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ECAM_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$IOMMU_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PCI_LINE" "$SERIAL_LOG" 2>/dev/null \
