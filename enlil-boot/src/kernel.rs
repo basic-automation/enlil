@@ -714,6 +714,33 @@ mod hw {
         serial.write_str("enlil kernel: acpi: IOMMU ");
         serial.write_str(summary.iommu.name());
         serial.write_str(" (DMAR/IVRS)\n");
+        // Each DMA-remapping hardware unit's register block — where per-guest
+        // DMA isolation is programmed (ROADMAP 6.4, LOCKED PRINCIPLE 5).
+        if summary.remapping_unit_count > 0 {
+            let mut n = [0u8; 20];
+            serial.write_str("enlil kernel: iommu: ");
+            serial.write_str(format_u64(
+                u64::try_from(summary.remapping_unit_count).unwrap_or(u64::MAX),
+                &mut n,
+            ));
+            serial.write_str(" DMA-remapping unit(s):");
+            for unit in summary
+                .remapping_units
+                .iter()
+                .take(summary.remapping_unit_count)
+            {
+                let mut base = [0u8; 18];
+                let mut seg = [0u8; 20];
+                serial.write_str(" regs@");
+                serial.write_str(format_u64_hex(unit.register_base, &mut base));
+                serial.write_str(" seg ");
+                serial.write_str(format_u64(u64::from(unit.segment), &mut seg));
+                if unit.covers_all {
+                    serial.write_str(" (all devices)");
+                }
+            }
+            serial.write_str("\n");
+        }
         if summary.ecam_base == 0 {
             return None;
         }

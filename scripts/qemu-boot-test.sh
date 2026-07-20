@@ -101,9 +101,13 @@ SMP_LINE="APs started via INIT-SIPI-SIPI"
 # range — the window for extended config space + full multi-bus PCI topology.
 ECAM_LINE="PCIe ECAM base"
 # Printed once the kernel classifies the firmware IOMMU (DMAR=VT-d / IVRS=AMD-Vi
-# / none) — Phase 6.4's prerequisite. Plain QEMU has no vIOMMU, so this is
-# "none" here; the DMAR/IVRS decode is proven by host unit tests.
-IOMMU_LINE="acpi: IOMMU"
+# / none) — Phase 6.4's prerequisite. The VM is given an emulated intel-iommu, so
+# this reports real VT-d rather than "none".
+IOMMU_LINE="acpi: IOMMU Intel VT-d"
+# Printed once the kernel parses the DMAR body and reports each DMA-remapping
+# hardware unit's register block — the addresses per-guest DMA isolation is
+# programmed through (ROADMAP 6.4). Read from a real firmware DMAR, not a stub.
+DMAR_LINE="DMA-remapping unit(s):"
 # Printed once the kernel enumerates PCI bus 0 via the legacy config mechanism
 # (0xCF8/0xCFC), reading the host bridge identity + present-function count.
 PCI_LINE="functions on bus 0"
@@ -264,6 +268,11 @@ QEMU_ARGS=(
     # Two CPUs so the MADT carries a real AP inventory (the kernel enumerates
     # the enabled APIC IDs); the AP stays in wait-for-SIPI until SMP bring-up.
     -smp 2
+    # An emulated Intel VT-d IOMMU, so the firmware publishes a real DMAR table
+    # with real DMA-remapping units for the kernel to parse (ROADMAP 6.4). QEMU
+    # emulates VT-d regardless of the host CPU vendor, so this works on this AMD
+    # workstation; enlil's own SVM path is unaffected.
+    -device intel-iommu
     -drive "format=raw,file=fat:rw:$ESP"
     -serial "file:$SERIAL_LOG"
     -display none
@@ -343,6 +352,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$SMP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ECAM_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$IOMMU_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$DMAR_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PCI_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PCI_CLASS_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ECAM_SCAN_LINE" "$SERIAL_LOG" 2>/dev/null \
@@ -369,7 +379,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$LONGMODE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_TEXT_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery, SMP AP bring-up (INIT-SIPI-SIPI), PCI enumeration, own page tables + 4 KiB split + kernel-owned guarded stack (bring-up continues on it), SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + 64-bit long-mode guest, and GOP draw observed on serial"
+    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery incl. real VT-d DMAR remapping units, SMP AP bring-up (INIT-SIPI-SIPI), PCI enumeration, own page tables + 4 KiB split + kernel-owned guarded stack (bring-up continues on it), SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + 64-bit long-mode guest, and GOP draw observed on serial"
     exit 0
 fi
 

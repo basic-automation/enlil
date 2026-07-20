@@ -85,6 +85,96 @@ fn read_u64(bytes: &[u8], off: usize) -> Option<u64> {
     Some(u64::from_le_bytes(raw.try_into().ok()?))
 }
 
+/// One DMA-remapping hardware unit from a `DMAR` table (Intel VT-d spec §8.3).
+///
+/// A `DRHD` structure describes one physical IOMMU: where its register block
+/// lives and which PCI segment and devices it covers. Programming DMA remapping
+/// (ROADMAP 6.4) starts by finding these — every root table, context table and
+/// page-table write goes through this register base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RemappingUnit {
+    /// Physical base of the unit's memory-mapped register block.
+    pub register_base: u64,
+    /// PCI segment (domain) the unit covers.
+    pub segment: u16,
+    /// Whether the unit covers **all** devices in its segment not claimed by
+    /// another unit (`INCLUDE_PCI_ALL`, flags bit 0) — the catch-all unit.
+    pub covers_all: bool,
+    /// Bytes of device-scope entries following the fixed `DRHD` fields, i.e. how
+    /// many specific devices the unit is scoped to (0 when `covers_all`).
+    pub device_scope_bytes: usize,
+}
+
+/// The `DRHD` remapping-structure type in a `DMAR` table.
+pub const DMAR_TYPE_DRHD: u16 = 0;
+
+/// Offset of the first remapping structure in a `DMAR` table.
+///
+/// The `DMAR` header adds a host address width byte and a flags byte (plus 10
+/// reserved) after the standard SDT header (VT-d spec §8.1).
+pub const DMAR_STRUCTURES_OFFSET: usize = SDT_HEADER_LEN + 12;
+
+/// Parse the `DMAR` table's body, collecting each DMA-remapping hardware unit
+/// into `out`, and return how many were found.
+///
+/// Walks the variable-length remapping structures after the `DMAR` header,
+/// selecting the `DRHD` (hardware unit definition) entries and decoding each
+/// one's flags, segment and register base (VT-d spec §8.3). Other structure
+/// types — reserved-memory regions, ATSR, RHSA — are skipped by their length.
+///
+/// The returned count is the true number present even if it exceeds `out`, so a
+/// caller can tell it needs a bigger buffer. A zero-length or over-long
+/// structure ends the walk rather than looping or reading past the table.
+#[must_use]
+pub fn dmar_remapping_units(dmar: &[u8], out: &mut [RemappingUnit]) -> usize {
+    /// Fixed `DRHD` fields: type(2) len(2) flags(1) rsvd(1) segment(2) base(8).
+    const DRHD_FIXED_LEN: usize = 16;
+
+    let Some(length) = sdt_length(dmar) else {
+        return 0;
+    };
+    let end = (length as usize).min(dmar.len());
+    let mut off = DMAR_STRUCTURES_OFFSET;
+    let mut found = 0usize;
+
+    while off + 4 <= end {
+        let (Some(kind), Some(struct_len)) = (read_u16(dmar, off), read_u16(dmar, off + 2)) else {
+            break;
+        };
+        let struct_len = struct_len as usize;
+        // A zero (or under-header) length would spin forever; an over-long one
+        // would read past the table.
+        if struct_len < 4 || off + struct_len > end {
+            break;
+        }
+        if kind == DMAR_TYPE_DRHD && struct_len >= DRHD_FIXED_LEN {
+            let flags = dmar.get(off + 4).copied().unwrap_or(0);
+            let (Some(segment), Some(register_base)) =
+                (read_u16(dmar, off + 6), read_u64(dmar, off + 8))
+            else {
+                break;
+            };
+            if let Some(slot) = out.get_mut(found) {
+                *slot = RemappingUnit {
+                    register_base,
+                    segment,
+                    covers_all: flags & 1 != 0,
+                    device_scope_bytes: struct_len - DRHD_FIXED_LEN,
+                };
+            }
+            found += 1;
+        }
+        off += struct_len;
+    }
+    found
+}
+
+/// Read a little-endian `u16` at `off`, or `None` past the end.
+fn read_u16(bytes: &[u8], off: usize) -> Option<u16> {
+    let raw = bytes.get(off..off.checked_add(2)?)?;
+    Some(u16::from_le_bytes(raw.try_into().ok()?))
+}
+
 /// Validate an ACPI 2.0+ RSDP and return its XSDT physical address.
 ///
 /// Checks the 8-byte signature, the revision (≥ 2, which guarantees an XSDT),
@@ -271,7 +361,18 @@ pub struct AcpiSummary {
     pub ecam_end_bus: u8,
     /// The IOMMU the firmware advertises (`DMAR`/`IVRS`), or `None`.
     pub iommu: IommuKind,
+    /// The first [`MAX_REPORTED_REMAPPING_UNITS`] DMA-remapping hardware units
+    /// from the `DMAR` — the register blocks Phase 6.4 programs.
+    pub remapping_units: [RemappingUnit; MAX_REPORTED_REMAPPING_UNITS],
+    /// How many remapping units the `DMAR` declared (may exceed the array).
+    pub remapping_unit_count: usize,
 }
+
+/// How many DMA-remapping hardware units the summary keeps.
+///
+/// Real platforms have one per PCI segment plus a catch-all; a handful is ample
+/// for the boot report without a heap allocation.
+pub const MAX_REPORTED_REMAPPING_UNITS: usize = 4;
 
 #[cfg(target_os = "uefi")]
 pub use hw::discover;
@@ -279,8 +380,9 @@ pub use hw::discover;
 #[cfg(target_os = "uefi")]
 mod hw {
     use super::{
-        AcpiSummary, IommuKind, MADT_SIGNATURE, MAX_REPORTED_APIC_IDS, MCFG_SIGNATURE,
-        SDT_HEADER_LEN, iommu_kind_from_signature, madt_enabled_apic_ids, madt_enabled_cpu_count,
+        AcpiSummary, DMAR_SIGNATURE, IommuKind, MADT_SIGNATURE, MAX_REPORTED_APIC_IDS,
+        MCFG_SIGNATURE, RemappingUnit, SDT_HEADER_LEN, dmar_remapping_units,
+        iommu_kind_from_signature, madt_enabled_apic_ids, madt_enabled_cpu_count,
         mcfg_first_allocation, rsdp_xsdt_address, sdt_length, sdt_signature, xsdt_entry,
         xsdt_entry_count,
     };
@@ -329,6 +431,8 @@ mod hw {
             ecam_base: 0,
             ecam_end_bus: 0,
             iommu: IommuKind::None,
+            remapping_units: [RemappingUnit::default(); super::MAX_REPORTED_REMAPPING_UNITS],
+            remapping_unit_count: 0,
         };
 
         // Scan the referenced tables for the MADT (enabled CPUs) and the MCFG
@@ -357,6 +461,10 @@ mod hw {
                 {
                     summary.ecam_base = base;
                     summary.ecam_end_bus = end;
+                } else if sig == *DMAR_SIGNATURE {
+                    // The register blocks DMA remapping is programmed through.
+                    summary.remapping_unit_count =
+                        dmar_remapping_units(table, &mut summary.remapping_units);
                 }
             }
             i += 1;
@@ -410,6 +518,98 @@ mod tests {
         let mut old = rsdp;
         old[15] = 0;
         assert_eq!(rsdp_xsdt_address(&old), None);
+    }
+
+    /// Build a DMAR table from raw remapping structures.
+    fn dmar_table(structures: &[Vec<u8>]) -> Vec<u8> {
+        let body: Vec<u8> = structures.concat();
+        let length = u32::try_from(DMAR_STRUCTURES_OFFSET + body.len()).unwrap();
+        let mut table = sdt_header(*DMAR_SIGNATURE, length).to_vec();
+        table.extend_from_slice(&[0u8; 12]); // host addr width + flags + reserved
+        table.extend_from_slice(&body);
+        table
+    }
+
+    /// A DRHD structure with `scope_bytes` of trailing device-scope entries.
+    fn drhd(flags: u8, segment: u16, base: u64, scope_bytes: usize) -> Vec<u8> {
+        let len = u16::try_from(16 + scope_bytes).unwrap();
+        let mut s = Vec::new();
+        s.extend_from_slice(&DMAR_TYPE_DRHD.to_le_bytes());
+        s.extend_from_slice(&len.to_le_bytes());
+        s.push(flags);
+        s.push(0); // reserved
+        s.extend_from_slice(&segment.to_le_bytes());
+        s.extend_from_slice(&base.to_le_bytes());
+        s.extend_from_slice(&vec![0u8; scope_bytes]);
+        s
+    }
+
+    /// A non-DRHD remapping structure (e.g. RMRR), which must be skipped.
+    fn other_structure(kind: u16, len: u16) -> Vec<u8> {
+        let mut s = Vec::new();
+        s.extend_from_slice(&kind.to_le_bytes());
+        s.extend_from_slice(&len.to_le_bytes());
+        s.extend_from_slice(&vec![0u8; usize::from(len) - 4]);
+        s
+    }
+
+    #[test]
+    fn dmar_decodes_remapping_units_and_skips_other_structures() {
+        let table = dmar_table(&[
+            drhd(0, 0, 0xFED9_0000, 8),  // scoped to specific devices
+            other_structure(1, 24),      // RMRR — skipped by length
+            drhd(1, 0, 0xFED9_1000, 0),  // INCLUDE_PCI_ALL catch-all
+            other_structure(2, 12),      // ATSR — skipped
+            drhd(0, 3, 0xFED9_2000, 16), // a different PCI segment
+        ]);
+
+        let mut units = [RemappingUnit::default(); 4];
+        assert_eq!(dmar_remapping_units(&table, &mut units), 3);
+
+        assert_eq!(units[0].register_base, 0xFED9_0000);
+        assert!(!units[0].covers_all);
+        assert_eq!(units[0].device_scope_bytes, 8);
+
+        assert!(units[1].covers_all, "INCLUDE_PCI_ALL not decoded");
+        assert_eq!(units[1].register_base, 0xFED9_1000);
+        assert_eq!(units[1].device_scope_bytes, 0);
+
+        assert_eq!(units[2].segment, 3);
+        assert_eq!(units[2].register_base, 0xFED9_2000);
+    }
+
+    #[test]
+    fn dmar_reports_the_true_count_past_a_short_buffer() {
+        let table = dmar_table(&[
+            drhd(0, 0, 0x1000, 0),
+            drhd(0, 0, 0x2000, 0),
+            drhd(0, 0, 0x3000, 0),
+        ]);
+        let mut one = [RemappingUnit::default(); 1];
+        // The caller learns it needs a bigger buffer, and the first still lands.
+        assert_eq!(dmar_remapping_units(&table, &mut one), 3);
+        assert_eq!(one[0].register_base, 0x1000);
+    }
+
+    #[test]
+    fn dmar_rejects_malformed_structures_without_looping_or_overreading() {
+        // A zero-length structure would spin forever if not caught.
+        let mut zero_len = dmar_table(&[drhd(0, 0, 0x1000, 0)]);
+        zero_len.extend_from_slice(&[0u8, 0, 0, 0]); // type 0, length 0
+        let mut units = [RemappingUnit::default(); 4];
+        assert_eq!(dmar_remapping_units(&zero_len, &mut units), 1);
+
+        // A structure claiming to run past the table end is refused.
+        let mut overlong = dmar_table(&[drhd(0, 0, 0x1000, 0)]);
+        let at = DMAR_STRUCTURES_OFFSET + 16;
+        overlong.extend_from_slice(&[0u8, 0, 0xFF, 0xFF]);
+        assert!(overlong.len() > at);
+        assert_eq!(dmar_remapping_units(&overlong, &mut units), 1);
+
+        // An empty body yields nothing.
+        assert_eq!(dmar_remapping_units(&dmar_table(&[]), &mut units), 0);
+        // A truncated table is not read past its end.
+        assert_eq!(dmar_remapping_units(&[0u8; 8], &mut units), 0);
     }
 
     #[test]
