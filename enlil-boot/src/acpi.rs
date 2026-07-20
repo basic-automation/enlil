@@ -370,9 +370,9 @@ mod tests {
     use super::*;
 
     /// Build a minimal SDT header with `sig` and `length`.
-    fn sdt_header(sig: &[u8; 4], length: u32) -> [u8; SDT_HEADER_LEN] {
+    fn sdt_header(sig: [u8; 4], length: u32) -> [u8; SDT_HEADER_LEN] {
         let mut h = [0u8; SDT_HEADER_LEN];
-        h[..4].copy_from_slice(sig);
+        h[..4].copy_from_slice(&sig);
         h[4..8].copy_from_slice(&length.to_le_bytes());
         h
     }
@@ -415,8 +415,8 @@ mod tests {
     #[test]
     fn xsdt_entry_count_and_entries() {
         // Header + two 8-byte pointers.
-        let length = (SDT_HEADER_LEN + 16) as u32;
-        let mut xsdt = sdt_header(XSDT_SIGNATURE, length).to_vec();
+        let length = u32::try_from(SDT_HEADER_LEN + 16).unwrap();
+        let mut xsdt = sdt_header(*XSDT_SIGNATURE, length).to_vec();
         xsdt.extend_from_slice(&0x1111u64.to_le_bytes());
         xsdt.extend_from_slice(&0x2222u64.to_le_bytes());
         assert_eq!(xsdt_entry_count(length), 2);
@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn madt_counts_only_enabled_apic_and_x2apic() {
-        let mut madt = sdt_header(MADT_SIGNATURE, 0).to_vec();
+        let mut madt = sdt_header(*MADT_SIGNATURE, 0).to_vec();
         madt.extend_from_slice(&[0u8; 8]); // local-APIC addr + flags → offset 44
         // Local APIC, enabled (type 0, len 8, flags bit0 set at struct off 4).
         madt.extend_from_slice(&[MADT_LOCAL_APIC, 8, 0, 0, 0x01, 0, 0, 0]);
@@ -459,7 +459,7 @@ mod tests {
 
     #[test]
     fn madt_collects_enabled_apic_ids_in_order() {
-        let mut madt = sdt_header(MADT_SIGNATURE, 0).to_vec();
+        let mut madt = sdt_header(*MADT_SIGNATURE, 0).to_vec();
         madt.extend_from_slice(&[0u8; 8]); // local-APIC addr + flags → offset 44
         // Local APIC id 5, enabled (type 0, len 8; id @off+3, flags @off+4).
         madt.extend_from_slice(&[MADT_LOCAL_APIC, 8, 0, 5, 0x01, 0, 0, 0]);
@@ -492,7 +492,7 @@ mod tests {
 
     #[test]
     fn madt_apic_id_count_exceeds_a_small_buffer() {
-        let mut madt = sdt_header(MADT_SIGNATURE, 0).to_vec();
+        let mut madt = sdt_header(*MADT_SIGNATURE, 0).to_vec();
         madt.extend_from_slice(&[0u8; 8]);
         for id in 0..4u8 {
             madt.extend_from_slice(&[MADT_LOCAL_APIC, 8, 0, id, 0x01, 0, 0, 0]);
@@ -506,7 +506,7 @@ mod tests {
 
     #[test]
     fn mcfg_reads_the_first_ecam_allocation() {
-        let mut mcfg = sdt_header(MCFG_SIGNATURE, 0).to_vec();
+        let mut mcfg = sdt_header(*MCFG_SIGNATURE, 0).to_vec();
         mcfg.extend_from_slice(&[0u8; 8]); // reserved
         // Allocation: base 0xB000_0000, segment 0, start bus 0, end bus 0xFF.
         mcfg.extend_from_slice(&0xB000_0000u64.to_le_bytes());
@@ -533,13 +533,13 @@ mod tests {
 
     #[test]
     fn mcfg_rejects_a_truncated_table() {
-        let mcfg = sdt_header(MCFG_SIGNATURE, 0).to_vec();
+        let mcfg = sdt_header(*MCFG_SIGNATURE, 0).to_vec();
         assert_eq!(mcfg_first_allocation(&mcfg), None);
     }
 
     #[test]
     fn madt_stops_on_a_zero_length_structure() {
-        let mut madt = sdt_header(MADT_SIGNATURE, 0).to_vec();
+        let mut madt = sdt_header(*MADT_SIGNATURE, 0).to_vec();
         madt.extend_from_slice(&[0u8; 8]);
         // A malformed zero-length structure must not spin.
         madt.extend_from_slice(&[MADT_LOCAL_APIC, 0, 0, 0]);

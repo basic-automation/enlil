@@ -1529,7 +1529,7 @@ mod tests {
             eax: 0x4000_0001,
             ebx: 0x7263_694D, // "Micr..." — a hypervisor signature
             ecx: 0x666F_736F,
-            edx: 0x76482074,
+            edx: 0x7648_2074,
         };
         assert_eq!(sanitize_cpuid(0x4000_0000, raw), CpuidRegs::default());
         assert_eq!(sanitize_cpuid(0x4000_00FF, raw), CpuidRegs::default());

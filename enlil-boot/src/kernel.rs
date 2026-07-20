@@ -209,6 +209,7 @@ mod hw {
     use crate::allocator::install_kernel_heap;
     use crate::handoff::BootHandoff;
     use crate::serial::SerialPort;
+    use alloc::alloc::Layout;
     use alloc::vec::Vec;
 
     /// The enlil kernel entry point.
@@ -480,16 +481,78 @@ mod hw {
         // SAFETY: `span` covers the highest usable RAM and the framebuffer
         // (floored at 4 GiB), so the CR3 reload continues execution seamlessly.
         match unsafe { crate::paging::install_identity_map(span) } {
-            Some(cr3) => {
+            Some(mut map) => {
                 let mut c = [0u8; 18];
                 let mut g = [0u8; 20];
                 serial.write_str("enlil kernel: paging: own identity tables (");
                 serial.write_str(format_u64(crate::paging::map_gib(span), &mut g));
                 serial.write_str(" GiB) installed, CR3=");
-                serial.write_str(format_u64_hex(cr3, &mut c));
+                serial.write_str(format_u64_hex(map.cr3, &mut c));
                 serial.write_str(" — off firmware page tables\n");
+                prove_4kib_split(serial, &mut map);
             }
             None => serial.write_str("enlil kernel: paging: page-table build FAILED\n"),
+        }
+    }
+
+    /// Refine one 2 MiB region of the live host map down to 4 KiB pages and
+    /// prove on real hardware that the split preserved the mapping (ROADMAP 6.2).
+    ///
+    /// The bulk of the host map stays huge-page-granular (few tables, few TLB
+    /// entries); this is the mixed-granularity step that lets a chosen region be
+    /// treated page by page — what a stack guard page needs (leave one page
+    /// absent so an overflow faults instead of silently corrupting its
+    /// neighbour) and what fine-grained MMIO trapping needs.
+    ///
+    /// The region split is a private 2 MiB-aligned heap block, so no page of it
+    /// is reachable from anywhere else and guarding inside it is safe. The proof
+    /// is a write/read-back through the freshly split leaves after the `CR3`
+    /// reload: the data reaches the same physical frame it did as a huge page.
+    fn prove_4kib_split(serial: &SerialPort, map: &mut crate::paging::HostMap) {
+        const TWO_MIB: usize = 2 * 1024 * 1024;
+        // A private, 2 MiB-aligned, 2 MiB-long block: exactly one huge leaf.
+        let Ok(layout) = Layout::from_size_align(TWO_MIB, TWO_MIB) else {
+            return;
+        };
+        // SAFETY: layout has a nonzero size; alloc returns a block or null.
+        let raw = unsafe { alloc::alloc::alloc(layout) };
+        if raw.is_null() {
+            serial.write_str("enlil kernel: paging: 4 KiB split — no 2 MiB block\n");
+            return;
+        }
+        let region = raw as u64;
+        // Write a sentinel through the huge-page mapping first...
+        const SENTINEL: u64 = 0xE117_5717_0BE1_5EAFu64;
+        let probe = raw.wrapping_add(0x3_000).cast::<u64>();
+        // SAFETY: probe is inside the 2 MiB block this call owns and is
+        // 8-byte-aligned (the block is 2 MiB-aligned, the offset a page).
+        unsafe { probe.write_volatile(SENTINEL) };
+
+        // Guard the last page of the private block — an unmapped page a stack
+        // placed here would fault on instead of running off the end.
+        let guard = region + (TWO_MIB as u64) - 4096;
+        // SAFETY: `guard` is the last page of the block allocated just above,
+        // which nothing else references and this kernel never touches.
+        let Some(base) = (unsafe { map.split_to_4kib(region, &[guard]) }) else {
+            serial.write_str("enlil kernel: paging: 4 KiB split FAILED\n");
+            return;
+        };
+        // ...and read it back through the 4 KiB leaves, after the CR3 reload.
+        // SAFETY: same page, still mapped — it is not the guard page.
+        let seen = unsafe { probe.read_volatile() };
+        let mut b = [0u8; 18];
+        let mut gu = [0u8; 18];
+        let mut sp = [0u8; 20];
+        if seen == SENTINEL {
+            serial.write_str("enlil kernel: paging: 2 MiB at ");
+            serial.write_str(format_u64_hex(base, &mut b));
+            serial.write_str(" split to 4 KiB pages, guard page at ");
+            serial.write_str(format_u64_hex(guard, &mut gu));
+            serial.write_str(" unmapped, mapping preserved (");
+            serial.write_str(format_u64(map.spare_pages_left(), &mut sp));
+            serial.write_str(" spare tables left)\n");
+        } else {
+            serial.write_str("enlil kernel: paging: 4 KiB split LOST THE MAPPING\n");
         }
     }
 

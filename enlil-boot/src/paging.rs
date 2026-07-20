@@ -54,14 +54,20 @@ pub const fn map_gib(bytes: u64) -> u64 {
     bytes / (1024 * 1024 * 1024)
 }
 
+/// Spare 4 KiB pages appended to the kernel's page-table buffer, available as
+/// page tables for later 2 MiB → 4 KiB splits ([`HostMap::split_to_4kib`]).
+///
+/// Each split of a 2 MiB region into 4 KiB pages consumes exactly one.
+pub const SPARE_TABLE_PAGES: u64 = 8;
+
 #[cfg(target_os = "uefi")]
-pub use hw::install_identity_map;
+pub use hw::{HostMap, install_identity_map};
 
 #[cfg(target_os = "uefi")]
 mod hw {
-    use super::MAP_MAX_BYTES;
+    use super::{MAP_MAX_BYTES, SPARE_TABLE_PAGES};
     use alloc::alloc::{Layout, alloc_zeroed};
-    use enlil_hal::npt::build_identity_npt_2mib;
+    use enlil_hal::npt::{HUGE_2MIB, build_identity_npt_2mib, split_npt_2mib_leaf};
 
     /// Table pages a 2 MiB-huge-page identity map of `span_bytes` needs:
     /// PML4 + PDPT + one PD per GiB (`ceil(span / 1 GiB)`).
@@ -89,9 +95,12 @@ mod hw {
     /// [`required_map_bytes`](super::required_map_bytes). A short map would fault
     /// on the first unmapped access.
     #[must_use]
-    pub unsafe fn install_identity_map(span_bytes: u64) -> Option<u64> {
+    pub unsafe fn install_identity_map(span_bytes: u64) -> Option<HostMap> {
         let span = span_bytes.min(MAP_MAX_BYTES);
-        let pages = usize::try_from(table_pages(span)).ok()?;
+        // Spare pages ride along so a region can later be refined to 4 KiB
+        // without a second allocation (the tables must stay one contiguous
+        // buffer for the phys_base-relative walk).
+        let pages = usize::try_from(table_pages(span).checked_add(SPARE_TABLE_PAGES)?).ok()?;
         let layout = Layout::from_size_align(pages.checked_mul(4096)?, 4096).ok()?;
         // SAFETY: layout is a nonzero, 4 KiB-aligned size; alloc_zeroed yields a
         // zeroed block or null.
@@ -103,15 +112,89 @@ mod hw {
         // SAFETY: raw owns layout.size() bytes; it is leaked below so the slice
         // never outlives the allocation.
         let buf = unsafe { core::slice::from_raw_parts_mut(raw, layout.size()) };
-        let cr3 = build_identity_npt_2mib(buf, phys_base, span).ok()?.ncr3;
+        let layout_info = build_identity_npt_2mib(buf, phys_base, span).ok()?;
+        let cr3 = layout_info.ncr3;
 
         // SAFETY: cr3 is a freshly built identity map covering `span` bytes of
         // physical memory — the kernel's code/stack/heap/ACPI/framebuffer all
         // lie within it, so execution continues seamlessly after the reload.
+        unsafe { load_cr3(cr3) };
+        Some(HostMap {
+            cr3,
+            buf,
+            next_spare_pa: phys_base + (layout_info.table_count as u64) * 4096,
+            spare_end_pa: phys_base + layout.size() as u64,
+        })
+    }
+
+    /// Load `CR3`, which also flushes every non-global TLB entry.
+    ///
+    /// # Safety
+    ///
+    /// `cr3` must be a page-table root mapping everything the kernel touches
+    /// next, or the very next instruction fetch faults.
+    unsafe fn load_cr3(cr3: u64) {
+        // SAFETY: the caller guarantees cr3 maps the running kernel.
         unsafe {
             core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
         }
-        Some(cr3)
+    }
+
+    /// The kernel's own live host page tables, retained so regions can be
+    /// refined after the initial `CR3` install.
+    ///
+    /// The buffer is leaked (the tables live for the kernel's lifetime), so the
+    /// borrow is `'static` and the kernel runs identity-mapped — a table's
+    /// virtual address is its physical address.
+    pub struct HostMap {
+        /// The installed table root (the live `CR3` value).
+        pub cr3: u64,
+        /// The whole table buffer; `buf[0]` is physical [`Self::cr3`].
+        buf: &'static mut [u8],
+        /// Physical address of the next unused spare page-table page.
+        next_spare_pa: u64,
+        /// One past the last byte of the buffer.
+        spare_end_pa: u64,
+    }
+
+    impl HostMap {
+        /// Spare page-table pages still available for a split.
+        #[must_use]
+        pub const fn spare_pages_left(&self) -> u64 {
+            (self.spare_end_pa - self.next_spare_pa) / 4096
+        }
+
+        /// Refine the 2 MiB region containing `addr` from one huge page to 512
+        /// 4 KiB pages, leaving each address in `guards` **not present** so a
+        /// touch of it faults.
+        ///
+        /// The mapping is otherwise preserved exactly, so the kernel keeps
+        /// running across the change. Consumes one spare page-table page and
+        /// reloads `CR3` to flush the stale huge-page TLB entry.
+        ///
+        /// Returns the 2 MiB-aligned base of the split region, or `None` if no
+        /// spare page remains or the region is not a huge-page leaf.
+        ///
+        /// # Safety
+        ///
+        /// Every address in `guards` must be one the kernel will never touch —
+        /// unmapping a live page faults on the next access. Guarding a page
+        /// inside a region the caller owns exclusively is the safe use.
+        #[must_use]
+        pub unsafe fn split_to_4kib(&mut self, addr: u64, guards: &[u64]) -> Option<u64> {
+            if self.spare_pages_left() == 0 {
+                return None;
+            }
+            let base = addr & !(HUGE_2MIB - 1);
+            let pt_pa = self.next_spare_pa;
+            split_npt_2mib_leaf(self.buf, self.cr3, base, pt_pa, guards).ok()?;
+            self.next_spare_pa += 4096;
+            // The CPU may still hold the 2 MiB translation; a CR3 reload drops it.
+            // SAFETY: the split reproduced every mapping except the guards, which
+            // the caller guarantees are untouched — the kernel stays mapped.
+            unsafe { load_cr3(self.cr3) };
+            Some(base)
+        }
     }
 }
 

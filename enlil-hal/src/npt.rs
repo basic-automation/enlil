@@ -90,6 +90,9 @@ pub enum NptError {
     /// huge-page leaf, not a page-table pointer — the map is huge-page-granular
     /// there and cannot take a 4 KiB leaf without a split ([`map_npt_4kib_leaf`]).
     HugePageOnPath,
+    /// The `PD` entry a split targeted was not a present 2 MiB huge-page leaf —
+    /// there is nothing to split there ([`split_npt_2mib_leaf`]).
+    NotAHugePageLeaf,
 }
 
 /// Build a 2 MiB-huge-page identity map of `[0, bytes_to_map)` for use as an
@@ -439,6 +442,133 @@ pub fn map_npt_4kib_leaf(
     Ok(())
 }
 
+/// Replace one 2 MiB huge-page leaf with a full 512-entry page table mapping the
+/// same 2 MiB at **4 KiB granularity**, optionally leaving chosen pages absent.
+///
+/// This is the mixed-granularity step: a map built by [`build_npt_2mib`] stays
+/// huge-page-granular in bulk (few tables, few TLB entries) while a single 2 MiB
+/// region is refined to 4 KiB so individual pages inside it can be treated
+/// separately — a stack guard page left not-present so an overflow faults
+/// instead of silently corrupting the neighbouring allocation, or an MMIO page
+/// carved out of otherwise-plain RAM for fine-grained trapping.
+///
+/// The 512 new leaves reproduce the huge page's mapping exactly — the same
+/// system-physical frame, at the same offsets, carrying the huge leaf's own
+/// flags (minus `HUGE_PAGE`) so cacheability and writability survive the split.
+/// Every `gpa` in `guard_gpas` is instead left absent. Afterwards the `PD` entry
+/// points at the new table, so [`map_npt_4kib_leaf`] can fill a guard slot back
+/// in later.
+///
+/// `pt_pa` is the physical address of a spare 4 KiB page **inside `buf`** to use
+/// as the new page table (the caller sizes its table buffer with room to spare);
+/// it is zeroed before use. `buf`/`phys_base` are the same buffer and physical
+/// base passed to [`build_npt_2mib`].
+///
+/// The caller must flush the TLB for the split region afterwards (reloading
+/// `CR3`, or `invlpg` per page) — the CPU may still hold the stale huge-page
+/// translation.
+///
+/// # Errors
+///
+/// - [`NptError::UnalignedBase`] if `gpa` is not 2 MiB-aligned, `pt_pa` is not
+///   4 KiB-aligned, or a guard address is not 4 KiB-aligned;
+/// - [`NptError::NotAHugePageLeaf`] if the `PD` entry is absent or is a table
+///   pointer rather than a 2 MiB leaf;
+/// - [`NptError::GuardPageOutOfRange`] if a guard address lies outside the
+///   2 MiB region being split;
+/// - [`NptError::TablesExceedBuffer`] if `pt_pa` does not lie fully within `buf`;
+/// - [`NptError::IntermediateNotPresent`] if a `PML4`/`PDPT` entry on the path is
+///   absent or points outside `buf`.
+pub fn split_npt_2mib_leaf(
+    buf: &mut [u8],
+    phys_base: u64,
+    gpa: u64,
+    pt_pa: u64,
+    guard_gpas: &[u64],
+) -> Result<(), NptError> {
+    if gpa & (HUGE_2MIB - 1) != 0 || pt_pa & (PAGE_SIZE - 1) != 0 {
+        return Err(NptError::UnalignedBase);
+    }
+    // Guard addresses must be 4 KiB-aligned and inside the region being split.
+    for &g in guard_gpas {
+        if g & (PAGE_SIZE - 1) != 0 {
+            return Err(NptError::UnalignedBase);
+        }
+        let index =
+            g.checked_sub(gpa)
+                .map(|d| d / PAGE_SIZE)
+                .ok_or(NptError::GuardPageOutOfRange {
+                    index: 0,
+                    num_pages: TABLE_ENTRIES,
+                })?;
+        if index >= TABLE_ENTRIES {
+            return Err(NptError::GuardPageOutOfRange {
+                index,
+                num_pages: TABLE_ENTRIES,
+            });
+        }
+    }
+
+    // The spare page must lie fully inside the table buffer.
+    let new_table_off = pt_pa
+        .checked_sub(phys_base)
+        .and_then(|d| usize::try_from(d).ok())
+        .ok_or(NptError::TablesExceedBuffer {
+            needed: 0,
+            have: buf.len(),
+        })?;
+    if new_table_off
+        .checked_add(4096)
+        .is_none_or(|end| end > buf.len())
+    {
+        return Err(NptError::TablesExceedBuffer {
+            needed: new_table_off.saturating_add(4096),
+            have: buf.len(),
+        });
+    }
+
+    let pml4_i = ((gpa >> 39) & 0x1FF) as usize;
+    let pdpt_i = ((gpa >> 30) & 0x1FF) as usize;
+    let pd_i = ((gpa >> 21) & 0x1FF) as usize;
+
+    // PML4[pml4_i] → PDPT → PD, following present table pointers.
+    let pdpt_off = child_offset(buf, phys_base, 0, pml4_i)?;
+    let pd_off = child_offset(buf, phys_base, pdpt_off, pdpt_i)?;
+
+    // The entry being split must be a present 2 MiB leaf.
+    let huge = read_entry(buf, pd_off + pd_i * 8)?;
+    if huge & flags::PRESENT == 0 || huge & flags::HUGE_PAGE == 0 {
+        return Err(NptError::NotAHugePageLeaf);
+    }
+    let spa_base = huge & ADDR_MASK;
+    // Inherit the huge leaf's flags so cacheability/writability survive; the
+    // HUGE_PAGE bit means "2 MiB frame" in a PD but "PAT" in a PT, so drop it.
+    let leaf_flags = (huge & !ADDR_MASK) & !flags::HUGE_PAGE;
+
+    // Zero the spare page, then lay 512 4 KiB leaves over the same 2 MiB.
+    for byte in &mut buf[new_table_off..new_table_off + 4096] {
+        *byte = 0;
+    }
+    for j in 0..TABLE_ENTRIES {
+        let page_gpa = gpa + j * PAGE_SIZE;
+        if guard_gpas.contains(&page_gpa) {
+            continue; // left not-present: a touch faults
+        }
+        let phys = spa_base + j * PAGE_SIZE;
+        let index = usize::try_from(j).unwrap_or(usize::MAX);
+        write_entry(
+            buf,
+            new_table_off + index * 8,
+            (phys & ADDR_MASK) | leaf_flags,
+        );
+    }
+
+    // Re-point the PD entry at the new table (a pointer, so no HUGE_PAGE).
+    let table_flags = flags::PRESENT | flags::WRITABLE | flags::USER;
+    write_entry(buf, pd_off + pd_i * 8, (pt_pa & ADDR_MASK) | table_flags);
+    Ok(())
+}
+
 /// Read the present table entry at `table_off + index*8` and return the `buf`
 /// offset of the table it points at (its physical address minus `phys_base`).
 fn child_offset(
@@ -491,6 +621,119 @@ mod tests {
         let mut b = [0u8; 8];
         b.copy_from_slice(&buf[off..off + 8]);
         u64::from_le_bytes(b)
+    }
+
+    #[test]
+    fn split_replaces_a_huge_leaf_with_512_identical_4kib_leaves() {
+        let phys_base = 0x1_0000u64;
+        // 4 MiB map (PML4+PDPT+PD = 3 pages) plus a spare page for the new PT.
+        let mut buf = alloc::vec![0u8; 4 * 4096];
+        build_identity_npt_2mib(&mut buf, phys_base, 4 * 1024 * 1024).unwrap();
+        let pt_pa = phys_base + 3 * 4096;
+
+        // Split the second huge page (GPA 2 MiB), which maps SPA 2 MiB.
+        split_npt_2mib_leaf(&mut buf, phys_base, HUGE_2MIB, pt_pa, &[]).unwrap();
+
+        // PD[1] is now a table pointer at pt_pa, not a huge leaf.
+        let pd_entry = read_entry(&buf, 0x2000, 1);
+        assert_eq!(pd_entry & flags::HUGE_PAGE, 0, "still a huge leaf");
+        assert_eq!(pd_entry & ADDR_MASK, pt_pa & ADDR_MASK);
+
+        // All 512 leaves reproduce the huge page's mapping at 4 KiB granularity.
+        let uwp = flags::PRESENT | flags::WRITABLE | flags::USER;
+        for j in 0..512u64 {
+            let leaf = read_entry(&buf, 3 * 4096, usize::try_from(j).unwrap());
+            assert_eq!(leaf, (HUGE_2MIB + j * PAGE_SIZE) | uwp, "leaf {j}");
+        }
+        // PD[0]'s huge page is untouched — the bulk stays 2 MiB-granular.
+        assert_ne!(read_entry(&buf, 0x2000, 0) & flags::HUGE_PAGE, 0);
+    }
+
+    #[test]
+    fn split_leaves_guard_pages_absent_and_map_npt_4kib_leaf_fills_them() {
+        let phys_base = 0x1_0000u64;
+        let mut buf = alloc::vec![0u8; 4 * 4096];
+        build_identity_npt_2mib(&mut buf, phys_base, 4 * 1024 * 1024).unwrap();
+        let pt_pa = phys_base + 3 * 4096;
+
+        // Guard the first and last page of the split region.
+        let guards = [0u64, 511 * PAGE_SIZE];
+        split_npt_2mib_leaf(&mut buf, phys_base, 0, pt_pa, &guards).unwrap();
+
+        assert_eq!(read_entry(&buf, 3 * 4096, 0) & flags::PRESENT, 0);
+        assert_eq!(read_entry(&buf, 3 * 4096, 511) & flags::PRESENT, 0);
+        // A page between the guards is mapped.
+        assert_ne!(read_entry(&buf, 3 * 4096, 1) & flags::PRESENT, 0);
+
+        // The split makes the region 4 KiB-granular, so a guard slot can be
+        // filled back in on demand (it used to hit HugePageOnPath).
+        map_npt_4kib_leaf(&mut buf, phys_base, 0, 0x5000).unwrap();
+        assert_eq!(
+            read_entry(&buf, 3 * 4096, 0),
+            0x5000 | flags::PRESENT | flags::WRITABLE | flags::USER
+        );
+    }
+
+    #[test]
+    fn split_inherits_the_huge_leafs_flags_without_the_huge_bit() {
+        // Hand-build a PD whose leaf carries an extra flag (NO_CACHE, bit 4) to
+        // prove cacheability survives the split.
+        const NO_CACHE: u64 = 1 << 4;
+        let phys_base = 0u64;
+        let mut buf = alloc::vec![0u8; 4 * 4096];
+        build_identity_npt_2mib(&mut buf, phys_base, 2 * 1024 * 1024).unwrap();
+        let huge = read_entry(&buf, 0x2000, 0) | NO_CACHE;
+        buf[0x2000..0x2008].copy_from_slice(&huge.to_le_bytes());
+
+        split_npt_2mib_leaf(&mut buf, phys_base, 0, 3 * 4096, &[]).unwrap();
+
+        let leaf = read_entry(&buf, 3 * 4096, 7);
+        assert_ne!(leaf & NO_CACHE, 0, "NO_CACHE lost in the split");
+        assert_eq!(leaf & flags::HUGE_PAGE, 0, "HUGE_PAGE means PAT in a PT");
+        assert_eq!(leaf & ADDR_MASK, 7 * PAGE_SIZE);
+    }
+
+    #[test]
+    fn split_rejects_bad_input() {
+        let phys_base = 0u64;
+        let mut buf = alloc::vec![0u8; 4 * 4096];
+        build_identity_npt_2mib(&mut buf, phys_base, 4 * 1024 * 1024).unwrap();
+        let pt_pa = 3 * 4096;
+
+        // Not 2 MiB-aligned.
+        assert_eq!(
+            split_npt_2mib_leaf(&mut buf, phys_base, 0x1000, pt_pa, &[]),
+            Err(NptError::UnalignedBase)
+        );
+        // Spare page not 4 KiB-aligned.
+        assert_eq!(
+            split_npt_2mib_leaf(&mut buf, phys_base, 0, pt_pa + 8, &[]),
+            Err(NptError::UnalignedBase)
+        );
+        // Guard outside the 2 MiB region.
+        assert_eq!(
+            split_npt_2mib_leaf(&mut buf, phys_base, 0, pt_pa, &[HUGE_2MIB]),
+            Err(NptError::GuardPageOutOfRange {
+                index: 512,
+                num_pages: 512,
+            })
+        );
+        // Spare page past the end of the buffer.
+        assert!(matches!(
+            split_npt_2mib_leaf(&mut buf, phys_base, 0, 8 * 4096, &[]),
+            Err(NptError::TablesExceedBuffer { .. })
+        ));
+        // Nothing to split: GPA 4 MiB is beyond the built map, so PD[2] is absent.
+        assert_eq!(
+            split_npt_2mib_leaf(&mut buf, phys_base, 4 * HUGE_2MIB, pt_pa, &[]),
+            Err(NptError::NotAHugePageLeaf)
+        );
+        // Splitting the same leaf twice: the second sees a table pointer.
+        split_npt_2mib_leaf(&mut buf, phys_base, 0, pt_pa, &[]).unwrap();
+        assert_eq!(
+            split_npt_2mib_leaf(&mut buf, phys_base, 0, pt_pa, &[]),
+            Err(NptError::NotAHugePageLeaf)
+        );
     }
 
     #[test]
