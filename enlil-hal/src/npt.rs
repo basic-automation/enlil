@@ -569,6 +569,49 @@ pub fn split_npt_2mib_leaf(
     Ok(())
 }
 
+/// Walk the tables and resolve `gpa` to the physical address it maps to, or
+/// `None` if any level on the path is not present.
+///
+/// The read-only counterpart to the builders: it answers "is this address
+/// actually mapped, and to what?" by following exactly the path the hardware
+/// walker would, handling both a 2 MiB huge-page leaf in the `PD` and a 4 KiB
+/// leaf in a `PT` (so it works before and after
+/// [`split_npt_2mib_leaf`]), and carrying the offset within the page through.
+///
+/// This is how a guard page is *proven* rather than assumed: a guarded address
+/// resolves to `None` while its neighbours resolve normally. It reads the same
+/// in-memory tables the CPU walks, so it also serves as a self-check that a
+/// builder wrote what it intended.
+///
+/// `buf`/`phys_base` are the table buffer and physical base the map was built
+/// with.
+#[must_use]
+pub fn translate_npt(buf: &[u8], phys_base: u64, gpa: u64) -> Option<u64> {
+    let pml4_i = ((gpa >> 39) & 0x1FF) as usize;
+    let pdpt_i = ((gpa >> 30) & 0x1FF) as usize;
+    let pd_i = ((gpa >> 21) & 0x1FF) as usize;
+    let leaf_i = ((gpa >> 12) & 0x1FF) as usize;
+
+    let pdpt_off = child_offset(buf, phys_base, 0, pml4_i).ok()?;
+    let pd_off = child_offset(buf, phys_base, pdpt_off, pdpt_i).ok()?;
+
+    // The PD entry is either a 2 MiB leaf or a pointer to a PT of 4 KiB leaves.
+    let pd_entry = read_entry(buf, pd_off + pd_i * 8).ok()?;
+    if pd_entry & flags::PRESENT == 0 {
+        return None;
+    }
+    if pd_entry & flags::HUGE_PAGE != 0 {
+        return Some((pd_entry & ADDR_MASK) | (gpa & (HUGE_2MIB - 1)));
+    }
+
+    let leaf_table_off = child_offset(buf, phys_base, pd_off, pd_i).ok()?;
+    let leaf = read_entry(buf, leaf_table_off + leaf_i * 8).ok()?;
+    if leaf & flags::PRESENT == 0 {
+        return None;
+    }
+    Some((leaf & ADDR_MASK) | (gpa & (PAGE_SIZE - 1)))
+}
+
 /// Read the present table entry at `table_off + index*8` and return the `buf`
 /// offset of the table it points at (its physical address minus `phys_base`).
 fn child_offset(
@@ -621,6 +664,32 @@ mod tests {
         let mut b = [0u8; 8];
         b.copy_from_slice(&buf[off..off + 8]);
         u64::from_le_bytes(b)
+    }
+
+    #[test]
+    fn translate_resolves_huge_leaves_4kib_leaves_and_guard_pages() {
+        let phys_base = 0x1_0000u64;
+        let mut buf = alloc::vec![0u8; 4 * 4096];
+        build_identity_npt_2mib(&mut buf, phys_base, 4 * 1024 * 1024).unwrap();
+
+        // Through a 2 MiB huge leaf, offset within the page carried through.
+        assert_eq!(translate_npt(&buf, phys_base, 0x1234), Some(0x1234));
+        assert_eq!(
+            translate_npt(&buf, phys_base, HUGE_2MIB + 0x99),
+            Some(HUGE_2MIB + 0x99)
+        );
+        // Past the built map: nothing there.
+        assert_eq!(translate_npt(&buf, phys_base, 8 * HUGE_2MIB), None);
+
+        // After a split the same addresses resolve identically, except the guard.
+        let guard = 0x7000u64;
+        split_npt_2mib_leaf(&mut buf, phys_base, 0, phys_base + 3 * 4096, &[guard]).unwrap();
+        assert_eq!(translate_npt(&buf, phys_base, 0x1234), Some(0x1234));
+        assert_eq!(translate_npt(&buf, phys_base, guard), None, "guard mapped");
+        assert_eq!(translate_npt(&buf, phys_base, guard + 0x40), None);
+        // Its neighbours on both sides are still mapped.
+        assert_eq!(translate_npt(&buf, phys_base, guard - 0x1000), Some(0x6000));
+        assert_eq!(translate_npt(&buf, phys_base, guard + 0x1000), Some(0x8000));
     }
 
     #[test]

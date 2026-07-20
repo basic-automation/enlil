@@ -556,8 +556,75 @@ mod hw {
                 serial.write_str(format_u64_hex(map.cr3, &mut c));
                 serial.write_str(" — off firmware page tables\n");
                 prove_4kib_split(serial, &mut map);
+                bring_up_guarded_stack(serial, &mut map);
             }
             None => serial.write_str("enlil kernel: paging: page-table build FAILED\n"),
+        }
+    }
+
+    /// Where the code run on the guarded stack records the `RSP` it saw.
+    static GUARDED_RSP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+    /// Runs on the kernel-owned stack and records where `RSP` landed.
+    ///
+    /// A plain `extern "C"` function with no arguments: the caller's locals live
+    /// on the old stack, so the result comes back through a static.
+    extern "C" fn record_rsp_on_guarded_stack() {
+        // Touch a real frame's worth of stack so this is not an empty call.
+        let scratch = [0u8; 512];
+        core::hint::black_box(&scratch);
+        GUARDED_RSP.store(
+            crate::stack::current_rsp(),
+            core::sync::atomic::Ordering::Release,
+        );
+    }
+
+    /// Give the kernel its own stack with a guard page and run on it (ROADMAP 6.2).
+    ///
+    /// Until now the kernel has been running on the firmware's stack: it lives in
+    /// boot-services memory the kernel means to reclaim, and it has no guard, so
+    /// an overflow corrupts whatever is below it silently. This allocates a stack
+    /// the kernel owns, unmaps the page below it via the 4 KiB split, and runs a
+    /// function on it — reporting the `RSP` that function actually saw and that
+    /// the guard page is genuinely unmapped (translated through the live tables,
+    /// not touched: touching it is what must fault).
+    ///
+    /// Switching `kernel_entry` itself onto this stack permanently is the next
+    /// step; this proves the stack, the guard, and the switch work first.
+    fn bring_up_guarded_stack(serial: &SerialPort, map: &mut crate::paging::HostMap) {
+        use core::sync::atomic::Ordering;
+
+        let Some(stack) = crate::stack::allocate_guarded_stack(map) else {
+            serial.write_str("enlil kernel: stack: guarded stack setup FAILED\n");
+            return;
+        };
+
+        // SAFETY: `stack` came from allocate_guarded_stack — a live, mapped,
+        // exclusively-owned region with a 16-byte-aligned top — and the callee
+        // does not switch stacks or recurse.
+        unsafe { crate::stack::run_on_guarded_stack(stack, record_rsp_on_guarded_stack) };
+
+        let seen = GUARDED_RSP.load(Ordering::Acquire);
+        let on_stack = crate::stack::rsp_in_stack(seen, stack.base);
+        let guard_absent = map
+            .translate(crate::stack::guard_page(stack.base))
+            .is_none();
+
+        let mut b = [0u8; 18];
+        let mut r = [0u8; 18];
+        let mut k = [0u8; 20];
+        if on_stack && guard_absent {
+            serial.write_str("enlil kernel: stack: ran on kernel-owned stack at ");
+            serial.write_str(format_u64_hex(stack.base, &mut b));
+            serial.write_str(" (RSP ");
+            serial.write_str(format_u64_hex(seen, &mut r));
+            serial.write_str(", ");
+            serial.write_str(format_u64(crate::stack::usable_bytes() / 1024, &mut k));
+            serial.write_str(" KiB usable), guard page unmapped — overflow faults\n");
+        } else if on_stack {
+            serial.write_str("enlil kernel: stack: ran on own stack but GUARD PAGE IS MAPPED\n");
+        } else {
+            serial.write_str("enlil kernel: stack: RSP DID NOT LAND on the kernel stack\n");
         }
     }
 

@@ -67,7 +67,7 @@ pub use hw::{HostMap, install_identity_map};
 mod hw {
     use super::{MAP_MAX_BYTES, SPARE_TABLE_PAGES};
     use alloc::alloc::{Layout, alloc_zeroed};
-    use enlil_hal::npt::{HUGE_2MIB, build_identity_npt_2mib, split_npt_2mib_leaf};
+    use enlil_hal::npt::{HUGE_2MIB, build_identity_npt_2mib, split_npt_2mib_leaf, translate_npt};
 
     /// Table pages a 2 MiB-huge-page identity map of `span_bytes` needs:
     /// PML4 + PDPT + one PD per GiB (`ceil(span / 1 GiB)`).
@@ -194,6 +194,16 @@ mod hw {
             // the caller guarantees are untouched — the kernel stays mapped.
             unsafe { load_cr3(self.cr3) };
             Some(base)
+        }
+
+        /// Resolve `addr` through the live tables, or `None` if it is unmapped.
+        ///
+        /// Reads the same tables the CPU walks, so it answers whether an address
+        /// would fault — the way a guard page is proven absent without touching
+        /// it (touching it is exactly what must fault).
+        #[must_use]
+        pub fn translate(&self, addr: u64) -> Option<u64> {
+            translate_npt(self.buf, self.cr3, addr)
         }
     }
 }

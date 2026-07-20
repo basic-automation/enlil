@@ -34,6 +34,7 @@ pub mod pci;
 pub mod percpu;
 pub mod serial;
 pub mod spinlock;
+pub mod stack;
 pub mod svm;
 pub mod tsc;
 
