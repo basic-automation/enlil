@@ -324,15 +324,95 @@ mod hw {
         }
         let ecam = bring_up_acpi(&serial, handoff);
         bring_up_pci(&serial);
-        bring_up_paging(&serial, handoff, highest_usable_end);
-        // ECAM reads need the identity map installed above (its window is < 4 GiB).
-        if let Some((ecam_base, end_bus)) = ecam {
-            bring_up_ecam(&serial, ecam_base, end_bus);
+        let map = bring_up_paging(&serial, handoff, highest_usable_end);
+
+        // Everything from here runs on a stack the kernel owns, with a guard
+        // page below it — off the firmware's unguarded boot-services stack. The
+        // continuation takes its inputs from statics because nothing on this
+        // stack survives the switch.
+        publish_continuation(handoff, ecam);
+        if let Some(mut map) = map
+            && let Some(stack) = bring_up_guarded_stack(&serial, &mut map)
+        {
+            // SAFETY: `stack` came from allocate_guarded_stack — a live, mapped,
+            // exclusively-owned region with a 16-byte-aligned top — and nothing
+            // on the current stack is needed again: the continuation diverges,
+            // and its inputs were published to statics above. `handoff` points
+            // into firmware memory, not this stack.
+            unsafe { crate::stack::switch_to_guarded_stack(stack, kernel_main_on_own_stack) };
+        }
+
+        // No guarded stack (no map, no spare table page, or the guard would not
+        // take) — carry on where we are rather than not booting at all.
+        serial.write_str("enlil kernel: stack: continuing on the firmware stack\n");
+        kernel_main_on_own_stack()
+    }
+
+    /// Where [`kernel_entry`] leaves the continuation's inputs, since the switch
+    /// to the kernel stack abandons everything on the old one.
+    static HANDOFF_PTR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    /// The ECAM base discovered from the MCFG, plus 1 (0 = none discovered).
+    static ECAM_BASE_PLUS1: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    /// The last bus in the ECAM window.
+    static ECAM_END_BUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+    /// Publish the continuation's inputs before the stack switch.
+    fn publish_continuation(handoff: &BootHandoff, ecam: Option<(u64, u8)>) {
+        use core::sync::atomic::Ordering;
+        HANDOFF_PTR.store(core::ptr::from_ref(handoff) as u64, Ordering::Release);
+        if let Some((base, end_bus)) = ecam {
+            ECAM_BASE_PLUS1.store(base.saturating_add(1), Ordering::Release);
+            ECAM_END_BUS.store(u64::from(end_bus), Ordering::Release);
+        }
+    }
+
+    /// The rest of the kernel's bring-up, running on the kernel-owned stack.
+    ///
+    /// Reached by [`switch_to_guarded_stack`](crate::stack::switch_to_guarded_stack)
+    /// (or called directly if no guarded stack could be built). Reports the `RSP`
+    /// it is actually running on, then finishes bring-up and parks.
+    extern "C" fn kernel_main_on_own_stack() -> ! {
+        use core::sync::atomic::Ordering;
+
+        let serial = SerialPort::com1();
+        report_running_stack(&serial);
+
+        let handoff_ptr = HANDOFF_PTR.load(Ordering::Acquire);
+        let handoff = (handoff_ptr != 0).then(|| {
+            // SAFETY: kernel_entry published a pointer to the BootHandoff it was
+            // called with, which lives in firmware memory (not on either stack)
+            // and outlives the kernel.
+            unsafe {
+                &*(core::ptr::with_exposed_provenance::<BootHandoff>(
+                    usize::try_from(handoff_ptr).unwrap_or(0),
+                ))
+            }
+        });
+
+        // ECAM reads need the identity map installed earlier (window < 4 GiB).
+        let ecam_base = ECAM_BASE_PLUS1.load(Ordering::Acquire);
+        if ecam_base != 0 {
+            let end_bus = u8::try_from(ECAM_END_BUS.load(Ordering::Acquire)).unwrap_or(u8::MAX);
+            bring_up_ecam(&serial, ecam_base - 1, end_bus);
         }
         bring_up_virtualization(&serial);
-        bring_up_framebuffer(&serial, handoff);
+        if let Some(handoff) = handoff {
+            bring_up_framebuffer(&serial, handoff);
+        }
 
         park()
+    }
+
+    /// Report which stack the kernel is actually running on now.
+    ///
+    /// Read after the switch, from the running `RSP` itself — so it reflects
+    /// reality rather than what was intended.
+    fn report_running_stack(serial: &SerialPort) {
+        let rsp = crate::stack::current_rsp();
+        let mut r = [0u8; 18];
+        serial.write_str("enlil kernel: stack: kernel bring-up continues at RSP ");
+        serial.write_str(format_u64_hex(rsp, &mut r));
+        serial.write_str("\n");
     }
 
     /// Calibrate the TSC against the PIT and report its frequency — the
@@ -539,7 +619,11 @@ mod hw {
     /// The span is derived from the real memory map (highest usable RAM) and the
     /// framebuffer, floored at 4 GiB — so it stays correct on hosts with RAM or
     /// MMIO above 4 GiB, not just this QEMU layout.
-    fn bring_up_paging(serial: &SerialPort, handoff: &BootHandoff, highest_usable_end: u64) {
+    fn bring_up_paging(
+        serial: &SerialPort,
+        handoff: &BootHandoff,
+        highest_usable_end: u64,
+    ) -> Option<crate::paging::HostMap> {
         let (fb_base, fb_size) = handoff
             .framebuffer
             .map_or((0, 0), |fb| (fb.base, fb.size_bytes()));
@@ -556,76 +640,46 @@ mod hw {
                 serial.write_str(format_u64_hex(map.cr3, &mut c));
                 serial.write_str(" — off firmware page tables\n");
                 prove_4kib_split(serial, &mut map);
-                bring_up_guarded_stack(serial, &mut map);
+                Some(map)
             }
-            None => serial.write_str("enlil kernel: paging: page-table build FAILED\n"),
+            None => {
+                serial.write_str("enlil kernel: paging: page-table build FAILED\n");
+                None
+            }
         }
     }
 
-    /// Where the code run on the guarded stack records the `RSP` it saw.
-    static GUARDED_RSP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-    /// Runs on the kernel-owned stack and records where `RSP` landed.
+    /// Build the kernel's own stack with a guard page (ROADMAP 6.2).
     ///
-    /// A plain `extern "C"` function with no arguments: the caller's locals live
-    /// on the old stack, so the result comes back through a static.
-    extern "C" fn record_rsp_on_guarded_stack() {
-        // Touch a real frame's worth of stack so this is not an empty call.
-        let scratch = [0u8; 512];
-        core::hint::black_box(&scratch);
-        GUARDED_RSP.store(
-            crate::stack::current_rsp(),
-            core::sync::atomic::Ordering::Release,
-        );
-    }
-
-    /// Give the kernel its own stack with a guard page and run on it (ROADMAP 6.2).
-    ///
-    /// Until now the kernel has been running on the firmware's stack: it lives in
+    /// Until now the kernel has run on the firmware's stack: it lives in
     /// boot-services memory the kernel means to reclaim, and it has no guard, so
     /// an overflow corrupts whatever is below it silently. This allocates a stack
-    /// the kernel owns, unmaps the page below it via the 4 KiB split, and runs a
-    /// function on it — reporting the `RSP` that function actually saw and that
-    /// the guard page is genuinely unmapped (translated through the live tables,
-    /// not touched: touching it is what must fault).
+    /// the kernel owns and unmaps the page below it via the 4 KiB split.
     ///
-    /// Switching `kernel_entry` itself onto this stack permanently is the next
-    /// step; this proves the stack, the guard, and the switch work first.
-    fn bring_up_guarded_stack(serial: &SerialPort, map: &mut crate::paging::HostMap) {
-        use core::sync::atomic::Ordering;
-
+    /// Returns the stack for the caller to switch onto, or `None` (reported on
+    /// serial) if it could not be built — including when the guard page did not
+    /// actually come out unmapped, which is checked by translating it through the
+    /// live tables rather than touching it (touching it is what must fault).
+    fn bring_up_guarded_stack(
+        serial: &SerialPort,
+        map: &mut crate::paging::HostMap,
+    ) -> Option<crate::stack::GuardedStack> {
         let Some(stack) = crate::stack::allocate_guarded_stack(map) else {
             serial.write_str("enlil kernel: stack: guarded stack setup FAILED\n");
-            return;
+            return None;
         };
 
-        // SAFETY: `stack` came from allocate_guarded_stack — a live, mapped,
-        // exclusively-owned region with a 16-byte-aligned top — and the callee
-        // does not switch stacks or recurse.
-        unsafe { crate::stack::run_on_guarded_stack(stack, record_rsp_on_guarded_stack) };
-
-        let seen = GUARDED_RSP.load(Ordering::Acquire);
-        let on_stack = crate::stack::rsp_in_stack(seen, stack.base);
-        let guard_absent = map
-            .translate(crate::stack::guard_page(stack.base))
-            .is_none();
-
         let mut b = [0u8; 18];
-        let mut r = [0u8; 18];
+        let mut g = [0u8; 18];
         let mut k = [0u8; 20];
-        if on_stack && guard_absent {
-            serial.write_str("enlil kernel: stack: ran on kernel-owned stack at ");
-            serial.write_str(format_u64_hex(stack.base, &mut b));
-            serial.write_str(" (RSP ");
-            serial.write_str(format_u64_hex(seen, &mut r));
-            serial.write_str(", ");
-            serial.write_str(format_u64(crate::stack::usable_bytes() / 1024, &mut k));
-            serial.write_str(" KiB usable), guard page unmapped — overflow faults\n");
-        } else if on_stack {
-            serial.write_str("enlil kernel: stack: ran on own stack but GUARD PAGE IS MAPPED\n");
-        } else {
-            serial.write_str("enlil kernel: stack: RSP DID NOT LAND on the kernel stack\n");
-        }
+        serial.write_str("enlil kernel: stack: kernel-owned stack at ");
+        serial.write_str(format_u64_hex(stack.base, &mut b));
+        serial.write_str(" (");
+        serial.write_str(format_u64(crate::stack::usable_bytes() / 1024, &mut k));
+        serial.write_str(" KiB usable), guard page ");
+        serial.write_str(format_u64_hex(crate::stack::guard_page(stack.base), &mut g));
+        serial.write_str(" unmapped — overflow faults\n");
+        Some(stack)
     }
 
     /// Refine one 2 MiB region of the live host map down to 4 KiB pages and

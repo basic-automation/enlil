@@ -49,7 +49,8 @@ pub const fn guard_page(base: u64) -> u64 {
 
 #[cfg(target_os = "uefi")]
 pub use hw::{
-    GuardedStack, allocate_guarded_stack, current_rsp, run_on_guarded_stack, usable_bytes,
+    GuardedStack, allocate_guarded_stack, current_rsp, run_on_guarded_stack,
+    switch_to_guarded_stack, usable_bytes,
 };
 
 #[cfg(target_os = "uefi")]
@@ -121,7 +122,7 @@ mod hw {
         // it is pushed/popped by hand because the compiler may be using it as a
         // frame pointer. The called function clobbers the volatile registers.
         // SAFETY: the caller guarantees `stack` is a live owned stack whose top
-        // is 16-byte aligned ('s requirement before a `call`), and RSP is
+        // is 16-byte aligned (`SysV`'s requirement before a `call`), and RSP is
         // restored from RBP before returning, so the caller's frame is intact.
         unsafe {
             core::arch::asm!(
@@ -134,6 +135,39 @@ mod hw {
                 top = in(reg) stack.top,
                 func = in(reg) f,
                 clobber_abi("sysv64"),
+            );
+        }
+    }
+
+    /// Switch `RSP` onto `stack` **permanently** and continue in `f`, which never
+    /// returns.
+    ///
+    /// Where [`run_on_guarded_stack`] borrows the stack for one call, this hands
+    /// the rest of the kernel's life to it: everything after this point runs on
+    /// memory the kernel owns, with a guard page beneath it, instead of on the
+    /// firmware's boot-services stack. Nothing on the old stack is reachable
+    /// afterwards, so `f` takes its inputs from statics.
+    ///
+    /// # Safety
+    ///
+    /// `stack` must be a live, mapped, exclusively-owned stack region — one from
+    /// [`allocate_guarded_stack`]. The caller must not need anything on its own
+    /// stack afterwards (locals, saved registers, return address): control never
+    /// comes back. Any `&` borrow held across this call must point outside the
+    /// old stack.
+    pub unsafe fn switch_to_guarded_stack(stack: GuardedStack, f: extern "C" fn() -> !) -> ! {
+        // `call` rather than `jmp`: it pushes a return address, leaving RSP
+        // 8 mod 16 at `f`'s entry, exactly what SysV specifies. The pushed
+        // address is never used — `f` diverges.
+        // SAFETY: the caller guarantees `stack` is a live owned stack with a
+        // 16-byte-aligned top, and that abandoning the current stack is intended.
+        unsafe {
+            core::arch::asm!(
+                "mov rsp, {top}",
+                "call {func}",
+                top = in(reg) stack.top,
+                func = in(reg) f,
+                options(noreturn),
             );
         }
     }

@@ -112,10 +112,13 @@ PCI_BAR_LINE="pci: BAR"
 # off the firmware's — reaching this line proves the map covers the kernel.
 PAGING_LINE="off firmware page tables"
 SPLIT_LINE="split to 4 KiB pages"
-# Printed once the kernel allocates its own stack, unmaps the page below it, and
-# runs a function on it — off the firmware's unguarded boot-services stack, with
-# an overflow now taking a diagnosable #PF instead of corrupting its neighbour.
-STACK_LINE="guard page unmapped — overflow faults"
+# Printed once the kernel allocates its own stack and unmaps the page below it —
+# an overflow now takes a diagnosable #PF instead of corrupting its neighbour.
+STACK_LINE="unmapped — overflow faults"
+# Printed from the continuation AFTER the permanent switch onto that stack, with
+# the RSP it is actually running on: the rest of bring-up (ECAM, the SVM guests,
+# the framebuffer) runs on kernel-owned memory, not the firmware's stack.
+STACK_SWITCH_LINE="kernel bring-up continues at RSP"
 # Printed once the kernel turns on the CPU virtualization extension (SVM on
 # this AMD host) — the enable gate for running a guest with VMRUN.
 SVM_LINE="svm: enabled"
@@ -337,6 +340,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PAGING_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$SPLIT_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$STACK_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$STACK_SWITCH_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$SVM_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$HSAVE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$VMCB_LINE" "$SERIAL_LOG" 2>/dev/null \
@@ -355,7 +359,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$LONGMODE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_TEXT_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery, PCI enumeration, own page tables + 4 KiB split + kernel-owned guarded stack, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + 64-bit long-mode guest, and GOP draw observed on serial"
+    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery, PCI enumeration, own page tables + 4 KiB split + kernel-owned guarded stack (bring-up continues on it), SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + 64-bit long-mode guest, and GOP draw observed on serial"
     exit 0
 fi
 
