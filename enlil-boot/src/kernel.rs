@@ -155,6 +155,66 @@ pub const fn boot_heap_size(region_bytes: u64) -> u64 {
     }
 }
 
+/// The planned guest-RAM window: a bump allocator over the region
+/// `plan_hypervisor_regions` carved for guests.
+///
+/// Guest RAM must **not** come from the kernel heap: the heap is where the
+/// hypervisor's own structures live, and a guest with a nested mapping onto it
+/// could reach them. The planner carves a span for exactly this purpose
+/// (LOCKED PRINCIPLE 5 — isolation), retyped `Reserved` in the map so nothing
+/// else claims it; this hands out disjoint slices of it, one per guest.
+///
+/// Empty until [`kernel::bring_up_memory_plan`](kernel) publishes the plan.
+pub mod guest_ram {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// Next free system-physical address inside the carved window.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    /// One past the last byte of the carved window (0 = no window).
+    static END: AtomicU64 = AtomicU64::new(0);
+
+    /// Publish the carved guest-RAM window so [`take`] can hand out slices.
+    pub fn publish(base: u64, size: u64) {
+        NEXT.store(base, Ordering::Release);
+        END.store(base.saturating_add(size), Ordering::Release);
+    }
+
+    /// Bytes still available in the carved window.
+    #[must_use]
+    pub fn remaining() -> u64 {
+        END.load(Ordering::Acquire)
+            .saturating_sub(NEXT.load(Ordering::Acquire))
+    }
+
+    /// Take a slice of the carved window for one guest.
+    ///
+    /// Returns the `size`-byte, `align`-aligned slice's system-physical base, or
+    /// `None` if no window was published or too little of it is left (the caller
+    /// then falls back to the heap).
+    ///
+    /// `align` must be a power of two. Slices are disjoint and never reused, so
+    /// one guest's RAM can never alias another's.
+    #[must_use]
+    pub fn take(size: u64, align: u64) -> Option<u64> {
+        let end = END.load(Ordering::Acquire);
+        if end == 0 || size == 0 || !align.is_power_of_two() {
+            return None;
+        }
+        let mut cur = NEXT.load(Ordering::Acquire);
+        loop {
+            let base = cur.checked_add(align - 1)? & !(align - 1);
+            let next = base.checked_add(size)?;
+            if next > end {
+                return None;
+            }
+            match NEXT.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(base),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+}
+
 /// Format `value` as decimal into `buf`, returning the used suffix.
 ///
 /// `no_std`- and alloc-free (the firmware allocator is gone when the kernel
@@ -742,6 +802,7 @@ mod hw {
                         serial.write_str(", vmcb ");
                         serial.write_str(format_u64_hex(vmcb, &mut c));
                         serial.write_str(")\n");
+                        report_guest_ram_source(serial);
                         // Drive the guest through the real #VMEXIT dispatch loop
                         // — the guest (in its own isolated RAM at GPA 0) runs
                         // CPUID/RDMSR/OUT/HLT, all routed through the HAL's
@@ -1292,12 +1353,43 @@ mod hw {
                     } else {
                         "enlil kernel: memplan: CARVED REGION OVERLAPS THE LIVE HEAP\n"
                     });
+
+                    // Publish the guest window only once it is known disjoint
+                    // from the heap — otherwise guests would be handed the
+                    // hypervisor's own allocator memory.
+                    if all_clear {
+                        if let Some(g0) = regions.guest_ram.first() {
+                            crate::kernel::guest_ram::publish(g0.base.as_u64(), g0.size);
+                        }
+                    }
                 }
             }
             None => {
                 serial.write_str("enlil kernel: memplan: region plan did not fit the usable map\n");
             }
         }
+    }
+
+    /// Report where the SVM guests' RAM came from — the planned, heap-disjoint
+    /// guest region, or the kernel heap as a fallback (ROADMAP 1.3 / 6.2).
+    ///
+    /// A guest backed by heap memory could reach the hypervisor's own allocator
+    /// through its nested mapping; backed by the carved region it cannot
+    /// (LOCKED PRINCIPLE 5). The remaining byte count is the proof the guest
+    /// actually consumed planned RAM rather than falling back.
+    fn report_guest_ram_source(serial: &SerialPort) {
+        const MIB: u64 = 1024 * 1024;
+        let left = crate::kernel::guest_ram::remaining();
+        if left == 0 {
+            serial.write_str(
+                "enlil kernel: svm: guest RAM from the kernel heap (no planned region)\n",
+            );
+            return;
+        }
+        let mut m = [0u8; 20];
+        serial.write_str("enlil kernel: svm: guest RAM from the planned region, ");
+        serial.write_str(format_u64(left / MIB, &mut m));
+        serial.write_str(" MiB left — guests cannot reach the hypervisor heap\n");
     }
 
     /// Emit the memory summary the QEMU+OVMF harness asserts on.
