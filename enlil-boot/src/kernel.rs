@@ -237,10 +237,16 @@ mod hw {
             let summary = summarize_memory_map(bytes, handoff.memory_descriptor_size);
             highest_usable_end = summary.highest_usable_end;
             report_memory(&serial, &summary);
-            bring_up_heap(&serial, &summary);
+            let heap_span = bring_up_heap(&serial, &summary);
             // The heap is live, so enlil-platform's heap-backed primitives work.
             bring_up_scheduler(&serial);
-            bring_up_memory_plan(&serial, bytes, handoff.memory_descriptor_size, &summary);
+            bring_up_memory_plan(
+                &serial,
+                bytes,
+                handoff.memory_descriptor_size,
+                &summary,
+                heap_span,
+            );
         } else {
             serial.write_str("enlil kernel: memory: NO MAP in handoff\n");
         }
@@ -1046,17 +1052,21 @@ mod hw {
 
     /// Install the kernel heap in the largest conventional region and prove
     /// dynamic allocation works with the firmware gone.
-    fn bring_up_heap(serial: &SerialPort, summary: &MemorySummary) {
+    ///
+    /// Returns the installed heap's `(base, size)` so later planning can mark it
+    /// in use ([`MemoryMap::reserve_span`]) — the heap is claimed before any
+    /// `MemoryMap` exists, so nothing else knows that memory is spoken for.
+    fn bring_up_heap(serial: &SerialPort, summary: &MemorySummary) -> Option<(u64, u64)> {
         let size = boot_heap_size(summary.largest_conventional_bytes);
         if size == 0 {
             serial.write_str("enlil kernel: heap: NO conventional region large enough\n");
-            return;
+            return None;
         }
         let base = summary.largest_conventional_base;
         let (Ok(base_usize), Ok(size_usize)) = (usize::try_from(base), usize::try_from(size))
         else {
             serial.write_str("enlil kernel: heap: region beyond addressable range\n");
-            return;
+            return None;
         };
         // SAFETY: the span is conventional memory (nothing of the firmware,
         // image, stack, or handoff lives there), sized within the region, and
@@ -1090,6 +1100,7 @@ mod hw {
         } else {
             serial.write_str(", alloc test FAILED\n");
         }
+        Some((base, size))
     }
 
     /// Run enlil-platform's bare-metal work-stealing scheduler on real hardware
@@ -1174,6 +1185,7 @@ mod hw {
         bytes: &[u8],
         descriptor_size: usize,
         summary: &MemorySummary,
+        heap_span: Option<(u64, u64)>,
     ) {
         use enlil_platform::memory::map::{MemoryMap, MemoryPlanRequest, UefiMemoryDescriptor};
 
@@ -1221,6 +1233,25 @@ mod hw {
             " MiB), DISAGREES with kernel summary\n"
         });
 
+        // The bootstrap heap was claimed from the raw firmware map before any
+        // MemoryMap existed, so the map still calls that span usable. Mark it in
+        // use or the plan below will carve guest RAM straight out of the memory
+        // the hypervisor is allocating from — silent corruption the moment a
+        // guest writes to its RAM.
+        if let Some((heap_base, heap_size)) = heap_span {
+            let mut hb = [0u8; 18];
+            let mut he = [0u8; 18];
+            serial.write_str(if map.reserve_span(heap_base, heap_size) {
+                "enlil kernel: memplan: reserved live heap "
+            } else {
+                "enlil kernel: memplan: live heap NOT reservable "
+            });
+            serial.write_str(format_u64_hex(heap_base, &mut hb));
+            serial.write_str("-");
+            serial.write_str(format_u64_hex(heap_base + heap_size, &mut he));
+            serial.write_str(" — planner cannot carve over it\n");
+        }
+
         let req = MemoryPlanRequest {
             heap_size: 8 * MIB,
             dma_size: 2 * MIB,
@@ -1242,6 +1273,26 @@ mod hw {
                     &mut guest_buf,
                 ));
                 serial.write_str(" — disjoint per-guest RAM (LOCKED PRINCIPLE 5)\n");
+
+                // Every carved region must now clear the live heap. Checking it
+                // here is what makes the reservation above a proof rather than a
+                // claim: before it, guest0 landed inside the heap.
+                if let Some((heap_base, heap_size)) = heap_span {
+                    let heap_end = heap_base + heap_size;
+                    let clears =
+                        |base: u64, size: u64| base + size <= heap_base || base >= heap_end;
+                    let all_clear = clears(regions.dma.base.as_u64(), regions.dma.size)
+                        && clears(regions.heap.base.as_u64(), regions.heap.size)
+                        && regions
+                            .guest_ram
+                            .iter()
+                            .all(|r| clears(r.base.as_u64(), r.size));
+                    serial.write_str(if all_clear {
+                        "enlil kernel: memplan: all carved regions clear the live heap — no overlap\n"
+                    } else {
+                        "enlil kernel: memplan: CARVED REGION OVERLAPS THE LIVE HEAP\n"
+                    });
+                }
             }
             None => {
                 serial.write_str("enlil kernel: memplan: region plan did not fit the usable map\n");

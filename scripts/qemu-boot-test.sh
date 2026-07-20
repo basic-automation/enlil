@@ -44,6 +44,7 @@ SCHED_LINE="BareMetalScheduler ran 4 tasks"
 # and carves the hypervisor's DMA/heap/per-guest regions — roadmap 1.3 wiring
 # the boot payload's real UEFI map into the platform region carver.
 MEMPLAN_LINE="enlil-platform MemoryMap from"
+HEAP_RESERVE_LINE="all carved regions clear the live heap"
 # Printed once the kernel feeds its PIT-calibrated TSC frequency to
 # enlil-platform's time backend and measures a busy-sleep with the platform
 # Instant/Duration — the third no_std enlil-platform module proven on hardware.
@@ -307,6 +308,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$HEAP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$SCHED_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$MEMPLAN_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$HEAP_RESERVE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PLATFORM_TIME_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$IDT_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$SPINLOCK_LINE" "$SERIAL_LOG" 2>/dev/null \

@@ -336,6 +336,54 @@ impl MemoryMap {
         None
     }
 
+    /// Retype every **usable** part of the span `[base, base + size)` as
+    /// [`Reserved`](MemoryKind::Reserved), so no later [`carve`](Self::carve) or
+    /// [`plan_hypervisor_regions`](Self::plan_hypervisor_regions) can hand it out.
+    ///
+    /// Where [`carve`](Self::carve) asks the map to *choose* a free span, this
+    /// tells the map about memory that is **already spoken for at a known
+    /// address** — the bootstrap heap installed before a `MemoryMap` existed, the
+    /// loaded kernel image, the firmware map buffer, an MMIO window. Without it a
+    /// planner working from the raw firmware map will happily carve guest RAM out
+    /// of memory the hypervisor is already using.
+    ///
+    /// The span may cover several regions, overlap them partially, or include
+    /// parts that are already reserved (those are left alone); regions are split
+    /// so untouched remainders stay usable. Returns `true` if any usable memory
+    /// was reserved, `false` if the span was empty, invalid, or already entirely
+    /// non-allocatable.
+    pub fn reserve_span(&mut self, base: u64, size: u64) -> bool {
+        if size == 0 {
+            return false;
+        }
+        let Some(end) = base.checked_add(size) else {
+            return false;
+        };
+        let mut reserved_any = false;
+        // Each pass reserves one usable overlap, strictly shrinking the usable
+        // area within the span, so this terminates.
+        while let Some((idx, start, len)) = self.first_usable_overlap(base, end) {
+            self.split_reserve(idx, start, len);
+            reserved_any = true;
+        }
+        reserved_any
+    }
+
+    /// The first usable region overlapping `[base, end)`, as its index and the
+    /// overlapping span — the unit [`reserve_span`](Self::reserve_span) retypes.
+    fn first_usable_overlap(&self, base: u64, end: u64) -> Option<(usize, u64, u64)> {
+        self.regions.iter().enumerate().find_map(|(i, region)| {
+            if !region.kind.is_allocatable() {
+                return None;
+            }
+            let start = region.base.as_u64().max(base);
+            let stop = region.end().min(end);
+            // `then`, not `then_some`: the subtraction underflows when the
+            // region does not overlap, and `then_some` evaluates eagerly.
+            (start < stop).then(|| (i, start, stop - start))
+        })
+    }
+
     /// Split usable region `idx` so the span `[start, start+size)` becomes a
     /// [`Reserved`](MemoryKind::Reserved) region, preserving the usable remainder
     /// on either side. Keeps the map sorted and non-overlapping.
@@ -460,6 +508,73 @@ mod tests {
 
     fn reserved(base: u64, size: u64) -> MemoryRegion {
         MemoryRegion::new(PhysAddr::new(base), size, MemoryKind::Reserved)
+    }
+
+    #[test]
+    fn reserve_span_carves_a_known_in_use_span_out_of_the_middle() {
+        let mut map = MemoryMap::from_regions(vec![usable(0x1000, 0x8000)]);
+        assert!(map.reserve_span(0x3000, 0x2000));
+
+        // Usable remainders on both sides, reserved in the middle.
+        assert_eq!(
+            map.regions(),
+            &[
+                usable(0x1000, 0x2000),
+                reserved(0x3000, 0x2000),
+                usable(0x5000, 0x4000),
+            ]
+        );
+        assert!(map.is_consistent());
+        assert_eq!(map.total_usable(), 0x6000);
+    }
+
+    #[test]
+    fn reserve_span_spans_several_regions_and_partial_overlaps() {
+        let mut map = MemoryMap::from_regions(vec![
+            usable(0x1000, 0x1000),
+            reserved(0x2000, 0x1000),
+            usable(0x3000, 0x3000),
+        ]);
+        // Covers the tail of the first region, all of the reserved one, and the
+        // head of the third.
+        assert!(map.reserve_span(0x1800, 0x2800));
+
+        assert_eq!(map.total_usable(), 0x800 + 0x2000);
+        assert!(map.is_consistent());
+        // Nothing usable is left anywhere inside the requested span.
+        assert!(
+            map.usable()
+                .all(|r| r.end() <= 0x1800 || r.base.as_u64() >= 0x4000)
+        );
+    }
+
+    #[test]
+    fn reserve_span_stops_a_later_carve_from_handing_out_the_same_memory() {
+        // The bug this exists for: a bootstrap heap installed at a known address
+        // before any MemoryMap existed, then a planner carving over it.
+        let heap_base = 0x0178_0000u64;
+        let heap_size = 0x0270_0000u64;
+        let mut map = MemoryMap::from_regions(vec![usable(0x100_000, 0x0800_0000)]);
+
+        map.reserve_span(heap_base, heap_size);
+        let carved = map.carve(0x20_0000, 0x20_0000).unwrap().as_u64();
+
+        assert!(
+            carved + 0x20_0000 <= heap_base || carved >= heap_base + heap_size,
+            "carved 0x{carved:x} overlaps the live heap"
+        );
+    }
+
+    #[test]
+    fn reserve_span_rejects_empty_and_already_reserved() {
+        let mut map = MemoryMap::from_regions(vec![usable(0x1000, 0x1000)]);
+        assert!(!map.reserve_span(0x1000, 0), "empty span");
+        assert!(!map.reserve_span(u64::MAX, 0x1000), "overflowing span");
+        assert!(!map.reserve_span(0x9000, 0x1000), "span outside the map");
+
+        assert!(map.reserve_span(0x1000, 0x1000));
+        assert!(!map.reserve_span(0x1000, 0x1000), "already reserved");
+        assert_eq!(map.total_usable(), 0);
     }
 
     #[test]
