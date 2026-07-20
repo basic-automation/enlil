@@ -314,6 +314,33 @@ pub mod ap_trampoline {
     pub fn sipi_vector() -> Option<u8> {
         u8::try_from(page()? >> 12).ok()
     }
+
+    /// The most APIC IDs the inventory keeps (matches the ACPI summary's array).
+    pub const MAX_APIC_IDS: usize = 8;
+
+    /// The enabled processors' APIC IDs, from the MADT — the wake targets.
+    static APIC_IDS: [AtomicU64; MAX_APIC_IDS] = [const { AtomicU64::new(0) }; MAX_APIC_IDS];
+    /// How many entries of [`APIC_IDS`] are valid.
+    static APIC_ID_COUNT: AtomicU64 = AtomicU64::new(0);
+
+    /// Record the enabled processors' APIC IDs discovered from the MADT.
+    pub fn publish_apic_ids(ids: &[u32]) {
+        let n = ids.len().min(MAX_APIC_IDS);
+        for (slot, &id) in APIC_IDS.iter().zip(&ids[..n]) {
+            slot.store(u64::from(id), Ordering::Release);
+        }
+        APIC_ID_COUNT.store(n as u64, Ordering::Release);
+    }
+
+    /// Copy the recorded APIC IDs into `out`, returning the populated prefix.
+    pub fn apic_ids(out: &mut [u32; MAX_APIC_IDS]) -> usize {
+        let n = usize::try_from(APIC_ID_COUNT.load(Ordering::Acquire)).unwrap_or(0);
+        let n = n.min(MAX_APIC_IDS);
+        for (slot, id) in out.iter_mut().zip(APIC_IDS.iter()).take(n) {
+            *slot = u32::try_from(id.load(Ordering::Acquire)).unwrap_or(0);
+        }
+        n
+    }
 }
 
 /// Format `value` as decimal into `buf`, returning the used suffix.
@@ -420,11 +447,17 @@ mod hw {
         bring_up_gdt(&serial);
         bring_up_timer(&serial);
         bring_up_deadline_timer(&serial);
-        if let Some(hz) = bring_up_time(&serial) {
+        let tsc_hz = bring_up_time(&serial);
+        if let Some(hz) = tsc_hz {
             bring_up_deadline_ns(&serial, hz);
             bring_up_platform_time(&serial, hz);
         }
         let ecam = bring_up_acpi(&serial, handoff);
+        // Needs both the MADT inventory (above) and the calibrated TSC (the
+        // INIT/SIPI delays are timing-critical).
+        if let Some(hz) = tsc_hz {
+            bring_up_smp(&serial, apic_id.unwrap_or(0), hz);
+        }
         bring_up_pci(&serial);
         let map = bring_up_paging(&serial, handoff, highest_usable_end);
 
@@ -677,6 +710,7 @@ mod hw {
             serial.write_str(format_u64(u64::from(summary.apic_ids[i]), &mut id));
         }
         serial.write_str(" (SMP AP inventory)\n");
+        crate::kernel::ap_trampoline::publish_apic_ids(&summary.apic_ids[..summary.apic_id_count]);
         serial.write_str("enlil kernel: acpi: IOMMU ");
         serial.write_str(summary.iommu.name());
         serial.write_str(" (DMAR/IVRS)\n");
@@ -799,6 +833,50 @@ mod hw {
         serial.write_str(" (SIPI vector ");
         serial.write_str(format_u64(page >> 12, &mut v));
         serial.write_str("), writable — reachable by a SIPI\n");
+    }
+
+    /// Wake the application processors with `INIT`-`SIPI`-`SIPI` (ROADMAP 6.2, SMP).
+    ///
+    /// The BSP has been the only running CPU since power-on. This starts every
+    /// other enabled processor from the MADT inventory on the trampoline page
+    /// claimed earlier, and waits for each to report in by bumping the
+    /// trampoline's counter — so "the AP started" is observed, not assumed.
+    ///
+    /// A started AP parks on `hlt` for now; giving it long mode, its own guarded
+    /// stack, a `PerCpu` block and IST stacks is the next slice.
+    fn bring_up_smp(serial: &SerialPort, bsp_apic_id: u32, tsc_hz: u64) {
+        let Some(page) = crate::kernel::ap_trampoline::page() else {
+            serial.write_str("enlil kernel: smp: no trampoline page — APs not started\n");
+            return;
+        };
+        let mut ids = [0u32; crate::kernel::ap_trampoline::MAX_APIC_IDS];
+        let count = crate::kernel::ap_trampoline::apic_ids(&mut ids);
+        if count == 0 {
+            serial.write_str("enlil kernel: smp: no MADT APIC inventory — APs not started\n");
+            return;
+        }
+
+        // SAFETY: x2APIC was enabled in bring_up_apic, `tsc_hz` is the calibrated
+        // TSC frequency, and `page` is the exclusively-owned low page verified
+        // writable earlier. The BSP's own id is excluded, so no INIT resets us.
+        let (started, expected) =
+            unsafe { crate::smp::start_aps(page, &ids[..count], bsp_apic_id, tsc_hz) };
+
+        let mut s = [0u8; 20];
+        let mut e = [0u8; 20];
+        if expected == 0 {
+            serial.write_str("enlil kernel: smp: no APs to start (uniprocessor)\n");
+            return;
+        }
+        serial.write_str("enlil kernel: smp: ");
+        serial.write_str(format_u64(u64::from(started), &mut s));
+        serial.write_str(" of ");
+        serial.write_str(format_u64(u64::from(expected), &mut e));
+        if started >= expected {
+            serial.write_str(" APs started via INIT-SIPI-SIPI — SMP alive\n");
+        } else {
+            serial.write_str(" APs started — some did not report in\n");
+        }
     }
 
     /// Build the kernel's own stack with a guard page (ROADMAP 6.2).

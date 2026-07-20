@@ -93,6 +93,10 @@ APIC_INVENTORY_LINE="SMP AP inventory"
 # startup trampoline (a SIPI can only start an AP page-aligned in low memory) and
 # proves it writable — found from the firmware map, not a hardcoded address.
 AP_TRAMPOLINE_LINE="AP trampoline page at"
+# Printed once the BSP wakes the application processors with INIT-SIPI-SIPI and
+# each one reports in by bumping the trampoline's counter — the machine's other
+# CPUs are running enlil's code. Booted -smp 2, so there is exactly one AP.
+SMP_LINE="APs started via INIT-SIPI-SIPI"
 # Printed once the kernel finds the MCFG and reports the PCIe ECAM base + bus
 # range — the window for extended config space + full multi-bus PCI topology.
 ECAM_LINE="PCIe ECAM base"
@@ -336,6 +340,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ACPI_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$APIC_INVENTORY_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$AP_TRAMPOLINE_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$SMP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ECAM_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$IOMMU_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PCI_LINE" "$SERIAL_LOG" 2>/dev/null \
@@ -364,7 +369,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$LONGMODE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_TEXT_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery, PCI enumeration, own page tables + 4 KiB split + kernel-owned guarded stack (bring-up continues on it), SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + 64-bit long-mode guest, and GOP draw observed on serial"
+    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery, SMP AP bring-up (INIT-SIPI-SIPI), PCI enumeration, own page tables + 4 KiB split + kernel-owned guarded stack (bring-up continues on it), SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + 64-bit long-mode guest, and GOP draw observed on serial"
     exit 0
 fi
 
