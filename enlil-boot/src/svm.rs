@@ -244,6 +244,34 @@ const GUEST_LM_PT_GPA: usize = 0x0001_0000;
 #[cfg(target_os = "uefi")]
 const GUEST_LM_STACK: u64 = 0x0000_8000;
 
+/// The port the long-mode *event-injection* guest `OUT`s from its interrupted
+/// code after the injected interrupt's 64-bit handler `IRETQ`s back to it.
+///
+/// A capture here proves an injected interrupt was delivered through a real
+/// 64-bit `IDT`, vectored to a handler that ran and returned via `IRETQ`, and
+/// the interrupted long-mode stream resumed — the full interrupt round-trip in
+/// the mode a real x86-64 OS handles interrupts in.
+pub const GUEST_LM_EVENT_PORT: u8 = 0x8B;
+
+/// The byte the long-mode event-injection guest's interrupted code `OUT`s after
+/// the handler `IRETQ`s (the handler leaves it in `AL`).
+pub const GUEST_LM_EVENT_SENTINEL: u8 = 0x3E;
+
+/// Guest-virtual/-physical offset of the long-mode event guest's handler (past
+/// the entry code, within the identity-mapped `[0, 2 MiB)` window).
+#[cfg(any(target_os = "uefi", test))]
+const GUEST_LM_HANDLER_OFF: usize = 0x0000_0100;
+
+/// Guest-physical base of the long-mode event guest's `GDT` (the `GDTR` base);
+/// holds a null, a 64-bit code (selector `0x08`), and a data (`0x10`) descriptor.
+#[cfg(any(target_os = "uefi", test))]
+const GUEST_LM_GDT_GPA: usize = 0x0000_1000;
+
+/// Guest-physical base of the long-mode event guest's `IDT` (the `IDTR` base);
+/// one 64-bit interrupt gate for [`GUEST_EVENT_VECTOR`] points at the handler.
+#[cfg(any(target_os = "uefi", test))]
+const GUEST_LM_IDT_GPA: usize = 0x0000_2000;
+
 /// A small per-guest shadow of MSRs the guest has written with `WRMSR`.
 ///
 /// A later `RDMSR` reads back what the guest wrote — MSR-state virtualization
@@ -564,10 +592,72 @@ const fn write_event_resume_program(ram: &mut [u8]) {
     ram[h + 7] = 0xCF; // IRET
 }
 
+/// Stamp the **64-bit long-mode** event-injection guest's program into `ram`:
+/// the interrupted entry code, a real 64-bit `GDT` and `IDT`, and a handler
+/// that `IRETQ`s.
+///
+/// This is the long-mode analogue of [`write_event_resume_program`] — the mode
+/// a real x86-64 OS handles interrupts in. Layout (all within the identity-
+/// mapped `[0, 2 MiB)` window; segment bases 0):
+/// - **GVA 0** — the interrupted stream the handler `IRETQ`s back to:
+///   `out GUEST_LM_EVENT_PORT, al ; hlt`. It runs only *after* the handler
+///   returns (VMRUN injects before the entry executes), with `AL` carrying
+///   [`GUEST_LM_EVENT_SENTINEL`].
+/// - **[`GUEST_LM_GDT_GPA`]** — a `GDT` of `[null, 64-bit code (selector
+///   `0x08`, the VMCB `CS`), data (`0x10`)]`; the injected interrupt reloads
+///   `CS` from the code descriptor.
+/// - **[`GUEST_LM_IDT_GPA`]** — a 64-bit interrupt gate at
+///   `IDT[GUEST_EVENT_VECTOR]` → (selector `0x08`, offset
+///   [`GUEST_LM_HANDLER_OFF`]).
+/// - **[`GUEST_LM_HANDLER_OFF`]** — the handler: `mov al, GUEST_LM_EVENT_SENTINEL
+///   ; iretq` (`REX.W` `CF`, so it pops the 64-bit `SS:RSP:RFLAGS:CS:RIP` frame).
+///
+/// Pure and host-testable; the firmware builder allocates the RAM, the guest
+/// page tables, and the NPT, and programs the VMCB `GDTR`/`IDTR`.
+#[cfg(any(target_os = "uefi", test))]
+fn write_long_mode_event_program(ram: &mut [u8]) {
+    // Interrupted entry at GVA 0 (runs only after the handler IRETQs).
+    ram[0] = 0xE6; // OUT imm8, AL
+    ram[1] = GUEST_LM_EVENT_PORT;
+    ram[2] = 0xF4; // HLT
+
+    // 64-bit handler: mov al, SENTINEL; iretq.
+    let h = GUEST_LM_HANDLER_OFF;
+    ram[h] = 0xB0; // MOV AL, imm8
+    ram[h + 1] = GUEST_LM_EVENT_SENTINEL;
+    ram[h + 2] = 0x48; // REX.W
+    ram[h + 3] = 0xCF; // IRETQ (pops the 64-bit interrupt frame)
+
+    // GDT: [0] null (zeroed), [1] 64-bit code (G=1,L=1, P DPL0 S exec/read/acc),
+    // [2] data (G=1,B=1, P DPL0 S read/write/acc). Selectors 0x08 / 0x10 index
+    // entries 1 / 2 — matching the VMCB's long-mode CS/DS selectors.
+    let g = GUEST_LM_GDT_GPA;
+    ram[g + 8..g + 16].copy_from_slice(&0x00AF_9B00_0000_FFFFu64.to_le_bytes());
+    ram[g + 16..g + 24].copy_from_slice(&0x00CF_9300_0000_FFFFu64.to_le_bytes());
+
+    // IDT 64-bit interrupt gate for GUEST_EVENT_VECTOR → (selector 0x08, offset
+    // GUEST_LM_HANDLER_OFF); present, DPL 0, type 0xE (64-bit interrupt gate).
+    let gate = GUEST_LM_IDT_GPA + (GUEST_EVENT_VECTOR as usize) * 16;
+    let ob = (GUEST_LM_HANDLER_OFF as u64).to_le_bytes();
+    ram[gate] = ob[0]; // offset 7:0
+    ram[gate + 1] = ob[1]; // offset 15:8
+    ram[gate + 2] = 0x08; // segment selector 7:0 (code)
+    ram[gate + 3] = 0x00; // segment selector 15:8
+    ram[gate + 4] = 0x00; // IST = 0 (use the current RSP)
+    ram[gate + 5] = 0x8E; // P=1, DPL=0, type=0xE (64-bit interrupt gate)
+    ram[gate + 6] = ob[2]; // offset 23:16
+    ram[gate + 7] = ob[3]; // offset 31:24
+    ram[gate + 8] = ob[4]; // offset 39:32
+    ram[gate + 9] = ob[5]; // offset 47:40
+    ram[gate + 10] = ob[6]; // offset 55:48
+    ram[gate + 11] = ob[7]; // offset 63:56
+}
+
 #[cfg(target_os = "uefi")]
 pub use hw::{
     enable_svm, program_boot_vmcb, program_event_inj_resume_vmcb, program_event_inj_vmcb,
-    program_host_save_area, program_long_mode_vmcb, run_boot_guest_loop,
+    program_host_save_area, program_long_mode_event_inj_vmcb, program_long_mode_vmcb,
+    run_boot_guest_loop,
 };
 
 #[cfg(target_os = "uefi")]
@@ -1273,6 +1363,127 @@ mod hw {
         Some((vmcb_pa, guest_cr3))
     }
 
+    /// Build a `VMRUN`-ready VMCB that proves an injected interrupt is delivered
+    /// through a real **64-bit long-mode `IDT`** and the handler `IRETQ`s back
+    /// to resume the interrupted guest, returning `(vmcb_pa, guest_spa)`.
+    ///
+    /// This is the long-mode counterpart of [`program_event_inj_resume_vmcb`] —
+    /// interrupt handling in the mode a real x86-64 OS runs in. The guest boots
+    /// in long mode (paging on, `CS.L`, its own `CR3` walked through the NPT)
+    /// with a real `GDT` + `IDT`
+    /// ([`write_long_mode_event_program`](super::write_long_mode_event_program)):
+    /// `VMRUN` arms `EVENTINJ` so [`GUEST_EVENT_VECTOR`](super::GUEST_EVENT_VECTOR)
+    /// is delivered before the first instruction, the CPU reads the 64-bit
+    /// interrupt gate, reloads `CS` from the `GDT` code descriptor, pushes the
+    /// `SS:RSP:RFLAGS:CS:RIP` frame, and vectors to the handler, which sets `AL`
+    /// and `IRETQ`s. The interrupted code at GVA 0 then `OUT`s
+    /// [`GUEST_LM_EVENT_SENTINEL`](super::GUEST_LM_EVENT_SENTINEL) — a capture of
+    /// it proves the whole long-mode deliver → handle → `IRETQ` → resume path.
+    ///
+    /// Layout in the guest's isolated `[0, 2 MiB)` RAM: entry at GVA 0, handler
+    /// at [`GUEST_LM_HANDLER_OFF`](super::GUEST_LM_HANDLER_OFF), `GDT` at
+    /// [`GUEST_LM_GDT_GPA`](super::GUEST_LM_GDT_GPA), `IDT` at
+    /// [`GUEST_LM_IDT_GPA`](super::GUEST_LM_IDT_GPA), stack at
+    /// [`GUEST_LM_STACK`](super::GUEST_LM_STACK), and the guest's own identity
+    /// page tables at [`GUEST_LM_PT_GPA`](super::GUEST_LM_PT_GPA) — all inside
+    /// the NPT-mapped window. The VMCB's `GDTR`/`IDTR` point at the guest tables.
+    /// All allocations are leaked to outlive `VMRUN`. Returns `None` on any
+    /// allocation/programming failure.
+    #[must_use]
+    pub fn program_long_mode_event_inj_vmcb() -> Option<(u64, u64)> {
+        use super::{
+            GUEST_EVENT_VECTOR, GUEST_LM_GDT_GPA, GUEST_LM_IDT_GPA, GUEST_LM_PT_GPA, GUEST_LM_STACK,
+        };
+
+        // Allocate + populate the guest's isolated RAM.
+        // SAFETY: GuestRam is nonzero, 2 MiB-aligned; alloc_zeroed yields it or null.
+        let ram_raw = unsafe { alloc_zeroed(Layout::new::<GuestRam>()) };
+        if ram_raw.is_null() {
+            return None;
+        }
+        let guest_spa = ram_raw as u64;
+        // SAFETY: ram_raw owns GUEST_RAM_BYTES writable bytes (leaked below).
+        super::write_long_mode_event_program(unsafe {
+            core::slice::from_raw_parts_mut(ram_raw, GUEST_RAM_BYTES)
+        });
+
+        // The guest's own identity page tables (GVA→GPA over [0, 2 MiB)) at
+        // GUEST_LM_PT_GPA — CR3 points here; the NPT resolves the GPAs.
+        // SAFETY: ram_raw owns GUEST_RAM_BYTES writable bytes.
+        let ram = unsafe { core::slice::from_raw_parts_mut(ram_raw, GUEST_RAM_BYTES) };
+        let pt = GUEST_LM_PT_GPA;
+        let guest_cr3 = build_identity_npt_2mib(
+            &mut ram[pt..pt + 3 * 4096],
+            GUEST_LM_PT_GPA as u64,
+            GUEST_RAM_BYTES as u64,
+        )
+        .ok()?
+        .ncr3;
+
+        // NPT mapping guest GPA [0, 2 MiB) onto the isolated RAM window.
+        // SAFETY: NptBuf is nonzero, 4 KiB-aligned; alloc_zeroed yields it or null.
+        let npt_raw = unsafe { alloc_zeroed(Layout::new::<NptBuf>()) };
+        if npt_raw.is_null() {
+            return None;
+        }
+        let npt_pa = npt_raw as u64;
+        // SAFETY: npt_raw owns a live, zeroed NptBuf, leaked below.
+        let npt_buf = unsafe { core::slice::from_raw_parts_mut(npt_raw, 3 * 4096) };
+        let ncr3 = build_npt_2mib(npt_buf, npt_pa, guest_spa, GUEST_RAM_BYTES as u64)
+            .ok()?
+            .ncr3;
+
+        // Program the VMCB for long mode entering the interrupted code at GVA 0.
+        let mut vmcb = Vmcb::new().ok()?;
+        let setup = LongModeGuestSetup {
+            asid: 1,
+            nested_cr3: ncr3,
+            guest_cr3,
+            entry_ip: 0,
+            stack_pointer: GUEST_LM_STACK,
+        };
+        program_long_mode_hlt_guest(vmcb.as_bytes_mut(), &setup).ok()?;
+
+        // Point GDTR/IDTR at the guest's tables so interrupt delivery can read
+        // the gate and reload CS from the code descriptor (program_long_mode_
+        // hlt_guest leaves them zeroed). GDT: 3 descriptors (limit 0x17); IDT:
+        // 256 gates (limit 0xFFF, covering GUEST_EVENT_VECTOR's slot).
+        write_segment(
+            vmcb.as_bytes_mut(),
+            save::GDTR,
+            VmcbSegment {
+                selector: 0,
+                attrib: 0,
+                limit: 0x0017,
+                base: GUEST_LM_GDT_GPA as u64,
+            },
+        );
+        write_segment(
+            vmcb.as_bytes_mut(),
+            save::IDTR,
+            VmcbSegment {
+                selector: 0,
+                attrib: 0,
+                limit: 0x0FFF,
+                base: GUEST_LM_IDT_GPA as u64,
+            },
+        );
+
+        // Arm port-I/O interception so the resumed code's OUT takes an IOIO exit.
+        let iopm = IoPermissionsMap::intercept_all().ok()?;
+        enable_io_intercept(vmcb.as_bytes_mut(), iopm.base_addr());
+        core::mem::forget(iopm);
+
+        // Arm EVENTINJ: VMRUN injects GUEST_EVENT_VECTOR before the first guest
+        // instruction; the run loop clears it after entry so it fires once.
+        let inj = encode_event_inj(GUEST_EVENT_VECTOR, event_type::EXTERNAL_INTERRUPT, None);
+        set_event_inj(vmcb.as_bytes_mut(), inj);
+
+        let vmcb_pa = vmcb.base_addr();
+        core::mem::forget(vmcb); // must outlive VMRUN
+        Some((vmcb_pa, guest_spa))
+    }
+
     /// Execute one `VMRUN` on the VMCB at `vmcb_pa`, swapping the guest's
     /// general-purpose registers (`*gprs`) in around the guest and back out on
     /// `#VMEXIT`.
@@ -1748,6 +1959,45 @@ mod tests {
             usize::from(GUEST_EVENT_WORK_OFF) < 0xFFF0,
             "work marker below the stack frame"
         );
+    }
+
+    #[test]
+    fn long_mode_event_program_lays_out_gdt_idt_and_iretq_handler() {
+        let mut ram = vec![0u8; 0x0020_0000];
+        write_long_mode_event_program(&mut ram);
+
+        // Interrupted entry at GVA 0: OUT GUEST_LM_EVENT_PORT, AL; HLT.
+        assert_eq!(ram[0], 0xE6);
+        assert_eq!(ram[1], GUEST_LM_EVENT_PORT);
+        assert_eq!(ram[2], 0xF4);
+
+        // Handler: MOV AL, SENTINEL; IRETQ (REX.W CF — pops the 64-bit frame).
+        let h = GUEST_LM_HANDLER_OFF;
+        assert_eq!(ram[h], 0xB0);
+        assert_eq!(ram[h + 1], GUEST_LM_EVENT_SENTINEL);
+        assert_eq!(ram[h + 2], 0x48, "REX.W");
+        assert_eq!(ram[h + 3], 0xCF, "IRETQ");
+
+        // GDT: [0] null, [1] 64-bit code (selector 0x08), [2] data (0x10).
+        let g = GUEST_LM_GDT_GPA;
+        assert!(ram[g..g + 8].iter().all(|&b| b == 0), "null descriptor");
+        let code = u64::from_le_bytes(ram[g + 8..g + 16].try_into().unwrap());
+        assert_eq!(code, 0x00AF_9B00_0000_FFFF, "64-bit code descriptor");
+        let data = u64::from_le_bytes(ram[g + 16..g + 24].try_into().unwrap());
+        assert_eq!(data, 0x00CF_9300_0000_FFFF, "data descriptor");
+
+        // IDT 64-bit interrupt gate for the vector → selector 0x08, offset
+        // GUEST_LM_HANDLER_OFF, present/DPL0/type-0xE.
+        let gate = GUEST_LM_IDT_GPA + (GUEST_EVENT_VECTOR as usize) * 16;
+        let ob = (GUEST_LM_HANDLER_OFF as u64).to_le_bytes();
+        assert_eq!(ram[gate], ob[0], "offset 7:0");
+        assert_eq!(ram[gate + 1], ob[1], "offset 15:8");
+        assert_eq!(ram[gate + 2], 0x08, "gate selector low (code)");
+        assert_eq!(ram[gate + 3], 0x00, "gate selector high");
+        assert_eq!(ram[gate + 4], 0x00, "IST");
+        assert_eq!(ram[gate + 5], 0x8E, "P|DPL0|64-bit interrupt gate");
+        assert_eq!(ram[gate + 6], ob[2], "offset 23:16");
+        assert_eq!(ram[gate + 7], ob[3], "offset 31:24");
     }
 
     #[test]

@@ -184,6 +184,10 @@ RESUME_WORK_LINE="handler work observed through the NPT window"
 # through the NPT, L-bit code segment) runs to its OUT — the mode a real
 # x86-64 OS boots in.
 LONGMODE_LINE="long-mode guest works"
+# Printed once an injected interrupt is delivered through a 64-bit long-mode
+# guest's real IDT/GDT, its handler IRETQs, and the interrupted code resumes —
+# interrupt handling in the mode a real x86-64 OS uses.
+LM_ROUNDTRIP_LINE="long-mode interrupt round-trip works"
 # Printed once the kernel draws to the GOP framebuffer and reads a pixel back
 # — proves the framebuffer I/O backend is wired with the firmware gone.
 GOP_LINE="framebuffer draw ok"
@@ -357,9 +361,10 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$RESUME_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$RESUME_WORK_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$LONGMODE_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$LM_ROUNDTRIP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_TEXT_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery, PCI enumeration, own page tables (null-page guard), SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + interrupt IRET-resume round-trip + 64-bit long-mode guest, and GOP draw observed on serial"
+    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery, PCI enumeration, own page tables (null-page guard), SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + interrupt IRET-resume round-trip + 64-bit long-mode guest + long-mode interrupt round-trip, and GOP draw observed on serial"
     exit 0
 fi
 

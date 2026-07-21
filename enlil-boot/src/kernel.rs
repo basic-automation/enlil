@@ -698,6 +698,10 @@ mod hw {
                         // does work and IRETs back to resume the interrupted
                         // guest — the full interrupt round-trip a real OS does.
                         run_event_inj_resume_guest(serial);
+                        // Fifth guest: the same interrupt round-trip but in
+                        // 64-bit long mode through a real IDT/GDT + IRETQ — the
+                        // mode a real x86-64 OS handles interrupts in.
+                        run_long_mode_event_inj_guest(serial);
                     }
                     None => serial.write_str("enlil kernel: svm: vmcb VMRUN-ready FAILED\n"),
                 }
@@ -965,6 +969,49 @@ mod hw {
                 }
             }
             None => serial.write_str("enlil kernel: svm: long-mode vmcb build FAILED\n"),
+        }
+    }
+
+    /// Build and run the 64-bit long-mode event-injection guest, reporting
+    /// whether the injected interrupt was delivered through the guest's real
+    /// long-mode `IDT` and its handler `IRETQ`ed back to resume the guest.
+    ///
+    /// The long-mode counterpart of [`run_event_inj_resume_guest`]: enlil arms
+    /// `EVENTINJ` so `VMRUN` injects
+    /// [`GUEST_EVENT_VECTOR`](crate::svm::GUEST_EVENT_VECTOR) into a guest
+    /// running in the mode a real x86-64 OS boots in. The CPU reads the guest's
+    /// 64-bit interrupt gate, reloads `CS` from the guest `GDT`, and vectors to
+    /// a handler that sets `AL` and `IRETQ`s; the interrupted code then `OUT`s
+    /// [`GUEST_LM_EVENT_SENTINEL`](crate::svm::GUEST_LM_EVENT_SENTINEL). A
+    /// matching capture proves the full long-mode interrupt round-trip
+    /// (deliver through a real IDT → handle → `IRETQ` → resume) — the enabling
+    /// step for interrupt-driven long-mode guests (ROADMAP 6.2 toward 6.7).
+    fn run_long_mode_event_inj_guest(serial: &SerialPort) {
+        use crate::svm::{GUEST_LM_EVENT_PORT, GUEST_LM_EVENT_SENTINEL};
+        match crate::svm::program_long_mode_event_inj_vmcb() {
+            Some((vmcb, _guest_spa)) => {
+                // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
+                // is a VMRUN-ready long-mode VMCB from
+                // program_long_mode_event_inj_vmcb.
+                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                if run.io_out_to(u16::from(GUEST_LM_EVENT_PORT))
+                    == Some(u32::from(GUEST_LM_EVENT_SENTINEL))
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: long-mode injected interrupt handled and IRETQ-resumed — long-mode interrupt round-trip works\n",
+                    );
+                } else {
+                    let mut e = [0u8; 18];
+                    serial.write_str(
+                        "enlil kernel: svm: long-mode interrupt round-trip NOT observed (final exit ",
+                    );
+                    serial.write_str(format_u64_hex(run.final_exit, &mut e));
+                    serial.write_str(")\n");
+                }
+            }
+            None => {
+                serial.write_str("enlil kernel: svm: long-mode event-inj vmcb build FAILED\n");
+            }
         }
     }
 
