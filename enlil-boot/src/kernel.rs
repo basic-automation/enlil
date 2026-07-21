@@ -687,6 +687,10 @@ mod hw {
                         // Third guest: prove a 64-bit long-mode guest runs (the
                         // mode a real OS boots in).
                         run_long_mode_guest(serial);
+                        // Fourth guest: prove an injected interrupt's handler
+                        // does work and IRETs back to resume the interrupted
+                        // guest — the full interrupt round-trip a real OS does.
+                        run_event_inj_resume_guest(serial);
                     }
                     None => serial.write_str("enlil kernel: svm: vmcb VMRUN-ready FAILED\n"),
                 }
@@ -862,6 +866,66 @@ mod hw {
                 }
             }
             None => serial.write_str("enlil kernel: svm: event-inj vmcb build FAILED\n"),
+        }
+    }
+
+    /// Build and run the *resume* event-injection guest, reporting whether the
+    /// injected interrupt's handler did work and `IRET`ed back to resume the
+    /// interrupted guest.
+    ///
+    /// Where [`run_event_inj_guest`] proves an injected interrupt reaches a
+    /// handler that then `HLT`s, this proves the full round-trip a real guest OS
+    /// interrupt performs. enlil arms `EVENTINJ` so `VMRUN` injects
+    /// [`GUEST_EVENT_VECTOR`](crate::svm::GUEST_EVENT_VECTOR); the guest's IVT
+    /// vectors it to a handler that stores
+    /// [`GUEST_EVENT_WORK_SENTINEL`](crate::svm::GUEST_EVENT_WORK_SENTINEL) into
+    /// guest RAM and `IRET`s, and the interrupted code at GPA 0 then `OUT`s
+    /// [`GUEST_EVENT_RESUME_SENTINEL`](crate::svm::GUEST_EVENT_RESUME_SENTINEL).
+    /// Two independent proofs follow: the resume-port `OUT` in the run record
+    /// (delivered → handled → `IRET` resumed → interrupted code ran), and the
+    /// work sentinel enlil reads back out of the guest's isolated RAM window
+    /// through its system-physical base (the handler mutated guest memory the
+    /// hypervisor can observe) — the enabling step for interrupt-driven device
+    /// backends and a preemptible guest (ROADMAP 6.2).
+    fn run_event_inj_resume_guest(serial: &SerialPort) {
+        use crate::svm::{
+            GUEST_EVENT_RESUME_PORT, GUEST_EVENT_RESUME_SENTINEL, GUEST_EVENT_WORK_OFF,
+            GUEST_EVENT_WORK_SENTINEL,
+        };
+        match crate::svm::program_event_inj_resume_vmcb() {
+            Some((vmcb, guest_spa)) => {
+                // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
+                // is a VMRUN-ready VMCB from program_event_inj_resume_vmcb.
+                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                if run.io_out_to(u16::from(GUEST_EVENT_RESUME_PORT))
+                    == Some(u32::from(GUEST_EVENT_RESUME_SENTINEL))
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: injected interrupt handled and IRET-resumed the guest — interrupt round-trip works\n",
+                    );
+                } else {
+                    serial.write_str(
+                        "enlil kernel: svm: interrupt IRET-resume NOT observed (guest did not resume after the handler)\n",
+                    );
+                }
+                // Read the byte the handler stored, out of the guest's isolated
+                // RAM window (the kernel runs identity-mapped, so guest_spa is a
+                // physical == virtual address). A match proves the handler's
+                // work landed in guest memory the hypervisor can observe.
+                // SAFETY: guest_spa is the base of the leaked, live 2 MiB guest
+                // RAM allocation; WORK_OFF is within it and identity-mapped.
+                let work = unsafe {
+                    core::ptr::read_volatile(
+                        (guest_spa + u64::from(GUEST_EVENT_WORK_OFF)) as *const u8,
+                    )
+                };
+                if work == GUEST_EVENT_WORK_SENTINEL {
+                    serial.write_str(
+                        "enlil kernel: svm: interrupt handler wrote the work sentinel into guest RAM — handler work observed through the NPT window\n",
+                    );
+                }
+            }
+            None => serial.write_str("enlil kernel: svm: event-inj-resume vmcb build FAILED\n"),
         }
     }
 

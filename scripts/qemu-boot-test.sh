@@ -168,6 +168,14 @@ VMMCALL_LINE="hypercall channel works"
 # before the guest's first instruction, and the guest's real-mode IVT vectors
 # it to a handler whose OUT enlil captures — proving event injection.
 EVENTINJ_LINE="event injection works"
+# Printed once enlil injects an interrupt whose handler does work and IRETs back
+# to resume the interrupted guest, which then runs — the full interrupt
+# round-trip (deliver → handle → IRET → continue) a real guest OS performs.
+RESUME_LINE="interrupt round-trip works"
+# Printed once that handler's store into guest RAM is read back by enlil out of
+# the guest's isolated system-physical window — the handler's work observed by
+# the hypervisor through the NPT mapping.
+RESUME_WORK_LINE="handler work observed through the NPT window"
 # Printed once a 64-bit long-mode guest (paging on, CR3 walking its own tables
 # through the NPT, L-bit code segment) runs to its OUT — the mode a real
 # x86-64 OS boots in.
@@ -341,10 +349,12 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$VMLOAD_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$VMMCALL_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$EVENTINJ_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$RESUME_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$RESUME_WORK_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$LONGMODE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_TEXT_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery, PCI enumeration, own page tables, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + 64-bit long-mode guest, and GOP draw observed on serial"
+    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery, PCI enumeration, own page tables, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + interrupt IRET-resume round-trip + 64-bit long-mode guest, and GOP draw observed on serial"
     exit 0
 fi
 
