@@ -369,8 +369,8 @@ mod hw {
 mod tests {
     use super::*;
 
-    /// Build a minimal SDT header with `sig` and `length`.
-    fn sdt_header(sig: &[u8; 4], length: u32) -> [u8; SDT_HEADER_LEN] {
+    /// Build a minimal SDT header with `sig` (a 4-byte signature) and `length`.
+    fn sdt_header(sig: &[u8], length: u32) -> [u8; SDT_HEADER_LEN] {
         let mut h = [0u8; SDT_HEADER_LEN];
         h[..4].copy_from_slice(sig);
         h[4..8].copy_from_slice(&length.to_le_bytes());
@@ -415,7 +415,7 @@ mod tests {
     #[test]
     fn xsdt_entry_count_and_entries() {
         // Header + two 8-byte pointers.
-        let length = (SDT_HEADER_LEN + 16) as u32;
+        let length = u32::try_from(SDT_HEADER_LEN + 16).unwrap();
         let mut xsdt = sdt_header(XSDT_SIGNATURE, length).to_vec();
         xsdt.extend_from_slice(&0x1111u64.to_le_bytes());
         xsdt.extend_from_slice(&0x2222u64.to_le_bytes());
