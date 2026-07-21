@@ -90,6 +90,14 @@ pub enum NptError {
     /// huge-page leaf, not a page-table pointer — the map is huge-page-granular
     /// there and cannot take a 4 KiB leaf without a split ([`map_npt_4kib_leaf`]).
     HugePageOnPath,
+    /// The requested 4 KiB-granular window sat outside the 2 MiB-mapped range
+    /// ([`build_identity_npt_2mib_with_4kib_window`]).
+    FineWindowOutOfRange {
+        /// The offending 2 MiB-slot index.
+        index: u64,
+        /// The number of 2 MiB slots the map covers.
+        num_2mib: u64,
+    },
 }
 
 /// Build a 2 MiB-huge-page identity map of `[0, bytes_to_map)` for use as an
@@ -439,6 +447,147 @@ pub fn map_npt_4kib_leaf(
     Ok(())
 }
 
+/// Build an identity map of `[0, bytes_to_map)` mostly at **2 MiB huge-page**
+/// granularity, with one 2 MiB slot rendered at **4 KiB** granularity.
+///
+/// The single slot `fine_2mib_index` is mapped through a page table instead of
+/// a huge-page leaf, and each `guard_pages` index (a 4 KiB page `0..512` within
+/// that slot) is left not-present so a touch of it faults.
+///
+/// The mixed-granularity composing map the host stack's guard page needs: the
+/// bulk of the identity map stays cheap 2 MiB huge pages, while the one 2 MiB
+/// region holding the stack is split into 4 KiB pages so the page just below
+/// the stack can be left unmapped — a stack overflow then faults into the
+/// kernel's `#PF` handler instead of silently corrupting whatever sits below.
+/// The same shape backs fine-grained MMIO trapping of a sub-2-MiB window.
+///
+/// Layout: `PML4` + `PDPT` + one `PD` per gibibyte (as
+/// [`build_identity_npt_2mib`]) plus one extra `PT` for the fine slot; that
+/// slot's `PD` entry points at the `PT` (a table pointer, not a huge-page leaf)
+/// so its 4 KiB leaves take effect while every other `PD` entry stays a 2 MiB
+/// huge-page leaf. Identity only (physical == mapped address); every level sets
+/// `U/S = 1` (see module docs). Returns an [`NptLayout`] whose `ncr3`
+/// (`== phys_base`) is the value to load into `CR3` (host) or `NESTED_CR3`
+/// (guest).
+///
+/// # Errors
+///
+/// - [`NptError::EmptyRegion`] if `bytes_to_map == 0`;
+/// - [`NptError::UnalignedBase`] if `phys_base` is not 4 KiB-aligned;
+/// - [`NptError::MapTooLarge`] if the map exceeds 512 GiB;
+/// - [`NptError::FineWindowOutOfRange`] if `fine_2mib_index` is outside the
+///   mapped range;
+/// - [`NptError::GuardPageOutOfRange`] if a guard index is `>= 512`;
+/// - [`NptError::TablesExceedBuffer`] if the tables do not fit in `buf`.
+pub fn build_identity_npt_2mib_with_4kib_window(
+    buf: &mut [u8],
+    phys_base: u64,
+    bytes_to_map: u64,
+    fine_2mib_index: u64,
+    guard_pages: &[u64],
+) -> Result<NptLayout, NptError> {
+    if bytes_to_map == 0 {
+        return Err(NptError::EmptyRegion);
+    }
+    if phys_base & (PAGE_SIZE - 1) != 0 {
+        return Err(NptError::UnalignedBase);
+    }
+
+    let num_2mib = bytes_to_map.div_ceil(HUGE_2MIB);
+    let num_pd = num_2mib.div_ceil(TABLE_ENTRIES);
+    if num_pd > TABLE_ENTRIES {
+        return Err(NptError::MapTooLarge { num_pd });
+    }
+    if fine_2mib_index >= num_2mib {
+        return Err(NptError::FineWindowOutOfRange {
+            index: fine_2mib_index,
+            num_2mib,
+        });
+    }
+    for &g in guard_pages {
+        if g >= TABLE_ENTRIES {
+            return Err(NptError::GuardPageOutOfRange {
+                index: g,
+                num_pages: TABLE_ENTRIES,
+            });
+        }
+    }
+    // All counts are ≤ 512 now, so the conversions never saturate.
+    let num_pd = usize::try_from(num_pd).unwrap_or(usize::MAX);
+    let num_2mib = usize::try_from(num_2mib).unwrap_or(usize::MAX);
+    let fine = usize::try_from(fine_2mib_index).unwrap_or(usize::MAX);
+
+    let table_count = 2 + num_pd + 1; // PML4 + PDPT + PDs + one PT (the fine slot)
+    let region_bytes = table_count
+        .checked_mul(4096)
+        .ok_or(NptError::TablesExceedBuffer {
+            needed: usize::MAX,
+            have: buf.len(),
+        })?;
+    if region_bytes > buf.len() {
+        return Err(NptError::TablesExceedBuffer {
+            needed: region_bytes,
+            have: buf.len(),
+        });
+    }
+    for byte in &mut buf[..region_bytes] {
+        *byte = 0;
+    }
+
+    let table_flags = flags::PRESENT | flags::WRITABLE | flags::USER;
+    let pdpt_pa = phys_base + PAGE_SIZE;
+    let first_pd_pa = phys_base + 2 * PAGE_SIZE;
+    let fine_pt_pa = phys_base + (2 + num_pd as u64) * PAGE_SIZE;
+    let pdpt_off = 4096;
+    let first_pd_off = 2 * 4096;
+    let fine_pt_off = (2 + num_pd) * 4096;
+
+    // PML4[0] → PDPT (a ≤512 GiB map lives entirely under PML4[0]).
+    write_entry(buf, 0, (pdpt_pa & ADDR_MASK) | table_flags);
+    // PDPT[k] → PD[k], one PD per gibibyte.
+    for k in 0..num_pd {
+        let pd_pa = first_pd_pa + (k as u64) * PAGE_SIZE;
+        write_entry(buf, pdpt_off + k * 8, (pd_pa & ADDR_MASK) | table_flags);
+    }
+
+    // PD leaves: 2 MiB huge pages everywhere except the fine slot, whose PD
+    // entry points at the extra PT instead of being a huge-page leaf.
+    let leaf_flags = flags::PRESENT | flags::WRITABLE | flags::USER | flags::HUGE_PAGE;
+    for page in 0..num_2mib {
+        let k = page / 512;
+        let j = page % 512;
+        let pd_off = first_pd_off + k * 4096;
+        if page == fine {
+            write_entry(buf, pd_off + j * 8, (fine_pt_pa & ADDR_MASK) | table_flags);
+        } else {
+            let phys = (page as u64) * HUGE_2MIB;
+            write_entry(buf, pd_off + j * 8, (phys & ADDR_MASK) | leaf_flags);
+        }
+    }
+
+    // The fine slot's PT: 512 identity 4 KiB leaves, minus the guard pages
+    // (left not-present by the zeroing above so a touch faults).
+    let fine_base = (fine as u64) * HUGE_2MIB;
+    let fine_page_flags = flags::PRESENT | flags::WRITABLE | flags::USER;
+    for p in 0..usize::try_from(TABLE_ENTRIES).unwrap_or(512) {
+        if guard_pages.contains(&(p as u64)) {
+            continue;
+        }
+        let phys = fine_base + (p as u64) * PAGE_SIZE;
+        write_entry(
+            buf,
+            fine_pt_off + p * 8,
+            (phys & ADDR_MASK) | fine_page_flags,
+        );
+    }
+
+    Ok(NptLayout {
+        ncr3: phys_base,
+        table_count,
+        bytes: region_bytes,
+    })
+}
+
 /// Read the present table entry at `table_off + index*8` and return the `buf`
 /// offset of the table it points at (its physical address minus `phys_base`).
 fn child_offset(
@@ -755,5 +904,69 @@ mod tests {
             build_identity_npt_2mib(&mut big, 0, 513 * 1024 * 1024 * 1024),
             Err(NptError::MapTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn mixed_map_renders_one_slot_at_4kib_with_a_guard() {
+        // 6 MiB = three 2 MiB slots; render slot 1 at 4 KiB with page 2 a guard.
+        let mut buf = alloc::vec![0u8; 0x5000];
+        let layout =
+            build_identity_npt_2mib_with_4kib_window(&mut buf, 0, 6 * 1024 * 1024, 1, &[2])
+                .expect("mixed map builds");
+        // PML4 + PDPT + 1 PD + 1 PT for the fine slot.
+        assert_eq!(layout.ncr3, 0);
+        assert_eq!(layout.table_count, 4);
+        assert_eq!(layout.bytes, 4 * 4096);
+
+        let ptr = flags::PRESENT | flags::WRITABLE | flags::USER;
+        let huge = ptr | flags::HUGE_PAGE;
+
+        // PML4[0] → PDPT, PDPT[0] → PD.
+        assert_eq!(read_entry(&buf, 0, 0), 0x1000 | ptr);
+        assert_eq!(read_entry(&buf, 0x1000, 0), 0x2000 | ptr);
+
+        // Slot 0 and slot 2 stay 2 MiB huge-page leaves (slot 0 phys == 0).
+        assert_eq!(read_entry(&buf, 0x2000, 0), huge);
+        assert_eq!(read_entry(&buf, 0x2000, 2), (2 * HUGE_2MIB) | huge);
+
+        // Slot 1's PD entry points at the PT (a table pointer, NOT a huge leaf).
+        assert_eq!(read_entry(&buf, 0x2000, 1), 0x3000 | ptr);
+        assert_eq!(read_entry(&buf, 0x2000, 1) & flags::HUGE_PAGE, 0);
+
+        // The fine slot's PT identity-maps its 512 pages at 4 KiB granularity,
+        // except the guard page (index 2), left not-present.
+        let fine_base = HUGE_2MIB; // slot 1
+        assert_eq!(read_entry(&buf, 0x3000, 0), fine_base | ptr);
+        assert_eq!(read_entry(&buf, 0x3000, 1), (fine_base + PAGE_SIZE) | ptr);
+        assert_eq!(read_entry(&buf, 0x3000, 2) & flags::PRESENT, 0); // guard
+        assert_eq!(
+            read_entry(&buf, 0x3000, 3),
+            (fine_base + 3 * PAGE_SIZE) | ptr
+        );
+        assert_eq!(
+            read_entry(&buf, 0x3000, 511),
+            (fine_base + 511 * PAGE_SIZE) | ptr
+        );
+    }
+
+    #[test]
+    fn mixed_map_rejects_out_of_range_window_and_guard() {
+        let mut buf = alloc::vec![0u8; 0x5000];
+        // The fine slot must lie within the mapped range (4 MiB = 2 slots → 0,1).
+        assert_eq!(
+            build_identity_npt_2mib_with_4kib_window(&mut buf, 0, 4 * 1024 * 1024, 2, &[]),
+            Err(NptError::FineWindowOutOfRange {
+                index: 2,
+                num_2mib: 2
+            })
+        );
+        // A guard index past the fine slot's 512 pages is rejected.
+        assert_eq!(
+            build_identity_npt_2mib_with_4kib_window(&mut buf, 0, 4 * 1024 * 1024, 0, &[512]),
+            Err(NptError::GuardPageOutOfRange {
+                index: 512,
+                num_pages: 512
+            })
+        );
     }
 }
