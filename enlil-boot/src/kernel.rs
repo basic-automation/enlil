@@ -712,6 +712,10 @@ mod hw {
                         // 64-bit long mode through a real IDT/GDT + IRETQ — the
                         // mode a real x86-64 OS handles interrupts in.
                         run_long_mode_event_inj_guest(serial);
+                        // Sixth guest: a pending virtual interrupt held off
+                        // while the guest masks interrupts (IF=0), then
+                        // delivered on STI — how a real OS is preempted.
+                        run_long_mode_vintr_guest(serial);
                     }
                     None => serial.write_str("enlil kernel: svm: vmcb VMRUN-ready FAILED\n"),
                 }
@@ -1021,6 +1025,70 @@ mod hw {
             }
             None => {
                 serial.write_str("enlil kernel: svm: long-mode event-inj vmcb build FAILED\n");
+            }
+        }
+    }
+
+    /// Build and run the long-mode *virtual-interrupt masking* guest, reporting
+    /// whether a pending virtual interrupt was correctly held off while the
+    /// guest masked interrupts and delivered only after it `STI`ed.
+    ///
+    /// enlil posts a pending virtual interrupt in the VMCB (`INT_CONTROL` /
+    /// `encode_vintr`) that the guest's `EFLAGS.IF` gates — the mechanism that
+    /// preempts a *running* guest. The guest `OUT`s
+    /// [`GUEST_LM_VINTR_BEFORE_SENTINEL`](crate::svm::GUEST_LM_VINTR_BEFORE_SENTINEL)
+    /// with interrupts masked, `STI`s, takes the now-deliverable interrupt (its
+    /// handler `OUT`s
+    /// [`GUEST_LM_VINTR_HANDLER_SENTINEL`](crate::svm::GUEST_LM_VINTR_HANDLER_SENTINEL)
+    /// and `IRETQ`s), then `OUT`s
+    /// [`GUEST_LM_VINTR_RESUME_SENTINEL`](crate::svm::GUEST_LM_VINTR_RESUME_SENTINEL).
+    /// The BEFORE → HANDLER → RESUME order in the run record proves the interrupt
+    /// stayed masked until `STI` — real interrupt masking, the basis for a
+    /// preemptible guest OS (ROADMAP 6.2 toward 6.7).
+    fn run_long_mode_vintr_guest(serial: &SerialPort) {
+        use crate::svm::{
+            GUEST_LM_VINTR_BEFORE_PORT, GUEST_LM_VINTR_BEFORE_SENTINEL,
+            GUEST_LM_VINTR_HANDLER_PORT, GUEST_LM_VINTR_HANDLER_SENTINEL,
+            GUEST_LM_VINTR_RESUME_PORT, GUEST_LM_VINTR_RESUME_SENTINEL,
+        };
+        match crate::svm::program_long_mode_vintr_vmcb() {
+            Some((vmcb, _spa)) => {
+                // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
+                // is a VMRUN-ready long-mode VMCB from program_long_mode_vintr_vmcb.
+                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                // The index of the first OUT matching (port, sentinel), if any.
+                let pos = |port: u8, val: u8| -> Option<usize> {
+                    let mut i = 0;
+                    while i < run.io_out_count {
+                        if run.io_outs[i].0 == u16::from(port) && run.io_outs[i].1 == u32::from(val)
+                        {
+                            return Some(i);
+                        }
+                        i += 1;
+                    }
+                    None
+                };
+                let before = pos(GUEST_LM_VINTR_BEFORE_PORT, GUEST_LM_VINTR_BEFORE_SENTINEL);
+                let handler = pos(GUEST_LM_VINTR_HANDLER_PORT, GUEST_LM_VINTR_HANDLER_SENTINEL);
+                let resume = pos(GUEST_LM_VINTR_RESUME_PORT, GUEST_LM_VINTR_RESUME_SENTINEL);
+                if let (Some(b), Some(h), Some(r)) = (before, handler, resume)
+                    && b < h
+                    && h < r
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: masked guest OUT preceded the STI-delivered virtual interrupt, then resumed — virtual-interrupt masking works\n",
+                    );
+                } else {
+                    let mut e = [0u8; 18];
+                    serial.write_str(
+                        "enlil kernel: svm: virtual-interrupt masking NOT observed (final exit ",
+                    );
+                    serial.write_str(format_u64_hex(run.final_exit, &mut e));
+                    serial.write_str(")\n");
+                }
+            }
+            None => {
+                serial.write_str("enlil kernel: svm: long-mode vintr vmcb build FAILED\n");
             }
         }
     }
