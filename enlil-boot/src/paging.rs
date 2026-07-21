@@ -61,33 +61,47 @@ pub use hw::install_identity_map;
 mod hw {
     use super::MAP_MAX_BYTES;
     use alloc::alloc::{Layout, alloc_zeroed};
-    use enlil_hal::npt::build_identity_npt_2mib;
+    use enlil_hal::npt::build_identity_npt_2mib_with_4kib_window;
 
-    /// Table pages a 2 MiB-huge-page identity map of `span_bytes` needs:
-    /// PML4 + PDPT + one PD per GiB (`ceil(span / 1 GiB)`).
+    /// Table pages the kernel's identity map needs: PML4 + PDPT + one PD per GiB
+    /// (`ceil(span / 1 GiB)`) + one PT for the low 2 MiB slot, which is rendered
+    /// at 4 KiB granularity so virtual address 0 (the null page) can be a guard.
     const fn table_pages(span_bytes: u64) -> u64 {
         let num_2mib = span_bytes.div_ceil(2 * 1024 * 1024);
         let num_pd = num_2mib.div_ceil(512);
-        2 + num_pd
+        2 + num_pd + 1
     }
 
     /// Build the kernel's own identity page tables covering `span_bytes` and
-    /// load them into `CR3`.
+    /// load them into `CR3`, leaving **virtual address 0 (the null page)
+    /// unmapped** as a guard.
+    ///
+    /// The bulk of the map is cheap 2 MiB huge pages; only the low 2 MiB slot is
+    /// rendered at 4 KiB granularity (via
+    /// [`build_identity_npt_2mib_with_4kib_window`]) so page 0 can be left
+    /// not-present. A stray kernel null-pointer dereference then takes a `#PF`
+    /// into the kernel's own handler (already on its IST stack) instead of
+    /// silently reading or corrupting physical page 0. The 64-bit kernel never
+    /// touches VA 0 — its code, stack, heap, the ACPI region, and the
+    /// framebuffer all live well above the first 2 MiB — so the guard is
+    /// invisible to normal execution (reaching the post-`CR3` steps is itself
+    /// the proof).
     ///
     /// Returns the installed table root (`CR3` value), or `None` if the buffer
-    /// could not be allocated or the map built.
-    /// The buffer is sized to exactly the tables the span needs and leaked (the
-    /// page tables must live for the kernel's lifetime). The kernel runs
-    /// identity-mapped, so the allocation's virtual address is its physical
-    /// address — both the builder's `phys_base` and the `CR3` value.
+    /// could not be allocated or the map built. The buffer is sized to exactly
+    /// the tables the span needs and leaked (the page tables must live for the
+    /// kernel's lifetime). The kernel runs identity-mapped, so the allocation's
+    /// virtual address is its physical address — both the builder's `phys_base`
+    /// and the `CR3` value.
     ///
     /// # Safety
     ///
     /// Loading `CR3` replaces the active address space. The caller must ensure
     /// `span_bytes` covers everything the kernel touches next (its code, stack,
     /// heap, the ACPI region, the framebuffer) — pass
-    /// [`required_map_bytes`](super::required_map_bytes). A short map would fault
-    /// on the first unmapped access.
+    /// [`required_map_bytes`](super::required_map_bytes) — and that nothing the
+    /// kernel touches lives in the guarded null page `[0, 4 KiB)`. A short map,
+    /// or a live access to the null page, would fault.
     #[must_use]
     pub unsafe fn install_identity_map(span_bytes: u64) -> Option<u64> {
         let span = span_bytes.min(MAP_MAX_BYTES);
@@ -103,11 +117,17 @@ mod hw {
         // SAFETY: raw owns layout.size() bytes; it is leaked below so the slice
         // never outlives the allocation.
         let buf = unsafe { core::slice::from_raw_parts_mut(raw, layout.size()) };
-        let cr3 = build_identity_npt_2mib(buf, phys_base, span).ok()?.ncr3;
+        // Render the low 2 MiB slot (index 0) at 4 KiB with page 0 a guard; the
+        // rest of the span stays 2 MiB huge pages. span >= 4 GiB (the map floor)
+        // so slot 0 is always within range.
+        let cr3 = build_identity_npt_2mib_with_4kib_window(buf, phys_base, span, 0, &[0])
+            .ok()?
+            .ncr3;
 
         // SAFETY: cr3 is a freshly built identity map covering `span` bytes of
         // physical memory — the kernel's code/stack/heap/ACPI/framebuffer all
-        // lie within it, so execution continues seamlessly after the reload.
+        // lie within it and above the guarded null page, so execution continues
+        // seamlessly after the reload.
         unsafe {
             core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
         }

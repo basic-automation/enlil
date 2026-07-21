@@ -488,6 +488,13 @@ mod hw {
                 serial.write_str(" GiB) installed, CR3=");
                 serial.write_str(format_u64_hex(cr3, &mut c));
                 serial.write_str(" — off firmware page tables\n");
+                // Reaching here proves the mixed 2 MiB + 4 KiB map is correct
+                // AND that the kernel touched nothing in the guarded null page
+                // during the reload — the low 2 MiB slot is 4 KiB-granular with
+                // VA 0 left unmapped so a null dereference faults.
+                serial.write_str(
+                    "enlil kernel: paging: null-page guard armed (VA 0 unmapped) — kernel runs on the mixed 2 MiB + 4 KiB map\n",
+                );
             }
             None => serial.write_str("enlil kernel: paging: page-table build FAILED\n"),
         }

@@ -109,6 +109,10 @@ PCI_BAR_LINE="pci: BAR"
 # Printed once the kernel builds its own identity page tables and reloads CR3
 # off the firmware's — reaching this line proves the map covers the kernel.
 PAGING_LINE="off firmware page tables"
+# Printed once the kernel installs the mixed 2 MiB + 4 KiB identity map with the
+# null page (VA 0) left unmapped as a guard; booting past it proves the mixed
+# map is correct and the kernel never touches page 0.
+NULLGUARD_LINE="null-page guard armed"
 # Printed once the kernel turns on the CPU virtualization extension (SVM on
 # this AMD host) — the enable gate for running a guest with VMRUN.
 SVM_LINE="svm: enabled"
@@ -334,6 +338,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ECAM_SCAN_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PCI_BAR_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PAGING_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$NULLGUARD_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$SVM_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$HSAVE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$VMCB_LINE" "$SERIAL_LOG" 2>/dev/null \
@@ -354,7 +359,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$LONGMODE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_TEXT_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery, PCI enumeration, own page tables, SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + interrupt IRET-resume round-trip + 64-bit long-mode guest, and GOP draw observed on serial"
+    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery, PCI enumeration, own page tables (null-page guard), SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + interrupt IRET-resume round-trip + 64-bit long-mode guest, and GOP draw observed on serial"
     exit 0
 fi
 
