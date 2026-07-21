@@ -212,6 +212,29 @@ pub struct MemoryBar {
     pub is_64: bool,
 }
 
+/// A summary of the memory BARs across PCI bus 0 — the total MMIO footprint.
+///
+/// The hypervisor must account for it when it routes config space and plans
+/// device passthrough (each guest's assigned BARs must land in its own address
+/// space).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MemoryBarSummary {
+    /// Number of implemented memory BARs found (a 64-bit BAR counts once).
+    pub count: u32,
+    /// Sum of their region sizes in bytes (from the write-probe; unsized BARs
+    /// contribute 0).
+    pub total_bytes: u64,
+}
+
+impl MemoryBarSummary {
+    /// Fold one implemented memory BAR of `size` bytes into the summary.
+    #[cfg(any(target_os = "uefi", test))]
+    const fn record(&mut self, size: u64) {
+        self.count += 1;
+        self.total_bytes = self.total_bytes.saturating_add(size);
+    }
+}
+
 /// What the kernel discovered from a PCI bus-0 scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PciScan {
@@ -245,7 +268,7 @@ impl PciScan {
 }
 
 #[cfg(target_os = "uefi")]
-pub use hw::{first_memory_bar, scan_bus0, scan_ecam};
+pub use hw::{first_memory_bar, scan_bus0, scan_ecam, scan_memory_bars};
 
 #[cfg(target_os = "uefi")]
 mod hw {
@@ -498,6 +521,60 @@ mod hw {
         None
     }
 
+    /// Summarize every implemented memory BAR across PCI bus 0 — their count and
+    /// total region size (the MMIO footprint the hypervisor must account for).
+    ///
+    /// Walks each present function's BARs 0–5 (following the multifunction bit),
+    /// skips I/O BARs and unimplemented (base 0) BARs, sizes each memory BAR via
+    /// the write-probe, and pairs a 64-bit BAR with its high dword (counted
+    /// once). The read-only companion to [`first_memory_bar`] that reports the
+    /// whole bus's MMIO rather than the first window.
+    #[must_use]
+    pub fn scan_memory_bars() -> super::MemoryBarSummary {
+        const HEADER_TYPE_OFFSET: u8 = 0x0C;
+        const HEADER_MULTIFUNCTION: u32 = 0x0080_0000;
+        const BAR_COUNT: u8 = 6;
+
+        let mut summary = super::MemoryBarSummary::default();
+        for device in 0u8..32 {
+            let dword0 = config_read(0, device, 0, 0);
+            if !vendor_present(vendor_of(dword0)) {
+                continue;
+            }
+            let multifunction =
+                config_read(0, device, 0, HEADER_TYPE_OFFSET) & HEADER_MULTIFUNCTION != 0;
+            let last_fn = if multifunction { 7 } else { 0 };
+            for function in 0u8..=last_fn {
+                if function != 0 && !vendor_present(vendor_of(config_read(0, device, function, 0)))
+                {
+                    continue;
+                }
+                let mut i = 0u8;
+                while i < BAR_COUNT {
+                    let off = BAR0_OFFSET + i * 4;
+                    let bar = config_read(0, device, function, off);
+                    if bar_is_io(bar) {
+                        i += 1;
+                        continue;
+                    }
+                    if bar_is_mem_64(bar) {
+                        let high = config_read(0, device, function, off + 4);
+                        if bar_mem_base_64(bar, high) != 0 {
+                            summary.record(size_memory_bar(device, function, off, true));
+                        }
+                        i += 2; // a 64-bit BAR consumes this dword and the next
+                    } else {
+                        if bar_mem_base(bar) != 0 {
+                            summary.record(size_memory_bar(device, function, off, false));
+                        }
+                        i += 1;
+                    }
+                }
+            }
+        }
+        summary
+    }
+
     /// Read config dword `offset` of `bus:device.function` through the ECAM
     /// window at `ecam_base` (MMIO).
     ///
@@ -695,5 +772,20 @@ mod tests {
         assert_eq!(scan.storage, 2);
         assert_eq!(scan.network, 1);
         assert_eq!(scan.display, 0);
+    }
+
+    #[test]
+    fn memory_bar_summary_accumulates_count_and_total() {
+        let mut s = MemoryBarSummary::default();
+        assert_eq!((s.count, s.total_bytes), (0, 0));
+        s.record(16 * 1024 * 1024);
+        s.record(0x100);
+        s.record(0); // an unsized BAR contributes 0 bytes but is still counted
+        assert_eq!(s.count, 3);
+        assert_eq!(s.total_bytes, 16 * 1024 * 1024 + 0x100);
+        // The total saturates rather than overflowing on a pathological size.
+        s.record(u64::MAX);
+        assert_eq!(s.total_bytes, u64::MAX);
+        assert_eq!(s.count, 4);
     }
 }

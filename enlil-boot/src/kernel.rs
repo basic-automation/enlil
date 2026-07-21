@@ -559,6 +559,16 @@ mod hw {
         } else {
             serial.write_str("enlil kernel: pci: BAR scan — no memory BAR on bus 0\n");
         }
+        // Summarize every memory BAR on bus 0 — the total MMIO footprint the
+        // hypervisor must account for (config-space routing + passthrough).
+        let bars = crate::pci::scan_memory_bars();
+        let mut n = [0u8; 20];
+        let mut t = [0u8; 18];
+        serial.write_str("enlil kernel: pci: ");
+        serial.write_str(format_u64(u64::from(bars.count), &mut n));
+        serial.write_str(" memory BARs on bus 0 totaling ");
+        serial.write_str(format_u64_hex(bars.total_bytes, &mut t));
+        serial.write_str(" bytes MMIO\n");
     }
 
     /// Arm the LAPIC timer once and prove it fires an interrupt into the kernel.
