@@ -281,6 +281,16 @@ pub const GUEST_LM_VINTR_RESUME_PORT: u8 = 0x8E;
 /// The byte the virtual-interrupt guest `OUT`s after resuming.
 pub const GUEST_LM_VINTR_RESUME_SENTINEL: u8 = 0x33;
 
+/// The port the long-mode *preemption* guest's handler `OUT`s.
+///
+/// The guest spins in an unconditional `jmp $` that never exits on its own, so
+/// a capture here can only come from the pending virtual interrupt breaking the
+/// loop — proof enlil forcibly preempted a non-cooperative running guest.
+pub const GUEST_LM_PREEMPT_PORT: u8 = 0x8F;
+
+/// The byte the preemption guest's handler `OUT`s before halting.
+pub const GUEST_LM_PREEMPT_SENTINEL: u8 = 0x44;
+
 /// Guest-virtual/-physical offset of the long-mode event guest's handler (past
 /// the entry code, within the identity-mapped `[0, 2 MiB)` window).
 #[cfg(any(target_os = "uefi", test))]
@@ -732,11 +742,41 @@ fn write_long_mode_vintr_program(ram: &mut [u8]) {
     write_long_mode_gdt_and_gate(ram);
 }
 
+/// Stamp the long-mode **preemption** guest's program into `ram`: a guest that
+/// `STI`s and then spins forever, only stoppable by a preempting interrupt.
+///
+/// Entry at GVA 0: `sti ; jmp $` — after the `STI` shadow the guest loops on an
+/// unconditional short jump-to-self that never exits (no `OUT`, no `HLT`). The
+/// pending virtual interrupt (posted in the VMCB) is the only thing that can
+/// break the loop: it vectors through the shared long-mode `IDT` to a handler
+/// that `OUT`s [`GUEST_LM_PREEMPT_SENTINEL`] and `HLT`s. A captured sentinel
+/// therefore proves enlil forcibly preempted a non-cooperative running guest —
+/// the essence of time-slicing. Reuses [`write_long_mode_gdt_and_gate`].
+///
+/// Pure and host-testable; the firmware builder posts the virtual interrupt.
+#[cfg(any(target_os = "uefi", test))]
+fn write_long_mode_preempt_program(ram: &mut [u8]) {
+    // Entry at GVA 0: sti; jmp $ (spin forever with interrupts enabled).
+    ram[0] = 0xFB; // STI
+    ram[1] = 0xEB; // JMP rel8
+    ram[2] = 0xFE; // -2 → jump to the JMP itself (spin)
+
+    // 64-bit handler: mov al, SENTINEL; out PORT, al; hlt (stops the guest).
+    let h = GUEST_LM_HANDLER_OFF;
+    ram[h] = 0xB0; // MOV AL, imm8
+    ram[h + 1] = GUEST_LM_PREEMPT_SENTINEL;
+    ram[h + 2] = 0xE6; // OUT imm8, AL
+    ram[h + 3] = GUEST_LM_PREEMPT_PORT;
+    ram[h + 4] = 0xF4; // HLT
+
+    write_long_mode_gdt_and_gate(ram);
+}
+
 #[cfg(target_os = "uefi")]
 pub use hw::{
     enable_svm, program_boot_vmcb, program_event_inj_resume_vmcb, program_event_inj_vmcb,
-    program_host_save_area, program_long_mode_event_inj_vmcb, program_long_mode_vintr_vmcb,
-    program_long_mode_vmcb, run_boot_guest_loop,
+    program_host_save_area, program_long_mode_event_inj_vmcb, program_long_mode_preempt_vmcb,
+    program_long_mode_vintr_vmcb, program_long_mode_vmcb, run_boot_guest_loop,
 };
 
 #[cfg(target_os = "uefi")]
@@ -1583,6 +1623,38 @@ mod hw {
     /// allocations are leaked to outlive `VMRUN`. Returns `None` on failure.
     #[must_use]
     pub fn program_long_mode_vintr_vmcb() -> Option<(u64, u64)> {
+        build_long_mode_vintr_guest(super::write_long_mode_vintr_program)
+    }
+
+    /// Build a `VMRUN`-ready VMCB that **preempts a spinning long-mode guest**
+    /// with a pending virtual interrupt, returning `(vmcb_pa, guest_spa)`.
+    ///
+    /// The strongest form of the V_INTR proof: the guest
+    /// ([`write_long_mode_preempt_program`](super::write_long_mode_preempt_program))
+    /// `STI`s and then spins in an unconditional `jmp $` that never exits on its
+    /// own. The only way it ever stops is the pending virtual interrupt breaking
+    /// the loop — its handler `OUT`s [`GUEST_LM_PREEMPT_SENTINEL`] and `HLT`s. A
+    /// captured sentinel plus a clean `HLT` stop proves enlil forcibly preempted
+    /// a non-cooperative running guest — time-slicing (ROADMAP 6.2 toward 6.7).
+    /// Same long-mode `GDT`/`IDT`/paging + posted virtual interrupt as
+    /// [`program_long_mode_vintr_vmcb`].
+    #[must_use]
+    pub fn program_long_mode_preempt_vmcb() -> Option<(u64, u64)> {
+        build_long_mode_vintr_guest(super::write_long_mode_preempt_program)
+    }
+
+    /// Assemble a long-mode guest with a **pending virtual interrupt** posted in
+    /// the VMCB, running the program `write_program` stamps into its RAM.
+    ///
+    /// The shared body of [`program_long_mode_vintr_vmcb`] (masking proof) and
+    /// [`program_long_mode_preempt_vmcb`] (spinning-guest preemption): it lays
+    /// out the guest's isolated RAM (running `write_program`, which also stamps
+    /// the shared long-mode `GDT`/`IDT` gate), its own identity page tables, and
+    /// the NPT; programs a long-mode VMCB with `GDTR`/`IDTR` pointing at those
+    /// tables, port-I/O interception, and a high-priority virtual interrupt via
+    /// `INT_CONTROL` ([`encode_vintr`]) that the guest's `EFLAGS.IF` gates. All
+    /// allocations are leaked to outlive `VMRUN`. Returns `None` on failure.
+    fn build_long_mode_vintr_guest(write_program: fn(&mut [u8])) -> Option<(u64, u64)> {
         use super::{
             GUEST_EVENT_VECTOR, GUEST_LM_GDT_GPA, GUEST_LM_IDT_GPA, GUEST_LM_PT_GPA, GUEST_LM_STACK,
         };
@@ -1595,9 +1667,7 @@ mod hw {
         }
         let guest_spa = ram_raw as u64;
         // SAFETY: ram_raw owns GUEST_RAM_BYTES writable bytes (leaked below).
-        super::write_long_mode_vintr_program(unsafe {
-            core::slice::from_raw_parts_mut(ram_raw, GUEST_RAM_BYTES)
-        });
+        write_program(unsafe { core::slice::from_raw_parts_mut(ram_raw, GUEST_RAM_BYTES) });
 
         // The guest's own identity page tables at GUEST_LM_PT_GPA.
         // SAFETY: ram_raw owns GUEST_RAM_BYTES writable bytes.
@@ -1624,7 +1694,7 @@ mod hw {
             .ok()?
             .ncr3;
 
-        // Program the VMCB for long mode entering the interrupted code at GVA 0.
+        // Program the VMCB for long mode entering the code at GVA 0.
         let mut vmcb = Vmcb::new().ok()?;
         let setup = LongModeGuestSetup {
             asid: 1,
@@ -2225,6 +2295,29 @@ mod tests {
         );
         let gate = GUEST_LM_IDT_GPA + (GUEST_EVENT_VECTOR as usize) * 16;
         assert_eq!(ram[gate + 2], 0x08, "gate selector (code)");
+        assert_eq!(ram[gate + 5], 0x8E, "64-bit interrupt gate");
+    }
+
+    #[test]
+    fn preempt_program_spins_forever_until_interrupted() {
+        let mut ram = vec![0u8; 0x0020_0000];
+        write_long_mode_preempt_program(&mut ram);
+
+        // Entry: sti; jmp $ (EB FE = jump to self — an infinite loop, no exit).
+        assert_eq!(ram[0], 0xFB, "STI");
+        assert_eq!(ram[1], 0xEB, "JMP rel8");
+        assert_eq!(ram[2], 0xFE, "-2 → spin on the JMP itself");
+
+        // Handler: mov al, SENTINEL; out PREEMPT_PORT; hlt (stops the guest).
+        let h = GUEST_LM_HANDLER_OFF;
+        assert_eq!(ram[h], 0xB0);
+        assert_eq!(ram[h + 1], GUEST_LM_PREEMPT_SENTINEL);
+        assert_eq!(ram[h + 2], 0xE6);
+        assert_eq!(ram[h + 3], GUEST_LM_PREEMPT_PORT);
+        assert_eq!(ram[h + 4], 0xF4, "HLT");
+
+        // Reuses the shared long-mode GDT + IDT gate.
+        let gate = GUEST_LM_IDT_GPA + (GUEST_EVENT_VECTOR as usize) * 16;
         assert_eq!(ram[gate + 5], 0x8E, "64-bit interrupt gate");
     }
 

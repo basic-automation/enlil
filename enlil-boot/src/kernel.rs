@@ -716,6 +716,9 @@ mod hw {
                         // while the guest masks interrupts (IF=0), then
                         // delivered on STI — how a real OS is preempted.
                         run_long_mode_vintr_guest(serial);
+                        // Seventh guest: preempt a guest spinning in an
+                        // infinite loop that never yields — pure time-slicing.
+                        run_long_mode_preempt_guest(serial);
                     }
                     None => serial.write_str("enlil kernel: svm: vmcb VMRUN-ready FAILED\n"),
                 }
@@ -1089,6 +1092,45 @@ mod hw {
             }
             None => {
                 serial.write_str("enlil kernel: svm: long-mode vintr vmcb build FAILED\n");
+            }
+        }
+    }
+
+    /// Build and run the long-mode *preemption* guest, reporting whether a
+    /// guest spinning in an infinite loop was forcibly preempted by a virtual
+    /// interrupt.
+    ///
+    /// The guest `STI`s and spins in an unconditional `jmp $` that never exits
+    /// on its own. enlil posts a pending virtual interrupt that breaks the loop,
+    /// vectoring through the guest's long-mode `IDT` to a handler that `OUT`s
+    /// [`GUEST_LM_PREEMPT_SENTINEL`](crate::svm::GUEST_LM_PREEMPT_SENTINEL) and
+    /// `HLT`s. A captured sentinel with a clean `HLT` stop proves enlil preempted
+    /// a non-cooperative running guest — the essence of time-slicing, and the
+    /// mechanism a scheduler quantum uses to reclaim a CPU (ROADMAP 6.2 → 6.7).
+    fn run_long_mode_preempt_guest(serial: &SerialPort) {
+        use crate::svm::{GUEST_LM_PREEMPT_PORT, GUEST_LM_PREEMPT_SENTINEL, RunStop};
+        match crate::svm::program_long_mode_preempt_vmcb() {
+            Some((vmcb, _spa)) => {
+                // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
+                // is a VMRUN-ready long-mode VMCB from program_long_mode_preempt_vmcb.
+                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                if run.stop == RunStop::Halted
+                    && run.io_out_to(u16::from(GUEST_LM_PREEMPT_PORT))
+                        == Some(u32::from(GUEST_LM_PREEMPT_SENTINEL))
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: spinning guest broken out of its loop by a virtual interrupt — guest preemption works\n",
+                    );
+                } else {
+                    let mut e = [0u8; 18];
+                    serial
+                        .write_str("enlil kernel: svm: guest preemption NOT observed (stop/exit ");
+                    serial.write_str(format_u64_hex(run.final_exit, &mut e));
+                    serial.write_str(")\n");
+                }
+            }
+            None => {
+                serial.write_str("enlil kernel: svm: long-mode preempt vmcb build FAILED\n");
             }
         }
     }
