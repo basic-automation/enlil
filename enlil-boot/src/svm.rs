@@ -670,6 +670,36 @@ mod hw {
     /// Size of the guest's isolated RAM window (2 MiB).
     const GUEST_RAM_BYTES: usize = 2 * 1024 * 1024;
 
+    /// Obtain a zeroed, 2 MiB-aligned [`GUEST_RAM_BYTES`] window for one guest,
+    /// returning a pointer to it (its system-physical base, since the kernel runs
+    /// identity-mapped).
+    ///
+    /// Prefers a disjoint slice of the **planned** guest-RAM region carved by
+    /// `plan_hypervisor_regions` — memory reserved for guests and provably clear
+    /// of the kernel heap, so a guest's nested mapping cannot reach the
+    /// hypervisor's own allocator (LOCKED PRINCIPLE 5). Falls back to the kernel
+    /// heap when no plan was published (no memory map in the handoff, or the plan
+    /// did not fit), so bring-up still works on a machine the planner cannot
+    /// satisfy.
+    ///
+    /// The window is leaked either way: it must outlive `VMRUN`.
+    fn alloc_guest_ram() -> Option<*mut u8> {
+        if let Some(spa) = crate::kernel::guest_ram::take(GUEST_RAM_BYTES as u64, 0x20_0000) {
+            let ptr: *mut u8 = core::ptr::with_exposed_provenance_mut(usize::try_from(spa).ok()?);
+            // Carved RAM is raw physical memory the firmware called usable; the
+            // heap's zeroing does not apply, so zero it here.
+            // SAFETY: the span is a disjoint slice of the planned guest region,
+            // identity-mapped by the kernel's own page tables, handed to exactly
+            // one caller and never reused.
+            unsafe { core::ptr::write_bytes(ptr, 0, GUEST_RAM_BYTES) };
+            return Some(ptr);
+        }
+        // SAFETY: GuestRam has a nonzero size; alloc_zeroed yields a zeroed,
+        // 2 MiB-aligned GuestRam-sized block or null.
+        let raw = unsafe { alloc_zeroed(Layout::new::<GuestRam>()) };
+        (!raw.is_null()).then_some(raw)
+    }
+
     /// Write the real-mode guest program into `bytes` at offset 0 (see the
     /// [`program_boot_vmcb`] instruction listing).
     const fn write_guest_program(bytes: &mut [u8]) {
@@ -819,12 +849,8 @@ mod hw {
         //   mov al, gs:[0]   65 A0 00 00     (GS.base loaded by VMLOAD only)
         //   out 0x86, al     E6 86           (IOIO → the GS sentinel)
         //   hlt              F4              (clean stop)
-        // SAFETY: GuestRam has a nonzero size; alloc_zeroed yields a zeroed,
-        // 2 MiB-aligned GuestRam-sized block or null.
-        let ram_raw = unsafe { alloc_zeroed(Layout::new::<GuestRam>()) };
-        if ram_raw.is_null() {
-            return None;
-        }
+        // Planned guest region when available, kernel heap otherwise.
+        let ram_raw = alloc_guest_ram()?;
         let guest_spa = ram_raw as u64;
         // SAFETY: ram_raw owns GUEST_RAM_BYTES writable bytes (leaked below).
         write_guest_program(unsafe { core::slice::from_raw_parts_mut(ram_raw, GUEST_RAM_BYTES) });
@@ -935,12 +961,8 @@ mod hw {
         };
 
         // Allocate + populate the guest's isolated RAM.
-        // SAFETY: GuestRam is a nonzero, 2 MiB-aligned block; alloc_zeroed
-        // yields it zeroed or null.
-        let ram_raw = unsafe { alloc_zeroed(Layout::new::<GuestRam>()) };
-        if ram_raw.is_null() {
-            return None;
-        }
+        // Planned guest region when available, kernel heap otherwise.
+        let ram_raw = alloc_guest_ram()?;
         let guest_spa = ram_raw as u64;
         // SAFETY: ram_raw owns GUEST_RAM_BYTES writable bytes (leaked below).
         let ram = unsafe { core::slice::from_raw_parts_mut(ram_raw, GUEST_RAM_BYTES) };
@@ -1039,11 +1061,8 @@ mod hw {
         use super::{GUEST_LM_PORT, GUEST_LM_PT_GPA, GUEST_LM_SENTINEL, GUEST_LM_STACK};
 
         // Allocate + populate the guest's isolated RAM.
-        // SAFETY: GuestRam is nonzero, 2 MiB-aligned; alloc_zeroed yields it or null.
-        let ram_raw = unsafe { alloc_zeroed(Layout::new::<GuestRam>()) };
-        if ram_raw.is_null() {
-            return None;
-        }
+        // Planned guest region when available, kernel heap otherwise.
+        let ram_raw = alloc_guest_ram()?;
         let guest_spa = ram_raw as u64;
         // SAFETY: ram_raw owns GUEST_RAM_BYTES writable bytes (leaked below).
         let ram = unsafe { core::slice::from_raw_parts_mut(ram_raw, GUEST_RAM_BYTES) };
@@ -1529,7 +1548,7 @@ mod tests {
             eax: 0x4000_0001,
             ebx: 0x7263_694D, // "Micr..." — a hypervisor signature
             ecx: 0x666F_736F,
-            edx: 0x76482074,
+            edx: 0x7648_2074,
         };
         assert_eq!(sanitize_cpuid(0x4000_0000, raw), CpuidRegs::default());
         assert_eq!(sanitize_cpuid(0x4000_00FF, raw), CpuidRegs::default());

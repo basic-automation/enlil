@@ -129,6 +129,71 @@ pub fn summarize_memory_map(bytes: &[u8], descriptor_size: usize) -> MemorySumma
     summary
 }
 
+/// The ceiling for an AP trampoline page.
+///
+/// A `SIPI`'s vector byte encodes the AP's real-mode start address as
+/// `vector << 12`, so a woken AP can only begin executing in the low 1 MiB,
+/// page-aligned (SDM Vol. 3 §9.4.4). Wherever the trampoline lands, it must be
+/// below this.
+pub const AP_TRAMPOLINE_LIMIT: u64 = 1024 * 1024;
+
+/// Lowest address an AP trampoline may use.
+///
+/// The real-mode IVT (0–0x400) and the BIOS data area (0x400–0x500) live at the
+/// bottom of memory; page 0 is also where a null-pointer write lands, which
+/// should keep faulting. Start above all of it.
+pub const AP_TRAMPOLINE_MIN: u64 = 0x1000;
+
+/// Find a page below 1 MiB that an AP trampoline can be placed in.
+///
+/// SMP bring-up sends `INIT`-`SIPI`-`SIPI` to each application processor, and
+/// the `SIPI` vector can only point at a page-aligned address in the low 1 MiB —
+/// so before an AP can be started at all, the kernel needs a page *there* that
+/// the firmware says is genuinely free. Hard-coding a traditional address (0x8000
+/// and friends) is a guess; under UEFI the low megabyte's layout is the
+/// firmware's business, and a wrong guess means the AP executes garbage and
+/// triple-faults.
+///
+/// Scans the raw firmware descriptor array for [`EFI_CONVENTIONAL`] memory —
+/// not merely `Usable`-mapped, since loader and boot-services regions still hold
+/// live boot state — and returns the **highest** qualifying page in
+/// `[AP_TRAMPOLINE_MIN, AP_TRAMPOLINE_LIMIT)`, keeping away from the very bottom
+/// of memory where legacy structures cluster. Alloc-free, so it runs before any
+/// `MemoryMap` exists. `None` if the firmware left no conventional page down
+/// there.
+#[must_use]
+pub fn find_ap_trampoline_page(bytes: &[u8], descriptor_size: usize) -> Option<u64> {
+    if descriptor_size < DESC_MIN_SIZE {
+        return None;
+    }
+    let mut best: Option<u64> = None;
+    for desc in bytes.chunks_exact(descriptor_size) {
+        let (Some(efi_type), Some(phys_start), Some(pages)) = (
+            read_u32_le(desc, DESC_TYPE_OFFSET),
+            read_u64_le(desc, DESC_PHYS_START_OFFSET),
+            read_u64_le(desc, DESC_NUM_PAGES_OFFSET),
+        ) else {
+            break;
+        };
+        if pages == 0 || efi_type != EFI_CONVENTIONAL {
+            continue;
+        }
+        let region_end = phys_start.saturating_add(pages.saturating_mul(UEFI_PAGE_SIZE));
+        // Clip the region to the window a SIPI vector can reach.
+        let start = phys_start.max(AP_TRAMPOLINE_MIN);
+        let end = region_end.min(AP_TRAMPOLINE_LIMIT);
+        if start >= end || end - start < UEFI_PAGE_SIZE {
+            continue;
+        }
+        // The highest whole page fully inside the clipped span.
+        let page = (end - UEFI_PAGE_SIZE) & !(UEFI_PAGE_SIZE - 1);
+        if page >= start {
+            best = Some(best.map_or(page, |b| b.max(page)));
+        }
+    }
+    best
+}
+
 /// Cap on the bootstrap kernel heap.
 ///
 /// Enough for the kernel's own structures while leaving the bulk of a large
@@ -152,6 +217,129 @@ pub const fn boot_heap_size(region_bytes: u64) -> u64 {
         BOOT_HEAP_MAX_BYTES
     } else {
         region_bytes
+    }
+}
+
+/// The planned guest-RAM window: a bump allocator over the region
+/// `plan_hypervisor_regions` carved for guests.
+///
+/// Guest RAM must **not** come from the kernel heap: the heap is where the
+/// hypervisor's own structures live, and a guest with a nested mapping onto it
+/// could reach them. The planner carves a span for exactly this purpose
+/// (LOCKED PRINCIPLE 5 — isolation), retyped `Reserved` in the map so nothing
+/// else claims it; this hands out disjoint slices of it, one per guest.
+///
+/// Empty until [`kernel::bring_up_memory_plan`](kernel) publishes the plan.
+pub mod guest_ram {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// Next free system-physical address inside the carved window.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    /// One past the last byte of the carved window (0 = no window).
+    static END: AtomicU64 = AtomicU64::new(0);
+
+    /// Publish the carved guest-RAM window so [`take`] can hand out slices.
+    pub fn publish(base: u64, size: u64) {
+        NEXT.store(base, Ordering::Release);
+        END.store(base.saturating_add(size), Ordering::Release);
+    }
+
+    /// Bytes still available in the carved window.
+    #[must_use]
+    pub fn remaining() -> u64 {
+        END.load(Ordering::Acquire)
+            .saturating_sub(NEXT.load(Ordering::Acquire))
+    }
+
+    /// Take a slice of the carved window for one guest.
+    ///
+    /// Returns the `size`-byte, `align`-aligned slice's system-physical base, or
+    /// `None` if no window was published or too little of it is left (the caller
+    /// then falls back to the heap).
+    ///
+    /// `align` must be a power of two. Slices are disjoint and never reused, so
+    /// one guest's RAM can never alias another's.
+    #[must_use]
+    pub fn take(size: u64, align: u64) -> Option<u64> {
+        let end = END.load(Ordering::Acquire);
+        if end == 0 || size == 0 || !align.is_power_of_two() {
+            return None;
+        }
+        let mut cur = NEXT.load(Ordering::Acquire);
+        loop {
+            let base = cur.checked_add(align - 1)? & !(align - 1);
+            let next = base.checked_add(size)?;
+            if next > end {
+                return None;
+            }
+            match NEXT.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(base),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+}
+
+/// The low-memory page reserved for the AP startup trampoline.
+///
+/// Found from the firmware map at boot ([`find_ap_trampoline_page`]) and kept
+/// here because the `SIPI` that starts an application processor encodes its
+/// start address as a vector byte — the page has to be known before any AP can
+/// be woken.
+pub mod ap_trampoline {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// The claimed page's physical address (0 = none claimed).
+    static PAGE: AtomicU64 = AtomicU64::new(0);
+
+    /// Record the page claimed for the trampoline.
+    pub fn publish(page: u64) {
+        PAGE.store(page, Ordering::Release);
+    }
+
+    /// The claimed trampoline page, if one was found.
+    #[must_use]
+    pub fn page() -> Option<u64> {
+        match PAGE.load(Ordering::Acquire) {
+            0 => None,
+            p => Some(p),
+        }
+    }
+
+    /// The `SIPI` vector byte that starts an AP at the claimed page.
+    ///
+    /// A `SIPI`'s vector is the start address shifted right by 12, so this is
+    /// `None` unless a page was claimed and it lies in the reachable low 1 MiB.
+    #[must_use]
+    pub fn sipi_vector() -> Option<u8> {
+        u8::try_from(page()? >> 12).ok()
+    }
+
+    /// The most APIC IDs the inventory keeps (matches the ACPI summary's array).
+    pub const MAX_APIC_IDS: usize = 8;
+
+    /// The enabled processors' APIC IDs, from the MADT — the wake targets.
+    static APIC_IDS: [AtomicU64; MAX_APIC_IDS] = [const { AtomicU64::new(0) }; MAX_APIC_IDS];
+    /// How many entries of [`APIC_IDS`] are valid.
+    static APIC_ID_COUNT: AtomicU64 = AtomicU64::new(0);
+
+    /// Record the enabled processors' APIC IDs discovered from the MADT.
+    pub fn publish_apic_ids(ids: &[u32]) {
+        let n = ids.len().min(MAX_APIC_IDS);
+        for (slot, &id) in APIC_IDS.iter().zip(&ids[..n]) {
+            slot.store(u64::from(id), Ordering::Release);
+        }
+        APIC_ID_COUNT.store(n as u64, Ordering::Release);
+    }
+
+    /// Copy the recorded APIC IDs into `out`, returning the populated prefix.
+    pub fn apic_ids(out: &mut [u32; MAX_APIC_IDS]) -> usize {
+        let n = usize::try_from(APIC_ID_COUNT.load(Ordering::Acquire)).unwrap_or(0);
+        let n = n.min(MAX_APIC_IDS);
+        for (slot, id) in out.iter_mut().zip(APIC_IDS.iter()).take(n) {
+            *slot = u32::try_from(id.load(Ordering::Acquire)).unwrap_or(0);
+        }
+        n
     }
 }
 
@@ -209,6 +397,7 @@ mod hw {
     use crate::allocator::install_kernel_heap;
     use crate::handoff::BootHandoff;
     use crate::serial::SerialPort;
+    use alloc::alloc::Layout;
     use alloc::vec::Vec;
 
     /// The enlil kernel entry point.
@@ -236,10 +425,17 @@ mod hw {
             let summary = summarize_memory_map(bytes, handoff.memory_descriptor_size);
             highest_usable_end = summary.highest_usable_end;
             report_memory(&serial, &summary);
-            bring_up_heap(&serial, &summary);
+            let heap_span = bring_up_heap(&serial, &summary);
             // The heap is live, so enlil-platform's heap-backed primitives work.
             bring_up_scheduler(&serial);
-            bring_up_memory_plan(&serial, bytes, handoff.memory_descriptor_size, &summary);
+            bring_up_memory_plan(
+                &serial,
+                bytes,
+                handoff.memory_descriptor_size,
+                &summary,
+                heap_span,
+            );
+            bring_up_ap_trampoline_page(&serial, bytes, handoff.memory_descriptor_size);
         } else {
             serial.write_str("enlil kernel: memory: NO MAP in handoff\n");
         }
@@ -251,21 +447,107 @@ mod hw {
         bring_up_gdt(&serial);
         bring_up_timer(&serial);
         bring_up_deadline_timer(&serial);
-        if let Some(hz) = bring_up_time(&serial) {
+        let tsc_hz = bring_up_time(&serial);
+        if let Some(hz) = tsc_hz {
             bring_up_deadline_ns(&serial, hz);
             bring_up_platform_time(&serial, hz);
         }
         let ecam = bring_up_acpi(&serial, handoff);
+        // Needs both the MADT inventory (above) and the calibrated TSC (the
+        // INIT/SIPI delays are timing-critical).
+        if let Some(hz) = tsc_hz {
+            bring_up_smp(&serial, apic_id.unwrap_or(0), hz);
+        }
         bring_up_pci(&serial);
-        bring_up_paging(&serial, handoff, highest_usable_end);
-        // ECAM reads need the identity map installed above (its window is < 4 GiB).
-        if let Some((ecam_base, end_bus)) = ecam {
-            bring_up_ecam(&serial, ecam_base, end_bus);
+        let map = bring_up_paging(&serial, handoff, highest_usable_end);
+
+        // Everything from here runs on a stack the kernel owns, with a guard
+        // page below it — off the firmware's unguarded boot-services stack. The
+        // continuation takes its inputs from statics because nothing on this
+        // stack survives the switch.
+        publish_continuation(handoff, ecam);
+        if let Some(mut map) = map
+            && let Some(stack) = bring_up_guarded_stack(&serial, &mut map)
+        {
+            // SAFETY: `stack` came from allocate_guarded_stack — a live, mapped,
+            // exclusively-owned region with a 16-byte-aligned top — and nothing
+            // on the current stack is needed again: the continuation diverges,
+            // and its inputs were published to statics above. `handoff` points
+            // into firmware memory, not this stack.
+            unsafe { crate::stack::switch_to_guarded_stack(stack, kernel_main_on_own_stack) };
+        }
+
+        // No guarded stack (no map, no spare table page, or the guard would not
+        // take) — carry on where we are rather than not booting at all.
+        serial.write_str("enlil kernel: stack: continuing on the firmware stack\n");
+        kernel_main_on_own_stack()
+    }
+
+    /// Where [`kernel_entry`] leaves the continuation's inputs, since the switch
+    /// to the kernel stack abandons everything on the old one.
+    static HANDOFF_PTR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    /// The ECAM base discovered from the MCFG, plus 1 (0 = none discovered).
+    static ECAM_BASE_PLUS1: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    /// The last bus in the ECAM window.
+    static ECAM_END_BUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+    /// Publish the continuation's inputs before the stack switch.
+    fn publish_continuation(handoff: &BootHandoff, ecam: Option<(u64, u8)>) {
+        use core::sync::atomic::Ordering;
+        HANDOFF_PTR.store(core::ptr::from_ref(handoff) as u64, Ordering::Release);
+        if let Some((base, end_bus)) = ecam {
+            ECAM_BASE_PLUS1.store(base.saturating_add(1), Ordering::Release);
+            ECAM_END_BUS.store(u64::from(end_bus), Ordering::Release);
+        }
+    }
+
+    /// The rest of the kernel's bring-up, running on the kernel-owned stack.
+    ///
+    /// Reached by [`switch_to_guarded_stack`](crate::stack::switch_to_guarded_stack)
+    /// (or called directly if no guarded stack could be built). Reports the `RSP`
+    /// it is actually running on, then finishes bring-up and parks.
+    extern "C" fn kernel_main_on_own_stack() -> ! {
+        use core::sync::atomic::Ordering;
+
+        let serial = SerialPort::com1();
+        report_running_stack(&serial);
+
+        let handoff_ptr = HANDOFF_PTR.load(Ordering::Acquire);
+        let handoff = (handoff_ptr != 0).then(|| {
+            // SAFETY: kernel_entry published a pointer to the BootHandoff it was
+            // called with, which lives in firmware memory (not on either stack)
+            // and outlives the kernel.
+            unsafe {
+                &*(core::ptr::with_exposed_provenance::<BootHandoff>(
+                    usize::try_from(handoff_ptr).unwrap_or(0),
+                ))
+            }
+        });
+
+        // ECAM reads need the identity map installed earlier (window < 4 GiB).
+        let ecam_base = ECAM_BASE_PLUS1.load(Ordering::Acquire);
+        if ecam_base != 0 {
+            let end_bus = u8::try_from(ECAM_END_BUS.load(Ordering::Acquire)).unwrap_or(u8::MAX);
+            bring_up_ecam(&serial, ecam_base - 1, end_bus);
         }
         bring_up_virtualization(&serial);
-        bring_up_framebuffer(&serial, handoff);
+        if let Some(handoff) = handoff {
+            bring_up_framebuffer(&serial, handoff);
+        }
 
         park()
+    }
+
+    /// Report which stack the kernel is actually running on now.
+    ///
+    /// Read after the switch, from the running `RSP` itself — so it reflects
+    /// reality rather than what was intended.
+    fn report_running_stack(serial: &SerialPort) {
+        let rsp = crate::stack::current_rsp();
+        let mut r = [0u8; 18];
+        serial.write_str("enlil kernel: stack: kernel bring-up continues at RSP ");
+        serial.write_str(format_u64_hex(rsp, &mut r));
+        serial.write_str("\n");
     }
 
     /// Calibrate the TSC against the PIT and report its frequency — the
@@ -428,9 +710,68 @@ mod hw {
             serial.write_str(format_u64(u64::from(summary.apic_ids[i]), &mut id));
         }
         serial.write_str(" (SMP AP inventory)\n");
+        crate::kernel::ap_trampoline::publish_apic_ids(&summary.apic_ids[..summary.apic_id_count]);
         serial.write_str("enlil kernel: acpi: IOMMU ");
         serial.write_str(summary.iommu.name());
         serial.write_str(" (DMAR/IVRS)\n");
+        // Each DMA-remapping hardware unit's register block — where per-guest
+        // DMA isolation is programmed (ROADMAP 6.4, LOCKED PRINCIPLE 5).
+        if summary.remapping_unit_count > 0 {
+            let mut n = [0u8; 20];
+            serial.write_str("enlil kernel: iommu: ");
+            serial.write_str(format_u64(
+                u64::try_from(summary.remapping_unit_count).unwrap_or(u64::MAX),
+                &mut n,
+            ));
+            serial.write_str(" DMA-remapping unit(s):");
+            for unit in summary
+                .remapping_units
+                .iter()
+                .take(summary.remapping_unit_count)
+            {
+                let mut base = [0u8; 18];
+                let mut seg = [0u8; 20];
+                serial.write_str(" regs@");
+                serial.write_str(format_u64_hex(unit.register_base, &mut base));
+                serial.write_str(" seg ");
+                serial.write_str(format_u64(u64::from(unit.segment), &mut seg));
+                if unit.covers_all {
+                    serial.write_str(" (all devices)");
+                }
+            }
+            serial.write_str("\n");
+
+            // Which devices that unit governs — what can be put in a per-guest
+            // DMA domain (LOCKED PRINCIPLE 5). A device no unit covers cannot
+            // be isolated, so passthrough must not be offered for it.
+            if summary.device_scope_count > 0 {
+                let mut n = [0u8; 20];
+                serial.write_str("enlil kernel: iommu: unit 0 scoped to ");
+                serial.write_str(format_u64(
+                    u64::try_from(summary.device_scope_count).unwrap_or(u64::MAX),
+                    &mut n,
+                ));
+                serial.write_str(" device(s):");
+                for scope in summary
+                    .device_scopes
+                    .iter()
+                    .take(summary.device_scope_count)
+                {
+                    let mut bus = [0u8; 20];
+                    let mut dev = [0u8; 20];
+                    let mut func = [0u8; 20];
+                    serial.write_str(" ");
+                    serial.write_str(scope.kind.name());
+                    serial.write_str("@");
+                    serial.write_str(format_u64(u64::from(scope.start_bus), &mut bus));
+                    serial.write_str(":");
+                    serial.write_str(format_u64(u64::from(scope.device), &mut dev));
+                    serial.write_str(".");
+                    serial.write_str(format_u64(u64::from(scope.function), &mut func));
+                }
+                serial.write_str("\n");
+            }
+        }
         if summary.ecam_base == 0 {
             return None;
         }
@@ -472,7 +813,11 @@ mod hw {
     /// The span is derived from the real memory map (highest usable RAM) and the
     /// framebuffer, floored at 4 GiB — so it stays correct on hosts with RAM or
     /// MMIO above 4 GiB, not just this QEMU layout.
-    fn bring_up_paging(serial: &SerialPort, handoff: &BootHandoff, highest_usable_end: u64) {
+    fn bring_up_paging(
+        serial: &SerialPort,
+        handoff: &BootHandoff,
+        highest_usable_end: u64,
+    ) -> Option<crate::paging::HostMap> {
         let (fb_base, fb_size) = handoff
             .framebuffer
             .map_or((0, 0), |fb| (fb.base, fb.size_bytes()));
@@ -480,16 +825,209 @@ mod hw {
         // SAFETY: `span` covers the highest usable RAM and the framebuffer
         // (floored at 4 GiB), so the CR3 reload continues execution seamlessly.
         match unsafe { crate::paging::install_identity_map(span) } {
-            Some(cr3) => {
+            Some(mut map) => {
                 let mut c = [0u8; 18];
                 let mut g = [0u8; 20];
                 serial.write_str("enlil kernel: paging: own identity tables (");
                 serial.write_str(format_u64(crate::paging::map_gib(span), &mut g));
                 serial.write_str(" GiB) installed, CR3=");
-                serial.write_str(format_u64_hex(cr3, &mut c));
+                serial.write_str(format_u64_hex(map.cr3, &mut c));
                 serial.write_str(" — off firmware page tables\n");
+                prove_4kib_split(serial, &mut map);
+                Some(map)
             }
-            None => serial.write_str("enlil kernel: paging: page-table build FAILED\n"),
+            None => {
+                serial.write_str("enlil kernel: paging: page-table build FAILED\n");
+                None
+            }
+        }
+    }
+
+    /// Claim the low-memory page an AP trampoline will be placed in, and prove
+    /// it is writable on real hardware (ROADMAP 6.2, SMP).
+    ///
+    /// Bringing up the application processors starts with `INIT`-`SIPI`-`SIPI`,
+    /// and a `SIPI` can only start an AP at a page-aligned address in the low
+    /// 1 MiB — so the first unbuilt piece is a page *there* that the firmware
+    /// agrees is free. This finds one from the real firmware map rather than
+    /// guessing a traditional address (a wrong guess means the AP executes
+    /// garbage and triple-faults, which is the open risk on this item), records
+    /// it for the bring-up step, and writes/reads a sentinel through it so the
+    /// page is known good before an AP is ever pointed at it.
+    ///
+    /// Sending the IPIs and running a real trampoline is the next slice.
+    fn bring_up_ap_trampoline_page(serial: &SerialPort, bytes: &[u8], descriptor_size: usize) {
+        let Some(page) = crate::kernel::find_ap_trampoline_page(bytes, descriptor_size) else {
+            serial.write_str(
+                "enlil kernel: smp: NO conventional page below 1 MiB for an AP trampoline\n",
+            );
+            return;
+        };
+
+        // Prove the page is real, writable memory before an AP runs from it.
+        let ptr: *mut u64 =
+            core::ptr::with_exposed_provenance_mut(usize::try_from(page).unwrap_or(0));
+        const SENTINEL: u64 = 0x5350_1AB0_0757_2A11;
+        // SAFETY: `page` is a whole 4 KiB page the firmware map reports as
+        // conventional (free) memory, identity-mapped like all low memory, and
+        // claimed here for the kernel's exclusive use.
+        let readback = unsafe {
+            ptr.write_volatile(SENTINEL);
+            ptr.read_volatile()
+        };
+        if readback != SENTINEL {
+            serial.write_str("enlil kernel: smp: AP trampoline page NOT WRITABLE\n");
+            return;
+        }
+        // SAFETY: same page, exclusively owned; leave it zeroed for the
+        // trampoline that will be copied in.
+        unsafe { ptr.write_volatile(0) };
+
+        crate::kernel::ap_trampoline::publish(page);
+        let mut p = [0u8; 18];
+        let mut v = [0u8; 20];
+        serial.write_str("enlil kernel: smp: AP trampoline page at ");
+        serial.write_str(format_u64_hex(page, &mut p));
+        serial.write_str(" (SIPI vector ");
+        serial.write_str(format_u64(page >> 12, &mut v));
+        serial.write_str("), writable — reachable by a SIPI\n");
+    }
+
+    /// Wake the application processors with `INIT`-`SIPI`-`SIPI` (ROADMAP 6.2, SMP).
+    ///
+    /// The BSP has been the only running CPU since power-on. This starts every
+    /// other enabled processor from the MADT inventory on the trampoline page
+    /// claimed earlier, and waits for each to report in by bumping the
+    /// trampoline's counter — so "the AP started" is observed, not assumed.
+    ///
+    /// A started AP parks on `hlt` for now; giving it long mode, its own guarded
+    /// stack, a `PerCpu` block and IST stacks is the next slice.
+    fn bring_up_smp(serial: &SerialPort, bsp_apic_id: u32, tsc_hz: u64) {
+        let Some(page) = crate::kernel::ap_trampoline::page() else {
+            serial.write_str("enlil kernel: smp: no trampoline page — APs not started\n");
+            return;
+        };
+        let mut ids = [0u32; crate::kernel::ap_trampoline::MAX_APIC_IDS];
+        let count = crate::kernel::ap_trampoline::apic_ids(&mut ids);
+        if count == 0 {
+            serial.write_str("enlil kernel: smp: no MADT APIC inventory — APs not started\n");
+            return;
+        }
+
+        // SAFETY: x2APIC was enabled in bring_up_apic, `tsc_hz` is the calibrated
+        // TSC frequency, and `page` is the exclusively-owned low page verified
+        // writable earlier. The BSP's own id is excluded, so no INIT resets us.
+        let (started, expected) =
+            unsafe { crate::smp::start_aps(page, &ids[..count], bsp_apic_id, tsc_hz) };
+
+        let mut s = [0u8; 20];
+        let mut e = [0u8; 20];
+        if expected == 0 {
+            serial.write_str("enlil kernel: smp: no APs to start (uniprocessor)\n");
+            return;
+        }
+        serial.write_str("enlil kernel: smp: ");
+        serial.write_str(format_u64(u64::from(started), &mut s));
+        serial.write_str(" of ");
+        serial.write_str(format_u64(u64::from(expected), &mut e));
+        if started >= expected {
+            serial.write_str(" APs started via INIT-SIPI-SIPI — SMP alive\n");
+        } else {
+            serial.write_str(" APs started — some did not report in\n");
+        }
+    }
+
+    /// Build the kernel's own stack with a guard page (ROADMAP 6.2).
+    ///
+    /// Until now the kernel has run on the firmware's stack: it lives in
+    /// boot-services memory the kernel means to reclaim, and it has no guard, so
+    /// an overflow corrupts whatever is below it silently. This allocates a stack
+    /// the kernel owns and unmaps the page below it via the 4 KiB split.
+    ///
+    /// Returns the stack for the caller to switch onto, or `None` (reported on
+    /// serial) if it could not be built — including when the guard page did not
+    /// actually come out unmapped, which is checked by translating it through the
+    /// live tables rather than touching it (touching it is what must fault).
+    fn bring_up_guarded_stack(
+        serial: &SerialPort,
+        map: &mut crate::paging::HostMap,
+    ) -> Option<crate::stack::GuardedStack> {
+        let Some(stack) = crate::stack::allocate_guarded_stack(map) else {
+            serial.write_str("enlil kernel: stack: guarded stack setup FAILED\n");
+            return None;
+        };
+
+        let mut b = [0u8; 18];
+        let mut g = [0u8; 18];
+        let mut k = [0u8; 20];
+        serial.write_str("enlil kernel: stack: kernel-owned stack at ");
+        serial.write_str(format_u64_hex(stack.base, &mut b));
+        serial.write_str(" (");
+        serial.write_str(format_u64(crate::stack::usable_bytes() / 1024, &mut k));
+        serial.write_str(" KiB usable), guard page ");
+        serial.write_str(format_u64_hex(crate::stack::guard_page(stack.base), &mut g));
+        serial.write_str(" unmapped — overflow faults\n");
+        Some(stack)
+    }
+
+    /// Refine one 2 MiB region of the live host map down to 4 KiB pages and
+    /// prove on real hardware that the split preserved the mapping (ROADMAP 6.2).
+    ///
+    /// The bulk of the host map stays huge-page-granular (few tables, few TLB
+    /// entries); this is the mixed-granularity step that lets a chosen region be
+    /// treated page by page — what a stack guard page needs (leave one page
+    /// absent so an overflow faults instead of silently corrupting its
+    /// neighbour) and what fine-grained MMIO trapping needs.
+    ///
+    /// The region split is a private 2 MiB-aligned heap block, so no page of it
+    /// is reachable from anywhere else and guarding inside it is safe. The proof
+    /// is a write/read-back through the freshly split leaves after the `CR3`
+    /// reload: the data reaches the same physical frame it did as a huge page.
+    fn prove_4kib_split(serial: &SerialPort, map: &mut crate::paging::HostMap) {
+        const TWO_MIB: usize = 2 * 1024 * 1024;
+        // A private, 2 MiB-aligned, 2 MiB-long block: exactly one huge leaf.
+        let Ok(layout) = Layout::from_size_align(TWO_MIB, TWO_MIB) else {
+            return;
+        };
+        // SAFETY: layout has a nonzero size; alloc returns a block or null.
+        let raw = unsafe { alloc::alloc::alloc(layout) };
+        if raw.is_null() {
+            serial.write_str("enlil kernel: paging: 4 KiB split — no 2 MiB block\n");
+            return;
+        }
+        let region = raw as u64;
+        // Write a sentinel through the huge-page mapping first...
+        const SENTINEL: u64 = 0xE117_5717_0BE1_5EAFu64;
+        let probe = raw.wrapping_add(0x3_000).cast::<u64>();
+        // SAFETY: probe is inside the 2 MiB block this call owns and is
+        // 8-byte-aligned (the block is 2 MiB-aligned, the offset a page).
+        unsafe { probe.write_volatile(SENTINEL) };
+
+        // Guard the last page of the private block — an unmapped page a stack
+        // placed here would fault on instead of running off the end.
+        let guard = region + (TWO_MIB as u64) - 4096;
+        // SAFETY: `guard` is the last page of the block allocated just above,
+        // which nothing else references and this kernel never touches.
+        let Some(base) = (unsafe { map.split_to_4kib(region, &[guard]) }) else {
+            serial.write_str("enlil kernel: paging: 4 KiB split FAILED\n");
+            return;
+        };
+        // ...and read it back through the 4 KiB leaves, after the CR3 reload.
+        // SAFETY: same page, still mapped — it is not the guard page.
+        let seen = unsafe { probe.read_volatile() };
+        let mut b = [0u8; 18];
+        let mut gu = [0u8; 18];
+        let mut sp = [0u8; 20];
+        if seen == SENTINEL {
+            serial.write_str("enlil kernel: paging: 2 MiB at ");
+            serial.write_str(format_u64_hex(base, &mut b));
+            serial.write_str(" split to 4 KiB pages, guard page at ");
+            serial.write_str(format_u64_hex(guard, &mut gu));
+            serial.write_str(" unmapped, mapping preserved (");
+            serial.write_str(format_u64(map.spare_pages_left(), &mut sp));
+            serial.write_str(" spare tables left)\n");
+        } else {
+            serial.write_str("enlil kernel: paging: 4 KiB split LOST THE MAPPING\n");
         }
     }
 
@@ -673,6 +1211,7 @@ mod hw {
                         serial.write_str(", vmcb ");
                         serial.write_str(format_u64_hex(vmcb, &mut c));
                         serial.write_str(")\n");
+                        report_guest_ram_source(serial);
                         // Drive the guest through the real #VMEXIT dispatch loop
                         // — the guest (in its own isolated RAM at GPA 0) runs
                         // CPUID/RDMSR/OUT/HLT, all routed through the HAL's
@@ -983,17 +1522,21 @@ mod hw {
 
     /// Install the kernel heap in the largest conventional region and prove
     /// dynamic allocation works with the firmware gone.
-    fn bring_up_heap(serial: &SerialPort, summary: &MemorySummary) {
+    ///
+    /// Returns the installed heap's `(base, size)` so later planning can mark it
+    /// in use ([`MemoryMap::reserve_span`]) — the heap is claimed before any
+    /// `MemoryMap` exists, so nothing else knows that memory is spoken for.
+    fn bring_up_heap(serial: &SerialPort, summary: &MemorySummary) -> Option<(u64, u64)> {
         let size = boot_heap_size(summary.largest_conventional_bytes);
         if size == 0 {
             serial.write_str("enlil kernel: heap: NO conventional region large enough\n");
-            return;
+            return None;
         }
         let base = summary.largest_conventional_base;
         let (Ok(base_usize), Ok(size_usize)) = (usize::try_from(base), usize::try_from(size))
         else {
             serial.write_str("enlil kernel: heap: region beyond addressable range\n");
-            return;
+            return None;
         };
         // SAFETY: the span is conventional memory (nothing of the firmware,
         // image, stack, or handoff lives there), sized within the region, and
@@ -1027,6 +1570,7 @@ mod hw {
         } else {
             serial.write_str(", alloc test FAILED\n");
         }
+        Some((base, size))
     }
 
     /// Run enlil-platform's bare-metal work-stealing scheduler on real hardware
@@ -1111,6 +1655,7 @@ mod hw {
         bytes: &[u8],
         descriptor_size: usize,
         summary: &MemorySummary,
+        heap_span: Option<(u64, u64)>,
     ) {
         use enlil_platform::memory::map::{MemoryMap, MemoryPlanRequest, UefiMemoryDescriptor};
 
@@ -1158,6 +1703,25 @@ mod hw {
             " MiB), DISAGREES with kernel summary\n"
         });
 
+        // The bootstrap heap was claimed from the raw firmware map before any
+        // MemoryMap existed, so the map still calls that span usable. Mark it in
+        // use or the plan below will carve guest RAM straight out of the memory
+        // the hypervisor is allocating from — silent corruption the moment a
+        // guest writes to its RAM.
+        if let Some((heap_base, heap_size)) = heap_span {
+            let mut hb = [0u8; 18];
+            let mut he = [0u8; 18];
+            serial.write_str(if map.reserve_span(heap_base, heap_size) {
+                "enlil kernel: memplan: reserved live heap "
+            } else {
+                "enlil kernel: memplan: live heap NOT reservable "
+            });
+            serial.write_str(format_u64_hex(heap_base, &mut hb));
+            serial.write_str("-");
+            serial.write_str(format_u64_hex(heap_base + heap_size, &mut he));
+            serial.write_str(" — planner cannot carve over it\n");
+        }
+
         let req = MemoryPlanRequest {
             heap_size: 8 * MIB,
             dma_size: 2 * MIB,
@@ -1179,11 +1743,62 @@ mod hw {
                     &mut guest_buf,
                 ));
                 serial.write_str(" — disjoint per-guest RAM (LOCKED PRINCIPLE 5)\n");
+
+                // Every carved region must now clear the live heap. Checking it
+                // here is what makes the reservation above a proof rather than a
+                // claim: before it, guest0 landed inside the heap.
+                if let Some((heap_base, heap_size)) = heap_span {
+                    let heap_end = heap_base + heap_size;
+                    let clears =
+                        |base: u64, size: u64| base + size <= heap_base || base >= heap_end;
+                    let all_clear = clears(regions.dma.base.as_u64(), regions.dma.size)
+                        && clears(regions.heap.base.as_u64(), regions.heap.size)
+                        && regions
+                            .guest_ram
+                            .iter()
+                            .all(|r| clears(r.base.as_u64(), r.size));
+                    serial.write_str(if all_clear {
+                        "enlil kernel: memplan: all carved regions clear the live heap — no overlap\n"
+                    } else {
+                        "enlil kernel: memplan: CARVED REGION OVERLAPS THE LIVE HEAP\n"
+                    });
+
+                    // Publish the guest window only once it is known disjoint
+                    // from the heap — otherwise guests would be handed the
+                    // hypervisor's own allocator memory.
+                    if all_clear {
+                        if let Some(g0) = regions.guest_ram.first() {
+                            crate::kernel::guest_ram::publish(g0.base.as_u64(), g0.size);
+                        }
+                    }
+                }
             }
             None => {
                 serial.write_str("enlil kernel: memplan: region plan did not fit the usable map\n");
             }
         }
+    }
+
+    /// Report where the SVM guests' RAM came from — the planned, heap-disjoint
+    /// guest region, or the kernel heap as a fallback (ROADMAP 1.3 / 6.2).
+    ///
+    /// A guest backed by heap memory could reach the hypervisor's own allocator
+    /// through its nested mapping; backed by the carved region it cannot
+    /// (LOCKED PRINCIPLE 5). The remaining byte count is the proof the guest
+    /// actually consumed planned RAM rather than falling back.
+    fn report_guest_ram_source(serial: &SerialPort) {
+        const MIB: u64 = 1024 * 1024;
+        let left = crate::kernel::guest_ram::remaining();
+        if left == 0 {
+            serial.write_str(
+                "enlil kernel: svm: guest RAM from the kernel heap (no planned region)\n",
+            );
+            return;
+        }
+        let mut m = [0u8; 20];
+        serial.write_str("enlil kernel: svm: guest RAM from the planned region, ");
+        serial.write_str(format_u64(left / MIB, &mut m));
+        serial.write_str(" MiB left — guests cannot reach the hypervisor heap\n");
     }
 
     /// Emit the memory summary the QEMU+OVMF harness asserts on.
@@ -1232,6 +1847,52 @@ mod tests {
 
     fn map(descriptors: &[Vec<u8>]) -> Vec<u8> {
         descriptors.concat()
+    }
+
+    #[test]
+    fn ap_trampoline_page_comes_from_conventional_low_memory() {
+        let stride = 48;
+        let bytes = map(&[
+            desc(7, 0x1000, 8, stride),      // conventional 0x1000-0x9000
+            desc(7, 0x10_0000, 256, stride), // conventional, but above 1 MiB
+            desc(2, 0x2_0000, 16, stride),   // loader data below 1 MiB: not free
+        ]);
+        // The highest whole page inside the low conventional span.
+        assert_eq!(find_ap_trampoline_page(&bytes, stride), Some(0x8000));
+    }
+
+    #[test]
+    fn ap_trampoline_page_is_clipped_to_the_sipi_reachable_window() {
+        let stride = 48;
+        // A region straddling 1 MiB: only the part below the limit is usable,
+        // and the chosen page must lie entirely within it.
+        let bytes = map(&[desc(7, 0xF_0000, 64, stride)]); // 0xF0000-0x130000
+        let page = find_ap_trampoline_page(&bytes, stride).unwrap();
+        assert_eq!(page, 0xF_F000);
+        assert!(page >= AP_TRAMPOLINE_MIN);
+        assert!(page + 4096 <= AP_TRAMPOLINE_LIMIT, "past a SIPI's reach");
+        assert_eq!(page % 4096, 0, "a SIPI vector is a page number");
+    }
+
+    #[test]
+    fn ap_trampoline_page_avoids_the_ivt_and_bios_data_area() {
+        let stride = 48;
+        // Conventional memory starting at 0: the IVT/BDA at the bottom is
+        // skipped, so nothing below AP_TRAMPOLINE_MIN is ever chosen.
+        let bytes = map(&[desc(7, 0, 1, stride)]); // only page 0
+        assert_eq!(find_ap_trampoline_page(&bytes, stride), None);
+    }
+
+    #[test]
+    fn ap_trampoline_page_absent_when_no_low_conventional_memory() {
+        let stride = 48;
+        let bytes = map(&[
+            desc(7, 0x10_0000, 256, stride), // all conventional memory is high
+            desc(0, 0x1000, 8, stride),      // low memory is reserved
+        ]);
+        assert_eq!(find_ap_trampoline_page(&bytes, stride), None);
+        // A malformed stride is refused rather than misread.
+        assert_eq!(find_ap_trampoline_page(&bytes, 4), None);
     }
 
     #[test]
