@@ -209,6 +209,31 @@ pub const GUEST_UD_PORT: u8 = 0x8B;
 /// trapped the guest's `#UD` and re-injected it to the guest's own handler.
 pub const GUEST_UD_SENTINEL: u8 = 0x4D;
 
+/// The interrupt vector the interrupt-round-trip guest is injected with.
+///
+/// Its handler runs then `IRET`s so the guest resumes past the injection point —
+/// the full inject → handle → `IRET` → resume cycle a virtual timer tick needs.
+pub const GUEST_IRQ_VECTOR: u8 = 0x21;
+
+/// Guest RAM offset of the interrupt-round-trip guest's handler (above the code
+/// at GPA 0, over an unused real-mode IVT slot like the event-injection guest).
+pub const GUEST_IRQ_HANDLER_OFF: u16 = 0x0200;
+
+/// The port the interrupt-round-trip guest's handler `OUT`s to (proves the
+/// injected interrupt vectored to the handler).
+pub const GUEST_IRQ_HANDLER_PORT: u8 = 0x8C;
+
+/// The byte the interrupt-round-trip handler `OUT`s before it `IRET`s.
+pub const GUEST_IRQ_HANDLER_SENTINEL: u8 = 0x3B;
+
+/// The port the interrupt-round-trip guest `OUT`s *after* the handler `IRET`s
+/// (proves the guest resumed execution past the injection point).
+pub const GUEST_IRQ_RESUME_PORT: u8 = 0x8D;
+
+/// The byte the interrupt-round-trip guest `OUT`s after the handler returns —
+/// present only if the handler `IRET`'d and the guest continued running.
+pub const GUEST_IRQ_RESUME_SENTINEL: u8 = 0x63;
+
 /// The port the 64-bit long-mode guest `OUT`s its sentinel to. A capture here
 /// proves a guest ran in long mode (paging on, `CR3` walked through the NPT)
 /// under enlil.
@@ -513,7 +538,8 @@ impl GuestRunOutcome {
 #[cfg(target_os = "uefi")]
 pub use hw::{
     enable_svm, program_boot_vmcb, program_event_inj_vmcb, program_host_save_area,
-    program_long_mode_vmcb, program_ud_exception_vmcb, run_boot_guest_loop,
+    program_irq_resume_vmcb, program_long_mode_vmcb, program_ud_exception_vmcb,
+    run_boot_guest_loop,
 };
 
 #[cfg(target_os = "uefi")]
@@ -1157,6 +1183,110 @@ mod hw {
         set_exception_intercept(vmcb.as_bytes_mut(), GUEST_UD_VECTOR);
 
         let handler_gpa = u64::from(GUEST_UD_HANDLER_OFF);
+        let vmcb_pa = vmcb.base_addr();
+        core::mem::forget(vmcb); // must outlive VMRUN
+        Some((vmcb_pa, handler_gpa))
+    }
+
+    /// Build a `VMRUN`-ready VMCB that proves a full **interrupt round-trip**,
+    /// returning `(vmcb_pa, handler_gpa)`.
+    ///
+    /// enlil arms `EVENTINJ` so `VMRUN` injects
+    /// [`GUEST_IRQ_VECTOR`](super::GUEST_IRQ_VECTOR) before the guest's first
+    /// instruction. The guest's real-mode IVT vectors it to a handler that
+    /// `OUT`s [`GUEST_IRQ_HANDLER_SENTINEL`](super::GUEST_IRQ_HANDLER_SENTINEL)
+    /// and then `IRET`s. `IRET` returns to the injection point (GPA 0), where the
+    /// guest's continuation `OUT`s
+    /// [`GUEST_IRQ_RESUME_SENTINEL`](super::GUEST_IRQ_RESUME_SENTINEL) and
+    /// `HLT`s. Capturing **both** sentinels proves the whole inject → handle →
+    /// `IRET` → resume cycle — the mechanism a virtual timer tick or device
+    /// interrupt uses to preempt a guest and let it keep running (ROADMAP 6.2),
+    /// a step beyond the handler-only event-injection proof.
+    ///
+    /// The injected interrupt pushes `FLAGS:CS:IP` (IP = 0) to the guest stack,
+    /// so `IRET` resumes at GPA 0 — which is why the continuation lives there and
+    /// the handler sits above the IVT. Assembled through `enlil-hal` like the
+    /// other proof guests; allocations are leaked to outlive `VMRUN`. Returns
+    /// `None` on any allocation/programming failure.
+    #[must_use]
+    pub fn program_irq_resume_vmcb() -> Option<(u64, u64)> {
+        use super::{
+            GUEST_IRQ_HANDLER_OFF, GUEST_IRQ_HANDLER_PORT, GUEST_IRQ_HANDLER_SENTINEL,
+            GUEST_IRQ_RESUME_PORT, GUEST_IRQ_RESUME_SENTINEL, GUEST_IRQ_VECTOR,
+        };
+
+        let ram_raw = alloc_guest_ram()?;
+        let guest_spa = ram_raw as u64;
+        // SAFETY: ram_raw owns GUEST_RAM_BYTES writable bytes (leaked below).
+        let ram = unsafe { core::slice::from_raw_parts_mut(ram_raw, GUEST_RAM_BYTES) };
+        // Continuation at GPA 0 (where IRET returns): mov al, RESUME; out; hlt.
+        ram[0] = 0xB0; // MOV AL, imm8
+        ram[1] = GUEST_IRQ_RESUME_SENTINEL;
+        ram[2] = 0xE6; // OUT imm8, AL
+        ram[3] = GUEST_IRQ_RESUME_PORT;
+        ram[4] = 0xF4; // HLT
+        // Real-mode IVT slot for the vector → segment 0, offset GUEST_IRQ_HANDLER_OFF.
+        let ivt = (GUEST_IRQ_VECTOR as usize) * 4;
+        let off = GUEST_IRQ_HANDLER_OFF.to_le_bytes();
+        ram[ivt] = off[0];
+        ram[ivt + 1] = off[1];
+        ram[ivt + 2] = 0x00; // segment low
+        ram[ivt + 3] = 0x00; // segment high
+        // Handler: mov al, HANDLER_SENTINEL; out PORT, al; iret.
+        let h = GUEST_IRQ_HANDLER_OFF as usize;
+        ram[h] = 0xB0; // MOV AL, imm8
+        ram[h + 1] = GUEST_IRQ_HANDLER_SENTINEL;
+        ram[h + 2] = 0xE6; // OUT imm8, AL
+        ram[h + 3] = GUEST_IRQ_HANDLER_PORT;
+        ram[h + 4] = 0xCF; // IRET (real-mode: pop IP, CS, FLAGS)
+
+        // NPT mapping guest GPA [0, 2 MiB) onto the isolated RAM window.
+        // SAFETY: NptBuf is nonzero, 4 KiB-aligned; alloc_zeroed yields it or null.
+        let npt_raw = unsafe { alloc_zeroed(Layout::new::<NptBuf>()) };
+        if npt_raw.is_null() {
+            return None;
+        }
+        let npt_pa = npt_raw as u64;
+        // SAFETY: npt_raw owns a live, zeroed NptBuf, leaked below.
+        let npt_buf = unsafe { core::slice::from_raw_parts_mut(npt_raw, 3 * 4096) };
+        let ncr3 = build_npt_2mib(npt_buf, npt_pa, guest_spa, GUEST_RAM_BYTES as u64)
+            .ok()?
+            .ncr3;
+
+        // Program a VMCB entering the continuation at GPA 0 under that NPT.
+        let mut vmcb = Vmcb::new().ok()?;
+        let setup = MinimalGuestSetup {
+            asid: 1,
+            nested_cr3: ncr3,
+            entry_ip: 0,
+            code_base: 0,
+            stack_pointer: 0,
+        };
+        program_minimal_hlt_guest(vmcb.as_bytes_mut(), &setup).ok()?;
+        // Install the real-mode IVT (base 0, limit 0x3FF) so the injected
+        // vector's slot is covered (program_minimal_hlt_guest leaves limit 0).
+        write_segment(
+            vmcb.as_bytes_mut(),
+            save::IDTR,
+            VmcbSegment {
+                selector: 0,
+                attrib: 0,
+                limit: 0x03FF,
+                base: 0,
+            },
+        );
+
+        // Arm port-I/O interception so both OUTs take IOIO #VMEXITs.
+        let iopm = IoPermissionsMap::intercept_all().ok()?;
+        enable_io_intercept(vmcb.as_bytes_mut(), iopm.base_addr());
+        core::mem::forget(iopm);
+
+        // Arm EVENTINJ: VMRUN injects GUEST_IRQ_VECTOR before the first guest
+        // instruction; the run loop clears it after entry so it fires once.
+        let inj = encode_event_inj(GUEST_IRQ_VECTOR, event_type::EXTERNAL_INTERRUPT, None);
+        set_event_inj(vmcb.as_bytes_mut(), inj);
+
+        let handler_gpa = u64::from(GUEST_IRQ_HANDLER_OFF);
         let vmcb_pa = vmcb.base_addr();
         core::mem::forget(vmcb); // must outlive VMRUN
         Some((vmcb_pa, handler_gpa))

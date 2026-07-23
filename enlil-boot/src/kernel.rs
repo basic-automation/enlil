@@ -1230,6 +1230,10 @@ mod hw {
                         // re-delivers it to the guest's handler (exception
                         // virtualization).
                         run_ud_exception_guest(serial);
+                        // Fifth guest: prove a full interrupt round-trip —
+                        // inject → handler → IRET → the guest resumes (what a
+                        // virtual timer tick needs).
+                        run_irq_resume_guest(serial);
                     }
                     None => serial.write_str("enlil kernel: svm: vmcb VMRUN-ready FAILED\n"),
                 }
@@ -1470,6 +1474,45 @@ mod hw {
                 }
             }
             None => serial.write_str("enlil kernel: svm: ud-exception vmcb build FAILED\n"),
+        }
+    }
+
+    /// Build and run the interrupt-round-trip guest, reporting whether the guest
+    /// both handled an injected interrupt and resumed past it.
+    ///
+    /// enlil injects [`GUEST_IRQ_VECTOR`](crate::svm::GUEST_IRQ_VECTOR); the
+    /// guest's handler `OUT`s
+    /// [`GUEST_IRQ_HANDLER_SENTINEL`](crate::svm::GUEST_IRQ_HANDLER_SENTINEL)
+    /// then `IRET`s, and the guest continuation `OUT`s
+    /// [`GUEST_IRQ_RESUME_SENTINEL`](crate::svm::GUEST_IRQ_RESUME_SENTINEL). Both
+    /// captures prove the whole inject → handle → `IRET` → resume cycle — the
+    /// mechanism a virtual timer tick / device interrupt uses to preempt a guest
+    /// and let it keep running (ROADMAP 6.2).
+    fn run_irq_resume_guest(serial: &SerialPort) {
+        use crate::svm::{
+            GUEST_IRQ_HANDLER_PORT, GUEST_IRQ_HANDLER_SENTINEL, GUEST_IRQ_RESUME_PORT,
+            GUEST_IRQ_RESUME_SENTINEL,
+        };
+        match crate::svm::program_irq_resume_vmcb() {
+            Some((vmcb, _handler)) => {
+                // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
+                // is a VMRUN-ready VMCB from program_irq_resume_vmcb.
+                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                let handled = run.io_out_to(u16::from(GUEST_IRQ_HANDLER_PORT))
+                    == Some(u32::from(GUEST_IRQ_HANDLER_SENTINEL));
+                let resumed = run.io_out_to(u16::from(GUEST_IRQ_RESUME_PORT))
+                    == Some(u32::from(GUEST_IRQ_RESUME_SENTINEL));
+                if handled && resumed {
+                    serial.write_str(
+                        "enlil kernel: svm: injected interrupt handled + guest resumed via IRET — interrupt round-trip works\n",
+                    );
+                } else {
+                    serial.write_str(
+                        "enlil kernel: svm: interrupt round-trip incomplete (handler or IRET-resume not observed)\n",
+                    );
+                }
+            }
+            None => serial.write_str("enlil kernel: svm: irq-resume vmcb build FAILED\n"),
         }
     }
 
