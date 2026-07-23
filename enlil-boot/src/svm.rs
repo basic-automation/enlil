@@ -234,6 +234,20 @@ pub const GUEST_IRQ_RESUME_PORT: u8 = 0x8D;
 /// present only if the handler `IRET`'d and the guest continued running.
 pub const GUEST_IRQ_RESUME_SENTINEL: u8 = 0x63;
 
+/// The guest-physical address the write-protection guest stores to.
+///
+/// A 16-bit real-mode offset within the guest's `[0, 2 MiB)` RAM. enlil marks
+/// the covering NPT leaf read-only, so the store takes a present+write nested
+/// page fault the run loop observes and grants.
+pub const GUEST_WP_GPA: u16 = 0x1800;
+
+/// The byte the write-protection guest stores then reads back — a matching `OUT`
+/// proves the store completed after enlil cleared the write-protection.
+pub const GUEST_WP_VALUE: u8 = 0x71;
+
+/// The port the write-protection guest `OUT`s its read-back byte to.
+pub const GUEST_WP_PORT: u8 = 0x8E;
+
 /// The port the 64-bit long-mode guest `OUT`s its sentinel to. A capture here
 /// proves a guest ran in long mode (paging on, `CR3` walked through the NPT)
 /// under enlil.
@@ -450,8 +464,11 @@ pub struct GuestRunOutcome {
     pub io_exits: u32,
     /// Intercepted `RDMSR`/`WRMSR` exits handled.
     pub msr_exits: u32,
-    /// Nested page faults demand-mapped.
+    /// Nested page faults demand-mapped (not-present faults).
     pub npf_exits: u32,
+    /// Nested write-protection faults observed then granted (present + write —
+    /// the dirty-tracking / copy-on-write signal).
+    pub npf_write_faults: u32,
     /// Intercepted `VMMCALL` hypercalls serviced.
     pub vmmcall_exits: u32,
     /// Intercepted guest exceptions re-delivered to the guest's own IDT/IVT.
@@ -498,6 +515,7 @@ impl GuestRunOutcome {
             vmmcall_exits: 0,
             exception_exits: 0,
             last_exception_vector: None,
+            npf_write_faults: 0,
         }
     }
 
@@ -539,7 +557,7 @@ impl GuestRunOutcome {
 pub use hw::{
     enable_svm, program_boot_vmcb, program_event_inj_vmcb, program_host_save_area,
     program_irq_resume_vmcb, program_long_mode_vmcb, program_ud_exception_vmcb,
-    run_boot_guest_loop,
+    program_wp_npf_vmcb, run_boot_guest_loop,
 };
 
 #[cfg(target_os = "uefi")]
@@ -550,7 +568,7 @@ mod hw {
         is_svm_enabled, is_valid_hsave_pa, svm_status, vm_cr_clear_svmdis,
     };
     use alloc::alloc::{Layout, alloc_zeroed};
-    use enlil_hal::npt::{build_identity_npt_2mib, build_npt_2mib};
+    use enlil_hal::npt::{build_identity_npt_2mib, build_npt_2mib, set_npt_2mib_leaf_writable};
     use enlil_hal::region::{IoPermissionsMap, MsrPermissionsMap, Vmcb};
     use enlil_hal::svm::{
         LongModeGuestSetup, MinimalGuestSetup, VmcbSegment, control, enable_io_intercept,
@@ -1292,6 +1310,87 @@ mod hw {
         Some((vmcb_pa, handler_gpa))
     }
 
+    /// Build a `VMRUN`-ready VMCB that proves **NPT write-protection** (the
+    /// dirty-tracking / copy-on-write primitive), returning `(vmcb_pa, wp_gpa)`.
+    ///
+    /// After building the guest's NPT, enlil clears the `WRITABLE` bit on the
+    /// leaf covering the guest's RAM ([`set_npt_2mib_leaf_writable`]), so the
+    /// guest can still fetch and read but any store faults. The guest stores
+    /// [`GUEST_WP_VALUE`](super::GUEST_WP_VALUE) to
+    /// [`GUEST_WP_GPA`](super::GUEST_WP_GPA); that store takes a present+write
+    /// nested page fault the run loop routes to `grant_npf_write` (records the
+    /// write, clears the protection, resumes without advancing RIP so the store
+    /// re-executes). The guest then reads the byte back and `OUT`s it — a match
+    /// proves the store completed only after enlil granted write access, i.e.
+    /// enlil observed the write before it landed (the signal live-migration
+    /// dirty tracking and copy-on-write build on; ROADMAP 6.2 / Phase 8).
+    ///
+    /// Assembled through `enlil-hal` like the other proof guests; allocations
+    /// are leaked to outlive `VMRUN`. Returns `None` on any allocation/
+    /// programming failure.
+    #[must_use]
+    pub fn program_wp_npf_vmcb() -> Option<(u64, u64)> {
+        use super::{GUEST_WP_GPA, GUEST_WP_PORT, GUEST_WP_VALUE};
+
+        let ram_raw = alloc_guest_ram()?;
+        let guest_spa = ram_raw as u64;
+        // SAFETY: ram_raw owns GUEST_RAM_BYTES writable bytes (leaked below).
+        let ram = unsafe { core::slice::from_raw_parts_mut(ram_raw, GUEST_RAM_BYTES) };
+        // Real-mode program at GPA 0 (reads DS:off with default DS base 0):
+        //   mov al, VALUE       B0 71
+        //   mov [WP_GPA], al    A2 lo hi   (store → present+write NPF, then granted)
+        //   mov al, [WP_GPA]    A0 lo hi   (read the stored byte back)
+        //   out WP_PORT, al     E6 8E      (IOIO → VALUE iff the store completed)
+        //   hlt                 F4
+        let off = GUEST_WP_GPA.to_le_bytes();
+        ram[0] = 0xB0; // mov al, VALUE
+        ram[1] = GUEST_WP_VALUE;
+        ram[2] = 0xA2; // mov moffs16, al (store)
+        ram[3] = off[0];
+        ram[4] = off[1];
+        ram[5] = 0xA0; // mov al, moffs16 (load)
+        ram[6] = off[0];
+        ram[7] = off[1];
+        ram[8] = 0xE6; // out imm8, al
+        ram[9] = GUEST_WP_PORT;
+        ram[10] = 0xF4; // hlt
+
+        // NPT mapping guest GPA [0, 2 MiB) onto the isolated RAM window.
+        // SAFETY: NptBuf is nonzero, 4 KiB-aligned; alloc_zeroed yields it or null.
+        let npt_raw = unsafe { alloc_zeroed(Layout::new::<NptBuf>()) };
+        if npt_raw.is_null() {
+            return None;
+        }
+        let npt_pa = npt_raw as u64;
+        // SAFETY: npt_raw owns a live, zeroed NptBuf, leaked below.
+        let npt_buf = unsafe { core::slice::from_raw_parts_mut(npt_raw, 3 * 4096) };
+        let ncr3 = build_npt_2mib(npt_buf, npt_pa, guest_spa, GUEST_RAM_BYTES as u64)
+            .ok()?
+            .ncr3;
+        // Write-protect the leaf covering the guest's RAM so its store faults.
+        set_npt_2mib_leaf_writable(npt_buf, npt_pa, 0, false).ok()?;
+
+        // Program a VMCB entering the code at GPA 0 under that NPT.
+        let mut vmcb = Vmcb::new().ok()?;
+        let setup = MinimalGuestSetup {
+            asid: 1,
+            nested_cr3: ncr3,
+            entry_ip: 0,
+            code_base: 0,
+            stack_pointer: 0,
+        };
+        program_minimal_hlt_guest(vmcb.as_bytes_mut(), &setup).ok()?;
+
+        // Arm port-I/O interception so the guest's OUT takes an IOIO #VMEXIT.
+        let iopm = IoPermissionsMap::intercept_all().ok()?;
+        enable_io_intercept(vmcb.as_bytes_mut(), iopm.base_addr());
+        core::mem::forget(iopm);
+
+        let vmcb_pa = vmcb.base_addr();
+        core::mem::forget(vmcb); // must outlive VMRUN
+        Some((vmcb_pa, u64::from(GUEST_WP_GPA)))
+    }
+
     /// Build a `VMRUN`-ready VMCB for a **64-bit long-mode** guest, returning
     /// `(vmcb_pa, guest_cr3)`.
     ///
@@ -1586,6 +1685,31 @@ mod hw {
         map_npt_2mib_leaf(npt, ncr3, fault_gpa, frame_spa).is_ok()
     }
 
+    /// Grant write access to the write-protected page a present+write NPF hit,
+    /// so a re-`VMRUN` completes the guest's store. Returns whether the leaf was
+    /// made writable.
+    ///
+    /// The fault (present + write, [`NptFaultInfo`](enlil_hal::svm::NptFaultInfo))
+    /// is the signal dirty-page tracking / copy-on-write want; here enlil simply
+    /// clears the write-protection ([`set_npt_2mib_leaf_writable`]) after noting
+    /// the write, then resumes without advancing RIP so the store re-executes.
+    ///
+    /// # Safety
+    ///
+    /// `vmcb`'s `NESTED_CR3` must point at the identity-mapped NPT (3 pages).
+    unsafe fn grant_npf_write(vmcb: &[u8]) -> bool {
+        use enlil_hal::npt::{HUGE_2MIB, set_npt_2mib_leaf_writable};
+        use enlil_hal::svm::{control, exit_info_2};
+
+        let fault_gpa = exit_info_2(vmcb) & !(HUGE_2MIB - 1);
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&vmcb[control::NESTED_CR3..control::NESTED_CR3 + 8]);
+        let ncr3 = u64::from_le_bytes(b);
+        // SAFETY: ncr3 is the identity-mapped NPT root (3 pages) the guest runs on.
+        let npt = unsafe { core::slice::from_raw_parts_mut(ncr3 as *mut u8, 3 * 4096) };
+        set_npt_2mib_leaf_writable(npt, ncr3, fault_gpa, true).is_ok()
+    }
+
     /// Drive the guest at `vmcb_pa` through a real `#VMEXIT` dispatch loop,
     /// returning what the run observed ([`GuestRunOutcome`]).
     ///
@@ -1694,10 +1818,10 @@ mod hw {
     ) -> bool {
         use enlil_hal::VmExit;
         use enlil_hal::svm::{
-            CPUID_INSN_LEN, IoioExitInfo, MSR_INSN_LEN, RunLoopExit, VMMCALL_INSN_LEN,
-            classify_run_loop_exit, encode_event_inj, event_type, exception_has_error_code,
-            exit_code, exit_info_1, exit_info_2, guest_rax, guest_rip, ioio_to_vmexit, next_rip,
-            resume_rip_after, set_event_inj, set_guest_rip,
+            CPUID_INSN_LEN, IoioExitInfo, MSR_INSN_LEN, NptFaultInfo, RunLoopExit,
+            VMMCALL_INSN_LEN, classify_run_loop_exit, encode_event_inj, event_type,
+            exception_has_error_code, exit_code, exit_info_1, exit_info_2, guest_rax, guest_rip,
+            ioio_to_vmexit, next_rip, resume_rip_after, set_event_inj, set_guest_rip,
         };
 
         let code = exit_code(vmcb);
@@ -1736,8 +1860,19 @@ mod hw {
                 return true;
             }
             RunLoopExit::Npf => {
-                // SAFETY: the caller guarantees an identity-mapped NPT root.
-                if unsafe { demand_map_npf(vmcb) } {
+                let info = NptFaultInfo::from_raw(exit_info_1(vmcb));
+                if info.was_present() && info.was_write() {
+                    // A write to a present-but-write-protected page — the dirty-
+                    // page / copy-on-write signal. Record it, grant write, and
+                    // re-run so the write completes (no RIP advance).
+                    // SAFETY: the caller guarantees an identity-mapped NPT root.
+                    if unsafe { grant_npf_write(vmcb) } {
+                        outcome.npf_write_faults += 1;
+                        return true;
+                    }
+                } else if unsafe { demand_map_npf(vmcb) } {
+                    // A not-present fault — demand-map the missing page.
+                    // SAFETY: the caller guarantees an identity-mapped NPT root.
                     outcome.npf_exits += 1;
                     return true; // resume WITHOUT advancing RIP
                 }

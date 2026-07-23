@@ -276,6 +276,49 @@ pub fn map_npt_2mib_leaf(
     Ok(())
 }
 
+/// Toggle the `WRITABLE` bit of the present 2 MiB huge-page leaf mapping `gpa`.
+///
+/// Clearing it **write-protects** the guest page: a guest write then takes a
+/// nested page fault (present, write — see [`NptFaultInfo`](crate::svm::NptFaultInfo))
+/// the backend observes, while reads and instruction fetches still succeed
+/// (they gate on `PRESENT`, not `WRITABLE`), so the guest keeps executing code
+/// out of a write-protected region. Setting it again grants the write so a
+/// re-`VMRUN` completes it. This is the primitive dirty-page tracking (live
+/// migration), copy-on-write, and MMIO write-trapping build on.
+///
+/// # Errors
+///
+/// - [`NptError::UnalignedBase`] if `gpa` is not 2 MiB-aligned;
+/// - [`NptError::NotAHugePageLeaf`] if the `PD` entry is absent or a table
+///   pointer rather than a present 2 MiB huge-page leaf.
+pub fn set_npt_2mib_leaf_writable(
+    buf: &mut [u8],
+    phys_base: u64,
+    gpa: u64,
+    writable: bool,
+) -> Result<(), NptError> {
+    if gpa & (HUGE_2MIB - 1) != 0 {
+        return Err(NptError::UnalignedBase);
+    }
+    let pml4_i = ((gpa >> 39) & 0x1FF) as usize;
+    let pdpt_i = ((gpa >> 30) & 0x1FF) as usize;
+    let pd_i = ((gpa >> 21) & 0x1FF) as usize;
+
+    let pdpt_off = child_offset(buf, phys_base, 0, pml4_i)?;
+    let pd_off = child_offset(buf, phys_base, pdpt_off, pdpt_i)?;
+    let entry = read_entry(buf, pd_off + pd_i * 8)?;
+    if entry & flags::PRESENT == 0 || entry & flags::HUGE_PAGE == 0 {
+        return Err(NptError::NotAHugePageLeaf);
+    }
+    let updated = if writable {
+        entry | flags::WRITABLE
+    } else {
+        entry & !flags::WRITABLE
+    };
+    write_entry(buf, pd_off + pd_i * 8, updated);
+    Ok(())
+}
+
 /// Build a **4 KiB-granular** identity map of `num_pages` pages, leaving each
 /// index in `guard_pages` **not present** so a touch of it faults.
 ///
@@ -690,6 +733,36 @@ mod tests {
         // Its neighbours on both sides are still mapped.
         assert_eq!(translate_npt(&buf, phys_base, guard - 0x1000), Some(0x6000));
         assert_eq!(translate_npt(&buf, phys_base, guard + 0x1000), Some(0x8000));
+    }
+
+    #[test]
+    fn write_protect_toggles_writable_and_keeps_the_page_present() {
+        let phys_base = 0x1_0000u64;
+        let mut buf = alloc::vec![0u8; 4 * 4096];
+        build_identity_npt_2mib(&mut buf, phys_base, 4 * 1024 * 1024).unwrap();
+
+        // The first huge leaf starts writable + present.
+        let leaf = read_entry(&buf, 0x2000, 0);
+        assert_ne!(leaf & flags::WRITABLE, 0);
+        assert_ne!(leaf & flags::PRESENT, 0);
+
+        // Write-protect it: WRITABLE clears, PRESENT stays (so reads/fetches
+        // still work and the address still translates — only a write faults).
+        set_npt_2mib_leaf_writable(&mut buf, phys_base, 0, false).unwrap();
+        let leaf = read_entry(&buf, 0x2000, 0);
+        assert_eq!(leaf & flags::WRITABLE, 0, "leaf should be write-protected");
+        assert_ne!(leaf & flags::PRESENT, 0, "leaf must stay present");
+        assert_eq!(translate_npt(&buf, phys_base, 0x1234), Some(0x1234));
+
+        // Granting write again restores WRITABLE.
+        set_npt_2mib_leaf_writable(&mut buf, phys_base, 0, true).unwrap();
+        assert_ne!(read_entry(&buf, 0x2000, 0) & flags::WRITABLE, 0);
+
+        // An unaligned GPA is rejected before any mutation.
+        assert_eq!(
+            set_npt_2mib_leaf_writable(&mut buf, phys_base, 0x1000, false),
+            Err(NptError::UnalignedBase)
+        );
     }
 
     #[test]

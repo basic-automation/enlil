@@ -1234,6 +1234,9 @@ mod hw {
                         // inject → handler → IRET → the guest resumes (what a
                         // virtual timer tick needs).
                         run_irq_resume_guest(serial);
+                        // Sixth guest: prove NPT write-protection — enlil traps a
+                        // guest store to a read-only page (dirty-tracking / COW).
+                        run_wp_npf_guest(serial);
                     }
                     None => serial.write_str("enlil kernel: svm: vmcb VMRUN-ready FAILED\n"),
                 }
@@ -1513,6 +1516,39 @@ mod hw {
                 }
             }
             None => serial.write_str("enlil kernel: svm: irq-resume vmcb build FAILED\n"),
+        }
+    }
+
+    /// Build and run the NPT write-protection guest, reporting whether enlil
+    /// trapped the guest's store to a write-protected page and let it complete.
+    ///
+    /// enlil marks the guest's RAM leaf read-only, so the guest's store takes a
+    /// present+write nested page fault; the run loop records it, grants write,
+    /// and resumes so the store completes. The guest reads the byte back and
+    /// `OUT`s [`GUEST_WP_VALUE`](crate::svm::GUEST_WP_VALUE) — a match plus a
+    /// counted write-fault proves enlil observed the write before it landed, the
+    /// signal live-migration dirty tracking and copy-on-write build on (ROADMAP
+    /// 6.2 / Phase 8).
+    fn run_wp_npf_guest(serial: &SerialPort) {
+        use crate::svm::{GUEST_WP_PORT, GUEST_WP_VALUE};
+        match crate::svm::program_wp_npf_vmcb() {
+            Some((vmcb, _gpa)) => {
+                // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
+                // is a VMRUN-ready VMCB from program_wp_npf_vmcb.
+                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                if run.npf_write_faults > 0
+                    && run.io_out_to(u16::from(GUEST_WP_PORT)) == Some(u32::from(GUEST_WP_VALUE))
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: guest write to a write-protected page trapped + granted by enlil — NPT dirty-tracking works\n",
+                    );
+                } else {
+                    serial.write_str(
+                        "enlil kernel: svm: NPT write-protection NOT observed (no write fault or store did not complete)\n",
+                    );
+                }
+            }
+            None => serial.write_str("enlil kernel: svm: wp-npf vmcb build FAILED\n"),
         }
     }
 
