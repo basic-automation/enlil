@@ -124,9 +124,16 @@ ECAM_SCAN_LINE="ECAM scan"
 # Printed once the kernel reads the first memory BAR on bus 0 — the MMIO window
 # a driver / passthrough claims. Read-only decode (base + 32/64-bit), no sizing.
 PCI_BAR_LINE="pci: BAR"
+# Printed once the kernel summarizes every memory BAR on bus 0 — the total MMIO
+# footprint (count + summed sizes) the hypervisor accounts for in passthrough.
+PCI_BARS_LINE="memory BARs on bus 0 totaling"
 # Printed once the kernel builds its own identity page tables and reloads CR3
 # off the firmware's — reaching this line proves the map covers the kernel.
 PAGING_LINE="off firmware page tables"
+# Printed once the kernel installs the mixed 2 MiB + 4 KiB identity map with the
+# null page (VA 0) left unmapped as a guard; booting past it proves the mixed
+# map is correct and the kernel never touches page 0.
+NULLGUARD_LINE="null-page guard armed"
 SPLIT_LINE="split to 4 KiB pages"
 # Printed once the kernel allocates its own stack and unmaps the page below it —
 # an overflow now takes a diagnosable #PF instead of corrupting its neighbour.
@@ -194,10 +201,30 @@ VMMCALL_LINE="hypercall channel works"
 # before the guest's first instruction, and the guest's real-mode IVT vectors
 # it to a handler whose OUT enlil captures — proving event injection.
 EVENTINJ_LINE="event injection works"
+# Printed once enlil injects an interrupt whose handler does work and IRETs back
+# to resume the interrupted guest, which then runs — the full interrupt
+# round-trip (deliver → handle → IRET → continue) a real guest OS performs.
+RESUME_LINE="interrupt round-trip works"
+# Printed once that handler's store into guest RAM is read back by enlil out of
+# the guest's isolated system-physical window — the handler's work observed by
+# the hypervisor through the NPT mapping.
+RESUME_WORK_LINE="handler work observed through the NPT window"
 # Printed once a 64-bit long-mode guest (paging on, CR3 walking its own tables
 # through the NPT, L-bit code segment) runs to its OUT — the mode a real
 # x86-64 OS boots in.
 LONGMODE_LINE="long-mode guest works"
+# Printed once an injected interrupt is delivered through a 64-bit long-mode
+# guest's real IDT/GDT, its handler IRETQs, and the interrupted code resumes —
+# interrupt handling in the mode a real x86-64 OS uses.
+LM_ROUNDTRIP_LINE="long-mode interrupt round-trip works"
+# Printed once a pending virtual interrupt is held off while the long-mode guest
+# masks interrupts (IF=0), then delivered on STI — proving the guest's own
+# interrupt masking gates virtual interrupts, how a real OS is preempted.
+VINTR_LINE="virtual-interrupt masking works"
+# Printed once a guest spinning in an infinite jmp-to-self loop (never yielding)
+# is forcibly broken out of it by a virtual interrupt — pure time-slicing, the
+# mechanism a scheduler quantum uses to reclaim a CPU from a running guest.
+PREEMPT_LINE="guest preemption works"
 # Printed once the kernel draws to the GOP framebuffer and reads a pixel back
 # — proves the framebuffer I/O backend is wired with the firmware gone.
 GOP_LINE="framebuffer draw ok"
@@ -362,7 +389,9 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PCI_CLASS_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ECAM_SCAN_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PCI_BAR_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$PCI_BARS_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PAGING_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$NULLGUARD_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$SPLIT_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$STACK_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$STACK_SWITCH_LINE" "$SERIAL_LOG" 2>/dev/null \
@@ -381,10 +410,15 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$VMLOAD_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$VMMCALL_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$EVENTINJ_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$RESUME_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$RESUME_WORK_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$LONGMODE_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$LM_ROUNDTRIP_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$VINTR_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$PREEMPT_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_TEXT_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery incl. real VT-d DMAR remapping units + device scopes, SMP AP bring-up (INIT-SIPI-SIPI), PCI enumeration, own page tables + 4 KiB split + kernel-owned guarded stack (bring-up continues on it), SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + 64-bit long-mode guest, and GOP draw observed on serial"
+    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery incl. real VT-d DMAR remapping units + device scopes, SMP AP bring-up (INIT-SIPI-SIPI), PCI enumeration, own page tables (null-page guard) + 4 KiB split + kernel-owned guarded stack (bring-up continues on it), SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + interrupt IRET-resume round-trip + 64-bit long-mode guest + long-mode interrupt round-trip + virtual-interrupt masking + spinning-guest preemption, and GOP draw observed on serial"
     exit 0
 fi
 
