@@ -1181,6 +1181,31 @@ pub fn set_guest_rip(region: &mut [u8], value: u64) {
 }
 
 // ---------------------------------------------------------------------------
+// TSC offsetting (timing stealth)
+// ---------------------------------------------------------------------------
+
+/// Program the VMCB `TSC_OFFSET` control field ([`control::TSC_OFFSET`]).
+///
+/// The CPU adds this signed offset to the physical TSC for every guest `RDTSC`
+/// / `RDTSCP` (and the TSC value a guest reads via the corresponding MSRs), so
+/// the guest sees `host_tsc + offset` with **no `#VMEXIT`** — the offset is
+/// applied in hardware, unlike an intercept, so there is no timing tell that
+/// the read was trapped (LOCKED PRINCIPLE 1). A negative offset equal to the
+/// host TSC captured just before `VMRUN` makes a guest's TSC appear to start
+/// near zero, hiding the host's absolute TSC (the bare-metal analogue of the
+/// KVM path's per-guest TSC offsetting, ROADMAP 3.4 / 5.4).
+pub fn set_tsc_offset(region: &mut [u8], offset: i64) {
+    put_u64(region, control::TSC_OFFSET, offset.cast_unsigned());
+}
+
+/// Read back the VMCB `TSC_OFFSET` control field ([`control::TSC_OFFSET`]) as a
+/// signed offset (companion to [`set_tsc_offset`]).
+#[must_use]
+pub fn tsc_offset(region: &[u8]) -> i64 {
+    get_u64(region, control::TSC_OFFSET).cast_signed()
+}
+
+// ---------------------------------------------------------------------------
 // Event injection
 // ---------------------------------------------------------------------------
 
@@ -1797,5 +1822,25 @@ mod tests {
         set_guest_rip(&mut region, 0x7C02);
         assert_eq!(guest_rax(&region), 0x1234);
         assert_eq!(guest_rip(&region), 0x7C02);
+    }
+
+    #[test]
+    fn tsc_offset_round_trips_positive_and_negative() {
+        let mut region = [0u8; VMCB_SIZE];
+        assert_eq!(tsc_offset(&region), 0);
+
+        set_tsc_offset(&mut region, 0x0123_4567_89AB_CDEF);
+        assert_eq!(tsc_offset(&region), 0x0123_4567_89AB_CDEF);
+        // The field lives at the control-area TSC_OFFSET slot, little-endian.
+        assert_eq!(get_u64(&region, control::TSC_OFFSET), 0x0123_4567_89AB_CDEF);
+
+        // A negative offset (the zero-a-guest's-TSC case) stores as two's
+        // complement and reads back signed.
+        set_tsc_offset(&mut region, -4_000_000_000);
+        assert_eq!(tsc_offset(&region), -4_000_000_000);
+        assert_eq!(
+            get_u64(&region, control::TSC_OFFSET),
+            (-4_000_000_000i64).cast_unsigned()
+        );
     }
 }
