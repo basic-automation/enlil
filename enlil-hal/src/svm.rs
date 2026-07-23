@@ -734,6 +734,16 @@ pub enum RunLoopExit {
     /// services it, writes the result back to guest `RAX`, then resumes past the
     /// fixed-length instruction.
     Vmmcall,
+    /// Intercepted guest exception (vector `0..=31`) — the guest raised a fault
+    /// enlil armed via [`set_exception_intercept`]. `EXITINFO1`/`EXITINFO2` carry
+    /// the exception's error code / faulting address where the vector defines
+    /// them (`#PF` puts CR2 in `EXITINFO2`); the caller observes/emulates the
+    /// fault or re-delivers it to the guest's own IDT via
+    /// [`encode_event_inj`]/[`set_event_inj`].
+    Exception {
+        /// The exception vector (`0..=31`), e.g. `6` for `#UD`, `14` for `#PF`.
+        vector: u8,
+    },
     /// An exit the minimal loop does not route yet — stop and report the raw
     /// code to the caller.
     Unhandled,
@@ -761,6 +771,9 @@ pub const MSR_INSN_LEN: u64 = 2;
 pub const fn classify_run_loop_exit(code: SvmExitCode) -> RunLoopExit {
     if code.is_invalid() {
         return RunLoopExit::Invalid;
+    }
+    if let Some(vector) = code.exception_vector() {
+        return RunLoopExit::Exception { vector };
     }
     match code.raw() {
         exit_code::HLT => RunLoopExit::Halted,
@@ -1112,6 +1125,43 @@ pub fn intercept_vmmcall(region: &mut [u8]) {
     );
 }
 
+/// Add an exception intercept for `vector` (0–31) to a programmed VMCB.
+///
+/// ORs the `vector`-th bit into the exception-intercept bitmap at
+/// [`control::INTERCEPT_EXCEPTIONS`] (APM §15.13) so a guest exception of that
+/// vector takes a `#VMEXIT` the run loop routes as [`RunLoopExit::Exception`] —
+/// the mechanism for trapping a guest's own faults (e.g. `#UD`, `#GP`, `#PF`)
+/// to observe, emulate, or re-deliver them. Vectors above 31 are ignored (no
+/// architectural exception intercept exists for them).
+pub fn set_exception_intercept(region: &mut [u8], vector: u8) {
+    if vector < 32 {
+        let bits = get_u32(region, control::INTERCEPT_EXCEPTIONS);
+        put_u32(region, control::INTERCEPT_EXCEPTIONS, bits | (1 << vector));
+    }
+}
+
+/// Whether the VMCB intercepts the exception `vector` (companion to
+/// [`set_exception_intercept`]).
+#[must_use]
+pub fn exception_intercepted(region: &[u8], vector: u8) -> bool {
+    vector < 32 && get_u32(region, control::INTERCEPT_EXCEPTIONS) & (1 << vector) != 0
+}
+
+/// Whether exception `vector` pushes an error code when delivered through the
+/// IDT.
+///
+/// The error-code-pushing vectors are `#DF`=8, `#TS`=10, `#NP`=11, `#SS`=12,
+/// `#GP`=13, `#PF`=14, `#AC`=17, `#CP`=21 (AMD APM Vol. 2 §8.2 / Intel SDM
+/// Vol. 3 §6.13). When re-injecting a trapped exception via [`encode_event_inj`],
+/// the caller
+/// carries the `EXITINFO1` error code only for the vectors this returns `true`
+/// for — the others must inject with no error code or the guest stack unwinds
+/// wrong.
+#[must_use]
+pub const fn exception_has_error_code(vector: u8) -> bool {
+    matches!(vector, 8 | 10 | 11 | 12 | 13 | 14 | 17 | 21)
+}
+
 /// Write a [`VmcbSegment`] into the 16-byte save-area slot at `offset` (one of
 /// the [`save`] segment offsets).
 pub fn write_segment(region: &mut [u8], offset: usize, seg: VmcbSegment) {
@@ -1178,6 +1228,31 @@ pub fn set_guest_rax(region: &mut [u8], value: u64) {
 /// emulated instruction using [`next_rip`]).
 pub fn set_guest_rip(region: &mut [u8], value: u64) {
     put_u64(region, save::RIP, value);
+}
+
+// ---------------------------------------------------------------------------
+// TSC offsetting (timing stealth)
+// ---------------------------------------------------------------------------
+
+/// Program the VMCB `TSC_OFFSET` control field ([`control::TSC_OFFSET`]).
+///
+/// The CPU adds this signed offset to the physical TSC for every guest `RDTSC`
+/// / `RDTSCP` (and the TSC value a guest reads via the corresponding MSRs), so
+/// the guest sees `host_tsc + offset` with **no `#VMEXIT`** — the offset is
+/// applied in hardware, unlike an intercept, so there is no timing tell that
+/// the read was trapped (LOCKED PRINCIPLE 1). A negative offset equal to the
+/// host TSC captured just before `VMRUN` makes a guest's TSC appear to start
+/// near zero, hiding the host's absolute TSC (the bare-metal analogue of the
+/// KVM path's per-guest TSC offsetting, ROADMAP 3.4 / 5.4).
+pub fn set_tsc_offset(region: &mut [u8], offset: i64) {
+    put_u64(region, control::TSC_OFFSET, offset.cast_unsigned());
+}
+
+/// Read back the VMCB `TSC_OFFSET` control field ([`control::TSC_OFFSET`]) as a
+/// signed offset (companion to [`set_tsc_offset`]).
+#[must_use]
+pub fn tsc_offset(region: &[u8]) -> i64 {
+    get_u64(region, control::TSC_OFFSET).cast_signed()
 }
 
 // ---------------------------------------------------------------------------
@@ -1853,5 +1928,83 @@ mod tests {
         set_guest_rip(&mut region, 0x7C02);
         assert_eq!(guest_rax(&region), 0x1234);
         assert_eq!(guest_rip(&region), 0x7C02);
+    }
+
+    #[test]
+    fn tsc_offset_round_trips_positive_and_negative() {
+        let mut region = [0u8; VMCB_SIZE];
+        assert_eq!(tsc_offset(&region), 0);
+
+        set_tsc_offset(&mut region, 0x0123_4567_89AB_CDEF);
+        assert_eq!(tsc_offset(&region), 0x0123_4567_89AB_CDEF);
+        // The field lives at the control-area TSC_OFFSET slot, little-endian.
+        assert_eq!(get_u64(&region, control::TSC_OFFSET), 0x0123_4567_89AB_CDEF);
+
+        // A negative offset (the zero-a-guest's-TSC case) stores as two's
+        // complement and reads back signed.
+        set_tsc_offset(&mut region, -4_000_000_000);
+        assert_eq!(tsc_offset(&region), -4_000_000_000);
+        assert_eq!(
+            get_u64(&region, control::TSC_OFFSET),
+            (-4_000_000_000i64).cast_unsigned()
+        );
+    }
+
+    #[test]
+    fn exception_intercept_sets_and_reads_the_vector_bit() {
+        let mut region = [0u8; VMCB_SIZE];
+        assert!(!exception_intercepted(&region, 6));
+
+        // Arm #UD (vector 6) and #PF (vector 14); the bits are independent.
+        set_exception_intercept(&mut region, 6);
+        set_exception_intercept(&mut region, 14);
+        assert!(exception_intercepted(&region, 6));
+        assert!(exception_intercepted(&region, 14));
+        assert!(!exception_intercepted(&region, 13));
+        assert_eq!(
+            get_u32(&region, control::INTERCEPT_EXCEPTIONS),
+            (1 << 6) | (1 << 14)
+        );
+
+        // Out-of-range vectors are ignored (no exception intercept exists).
+        set_exception_intercept(&mut region, 32);
+        assert!(!exception_intercepted(&region, 32));
+        assert_eq!(
+            get_u32(&region, control::INTERCEPT_EXCEPTIONS),
+            (1 << 6) | (1 << 14)
+        );
+    }
+
+    #[test]
+    fn classify_routes_an_exception_exit_to_its_vector() {
+        // EXCEPTION_BASE + 6 (#UD) classifies as Exception { vector: 6 }.
+        let ud = SvmExitCode::from_raw(exit_code::EXCEPTION_BASE + 6);
+        assert_eq!(
+            classify_run_loop_exit(ud),
+            RunLoopExit::Exception { vector: 6 }
+        );
+        // #PF (vector 14).
+        let pf = SvmExitCode::from_raw(exit_code::EXCEPTION_BASE + 14);
+        assert_eq!(
+            classify_run_loop_exit(pf),
+            RunLoopExit::Exception { vector: 14 }
+        );
+        // A non-exception exit is unaffected.
+        assert_eq!(
+            classify_run_loop_exit(SvmExitCode::from_raw(exit_code::HLT)),
+            RunLoopExit::Halted
+        );
+    }
+
+    #[test]
+    fn exception_error_code_matches_the_architecture() {
+        // The error-code-pushing vectors.
+        for v in [8u8, 10, 11, 12, 13, 14, 17, 21] {
+            assert!(exception_has_error_code(v), "vector {v} should push a code");
+        }
+        // A sampling of the ones that do not (#DE, #UD, #NM, #MF).
+        for v in [0u8, 6, 7, 16] {
+            assert!(!exception_has_error_code(v), "vector {v} pushes no code");
+        }
     }
 }

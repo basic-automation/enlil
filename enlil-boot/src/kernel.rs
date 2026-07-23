@@ -1258,6 +1258,17 @@ mod hw {
                         // Seventh guest: preempt a guest spinning in an
                         // infinite loop that never yields — pure time-slicing.
                         run_long_mode_preempt_guest(serial);
+                        // Eighth guest: prove enlil traps a guest's own #UD and
+                        // re-delivers it to the guest's handler (exception
+                        // virtualization).
+                        run_ud_exception_guest(serial);
+                        // Ninth guest: prove a full interrupt round-trip —
+                        // inject → handler → IRET → the guest resumes (what a
+                        // virtual timer tick needs).
+                        run_irq_resume_guest(serial);
+                        // Tenth guest: prove NPT write-protection — enlil traps a
+                        // guest store to a read-only page (dirty-tracking / COW).
+                        run_wp_npf_guest(serial);
                     }
                     None => serial.write_str("enlil kernel: svm: vmcb VMRUN-ready FAILED\n"),
                 }
@@ -1671,6 +1682,111 @@ mod hw {
             None => {
                 serial.write_str("enlil kernel: svm: long-mode preempt vmcb build FAILED\n");
             }
+        }
+    }
+
+    /// Build and run the exception-interception guest, reporting whether enlil
+    /// trapped the guest's own `#UD` and re-delivered it to the guest's handler.
+    ///
+    /// enlil arms the `#UD` exception intercept so the guest's `UD2` takes a
+    /// `#VMEXIT`; the run loop re-injects the fault into the guest's own IVT
+    /// ([`RunLoopExit::Exception`](enlil_hal::svm::RunLoopExit::Exception)), whose
+    /// handler `OUT`s [`GUEST_UD_SENTINEL`](crate::svm::GUEST_UD_SENTINEL). A
+    /// matching capture proves enlil can trap a guest's own fault and hand it
+    /// back to the guest — the mechanism for observing/emulating guest
+    /// exceptions while the guest still handles them (ROADMAP 6.2).
+    fn run_ud_exception_guest(serial: &SerialPort) {
+        use crate::svm::{GUEST_UD_PORT, GUEST_UD_SENTINEL};
+        match crate::svm::program_ud_exception_vmcb() {
+            Some((vmcb, _handler)) => {
+                // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
+                // is a VMRUN-ready VMCB from program_ud_exception_vmcb.
+                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                if run.exception_exits > 0
+                    && run.io_out_to(u16::from(GUEST_UD_PORT)) == Some(u32::from(GUEST_UD_SENTINEL))
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: guest #UD trapped + re-injected to its handler — exception interception works\n",
+                    );
+                } else {
+                    serial.write_str(
+                        "enlil kernel: svm: #UD interception NOT observed (guest took the fallback path)\n",
+                    );
+                }
+            }
+            None => serial.write_str("enlil kernel: svm: ud-exception vmcb build FAILED\n"),
+        }
+    }
+
+    /// Build and run the interrupt-round-trip guest, reporting whether the guest
+    /// both handled an injected interrupt and resumed past it.
+    ///
+    /// enlil injects [`GUEST_IRQ_VECTOR`](crate::svm::GUEST_IRQ_VECTOR); the
+    /// guest's handler `OUT`s
+    /// [`GUEST_IRQ_HANDLER_SENTINEL`](crate::svm::GUEST_IRQ_HANDLER_SENTINEL)
+    /// then `IRET`s, and the guest continuation `OUT`s
+    /// [`GUEST_IRQ_RESUME_SENTINEL`](crate::svm::GUEST_IRQ_RESUME_SENTINEL). Both
+    /// captures prove the whole inject → handle → `IRET` → resume cycle — the
+    /// mechanism a virtual timer tick / device interrupt uses to preempt a guest
+    /// and let it keep running (ROADMAP 6.2).
+    fn run_irq_resume_guest(serial: &SerialPort) {
+        use crate::svm::{
+            GUEST_IRQ_HANDLER_PORT, GUEST_IRQ_HANDLER_SENTINEL, GUEST_IRQ_RESUME_PORT,
+            GUEST_IRQ_RESUME_SENTINEL,
+        };
+        match crate::svm::program_irq_resume_vmcb() {
+            Some((vmcb, _handler)) => {
+                // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
+                // is a VMRUN-ready VMCB from program_irq_resume_vmcb.
+                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                let handled = run.io_out_to(u16::from(GUEST_IRQ_HANDLER_PORT))
+                    == Some(u32::from(GUEST_IRQ_HANDLER_SENTINEL));
+                let resumed = run.io_out_to(u16::from(GUEST_IRQ_RESUME_PORT))
+                    == Some(u32::from(GUEST_IRQ_RESUME_SENTINEL));
+                if handled && resumed {
+                    serial.write_str(
+                        "enlil kernel: svm: injected interrupt handled + guest resumed via IRET — interrupt round-trip works\n",
+                    );
+                } else {
+                    serial.write_str(
+                        "enlil kernel: svm: interrupt round-trip incomplete (handler or IRET-resume not observed)\n",
+                    );
+                }
+            }
+            None => serial.write_str("enlil kernel: svm: irq-resume vmcb build FAILED\n"),
+        }
+    }
+
+    /// Build and run the NPT write-protection guest, reporting whether enlil
+    /// trapped the guest's store to a write-protected page and let it complete.
+    ///
+    /// enlil marks the guest's RAM leaf read-only, so the guest's store takes a
+    /// present+write nested page fault; the run loop records it, grants write,
+    /// and resumes so the store completes. The guest reads the byte back and
+    /// `OUT`s [`GUEST_WP_VALUE`](crate::svm::GUEST_WP_VALUE) — a match plus a
+    /// counted write-fault proves enlil observed the write before it landed, the
+    /// signal live-migration dirty tracking and copy-on-write build on (ROADMAP
+    /// 6.2 / Phase 8).
+    fn run_wp_npf_guest(serial: &SerialPort) {
+        use crate::svm::{GUEST_WP_PORT, GUEST_WP_VALUE};
+        match crate::svm::program_wp_npf_vmcb() {
+            Some((vmcb, _gpa)) => {
+                // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
+                // is a VMRUN-ready VMCB from program_wp_npf_vmcb.
+                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                if run.npf_write_faults > 0
+                    && run.io_out_to(u16::from(GUEST_WP_PORT)) == Some(u32::from(GUEST_WP_VALUE))
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: guest write to a write-protected page trapped + granted by enlil — NPT dirty-tracking works\n",
+                    );
+                } else {
+                    serial.write_str(
+                        "enlil kernel: svm: NPT write-protection NOT observed (no write fault or store did not complete)\n",
+                    );
+                }
+            }
+            None => serial.write_str("enlil kernel: svm: wp-npf vmcb build FAILED\n"),
         }
     }
 
