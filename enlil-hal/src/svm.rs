@@ -1229,6 +1229,38 @@ pub fn event_inj(region: &[u8]) -> u64 {
     get_u64(region, control::EVENT_INJ)
 }
 
+/// Encode a VMCB `INT_CONTROL` value that posts a **virtual (maskable)
+/// interrupt** of `vector` at `priority` for the guest (AMD APM Vol. 2 §15.21).
+///
+/// Unlike [`encode_event_inj`] — which delivers unconditionally before the
+/// first guest instruction — a virtual interrupt is *pending* and delivered
+/// through the guest `IDT` only when the guest can take it, i.e. after it sets
+/// `EFLAGS.IF` (`STI`). This is the mechanism that preempts a *running* guest
+/// with an asynchronous timer/device tick, respecting the guest's own interrupt
+/// masking. The value sets `V_IRQ` (a virtual interrupt is pending), `V_INTR_PRIO`
+/// (bits 19:16), `V_IGN_TPR` (bit 20 — bypass the `V_TPR` priority check),
+/// `V_INTR_MASKING` (bit 24 — the guest's `EFLAGS.IF` gates virtual interrupts),
+/// and `V_INTR_VECTOR` (bits 39:32). `priority` is masked to 4 bits.
+#[must_use]
+pub const fn encode_vintr(vector: u8, priority: u8) -> u64 {
+    const V_IRQ: u64 = 1 << 8;
+    const V_IGN_TPR: u64 = 1 << 20;
+    const V_INTR_MASKING: u64 = 1 << 24;
+    V_IRQ | ((priority as u64 & 0xF) << 16) | V_IGN_TPR | V_INTR_MASKING | ((vector as u64) << 32)
+}
+
+/// Program the VMCB `INT_CONTROL` field ([`control::INT_CONTROL`]). A value from
+/// [`encode_vintr`] posts a pending virtual interrupt; writing 0 clears it.
+pub fn set_int_control(region: &mut [u8], value: u64) {
+    put_u64(region, control::INT_CONTROL, value);
+}
+
+/// Read back the VMCB `INT_CONTROL` field.
+#[must_use]
+pub fn int_control(region: &[u8]) -> u64 {
+    get_u64(region, control::INT_CONTROL)
+}
+
 // Little-endian field accessors. The VMCB is always a full page here, so the
 // curated Appendix-B offsets are in bounds.
 
@@ -1600,6 +1632,30 @@ mod tests {
         // Writing 0 clears a pending injection.
         set_event_inj(&mut region, 0);
         assert_eq!(event_inj(&region), 0);
+    }
+
+    #[test]
+    fn vintr_posts_a_maskable_virtual_interrupt() {
+        // A virtual timer interrupt, vector 0x20, priority 0xF.
+        let v = encode_vintr(0x20, 0xF);
+        assert_ne!(v & (1 << 8), 0, "V_IRQ (interrupt pending)");
+        assert_eq!((v >> 16) & 0xF, 0xF, "V_INTR_PRIO");
+        assert_ne!(v & (1 << 20), 0, "V_IGN_TPR (bypass TPR check)");
+        assert_ne!(v & (1 << 24), 0, "V_INTR_MASKING (guest IF gates it)");
+        assert_eq!((v >> 32) & 0xFF, 0x20, "V_INTR_VECTOR");
+        // The priority field is 4 bits — a wider value is masked in.
+        assert_eq!((encode_vintr(0x30, 0x1F) >> 16) & 0xF, 0xF);
+    }
+
+    #[test]
+    fn int_control_round_trips_through_the_vmcb() {
+        let mut region = [0u8; VMCB_SIZE];
+        assert_eq!(int_control(&region), 0);
+        let value = encode_vintr(0x20, 0xF);
+        set_int_control(&mut region, value);
+        assert_eq!(int_control(&region), value);
+        set_int_control(&mut region, 0);
+        assert_eq!(int_control(&region), 0);
     }
 
     #[test]

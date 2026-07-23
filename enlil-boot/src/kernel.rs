@@ -833,6 +833,13 @@ mod hw {
                 serial.write_str(" GiB) installed, CR3=");
                 serial.write_str(format_u64_hex(map.cr3, &mut c));
                 serial.write_str(" — off firmware page tables\n");
+                // Reaching here proves the mixed 2 MiB + 4 KiB map is correct
+                // AND that the kernel touched nothing in the guarded null page
+                // during the reload — the low 2 MiB slot is 4 KiB-granular with
+                // VA 0 left unmapped so a null dereference faults.
+                serial.write_str(
+                    "enlil kernel: paging: null-page guard armed (VA 0 unmapped) — kernel runs on the mixed 2 MiB + 4 KiB map\n",
+                );
                 prove_4kib_split(serial, &mut map);
                 Some(map)
             }
@@ -1090,6 +1097,16 @@ mod hw {
         } else {
             serial.write_str("enlil kernel: pci: BAR scan — no memory BAR on bus 0\n");
         }
+        // Summarize every memory BAR on bus 0 — the total MMIO footprint the
+        // hypervisor must account for (config-space routing + passthrough).
+        let bars = crate::pci::scan_memory_bars();
+        let mut n = [0u8; 20];
+        let mut t = [0u8; 18];
+        serial.write_str("enlil kernel: pci: ");
+        serial.write_str(format_u64(u64::from(bars.count), &mut n));
+        serial.write_str(" memory BARs on bus 0 totaling ");
+        serial.write_str(format_u64_hex(bars.total_bytes, &mut t));
+        serial.write_str(" bytes MMIO\n");
     }
 
     /// Arm the LAPIC timer once and prove it fires an interrupt into the kernel.
@@ -1226,6 +1243,21 @@ mod hw {
                         // Third guest: prove a 64-bit long-mode guest runs (the
                         // mode a real OS boots in).
                         run_long_mode_guest(serial);
+                        // Fourth guest: prove an injected interrupt's handler
+                        // does work and IRETs back to resume the interrupted
+                        // guest — the full interrupt round-trip a real OS does.
+                        run_event_inj_resume_guest(serial);
+                        // Fifth guest: the same interrupt round-trip but in
+                        // 64-bit long mode through a real IDT/GDT + IRETQ — the
+                        // mode a real x86-64 OS handles interrupts in.
+                        run_long_mode_event_inj_guest(serial);
+                        // Sixth guest: a pending virtual interrupt held off
+                        // while the guest masks interrupts (IF=0), then
+                        // delivered on STI — how a real OS is preempted.
+                        run_long_mode_vintr_guest(serial);
+                        // Seventh guest: preempt a guest spinning in an
+                        // infinite loop that never yields — pure time-slicing.
+                        run_long_mode_preempt_guest(serial);
                     }
                     None => serial.write_str("enlil kernel: svm: vmcb VMRUN-ready FAILED\n"),
                 }
@@ -1404,6 +1436,66 @@ mod hw {
         }
     }
 
+    /// Build and run the *resume* event-injection guest, reporting whether the
+    /// injected interrupt's handler did work and `IRET`ed back to resume the
+    /// interrupted guest.
+    ///
+    /// Where [`run_event_inj_guest`] proves an injected interrupt reaches a
+    /// handler that then `HLT`s, this proves the full round-trip a real guest OS
+    /// interrupt performs. enlil arms `EVENTINJ` so `VMRUN` injects
+    /// [`GUEST_EVENT_VECTOR`](crate::svm::GUEST_EVENT_VECTOR); the guest's IVT
+    /// vectors it to a handler that stores
+    /// [`GUEST_EVENT_WORK_SENTINEL`](crate::svm::GUEST_EVENT_WORK_SENTINEL) into
+    /// guest RAM and `IRET`s, and the interrupted code at GPA 0 then `OUT`s
+    /// [`GUEST_EVENT_RESUME_SENTINEL`](crate::svm::GUEST_EVENT_RESUME_SENTINEL).
+    /// Two independent proofs follow: the resume-port `OUT` in the run record
+    /// (delivered → handled → `IRET` resumed → interrupted code ran), and the
+    /// work sentinel enlil reads back out of the guest's isolated RAM window
+    /// through its system-physical base (the handler mutated guest memory the
+    /// hypervisor can observe) — the enabling step for interrupt-driven device
+    /// backends and a preemptible guest (ROADMAP 6.2).
+    fn run_event_inj_resume_guest(serial: &SerialPort) {
+        use crate::svm::{
+            GUEST_EVENT_RESUME_PORT, GUEST_EVENT_RESUME_SENTINEL, GUEST_EVENT_WORK_OFF,
+            GUEST_EVENT_WORK_SENTINEL,
+        };
+        match crate::svm::program_event_inj_resume_vmcb() {
+            Some((vmcb, guest_spa)) => {
+                // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
+                // is a VMRUN-ready VMCB from program_event_inj_resume_vmcb.
+                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                if run.io_out_to(u16::from(GUEST_EVENT_RESUME_PORT))
+                    == Some(u32::from(GUEST_EVENT_RESUME_SENTINEL))
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: injected interrupt handled and IRET-resumed the guest — interrupt round-trip works\n",
+                    );
+                } else {
+                    serial.write_str(
+                        "enlil kernel: svm: interrupt IRET-resume NOT observed (guest did not resume after the handler)\n",
+                    );
+                }
+                // Read the byte the handler stored, out of the guest's isolated
+                // RAM window (the kernel runs identity-mapped, so guest_spa is a
+                // physical == virtual address). A match proves the handler's
+                // work landed in guest memory the hypervisor can observe.
+                // SAFETY: guest_spa is the base of the leaked, live 2 MiB guest
+                // RAM allocation; WORK_OFF is within it and identity-mapped.
+                let work = unsafe {
+                    core::ptr::read_volatile(
+                        (guest_spa + u64::from(GUEST_EVENT_WORK_OFF)) as *const u8,
+                    )
+                };
+                if work == GUEST_EVENT_WORK_SENTINEL {
+                    serial.write_str(
+                        "enlil kernel: svm: interrupt handler wrote the work sentinel into guest RAM — handler work observed through the NPT window\n",
+                    );
+                }
+            }
+            None => serial.write_str("enlil kernel: svm: event-inj-resume vmcb build FAILED\n"),
+        }
+    }
+
     /// Build and run a 64-bit long-mode guest, reporting whether it executed.
     ///
     /// enlil programs a VMCB for long mode (paging on, `CR3` walking the guest's
@@ -1433,6 +1525,152 @@ mod hw {
                 }
             }
             None => serial.write_str("enlil kernel: svm: long-mode vmcb build FAILED\n"),
+        }
+    }
+
+    /// Build and run the 64-bit long-mode event-injection guest, reporting
+    /// whether the injected interrupt was delivered through the guest's real
+    /// long-mode `IDT` and its handler `IRETQ`ed back to resume the guest.
+    ///
+    /// The long-mode counterpart of [`run_event_inj_resume_guest`]: enlil arms
+    /// `EVENTINJ` so `VMRUN` injects
+    /// [`GUEST_EVENT_VECTOR`](crate::svm::GUEST_EVENT_VECTOR) into a guest
+    /// running in the mode a real x86-64 OS boots in. The CPU reads the guest's
+    /// 64-bit interrupt gate, reloads `CS` from the guest `GDT`, and vectors to
+    /// a handler that sets `AL` and `IRETQ`s; the interrupted code then `OUT`s
+    /// [`GUEST_LM_EVENT_SENTINEL`](crate::svm::GUEST_LM_EVENT_SENTINEL). A
+    /// matching capture proves the full long-mode interrupt round-trip
+    /// (deliver through a real IDT → handle → `IRETQ` → resume) — the enabling
+    /// step for interrupt-driven long-mode guests (ROADMAP 6.2 toward 6.7).
+    fn run_long_mode_event_inj_guest(serial: &SerialPort) {
+        use crate::svm::{GUEST_LM_EVENT_PORT, GUEST_LM_EVENT_SENTINEL};
+        match crate::svm::program_long_mode_event_inj_vmcb() {
+            Some((vmcb, _guest_spa)) => {
+                // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
+                // is a VMRUN-ready long-mode VMCB from
+                // program_long_mode_event_inj_vmcb.
+                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                if run.io_out_to(u16::from(GUEST_LM_EVENT_PORT))
+                    == Some(u32::from(GUEST_LM_EVENT_SENTINEL))
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: long-mode injected interrupt handled and IRETQ-resumed — long-mode interrupt round-trip works\n",
+                    );
+                } else {
+                    let mut e = [0u8; 18];
+                    serial.write_str(
+                        "enlil kernel: svm: long-mode interrupt round-trip NOT observed (final exit ",
+                    );
+                    serial.write_str(format_u64_hex(run.final_exit, &mut e));
+                    serial.write_str(")\n");
+                }
+            }
+            None => {
+                serial.write_str("enlil kernel: svm: long-mode event-inj vmcb build FAILED\n");
+            }
+        }
+    }
+
+    /// Build and run the long-mode *virtual-interrupt masking* guest, reporting
+    /// whether a pending virtual interrupt was correctly held off while the
+    /// guest masked interrupts and delivered only after it `STI`ed.
+    ///
+    /// enlil posts a pending virtual interrupt in the VMCB (`INT_CONTROL` /
+    /// `encode_vintr`) that the guest's `EFLAGS.IF` gates — the mechanism that
+    /// preempts a *running* guest. The guest `OUT`s
+    /// [`GUEST_LM_VINTR_BEFORE_SENTINEL`](crate::svm::GUEST_LM_VINTR_BEFORE_SENTINEL)
+    /// with interrupts masked, `STI`s, takes the now-deliverable interrupt (its
+    /// handler `OUT`s
+    /// [`GUEST_LM_VINTR_HANDLER_SENTINEL`](crate::svm::GUEST_LM_VINTR_HANDLER_SENTINEL)
+    /// and `IRETQ`s), then `OUT`s
+    /// [`GUEST_LM_VINTR_RESUME_SENTINEL`](crate::svm::GUEST_LM_VINTR_RESUME_SENTINEL).
+    /// The BEFORE → HANDLER → RESUME order in the run record proves the interrupt
+    /// stayed masked until `STI` — real interrupt masking, the basis for a
+    /// preemptible guest OS (ROADMAP 6.2 toward 6.7).
+    fn run_long_mode_vintr_guest(serial: &SerialPort) {
+        use crate::svm::{
+            GUEST_LM_VINTR_BEFORE_PORT, GUEST_LM_VINTR_BEFORE_SENTINEL,
+            GUEST_LM_VINTR_HANDLER_PORT, GUEST_LM_VINTR_HANDLER_SENTINEL,
+            GUEST_LM_VINTR_RESUME_PORT, GUEST_LM_VINTR_RESUME_SENTINEL,
+        };
+        match crate::svm::program_long_mode_vintr_vmcb() {
+            Some((vmcb, _spa)) => {
+                // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
+                // is a VMRUN-ready long-mode VMCB from program_long_mode_vintr_vmcb.
+                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                // The index of the first OUT matching (port, sentinel), if any.
+                let pos = |port: u8, val: u8| -> Option<usize> {
+                    let mut i = 0;
+                    while i < run.io_out_count {
+                        if run.io_outs[i].0 == u16::from(port) && run.io_outs[i].1 == u32::from(val)
+                        {
+                            return Some(i);
+                        }
+                        i += 1;
+                    }
+                    None
+                };
+                let before = pos(GUEST_LM_VINTR_BEFORE_PORT, GUEST_LM_VINTR_BEFORE_SENTINEL);
+                let handler = pos(GUEST_LM_VINTR_HANDLER_PORT, GUEST_LM_VINTR_HANDLER_SENTINEL);
+                let resume = pos(GUEST_LM_VINTR_RESUME_PORT, GUEST_LM_VINTR_RESUME_SENTINEL);
+                if let (Some(b), Some(h), Some(r)) = (before, handler, resume)
+                    && b < h
+                    && h < r
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: masked guest OUT preceded the STI-delivered virtual interrupt, then resumed — virtual-interrupt masking works\n",
+                    );
+                } else {
+                    let mut e = [0u8; 18];
+                    serial.write_str(
+                        "enlil kernel: svm: virtual-interrupt masking NOT observed (final exit ",
+                    );
+                    serial.write_str(format_u64_hex(run.final_exit, &mut e));
+                    serial.write_str(")\n");
+                }
+            }
+            None => {
+                serial.write_str("enlil kernel: svm: long-mode vintr vmcb build FAILED\n");
+            }
+        }
+    }
+
+    /// Build and run the long-mode *preemption* guest, reporting whether a
+    /// guest spinning in an infinite loop was forcibly preempted by a virtual
+    /// interrupt.
+    ///
+    /// The guest `STI`s and spins in an unconditional `jmp $` that never exits
+    /// on its own. enlil posts a pending virtual interrupt that breaks the loop,
+    /// vectoring through the guest's long-mode `IDT` to a handler that `OUT`s
+    /// [`GUEST_LM_PREEMPT_SENTINEL`](crate::svm::GUEST_LM_PREEMPT_SENTINEL) and
+    /// `HLT`s. A captured sentinel with a clean `HLT` stop proves enlil preempted
+    /// a non-cooperative running guest — the essence of time-slicing, and the
+    /// mechanism a scheduler quantum uses to reclaim a CPU (ROADMAP 6.2 → 6.7).
+    fn run_long_mode_preempt_guest(serial: &SerialPort) {
+        use crate::svm::{GUEST_LM_PREEMPT_PORT, GUEST_LM_PREEMPT_SENTINEL, RunStop};
+        match crate::svm::program_long_mode_preempt_vmcb() {
+            Some((vmcb, _spa)) => {
+                // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
+                // is a VMRUN-ready long-mode VMCB from program_long_mode_preempt_vmcb.
+                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                if run.stop == RunStop::Halted
+                    && run.io_out_to(u16::from(GUEST_LM_PREEMPT_PORT))
+                        == Some(u32::from(GUEST_LM_PREEMPT_SENTINEL))
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: spinning guest broken out of its loop by a virtual interrupt — guest preemption works\n",
+                    );
+                } else {
+                    let mut e = [0u8; 18];
+                    serial
+                        .write_str("enlil kernel: svm: guest preemption NOT observed (stop/exit ");
+                    serial.write_str(format_u64_hex(run.final_exit, &mut e));
+                    serial.write_str(")\n");
+                }
+            }
+            None => {
+                serial.write_str("enlil kernel: svm: long-mode preempt vmcb build FAILED\n");
+            }
         }
     }
 
