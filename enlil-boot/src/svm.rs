@@ -192,6 +192,23 @@ pub const GUEST_EVENT_PORT: u8 = 0x87;
 /// I/O record iff [`GUEST_EVENT_VECTOR`] was injected and the handler ran.
 pub const GUEST_EVENT_SENTINEL: u8 = 0x7E;
 
+/// The exception vector the exception-intercept guest deliberately raises: `#UD`
+/// (invalid opcode, vector 6). enlil traps it and re-delivers it to the guest's
+/// own IVT handler (exception virtualization).
+pub const GUEST_UD_VECTOR: u8 = 6;
+
+/// Guest RAM offset (a 16-bit real-mode offset) of the `#UD` handler — above the
+/// real-mode IVT (`[0, 0x400)`) and below the [`GUEST_GS_BASE`] sentinel.
+pub const GUEST_UD_HANDLER_OFF: u16 = 0x0500;
+
+/// The port the exception-intercept guest's `#UD` handler `OUT`s its sentinel
+/// to.
+pub const GUEST_UD_PORT: u8 = 0x8B;
+
+/// The byte the `#UD` handler `OUT`s. Present in the run's I/O record iff enlil
+/// trapped the guest's `#UD` and re-injected it to the guest's own handler.
+pub const GUEST_UD_SENTINEL: u8 = 0x4D;
+
 /// The port the 64-bit long-mode guest `OUT`s its sentinel to. A capture here
 /// proves a guest ran in long mode (paging on, `CR3` walked through the NPT)
 /// under enlil.
@@ -412,6 +429,10 @@ pub struct GuestRunOutcome {
     pub npf_exits: u32,
     /// Intercepted `VMMCALL` hypercalls serviced.
     pub vmmcall_exits: u32,
+    /// Intercepted guest exceptions re-delivered to the guest's own IDT/IVT.
+    pub exception_exits: u32,
+    /// Vector of the last intercepted guest exception, if any.
+    pub last_exception_vector: Option<u8>,
     /// The `(port, byte)` writes the guest performed, oldest first, up to
     /// [`MAX_IO_OUTS`](Self::MAX_IO_OUTS) — each captured through the
     /// arch-neutral `VmExit::IoOut`. Query with [`io_out_to`](Self::io_out_to).
@@ -450,6 +471,8 @@ impl GuestRunOutcome {
             cpuid_leaf0_ebx: None,
             final_exit: 0,
             vmmcall_exits: 0,
+            exception_exits: 0,
+            last_exception_vector: None,
         }
     }
 
@@ -490,7 +513,7 @@ impl GuestRunOutcome {
 #[cfg(target_os = "uefi")]
 pub use hw::{
     enable_svm, program_boot_vmcb, program_event_inj_vmcb, program_host_save_area,
-    program_long_mode_vmcb, run_boot_guest_loop,
+    program_long_mode_vmcb, program_ud_exception_vmcb, run_boot_guest_loop,
 };
 
 #[cfg(target_os = "uefi")]
@@ -506,7 +529,8 @@ mod hw {
     use enlil_hal::svm::{
         LongModeGuestSetup, MinimalGuestSetup, VmcbSegment, control, enable_io_intercept,
         enable_msr_intercept, encode_event_inj, event_type, intercept_vmmcall,
-        program_long_mode_hlt_guest, program_minimal_hlt_guest, save, set_event_inj, write_segment,
+        program_long_mode_hlt_guest, program_minimal_hlt_guest, save, set_event_inj,
+        set_exception_intercept, write_segment,
     };
 
     /// Read a 64-bit MSR.
@@ -1038,6 +1062,106 @@ mod hw {
         Some((vmcb_pa, handler_gpa))
     }
 
+    /// Build a `VMRUN`-ready VMCB that proves **guest exception interception**,
+    /// returning `(vmcb_pa, handler_gpa)`.
+    ///
+    /// The guest's first instruction is `UD2` (`0F 0B`), which raises `#UD`.
+    /// enlil arms the `#UD` exception intercept ([`set_exception_intercept`]) so
+    /// the fault takes a `#VMEXIT` ([`RunLoopExit::Exception`]) instead of
+    /// vectoring directly; the run loop then **re-delivers** it to the guest's
+    /// own real-mode IVT (`EVENTINJ`, resumed without advancing RIP). The IVT
+    /// slot for `#UD` (`4 * 6`) points at a handler that `OUT`s
+    /// [`GUEST_UD_SENTINEL`](super::GUEST_UD_SENTINEL) and `HLT`s. A matching
+    /// capture proves enlil trapped the guest's own fault and handed it back to
+    /// the guest — the mechanism for observing/emulating guest exceptions while
+    /// the guest still handles them (ROADMAP 6.2).
+    ///
+    /// Assembled through `enlil-hal` like the other proof guests (isolated RAM +
+    /// IVT + handler, an NPT mapping the low GiB, a [`Vmcb`] with the real-mode
+    /// IVT limit, the I/O intercept, and the `#UD` intercept armed); allocations
+    /// are leaked to outlive `VMRUN`. Returns `None` on any allocation/
+    /// programming failure.
+    #[must_use]
+    pub fn program_ud_exception_vmcb() -> Option<(u64, u64)> {
+        use super::{GUEST_UD_HANDLER_OFF, GUEST_UD_PORT, GUEST_UD_SENTINEL, GUEST_UD_VECTOR};
+
+        let ram_raw = alloc_guest_ram()?;
+        let guest_spa = ram_raw as u64;
+        // SAFETY: ram_raw owns GUEST_RAM_BYTES writable bytes (leaked below).
+        let ram = unsafe { core::slice::from_raw_parts_mut(ram_raw, GUEST_RAM_BYTES) };
+        // Entry code at GPA 0: UD2 (raises #UD) then a fallback HLT (unreached if
+        // the intercept + re-injection work, since control goes to the handler).
+        ram[0] = 0x0F; // UD2
+        ram[1] = 0x0B;
+        ram[2] = 0xF4; // HLT (fallback)
+        // Real-mode IVT slot for #UD (vector 6): offset (u16 LE) then segment
+        // (u16 LE), pointing at segment 0, offset GUEST_UD_HANDLER_OFF.
+        let ivt = (GUEST_UD_VECTOR as usize) * 4;
+        let off = GUEST_UD_HANDLER_OFF.to_le_bytes();
+        ram[ivt] = off[0];
+        ram[ivt + 1] = off[1];
+        ram[ivt + 2] = 0x00; // segment low
+        ram[ivt + 3] = 0x00; // segment high
+        // Handler: mov al, SENTINEL; out PORT, al; hlt.
+        let h = GUEST_UD_HANDLER_OFF as usize;
+        ram[h] = 0xB0; // MOV AL, imm8
+        ram[h + 1] = GUEST_UD_SENTINEL;
+        ram[h + 2] = 0xE6; // OUT imm8, AL
+        ram[h + 3] = GUEST_UD_PORT;
+        ram[h + 4] = 0xF4; // HLT
+
+        // NPT mapping guest GPA [0, 2 MiB) onto the isolated RAM window.
+        // SAFETY: NptBuf is nonzero, 4 KiB-aligned; alloc_zeroed yields it or null.
+        let npt_raw = unsafe { alloc_zeroed(Layout::new::<NptBuf>()) };
+        if npt_raw.is_null() {
+            return None;
+        }
+        let npt_pa = npt_raw as u64;
+        // SAFETY: npt_raw owns a live, zeroed NptBuf, leaked below.
+        let npt_buf = unsafe { core::slice::from_raw_parts_mut(npt_raw, 3 * 4096) };
+        let ncr3 = build_npt_2mib(npt_buf, npt_pa, guest_spa, GUEST_RAM_BYTES as u64)
+            .ok()?
+            .ncr3;
+
+        // Program a VMCB entering the UD2 at GPA 0 under that NPT.
+        let mut vmcb = Vmcb::new().ok()?;
+        let setup = MinimalGuestSetup {
+            asid: 1,
+            nested_cr3: ncr3,
+            entry_ip: 0,
+            code_base: 0,
+            stack_pointer: 0,
+        };
+        program_minimal_hlt_guest(vmcb.as_bytes_mut(), &setup).ok()?;
+        // Install the standard real-mode IVT (base 0, limit 0x3FF) so the
+        // re-injected #UD's IVT slot is covered (program_minimal_hlt_guest leaves
+        // IDTR limit 0).
+        write_segment(
+            vmcb.as_bytes_mut(),
+            save::IDTR,
+            VmcbSegment {
+                selector: 0,
+                attrib: 0,
+                limit: 0x03FF,
+                base: 0,
+            },
+        );
+
+        // Arm port-I/O interception so the handler's OUT takes an IOIO #VMEXIT.
+        let iopm = IoPermissionsMap::intercept_all().ok()?;
+        enable_io_intercept(vmcb.as_bytes_mut(), iopm.base_addr());
+        core::mem::forget(iopm);
+
+        // Arm the #UD exception intercept so the guest's UD2 takes a #VMEXIT the
+        // run loop routes as RunLoopExit::Exception (then re-injects to the guest).
+        set_exception_intercept(vmcb.as_bytes_mut(), GUEST_UD_VECTOR);
+
+        let handler_gpa = u64::from(GUEST_UD_HANDLER_OFF);
+        let vmcb_pa = vmcb.base_addr();
+        core::mem::forget(vmcb); // must outlive VMRUN
+        Some((vmcb_pa, handler_gpa))
+    }
+
     /// Build a `VMRUN`-ready VMCB for a **64-bit long-mode** guest, returning
     /// `(vmcb_pa, guest_cr3)`.
     ///
@@ -1441,8 +1565,9 @@ mod hw {
         use enlil_hal::VmExit;
         use enlil_hal::svm::{
             CPUID_INSN_LEN, IoioExitInfo, MSR_INSN_LEN, RunLoopExit, VMMCALL_INSN_LEN,
-            classify_run_loop_exit, exit_code, exit_info_1, exit_info_2, guest_rax, guest_rip,
-            ioio_to_vmexit, next_rip, resume_rip_after, set_guest_rip,
+            classify_run_loop_exit, encode_event_inj, event_type, exception_has_error_code,
+            exit_code, exit_info_1, exit_info_2, guest_rax, guest_rip, ioio_to_vmexit, next_rip,
+            resume_rip_after, set_event_inj, set_guest_rip,
         };
 
         let code = exit_code(vmcb);
@@ -1493,6 +1618,21 @@ mod hw {
                 emulate_vmmcall(vmcb);
                 let rip = resume_rip_after(next_rip(vmcb), guest_rip(vmcb), VMMCALL_INSN_LEN);
                 set_guest_rip(vmcb, rip);
+                return true;
+            }
+            RunLoopExit::Exception { vector } => {
+                outcome.exception_exits += 1;
+                outcome.last_exception_vector = Some(vector);
+                // Re-deliver the trapped fault to the guest's own IDT/IVT so its
+                // handler runs — exception virtualization. Carry the EXITINFO1
+                // error code for the vectors that push one (#DF/#TS/#NP/#SS/#GP/
+                // #PF/#AC/#CP). Resume WITHOUT advancing RIP: the fault is on the
+                // current instruction, and VMRUN's injected event pushes the
+                // faulting CS:IP and vectors through the guest's IDT itself.
+                let error_code = exception_has_error_code(vector)
+                    .then(|| u32::try_from(exit_info_1(vmcb) & 0xFFFF_FFFF).unwrap_or(0));
+                let inj = encode_event_inj(vector, event_type::EXCEPTION, error_code);
+                set_event_inj(vmcb, inj);
                 return true;
             }
         }

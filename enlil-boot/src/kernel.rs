@@ -1226,6 +1226,10 @@ mod hw {
                         // Third guest: prove a 64-bit long-mode guest runs (the
                         // mode a real OS boots in).
                         run_long_mode_guest(serial);
+                        // Fourth guest: prove enlil traps a guest's own #UD and
+                        // re-delivers it to the guest's handler (exception
+                        // virtualization).
+                        run_ud_exception_guest(serial);
                     }
                     None => serial.write_str("enlil kernel: svm: vmcb VMRUN-ready FAILED\n"),
                 }
@@ -1433,6 +1437,39 @@ mod hw {
                 }
             }
             None => serial.write_str("enlil kernel: svm: long-mode vmcb build FAILED\n"),
+        }
+    }
+
+    /// Build and run the exception-interception guest, reporting whether enlil
+    /// trapped the guest's own `#UD` and re-delivered it to the guest's handler.
+    ///
+    /// enlil arms the `#UD` exception intercept so the guest's `UD2` takes a
+    /// `#VMEXIT`; the run loop re-injects the fault into the guest's own IVT
+    /// ([`RunLoopExit::Exception`](enlil_hal::svm::RunLoopExit::Exception)), whose
+    /// handler `OUT`s [`GUEST_UD_SENTINEL`](crate::svm::GUEST_UD_SENTINEL). A
+    /// matching capture proves enlil can trap a guest's own fault and hand it
+    /// back to the guest — the mechanism for observing/emulating guest
+    /// exceptions while the guest still handles them (ROADMAP 6.2).
+    fn run_ud_exception_guest(serial: &SerialPort) {
+        use crate::svm::{GUEST_UD_PORT, GUEST_UD_SENTINEL};
+        match crate::svm::program_ud_exception_vmcb() {
+            Some((vmcb, _handler)) => {
+                // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
+                // is a VMRUN-ready VMCB from program_ud_exception_vmcb.
+                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                if run.exception_exits > 0
+                    && run.io_out_to(u16::from(GUEST_UD_PORT)) == Some(u32::from(GUEST_UD_SENTINEL))
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: guest #UD trapped + re-injected to its handler — exception interception works\n",
+                    );
+                } else {
+                    serial.write_str(
+                        "enlil kernel: svm: #UD interception NOT observed (guest took the fallback path)\n",
+                    );
+                }
+            }
+            None => serial.write_str("enlil kernel: svm: ud-exception vmcb build FAILED\n"),
         }
     }
 
