@@ -131,8 +131,8 @@ mod hw {
         // Render the low 2 MiB slot (index 0) at 4 KiB with page 0 a guard; the
         // rest of the span stays 2 MiB huge pages. span >= 4 GiB (the map floor)
         // so slot 0 is always within range.
-        let layout_info = build_identity_npt_2mib_with_4kib_window(buf, phys_base, span, 0, &[0])
-            .ok()?;
+        let layout_info =
+            build_identity_npt_2mib_with_4kib_window(buf, phys_base, span, 0, &[0]).ok()?;
         let cr3 = layout_info.ncr3;
 
         // SAFETY: cr3 is a freshly built identity map covering `span` bytes of

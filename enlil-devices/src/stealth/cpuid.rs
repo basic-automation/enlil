@@ -1020,7 +1020,7 @@ const fn ceil_log2(n: u32) -> u32 {
     if n <= 1 {
         0
     } else {
-        u32::BITS - (n - 1).leading_zeros()
+        (n - 1).bit_width()
     }
 }
 
