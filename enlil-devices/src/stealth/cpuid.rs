@@ -1017,11 +1017,7 @@ impl CpuidStealthTable {
 /// of two: `ceil_log2(4) == 2`, whereas the latter gives 3. Using `(n - 1)`
 /// before counting leading zeros collapses that off-by-one.
 const fn ceil_log2(n: u32) -> u32 {
-    if n <= 1 {
-        0
-    } else {
-        (n - 1).bit_width()
-    }
+    if n <= 1 { 0 } else { (n - 1).bit_width() }
 }
 
 /// Create a brand string from a Rust &str, padded to 48 bytes
