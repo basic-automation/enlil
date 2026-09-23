@@ -178,7 +178,7 @@ mod hw {
         let rsp: u64;
         // SAFETY: a plain register read with no memory or flag effects.
         unsafe {
-            core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags))
+            core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags));
         };
         rsp
     }

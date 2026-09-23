@@ -1975,9 +1975,10 @@ mod hw {
         Some((vmcb_pa, guest_spa))
     }
 
-    /// Build a `VMRUN`-ready VMCB that proves **virtual-interrupt masking**: a
-    /// 64-bit long-mode guest runs with interrupts masked, `STI`s, and only then
-    /// takes a *pending* virtual interrupt through its `IDT`. Returns
+    /// Build a `VMRUN`-ready VMCB that proves **virtual-interrupt masking**.
+    ///
+    /// A 64-bit long-mode guest runs with interrupts masked, `STI`s, and only
+    /// then takes a *pending* virtual interrupt through its `IDT`. Returns
     /// `(vmcb_pa, guest_spa)`.
     ///
     /// Where [`program_long_mode_event_inj_vmcb`] injects unconditionally via
@@ -2000,7 +2001,7 @@ mod hw {
     /// Build a `VMRUN`-ready VMCB that **preempts a spinning long-mode guest**
     /// with a pending virtual interrupt, returning `(vmcb_pa, guest_spa)`.
     ///
-    /// The strongest form of the V_INTR proof: the guest
+    /// The strongest form of the `V_INTR` proof: the guest
     /// ([`write_long_mode_preempt_program`](super::write_long_mode_preempt_program))
     /// `STI`s and then spins in an unconditional `jmp $` that never exits on its
     /// own. The only way it ever stops is the pending virtual interrupt breaking
@@ -2471,7 +2472,14 @@ mod hw {
             RunLoopExit::Halted => outcome.stop = super::RunStop::Halted,
             RunLoopExit::ShutDown => outcome.stop = super::RunStop::ShutDown,
             RunLoopExit::Invalid => outcome.stop = super::RunStop::Invalid,
-            RunLoopExit::Unhandled => outcome.stop = super::RunStop::Unhandled,
+            // A physical interrupt intercepted rather than delivered (Intr) joins
+            // the unrouted case: the generic dispatch loop does not arm the INTR
+            // intercept, so Intr is unreachable for its guests (the timer-driven
+            // preemption loop, which arms it, handles Intr itself). Either way,
+            // stop — final_exit still carries the raw exit code.
+            RunLoopExit::Unhandled | RunLoopExit::Intr => {
+                outcome.stop = super::RunStop::Unhandled;
+            }
             RunLoopExit::Cpuid => {
                 outcome.cpuid_exits += 1;
                 if let Some(ebx0) = emulate_cpuid(vmcb, gprs) {
