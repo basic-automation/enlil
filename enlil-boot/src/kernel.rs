@@ -1271,6 +1271,11 @@ mod hw {
                         // Tenth guest: prove NPT write-protection — enlil traps a
                         // guest store to a read-only page (dirty-tracking / COW).
                         run_wp_npf_guest(serial);
+                        // Eleventh guest: preempt a spinning guest with the REAL
+                        // host LAPIC timer via an INTR intercept (not a pre-posted
+                        // virtual interrupt) — timer-driven time-slicing on a
+                        // hardware clock (ROADMAP 6.2 toward 6.7).
+                        run_timer_preempt_guest(serial);
                     }
                     None => serial.write_str("enlil kernel: svm: vmcb VMRUN-ready FAILED\n"),
                 }
@@ -1684,6 +1689,71 @@ mod hw {
             None => {
                 serial.write_str("enlil kernel: svm: long-mode preempt vmcb build FAILED\n");
             }
+        }
+    }
+
+    /// Build and run the **timer-preemption** guest, reporting whether the real
+    /// host LAPIC timer preempted a spinning long-mode guest into an `INTR`
+    /// #VMEXIT.
+    ///
+    /// Where [`run_long_mode_preempt_guest`] breaks a guest out with a *pre-posted*
+    /// virtual interrupt, this uses the real hardware clock: the guest
+    /// ([`write_long_mode_bounded_spin_program`](crate::svm::program_timer_preempt_vmcb))
+    /// `STI`s and spins in a bounded loop, the host arms a one-shot LAPIC timer,
+    /// and — with the `INTR` intercept armed — a physical timer interrupt pending
+    /// while the guest runs takes an `INTR` #VMEXIT (`final_exit ==
+    /// exit_code::INTR`). That async preemption *on a real time base* is what a
+    /// scheduler quantum uses to reclaim a CPU (ROADMAP 6.2 toward 6.7). If the
+    /// (nested-KVM) harness does not surface the host timer as a guest `INTR`
+    /// intercept, the guest finishes its bounded spin and `HLT`s — reported
+    /// honestly, no hang. The pending timer interrupt is drained afterwards.
+    fn run_timer_preempt_guest(serial: &SerialPort) {
+        use crate::svm::RunStop;
+        /// The LAPIC timer vector (shared with the other timer paths).
+        const TIMER_VECTOR: u8 = 0x40;
+        /// A one-shot LAPIC countdown (divide-by-16, no TSC frequency needed)
+        /// small enough to fire while the guest is still spinning.
+        const TIMER_COUNT: u32 = 0x0004_0000;
+
+        let Some((vmcb, _spa)) = crate::svm::program_timer_preempt_vmcb() else {
+            serial.write_str("enlil kernel: svm: timer-preempt vmcb build FAILED\n");
+            return;
+        };
+        crate::idt::install_timer_gate(TIMER_VECTOR);
+        // Arm the host LAPIC timer, then enter the guest. With the guest's INTR
+        // intercept armed, a physical timer interrupt pending while the guest
+        // runs takes an INTR #VMEXIT (host IF gates host *delivery* to the IDT,
+        // not whether the guest intercept fires).
+        crate::apic::arm_oneshot_timer(TIMER_VECTOR, TIMER_COUNT);
+        // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb` is a
+        // VMRUN-ready long-mode VMCB from program_timer_preempt_vmcb.
+        let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+        // Drain any still-pending timer interrupt so it does not disturb later
+        // bring-up: briefly enable interrupts so the host handler takes + EOIs it.
+        // SAFETY: the timer gate is installed and its handler signals EOI; only
+        // the just-armed timer can be pending here.
+        unsafe {
+            core::arch::asm!(
+                "sti",
+                "nop",
+                "cli",
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+
+        if run.final_exit == enlil_hal::svm::exit_code::INTR {
+            serial.write_str(
+                "enlil kernel: svm: spinning guest preempted by the host LAPIC timer (INTR #VMEXIT) — timer-driven time-slice\n",
+            );
+        } else if run.stop == RunStop::Halted {
+            serial.write_str(
+                "enlil kernel: svm: timer-preempt guest self-halted (host timer not surfaced as a guest INTR intercept under this harness)\n",
+            );
+        } else {
+            let mut e = [0u8; 18];
+            serial.write_str("enlil kernel: svm: timer-preempt guest stopped unexpectedly (exit ");
+            serial.write_str(format_u64_hex(run.final_exit, &mut e));
+            serial.write_str(")\n");
         }
     }
 

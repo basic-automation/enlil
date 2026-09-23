@@ -230,6 +230,11 @@ VINTR_LINE="virtual-interrupt masking works"
 # is forcibly broken out of it by a virtual interrupt — pure time-slicing, the
 # mechanism a scheduler quantum uses to reclaim a CPU from a running guest.
 PREEMPT_LINE="guest preemption works"
+# Printed once a spinning guest is preempted by the REAL host LAPIC timer: with
+# the INTR intercept armed, a physical timer interrupt pending during guest
+# execution takes an INTR #VMEXIT — timer-driven time-slicing on a hardware
+# clock, not a pre-posted virtual interrupt (ROADMAP 6.2 toward 6.7).
+TIMER_PREEMPT_LINE="preempted by the host LAPIC timer"
 # Printed once enlil traps a guest's own #UD (invalid-opcode fault), arms it via
 # the VMCB exception-intercept bitmap, and re-injects it into the guest's own
 # real-mode IVT handler — exception virtualization (trap + re-deliver a guest fault).
@@ -434,12 +439,13 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$LM_ROUNDTRIP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$VINTR_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PREEMPT_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$TIMER_PREEMPT_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$UD_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$IRQ_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$WP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_TEXT_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, scheduler quantum driven by the LAPIC timer, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery incl. real VT-d DMAR remapping units + device scopes, SMP AP bring-up (INIT-SIPI-SIPI), PCI enumeration, own page tables (null-page guard) + 4 KiB split + kernel-owned guarded stack (bring-up continues on it), SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + interrupt IRET-resume round-trip + 64-bit long-mode guest + long-mode interrupt round-trip + virtual-interrupt masking + spinning-guest preemption + guest-exception interception (#UD trap + re-inject) + interrupt round-trip (inject/handle/IRET/resume) + NPT write-protection dirty-tracking (trap+grant a guest store), and GOP draw observed on serial"
+    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, scheduler quantum driven by the LAPIC timer, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery incl. real VT-d DMAR remapping units + device scopes, SMP AP bring-up (INIT-SIPI-SIPI), PCI enumeration, own page tables (null-page guard) + 4 KiB split + kernel-owned guarded stack (bring-up continues on it), SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + interrupt IRET-resume round-trip + 64-bit long-mode guest + long-mode interrupt round-trip + virtual-interrupt masking + spinning-guest preemption + host-LAPIC-timer preemption (INTR intercept) + guest-exception interception (#UD trap + re-inject) + interrupt round-trip (inject/handle/IRET/resume) + NPT write-protection dirty-tracking (trap+grant a guest store), and GOP draw observed on serial"
     exit 0
 fi
 
