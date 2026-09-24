@@ -1,4 +1,9 @@
 [toolchain]
-channel = "nightly"
+# Pinned to a DATED nightly on purpose. A floating `nightly` meant a silent
+# toolchain bump could break the build without a code change: on 2026-09-23 one
+# broke the x86_64-unknown-enlil target spec (renamed `rustc-abi` values) and
+# tightened clippy's pedantic/nursery sets enough to reject previously-clean
+# code. Bumping this date is now a deliberate, reviewed change.
+channel = "nightly-2026-09-23"
 components = ["rustfmt", "clippy", "rust-src"]
 targets = ["x86_64-unknown-linux-gnu", "x86_64-unknown-uefi"]

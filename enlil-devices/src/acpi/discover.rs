@@ -183,8 +183,7 @@ pub fn host_cpu_count(mem: &[u8], rsdp_gpa: u64) -> Option<usize> {
 pub fn host_apic_ids(mem: &[u8], rsdp_gpa: u64) -> Vec<u32> {
     find_table(mem, rsdp_gpa, b"APIC")
         .and_then(|gpa| table_at(mem, gpa))
-        .map(super::madt::enabled_apic_ids)
-        .unwrap_or_default()
+        .map_or_default(super::madt::enabled_apic_ids)
 }
 
 /// Discover the `PCIe` ECAM allocations from the firmware's MCFG (Phase 6.3).
@@ -197,8 +196,7 @@ pub fn host_apic_ids(mem: &[u8], rsdp_gpa: u64) -> Vec<u32> {
 pub fn host_ecam_allocations(mem: &[u8], rsdp_gpa: u64) -> Vec<super::mcfg::McfgAllocation> {
     find_table(mem, rsdp_gpa, b"MCFG")
         .and_then(|gpa| table_at(mem, gpa))
-        .map(super::mcfg::parse_mcfg_allocations)
-        .unwrap_or_default()
+        .map_or_default(super::mcfg::parse_mcfg_allocations)
 }
 
 /// Discover the host's PCI functions by walking every ECAM window (Phase 6.3).
@@ -264,8 +262,7 @@ pub fn host_iommu_kind(mem: &[u8], rsdp_gpa: u64) -> Option<IommuKind> {
 pub fn host_numa_domains(mem: &[u8], rsdp_gpa: u64) -> Vec<u32> {
     find_table(mem, rsdp_gpa, b"SRAT")
         .and_then(|gpa| table_at(mem, gpa))
-        .map(super::srat::numa_domains)
-        .unwrap_or_default()
+        .map_or_default(super::srat::numa_domains)
 }
 
 /// Discover the NUMA memory ranges from the firmware's SRAT (Phase 6.3): which
@@ -278,8 +275,7 @@ pub fn host_numa_domains(mem: &[u8], rsdp_gpa: u64) -> Vec<u32> {
 pub fn host_memory_affinities(mem: &[u8], rsdp_gpa: u64) -> Vec<super::srat::MemoryAffinity> {
     find_table(mem, rsdp_gpa, b"SRAT")
         .and_then(|gpa| table_at(mem, gpa))
-        .map(super::srat::memory_affinities)
-        .unwrap_or_default()
+        .map_or_default(super::srat::memory_affinities)
 }
 
 /// Discover the CPU→NUMA-node bindings from the firmware's SRAT (Phase 6.3):
@@ -292,8 +288,7 @@ pub fn host_memory_affinities(mem: &[u8], rsdp_gpa: u64) -> Vec<super::srat::Mem
 pub fn host_cpu_affinities(mem: &[u8], rsdp_gpa: u64) -> Vec<super::srat::CpuAffinity> {
     find_table(mem, rsdp_gpa, b"SRAT")
         .and_then(|gpa| table_at(mem, gpa))
-        .map(super::srat::cpu_affinities)
-        .unwrap_or_default()
+        .map_or_default(super::srat::cpu_affinities)
 }
 
 /// Discover the NUMA node-to-node distance matrix from the firmware's SLIT

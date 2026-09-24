@@ -401,8 +401,8 @@ mod tests {
     #[test]
     fn ioapic_default_entries_masked() {
         let ioapic = IoApic::new(0);
-        for i in 0..NUM_IOAPIC_PINS {
-            assert!(ioapic.entries[i].masked);
+        for entry in ioapic.entries.iter().take(NUM_IOAPIC_PINS) {
+            assert!(entry.masked);
         }
     }
 

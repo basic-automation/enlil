@@ -3038,7 +3038,7 @@ mod tests {
         assert_eq!(ram[gate + 5], 0x8E, "64-bit interrupt gate");
         assert_eq!(
             u16::from_le_bytes([ram[gate], ram[gate + 1]]),
-            GUEST_LM_HANDLER_OFF as u16,
+            u16::try_from(GUEST_LM_HANDLER_OFF).unwrap(),
             "gate offset points at the handler"
         );
     }
