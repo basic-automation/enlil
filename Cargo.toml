@@ -15,6 +15,13 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/physics515/enlil"
+homepage = "https://github.com/physics515/enlil"
+readme = "README.md"
+authors = ["Justin Icenhour"]
+keywords = ["hypervisor", "virtualization", "bare-metal", "no-std", "x86-64"]
+categories = ["virtualization", "no-std", "os"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

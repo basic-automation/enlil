@@ -3,6 +3,14 @@ name = "enlil-config"
 version = "0.1.0"
 edition = "2024"
 description = "Configuration parsing — guest definitions, peripheral routing rules"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Publishing guard. This repo runs an automated nightly routine that reshapes
+# these crates; they are tightly-coupled internals of an unfinished hypervisor,
+# not yet standalone libraries. Flip to `true` (or delete) per crate only when
+# its API is stable enough to maintain on crates.io under semver.
+publish = false
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

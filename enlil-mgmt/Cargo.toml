@@ -3,6 +3,14 @@ name = "enlil-mgmt"
 version = "0.1.0"
 edition = "2021"
 description = "TUI management console for the Enlil hypervisor"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Publishing guard. This repo runs an automated nightly routine that reshapes
+# these crates; they are tightly-coupled internals of an unfinished hypervisor,
+# not yet standalone libraries. Flip to `true` (or delete) per crate only when
+# its API is stable enough to maintain on crates.io under semver.
+publish = false
 
 [[bin]]
 name = "enlil-mgmt"
@@ -21,8 +29,8 @@ log = "0.4"
 env_logger = "0.11"
 anyhow = "1"
 thiserror = "2"
-enlil-config = { path = "../enlil-config" }
-enlil-core = { path = "../enlil-core" }
+enlil-config = { path = "../enlil-config", version = "0.1.0" }
+enlil-core = { path = "../enlil-core", version = "0.1.0" }
 
 [dev-dependencies]
 tempfile = "3"

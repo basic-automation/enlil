@@ -3,6 +3,14 @@ name = "enlil-setup"
 version.workspace = true
 edition.workspace = true
 description = "Enlil first-run setup wizard — hardware detection, resource allocation, guest configuration"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Publishing guard. This repo runs an automated nightly routine that reshapes
+# these crates; they are tightly-coupled internals of an unfinished hypervisor,
+# not yet standalone libraries. Flip to `true` (or delete) per crate only when
+# its API is stable enough to maintain on crates.io under semver.
+publish = false
 
 [dependencies]
 serde = { workspace = true }

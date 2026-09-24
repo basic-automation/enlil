@@ -3,6 +3,14 @@ name = "enlil-hal"
 version = "0.1.0"
 edition = "2024"
 description = "Hardware Abstraction Layer — architecture-neutral hypervisor backend traits"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Publishing guard. This repo runs an automated nightly routine that reshapes
+# these crates; they are tightly-coupled internals of an unfinished hypervisor,
+# not yet standalone libraries. Flip to `true` (or delete) per crate only when
+# its API is stable enough to maintain on crates.io under semver.
+publish = false
 
 # no_std + alloc: builds for both the Linux/KVM dev host and the bare-metal
 # x86_64-unknown-enlil kernel target. No external deps so the HAL seam stays
