@@ -10,7 +10,7 @@ sharing, and a path toward pooling hardware across many physical machines.
 - **Foundation:** the [RustVMM](https://github.com/rust-vmm) crate ecosystem
 - **Target hardware:** x86-64 desktops with Intel VT-x/VT-d or AMD-V/AMD-Vi (ARM & RISC-V planned)
 - **Boot model:** a UEFI application on a USB stick — non-destructive, coexists with your existing OS
-- **License:** TBD (MIT or Apache-2.0 recommended)
+- **License:** [MIT](LICENSE)
 
 ---
 

@@ -3,6 +3,14 @@ name = "enlil-boot"
 version = "0.1.0"
 edition = "2024"
 description = "UEFI boot payload — bare-metal target (Phase 6)"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Publishing guard. This repo runs an automated nightly routine that reshapes
+# these crates; they are tightly-coupled internals of an unfinished hypervisor,
+# not yet standalone libraries. Flip to `true` (or delete) per crate only when
+# its API is stable enough to maintain on crates.io under semver.
+publish = false
 
 [dependencies]
 log = "0.4"
@@ -10,7 +18,7 @@ log = "0.4"
 # decode/programming layer and the page-aligned VMX/SVM region types. enlil-hal
 # is no_std + alloc and builds for x86_64-unknown-uefi / x86_64-unknown-enlil,
 # so the boot kernel links it directly rather than re-deriving ISA constants.
-enlil-hal = { path = "../enlil-hal" }
+enlil-hal = { path = "../enlil-hal", version = "0.1.0" }
 
 # The uefi-rs runtime is only pulled in when building for the UEFI firmware
 # target. On the Linux/Windows dev host the crate still compiles (the entry
@@ -35,6 +43,6 @@ linked_list_allocator = "0.10"
 # of re-deriving them. Gated to the uefi target so the host `cargo build
 # --workspace` (where enlil-core pulls enlil-platform with platform-linux) never
 # unifies the two mutually-exclusive backend features into one build.
-enlil-platform = { path = "../enlil-platform", default-features = false, features = [
+enlil-platform = { path = "../enlil-platform", version = "0.1.0", default-features = false, features = [
     "platform-baremetal",
 ] }

@@ -3,11 +3,19 @@ name = "enlil-core"
 version = "0.1.0"
 edition = "2021"
 description = "Enlil hypervisor core — VMM entry, vCPU management, memory partitioning"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Publishing guard. This repo runs an automated nightly routine that reshapes
+# these crates; they are tightly-coupled internals of an unfinished hypervisor,
+# not yet standalone libraries. Flip to `true` (or delete) per crate only when
+# its API is stable enough to maintain on crates.io under semver.
+publish = false
 
 [dependencies]
-enlil-config = { path = "../enlil-config" }
-enlil-devices = { path = "../enlil-devices" }
-enlil-platform = { path = "../enlil-platform" }
+enlil-config = { path = "../enlil-config", version = "0.1.0" }
+enlil-devices = { path = "../enlil-devices", version = "0.1.0" }
+enlil-platform = { path = "../enlil-platform", version = "0.1.0" }
 log = "0.4"
 thiserror = "2"
 anyhow = "1"

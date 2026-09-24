@@ -3,6 +3,14 @@ name = "enlil-std"
 version = "0.1.0"
 edition = "2024"
 description = "Enlil standard library compatibility layer — std-like APIs backed by enlil-platform"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Publishing guard. This repo runs an automated nightly routine that reshapes
+# these crates; they are tightly-coupled internals of an unfinished hypervisor,
+# not yet standalone libraries. Flip to `true` (or delete) per crate only when
+# its API is stable enough to maintain on crates.io under semver.
+publish = false
 
 [features]
 default = ["platform-linux"]
@@ -10,7 +18,7 @@ platform-linux = ["enlil-platform/platform-linux"]
 platform-baremetal = ["enlil-platform/platform-baremetal"]
 
 [dependencies]
-enlil-platform = { path = "../enlil-platform", default-features = false }
+enlil-platform = { path = "../enlil-platform", version = "0.1.0", default-features = false }
 
 [dev-dependencies]
 env_logger = "0.11"
