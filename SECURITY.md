@@ -27,7 +27,7 @@ prerelease; there are no backports.
 
 Use GitHub's private vulnerability reporting on this repository:
 **Security → Report a vulnerability** (or
-[github.com/physics515/enlil/security/advisories/new](https://github.com/physics515/enlil/security/advisories/new)).
+[github.com/basic-automation/enlil/security/advisories/new](https://github.com/basic-automation/enlil/security/advisories/new)).
 That channel is private to the maintainers and lets us discuss and prepare a fix before
 anything is disclosed.
 
