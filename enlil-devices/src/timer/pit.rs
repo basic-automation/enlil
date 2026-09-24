@@ -242,7 +242,6 @@ impl PitChannel {
                     self.status.output = true;
                     return true;
                 }
-                false
             }
             ChannelMode::RateGenerator => {
                 self.count = self.count.wrapping_sub(1);
@@ -256,7 +255,6 @@ impl PitChannel {
                     return true;
                 }
                 self.status.output = true;
-                false
             }
             ChannelMode::SquareWave => {
                 if self.count == 0 {
@@ -269,15 +267,14 @@ impl PitChannel {
                     self.count = self.reload;
                     return self.status.output;
                 }
-                false
             }
             _ => {
                 if self.count > 0 {
                     self.count = self.count.wrapping_sub(1);
                 }
-                false
             }
         }
+        false
     }
 }
 

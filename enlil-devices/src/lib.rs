@@ -1,4 +1,10 @@
 #![deny(clippy::all, clippy::pedantic, clippy::nursery)]
+// `assert_is_empty` (new in the 2026-09 nightly, pedantic) rewrites
+// `assert!(x.is_empty())` into `assert_eq!(x, [] as [T; 0])` to show the value on
+// failure. That form needs an explicit type ascription at every call site and is
+// markedly less readable than the near-universal `is_empty()` idiom, so it is
+// allowed here rather than churning the assertions. Correctness lints stay denied.
+#![allow(clippy::assert_is_empty)]
 // Curated allow-list for this low-level device-emulation crate. These
 // pedantic/nursery lints are either inherent to hardware/register code or are
 // low-value churn here; correctness lints (clippy::all) stay denied. Kept

@@ -19,9 +19,11 @@ jobs:
       # tests self-skip when these binaries are absent. Installing them makes
       # those tests hard gates instead of silent skips.
       - run: sudo apt-get update && sudo apt-get install -y acpica-tools dmidecode
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt, clippy
+      # Install exactly the toolchain rust-toolchain.toml pins (channel,
+      # components and targets). `dtolnay/rust-toolchain@nightly` was previously
+      # used here, which installs the LATEST nightly and ignores the pin, so CI
+      # and local builds could silently diverge on different compilers.
+      - run: rustup show active-toolchain || rustup toolchain install
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --workspace -- -D warnings
       - run: cargo test --workspace
