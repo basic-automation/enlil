@@ -1276,6 +1276,10 @@ mod hw {
                         // virtual interrupt) — timer-driven time-slicing on a
                         // hardware clock (ROADMAP 6.2 toward 6.7).
                         run_timer_preempt_guest(serial);
+                        // Twelfth guest: deliver that timer tick INTO the guest
+                        // as a virtual interrupt so its own handler runs — how a
+                        // guest OS receives its scheduler tick.
+                        run_timer_tick_delivery_guest(serial);
                     }
                     None => serial.write_str("enlil kernel: svm: vmcb VMRUN-ready FAILED\n"),
                 }
@@ -1752,6 +1756,54 @@ mod hw {
         } else {
             let mut e = [0u8; 18];
             serial.write_str("enlil kernel: svm: timer-preempt guest stopped unexpectedly (exit ");
+            serial.write_str(format_u64_hex(run.final_exit, &mut e));
+            serial.write_str(")\n");
+        }
+    }
+
+    /// Build and run the **timer-tick delivery** guest: the host LAPIC timer
+    /// preempts a spinning guest, and enlil delivers that tick *into* the guest
+    /// as a virtual interrupt so the guest's own handler runs.
+    ///
+    /// [`run_timer_preempt_guest`] proves the host can take a CPU back from a
+    /// spinning guest (the `INTR` #VMEXIT). This closes the loop: driven by
+    /// [`run_timer_tick_guest_loop`](crate::svm::run_timer_tick_guest_loop), each
+    /// intercepted physical timer interrupt is serviced by the host, re-posted to
+    /// the guest as a virtual interrupt, and the guest resumed — so the guest
+    /// vectors through its own long-mode `IDT` to a handler that `OUT`s
+    /// [`GUEST_LM_PREEMPT_SENTINEL`](crate::svm::GUEST_LM_PREEMPT_SENTINEL) and
+    /// `HLT`s. A captured sentinel proves a host hardware-clock tick reached a
+    /// running guest OS and was handled there — how a guest receives its
+    /// scheduler tick (ROADMAP 6.2 toward 6.7). The guest's spin is bounded, so a
+    /// tick that never arrives ends in a clean self-`HLT` rather than a hang.
+    fn run_timer_tick_delivery_guest(serial: &SerialPort) {
+        use crate::svm::{GUEST_LM_PREEMPT_PORT, GUEST_LM_PREEMPT_SENTINEL, RunStop};
+        /// The LAPIC timer vector (shared with the other timer paths).
+        const TIMER_VECTOR: u8 = 0x40;
+        /// A one-shot LAPIC countdown small enough to fire mid-spin.
+        const TIMER_COUNT: u32 = 0x0004_0000;
+
+        let Some((vmcb, _spa)) = crate::svm::program_timer_tick_vmcb() else {
+            serial.write_str("enlil kernel: svm: timer-tick vmcb build FAILED\n");
+            return;
+        };
+        crate::idt::install_timer_gate(TIMER_VECTOR);
+        crate::apic::arm_oneshot_timer(TIMER_VECTOR, TIMER_COUNT);
+        // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, `vmcb` is a
+        // VMRUN-ready long-mode VMCB from program_timer_tick_vmcb, and the timer
+        // gate is installed (the loop briefly enables interrupts to EOI).
+        let run = unsafe { crate::svm::run_timer_tick_guest_loop(vmcb) };
+
+        if run.stop == RunStop::Halted
+            && run.io_out_to(u16::from(GUEST_LM_PREEMPT_PORT))
+                == Some(u32::from(GUEST_LM_PREEMPT_SENTINEL))
+        {
+            serial.write_str(
+                "enlil kernel: svm: host LAPIC timer tick delivered into the guest and handled by its own IDT — guest scheduler tick works\n",
+            );
+        } else {
+            let mut e = [0u8; 18];
+            serial.write_str("enlil kernel: svm: guest timer-tick delivery NOT observed (exit ");
             serial.write_str(format_u64_hex(run.final_exit, &mut e));
             serial.write_str(")\n");
         }
