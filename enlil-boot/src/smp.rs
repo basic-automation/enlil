@@ -80,7 +80,7 @@ mod hw {
     /// x2APIC mode must be enabled (the ICR is an MSR only then), and `value`
     /// must be a well-formed ICR encoding — a malformed IPI can reset a CPU.
     unsafe fn write_icr(value: u64) {
-        let low = value as u32;
+        let low = (value & 0xFFFF_FFFF) as u32;
         let high = (value >> 32) as u32;
         // SAFETY: caller guarantees x2APIC is on and `value` is well-formed.
         unsafe {
@@ -146,6 +146,7 @@ mod hw {
     /// and `page` must be an exclusively-owned, identity-mapped, free 4 KiB page
     /// below 1 MiB. Sending `INIT` to the BSP's own APIC id would reset it, so
     /// `bsp_id` is excluded.
+    #[must_use]
     pub unsafe fn start_aps(page: u64, apic_ids: &[u32], bsp_id: u32, tsc_hz: u64) -> (u8, u8) {
         // SAFETY: the caller guarantees `page` is an owned, writable low page.
         unsafe { install_trampoline(page) };

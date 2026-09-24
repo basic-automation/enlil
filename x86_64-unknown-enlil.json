@@ -12,7 +12,7 @@
   "linker": "rust-lld",
   "executables": true,
   "features": "-mmx,-sse,-sse2,+soft-float",
-  "rustc-abi": "x86-softfloat",
+  "rustc-abi": "softfloat",
   "disable-redzone": true,
   "panic-strategy": "abort",
   "code-model": "kernel",

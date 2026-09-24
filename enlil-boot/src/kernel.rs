@@ -450,6 +450,7 @@ mod hw {
         let tsc_hz = bring_up_time(&serial);
         if let Some(hz) = tsc_hz {
             bring_up_deadline_ns(&serial, hz);
+            bring_up_scheduler_quantum(&serial, hz);
             bring_up_platform_time(&serial, hz);
         }
         let ecam = bring_up_acpi(&serial, handoff);
@@ -704,10 +705,10 @@ mod hw {
         // The AP inventory SMP bring-up (INIT-SIPI-SIPI) targets: the enabled
         // processors' APIC IDs, BSP included.
         serial.write_str("enlil kernel: acpi: APIC IDs");
-        for i in 0..summary.apic_id_count {
+        for id_val in summary.apic_ids.iter().take(summary.apic_id_count) {
             let mut id = [0u8; 20];
             serial.write_str(" ");
-            serial.write_str(format_u64(u64::from(summary.apic_ids[i]), &mut id));
+            serial.write_str(format_u64(u64::from(*id_val), &mut id));
         }
         serial.write_str(" (SMP AP inventory)\n");
         crate::kernel::ap_trampoline::publish_apic_ids(&summary.apic_ids[..summary.apic_id_count]);
@@ -824,29 +825,26 @@ mod hw {
         let span = crate::paging::required_map_bytes(highest_usable_end, fb_base, fb_size);
         // SAFETY: `span` covers the highest usable RAM and the framebuffer
         // (floored at 4 GiB), so the CR3 reload continues execution seamlessly.
-        match unsafe { crate::paging::install_identity_map(span) } {
-            Some(mut map) => {
-                let mut c = [0u8; 18];
-                let mut g = [0u8; 20];
-                serial.write_str("enlil kernel: paging: own identity tables (");
-                serial.write_str(format_u64(crate::paging::map_gib(span), &mut g));
-                serial.write_str(" GiB) installed, CR3=");
-                serial.write_str(format_u64_hex(map.cr3, &mut c));
-                serial.write_str(" — off firmware page tables\n");
-                // Reaching here proves the mixed 2 MiB + 4 KiB map is correct
-                // AND that the kernel touched nothing in the guarded null page
-                // during the reload — the low 2 MiB slot is 4 KiB-granular with
-                // VA 0 left unmapped so a null dereference faults.
-                serial.write_str(
-                    "enlil kernel: paging: null-page guard armed (VA 0 unmapped) — kernel runs on the mixed 2 MiB + 4 KiB map\n",
-                );
-                prove_4kib_split(serial, &mut map);
-                Some(map)
-            }
-            None => {
-                serial.write_str("enlil kernel: paging: page-table build FAILED\n");
-                None
-            }
+        if let Some(mut map) = unsafe { crate::paging::install_identity_map(span) } {
+            let mut c = [0u8; 18];
+            let mut g = [0u8; 20];
+            serial.write_str("enlil kernel: paging: own identity tables (");
+            serial.write_str(format_u64(crate::paging::map_gib(span), &mut g));
+            serial.write_str(" GiB) installed, CR3=");
+            serial.write_str(format_u64_hex(map.cr3, &mut c));
+            serial.write_str(" — off firmware page tables\n");
+            // Reaching here proves the mixed 2 MiB + 4 KiB map is correct
+            // AND that the kernel touched nothing in the guarded null page
+            // during the reload — the low 2 MiB slot is 4 KiB-granular with
+            // VA 0 left unmapped so a null dereference faults.
+            serial.write_str(
+                "enlil kernel: paging: null-page guard armed (VA 0 unmapped) — kernel runs on the mixed 2 MiB + 4 KiB map\n",
+            );
+            prove_4kib_split(serial, &mut map);
+            Some(map)
+        } else {
+            serial.write_str("enlil kernel: paging: page-table build FAILED\n");
+            None
         }
     }
 
@@ -864,6 +862,7 @@ mod hw {
     ///
     /// Sending the IPIs and running a real trampoline is the next slice.
     fn bring_up_ap_trampoline_page(serial: &SerialPort, bytes: &[u8], descriptor_size: usize) {
+        const SENTINEL: u64 = 0x5350_1AB0_0757_2A11;
         let Some(page) = crate::kernel::find_ap_trampoline_page(bytes, descriptor_size) else {
             serial.write_str(
                 "enlil kernel: smp: NO conventional page below 1 MiB for an AP trampoline\n",
@@ -874,7 +873,6 @@ mod hw {
         // Prove the page is real, writable memory before an AP runs from it.
         let ptr: *mut u64 =
             core::ptr::with_exposed_provenance_mut(usize::try_from(page).unwrap_or(0));
-        const SENTINEL: u64 = 0x5350_1AB0_0757_2A11;
         // SAFETY: `page` is a whole 4 KiB page the firmware map reports as
         // conventional (free) memory, identity-mapped like all low memory, and
         // claimed here for the kernel's exclusive use.
@@ -992,6 +990,7 @@ mod hw {
     /// reload: the data reaches the same physical frame it did as a huge page.
     fn prove_4kib_split(serial: &SerialPort, map: &mut crate::paging::HostMap) {
         const TWO_MIB: usize = 2 * 1024 * 1024;
+        const SENTINEL: u64 = 0xE117_5717_0BE1_5EAFu64;
         // A private, 2 MiB-aligned, 2 MiB-long block: exactly one huge leaf.
         let Ok(layout) = Layout::from_size_align(TWO_MIB, TWO_MIB) else {
             return;
@@ -1003,9 +1002,12 @@ mod hw {
             return;
         }
         let region = raw as u64;
-        // Write a sentinel through the huge-page mapping first...
-        const SENTINEL: u64 = 0xE117_5717_0BE1_5EAFu64;
-        let probe = raw.wrapping_add(0x3_000).cast::<u64>();
+        // Write a sentinel through the huge-page mapping first. Build the probe
+        // pointer from the block's integer address (mirroring the AP-trampoline
+        // path) rather than casting `*mut u8` → `*mut u64`, which trips the
+        // pointer-alignment lint even though the address is 8-aligned.
+        let probe: *mut u64 =
+            core::ptr::with_exposed_provenance_mut(usize::try_from(region + 0x3_000).unwrap_or(0));
         // SAFETY: probe is inside the 2 MiB block this call owns and is
         // 8-byte-aligned (the block is 2 MiB-aligned, the offset a page).
         unsafe { probe.write_volatile(SENTINEL) };
@@ -1269,6 +1271,15 @@ mod hw {
                         // Tenth guest: prove NPT write-protection — enlil traps a
                         // guest store to a read-only page (dirty-tracking / COW).
                         run_wp_npf_guest(serial);
+                        // Eleventh guest: preempt a spinning guest with the REAL
+                        // host LAPIC timer via an INTR intercept (not a pre-posted
+                        // virtual interrupt) — timer-driven time-slicing on a
+                        // hardware clock (ROADMAP 6.2 toward 6.7).
+                        run_timer_preempt_guest(serial);
+                        // Twelfth guest: deliver that timer tick INTO the guest
+                        // as a virtual interrupt so its own handler runs — how a
+                        // guest OS receives its scheduler tick.
+                        run_timer_tick_delivery_guest(serial);
                     }
                     None => serial.write_str("enlil kernel: svm: vmcb VMRUN-ready FAILED\n"),
                 }
@@ -1685,6 +1696,119 @@ mod hw {
         }
     }
 
+    /// Build and run the **timer-preemption** guest, reporting whether the real
+    /// host LAPIC timer preempted a spinning long-mode guest into an `INTR`
+    /// #VMEXIT.
+    ///
+    /// Where [`run_long_mode_preempt_guest`] breaks a guest out with a *pre-posted*
+    /// virtual interrupt, this uses the real hardware clock: the guest
+    /// ([`write_long_mode_bounded_spin_program`](crate::svm::program_timer_preempt_vmcb))
+    /// `STI`s and spins in a bounded loop, the host arms a one-shot LAPIC timer,
+    /// and — with the `INTR` intercept armed — a physical timer interrupt pending
+    /// while the guest runs takes an `INTR` #VMEXIT (`final_exit ==
+    /// exit_code::INTR`). That async preemption *on a real time base* is what a
+    /// scheduler quantum uses to reclaim a CPU (ROADMAP 6.2 toward 6.7). If the
+    /// (nested-KVM) harness does not surface the host timer as a guest `INTR`
+    /// intercept, the guest finishes its bounded spin and `HLT`s — reported
+    /// honestly, no hang. The pending timer interrupt is drained afterwards.
+    fn run_timer_preempt_guest(serial: &SerialPort) {
+        use crate::svm::RunStop;
+        /// The LAPIC timer vector (shared with the other timer paths).
+        const TIMER_VECTOR: u8 = 0x40;
+        /// A one-shot LAPIC countdown (divide-by-16, no TSC frequency needed)
+        /// small enough to fire while the guest is still spinning.
+        const TIMER_COUNT: u32 = 0x0004_0000;
+
+        let Some((vmcb, _spa)) = crate::svm::program_timer_preempt_vmcb() else {
+            serial.write_str("enlil kernel: svm: timer-preempt vmcb build FAILED\n");
+            return;
+        };
+        crate::idt::install_timer_gate(TIMER_VECTOR);
+        // Arm the host LAPIC timer, then enter the guest. With the guest's INTR
+        // intercept armed, a physical timer interrupt pending while the guest
+        // runs takes an INTR #VMEXIT (host IF gates host *delivery* to the IDT,
+        // not whether the guest intercept fires).
+        crate::apic::arm_oneshot_timer(TIMER_VECTOR, TIMER_COUNT);
+        // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb` is a
+        // VMRUN-ready long-mode VMCB from program_timer_preempt_vmcb.
+        let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+        // Drain any still-pending timer interrupt so it does not disturb later
+        // bring-up: briefly enable interrupts so the host handler takes + EOIs it.
+        // SAFETY: the timer gate is installed and its handler signals EOI; only
+        // the just-armed timer can be pending here.
+        unsafe {
+            core::arch::asm!(
+                "sti",
+                "nop",
+                "cli",
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+
+        if run.final_exit == enlil_hal::svm::exit_code::INTR {
+            serial.write_str(
+                "enlil kernel: svm: spinning guest preempted by the host LAPIC timer (INTR #VMEXIT) — timer-driven time-slice\n",
+            );
+        } else if run.stop == RunStop::Halted {
+            serial.write_str(
+                "enlil kernel: svm: timer-preempt guest self-halted (host timer not surfaced as a guest INTR intercept under this harness)\n",
+            );
+        } else {
+            let mut e = [0u8; 18];
+            serial.write_str("enlil kernel: svm: timer-preempt guest stopped unexpectedly (exit ");
+            serial.write_str(format_u64_hex(run.final_exit, &mut e));
+            serial.write_str(")\n");
+        }
+    }
+
+    /// Build and run the **timer-tick delivery** guest: the host LAPIC timer
+    /// preempts a spinning guest, and enlil delivers that tick *into* the guest
+    /// as a virtual interrupt so the guest's own handler runs.
+    ///
+    /// [`run_timer_preempt_guest`] proves the host can take a CPU back from a
+    /// spinning guest (the `INTR` #VMEXIT). This closes the loop: driven by
+    /// [`run_timer_tick_guest_loop`](crate::svm::run_timer_tick_guest_loop), each
+    /// intercepted physical timer interrupt is serviced by the host, re-posted to
+    /// the guest as a virtual interrupt, and the guest resumed — so the guest
+    /// vectors through its own long-mode `IDT` to a handler that `OUT`s
+    /// [`GUEST_LM_PREEMPT_SENTINEL`](crate::svm::GUEST_LM_PREEMPT_SENTINEL) and
+    /// `HLT`s. A captured sentinel proves a host hardware-clock tick reached a
+    /// running guest OS and was handled there — how a guest receives its
+    /// scheduler tick (ROADMAP 6.2 toward 6.7). The guest's spin is bounded, so a
+    /// tick that never arrives ends in a clean self-`HLT` rather than a hang.
+    fn run_timer_tick_delivery_guest(serial: &SerialPort) {
+        use crate::svm::{GUEST_LM_PREEMPT_PORT, GUEST_LM_PREEMPT_SENTINEL, RunStop};
+        /// The LAPIC timer vector (shared with the other timer paths).
+        const TIMER_VECTOR: u8 = 0x40;
+        /// A one-shot LAPIC countdown small enough to fire mid-spin.
+        const TIMER_COUNT: u32 = 0x0004_0000;
+
+        let Some((vmcb, _spa)) = crate::svm::program_timer_tick_vmcb() else {
+            serial.write_str("enlil kernel: svm: timer-tick vmcb build FAILED\n");
+            return;
+        };
+        crate::idt::install_timer_gate(TIMER_VECTOR);
+        crate::apic::arm_oneshot_timer(TIMER_VECTOR, TIMER_COUNT);
+        // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, `vmcb` is a
+        // VMRUN-ready long-mode VMCB from program_timer_tick_vmcb, and the timer
+        // gate is installed (the loop briefly enables interrupts to EOI).
+        let run = unsafe { crate::svm::run_timer_tick_guest_loop(vmcb) };
+
+        if run.stop == RunStop::Halted
+            && run.io_out_to(u16::from(GUEST_LM_PREEMPT_PORT))
+                == Some(u32::from(GUEST_LM_PREEMPT_SENTINEL))
+        {
+            serial.write_str(
+                "enlil kernel: svm: host LAPIC timer tick delivered into the guest and handled by its own IDT — guest scheduler tick works\n",
+            );
+        } else {
+            let mut e = [0u8; 18];
+            serial.write_str("enlil kernel: svm: guest timer-tick delivery NOT observed (exit ");
+            serial.write_str(format_u64_hex(run.final_exit, &mut e));
+            serial.write_str(")\n");
+        }
+    }
+
     /// Build and run the exception-interception guest, reporting whether enlil
     /// trapped the guest's own `#UD` and re-delivered it to the guest's handler.
     ///
@@ -1993,6 +2117,123 @@ mod hw {
         }
     }
 
+    /// Drive the bare-metal scheduler's quantum cadence from the **real LAPIC
+    /// TSC-deadline timer** — one dispatch per hardware tick (ROADMAP 6.2 toward
+    /// 6.7).
+    ///
+    /// [`bring_up_scheduler`] proved the run queue dispatches in priority order
+    /// by draining it in a tight loop; this proves the *clock* a preemptive
+    /// scheduler quantizes on. Four tasks are submitted, then dispatched one per
+    /// quantum: each iteration arms a real nanosecond TSC-deadline
+    /// ([`arm_tsc_deadline_timer`](crate::apic::arm_tsc_deadline_timer)) for the
+    /// quantum, waits (`sti` + bounded spin, exactly as [`bring_up_deadline_ns`])
+    /// for that hardware tick to land, then runs exactly one scheduler quantum
+    /// ([`run_one`](enlil_platform::threading::BareMetalScheduler::run_one)). A
+    /// correct run drains all four in priority order with one hardware timer tick
+    /// per quantum — the "feed the LAPIC preemption tick into a live scheduler
+    /// quantum" step. Bounded so a non-firing timer is reported, not hung.
+    ///
+    /// Runs after [`bring_up_time`] so the calibrated `hz` is known; needs the
+    /// APIC enabled and the IDT installed (both done earlier in bring-up).
+    fn bring_up_scheduler_quantum(serial: &SerialPort, hz: u64) {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        use enlil_platform::threading::{BareMetalScheduler, CpuAffinity, Priority, Task};
+
+        /// The IDT vector the LAPIC timer delivers on (shared with the other
+        /// timer self-tests).
+        const TIMER_VECTOR: u8 = 0x40;
+        /// Quantum length: 1 ms of real time per dispatch.
+        const QUANTUM_NS: u64 = 1_000_000;
+        /// Cap on the per-quantum wait spins so a dead timer is reported, not
+        /// hung (matches the other timer self-tests).
+        const WAIT_SPINS: u32 = 200_000_000;
+        /// Number of tasks submitted, and quanta the self-test drives.
+        const QUANTA: usize = 4;
+
+        /// Priority discriminant each task records as it runs, in run order.
+        static ORDER: [AtomicUsize; QUANTA] = [
+            AtomicUsize::new(usize::MAX),
+            AtomicUsize::new(usize::MAX),
+            AtomicUsize::new(usize::MAX),
+            AtomicUsize::new(usize::MAX),
+        ];
+        /// Next free slot in `ORDER`.
+        static CURSOR: AtomicUsize = AtomicUsize::new(0);
+
+        if !crate::apic::tsc_deadline_available() {
+            return; // reported already by bring_up_deadline_timer
+        }
+
+        let sched = BareMetalScheduler::new(1);
+        // Submitted out of priority order; a correct run queue dispatches them
+        // Critical(0) → High(1) → Normal(2) → Low(3) one per quantum.
+        let prios = [
+            Priority::Low,
+            Priority::Critical,
+            Priority::Normal,
+            Priority::High,
+        ];
+        for prio in prios {
+            let task = Task::new("boot-quantum-probe", prio, CpuAffinity::Any, move || {
+                let slot = CURSOR.fetch_add(1, Ordering::Relaxed);
+                if let Some(cell) = ORDER.get(slot) {
+                    cell.store(prio as usize, Ordering::Relaxed);
+                }
+            });
+            if sched.submit(task).is_err() {
+                serial.write_str("enlil kernel: sched: quantum submit FAILED\n");
+                return;
+            }
+        }
+
+        crate::idt::install_timer_gate(TIMER_VECTOR);
+        let start_ticks = crate::idt::timer_ticks();
+        let mut quanta = 0u32;
+        for _ in 0..QUANTA {
+            let before = crate::idt::timer_ticks();
+            crate::apic::arm_tsc_deadline_timer(
+                TIMER_VECTOR,
+                crate::tsc::ns_to_ticks(QUANTUM_NS, hz),
+            );
+            // SAFETY: the timer gate is installed and its handler signals EOI;
+            // sti only enables delivery of the deadline interrupt just armed.
+            unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)) };
+            let mut spun = 0u32;
+            while crate::idt::timer_ticks() == before && spun < WAIT_SPINS {
+                spun += 1;
+                core::hint::spin_loop();
+            }
+            // SAFETY: re-mask interrupts before touching the scheduler (the boot
+            // path is single-threaded with interrupts masked between tests).
+            unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)) };
+            if crate::idt::timer_ticks() == before {
+                serial.write_str("enlil kernel: sched: quantum timer did NOT fire\n");
+                return;
+            }
+            // Exactly one scheduler quantum on this hardware tick.
+            if !sched.run_one(0) {
+                break;
+            }
+            quanta += 1;
+        }
+
+        let ticks = crate::idt::timer_ticks().wrapping_sub(start_ticks);
+        let ordered = ORDER
+            .iter()
+            .enumerate()
+            .all(|(i, cell)| cell.load(Ordering::Relaxed) == i);
+        if quanta as usize == QUANTA && ordered && ticks as usize >= QUANTA {
+            let mut buf = [0u8; 20];
+            serial.write_str("enlil kernel: sched: ");
+            serial.write_str(format_u64(u64::from(quanta), &mut buf));
+            serial.write_str(
+                " scheduler quanta driven by the LAPIC TSC-deadline timer — time-sliced dispatch live\n",
+            );
+        } else {
+            serial.write_str("enlil kernel: sched: quantum self-test FAILED\n");
+        }
+    }
+
     /// Build enlil-platform's `MemoryMap` from the real firmware map and carve
     /// the hypervisor's physical regions — roadmap 1.3 "wire the boot payload to
     /// collect the real UEFI map and feed it".
@@ -2120,10 +2361,8 @@ mod hw {
                     // Publish the guest window only once it is known disjoint
                     // from the heap — otherwise guests would be handed the
                     // hypervisor's own allocator memory.
-                    if all_clear {
-                        if let Some(g0) = regions.guest_ram.first() {
-                            crate::kernel::guest_ram::publish(g0.base.as_u64(), g0.size);
-                        }
+                    if all_clear && let Some(g0) = regions.guest_ram.first() {
+                        crate::kernel::guest_ram::publish(g0.base.as_u64(), g0.size);
                     }
                 }
             }

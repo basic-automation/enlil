@@ -645,6 +645,30 @@ pub fn enable_msr_intercept(region: &mut [u8], msrpm_base_pa: u64) {
     put_u64(region, control::MSRPM_BASE_PA, msrpm_base_pa);
 }
 
+/// Arm physical-interrupt (INTR) interception on a programmed VMCB.
+///
+/// Sets the `INTR` intercept bit (preserving the other misc-1 intercepts).
+/// Unlike the IOIO/MSR intercepts this needs no permissions map — it is
+/// unconditional. With it set, a physical maskable interrupt that becomes
+/// pending while the guest is running takes an [`INTR`](exit_code::INTR)
+/// #VMEXIT ([`RunLoopExit::Intr`]) instead of being delivered; the interrupt
+/// stays pending in the LAPIC across the exit, so the host services it (EOI)
+/// after `#VMEXIT`. This is the vehicle enlil uses to wrest a CPU-bound guest
+/// back onto the host — arm the host LAPIC timer for the quantum, and its tick
+/// forces the exit so the run loop can post a virtual timer interrupt and
+/// re-arm the next quantum (time-slicing, ROADMAP 6.2 toward 6.7).
+pub fn set_intr_intercept(region: &mut [u8]) {
+    let misc1 = get_u32(region, control::INTERCEPT_MISC1) | intercept1::INTR;
+    put_u32(region, control::INTERCEPT_MISC1, misc1);
+}
+
+/// Whether physical-interrupt (INTR) interception is armed on `region`
+/// (see [`set_intr_intercept`]).
+#[must_use]
+pub fn intr_intercepted(region: &[u8]) -> bool {
+    get_u32(region, control::INTERCEPT_MISC1) & intercept1::INTR != 0
+}
+
 /// Map a #VMEXIT code that needs no further VMCB reads onto the arch-neutral
 /// [`VmExit`](crate::VmExit).
 ///
@@ -744,6 +768,13 @@ pub enum RunLoopExit {
         /// The exception vector (`0..=31`), e.g. `6` for `#UD`, `14` for `#PF`.
         vector: u8,
     },
+    /// A physical maskable interrupt (INTR) became pending while the guest ran
+    /// and was intercepted ([`set_intr_intercept`]) rather than delivered. The
+    /// guest retired no instruction of its own — this is the *asynchronous* exit
+    /// enlil uses to preempt a CPU-bound guest: the host services the pending
+    /// interrupt (EOI), posts a virtual timer tick / re-arms the next quantum,
+    /// then resumes the guest **without** advancing RIP (nothing was retired).
+    Intr,
     /// An exit the minimal loop does not route yet — stop and report the raw
     /// code to the caller.
     Unhandled,
@@ -765,8 +796,9 @@ pub const MSR_INSN_LEN: u64 = 2;
 /// [`RunLoopExit`]).
 ///
 /// An [`INVALID`](exit_code::INVALID) code maps to [`RunLoopExit::Invalid`];
-/// `HLT`/`SHUTDOWN` to their terminal variants; `CPUID`/`IOIO`/`MSR` to their
-/// resumable variants; everything else to [`RunLoopExit::Unhandled`].
+/// `HLT`/`SHUTDOWN` to their terminal variants; `CPUID`/`IOIO`/`MSR`/`NPF`/
+/// `VMMCALL` and an intercepted `INTR` to their resumable variants; everything
+/// else to [`RunLoopExit::Unhandled`].
 #[must_use]
 pub const fn classify_run_loop_exit(code: SvmExitCode) -> RunLoopExit {
     if code.is_invalid() {
@@ -783,6 +815,7 @@ pub const fn classify_run_loop_exit(code: SvmExitCode) -> RunLoopExit {
         exit_code::MSR => RunLoopExit::Msr,
         exit_code::NPF => RunLoopExit::Npf,
         exit_code::VMMCALL => RunLoopExit::Vmmcall,
+        exit_code::INTR => RunLoopExit::Intr,
         _ => RunLoopExit::Unhandled,
     }
 }
@@ -1535,6 +1568,33 @@ mod tests {
     }
 
     #[test]
+    fn set_intr_intercept_arms_intr_without_disturbing_other_intercepts() {
+        let mut region = [0u8; VMCB_SIZE];
+        let setup = MinimalGuestSetup {
+            asid: 1,
+            nested_cr3: 0x2000,
+            entry_ip: 0,
+            code_base: 0x1000,
+            stack_pointer: 0,
+        };
+        program_minimal_hlt_guest(&mut region, &setup).unwrap();
+        assert!(!intr_intercepted(&region));
+        set_intr_intercept(&mut region);
+        assert!(intr_intercepted(&region));
+        let misc1 = get_u32(&region, control::INTERCEPT_MISC1);
+        assert_ne!(misc1 & intercept1::INTR, 0);
+        // The minimal guest's HLT/SHUTDOWN/CPUID intercepts are preserved, and
+        // arming INTR touches no permissions-map base pointer.
+        assert_ne!(misc1 & intercept1::HLT, 0);
+        assert_ne!(misc1 & intercept1::SHUTDOWN, 0);
+        assert_ne!(misc1 & intercept1::CPUID, 0);
+        assert_eq!(get_u64(&region, control::IOPM_BASE_PA), 0);
+        // Idempotent: a second arm leaves the bit set and nothing else changes.
+        set_intr_intercept(&mut region);
+        assert_eq!(get_u32(&region, control::INTERCEPT_MISC1), misc1);
+    }
+
+    #[test]
     fn msrpm_read_bit_maps_the_three_windows() {
         // Low window (byte 0): 2 bits per MSR.
         assert_eq!(msrpm_read_bit(0x0000_0000), Some(0));
@@ -1652,6 +1712,12 @@ mod tests {
         assert_eq!(
             classify_run_loop_exit(SvmExitCode::from_raw(exit_code::VMMCALL)),
             RunLoopExit::Vmmcall
+        );
+        // An intercepted physical interrupt is the asynchronous preemption exit,
+        // distinct from Unhandled (the run loop posts a virtual tick + resumes).
+        assert_eq!(
+            classify_run_loop_exit(SvmExitCode::from_raw(exit_code::INTR)),
+            RunLoopExit::Intr
         );
         // A genuinely-unrouted code (PAUSE here) is Unhandled.
         assert_eq!(
