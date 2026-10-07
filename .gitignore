@@ -1,5 +1,8 @@
 /target
 /scratch
+# mdbook build output (docs/book.toml [build] build-dir). Never commit the
+# rendered book; CI rebuilds it from docs/src/ on every run.
+/docs/book/
 # Signed-boot build outputs + signing material (scripts/make-signed-iso.sh).
 # Never commit signing keys or generated boot images.
 /dist
