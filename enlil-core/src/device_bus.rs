@@ -74,6 +74,16 @@ pub struct DeviceBus {
     /// controller which vCPU's LAPIC the one shared aperture is now serving.
     /// `None` until the aperture is mounted.
     interrupts: Option<SharedInterruptController>,
+    /// Whether a guest `WRMSR` to `IA32_TSC_DEADLINE` has ever reached this
+    /// handler (i.e. arrived as a userspace MSR exit).
+    ///
+    /// On Intel VMX hosts KVM's MSR-write fast path can consume the write
+    /// in-kernel, bypassing the MSR filter and the userspace exit entirely —
+    /// so the *absence* of such an exit tells the run loop nothing, but one
+    /// *observed* write proves the fast path is off for this VM (the
+    /// fast-path condition is static per VM), and the run loop can stop
+    /// reconciling KVM's `IA32_TSC_DEADLINE` copy on every entry.
+    tsc_deadline_write_reached_userspace: bool,
 }
 
 /// A bank of per-vCPU [`StealthMsrRouter`]s with an `active` selector.
@@ -122,6 +132,7 @@ impl DeviceBus {
             pci_reset: None,
             stealth: None,
             interrupts: None,
+            tsc_deadline_write_reached_userspace: false,
         }
     }
 
@@ -178,6 +189,20 @@ impl DeviceBus {
     #[must_use]
     pub fn active_vcpu(&self) -> Option<usize> {
         self.stealth.as_ref().map(|b| b.active)
+    }
+
+    /// Whether a guest `WRMSR` to `IA32_TSC_DEADLINE` has ever arrived as a
+    /// userspace MSR exit on this bus.
+    ///
+    /// The run loop consults this in
+    /// [`StealthRunLoop::fire_due_tsc_deadlines`](crate::run_loop::StealthRunLoop::fire_due_tsc_deadlines):
+    /// one observed write proves KVM's MSR-write fast path is not consuming
+    /// the guest's deadline writes for this VM (the fast-path condition is
+    /// static per VM), so KVM's `IA32_TSC_DEADLINE` copy can never hold an arm
+    /// the emulated LAPIC missed and the per-entry read-back can stop.
+    #[must_use]
+    pub(crate) fn tsc_deadline_write_reached_userspace(&self) -> bool {
+        self.tsc_deadline_write_reached_userspace
     }
 
     /// The number of per-vCPU routers installed, or 0 if none.
@@ -1529,6 +1554,38 @@ impl StandardPc {
         })
     }
 
+    /// Mirror a TSC-deadline value KVM recorded for vCPU `lapic_id` into the
+    /// emulated LAPIC.
+    ///
+    /// On Intel VMX hosts KVM's MSR-write fast path can consume a guest
+    /// `WRMSR` to `IA32_TSC_DEADLINE` in-kernel, bypassing the MSR filter and
+    /// the userspace exit — so the emulated LAPIC never sees the arming write
+    /// while KVM's own `IA32_TSC_DEADLINE` copy holds it. The run loop adopts
+    /// that copy here before checking for due timers. Arming goes through
+    /// [`LocalApic::write_tsc_deadline_msr`](enlil_devices::interrupt::LocalApic::write_tsc_deadline_msr),
+    /// so the SDM §10.5.4.1 mode-gating applies exactly as for a userspace
+    /// write: ignored unless the LVT timer is in TSC-deadline mode (a re-arm
+    /// supersedes the previous deadline, matching hardware). Unknown LAPIC IDs
+    /// are ignored.
+    pub fn adopt_kvm_tsc_deadline(&self, lapic_id: u8, value: u64) {
+        self.ioapic.with(|c| {
+            if let Some(lapic) = c.lapic_mut(lapic_id) {
+                lapic.write_tsc_deadline_msr(value);
+            }
+        });
+    }
+
+    /// Clear vCPU `lapic_id`'s emulated TSC-deadline timer, mirroring a disarm
+    /// the guest performed through KVM's MSR-write fast path (a `WRMSR` of 0
+    /// that likewise bypassed userspace). Unknown LAPIC IDs are ignored.
+    pub fn disarm_kvm_tsc_deadline(&self, lapic_id: u8) {
+        self.ioapic.with(|c| {
+            if let Some(lapic) = c.lapic_mut(lapic_id) {
+                lapic.set_tsc_deadline(0);
+            }
+        });
+    }
+
     /// Advance the MC146818 RTC/CMOS calendar by `seconds` whole wall seconds,
     /// ticking it once per second so a guest reading the RTC sees real calendar
     /// time pass during a run and any enabled update/alarm interrupt (IRQ8)
@@ -1680,6 +1737,12 @@ impl VmExitHandler for DeviceBus {
         // mode, per SDM §10.5.4.1). check_lapic_tsc_deadlines later fires it
         // against the guest TSC.
         if msr == IA32_TSC_DEADLINE {
+            // A write that reaches userspace proves KVM's MSR-write fast path
+            // did not consume it (Intel VMX can swallow it in-kernel, bypassing
+            // the MSR filter and this handler entirely); the run loop uses this
+            // to stop reconciling KVM's IA32_TSC_DEADLINE copy once the
+            // userspace path is proven.
+            self.tsc_deadline_write_reached_userspace = true;
             if let Some(pic) = self.interrupts.as_ref() {
                 pic.with(|c| {
                     let id = c.active_lapic_id();
@@ -2467,6 +2530,102 @@ mod tests {
             !pc.any_lapic_tsc_deadline_armed(),
             "a software-disabled APIC is not armed"
         );
+    }
+
+    // The run loop's KVM fast-path reconcile keys off whether a guest
+    // IA32_TSC_DEADLINE write ever reached userspace: one observed write
+    // proves KVM's MSR-write fast path is off for the VM, so the per-entry
+    // KVM read-back can stop. The flag tracks *reaching userspace*, not
+    // arming — a write ignored by the SDM mode gate still proves the path.
+    #[test]
+    fn tsc_deadline_userspace_write_flag_tracks_msr_exits() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::interrupt::IA32_TSC_DEADLINE;
+
+        let mut pc =
+            DeviceBus::standard_pc_complete(SerialOutput::new("g", SerialOutputMode::Null), 0, 1)
+                .expect("build standard pc");
+        assert!(
+            !pc.bus.tsc_deadline_write_reached_userspace(),
+            "fresh bus has seen no IA32_TSC_DEADLINE write"
+        );
+
+        // An unrelated MSR write does not set the flag.
+        let _ = VmExitHandler::wrmsr(&mut pc.bus, 0x10, 0x1234);
+        assert!(!pc.bus.tsc_deadline_write_reached_userspace());
+
+        // A IA32_TSC_DEADLINE write sets it — even though LAPIC 0 is not in
+        // TSC-deadline mode here, so the write itself is ignored by the mode
+        // gate and arms nothing.
+        assert!(VmExitHandler::wrmsr(&mut pc.bus, IA32_TSC_DEADLINE, 42));
+        assert!(pc.bus.tsc_deadline_write_reached_userspace());
+        assert!(
+            !pc.any_lapic_tsc_deadline_armed(),
+            "the mode gate still ignores the write; only the flag is set"
+        );
+    }
+
+    // adopt_kvm_tsc_deadline mirrors a deadline KVM consumed via its MSR-write
+    // fast path into the emulated LAPIC: this is the host-side half of the run
+    // loop's reconcile, exercised here without /dev/kvm by driving the
+    // StandardPc methods directly the way sync_tsc_deadline_from_kvm does.
+    #[test]
+    fn adopt_kvm_tsc_deadline_arms_and_fires_through_the_emulated_lapic() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+
+        const LAPIC_SVR_OFF: u32 = 0x0F0;
+        const LAPIC_LVT_TIMER_OFF: u32 = 0x320;
+        const TSC_DEADLINE_MODE: u32 = 2 << 17;
+
+        let pc =
+            DeviceBus::standard_pc_complete(SerialOutput::new("g", SerialOutputMode::Null), 0, 1)
+                .expect("build standard pc");
+        // Software-enable LAPIC 0 and put its timer in TSC-deadline mode, as
+        // the guest's MMIO programming would (that path always reaches
+        // userspace — only the WRMSR can be fast-pathed away).
+        pc.ioapic.with(|c| {
+            c.lapics[0].write_register(LAPIC_SVR_OFF, 0x1FF);
+            c.lapics[0].write_register(LAPIC_LVT_TIMER_OFF, 0x40 | TSC_DEADLINE_MODE);
+        });
+        assert!(!pc.any_lapic_tsc_deadline_armed());
+
+        // Adopt the deadline KVM recorded: the emulated LAPIC arms and fires
+        // it against the guest TSC exactly like a userspace write would.
+        pc.adopt_kvm_tsc_deadline(0, 1_000);
+        assert!(pc.any_lapic_tsc_deadline_armed());
+        assert!(pc.check_lapic_tsc_deadlines(999).is_empty());
+        assert_eq!(pc.check_lapic_tsc_deadlines(1_000), vec![0]);
+        assert_eq!(
+            pc.ioapic.with(|c| c.pending_vector(0)),
+            Some(0x40),
+            "the adopted deadline fires its LVT vector into the IRR"
+        );
+
+        // A re-adopt supersedes the previous deadline (latest write wins).
+        pc.adopt_kvm_tsc_deadline(0, 2_000);
+        assert!(pc.any_lapic_tsc_deadline_armed());
+
+        // Mirroring a fast-path disarm clears the emulated deadline.
+        pc.disarm_kvm_tsc_deadline(0);
+        assert!(
+            !pc.any_lapic_tsc_deadline_armed(),
+            "mirrored disarm clears the adopted deadline"
+        );
+        assert!(pc.check_lapic_tsc_deadlines(3_000).is_empty());
+
+        // The SDM mode gate applies to adopts too: in one-shot mode the
+        // adopted value is ignored, like a userspace write would be.
+        pc.ioapic
+            .with(|c| c.lapics[0].write_register(LAPIC_LVT_TIMER_OFF, 0x40));
+        pc.adopt_kvm_tsc_deadline(0, 500);
+        assert!(
+            !pc.any_lapic_tsc_deadline_armed(),
+            "adopt honors the TSC-deadline mode gate"
+        );
+
+        // Unknown LAPIC IDs are ignored, not a panic.
+        pc.adopt_kvm_tsc_deadline(7, 100);
+        pc.disarm_kvm_tsc_deadline(7);
     }
 
     // advance_rtc_seconds ticks the MC146818 calendar by whole wall seconds and

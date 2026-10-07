@@ -32,6 +32,11 @@
 #[cfg(target_os = "linux")]
 pub use linux::{cycles_to_ns, LoopOutcome, RunStep, StealthRunLoop};
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use linux::{
+    kvm_tsc_deadline_fastpath_possible, tsc_deadline_sync_action, TscDeadlineSyncAction,
+};
+
 #[cfg(target_os = "linux")]
 mod linux {
     use crate::device_bus::{PlatformEvent, StandardPc};
@@ -129,6 +134,24 @@ mod linux {
         /// this baseline (the RTC tracks wall time, not guest execution time);
         /// `None` until the first entry establishes it.
         last_rtc_wall_secs: Option<u64>,
+        /// Whether the run loop must reconcile KVM's own `IA32_TSC_DEADLINE`
+        /// copy into the emulated LAPICs (see
+        /// [`fire_due_tsc_deadlines`](Self::fire_due_tsc_deadlines)).
+        ///
+        /// On Intel VMX hosts KVM's MSR-write fast path can consume a guest
+        /// `WRMSR` to `IA32_TSC_DEADLINE` in-kernel, bypassing the MSR filter
+        /// and the userspace exit — the emulated LAPIC then never sees the
+        /// arming write. False on hosts where the fast path cannot exist (AMD
+        /// SVM implements no hypervisor-timer op), where the emulated LAPIC
+        /// sees every write and the reconcile is pure overhead.
+        tsc_deadline_kvm_sync: bool,
+        /// Per-vCPU `IA32_TSC_DEADLINE` values previously adopted from KVM's
+        /// fast-path copy (`0` = none adopted) — the bookkeeping that lets
+        /// [`fire_due_tsc_deadlines`](Self::fire_due_tsc_deadlines) tell a
+        /// guest disarm (KVM's copy went back to 0) apart from "KVM never saw
+        /// a write", and avoid re-adopting an already-fired deadline.
+        /// Indexed by vCPU, sized at install like `timings`.
+        kvm_adopted_tsc_deadlines: Vec<u64>,
     }
 
     /// Convert a guest reference-cycle delta to nanoseconds at `tsc_khz`.
@@ -145,6 +168,65 @@ mod linux {
             return 0;
         }
         ((cycles as u128) * 1_000_000 / (tsc_khz as u128)) as u64
+    }
+
+    /// Whether the host KVM can consume a guest `WRMSR` to `IA32_TSC_DEADLINE`
+    /// through its in-kernel MSR-write fast path, bypassing the MSR filter and
+    /// the userspace exit.
+    ///
+    /// KVM's fast path (`handle_fastpath_set_msr_irqoff` →
+    /// `handle_fastpath_set_tscdeadline`) runs only when `kvm_can_use_hv_timer()`,
+    /// which requires `kvm_x86_ops.set_hv_timer` — implemented by VMX alone.
+    /// AMD (SVM) has no hypervisor-timer op, so a deadline write always reaches
+    /// userspace there. Anything else (Intel, Zhaoxin, unknown) takes the
+    /// conservative branch, matching
+    /// [`CpuVendor::detect_host`](enlil_devices::stealth::cpuid::CpuVendor::detect_host)'s
+    /// non-AMD ⇒ Intel default.
+    #[must_use]
+    pub(crate) fn kvm_tsc_deadline_fastpath_possible() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use enlil_devices::stealth::cpuid::CpuVendor;
+            !matches!(CpuVendor::detect_host(), CpuVendor::Amd)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            true
+        }
+    }
+
+    /// What [`StealthRunLoop::sync_tsc_deadline_from_kvm`] should do about a
+    /// vCPU's emulated TSC-deadline timer, given the `IA32_TSC_DEADLINE` value
+    /// KVM recorded for the vCPU and the value previously adopted from KVM
+    /// (`0` = none adopted).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum TscDeadlineSyncAction {
+        /// KVM holds a newly-armed deadline the emulated LAPIC has not
+        /// adopted: mirror it in.
+        Adopt,
+        /// KVM's copy went from adopted-nonzero back to zero: the guest
+        /// disarmed through the fast path — mirror the disarm into the
+        /// emulated LAPIC.
+        MirrorDisarm,
+        /// Nothing to do: no new arm, no disarm.
+        None,
+    }
+
+    /// Pure decision table for the KVM fast-path reconcile — kept separate
+    /// from the ioctl-performing
+    /// [`StealthRunLoop::sync_tsc_deadline_from_kvm`] so it is unit-testable
+    /// without `/dev/kvm`.
+    pub(crate) fn tsc_deadline_sync_action(
+        kvm_deadline: u64,
+        adopted: u64,
+    ) -> TscDeadlineSyncAction {
+        if kvm_deadline != 0 && kvm_deadline != adopted {
+            TscDeadlineSyncAction::Adopt
+        } else if kvm_deadline == 0 && adopted != 0 {
+            TscDeadlineSyncAction::MirrorDisarm
+        } else {
+            TscDeadlineSyncAction::None
+        }
     }
 
     impl StealthRunLoop {
@@ -212,6 +294,13 @@ mod linux {
             // KVM would #GP the guest's deadline writes (there is no in-kernel
             // LAPIC under new_without_irqchip), so the guest could never arm its
             // TSC-deadline timer. fire_due_tsc_deadlines then fires it.
+            //
+            // Note the filter is necessary but not sufficient on Intel VMX:
+            // KVM's MSR-write fast path (handle_fastpath_set_msr_irqoff)
+            // consumes the WRMSR in-kernel whenever the hypervisor timer is
+            // usable, bypassing the filter and the userspace exit entirely.
+            // fire_due_tsc_deadlines reconciles KVM's IA32_TSC_DEADLINE copy
+            // back into the emulated LAPIC to cover that path.
             ranges.push((IA32_TSC_DEADLINE, 1));
             backend.enable_userspace_msr_exits()?;
             backend.forward_msrs_to_userspace(&ranges)?;
@@ -222,6 +311,8 @@ mod linux {
                 model,
                 tsc_khz: None,
                 last_rtc_wall_secs: None,
+                tsc_deadline_kvm_sync: kvm_tsc_deadline_fastpath_possible(),
+                kvm_adopted_tsc_deadlines: vec![0; vcpu_count],
             })
         }
 
@@ -469,6 +560,13 @@ mod linux {
         /// which self-injects the LVT timer vector into each fired LAPIC's IRR
         /// and auto-disarms it.
         ///
+        /// Before checking, the run loop reconciles KVM's own
+        /// `IA32_TSC_DEADLINE` copy for the vCPU (see
+        /// [`sync_tsc_deadline_from_kvm`](Self::sync_tsc_deadline_from_kvm)):
+        /// on Intel VMX hosts KVM's MSR-write fast path can consume the
+        /// guest's arming write in-kernel, bypassing the MSR filter and the
+        /// userspace exit, so the emulated LAPIC would otherwise never see it.
+        ///
         /// Call after [`run_vcpu_once`](Self::run_vcpu_once) for the vCPU just
         /// run. Kept separate from `run_vcpu_once` so a caller that does not use
         /// the TSC-deadline timer pays neither the extra `KVM_GET_MSRS` nor a
@@ -479,8 +577,18 @@ mod linux {
         /// guest that never uses the mode.
         ///
         /// # Errors
-        /// Propagates [`KvmBackend::read_guest_tsc`].
+        /// Propagates [`KvmBackend::read_guest_tsc`],
+        /// [`KvmBackend::read_guest_tsc_deadline`] and
+        /// [`KvmBackend::write_guest_tsc_deadline`].
         pub fn fire_due_tsc_deadlines(&mut self, index: usize) -> Result<Vec<usize>> {
+            // Mirror a deadline KVM may have consumed via its MSR-write fast
+            // path into the emulated LAPIC. Skipped once a userspace
+            // IA32_TSC_DEADLINE write has been observed — that proves the fast
+            // path is off for this VM — and on hosts where it cannot exist
+            // (AMD SVM), keeping the per-entry cost at zero there.
+            if self.tsc_deadline_kvm_sync && !self.pc.bus.tsc_deadline_write_reached_userspace() {
+                self.sync_tsc_deadline_from_kvm(index)?;
+            }
             // Skip the guest-TSC read entirely when no LAPIC has a deadline armed
             // — the common case for a guest using the bus-clock timer, so the
             // per-entry cost in the run loop is a cheap host-side check, not a
@@ -489,7 +597,64 @@ mod linux {
                 return Ok(Vec::new());
             }
             let guest_tsc = self.backend.read_guest_tsc(index)?;
-            Ok(self.pc.check_lapic_tsc_deadlines(guest_tsc))
+            let fired = self.pc.check_lapic_tsc_deadlines(guest_tsc);
+            // A fired deadline adopted from KVM's copy must also clear that
+            // copy: otherwise the next reconcile would re-adopt the
+            // already-fired value and the timer would fire again, and KVM's
+            // in-kernel LAPIC timer would keep a stale arm.
+            if let Some(adopted) = self.kvm_adopted_tsc_deadlines.get_mut(index) {
+                if *adopted != 0 && fired.contains(&index) {
+                    self.backend.write_guest_tsc_deadline(index, 0)?;
+                    *adopted = 0;
+                }
+            }
+            Ok(fired)
+        }
+
+        /// Reconcile vCPU `index`'s emulated LAPIC TSC-deadline timer with the
+        /// `IA32_TSC_DEADLINE` value KVM recorded for the vCPU.
+        ///
+        /// On Intel VMX hosts where KVM can use the hypervisor timer, KVM's
+        /// MSR-write fast path consumes a guest `WRMSR` to `IA32_TSC_DEADLINE`
+        /// in-kernel: the MSR filter never sees it and no userspace exit is
+        /// generated, so the emulated LAPIC never sees the arming write while
+        /// KVM's own copy holds it. This mirrors KVM's copy into the emulated
+        /// LAPIC (a re-arm supersedes the previous deadline, matching
+        /// hardware) and remembers the adopted value per vCPU, so that:
+        /// - a later guest disarm (likewise fast-pathed: KVM's copy goes back
+        ///   to 0) is mirrored into the emulated LAPIC, and
+        /// - an already-fired deadline is never re-adopted (the fire path in
+        ///   [`fire_due_tsc_deadlines`](Self::fire_due_tsc_deadlines) clears
+        ///   KVM's copy).
+        ///
+        /// The adopt goes through
+        /// [`LocalApic::write_tsc_deadline_msr`](enlil_devices::interrupt::LocalApic::write_tsc_deadline_msr),
+        /// so the SDM §10.5.4.1 mode-gating applies exactly as for a userspace
+        /// write. Out-of-range vCPU indices (and LAPIC IDs) are ignored — the
+        /// callers that need a valid vCPU fail on their own terms.
+        ///
+        /// # Errors
+        /// Propagates [`KvmBackend::read_guest_tsc_deadline`].
+        fn sync_tsc_deadline_from_kvm(&mut self, index: usize) -> Result<()> {
+            let kvm_deadline = self.backend.read_guest_tsc_deadline(index)?;
+            let Some(adopted) = self.kvm_adopted_tsc_deadlines.get_mut(index) else {
+                return Ok(());
+            };
+            let Ok(lapic_id) = u8::try_from(index) else {
+                return Ok(());
+            };
+            match tsc_deadline_sync_action(kvm_deadline, *adopted) {
+                TscDeadlineSyncAction::Adopt => {
+                    self.pc.adopt_kvm_tsc_deadline(lapic_id, kvm_deadline);
+                    *adopted = kvm_deadline;
+                }
+                TscDeadlineSyncAction::MirrorDisarm => {
+                    self.pc.disarm_kvm_tsc_deadline(lapic_id);
+                    *adopted = 0;
+                }
+                TscDeadlineSyncAction::None => {}
+            }
+            Ok(())
         }
 
         /// Advance the platform timers (PIT, HPET, ACPI PM, bus-clock LAPIC) by
@@ -994,6 +1159,39 @@ mod tests {
         assert_eq!(
             cycles_to_ns(u64::MAX, 1_000_000),
             (u128::from(u64::MAX)) as u64
+        );
+    }
+
+    // Decision table for the KVM fast-path reconcile: KVM's recorded
+    // IA32_TSC_DEADLINE value vs. the value previously adopted from KVM
+    // (0 = none). Pure logic, so it is covered without /dev/kvm.
+    #[test]
+    fn tsc_deadline_sync_action_covers_the_reconcile_cases() {
+        use TscDeadlineSyncAction::{Adopt, MirrorDisarm, None};
+        // Nothing anywhere: idle.
+        assert_eq!(tsc_deadline_sync_action(0, 0), None);
+        // KVM holds a deadline the emulated LAPIC has not adopted: arm it.
+        assert_eq!(tsc_deadline_sync_action(1_000, 0), Adopt);
+        // Already adopted: no repeat work (and no re-fire after one).
+        assert_eq!(tsc_deadline_sync_action(1_000, 1_000), None);
+        // Guest re-armed through the fast path: the latest write wins,
+        // superseding the adopted deadline.
+        assert_eq!(tsc_deadline_sync_action(2_000, 1_000), Adopt);
+        // KVM's copy went back to zero after an adopt: the guest disarmed
+        // through the fast path — mirror the disarm.
+        assert_eq!(tsc_deadline_sync_action(0, 1_000), MirrorDisarm);
+    }
+
+    // The fast-path probe follows the host vendor classification: AMD (SVM
+    // implements no hypervisor-timer op, so the fast path cannot fire) takes
+    // the no-sync branch; everything else syncs conservatively.
+    #[test]
+    fn kvm_tsc_deadline_fastpath_probe_follows_the_host_vendor() {
+        use enlil_devices::stealth::cpuid::CpuVendor;
+        assert_eq!(
+            kvm_tsc_deadline_fastpath_possible(),
+            !matches!(CpuVendor::detect_host(), CpuVendor::Amd),
+            "fast-path reconcile must be skipped exactly where the KVM fast path cannot exist"
         );
     }
 

@@ -1314,6 +1314,93 @@ mod linux {
             Ok(msrs.as_slice()[0].data)
         }
 
+        /// The guest's `IA32_TSC_DEADLINE` (MSR `0x6E0`) on vCPU `index`, read
+        /// via `KVM_GET_MSRS`.
+        ///
+        /// This is the value **KVM itself** recorded for the MSR — which is not
+        /// necessarily what the [`DeviceBus`]-emulated LAPIC holds. On Intel
+        /// VMX hosts where KVM can use the hypervisor timer, KVM's MSR-write
+        /// fast path (`handle_fastpath_set_msr_irqoff`) consumes a guest
+        /// `WRMSR` to `IA32_TSC_DEADLINE` entirely in-kernel: it bypasses both
+        /// the `KVM_X86_SET_MSR_FILTER` deny entry
+        /// [`StealthRunLoop::install`](crate::run_loop::StealthRunLoop::install)
+        /// installs for it and the `KVM_EXIT_X86_WRMSR` userspace exit, so the
+        /// emulated LAPIC never sees the arming write. The run loop
+        /// ([`StealthRunLoop::fire_due_tsc_deadlines`](crate::run_loop::StealthRunLoop::fire_due_tsc_deadlines))
+        /// reconciles this KVM-side value into the emulated LAPIC before
+        /// checking for due timers, so a guest-armed TSC-deadline timer fires
+        /// no matter which path the write took. On hosts without the fast path
+        /// (AMD SVM implements no `set_hv_timer`, so the write always reaches
+        /// userspace) KVM's copy stays 0.
+        ///
+        /// Host-initiated `KVM_GET_MSRS` is not subject to the guest MSR
+        /// filter, so this reads KVM's copy even though the filter denies the
+        /// MSR to the guest.
+        ///
+        /// # Errors
+        /// Returns [`Error::Vcpu`] if `index` names no vCPU, `KVM_GET_MSRS`
+        /// fails, or it does not return the single requested entry.
+        pub fn read_guest_tsc_deadline(&self, index: usize) -> Result<u64> {
+            use enlil_devices::interrupt::IA32_TSC_DEADLINE;
+            use kvm_bindings::{kvm_msr_entry, Msrs};
+            let vcpu = self
+                .vcpus
+                .get(index)
+                .ok_or_else(|| Error::Vcpu(format!("no vcpu at index {index}")))?;
+            let mut msrs = Msrs::from_entries(&[kvm_msr_entry {
+                index: IA32_TSC_DEADLINE,
+                ..Default::default()
+            }])
+            .map_err(|e| Error::Vcpu(format!("Msrs alloc: {e:?}")))?;
+            let n = vcpu
+                .get_msrs(&mut msrs)
+                .map_err(|e| Error::Vcpu(format!("KVM_GET_MSRS(IA32_TSC_DEADLINE): {e}")))?;
+            if n != 1 {
+                return Err(Error::Vcpu(format!(
+                    "KVM_GET_MSRS(IA32_TSC_DEADLINE) returned {n} entries, expected 1"
+                )));
+            }
+            Ok(msrs.as_slice()[0].data)
+        }
+
+        /// Overwrite the guest's `IA32_TSC_DEADLINE` (MSR `0x6E0`) on vCPU
+        /// `index` via `KVM_SET_MSRS`.
+        ///
+        /// Companion to [`read_guest_tsc_deadline`](Self::read_guest_tsc_deadline):
+        /// once the run loop has adopted a KVM-fast-path deadline into the
+        /// emulated LAPIC (which then owns firing and auto-disarm), KVM's copy
+        /// is cleared so a later reconcile does not re-adopt the already-fired
+        /// deadline, and so KVM's in-kernel LAPIC timer does not hold a stale
+        /// arm. Host-initiated `KVM_SET_MSRS` is not subject to the guest MSR
+        /// filter.
+        ///
+        /// # Errors
+        /// Returns [`Error::Vcpu`] if `index` names no vCPU, `KVM_SET_MSRS`
+        /// fails, or it does not accept the single entry.
+        pub fn write_guest_tsc_deadline(&self, index: usize, value: u64) -> Result<()> {
+            use enlil_devices::interrupt::IA32_TSC_DEADLINE;
+            use kvm_bindings::{kvm_msr_entry, Msrs};
+            let vcpu = self
+                .vcpus
+                .get(index)
+                .ok_or_else(|| Error::Vcpu(format!("no vcpu at index {index}")))?;
+            let msrs = Msrs::from_entries(&[kvm_msr_entry {
+                index: IA32_TSC_DEADLINE,
+                data: value,
+                ..Default::default()
+            }])
+            .map_err(|e| Error::Vcpu(format!("Msrs alloc: {e:?}")))?;
+            let n = vcpu
+                .set_msrs(&msrs)
+                .map_err(|e| Error::Vcpu(format!("KVM_SET_MSRS(IA32_TSC_DEADLINE): {e}")))?;
+            if n != 1 {
+                return Err(Error::Vcpu(format!(
+                    "KVM_SET_MSRS(IA32_TSC_DEADLINE) accepted {n} entries, expected 1"
+                )));
+            }
+            Ok(())
+        }
+
         /// Capture vCPU `index`'s full architectural state into a
         /// [`KvmVcpuState`] — general registers, special/segment/control
         /// registers, the XSAVE extended state, and the context-relevant MSRs
