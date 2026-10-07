@@ -214,6 +214,31 @@ pub struct GuestConfig {
     /// to let the hypervisor synthesize a safe locally-administered address.
     #[serde(default)]
     pub mac: Option<String>,
+    /// Virtual UEFI firmware (OVMF) for this guest (`[guest.<id>.firmware]`).
+    /// When set, the guest boots through its own virtual firmware instead of
+    /// direct kernel boot; `scripts/make-guest-esp.sh` stages the images onto
+    /// the stick's ESP at `EFI/enlil/firmware/<id>/`. Leave unset for direct
+    /// kernel/initrd boot.
+    #[serde(default)]
+    pub firmware: Option<FirmwareConfig>,
+}
+
+/// Virtual UEFI firmware images for one guest (`[guest.<id>.firmware]`).
+///
+/// Guests get their own virtual UEFI (per the README's USB-stick model): the
+/// stick carries an OVMF CODE + VARS pair per guest, and the hypervisor maps
+/// them as the guest's firmware flash at launch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FirmwareConfig {
+    /// Path to the read-only OVMF CODE image (e.g. `OVMF_CODE.fd`). May be
+    /// shared between guests: code flash is never written at runtime.
+    pub code: PathBuf,
+    /// Path to the OVMF VARS template (`OVMF_VARS.fd`). The layout script
+    /// copies this to a per-guest `OVMF_VARS.fd` on the ESP, and the launcher
+    /// copies that template to a writable per-boot vars file: the running
+    /// variable store is writable, so it must never be the same file for two
+    /// guests or for the code image.
+    pub vars: PathBuf,
 }
 
 fn default_cmdline() -> String {
