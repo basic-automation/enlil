@@ -24,10 +24,12 @@
 //! so it cross-compiles for the custom `x86_64-unknown-enlil` target (Phase
 //! 1.2). The modules whose backend is already host-agnostic — [`memory`]
 //! (buddy/slab/heap + the `map`/`paging` builders), [`sync`] (spin-backed
-//! Mutex/RwLock/Condvar + the bounded MPSC channel), and [`time`] — build for
-//! bare metal today; the remaining OS-backed modules ([`io`], [`threading`],
-//! [`async_rt`]) stay gated to `platform-linux` until their bare-metal backends
-//! land (their bare-metal seams live in `enlil-boot` for now).
+//! Mutex/RwLock/Condvar + the bounded MPSC channel), [`time`], and [`io`]
+//! (whose [`PlatformIo`](io::PlatformIo) trait reports the `no_std`
+//! [`IoError`](io::IoError) instead of `std::io::Error`) — build for bare
+//! metal today; the remaining OS-backed module ([`async_rt`]) stays gated to
+//! `platform-linux` until its bare-metal backend lands (its bare-metal seam
+//! lives in `enlil-boot` for now).
 
 #[cfg(feature = "platform-baremetal")]
 extern crate alloc;
@@ -39,7 +41,6 @@ pub mod time;
 
 #[cfg(feature = "platform-linux")]
 pub mod async_rt;
-#[cfg(feature = "platform-linux")]
 pub mod io;
 
 /// Platform initialization — must be called before any other platform services.

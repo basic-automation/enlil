@@ -17,17 +17,24 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET="$REPO_ROOT/x86_64-unknown-enlil.json"
 
 # Crates that are no_std + alloc clean and compile for the bare-metal kernel
-# target today. As more of the core graph is ported (enlil-platform's
-# baremetal backend, enlil-core, …) add them here — each addition is a
-# critical-path increment proven by this script staying green.
-BAREMETAL_CRATES=(enlil-hal)
+# target today. As more of the core graph is ported (enlil-core, …) add them
+# here — each addition is a critical-path increment proven by this script
+# staying green.
+BAREMETAL_CRATES=(enlil-hal enlil-platform)
 
 FLAGS=(-Z build-std=core,alloc -Z json-target-spec)
 
 rc=0
 for crate in "${BAREMETAL_CRATES[@]}"; do
     echo "==> building $crate for x86_64-unknown-enlil"
-    if cargo build -p "$crate" --target "$TARGET" "${FLAGS[@]}" \
+    # Per-crate extra flags: enlil-platform defaults to the hosted
+    # platform-linux backend, so the bare-metal build must explicitly select
+    # the platform-baremetal backend instead.
+    extra_flags=()
+    case "$crate" in
+        enlil-platform) extra_flags=(--no-default-features --features platform-baremetal) ;;
+    esac
+    if cargo build -p "$crate" --target "$TARGET" "${FLAGS[@]}" "${extra_flags[@]}" \
             --manifest-path "$REPO_ROOT/Cargo.toml"; then
         echo "OK: $crate"
     else

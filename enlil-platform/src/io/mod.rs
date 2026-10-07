@@ -8,8 +8,139 @@
 //! - **Linux:** Delegates to `std::io` (stdout/stderr).
 //! - **Bare-metal:** Serial port (COM1) for early boot, framebuffer console later.
 
-use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(feature = "platform-baremetal")]
+use alloc::string::String;
+
+// ===========================================================================
+// IoError — a small no_std I/O error type
+// ===========================================================================
+
+/// The kind of an [`IoError`].
+///
+/// A deliberately small subset of [`std::io::ErrorKind`]: just the variants
+/// the platform layer's I/O backends can actually produce. `Copy` so it stays
+/// cheap to pass around in `no_std` contexts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IoErrorKind {
+    /// Entity not found (device, resource).
+    NotFound,
+    /// Permission denied.
+    PermissionDenied,
+    /// Operation interrupted; it may be retried.
+    Interrupted,
+    /// Invalid input parameter.
+    InvalidInput,
+    /// Invalid data encountered.
+    InvalidData,
+    /// Write of length zero.
+    WriteZero,
+    /// Operation not supported by this device.
+    Unsupported,
+    /// Any other error.
+    Other,
+}
+
+/// I/O error type that works in `no_std` environments.
+///
+/// This is the error half of every [`PlatformIo`] method's result, replacing
+/// `std::io::Error` so the whole `io` module cross-compiles for the
+/// bare-metal target. On Linux the backends convert from `std::io::Error` via
+/// the [`From`] impl, keeping behavior identical to the old `std::io::Result`
+/// signatures (the success paths are untouched; only the error is re-wrapped,
+/// keeping its kind and dropping any heap-allocated message).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoError {
+    kind: IoErrorKind,
+    message: Option<&'static str>,
+}
+
+impl IoError {
+    /// Create an error of the given kind, with no message.
+    #[must_use]
+    pub const fn new(kind: IoErrorKind) -> Self {
+        Self {
+            kind,
+            message: None,
+        }
+    }
+
+    /// Create an error of the given kind with a static message.
+    #[must_use]
+    pub const fn with_message(kind: IoErrorKind, message: &'static str) -> Self {
+        Self {
+            kind,
+            message: Some(message),
+        }
+    }
+
+    /// The kind of this error.
+    #[must_use]
+    pub const fn kind(&self) -> IoErrorKind {
+        self.kind
+    }
+
+    /// The static message attached to this error, if any.
+    #[must_use]
+    pub const fn message(&self) -> Option<&'static str> {
+        self.message
+    }
+}
+
+impl core::fmt::Display for IoError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.message {
+            Some(msg) => write!(f, "{:?}: {msg}", self.kind),
+            None => write!(f, "{:?}", self.kind),
+        }
+    }
+}
+
+impl core::error::Error for IoError {}
+
+/// Convenience alias for the results returned by [`PlatformIo`] methods.
+pub type IoResult<T> = Result<T, IoError>;
+
+/// Convert a `std::io::Error` into the platform error, preserving its kind.
+///
+/// Only the kind survives the conversion: the original message may own heap
+/// memory, which has no `no_std` representation here.
+#[cfg(feature = "platform-linux")]
+impl From<std::io::Error> for IoError {
+    fn from(err: std::io::Error) -> Self {
+        let kind = match err.kind() {
+            std::io::ErrorKind::NotFound => IoErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied => IoErrorKind::PermissionDenied,
+            std::io::ErrorKind::Interrupted => IoErrorKind::Interrupted,
+            std::io::ErrorKind::InvalidInput => IoErrorKind::InvalidInput,
+            std::io::ErrorKind::InvalidData => IoErrorKind::InvalidData,
+            std::io::ErrorKind::WriteZero => IoErrorKind::WriteZero,
+            std::io::ErrorKind::Unsupported => IoErrorKind::Unsupported,
+            _ => IoErrorKind::Other,
+        };
+        Self::new(kind)
+    }
+}
+
+/// Convert a platform error back into a `std::io::Error` (Linux only).
+#[cfg(feature = "platform-linux")]
+impl From<IoError> for std::io::Error {
+    fn from(err: IoError) -> Self {
+        let kind = match err.kind() {
+            IoErrorKind::NotFound => std::io::ErrorKind::NotFound,
+            IoErrorKind::PermissionDenied => std::io::ErrorKind::PermissionDenied,
+            IoErrorKind::Interrupted => std::io::ErrorKind::Interrupted,
+            IoErrorKind::InvalidInput => std::io::ErrorKind::InvalidInput,
+            IoErrorKind::InvalidData => std::io::ErrorKind::InvalidData,
+            IoErrorKind::WriteZero => std::io::ErrorKind::WriteZero,
+            IoErrorKind::Unsupported => std::io::ErrorKind::Unsupported,
+            IoErrorKind::Other => std::io::ErrorKind::Other,
+        };
+        err.message()
+            .map_or_else(|| Self::from(kind), |msg| Self::new(kind, msg))
+    }
+}
 
 // ===========================================================================
 // PlatformIo trait
@@ -26,7 +157,7 @@ pub trait PlatformIo: Send + Sync {
     ///
     /// Returns an error if the read operation fails, such as when the device
     /// is unavailable, the read is interrupted, or the device does not support reading.
-    fn read(&self, buf: &mut [u8]) -> io::Result<usize>;
+    fn read(&self, buf: &mut [u8]) -> IoResult<usize>;
 
     /// Write bytes to this I/O device.
     ///
@@ -34,7 +165,7 @@ pub trait PlatformIo: Send + Sync {
     ///
     /// Returns an error if the write operation fails, such as when the device
     /// is unavailable, the write is interrupted, or the device is full.
-    fn write(&self, buf: &[u8]) -> io::Result<usize>;
+    fn write(&self, buf: &[u8]) -> IoResult<usize>;
 
     /// Flush any buffered output.
     ///
@@ -42,7 +173,7 @@ pub trait PlatformIo: Send + Sync {
     ///
     /// Returns an error if the flush operation fails, such as when the device
     /// is unavailable or the underlying I/O system encounters an error.
-    fn flush(&self) -> io::Result<()> {
+    fn flush(&self) -> IoResult<()> {
         Ok(())
     }
 
@@ -89,18 +220,18 @@ impl Console {
     }
 
     /// Write a formatted string to the console.
-    pub fn write_fmt(args: std::fmt::Arguments<'_>) {
-        use std::fmt::Write;
+    pub fn write_fmt(args: core::fmt::Arguments<'_>) {
+        use core::fmt::Write;
         let mut writer = ConsoleWriter;
         let _ = writer.write_fmt(args);
     }
 }
 
-/// Internal writer that implements `std::fmt::Write`.
+/// Internal writer that implements `core::fmt::Write`.
 struct ConsoleWriter;
 
-impl std::fmt::Write for ConsoleWriter {
-    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+impl core::fmt::Write for ConsoleWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
         Console::write_str(s);
         Ok(())
     }
@@ -158,11 +289,11 @@ impl SerialPort {
 }
 
 impl PlatformIo for SerialPort {
-    fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+    fn read(&self, buf: &mut [u8]) -> IoResult<usize> {
         #[cfg(feature = "platform-linux")]
         {
             use std::io::Read;
-            std::io::stdin().read(buf)
+            std::io::stdin().read(buf).map_err(IoError::from)
         }
         #[cfg(not(feature = "platform-linux"))]
         {
@@ -172,11 +303,11 @@ impl PlatformIo for SerialPort {
         }
     }
 
-    fn write(&self, buf: &[u8]) -> io::Result<usize> {
+    fn write(&self, buf: &[u8]) -> IoResult<usize> {
         #[cfg(feature = "platform-linux")]
         {
             use std::io::Write;
-            std::io::stdout().write(buf)
+            std::io::stdout().write(buf).map_err(IoError::from)
         }
         #[cfg(not(feature = "platform-linux"))]
         {
@@ -186,11 +317,11 @@ impl PlatformIo for SerialPort {
         }
     }
 
-    fn flush(&self) -> io::Result<()> {
+    fn flush(&self) -> IoResult<()> {
         #[cfg(feature = "platform-linux")]
         {
             use std::io::Write;
-            std::io::stdout().flush()
+            std::io::stdout().flush().map_err(IoError::from)
         }
         #[cfg(not(feature = "platform-linux"))]
         {
@@ -269,15 +400,15 @@ impl FramebufferConsole {
 }
 
 impl PlatformIo for FramebufferConsole {
-    fn read(&self, _buf: &mut [u8]) -> io::Result<usize> {
+    fn read(&self, _buf: &mut [u8]) -> IoResult<usize> {
         // Framebuffer is output-only.
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
+        Err(IoError::with_message(
+            IoErrorKind::Unsupported,
             "framebuffer is output-only",
         ))
     }
 
-    fn write(&self, buf: &[u8]) -> io::Result<usize> {
+    fn write(&self, buf: &[u8]) -> IoResult<usize> {
         // On bare-metal: render characters to framebuffer.
         // Stubbed — real pixel rendering in Phase 6.
         // Each byte would be rendered as a glyph at the current cursor position
@@ -378,8 +509,8 @@ pub enum Subsystem {
     Custom(String),
 }
 
-impl std::fmt::Display for Subsystem {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Subsystem {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Vcpu(id) => write!(f, "vcpu:{id}"),
             Self::Memory => write!(f, "memory"),
@@ -515,12 +646,55 @@ mod tests {
         let mut buf = [0u8; 16];
         let result = fb.read(&mut buf);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Unsupported);
+        assert_eq!(result.unwrap_err().kind(), IoErrorKind::Unsupported);
     }
 
     #[test]
     fn platform_logger_creation() {
         let logger = PlatformLogger::new(log::LevelFilter::Info);
         assert!(logger.enabled(&log::Metadata::builder().build()));
+    }
+
+    #[test]
+    fn io_error_kind_and_message() {
+        let err = IoError::new(IoErrorKind::NotFound);
+        assert_eq!(err.kind(), IoErrorKind::NotFound);
+        assert_eq!(err.message(), None);
+        assert_eq!(format!("{err}"), "NotFound");
+
+        let err = IoError::with_message(IoErrorKind::Unsupported, "framebuffer is output-only");
+        assert_eq!(err.kind(), IoErrorKind::Unsupported);
+        assert_eq!(err.message(), Some("framebuffer is output-only"));
+        assert_eq!(format!("{err}"), "Unsupported: framebuffer is output-only");
+
+        // Copy semantics: cheap to pass around in no_std code.
+        let copied = err;
+        assert_eq!(copied, err);
+    }
+
+    #[test]
+    fn io_result_alias() {
+        let ok: IoResult<usize> = Ok(42);
+        assert!(matches!(ok, Ok(42)));
+        let err: IoResult<usize> = Err(IoError::new(IoErrorKind::Interrupted));
+        assert!(matches!(err, Err(e) if e.kind() == IoErrorKind::Interrupted));
+    }
+
+    #[cfg(feature = "platform-linux")]
+    #[test]
+    fn io_error_std_round_trip() {
+        // std -> IoError preserves the kind.
+        let std_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let err = IoError::from(std_err);
+        assert_eq!(err.kind(), IoErrorKind::PermissionDenied);
+
+        // Unknown std kinds collapse to Other.
+        let std_err = std::io::Error::new(std::io::ErrorKind::AddrInUse, "in use");
+        assert_eq!(IoError::from(std_err).kind(), IoErrorKind::Other);
+
+        // IoError -> std preserves kind and message.
+        let back = std::io::Error::from(IoError::with_message(IoErrorKind::WriteZero, "zero"));
+        assert_eq!(back.kind(), std::io::ErrorKind::WriteZero);
+        assert!(format!("{back}").contains("zero"));
     }
 }
