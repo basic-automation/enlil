@@ -30,7 +30,7 @@
 //! [`StandardPc`]: crate::device_bus::StandardPc
 
 #[cfg(target_os = "linux")]
-pub use linux::{cycles_to_ns, LoopOutcome, RunStep, StealthRunLoop};
+pub use linux::{cycles_to_ns, LoopOutcome, RunStep, StealthRunLoop, TimesliceOutcome};
 
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use linux::{
@@ -40,14 +40,16 @@ pub(crate) use linux::{
 #[cfg(target_os = "linux")]
 mod linux {
     use crate::device_bus::{PlatformEvent, StandardPc};
-    use crate::kvm_backend::{GuestExit, KvmBackend};
+    use crate::kvm_backend::{GuestExit, KvmBackend, KvmVcpuState};
     use crate::timing_stealth::VcpuTimingState;
+    use crate::vcpu::TimeSliceScheduler;
     use crate::Result;
     use enlil_devices::acpi::{SLP_TYP_S3, SLP_TYP_S4};
     use enlil_devices::interrupt::IA32_TSC_DEADLINE;
     use enlil_devices::stealth::lbr::LbrPlatform;
     use enlil_devices::stealth::pmc::PmcRateModel;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     /// The outcome of a single run-loop iteration.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +91,25 @@ mod linux {
         /// bound that keeps a never-halting or reboot-looping guest from
         /// spinning here forever.
         Exhausted,
+    }
+
+    /// How a bounded time-sliced run ([`StealthRunLoop::run_timesliced`])
+    /// ended.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum TimesliceOutcome {
+        /// A vCPU reached a stopping point (see [`RunStep::is_stop`]) — the
+        /// run ended before the switch bound. The vCPU stays in the
+        /// time-slice run queue; the owner either keeps driving it or drops
+        /// it with [`StealthRunLoop::remove_timeslice_vcpu`].
+        Stopped {
+            /// The backend vCPU index that stopped (the index
+            /// [`StealthRunLoop::run_vcpu_once`] takes).
+            index: usize,
+            /// Its final step.
+            step: RunStep,
+        },
+        /// `max_switches` context switches elapsed without a vCPU stopping.
+        SwitchesExhausted,
     }
 
     impl RunStep {
@@ -152,6 +173,17 @@ mod linux {
         /// a write", and avoid re-adopting an already-fired deadline.
         /// Indexed by vCPU, sized at install like `timings`.
         kvm_adopted_tsc_deadlines: Vec<u64>,
+        /// Cooperative time-slice scheduler for this loop's vCPUs (item 2.3),
+        /// or `None` until [`enable_timeslice`](Self::enable_timeslice)
+        /// installs it. Instantiated with [`KvmVcpuState`] so the
+        /// host-agnostic round-robin seam in [`crate::vcpu`] drives the real
+        /// KVM save/restore primitive: on quantum expiry
+        /// [`run_timesliced`](Self::run_timesliced) captures the outgoing
+        /// vCPU with [`KvmBackend::save_vcpu_state`], hands it to
+        /// [`TimeSliceScheduler::switch_saving`](crate::vcpu::TimeSliceScheduler::switch_saving),
+        /// and re-applies the incoming vCPU's previously saved state with
+        /// [`KvmBackend::restore_vcpu_state`] before resuming it.
+        timeslice: Option<TimeSliceScheduler<KvmVcpuState>>,
     }
 
     /// Convert a guest reference-cycle delta to nanoseconds at `tsc_khz`.
@@ -313,6 +345,7 @@ mod linux {
                 last_rtc_wall_secs: None,
                 tsc_deadline_kvm_sync: kvm_tsc_deadline_fastpath_possible(),
                 kvm_adopted_tsc_deadlines: vec![0; vcpu_count],
+                timeslice: None,
             })
         }
 
@@ -455,6 +488,158 @@ mod linux {
                 }
             }
             Ok((last, total_cycles))
+        }
+
+        /// Install a cooperative time-slice scheduler on this run loop (item
+        /// 2.3): the vCPUs added with
+        /// [`add_timeslice_vcpu`](Self::add_timeslice_vcpu) time-share one
+        /// physical core round-robin, with a full architectural state save on
+        /// each quantum expiry.
+        ///
+        /// This is the live wiring the scheduler seam was built for: the
+        /// scheduler is [`TimeSliceScheduler`] instantiated with
+        /// [`KvmVcpuState`], so the host-agnostic round-robin in
+        /// [`crate::vcpu`] drives the real KVM save/restore primitive via
+        /// [`run_timesliced`](Self::run_timesliced).
+        ///
+        /// Replaces any scheduler previously installed (dropping its queued
+        /// vCPUs and any saved contexts).
+        pub fn enable_timeslice(&mut self, physical_core: u32, quantum_ms: u64) {
+            self.timeslice = Some(TimeSliceScheduler::new(physical_core, quantum_ms));
+        }
+
+        /// The installed time-slice scheduler, or an [`Error::Vcpu`] telling
+        /// the caller to [`enable_timeslice`](Self::enable_timeslice) first.
+        ///
+        /// [`Error::Vcpu`]: crate::Error::Vcpu
+        fn timeslice_sched(&mut self) -> Result<&mut TimeSliceScheduler<KvmVcpuState>> {
+            self.timeslice.as_mut().ok_or_else(|| {
+                crate::Error::Vcpu(
+                    "time-slicing is not enabled; call enable_timeslice first".to_string(),
+                )
+            })
+        }
+
+        /// Add the backend vCPU `index` (the same index
+        /// [`run_vcpu_once`](Self::run_vcpu_once) takes) to the time-slice
+        /// run queue under `guest_id`.
+        ///
+        /// The scheduler keys vCPUs by `(guest_id, vcpu_id)`; this loop binds
+        /// `vcpu_id` to the backend vCPU index, so the
+        /// [`VcpuSwitch`](crate::vcpu::VcpuSwitch) handed back on a switch
+        /// names the backend vCPU to resume directly.
+        ///
+        /// # Errors
+        /// Returns [`Error::Vcpu`] if time-slicing is not enabled or `index`
+        /// does not fit in a `u32`.
+        ///
+        /// [`Error::Vcpu`]: crate::Error::Vcpu
+        pub fn add_timeslice_vcpu(&mut self, guest_id: &str, index: usize) -> Result<()> {
+            let id = u32::try_from(index).map_err(|_| {
+                crate::Error::Vcpu(format!("vcpu index {index} does not fit in u32"))
+            })?;
+            self.timeslice_sched()?.add_vcpu(guest_id, id);
+            Ok(())
+        }
+
+        /// Remove the backend vCPU `index` from the time-slice run queue.
+        /// Returns whether it was queued.
+        ///
+        /// # Errors
+        /// As [`add_timeslice_vcpu`](Self::add_timeslice_vcpu).
+        pub fn remove_timeslice_vcpu(&mut self, guest_id: &str, index: usize) -> Result<bool> {
+            let id = u32::try_from(index).map_err(|_| {
+                crate::Error::Vcpu(format!("vcpu index {index} does not fit in u32"))
+            })?;
+            Ok(self.timeslice_sched()?.remove_vcpu(guest_id, id))
+        }
+
+        /// Drive the time-sliced vCPUs until one reaches a stopping point or
+        /// `max_switches` context switches have been performed.
+        ///
+        /// This is the live wiring of the item-2.3 scheduler seam. Each
+        /// queued vCPU runs [`run_vcpu_once`](Self::run_vcpu_once) entries
+        /// until its quantum expires — the `quantum_ms` from
+        /// [`enable_timeslice`](Self::enable_timeslice), measured in host
+        /// wall-clock time. On expiry the run loop captures the outgoing
+        /// vCPU's full architectural state with
+        /// [`KvmBackend::save_vcpu_state`], passes it to
+        /// [`TimeSliceScheduler::switch_saving`](crate::vcpu::TimeSliceScheduler::switch_saving)
+        /// (which stores it and advances round-robin), and re-applies the
+        /// incoming vCPU's previously saved state with
+        /// [`KvmBackend::restore_vcpu_state`] before resuming it. A vCPU
+        /// running its first quantum has no saved state and resumes fresh.
+        ///
+        /// Returns the [`TimesliceOutcome`] and the number of context
+        /// switches performed. A vCPU that reaches a stopping point (see
+        /// [`RunStep::is_stop`]) ends the run but stays queued — the owner
+        /// removes it with
+        /// [`remove_timeslice_vcpu`](Self::remove_timeslice_vcpu) or keeps
+        /// driving it. `max_switches = 0` still runs the current vCPU's first
+        /// quantum.
+        ///
+        /// Preemption is cooperative: without the APIC-timer/TSC-deadline
+        /// preemption of item 2.3's remaining slice, a guest that never
+        /// exits to the host (no `KVM_RUN` return) cannot be switched
+        /// mid-quantum — each [`run_vcpu_once`](Self::run_vcpu_once) entry
+        /// is the preemption point.
+        ///
+        /// # Errors
+        /// Propagates [`run_vcpu_once`](Self::run_vcpu_once),
+        /// [`KvmBackend::save_vcpu_state`] and
+        /// [`KvmBackend::restore_vcpu_state`]; returns [`Error::Vcpu`] if
+        /// time-slicing is not enabled or the run queue is empty.
+        ///
+        /// [`Error::Vcpu`]: crate::Error::Vcpu
+        pub fn run_timesliced(&mut self, max_switches: usize) -> Result<(TimesliceOutcome, u64)> {
+            let quantum = Duration::from_millis(self.timeslice_sched()?.quantum_ms());
+            let mut index = {
+                let sched = self.timeslice_sched()?;
+                let (_, id) = sched.current_vcpu().cloned().ok_or_else(|| {
+                    crate::Error::Vcpu("time-slice run queue is empty".to_string())
+                })?;
+                usize::try_from(id).map_err(|_| {
+                    crate::Error::Vcpu(format!("scheduled vcpu id {id} does not fit in usize"))
+                })?
+            };
+
+            let mut switches = 0u64;
+            let mut quantum_start = Instant::now();
+            loop {
+                let step = self.run_vcpu_once(index)?;
+                if step.is_stop() {
+                    return Ok((TimesliceOutcome::Stopped { index, step }, switches));
+                }
+                if quantum_start.elapsed() < quantum {
+                    continue;
+                }
+                if switches >= max_switches as u64 {
+                    return Ok((TimesliceOutcome::SwitchesExhausted, switches));
+                }
+                // Quantum expired: save the outgoing vCPU's state, advance
+                // the scheduler, and restore the incoming vCPU before
+                // resuming it. Field borrows only (never `&mut self` here),
+                // so the scheduler and the backend are usable in sequence.
+                let saved = self.backend.save_vcpu_state(index)?;
+                let (incoming_id, restore) = {
+                    let sched = self.timeslice_sched()?;
+                    let switch = sched.switch_saving(saved).ok_or_else(|| {
+                        crate::Error::Vcpu("time-slice run queue emptied mid-run".to_string())
+                    })?;
+                    (switch.vcpu, switch.restore)
+                };
+                let incoming = usize::try_from(incoming_id).map_err(|_| {
+                    crate::Error::Vcpu(format!(
+                        "scheduled vcpu id {incoming_id} does not fit in usize"
+                    ))
+                })?;
+                if let Some(state) = restore {
+                    self.backend.restore_vcpu_state(incoming, &state)?;
+                }
+                switches += 1;
+                index = incoming;
+                quantum_start = Instant::now();
+            }
         }
 
         /// Drive a real-mode guest on vCPU `index`, *acting on* the platform
@@ -2453,6 +2638,129 @@ mod tests {
             ioapic.with(|c| c.pending_vector(0)),
             Some(0x40),
             "run_real_mode must fire the armed TSC-deadline timer"
+        );
+    }
+
+    // End-to-end on /dev/kvm: the item-2.3 live wiring. Two vCPUs share one
+    // core under a zero quantum (every entry expires, so the switch sequence
+    // is deterministic); each runs a real-mode guest that writes its marker
+    // byte to COM1 and halts. The `out` always exits to the host, so each
+    // vCPU is saved mid-blob via save_vcpu_state -> switch_saving, the other
+    // vCPU runs fresh, and the first vCPU's saved state is re-applied via
+    // restore_vcpu_state before it resumes to HLT. Both markers in the
+    // serial sink prove each vCPU's full architectural state survived the
+    // round trip.
+    #[test]
+    fn run_timesliced_switches_two_vcpus_with_save_restore() {
+        if !is_kvm_available() {
+            eprintln!("skipping run_timesliced_switches_two_vcpus_with_save_restore: no /dev/kvm");
+            return;
+        }
+
+        // mov al, MARKER; mov dx, 0x3F8; out dx, al; hlt. The `out` always
+        // exits to the host, so no vCPU can halt inside its first quantum.
+        fn guest_code(marker: u8) -> [u8; 7] {
+            [0xB0, marker, 0xBA, 0xF8, 0x03, 0xEE, 0xF4]
+        }
+        const ENTRY0: u64 = 0x1000;
+        const ENTRY1: u64 = 0x2000;
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Shared(Arc::clone(&sink))),
+            0,
+            1,
+        )
+        .expect("build standard pc");
+
+        let backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        let mut run = match StealthRunLoop::install_smp(backend, pc, LbrPlatform::AmdSvm, 2) {
+            Ok(run) => run,
+            Err(e) => {
+                eprintln!("skipping run_timesliced_switches_two_vcpus_with_save_restore: {e}");
+                return;
+            }
+        };
+        // A zero quantum expires after every entry: the switch sequence is
+        // fully deterministic (vCPU 0 -> vCPU 1 -> vCPU 0 -> halt).
+        run.enable_timeslice(0, 0);
+        run.add_timeslice_vcpu("guest", 0).expect("queue vcpu 0");
+        run.add_timeslice_vcpu("guest", 1).expect("queue vcpu 1");
+
+        let mut ram0 = GuestRam::new(0x1000);
+        ram0.as_mut_slice()[..7].copy_from_slice(&guest_code(0xA1));
+        let mut ram1 = GuestRam::new(0x1000);
+        ram1.as_mut_slice()[..7].copy_from_slice(&guest_code(0xB2));
+        // SAFETY: `ram0`/`ram1` outlive `run` within this test scope.
+        unsafe {
+            run.backend_mut()
+                .map_memory(ENTRY0, ram0.host_addr(), ram0.len() as u64)
+        }
+        .expect("map guest memory 0");
+        unsafe {
+            run.backend_mut()
+                .map_memory(ENTRY1, ram1.host_addr(), ram1.len() as u64)
+        }
+        .expect("map guest memory 1");
+        run.create_vcpu(0).expect("create vcpu 0");
+        run.create_vcpu(1).expect("create vcpu 1");
+        run.apply_cpuid_stealth().expect("clear hypervisor bit");
+        run.backend_mut()
+            .prepare_real_mode_vcpu(0, ENTRY0)
+            .expect("set real-mode entry 0");
+        run.backend_mut()
+            .prepare_real_mode_vcpu(1, ENTRY1)
+            .expect("set real-mode entry 1");
+
+        // vCPU 0 runs its `out` (exit), is switched out mid-blob, vCPU 1 runs
+        // its `out` fresh, vCPU 0 is restored and resumes to HLT.
+        let (outcome, switches) = run.run_timesliced(100).expect("run timesliced");
+        let stopped = match outcome {
+            TimesliceOutcome::Stopped { index, step } => {
+                assert_eq!(
+                    step.exit,
+                    GuestExit::Halted,
+                    "vCPU {index} stopped without halting"
+                );
+                index
+            }
+            TimesliceOutcome::SwitchesExhausted => panic!("no vCPU halted within 100 switches"),
+        };
+        assert!(
+            switches >= 2,
+            "neither vCPU can halt before its `out` exit, so the first halt needs at least two switches, got {switches}"
+        );
+
+        // The halted vCPU is done; drop it from the queue and run the
+        // survivor — it resumes from its own `out` exit to HLT.
+        assert!(
+            run.remove_timeslice_vcpu("guest", stopped)
+                .expect("remove halted vcpu"),
+            "halted vCPU {stopped} was not queued"
+        );
+        let (outcome, _) = run.run_timesliced(100).expect("run survivor");
+        match outcome {
+            TimesliceOutcome::Stopped { index, step } => {
+                assert_eq!(
+                    step.exit,
+                    GuestExit::Halted,
+                    "survivor vCPU {index} stopped without halting"
+                );
+                assert_ne!(index, stopped, "the removed vCPU must not run again");
+            }
+            TimesliceOutcome::SwitchesExhausted => panic!("survivor never halted"),
+        }
+
+        // Both markers emitted: each vCPU executed its blob across the
+        // save/switch/restore round trip, not just the first quantum.
+        let sink = sink.lock().unwrap();
+        assert!(
+            sink.contains(&0xA1),
+            "vCPU 0 never emitted its marker: {sink:?}"
+        );
+        assert!(
+            sink.contains(&0xB2),
+            "vCPU 1 never emitted its marker: {sink:?}"
         );
     }
 }
