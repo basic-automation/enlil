@@ -1,4 +1,12 @@
 #![cfg_attr(feature = "platform-baremetal", no_std)]
+// The bare-metal interrupt event source (`async_rt::interrupts`) defines real
+// `extern "x86-interrupt"` handlers, which still need the language feature on
+// this toolchain. Gated exactly like that module (bare-metal backend on
+// x86-64, plus host test builds so the pure dispatch logic is unit-tested).
+#![cfg_attr(
+    all(target_arch = "x86_64", any(feature = "platform-baremetal", test)),
+    feature(abi_x86_interrupt)
+)]
 #![deny(clippy::all, clippy::pedantic, clippy::nursery)]
 //! Enlil Platform Layer
 //!
