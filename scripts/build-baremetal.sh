@@ -3,11 +3,13 @@
 # kernel target (os=none, no_std + alloc), rebuilding core/alloc from source
 # with -Z build-std.
 #
-# Why a script instead of .cargo/config.toml: `build-std` under
-# `[unstable]` in a root .cargo/config.toml applies to EVERY cargo
-# invocation, which would force the Linux/Windows dev host to rebuild std
-# from source on ordinary `cargo build` too. Encoding the flags here keeps
-# the host dev builds fast while giving a one-command bare-metal build.
+# Why a script instead of .cargo/config.toml (DECISION, T-1.1 2026-10-07,
+# recorded in ROADMAP.md Phase 1.2): `build-std` under `[unstable]` in a root
+# .cargo/config.toml applies to EVERY cargo invocation, which would force the
+# Linux/Windows dev host to rebuild std from source on ordinary `cargo build`
+# too. Encoding the flags here keeps the host dev builds fast while giving a
+# one-command bare-metal build. Deliberately NOT revisited per roadmap churn —
+# any future .cargo/config.toml wiring must first justify the host-build cost.
 #
 # Exit codes: 0 all listed crates built for the bare-metal target; 1 a build
 # failed.
@@ -20,21 +22,31 @@ TARGET="$REPO_ROOT/x86_64-unknown-enlil.json"
 # target today. As more of the core graph is ported (enlil-core, …) add them
 # here — each addition is a critical-path increment proven by this script
 # staying green.
+#
+# BAREMETAL_EXTRA_FLAGS carries per-crate extra cargo flags, index-aligned
+# with BAREMETAL_CRATES: enlil-platform needs its bare-metal backend feature
+# selected (and default features off — platform-linux gates the std-only io
+# and async_rt modules).
 BAREMETAL_CRATES=(enlil-hal enlil-platform)
+BAREMETAL_EXTRA_FLAGS=(
+    ""                                                # enlil-hal: no_std + alloc, no features at all
+    "--no-default-features --features platform-baremetal" # enlil-platform: no_std + alloc backend
+)
+
+if [ "${#BAREMETAL_CRATES[@]}" -ne "${#BAREMETAL_EXTRA_FLAGS[@]}" ]; then
+    echo "BUG: BAREMETAL_CRATES and BAREMETAL_EXTRA_FLAGS are out of sync" >&2
+    exit 1
+fi
 
 FLAGS=(-Z build-std=core,alloc -Z json-target-spec)
 
 rc=0
-for crate in "${BAREMETAL_CRATES[@]}"; do
+for i in "${!BAREMETAL_CRATES[@]}"; do
+    crate="${BAREMETAL_CRATES[$i]}"
     echo "==> building $crate for x86_64-unknown-enlil"
-    # Per-crate extra flags: enlil-platform defaults to the hosted
-    # platform-linux backend, so the bare-metal build must explicitly select
-    # the platform-baremetal backend instead.
-    extra_flags=()
-    case "$crate" in
-        enlil-platform) extra_flags=(--no-default-features --features platform-baremetal) ;;
-    esac
-    if cargo build -p "$crate" --target "$TARGET" "${FLAGS[@]}" "${extra_flags[@]}" \
+    # Word-split the per-crate extra flags (empty for crates that need none).
+    # shellcheck disable=SC2086
+    if cargo build -p "$crate" --target "$TARGET" ${BAREMETAL_EXTRA_FLAGS[$i]} "${FLAGS[@]}" \
             --manifest-path "$REPO_ROOT/Cargo.toml"; then
         echo "OK: $crate"
     else
