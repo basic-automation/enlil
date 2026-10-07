@@ -2,7 +2,9 @@
 //!
 //! Provides priority-based task scheduling with per-CPU run queues and
 //! work-stealing. On hosted platforms (feature `linux`), delegates to
-//! `std::thread`. On bare-metal, uses a cooperative per-CPU scheduler.
+//! `std::thread`. On bare-metal, uses a preemptive per-CPU scheduler: the
+//! [`context`] module performs real context switches (register + XSAVE
+//! state), driven by the APIC timer via [`preempt`].
 //!
 //! # Architecture
 //!
@@ -13,9 +15,13 @@
 //!                               └─── RunQueue(cpu N)
 //!
 //!  Each RunQueue is a priority-sorted deque. Idle CPUs steal from
-//!  the tail of the busiest neighbour (Chase-Lev concept).
+//!  the tail of the busiest neighbour (Chase-Lev concept). The APIC timer
+//!  raises [`preempt::PreemptFlag`] every [`preempt::Quantum`], and the
+//!  dispatch loop answers with a [`context::switch_task`].
 //! ```
 
+pub mod context;
+pub mod preempt;
 pub mod scheduler;
 
 use crate::sync::Mutex;
@@ -28,6 +34,8 @@ use std::{boxed::Box, collections::VecDeque, string::String, sync::Arc, vec::Vec
 use alloc::{boxed::Box, collections::VecDeque, string::String, sync::Arc, vec::Vec};
 
 // Re-exports
+pub use context::{Context, TaskContext, TaskEntry, TaskFiber, switch_context, switch_task};
+pub use preempt::{PreemptFlag, Quantum, oneshot_count, tsc_deadline_offset};
 pub use scheduler::Scheduler;
 
 // ---------------------------------------------------------------------------

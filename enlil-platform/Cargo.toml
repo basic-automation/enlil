@@ -20,6 +20,11 @@ platform-linux = []
 platform-baremetal = ["dep:linked_list_allocator"]
 
 [dependencies]
+# The ISA seam (LOCKED PRINCIPLE 2): threading::context keeps each task's
+# XSAVE area in enlil-hal's XSaveArea rather than re-deriving the layout.
+# enlil-hal is no_std + alloc with no features, so this never perturbs the
+# bare-metal build.
+enlil-hal = { path = "../enlil-hal", version = "0.1.0" }
 log = "0.4"
 spin = "0.9"
 # Intrusive-free-list heap for the bare-metal GlobalAlloc. Pulled in only under

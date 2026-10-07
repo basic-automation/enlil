@@ -20,6 +20,7 @@ pub mod npt;
 pub mod region;
 pub mod svm;
 pub mod vmx;
+pub mod xsave;
 
 use alloc::string::String;
 use core::fmt;

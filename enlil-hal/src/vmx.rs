@@ -555,14 +555,128 @@ impl EptViolationQualification {
     }
 }
 
+// ---------------------------------------------------------------------------
+// VMX host state for task context switches
+// ---------------------------------------------------------------------------
+
+/// `VmxHostState::vmcs` when the task is not bound to any VMCS.
+pub const VMCS_NONE: u64 = u64::MAX;
+
+/// Indices into [`VmxHostState::gpr`]: `rax, rcx, rdx, rbx, rsp, rbp, rsi,
+/// rdi, r8–r15` — the order the VM-exit path spills them in.
+pub const GPR_RAX: usize = 0;
+pub const GPR_RCX: usize = 1;
+pub const GPR_RDX: usize = 2;
+pub const GPR_RBX: usize = 3;
+pub const GPR_RSP: usize = 4;
+pub const GPR_RBP: usize = 5;
+pub const GPR_RSI: usize = 6;
+pub const GPR_RDI: usize = 7;
+pub const GPR_R8: usize = 8;
+pub const GPR_R9: usize = 9;
+pub const GPR_R10: usize = 10;
+pub const GPR_R11: usize = 11;
+pub const GPR_R12: usize = 12;
+pub const GPR_R13: usize = 13;
+pub const GPR_R14: usize = 14;
+pub const GPR_R15: usize = 15;
+
+/// Host-side state a vCPU task carries across a preemption on a VMX backend.
+///
+/// A bare-metal context switch between vCPU tasks must preserve three things:
+/// the host general-purpose registers (the VM-exit path spills them here), the
+/// extended processor state (FPU/SSE/AVX via an [`XSaveArea`](crate::xsave::XSaveArea)),
+/// and which VMCS the task last ran with — so the scheduler can `VMCLEAR` a
+/// stale current-VMCS before another task's `VMPTRLD`. The VMCS *contents*
+/// (guest state) live in the region itself; this is the host-side bundle the
+/// switch swaps.
+pub struct VmxHostState {
+    /// Saved host GPRs, indexed by the `GPR_*` constants.
+    pub gpr: [u64; 16],
+    /// Physical address of the VMCS this task last ran with, or [`VMCS_NONE`]
+    /// when the task is not bound to a VMCS.
+    pub vmcs: u64,
+    /// VMCS revision identifier (from [`VmxBasic::revision_id`]) stamped into
+    /// the bound VMCS region.
+    pub revision_id: u32,
+    /// The task's extended processor state.
+    pub xsave: crate::xsave::XSaveArea,
+}
+
+impl VmxHostState {
+    /// Allocate host state for a task, with a fresh zeroed XSAVE area sized
+    /// for the current `XCR0`.
+    ///
+    /// Returns `None` if the XSAVE area allocation fails.
+    #[must_use]
+    pub fn new(revision_id: u32) -> Option<Self> {
+        Some(Self {
+            gpr: [0; 16],
+            vmcs: VMCS_NONE,
+            revision_id,
+            xsave: crate::xsave::XSaveArea::for_current_xcr0()?,
+        })
+    }
+
+    /// Bind the task to the VMCS at physical address `vmcs_phys` — the VMCS
+    /// the next `VMPTRLD` will make current for this task.
+    pub const fn bind_vmcs(&mut self, vmcs_phys: u64) {
+        self.vmcs = vmcs_phys;
+    }
+
+    /// Drop the VMCS binding (e.g. after the region was freed).
+    pub const fn unbind_vmcs(&mut self) {
+        self.vmcs = VMCS_NONE;
+    }
+
+    /// Whether the task is currently bound to a VMCS.
+    #[must_use]
+    pub const fn has_vmcs(&self) -> bool {
+        self.vmcs != VMCS_NONE
+    }
+
+    /// Save the task's extended processor state into its XSAVE area
+    /// (`XSAVE64`).
+    ///
+    /// # Safety
+    ///
+    /// The `xsave` CPU feature must be enabled (`xsave_supported()` and, on
+    /// bare metal, `CR4.OSXSAVE`).
+    pub unsafe fn save_fpu(&self) {
+        // SAFETY: upheld by the caller.
+        unsafe { self.xsave.save() }
+    }
+
+    /// Restore the task's extended processor state from its XSAVE area
+    /// (`XRSTOR64`).
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`save_fpu`](Self::save_fpu).
+    pub unsafe fn restore_fpu(&self) {
+        // SAFETY: upheld by the caller.
+        unsafe { self.xsave.restore() }
+    }
+}
+
+impl core::fmt::Debug for VmxHostState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("VmxHostState")
+            .field("vmcs", &format_args!("{:#x}", self.vmcs))
+            .field("revision_id", &self.revision_id)
+            .field("xsave", &self.xsave)
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         EptViolationQualification, IA32_VMX_BASIC, IA32_VMX_ENTRY_CTLS, IA32_VMX_PINBASED_CTLS,
-        IA32_VMX_PROCBASED_CTLS, IA32_VMX_TRUE_PINBASED_CTLS, IoExitQualification, VMX_REGION_SIZE,
-        VmcsField, VmcsFieldType, VmcsFieldWidth, VmcsMemoryType, VmxBasic, VmxControlCaps,
-        VmxExitReason, VmxRegionError, exit_reason, init_vmx_region, io_exit_to_vmexit,
-        simple_exit_to_vmexit,
+        IA32_VMX_PROCBASED_CTLS, IA32_VMX_TRUE_PINBASED_CTLS, IoExitQualification, VMCS_NONE,
+        VMX_REGION_SIZE, VmcsField, VmcsFieldType, VmcsFieldWidth, VmcsMemoryType, VmxBasic,
+        VmxControlCaps, VmxExitReason, VmxHostState, VmxRegionError, exit_reason, init_vmx_region,
+        io_exit_to_vmexit, simple_exit_to_vmexit,
     };
     use crate::VmExit;
 
@@ -867,5 +981,67 @@ mod tests {
         assert!(qual.guest_linear_valid());
         // Bit 8 set → not the final translation.
         assert!(!qual.is_final_translation());
+    }
+
+    #[test]
+    fn host_state_starts_unbound_with_zeroed_gprs() {
+        let st = VmxHostState::new(1).expect("host state allocates");
+        assert_eq!(st.vmcs, VMCS_NONE);
+        assert!(!st.has_vmcs());
+        assert_eq!(st.revision_id, 1);
+        assert_eq!(st.gpr, [0; 16]);
+        // The XSAVE area is real: 64-byte aligned, sized for the live XCR0.
+        assert_eq!(st.xsave.as_ptr() as usize % crate::xsave::XSAVE_ALIGN, 0);
+        assert!(st.xsave.len() >= crate::xsave::XSAVE_MIN_SIZE);
+    }
+
+    #[test]
+    fn host_state_vmcs_bind_unbind_cycle() {
+        let mut st = VmxHostState::new(0x42).expect("host state allocates");
+        st.bind_vmcs(0x1_0000);
+        assert!(st.has_vmcs());
+        assert_eq!(st.vmcs, 0x1_0000);
+        // Rebinding switches the current VMCS (the scheduler VMCLEARs the old).
+        st.bind_vmcs(0x2_0000);
+        assert_eq!(st.vmcs, 0x2_0000);
+        st.unbind_vmcs();
+        assert!(!st.has_vmcs());
+        assert_eq!(st.vmcs, VMCS_NONE);
+    }
+
+    #[test]
+    fn host_state_gpr_file_read_write() {
+        use super::{GPR_R12, GPR_RAX, GPR_RSP};
+        let mut st = VmxHostState::new(7).expect("host state allocates");
+        st.gpr[GPR_RAX] = 0xAAAA_AAAA_AAAA_AAAA;
+        st.gpr[GPR_RSP] = 0x7FFF_FFFF_F000;
+        st.gpr[GPR_R12] = 0x0C0C_0C0C_0C0C_0C0C;
+        assert_eq!(st.gpr[GPR_RAX], 0xAAAA_AAAA_AAAA_AAAA);
+        assert_eq!(st.gpr[GPR_RSP], 0x7FFF_FFFF_F000);
+        assert_eq!(st.gpr[GPR_R12], 0x0C0C_0C0C_0C0C_0C0C);
+        // Untouched registers stay zeroed.
+        assert_eq!(st.gpr[super::GPR_RBX], 0);
+    }
+
+    #[test]
+    fn host_state_fpu_save_restore_roundtrip() {
+        use crate::xsave::xsave_supported;
+        if !xsave_supported() {
+            return; // No XSAVE on this CPU — nothing to exercise.
+        }
+        let st = VmxHostState::new(9).expect("host state allocates");
+        // SAFETY: XSAVE is supported (checked above); the area is valid and
+        // exclusively owned by this test.
+        unsafe {
+            st.save_fpu();
+            st.restore_fpu();
+        }
+    }
+
+    #[test]
+    fn host_state_debug_format() {
+        let st = VmxHostState::new(3).expect("host state allocates");
+        let dbg = alloc::format!("{st:?}");
+        assert!(dbg.contains("VmxHostState"));
     }
 }

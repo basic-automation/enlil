@@ -405,6 +405,7 @@ dependencies = [
 name = "enlil-platform"
 version = "0.1.0"
 dependencies = [
+ "enlil-hal",
  "env_logger",
  "libc",
  "linked_list_allocator",
