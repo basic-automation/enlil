@@ -443,6 +443,7 @@ mod hw {
         bring_up_interrupts(&serial);
         bring_up_locks(&serial);
         let apic_id = bring_up_apic(&serial);
+        bring_up_reactor_event_source(&serial, apic_id);
         bring_up_percpu(&serial, apic_id.unwrap_or(0));
         bring_up_gdt(&serial);
         bring_up_timer(&serial);
@@ -1931,6 +1932,80 @@ mod hw {
                 Some(id)
             },
         )
+    }
+
+    /// Install the bare-metal async-reactor event source (item 1.6, T-1.5) and
+    /// prove it delivers.
+    ///
+    /// The reactor core is backend-neutral; this is its bare-metal event
+    /// source: per-vector device-IRQ stubs plus a cross-CPU IPI wakeup, all
+    /// feeding `Reactor::mark_ready` — so the executor can block on device
+    /// interrupts instead of the sourceless sleep fallback. Installs the IPI
+    /// wakeup gate and every device-IRQ stub gate into the live IDT
+    /// (interrupts masked, single boot CPU, as the timer bring-up does),
+    /// publishes the reactor to the stubs, then self-tests the full
+    /// interrupt→reactor path with an IPI to this CPU — no real device
+    /// hardware needed. Routing real device IRQs onto window vectors at the
+    /// IOAPIC is a later step; the dispatch mechanism it feeds is what this
+    /// proves. The IPI registration stays live afterwards (the wakeup source
+    /// remains armed).
+    fn bring_up_reactor_event_source(serial: &SerialPort, apic_id: Option<u32>) {
+        use enlil_platform::async_rt::Reactor;
+        use enlil_platform::async_rt::interrupts::{
+            self, DEVICE_IRQ_VECTOR_BASE, DEVICE_IRQ_VECTORS, IPI_WAKEUP_VECTOR,
+            InterruptEventSource,
+        };
+
+        /// Cap on the wait spins so a non-delivered IPI is reported, not hung.
+        const WAIT_SPINS: u32 = 200_000_000;
+
+        static REACTOR: Reactor = Reactor::new();
+        let source = InterruptEventSource::new(&REACTOR);
+        source.install();
+
+        crate::idt::install_interrupt_gate(
+            IPI_WAKEUP_VECTOR,
+            interrupts::ipi_wakeup_handler_addr(),
+            0,
+        );
+        for i in 0..DEVICE_IRQ_VECTORS {
+            let vector = DEVICE_IRQ_VECTOR_BASE + i;
+            if let Some(addr) = interrupts::device_irq_handler_addr(vector) {
+                crate::idt::install_interrupt_gate(vector, addr, 0);
+            }
+        }
+        serial.write_str("enlil kernel: reactor: IPI + device-IRQ gates installed\n");
+
+        let Some(apic_id) = apic_id else {
+            serial.write_str("enlil kernel: reactor: no APIC — IPI self-test skipped\n");
+            return;
+        };
+
+        // Self-test: arm the IPI wakeup on a token, IPI ourselves, and check
+        // the handler marked the token ready. The IPI pends while IF=0 and
+        // vectors as soon as interrupts are enabled below.
+        let token = REACTOR.register(usize::from(IPI_WAKEUP_VECTOR));
+        source.arm_ipi_wakeup(token);
+        interrupts::send_wakeup_ipi(apic_id);
+        // SAFETY: the IPI gate is installed and the handler signals EOI; sti
+        // only enables delivery of the IPI just sent to ourselves.
+        unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)) };
+        let mut spun = 0u32;
+        while !REACTOR.is_ready(token) && spun < WAIT_SPINS {
+            spun += 1;
+            core::hint::spin_loop();
+        }
+        // SAFETY: re-mask interrupts before continuing the single-threaded boot.
+        unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)) };
+
+        let drained = REACTOR.take_ready();
+        if drained.len() == 1 && drained[0] == token {
+            serial.write_str(
+                "enlil kernel: reactor: IPI self-test ok — interrupt marked its token ready\n",
+            );
+        } else {
+            serial.write_str("enlil kernel: reactor: IPI self-test FAILED\n");
+        }
     }
 
     /// Install the kernel's own GDT + TSS with an IST stack and self-test that

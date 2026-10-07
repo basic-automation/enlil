@@ -33,6 +33,17 @@ use spin::{Mutex, MutexGuard};
 #[cfg(all(feature = "platform-linux", target_os = "linux"))]
 pub mod epoll;
 
+/// Bare-metal interrupt + IPI event source driving the [`Reactor`] (item
+/// 1.6, T-1.5): device-IRQ stubs and a cross-CPU IPI wakeup vector feeding
+/// the same `mark_ready`, with an `hlt`-based blocking [`poll`](interrupts::InterruptEventSource::poll).
+///
+/// Compiled for the bare-metal backend on x86-64 — and on the host under
+/// `cfg(test)`, so the pure dispatch/table/ICR logic is exercised by `cargo
+/// test` (the privileged instructions compile there but are never executed
+/// by the tests).
+#[cfg(all(target_arch = "x86_64", any(feature = "platform-baremetal", test)))]
+pub mod interrupts;
+
 /// A boxed future that can be sent across threads.
 type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -193,6 +204,49 @@ impl Executor {
             // Block in the kernel until a descriptor is ready; poll() fires the
             // parked tasks' wakers, re-enqueuing them for the next drain.
             poller.poll(reactor, None)?;
+        }
+    }
+
+    /// Run the executor as a full I/O event loop over the bare-metal
+    /// interrupt [`source`](interrupts::InterruptEventSource) (item 1.6,
+    /// T-1.5).
+    ///
+    /// Each round drains every task that can make progress now
+    /// ([`run`](Self::run)); then, while any task is still parked on a source
+    /// registered with the reactor, it blocks in
+    /// [`InterruptEventSource::poll`](interrupts::InterruptEventSource::poll),
+    /// which halts the CPU until a device interrupt or IPI marks a token
+    /// ready (firing the parked tasks' wakers), and loops. It returns once
+    /// every task has completed and the reactor holds no sources.
+    ///
+    /// This is the bare-metal counterpart of
+    /// [`run_with_poller`](Self::run_with_poller): where Linux blocks in
+    /// `epoll_wait`, bare metal blocks in `hlt`, woken by the very interrupts
+    /// that carry readiness. Requires the source to be installed (IDT gates
+    /// for the device-IRQ window and the IPI vector, LAPIC enabled) —
+    /// otherwise no interrupt ever arrives and the loop sleeps indefinitely.
+    /// A task that parks on a source that never signals blocks here
+    /// indefinitely, as any event loop does; a task must deregister its
+    /// source from the reactor when it finishes so the loop can terminate
+    /// (the reactor emptying is the exit condition).
+    ///
+    /// Returns with interrupts enabled (see
+    /// [`InterruptEventSource::poll`](interrupts::InterruptEventSource::poll)).
+    #[cfg(all(target_arch = "x86_64", any(feature = "platform-baremetal", test)))]
+    pub fn run_with_interrupt_source(&self, source: &interrupts::InterruptEventSource) {
+        let reactor = source.reactor();
+        loop {
+            // Drain every task that can run right now.
+            self.run();
+            // No task is parked on a device source → all work is complete.
+            if reactor.is_empty() {
+                return;
+            }
+            // Halt until a device interrupt or IPI marks a token ready; the
+            // stubs fire the parked tasks' wakers, re-enqueuing them for the
+            // next drain. The ready count is not needed — the next loop
+            // iteration re-drains via run().
+            let _ = source.poll(None);
         }
     }
 }
@@ -506,8 +560,11 @@ impl Reactor {
     /// yield the CPU. The real Linux path drives readiness with
     /// [`epoll::EpollPoller::poll`], which blocks in the kernel and calls
     /// [`mark_ready`](Self::mark_ready) for each ready descriptor; a caller
-    /// using a poller uses that instead of this method. The bare-metal source
-    /// (device interrupt + IPI) is still item 1.6.
+    /// using a poller uses that instead of this method. The bare-metal path
+    /// drives readiness with
+    /// [`interrupts::InterruptEventSource::poll`](interrupts::InterruptEventSource::poll),
+    /// which halts the CPU until a device interrupt or IPI marks a token
+    /// ready.
     pub fn wait(&self, timeout_ms: Option<u64>) {
         #[cfg(feature = "platform-linux")]
         {
