@@ -294,6 +294,43 @@ pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
         errors.push("No guests configured; the hypervisor has nothing to run".into());
     }
 
+    // Per-guest virtual UEFI firmware blocks (Phase 0.3).
+    errors.append(&mut validate_guest_firmware(config));
+
+    errors
+}
+
+/// Validate per-guest virtual UEFI firmware blocks (`[guest.<id>.firmware]`,
+/// Phase 0.3): a firmware block must name both images, and a guest's code
+/// image must not double as its vars template — the vars flash is writable at
+/// runtime, so pointing it at the read-only code image would corrupt the
+/// firmware on first boot. Sharing one vars *template* between guests is fine:
+/// `scripts/make-guest-esp.sh` stages a per-guest copy onto the ESP and the
+/// launcher copies that to a writable per-boot vars file, so the runtime
+/// variable stores never alias.
+fn validate_guest_firmware(config: &EnlilConfig) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (id, guest) in &config.guest {
+        let Some(fw) = &guest.firmware else {
+            continue;
+        };
+        if fw.code.as_os_str().is_empty() {
+            errors.push(format!(
+                "Guest '{id}': firmware.code must name an OVMF CODE image"
+            ));
+        }
+        if fw.vars.as_os_str().is_empty() {
+            errors.push(format!(
+                "Guest '{id}': firmware.vars must name an OVMF VARS template"
+            ));
+        }
+        if !fw.code.as_os_str().is_empty() && fw.code == fw.vars {
+            errors.push(format!(
+                "Guest '{id}': firmware.vars must not be the same file as firmware.code; \
+                 the variable store is writable and would corrupt the code image"
+            ));
+        }
+    }
     errors
 }
 
@@ -318,6 +355,7 @@ mod tests {
                 disks: vec![],
                 serial: SerialPortConfig::default(),
                 mac: None,
+                firmware: None,
             },
         );
         EnlilConfig {
@@ -352,6 +390,7 @@ mod tests {
                 disks: vec![],
                 serial: SerialPortConfig::default(),
                 mac: None,
+                firmware: None,
             },
         );
         let errors = validate_config(&config);
@@ -522,6 +561,7 @@ mod tests {
                 disks: vec![],
                 serial: SerialPortConfig::default(),
                 mac: None,
+                firmware: None,
             },
         );
         let errors = validate_config(&config);
@@ -547,6 +587,7 @@ mod tests {
                 disks: vec![],
                 serial: SerialPortConfig::default(),
                 mac: None,
+                firmware: None,
             },
         );
         let errors = validate_config(&config);
@@ -578,6 +619,7 @@ mod tests {
                 disks: vec![],
                 serial: SerialPortConfig::default(),
                 mac: None,
+                firmware: None,
             },
         );
         let errors = validate_config(&config);
@@ -636,6 +678,7 @@ mod tests {
                 serial: SerialPortConfig::default(),
                 // Same address as vm1 but written with hyphens + upper case.
                 mac: Some("DE-AD-BE-EF-00-01".into()),
+                firmware: None,
             },
         );
         let errors = validate_config(&config);
@@ -789,6 +832,7 @@ mod tests {
             disks,
             serial: SerialPortConfig::default(),
             mac: None,
+            firmware: None,
         }
     }
 
@@ -846,6 +890,104 @@ mod tests {
         let errors = validate_config(&config);
         assert!(
             errors.iter().any(|e| e.contains("writable handle")),
+            "{errors:?}"
+        );
+    }
+
+    fn with_firmware(config: &mut EnlilConfig, id: &str, code: &str, vars: &str) {
+        config.guest.get_mut(id).unwrap().firmware = Some(FirmwareConfig {
+            code: code.into(),
+            vars: vars.into(),
+        });
+    }
+
+    #[test]
+    fn firmware_block_with_distinct_images_passes() {
+        let mut config = minimal_config();
+        with_firmware(
+            &mut config,
+            "vm1",
+            "/firmware/OVMF_CODE.fd",
+            "/firmware/OVMF_VARS.fd",
+        );
+        let errors = validate_config(&config);
+        assert!(errors.is_empty(), "Expected no errors, got: {errors:?}");
+    }
+
+    #[test]
+    fn firmware_guests_may_share_code_and_vars_templates() {
+        // Code flash is read-only at runtime and the vars *template* is copied
+        // per guest by the layout script, so sharing the template sources is
+        // safe by construction — only the staged per-guest copies must differ.
+        let mut config = minimal_config();
+        config.guest.insert(
+            "vm2".into(),
+            GuestConfig {
+                name: "Test VM 2".into(),
+                cpus: vec![2, 3],
+                memory_mb: 2048,
+                kernel: None,
+                initrd: None,
+                cmdline: "console=ttyS0".into(),
+                scheduling: SchedulingMode::Dedicated,
+                disks: vec![],
+                serial: SerialPortConfig::default(),
+                mac: None,
+                firmware: None,
+            },
+        );
+        with_firmware(
+            &mut config,
+            "vm1",
+            "/firmware/OVMF_CODE.fd",
+            "/firmware/OVMF_VARS.fd",
+        );
+        with_firmware(
+            &mut config,
+            "vm2",
+            "/firmware/OVMF_CODE.fd",
+            "/firmware/OVMF_VARS.fd",
+        );
+        let errors = validate_config(&config);
+        assert!(errors.is_empty(), "Expected no errors, got: {errors:?}");
+    }
+
+    #[test]
+    fn firmware_rejects_empty_code_path() {
+        let mut config = minimal_config();
+        with_firmware(&mut config, "vm1", "", "/firmware/OVMF_VARS.fd");
+        let errors = validate_config(&config);
+        assert!(
+            errors.iter().any(|e| e.contains("firmware.code")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn firmware_rejects_empty_vars_path() {
+        let mut config = minimal_config();
+        with_firmware(&mut config, "vm1", "/firmware/OVMF_CODE.fd", "");
+        let errors = validate_config(&config);
+        assert!(
+            errors.iter().any(|e| e.contains("firmware.vars")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn firmware_rejects_vars_pointing_at_the_code_image() {
+        let mut config = minimal_config();
+        with_firmware(
+            &mut config,
+            "vm1",
+            "/firmware/OVMF_CODE.fd",
+            "/firmware/OVMF_CODE.fd",
+        );
+        let errors = validate_config(&config);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("firmware.vars") && e.contains("firmware.code")),
             "{errors:?}"
         );
     }
