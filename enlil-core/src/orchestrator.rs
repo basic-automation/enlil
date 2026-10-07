@@ -700,6 +700,7 @@ mod tests {
             disks: vec![],
             serial: SerialPortConfig::default(),
             mac: None,
+            firmware: None,
         };
         let spec = GuestBootSpec::from_guest_config(
             &config,
@@ -993,6 +994,7 @@ mod tests {
                 disks: vec![],
                 serial: SerialPortConfig::default(),
                 mac: None,
+                firmware: None,
             },
         );
         let config = EnlilConfig {
