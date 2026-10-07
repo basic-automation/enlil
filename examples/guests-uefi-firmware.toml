@@ -1,0 +1,39 @@
+# Example: guests that boot through their own virtual UEFI firmware (Phase 0.3).
+#
+# Each `[guest.<id>.firmware]` block names the OVMF CODE image and VARS template
+# for that guest. `scripts/make-guest-esp.sh --config examples/guests-uefi-firmware.toml`
+# stages them onto the stick's ESP at:
+#   EFI/enlil/firmware/<id>/OVMF_CODE.fd
+#   EFI/enlil/firmware/<id>/OVMF_VARS.fd
+# alongside the host payload (EFI/BOOT/BOOTX64.EFI) and a copy of this config.
+#
+# The CODE image is read-only at runtime and may be shared between guests. The
+# VARS template is copied per guest onto the ESP, and the launcher copies that
+# to a writable per-boot vars file — the running variable store is never
+# shared. Point ENLIL_OVMF_CODE / ENLIL_OVMF_VARS at your firmware to override
+# the paths below (or pass --allow-placeholders to stage clearly-marked
+# placeholder files when no firmware is installed).
+[hypervisor]
+reserved_memory_mb = 512
+log_level = "info"
+management_port = 9100
+
+[guest.workstation]
+name = "Linux Workstation (UEFI)"
+cpus = [0, 1, 2, 3]
+memory_mb = 8192
+scheduling = "dedicated"
+
+[guest.workstation.firmware]
+code = "/usr/share/OVMF/OVMF_CODE.fd"
+vars = "/usr/share/OVMF/OVMF_VARS.fd"
+
+[guest.devserver]
+name = "Linux Dev Server (UEFI)"
+cpus = [4, 5, 6, 7]
+memory_mb = 8192
+scheduling = "dedicated"
+
+[guest.devserver.firmware]
+code = "/usr/share/OVMF/OVMF_CODE.fd"
+vars = "/usr/share/OVMF/OVMF_VARS.fd"
