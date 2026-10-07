@@ -41,6 +41,7 @@ pub(crate) use linux::{
 mod linux {
     use crate::device_bus::{PlatformEvent, StandardPc};
     use crate::kvm_backend::{GuestExit, KvmBackend, KvmVcpuState};
+    use crate::preempt_watchdog::{tsc_deadline_for_quantum, PreemptWatchdog};
     use crate::timing_stealth::VcpuTimingState;
     use crate::vcpu::TimeSliceScheduler;
     use crate::Result;
@@ -48,6 +49,7 @@ mod linux {
     use enlil_devices::interrupt::IA32_TSC_DEADLINE;
     use enlil_devices::stealth::lbr::LbrPlatform;
     use enlil_devices::stealth::pmc::PmcRateModel;
+    use enlil_platform::threading::preempt::Quantum;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -131,6 +133,22 @@ mod linux {
     /// [`apply_cpuid_stealth`](Self::apply_cpuid_stealth) once they exist, and
     /// drive [`run_vcpu_once`](Self::run_vcpu_once) per entry.
     pub struct StealthRunLoop {
+        /// Forced-quantum preemption watchdog (item 2.3's APIC-timer /
+        /// TSC-deadline slice): armed with an absolute host-TSC deadline at
+        /// the start of every time-slice quantum, it kicks the running vCPU
+        /// out of `KVM_RUN` when the deadline passes, so a guest that never
+        /// exits on its own is still preempted.
+        ///
+        /// Built lazily by [`run_timesliced`](Self::run_timesliced) — the
+        /// host TSC frequency (`KVM_GET_TSC_KHZ`) needs a vCPU to exist, which
+        /// is only guaranteed once the run queue is non-empty.
+        ///
+        /// Declared BEFORE `backend` on purpose: struct fields drop in
+        /// declaration order, so the watchdog thread (which holds
+        /// [`ImmediateExitKicker`](crate::kvm_backend::ImmediateExitKicker)s
+        /// pointing into the backend's `kvm_run` mappings) is shut down and
+        /// joined before the backend unmaps those pages.
+        preempt_watchdog: Option<PreemptWatchdog>,
         backend: KvmBackend,
         pc: StandardPc,
         /// One timing handle per vCPU, each shared with that vCPU's installed
@@ -337,6 +355,7 @@ mod linux {
             backend.enable_userspace_msr_exits()?;
             backend.forward_msrs_to_userspace(&ranges)?;
             Ok(Self {
+                preempt_watchdog: None,
                 backend,
                 pc,
                 timings,
@@ -460,10 +479,12 @@ mod linux {
         /// Returns the final [`RunStep`] and the total guest reference cycles
         /// summed across every entry. `max_entries` is the bound that keeps a
         /// guest which never halts (e.g. one that spins, or idles in `HLT`
-        /// under an in-kernel IRQ chip) from looping forever here; a real
-        /// driver pairs this with [`KvmBackend::set_immediate_exit`] from a
-        /// watchdog, but the bound alone makes the synchronous loop terminating
-        /// and testable.
+        /// under an in-kernel IRQ chip) from looping forever here; the bound
+        /// alone makes the synchronous loop terminating and testable. The
+        /// time-sliced driver ([`run_timesliced`](Self::run_timesliced)) is the
+        /// real watchdog pairing the old docs anticipated: its preemption
+        /// watchdog arms [`KvmBackend::set_immediate_exit`] from another thread
+        /// at every quantum deadline.
         ///
         /// # Errors
         /// Propagates [`run_vcpu_once`](Self::run_vcpu_once).
@@ -578,11 +599,19 @@ mod linux {
         /// driving it. `max_switches = 0` still runs the current vCPU's first
         /// quantum.
         ///
-        /// Preemption is cooperative: without the APIC-timer/TSC-deadline
-        /// preemption of item 2.3's remaining slice, a guest that never
-        /// exits to the host (no `KVM_RUN` return) cannot be switched
-        /// mid-quantum — each [`run_vcpu_once`](Self::run_vcpu_once) entry
-        /// is the preemption point.
+        /// Preemption is forced, not cooperative: at the start of every
+        /// quantum the run loop arms the preemption watchdog with an absolute
+        /// host-TSC deadline
+        /// ([`tsc_deadline_for_quantum`](crate::preempt_watchdog::tsc_deadline_for_quantum)
+        /// — the KVM-path form of the APIC TSC-deadline timer). When the
+        /// deadline passes, the watchdog kicks the running vCPU out of its
+        /// in-flight `KVM_RUN` ([`GuestExit::Interrupted`]); the run loop
+        /// recognizes the kick via
+        /// [`take_immediate_exit`](KvmBackend::take_immediate_exit) and ends
+        /// the quantum with a context switch — even for a guest that spins
+        /// without ever exiting to the host on its own. A guest that exits
+        /// frequently is still switched on the wall-clock quantum as before;
+        /// the watchdog is the backstop that bounds the worst case.
         ///
         /// # Errors
         /// Propagates [`run_vcpu_once`](Self::run_vcpu_once),
@@ -592,7 +621,8 @@ mod linux {
         ///
         /// [`Error::Vcpu`]: crate::Error::Vcpu
         pub fn run_timesliced(&mut self, max_switches: usize) -> Result<(TimesliceOutcome, u64)> {
-            let quantum = Duration::from_millis(self.timeslice_sched()?.quantum_ms());
+            let quantum_ms = self.timeslice_sched()?.quantum_ms();
+            let quantum = Duration::from_millis(quantum_ms);
             let mut index = {
                 let sched = self.timeslice_sched()?;
                 let (_, id) = sched.current_vcpu().cloned().ok_or_else(|| {
@@ -602,25 +632,39 @@ mod linux {
                     crate::Error::Vcpu(format!("scheduled vcpu id {id} does not fit in usize"))
                 })?
             };
+            // The watchdog needs the host TSC frequency, which needs a vCPU
+            // to exist — guaranteed now that the run queue is non-empty.
+            let tsc_hz = self.ensure_preempt_watchdog()?;
 
             let mut switches = 0u64;
             let mut quantum_start = Instant::now();
+            self.arm_quantum_watchdog(index, None, quantum_ms, tsc_hz)?;
             loop {
                 let step = self.run_vcpu_once(index)?;
+                // A watchdog kick lands here as GuestExit::Interrupted with
+                // the kick byte still set: that is the forced preemption, not
+                // a spurious host signal. take_immediate_exit consumes the
+                // byte so the next entry starts clean.
+                let kicked = self.backend.take_immediate_exit(index)?;
                 if step.is_stop() {
+                    self.disarm_quantum_watchdog(index)?;
                     return Ok((TimesliceOutcome::Stopped { index, step }, switches));
                 }
-                if quantum_start.elapsed() < quantum {
+                // Forced (watchdog kick) or cooperative (wall-clock quantum
+                // elapsed) expiry — either way, switch vCPUs now.
+                if !kicked && quantum_start.elapsed() < quantum {
                     continue;
                 }
                 if switches >= max_switches as u64 {
+                    self.disarm_quantum_watchdog(index)?;
                     return Ok((TimesliceOutcome::SwitchesExhausted, switches));
                 }
                 // Quantum expired: save the outgoing vCPU's state, advance
                 // the scheduler, and restore the incoming vCPU before
                 // resuming it. Field borrows only (never `&mut self` here),
                 // so the scheduler and the backend are usable in sequence.
-                let saved = self.backend.save_vcpu_state(index)?;
+                let outgoing = index;
+                let saved = self.backend.save_vcpu_state(outgoing)?;
                 let (incoming_id, restore) = {
                     let sched = self.timeslice_sched()?;
                     let switch = sched.switch_saving(saved).ok_or_else(|| {
@@ -636,10 +680,80 @@ mod linux {
                 if let Some(state) = restore {
                     self.backend.restore_vcpu_state(incoming, &state)?;
                 }
+                // Re-arm the watchdog for the incoming vCPU before resuming
+                // it; the watchdog clears the outgoing vCPU's kick byte as it
+                // installs the new arm, closing the race where a late fire
+                // for the old quantum would strand a set byte on a vCPU that
+                // is no longer running.
+                self.arm_quantum_watchdog(incoming, Some(outgoing), quantum_ms, tsc_hz)?;
                 switches += 1;
                 index = incoming;
                 quantum_start = Instant::now();
             }
+        }
+
+        /// Build the preemption watchdog on first use and return the host TSC
+        /// frequency it arms deadlines against.
+        ///
+        /// Lazy because [`KvmBackend::tsc_khz`] needs a vCPU to exist, which
+        /// only holds once [`run_timesliced`](Self::run_timesliced) is driving
+        /// a non-empty run queue — [`enable_timeslice`](Self::enable_timeslice)
+        /// is too early (callers enable it before creating vCPUs).
+        fn ensure_preempt_watchdog(&mut self) -> Result<u64> {
+            if let Some(watchdog) = self.preempt_watchdog.as_ref() {
+                return Ok(watchdog.tsc_hz());
+            }
+            let khz = self.backend.tsc_khz()?;
+            let hz = u64::from(khz).saturating_mul(1000);
+            let watchdog = PreemptWatchdog::spawn(hz)?;
+            let hz = watchdog.tsc_hz();
+            self.preempt_watchdog = Some(watchdog);
+            Ok(hz)
+        }
+
+        /// Arm the preemption watchdog for the quantum `running` is starting:
+        /// clear any stale kick byte, then install the absolute host-TSC
+        /// deadline `quantum_ms` out. `outgoing` names the vCPU being switched
+        /// out (if any) so the watchdog clears its byte as the new arm lands.
+        fn arm_quantum_watchdog(
+            &mut self,
+            running: usize,
+            outgoing: Option<usize>,
+            quantum_ms: u64,
+            tsc_hz: u64,
+        ) -> Result<()> {
+            // Belt and braces with the watchdog's own install-time clearing:
+            // the byte must be clear when the quantum starts no matter what a
+            // previous run left behind.
+            self.backend.set_immediate_exit(running, false)?;
+            let kicker = self.backend.immediate_exit_kicker(running)?;
+            let prev_kicker = outgoing
+                .map(|o| self.backend.immediate_exit_kicker(o))
+                .transpose()?;
+            // SAFETY: `_rdtsc` is a baseline x86-64 instruction with no
+            // preconditions; the KVM backend only compiles for x86-64 Linux.
+            let now_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+            let deadline =
+                tsc_deadline_for_quantum(now_tsc, Quantum::from_millis(quantum_ms), tsc_hz);
+            let watchdog = self.preempt_watchdog.as_ref().ok_or_else(|| {
+                crate::Error::Vcpu(
+                    "preemption watchdog not installed; call ensure_preempt_watchdog first"
+                        .to_string(),
+                )
+            })?;
+            watchdog.arm(kicker, prev_kicker, deadline);
+            Ok(())
+        }
+
+        /// Stand the watchdog down at the end of a
+        /// [`run_timesliced`](Self::run_timesliced) run and clear the running
+        /// vCPU's kick byte, so a later run starts with no pending kick.
+        fn disarm_quantum_watchdog(&mut self, running: usize) -> Result<()> {
+            if let Some(watchdog) = self.preempt_watchdog.as_ref() {
+                watchdog.disarm();
+            }
+            self.backend.set_immediate_exit(running, false)?;
+            Ok(())
         }
 
         /// Drive a real-mode guest on vCPU `index`, *acting on* the platform
@@ -963,6 +1077,7 @@ mod tests {
     use enlil_devices::stealth::lbr::LbrPlatform;
     use enlil_devices::stealth::timing::msr as timing_msr;
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     // End-to-end through the driver: install the stealth stack, seed APERF, and
     // a real-mode guest that `rdmsr APERF; out 0x3F8` reads back the seeded low
@@ -2761,6 +2876,132 @@ mod tests {
         assert!(
             sink.contains(&0xB2),
             "vCPU 1 never emitted its marker: {sink:?}"
+        );
+    }
+
+    // End-to-end on /dev/kvm: the item-2.3 forced preemption. vCPU 0 spins
+    // forever (`jmp $`, producing no exit at all) while vCPU 1 just halts.
+    // Without the TSC-deadline watchdog, vCPU 0's first KVM_RUN would never
+    // return and vCPU 1 would never run; with it, the quantum deadline kicks
+    // the spinner out of its in-flight KVM_RUN and the scheduler switches to
+    // vCPU 1, which halts. A monitor thread bounds the run so a broken
+    // watchdog fails the test instead of hanging the suite. Self-skips
+    // without /dev/kvm rather than faking it.
+    #[test]
+    fn preempt_watchdog_forces_switch_of_spinning_guest() {
+        if !is_kvm_available() {
+            eprintln!("skipping preempt_watchdog_forces_switch_of_spinning_guest: no /dev/kvm");
+            return;
+        }
+
+        #[rustfmt::skip]
+        let spin: [u8; 2] = [0xEB, 0xFE]; // jmp $ — no exit, ever
+        let halt: [u8; 1] = [0xF4]; // hlt
+        const ENTRY0: u64 = 0x1000;
+        const ENTRY1: u64 = 0x2000;
+
+        let pc = DeviceBus::standard_pc_complete(
+            SerialOutput::new("guest", SerialOutputMode::Null),
+            0,
+            1,
+        )
+        .expect("build standard pc");
+
+        let backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        let mut run = match StealthRunLoop::install_smp(backend, pc, LbrPlatform::AmdSvm, 2) {
+            Ok(run) => run,
+            Err(e) => {
+                eprintln!("skipping preempt_watchdog_forces_switch_of_spinning_guest: {e}");
+                return;
+            }
+        };
+        run.enable_timeslice(0, 50);
+        run.add_timeslice_vcpu("guest", 0).expect("queue vcpu 0");
+        run.add_timeslice_vcpu("guest", 1).expect("queue vcpu 1");
+
+        let mut ram0 = GuestRam::new(0x1000);
+        ram0.as_mut_slice()[..spin.len()].copy_from_slice(&spin);
+        let mut ram1 = GuestRam::new(0x1000);
+        ram1.as_mut_slice()[..halt.len()].copy_from_slice(&halt);
+        // SAFETY: `ram0`/`ram1` outlive `run` within this test scope.
+        unsafe {
+            run.backend_mut()
+                .map_memory(ENTRY0, ram0.host_addr(), ram0.len() as u64)
+        }
+        .expect("map guest memory 0");
+        unsafe {
+            run.backend_mut()
+                .map_memory(ENTRY1, ram1.host_addr(), ram1.len() as u64)
+        }
+        .expect("map guest memory 1");
+        run.create_vcpu(0).expect("create vcpu 0");
+        run.create_vcpu(1).expect("create vcpu 1");
+        run.apply_cpuid_stealth().expect("clear hypervisor bit");
+        run.backend_mut()
+            .prepare_real_mode_vcpu(0, ENTRY0)
+            .expect("set real-mode entry 0");
+        run.backend_mut()
+            .prepare_real_mode_vcpu(1, ENTRY1)
+            .expect("set real-mode entry 1");
+
+        // The spinner can never exit on its own, so without forced preemption
+        // this never returns. A monitor thread bounds the run: if the
+        // watchdog has not preempted the spinner within 30s, the monitor
+        // kicks it via its (Send-safe) kicker so the stuck KVM_RUN returns
+        // and the test fails loudly instead of hanging the suite. (Only the
+        // kicker crosses threads — the run loop itself is not Send because
+        // the device bus owns !Send PIO devices.)
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let done = Arc::new(AtomicBool::new(false));
+        let kicker0 = run
+            .backend_mut()
+            .immediate_exit_kicker(0)
+            .expect("kicker for vcpu 0");
+        let monitor_done = Arc::clone(&done);
+        let monitor = std::thread::spawn(move || {
+            let start = Instant::now();
+            while !monitor_done.load(Ordering::Acquire) {
+                if start.elapsed() > Duration::from_secs(30) {
+                    // Recheck after a beat: the run may have finished between
+                    // the flag load and the deadline check.
+                    std::thread::sleep(Duration::from_millis(100));
+                    if monitor_done.load(Ordering::Acquire) {
+                        return false;
+                    }
+                    kicker0.set(true);
+                    return true; // rescued a stuck run
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            false
+        });
+
+        let (outcome, switches) = run.run_timesliced(100).expect("run timesliced");
+        done.store(true, Ordering::Release);
+        let rescued = monitor.join().expect("monitor thread panicked");
+        assert!(
+            !rescued,
+            "preemption watchdog failed: the spinning vCPU was never force-preempted within 30s"
+        );
+
+        // vCPU 1 halted, which is only reachable if vCPU 0 was force-switched
+        // out of its spin mid-quantum at least once.
+        match outcome {
+            TimesliceOutcome::Stopped { index, step } => {
+                assert_eq!(index, 1, "expected the halting vCPU 1 to stop the run");
+                assert_eq!(
+                    step.exit,
+                    GuestExit::Halted,
+                    "vCPU 1 stopped without halting"
+                );
+            }
+            TimesliceOutcome::SwitchesExhausted => {
+                panic!("vCPU 1 never ran: the spinner was not preempted within 100 switches")
+            }
+        }
+        assert!(
+            switches >= 1,
+            "stopping without any context switch means the spinner was never preempted"
         );
     }
 }

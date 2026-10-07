@@ -182,7 +182,7 @@ mod linux {
     use super::{GuestExit, VmExitHandler};
     use crate::error::{Error, Result};
     use enlil_devices::usb::xhci::transfer::DmaMemory;
-    use kvm_bindings::kvm_userspace_memory_region;
+    use kvm_bindings::{kvm_run, kvm_userspace_memory_region};
     use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
     use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
     use std::ptr::NonNull;
@@ -441,11 +441,85 @@ mod linux {
         pub msrs: Vec<(u32, u64)>,
     }
 
+    /// A thread-safe handle for kicking one vCPU out of `KVM_RUN` from another
+    /// thread — the preemption watchdog's side of the
+    /// [`KvmBackend::set_immediate_exit`] protocol.
+    ///
+    /// `kvm-ioctls` implements `set_kvm_immediate_exit` as a plain store to
+    /// the `immediate_exit` byte of the vCPU's `kvm_run` page (there is no
+    /// ioctl; the page is shared memory KVM itself polls). This handle keeps
+    /// the address of that byte so the watchdog thread can perform the same
+    /// store without borrowing the [`VcpuFd`], which the run loop owns across
+    /// the very `KVM_RUN` the kick must interrupt.
+    ///
+    /// # Safety contract
+    ///
+    /// The pointer is valid exactly while the owning [`KvmBackend`] lives:
+    /// the `kvm_run` mapping is created with the `VcpuFd` and unmapped when
+    /// the backend drops. Kickers are therefore only ever held by the
+    /// preemption watchdog owned by [`StealthRunLoop`](crate::run_loop::StealthRunLoop),
+    /// whose field order drops the watchdog (joining its thread) before the
+    /// backend. Never construct one by hand; use
+    /// [`KvmBackend::immediate_exit_kicker`].
+    #[derive(Debug, Clone, Copy)]
+    pub struct ImmediateExitKicker {
+        flag: *mut u8,
+    }
+
+    // SAFETY: the pointed-to byte is the `immediate_exit` field of the vCPU's
+    // `kvm_run` page — shared memory the kernel itself reads concurrently as
+    // part of the `KVM_RUN` protocol (this is the documented cross-thread kick
+    // mechanism, cf. QEMU's `kvm_cpu_exec` watchdog path). All accesses go
+    // through volatile read/write of a single byte, and the pointer's validity
+    // is covered by the contract above.
+    unsafe impl Send for ImmediateExitKicker {}
+    // SAFETY: see above.
+    unsafe impl Sync for ImmediateExitKicker {}
+
+    impl ImmediateExitKicker {
+        /// Build a kicker for the `immediate_exit` byte at `flag`.
+        ///
+        /// Visible inside the crate for the preemption watchdog's tests; all
+        /// production construction goes through
+        /// [`KvmBackend::immediate_exit_kicker`].
+        ///
+        /// # Safety
+        ///
+        /// `flag` must point at a live vCPU `kvm_run.immediate_exit` byte and
+        /// stay valid for as long as the kicker (or any clone) is used — see
+        /// the struct-level contract.
+        pub(crate) unsafe fn new(flag: *mut u8) -> Self {
+            Self { flag }
+        }
+
+        /// Arm (`true`) or disarm (`false`) the kick: with it armed, the next
+        /// `KVM_RUN` returns immediately, and an in-flight `KVM_RUN` is kicked
+        /// straight back out (surfacing as [`GuestExit::Interrupted`]).
+        pub fn set(&self, armed: bool) {
+            // SAFETY: upheld by the constructor's contract; volatile so the
+            // store is visible to KVM's poll of the shared page.
+            unsafe { core::ptr::write_volatile(self.flag, u8::from(armed)) };
+        }
+
+        /// Whether a kick is currently armed (volatile read).
+        #[must_use]
+        pub fn is_armed(&self) -> bool {
+            // SAFETY: as in [`set`](Self::set).
+            unsafe { core::ptr::read_volatile(self.flag) != 0 }
+        }
+    }
+
     /// A live KVM virtual machine plus its vCPUs.
     pub struct KvmBackend {
         kvm: Kvm,
         vm: VmFd,
         vcpus: Vec<VcpuFd>,
+        /// One [`ImmediateExitKicker`] per vCPU (parallel to `vcpus`), captured
+        /// at [`create_vcpu`](Self::create_vcpu) time. The preemption watchdog
+        /// thread holds these — not the `VcpuFd`s — so it can kick a vCPU out
+        /// of an in-flight `KVM_RUN` while the run loop holds `&mut self` on
+        /// the backend.
+        kickers: Vec<ImmediateExitKicker>,
         /// The x2APIC ID each vCPU was created with (`apic_ids[i]` is vCPU `i`'s),
         /// the value [`create_vcpu`](Self::create_vcpu) passed to
         /// `KVM_CREATE_VCPU`. Kept so [`apply_topology_stealth`](Self::apply_topology_stealth)
@@ -533,6 +607,7 @@ mod linux {
                 kvm,
                 vm,
                 vcpus: Vec::new(),
+                kickers: Vec::new(),
                 apic_ids: Vec::new(),
                 slots: Vec::new(),
                 next_slot: 0,
@@ -1240,10 +1315,21 @@ mod linux {
         /// # Errors
         /// Returns [`Error::Vcpu`] if `KVM_CREATE_VCPU` fails.
         pub fn create_vcpu(&mut self, id: u64) -> Result<usize> {
-            let vcpu = self
+            let mut vcpu = self
                 .vm
                 .create_vcpu(id)
                 .map_err(|e| Error::Vcpu(format!("KVM_CREATE_VCPU {id}: {e}")))?;
+            // Capture the kvm_run `immediate_exit` byte while we hold `&mut`
+            // the fresh VcpuFd, so the preemption watchdog can later kick this
+            // vCPU without borrowing it back from the backend.
+            let flag: *mut u8 = {
+                let kvm_run: &mut kvm_run = vcpu.get_kvm_run();
+                core::ptr::addr_of_mut!(kvm_run.immediate_exit)
+            };
+            // SAFETY: `flag` points into this vCPU's kvm_run page, which lives
+            // exactly as long as the `VcpuFd` the backend now owns; the kicker
+            // is only handed to the watchdog under that contract.
+            self.kickers.push(unsafe { ImmediateExitKicker::new(flag) });
             self.vcpus.push(vcpu);
             self.apic_ids.push(id);
             Ok(self.vcpus.len() - 1)
@@ -1903,6 +1989,45 @@ mod linux {
             Ok(())
         }
 
+        /// The thread-safe kick handle for vCPU `index`, captured at
+        /// [`create_vcpu`](Self::create_vcpu) time.
+        ///
+        /// This is what the preemption watchdog arms from its own thread to
+        /// force a [`GuestExit::Interrupted`] out of an in-flight `KVM_RUN`
+        /// when the vCPU's quantum expires — the KVM-path equivalent of the
+        /// bare-metal LAPIC timer IRQ. The handle stays valid while the
+        /// backend lives (see [`ImmediateExitKicker`]'s safety contract).
+        ///
+        /// # Errors
+        /// Returns [`Error::Vcpu`] if `index` is out of range.
+        pub fn immediate_exit_kicker(&self, index: usize) -> Result<ImmediateExitKicker> {
+            self.kickers
+                .get(index)
+                .copied()
+                .ok_or_else(|| Error::Vcpu(format!("no vcpu at index {index}")))
+        }
+
+        /// Read and clear vCPU `index`'s immediate-exit flag, returning whether
+        /// a watchdog kick was pending.
+        ///
+        /// The run loop calls this after every [`run_vcpu`](Self::run_vcpu):
+        /// a set byte means the preemption watchdog fired during this quantum
+        /// (the `KVM_RUN` returned [`GuestExit::Interrupted`] because of the
+        /// kick, not a spurious host signal), so the quantum expired by force
+        /// and the scheduler must switch rather than re-enter. Clearing it
+        /// here keeps the next entry clean.
+        ///
+        /// # Errors
+        /// Returns [`Error::Vcpu`] if `index` is out of range.
+        pub fn take_immediate_exit(&self, index: usize) -> Result<bool> {
+            let kicker = self.immediate_exit_kicker(index)?;
+            let armed = kicker.is_armed();
+            if armed {
+                kicker.set(false);
+            }
+            Ok(armed)
+        }
+
         /// Translate a single `kvm-ioctls` exit into a [`GuestExit`], invoking
         /// the handler for data transfer. Split out so the mapping is easy to
         /// reason about.
@@ -1964,7 +2089,8 @@ mod linux {
 
 #[cfg(target_os = "linux")]
 pub use linux::{
-    is_kvm_available, GuestMemory, GuestRam, KvmBackend, KvmVcpuState, MemSlot, HOST_PAGE_SIZE,
+    is_kvm_available, GuestMemory, GuestRam, ImmediateExitKicker, KvmBackend, KvmVcpuState,
+    MemSlot, HOST_PAGE_SIZE,
 };
 
 #[cfg(test)]
