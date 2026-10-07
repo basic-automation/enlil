@@ -4,14 +4,30 @@
 //!
 //! # Backends
 //!
-//! - **Linux:** Uses std threading for the reactor, epoll-based I/O wakeup.
+//! - **Linux:** epoll-based I/O wakeup via [`epoll::EpollPoller`].
 //! - **Bare-metal:** Interrupt-driven reactor with per-CPU executors.
+//!
+//! # `no_std` design
+//!
+//! The module is `no_std` + `alloc` clean: the reactor's registration table is
+//! an `alloc` [`BTreeMap`](alloc::collections::BTreeMap), all locks are
+//! [`spin::Mutex`]es (no poisoning, no OS blocking — safe to take from an
+//! interrupt context), and tasks/wakers use `alloc`'s [`Arc`](alloc::sync::Arc)
+//! plus [`Wake`](alloc::task::Wake)/[`Waker`](core::task::Waker).
+//! Only the Linux epoll event source ([`epoll`]) and
+//! [`Executor::run_with_poller`] need `std`/syscalls and stay gated to
+//! `platform-linux` on Linux.
 
-use std::collections::{HashMap, VecDeque};
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::task::{Context, Poll, Wake, Waker};
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, VecDeque};
+use alloc::sync::Arc;
+use alloc::task::Wake;
+use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll, Waker};
+
+use spin::{Mutex, MutexGuard};
 
 /// Linux epoll event source driving the [`Reactor`] (item 1.6).
 #[cfg(all(feature = "platform-linux", target_os = "linux"))]
@@ -59,15 +75,15 @@ impl TaskQueue {
     }
 
     fn push(&self, task: Arc<Task>) {
-        self.queue.lock().unwrap().push_back(task);
+        self.queue.lock().push_back(task);
     }
 
     fn pop(&self) -> Option<Arc<Task>> {
-        self.queue.lock().unwrap().pop_front()
+        self.queue.lock().pop_front()
     }
 
     fn is_empty(&self) -> bool {
-        self.queue.lock().unwrap().is_empty()
+        self.queue.lock().is_empty()
     }
 }
 
@@ -105,14 +121,11 @@ impl Executor {
     ///
     /// This blocks the current thread.
     ///
-    /// # Panics
-    ///
-    /// Panics if a task's [`Mutex`] is poisoned.
     pub fn run(&self) {
         while let Some(task) = self.queue.pop() {
             let waker = Waker::from(task.clone());
             let mut cx = Context::from_waker(&waker);
-            let mut future = task.future.lock().unwrap();
+            let mut future = task.future.lock();
             if future.as_mut().poll(&mut cx).is_pending() {
                 // Task will re-enqueue itself via the waker when ready.
             }
@@ -122,15 +135,12 @@ impl Executor {
 
     /// Run the executor, polling once. Returns true if there are still pending tasks.
     ///
-    /// # Panics
-    ///
-    /// Panics if a task's [`Mutex`] is poisoned.
     #[must_use]
     pub fn poll_once(&self) -> bool {
         if let Some(task) = self.queue.pop() {
             let waker = Waker::from(task.clone());
             let mut cx = Context::from_waker(&waker);
-            let mut future = task.future.lock().unwrap();
+            let mut future = task.future.lock();
             let _ = future.as_mut().poll(&mut cx);
         }
         !self.queue.is_empty()
@@ -167,8 +177,6 @@ impl Executor {
     /// Propagates [`EpollPoller::poll`](epoll::EpollPoller::poll) errors (an
     /// `epoll_wait` failure other than `EINTR`).
     ///
-    /// # Panics
-    /// Panics if a task's [`Mutex`] is poisoned.
     #[cfg(all(feature = "platform-linux", target_os = "linux"))]
     pub fn run_with_poller(
         &self,
@@ -259,9 +267,6 @@ impl PriorityExecutor {
     /// Tasks are polled in strict priority order: all High tasks are drained
     /// before any Normal task is polled, and all Normal tasks before any Low.
     ///
-    /// # Panics
-    ///
-    /// Panics if a task's [`Mutex`] is poisoned.
     pub fn run(&self) {
         loop {
             // Always restart from the highest priority queue.
@@ -286,9 +291,6 @@ impl PriorityExecutor {
     ///
     /// Returns `true` if there are still pending tasks in any queue.
     ///
-    /// # Panics
-    ///
-    /// Panics if a task's [`Mutex`] is poisoned.
     #[must_use]
     pub fn poll_once(&self) -> bool {
         if let Some(task) = self.high.pop() {
@@ -320,7 +322,7 @@ impl PriorityExecutor {
     fn poll_task(task: &Arc<Task>) {
         let waker = Waker::from(task.clone());
         let mut cx = Context::from_waker(&waker);
-        let mut future = task.future.lock().unwrap();
+        let mut future = task.future.lock();
         let _ = future.as_mut().poll(&mut cx);
     }
 }
@@ -356,18 +358,19 @@ struct Registration {
 /// readiness→waker bookkeeping. The OS-specific event source that drives
 /// [`mark_ready`](Self::mark_ready) layers on top — on Linux the
 /// [`epoll::EpollPoller`] source, a device interrupt on bare metal (item 1.6).
-/// All state sits behind a `Mutex` so a task can register and arm its waker from
-/// one
-/// thread while an interrupt/epoll thread signals readiness from another; wakers
-/// are always fired *after* the lock is released, so a waker that re-enters the
-/// reactor cannot deadlock.
+/// All state sits behind a [`spin::Mutex`] so a task can register and arm its
+/// waker from one thread while an interrupt/epoll thread signals readiness
+/// from another; wakers are always fired *after* the lock is released, so a
+/// waker that re-enters the reactor cannot deadlock. The spin lock never
+/// poisons and never blocks on the OS, so the reactor is safe to drive from
+/// bare-metal interrupt handlers.
 pub struct Reactor {
     inner: Mutex<ReactorInner>,
 }
 
 struct ReactorInner {
     /// token → registration.
-    sources: HashMap<usize, Registration>,
+    sources: BTreeMap<usize, Registration>,
     /// Monotonic token allocator (never reused, so a stale token cannot alias a
     /// later registration).
     next_token: usize,
@@ -378,21 +381,22 @@ struct ReactorInner {
 impl Reactor {
     /// Create an empty reactor.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             inner: Mutex::new(ReactorInner {
-                sources: HashMap::new(),
+                sources: BTreeMap::new(),
                 next_token: 0,
                 ready_queue: VecDeque::new(),
             }),
         }
     }
 
-    /// Lock the shared state. Panics only on lock poisoning (a thread panicked
-    /// while holding it); kept private so the public API's panic surface is this
-    /// one well-understood case rather than a `# Panics` note on every method.
+    /// Lock the shared state. The [`spin::Mutex`] never poisons and never
+    /// blocks on the OS, so this cannot fail; kept private so the lock
+    /// discipline (wakers always fired *after* the guard is dropped) lives in
+    /// one place.
     fn locked(&self) -> MutexGuard<'_, ReactorInner> {
-        self.inner.lock().unwrap()
+        self.inner.lock()
     }
 
     /// Register interest in an I/O `source`, returning a token used for
@@ -530,7 +534,7 @@ impl Default for Reactor {
 
 /// Block the current thread on a single future until it completes.
 pub fn block_on<F: Future>(future: F) -> F::Output {
-    let mut future = std::pin::pin!(future);
+    let mut future = core::pin::pin!(future);
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
 
@@ -540,7 +544,7 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
             Poll::Pending => {
                 // In a real implementation, we'd park the thread and wait
                 // for a wakeup from the reactor. For now, spin.
-                std::hint::spin_loop();
+                core::hint::spin_loop();
             }
         }
     }
@@ -692,7 +696,7 @@ mod tests {
         let o = order.clone();
         exec.spawn(
             async move {
-                o.lock().unwrap().push("low");
+                o.lock().push("low");
             },
             TaskPriority::Low,
         );
@@ -700,7 +704,7 @@ mod tests {
         let o = order.clone();
         exec.spawn(
             async move {
-                o.lock().unwrap().push("normal");
+                o.lock().push("normal");
             },
             TaskPriority::Normal,
         );
@@ -708,14 +712,14 @@ mod tests {
         let o = order.clone();
         exec.spawn(
             async move {
-                o.lock().unwrap().push("high");
+                o.lock().push("high");
             },
             TaskPriority::High,
         );
 
         exec.run();
 
-        let result = order.lock().unwrap();
+        let result = order.lock();
         assert_eq!(*result, vec!["high", "normal", "low"]);
         drop(result);
     }
@@ -729,7 +733,7 @@ mod tests {
         let o = order.clone();
         exec.spawn(
             async move {
-                o.lock().unwrap().push("normal-1");
+                o.lock().push("normal-1");
             },
             TaskPriority::Normal,
         );
@@ -737,7 +741,7 @@ mod tests {
         let o = order.clone();
         exec.spawn(
             async move {
-                o.lock().unwrap().push("low-1");
+                o.lock().push("low-1");
             },
             TaskPriority::Low,
         );
@@ -745,7 +749,7 @@ mod tests {
         let o = order.clone();
         exec.spawn(
             async move {
-                o.lock().unwrap().push("high-1");
+                o.lock().push("high-1");
             },
             TaskPriority::High,
         );
@@ -753,7 +757,7 @@ mod tests {
         let o = order.clone();
         exec.spawn(
             async move {
-                o.lock().unwrap().push("high-2");
+                o.lock().push("high-2");
             },
             TaskPriority::High,
         );
@@ -761,7 +765,7 @@ mod tests {
         let o = order.clone();
         exec.spawn(
             async move {
-                o.lock().unwrap().push("low-2");
+                o.lock().push("low-2");
             },
             TaskPriority::Low,
         );
@@ -769,14 +773,14 @@ mod tests {
         let o = order.clone();
         exec.spawn(
             async move {
-                o.lock().unwrap().push("normal-2");
+                o.lock().push("normal-2");
             },
             TaskPriority::Normal,
         );
 
         exec.run();
 
-        let result = order.lock().unwrap();
+        let result = order.lock();
         assert_eq!(
             *result,
             vec!["high-1", "high-2", "normal-1", "normal-2", "low-1", "low-2"]
