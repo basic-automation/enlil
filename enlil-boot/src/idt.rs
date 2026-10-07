@@ -113,7 +113,8 @@ pub struct IdtPointer {
 #[cfg(target_os = "uefi")]
 pub use hw::{
     InterruptStackFrame, breakpoint_hits, init_and_selftest, install_interrupt_gate,
-    install_timer_gate, repoint_df_to_ist, repoint_gp_to_ist, repoint_pf_to_ist, timer_ticks,
+    install_timer_gate, repoint_df_to_ist, repoint_gp_to_ist, repoint_pf_to_ist,
+    timer_preempt_flag, timer_ticks,
 };
 
 #[cfg(target_os = "uefi")]
@@ -122,6 +123,7 @@ mod hw {
     use crate::serial::SerialPort;
     use core::cell::UnsafeCell;
     use core::sync::atomic::{AtomicU32, Ordering};
+    use enlil_platform::threading::preempt::PreemptFlag;
 
     /// The stack frame the CPU pushes for an `x86-interrupt` handler.
     #[repr(C)]
@@ -163,13 +165,31 @@ mod hw {
         BREAKPOINT_HITS.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// LAPIC timer interrupt handler: count the tick and acknowledge the APIC.
+    /// Preemption flag raised by the LAPIC timer handler on every tick.
+    ///
+    /// The scheduler's dispatch loop drains it ([`timer_preempt_flag`]) and,
+    /// when set, switches to the next runnable task instead of resuming the
+    /// preempted one — that check is what turns the timer tick into a forced
+    /// context switch (`enlil_platform::threading::preempt::PreemptFlag`).
+    static TIMER_PREEMPT: PreemptFlag = PreemptFlag::new();
+
+    /// The preemption flag the LAPIC timer handler raises on every tick.
+    ///
+    /// The scheduler drains it after each quantum; a set flag means the
+    /// running task's quantum expired.
+    pub fn timer_preempt_flag() -> &'static PreemptFlag {
+        &TIMER_PREEMPT
+    }
+
+    /// LAPIC timer interrupt handler: count the tick, request preemption, and
+    /// acknowledge the APIC.
     ///
     /// An interrupt gate (IF cleared on entry), so it is not re-entered; it
     /// signals EOI so the LAPIC can deliver further interrupts, then `IRET`s
     /// back to the interrupted code (the kernel's wait loop).
     extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
         TIMER_TICKS.fetch_add(1, Ordering::AcqRel);
+        TIMER_PREEMPT.request();
         crate::apic::signal_eoi();
     }
 
