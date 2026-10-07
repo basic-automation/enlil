@@ -7,6 +7,7 @@ pub mod error;
 pub mod kvm_backend;
 pub mod memory;
 pub mod orchestrator;
+pub mod preempt_watchdog;
 pub mod run_loop;
 pub mod serial;
 pub mod stealth_msr;
