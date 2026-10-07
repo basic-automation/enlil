@@ -362,6 +362,7 @@ ZK-proof attestation and cross-guest isolation proofs — see [`ROADMAP.md`](ROA
 |----------|--------------|
 | **README.md** (this file) | Project overview — what Enlil is, its architecture, the crate layout, how to build, and where things stand today. |
 | [**ROADMAP.md**](ROADMAP.md) | The development roadmap — a `[ ]`/`[x]` task checklist of every phase, from scaffold through to the multi-machine mesh. |
+| **Developer book** (`docs/`) | Browsable developer docs built with mdbook (pinned 0.4.52): layer stack, crate structure, KVM-to-bare-metal migration plan, dev environment, testing, and the docs/CI build. Build with `mdbook build docs`. |
 
 ---
 

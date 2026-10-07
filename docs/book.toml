@@ -1,0 +1,21 @@
+# Enlil developer documentation — mdBook configuration.
+#
+# The mdbook version is pinned deliberately (see .github/workflows/ci.yml and
+# docs/src/dev-environment.md): mdBook 0.5 removed/renamed several book.toml
+# options, so every option set here is 0.4-compatible and bumping the renderer
+# is a reviewed change, not a surprise.
+[book]
+title = "Enlil Developer Documentation"
+authors = ["Justin Icenhour"]
+description = "Developer docs for the Enlil Type-1 hypervisor: architecture, crate map, dev environment, testing, and the KVM-to-bare-metal migration plan."
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/basic-automation/enlil"
+edit-url-template = "https://github.com/basic-automation/enlil/edit/master/docs/{path}"
