@@ -8,7 +8,7 @@
   "os": "none",
   "env": "",
   "vendor": "unknown",
-  "linker-flavor": "gcc",
+  "linker-flavor": "gnu-lld",
   "linker": "rust-lld",
   "executables": true,
   "features": "-mmx,-sse,-sse2,+soft-float",

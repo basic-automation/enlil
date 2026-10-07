@@ -15,10 +15,21 @@ publish = false
 [features]
 default = ["platform-linux"]
 platform-linux = ["enlil-platform/platform-linux"]
-platform-baremetal = ["enlil-platform/platform-baremetal"]
+# The bare-metal backend is `no_std` + `alloc`: `HashMap`/`HashSet` come from
+# hashbrown (no_std-compatible) instead of `std::collections`.
+platform-baremetal = ["enlil-platform/platform-baremetal", "dep:hashbrown"]
+
+[[bin]]
+name = "milestone_1_11"
+path = "src/bin/milestone_1_11.rs"
 
 [dependencies]
 enlil-platform = { path = "../enlil-platform", version = "0.1.0", default-features = false }
+# Lazy global bare-metal task scheduler for `thread::spawn` (no_std has no
+# `std::sync::OnceLock`).
+spin = "0.9"
+# no_std HashMap/HashSet for the bare-metal backend.
+hashbrown = { version = "0.15", default-features = false, features = [
+    "default-hasher",
+], optional = true }
 
-[dev-dependencies]
-env_logger = "0.11"
