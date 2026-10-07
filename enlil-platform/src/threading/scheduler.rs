@@ -37,6 +37,23 @@ impl Priority {
     }
 }
 
+/// Convert the threading module's canonical [`super::Priority`] into the
+/// scheduler priority used by the [`PriorityInheritance`] tracker.
+///
+/// The levels match one-to-one; this is the seam between thread-registered
+/// priorities (`threading::current_task_priority`) and the lock-contention
+/// bookkeeping consumed by the platform [`Mutex`](crate::sync::Mutex).
+impl From<super::Priority> for Priority {
+    fn from(p: super::Priority) -> Self {
+        match p {
+            super::Priority::Critical => Self::Critical,
+            super::Priority::High => Self::High,
+            super::Priority::Normal => Self::Normal,
+            super::Priority::Low => Self::Low,
+        }
+    }
+}
+
 /// A schedulable task.
 pub struct SchedulerTask {
     /// Unique task ID.
@@ -290,9 +307,13 @@ impl Scheduler {
 /// at the same priority both count, so releasing one keeps the boost while the
 /// other still waits.
 ///
-/// This is the backend-neutral bookkeeping; wiring it into the platform
-/// [`Mutex`](crate::sync::Mutex) (arm a waiter on block, drop it on acquire, and
-/// re-target the scheduler at the effective priority) is the next slice.
+/// This is the backend-neutral bookkeeping. It is wired into the platform
+/// [`Mutex`](crate::sync::Mutex): [`Mutex::lock`](crate::sync::Mutex::lock)
+/// arms a waiter at the blocking thread's registered priority while the lock
+/// is contended, drops the registration once the lock is acquired, and
+/// [`Mutex::effective_priority`](crate::sync::Mutex::effective_priority)
+/// exposes the donated priority so the scheduler's dispatch loop can run the
+/// holder at the boosted level.
 #[derive(Debug, Clone)]
 pub struct PriorityInheritance {
     base: Priority,
@@ -543,5 +564,27 @@ mod tests {
         assert_eq!(pi.base(), Priority::Critical);
         assert_eq!(pi.effective(), Priority::Critical);
         assert!(!pi.is_boosted());
+    }
+
+    #[test]
+    fn priority_converts_from_threading_priority() {
+        // The threading module's canonical priority maps one-to-one onto the
+        // scheduler priority used by the inheritance tracker.
+        assert_eq!(
+            Priority::from(crate::threading::Priority::Critical),
+            Priority::Critical
+        );
+        assert_eq!(
+            Priority::from(crate::threading::Priority::High),
+            Priority::High
+        );
+        assert_eq!(
+            Priority::from(crate::threading::Priority::Normal),
+            Priority::Normal
+        );
+        assert_eq!(
+            Priority::from(crate::threading::Priority::Low),
+            Priority::Low
+        );
     }
 }

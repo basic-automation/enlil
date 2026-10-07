@@ -332,6 +332,57 @@ pub fn tick() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Current-task priority registry (priority-inheritance source)
+//
+// The platform Mutex (crate::sync) reads the calling thread's registered
+// priority when it blocks on a contended lock: the waiter's priority is
+// donated to the lock holder (see scheduler::PriorityInheritance). Scheduler
+// thread pools register each task's priority on entry (spawn_hosted does
+// this); threads that never register — or clear the registration with
+// None — lock without donating. On bare-metal there is no per-thread
+// storage yet (per-CPU state lives at the GS-segment base), so the
+// registry is a no-op stub there for now.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "platform-linux")]
+thread_local! {
+    static CURRENT_TASK_PRIORITY: core::cell::Cell<Option<Priority>> = const { core::cell::Cell::new(None) };
+}
+
+/// Register (or clear, with `None`) the calling thread's current task priority.
+///
+/// This is the priority [`crate::sync::Mutex`] donates to a lock holder while
+/// this thread is blocked acquiring that mutex.
+#[cfg(feature = "platform-linux")]
+pub fn set_current_task_priority(priority: Option<Priority>) {
+    CURRENT_TASK_PRIORITY.with(|c| c.set(priority));
+}
+
+/// The calling thread's registered task priority, if any.
+#[cfg(feature = "platform-linux")]
+#[must_use]
+pub fn current_task_priority() -> Option<Priority> {
+    CURRENT_TASK_PRIORITY.with(core::cell::Cell::get)
+}
+
+/// Register the calling thread's current task priority.
+///
+/// Bare-metal has no per-thread storage yet — per-CPU state lives at the
+/// GS-segment base, and the TLS registry lands with the bare-metal scheduler
+/// loop — so priority donation is a no-op there for now.
+#[cfg(feature = "platform-baremetal")]
+pub const fn set_current_task_priority(_priority: Option<Priority>) {}
+
+/// The calling thread's registered task priority.
+///
+/// Always `None` on bare-metal (see [`set_current_task_priority`]).
+#[cfg(feature = "platform-baremetal")]
+#[must_use]
+pub const fn current_task_priority() -> Option<Priority> {
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Platform-gated backend: hosted (std::thread)
 // ---------------------------------------------------------------------------
 
@@ -347,9 +398,13 @@ pub fn tick() -> u64 {
 #[must_use]
 pub fn spawn_hosted(task: Task) -> std::thread::JoinHandle<()> {
     let name = task.name.clone();
+    let priority = task.priority;
     std::thread::Builder::new()
         .name(name.clone())
         .spawn(move || {
+            // Register this thread's scheduling priority so platform mutexes
+            // can donate it to a lock holder while this task is blocked.
+            set_current_task_priority(Some(priority));
             let mut t = task;
             log::debug!("hosted: running task '{}'", t.name);
             t.run();
@@ -655,6 +710,28 @@ mod tests {
         let t1 = tick();
         let t2 = tick();
         assert_eq!(t2, t1 + 1);
+    }
+
+    #[test]
+    fn current_task_priority_registry_roundtrip() {
+        assert_eq!(current_task_priority(), None);
+        set_current_task_priority(Some(Priority::High));
+        assert_eq!(current_task_priority(), Some(Priority::High));
+        set_current_task_priority(None);
+        assert_eq!(current_task_priority(), None);
+    }
+
+    #[test]
+    fn spawn_hosted_registers_task_priority() {
+        let handle = spawn_hosted(Task::new(
+            "prio-test",
+            Priority::Critical,
+            CpuAffinity::Any,
+            || {
+                assert_eq!(current_task_priority(), Some(Priority::Critical));
+            },
+        ));
+        handle.join().unwrap();
     }
 
     #[test]
