@@ -24,14 +24,14 @@
 //! so it cross-compiles for the custom `x86_64-unknown-enlil` target (Phase
 //! 1.2). The modules whose backend is already host-agnostic — [`memory`]
 //! (buddy/slab/heap + the `map`/`paging` builders), [`sync`] (spin-backed
-//! Mutex/RwLock/Condvar + the bounded MPSC channel), [`time`], and [`io`]
+//! Mutex/RwLock/Condvar + the bounded MPSC channel), [`time`], [`io`]
 //! (whose [`PlatformIo`](io::PlatformIo) trait reports the `no_std`
-//! [`IoError`](io::IoError) instead of `std::io::Error`) — build for bare
-//! metal today; the remaining OS-backed module ([`async_rt`]) stays gated to
-//! `platform-linux` until its bare-metal backend lands (its bare-metal seam
-//! lives in `enlil-boot` for now).
+//! [`IoError`](io::IoError) instead of `std::io::Error`), and [`async_rt`]
+//! (executor + reactor on `alloc`'s `BTreeMap`, `spin` locks, and
+//! `alloc::task`'s `Wake` — only its Linux epoll event source and
+//! [`Executor::run_with_poller`](async_rt::Executor::run_with_poller) stay
+//! gated to `platform-linux`) — build for bare metal today.
 
-#[cfg(feature = "platform-baremetal")]
 extern crate alloc;
 
 pub mod memory;
@@ -39,7 +39,6 @@ pub mod sync;
 pub mod threading;
 pub mod time;
 
-#[cfg(feature = "platform-linux")]
 pub mod async_rt;
 pub mod io;
 

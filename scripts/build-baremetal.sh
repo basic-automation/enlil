@@ -25,8 +25,9 @@ TARGET="$REPO_ROOT/x86_64-unknown-enlil.json"
 #
 # BAREMETAL_EXTRA_FLAGS carries per-crate extra cargo flags, index-aligned
 # with BAREMETAL_CRATES: enlil-platform needs its bare-metal backend feature
-# selected (and default features off — platform-linux gates the std-only io
-# and async_rt modules).
+# selected (and default features off — platform-linux gates the remaining
+# std-only bits such as async_rt::epoll; io and async_rt themselves are
+# no_std-clean since T-1.2/T-1.3).
 BAREMETAL_CRATES=(enlil-hal enlil-platform)
 BAREMETAL_EXTRA_FLAGS=(
     ""                                                # enlil-hal: no_std + alloc, no features at all
