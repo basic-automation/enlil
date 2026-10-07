@@ -7,16 +7,37 @@
 
 use core::ops::{Deref, DerefMut};
 
+use crate::threading::scheduler::{self, PriorityInheritance};
+
 // ===========================================================================
 // Mutex
 // ===========================================================================
 
+/// Raw lock guarding a [`Mutex`]'s priority-inheritance state.
+///
+/// Deliberately a raw `std`/`spin` mutex rather than the platform [`Mutex`]
+/// itself, so updating the bookkeeping never recurses into the donation
+/// logic. It is a leaf lock: never held while acquiring any other lock.
+#[cfg(feature = "platform-linux")]
+type PiLock = std::sync::Mutex<PriorityInheritance>;
+#[cfg(feature = "platform-baremetal")]
+type PiLock = spin::Mutex<PriorityInheritance>;
+
 /// A platform-abstracted mutual exclusion lock.
+///
+/// The mutex carries priority-inheritance bookkeeping
+/// ([`scheduler::PriorityInheritance`]): while a thread with a registered
+/// scheduling priority (see [`crate::threading::current_task_priority`]) is
+/// blocked in [`Mutex::lock`], its priority is donated to the lock holder, and
+/// [`Mutex::effective_priority`] reports the priority the scheduler should run
+/// the holder at until the lock is released.
 pub struct Mutex<T> {
     #[cfg(feature = "platform-linux")]
     inner: std::sync::Mutex<T>,
     #[cfg(feature = "platform-baremetal")]
     inner: spin::Mutex<T>,
+    /// Holder base priority + blocked-waiter multiset for priority donation.
+    pi: PiLock,
 }
 
 // Safety: inner types are already Send + Sync where T: Send.
@@ -31,51 +52,177 @@ impl<T> Mutex<T> {
             inner: std::sync::Mutex::new(value),
             #[cfg(feature = "platform-baremetal")]
             inner: spin::Mutex::new(value),
+            pi: PiLock::new(PriorityInheritance::new(scheduler::Priority::Normal)),
         }
     }
+
+    /// Locks the priority-inheritance state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying PI mutex is poisoned (Linux).
+    #[cfg(feature = "platform-linux")]
+    fn pi_state(&self) -> std::sync::MutexGuard<'_, PriorityInheritance> {
+        self.pi.lock().unwrap()
+    }
+
+    /// Locks the priority-inheritance state.
+    #[cfg(feature = "platform-baremetal")]
+    fn pi_state(&self) -> spin::MutexGuard<'_, PriorityInheritance> {
+        self.pi.lock()
+    }
+
+    /// The calling thread's priority in scheduler terms, if registered.
+    fn waiter_priority() -> Option<scheduler::Priority> {
+        crate::threading::current_task_priority().map(scheduler::Priority::from)
+    }
+
+    /// Records a successful acquire in the inheritance bookkeeping: drops our
+    /// waiter registration if we armed one while blocked, then refreshes the
+    /// holder's base priority to the acquirer's own.
+    fn note_acquired(&self, waiter: Option<scheduler::Priority>) {
+        if let Some(p) = waiter {
+            self.pi_state().remove_waiter(p);
+        }
+        refresh_holder_base(&self.pi);
+    }
+}
+
+/// Refreshes a mutex's inheritance holder base to the calling thread's
+/// registered priority (or `Normal` when unregistered).
+///
+/// Used on acquire paths that bypass [`Mutex::lock`] — e.g. the re-acquire
+/// inside [`Condvar::wait`] — so the tracker's base always reflects the
+/// actual holder.
+fn refresh_holder_base(pi: &PiLock) {
+    let base = crate::threading::current_task_priority()
+        .map_or(scheduler::Priority::Normal, scheduler::Priority::from);
+    #[cfg(feature = "platform-linux")]
+    pi.lock().unwrap().set_base(base);
+    #[cfg(feature = "platform-baremetal")]
+    pi.lock().set_base(base);
 }
 
 impl<T> Mutex<T> {
     /// Acquires the mutex, blocking until available.
     ///
+    /// If the lock is contended and the calling thread has a registered
+    /// scheduling priority, the thread is registered as a priority-inheritance
+    /// waiter while it blocks — donating its priority to the holder — and the
+    /// registration is dropped once the lock is acquired.
+    ///
     /// # Panics
     ///
     /// Panics if the underlying mutex is poisoned (Linux).
     pub fn lock(&self) -> MutexGuard<'_, T> {
+        let waiter = Self::waiter_priority();
+
+        // Fast path: uncontended acquire. No waiter to arm; just record the
+        // new holder in the inheritance bookkeeping.
         #[cfg(feature = "platform-linux")]
-        {
-            MutexGuard {
-                inner: MutexGuardInner::Linux(self.inner.lock().unwrap()),
+        match self.inner.try_lock() {
+            Ok(inner) => {
+                self.note_acquired(waiter);
+                return MutexGuard {
+                    inner: MutexGuardInner::Linux(inner),
+                    pi: &self.pi,
+                };
             }
+            Err(std::sync::TryLockError::Poisoned(e)) => panic!("mutex poisoned: {e}"),
+            Err(std::sync::TryLockError::WouldBlock) => {}
         }
         #[cfg(feature = "platform-baremetal")]
-        {
-            MutexGuard {
-                inner: MutexGuardInner::Baremetal(self.inner.lock()),
-            }
+        if let Some(inner) = self.inner.try_lock() {
+            self.note_acquired(waiter);
+            return MutexGuard {
+                inner: MutexGuardInner::Baremetal(inner),
+                pi: &self.pi,
+            };
+        }
+
+        // Slow path: the lock is contended. Arm a waiter so the holder runs
+        // at our priority while we block (if our priority is known), then
+        // block on the raw inner lock directly.
+        if let Some(p) = waiter {
+            self.pi_state().add_waiter(p);
+        }
+
+        #[cfg(feature = "platform-linux")]
+        let inner = self.inner.lock().unwrap();
+        #[cfg(feature = "platform-baremetal")]
+        let inner = self.inner.lock();
+
+        // Acquired: drop our waiter registration and record ourselves as the
+        // new holder.
+        self.note_acquired(waiter);
+
+        MutexGuard {
+            #[cfg(feature = "platform-linux")]
+            inner: MutexGuardInner::Linux(inner),
+            #[cfg(feature = "platform-baremetal")]
+            inner: MutexGuardInner::Baremetal(inner),
+            pi: &self.pi,
         }
     }
 
     /// Attempts to acquire the mutex without blocking.
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
+        let waiter = Self::waiter_priority();
         #[cfg(feature = "platform-linux")]
         {
-            self.inner.try_lock().ok().map(|g| MutexGuard {
-                inner: MutexGuardInner::Linux(g),
+            let inner = self.inner.try_lock().ok()?;
+            self.note_acquired(waiter);
+            Some(MutexGuard {
+                inner: MutexGuardInner::Linux(inner),
+                pi: &self.pi,
             })
         }
         #[cfg(feature = "platform-baremetal")]
         {
-            self.inner.try_lock().map(|g| MutexGuard {
-                inner: MutexGuardInner::Baremetal(g),
+            let inner = self.inner.try_lock()?;
+            self.note_acquired(waiter);
+            Some(MutexGuard {
+                inner: MutexGuardInner::Baremetal(inner),
+                pi: &self.pi,
             })
         }
+    }
+
+    /// The priority the current lock holder should run at: its own base
+    /// priority, boosted to the highest-priority blocked waiter while one
+    /// exists.
+    ///
+    /// This is the scheduler's re-targeting input for priority inheritance.
+    /// While a higher-priority thread is blocked in [`Mutex::lock`], the
+    /// dispatch loop should run the holder at this priority so it releases
+    /// the lock promptly instead of being preempted by medium-priority work.
+    /// The donation is armed and dropped automatically by `lock()`; waiters
+    /// whose threads never registered a priority donate nothing.
+    #[must_use]
+    pub fn effective_priority(&self) -> scheduler::Priority {
+        self.pi_state().effective()
+    }
+
+    /// Number of threads currently blocked in [`Mutex::lock`] with a
+    /// registered priority — i.e. the active priority donors.
+    #[must_use]
+    pub fn waiter_count(&self) -> usize {
+        self.pi_state().waiter_count()
     }
 }
 
 /// RAII guard for `Mutex`.
 pub struct MutexGuard<'a, T> {
     inner: MutexGuardInner<'a, T>,
+    /// Inheritance state of the mutex this guard was acquired from. Lets
+    /// [`Condvar::wait`] refresh the holder's base priority when it
+    /// re-acquires the mutex after blocking.
+    ///
+    /// Only *read* on Linux: the bare-metal `Condvar::wait` never releases
+    /// the mutex, so there is no re-acquire to refresh (hence the
+    /// `dead_code` allow on bare-metal builds).
+    #[cfg_attr(feature = "platform-baremetal", allow(dead_code))]
+    pi: &'a PiLock,
 }
 
 enum MutexGuardInner<'a, T> {
@@ -308,11 +455,17 @@ impl Condvar {
     /// Callers should use `wait` inside a loop that checks a predicate.
     #[cfg(feature = "platform-linux")]
     pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+        let pi = guard.pi;
         match guard.inner {
             MutexGuardInner::Linux(std_guard) => {
                 let std_guard = self.inner.wait(std_guard).unwrap();
+                // Re-acquired after blocking: refresh the holder's base
+                // priority, since another thread may have held the mutex
+                // while we waited.
+                refresh_holder_base(pi);
                 MutexGuard {
                     inner: MutexGuardInner::Linux(std_guard),
+                    pi,
                 }
             }
         }
@@ -764,7 +917,13 @@ pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::threading::scheduler;
     use std::sync::Arc;
+
+    /// Register (or clear) the current test thread's task priority.
+    fn set_thread_priority(p: Option<crate::threading::Priority>) {
+        crate::threading::set_current_task_priority(p);
+    }
 
     #[test]
     fn mutex_basic() {
@@ -804,6 +963,131 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(*m.lock(), 10_000);
+    }
+
+    #[test]
+    fn mutex_pi_uncontended_acquire_records_holder_base() {
+        set_thread_priority(Some(crate::threading::Priority::High));
+        let m = Mutex::new(0);
+        {
+            let _guard = m.lock();
+            assert_eq!(m.effective_priority(), scheduler::Priority::High);
+            assert_eq!(m.waiter_count(), 0);
+        }
+        set_thread_priority(None);
+    }
+
+    #[test]
+    fn mutex_pi_try_lock_records_holder_base() {
+        set_thread_priority(Some(crate::threading::Priority::Critical));
+        let m = Mutex::new(0);
+        let _guard = m.try_lock().expect("uncontended try_lock succeeds");
+        assert_eq!(m.effective_priority(), scheduler::Priority::Critical);
+        assert_eq!(m.waiter_count(), 0);
+        set_thread_priority(None);
+    }
+
+    #[test]
+    fn mutex_pi_unregistered_thread_donates_nothing() {
+        set_thread_priority(None);
+        let m = Mutex::new(0);
+        let _guard = m.lock();
+        // No registered priority: holder base falls back to Normal, no waiter.
+        assert_eq!(m.effective_priority(), scheduler::Priority::Normal);
+        assert_eq!(m.waiter_count(), 0);
+    }
+
+    #[test]
+    fn mutex_pi_blocked_waiter_boosts_holder_until_acquire() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        // Main thread holds the mutex at Low priority.
+        set_thread_priority(Some(crate::threading::Priority::Low));
+        let m = Arc::new(Mutex::new(0u32));
+        let holder = m.lock();
+        assert_eq!(m.effective_priority(), scheduler::Priority::Low);
+
+        // A Critical thread blocks on the mutex; while blocked it donates its
+        // priority to the holder.
+        let m2 = Arc::clone(&m);
+        let acquired = Arc::new(AtomicBool::new(false));
+        let acquired_flag = Arc::clone(&acquired);
+        let waiter = std::thread::spawn(move || {
+            set_thread_priority(Some(crate::threading::Priority::Critical));
+            let _guard = m2.lock();
+            // Acquired: waiter registration dropped, holder base = Critical.
+            assert_eq!(m2.effective_priority(), scheduler::Priority::Critical);
+            assert_eq!(m2.waiter_count(), 0);
+            acquired_flag.store(true, Ordering::SeqCst);
+        });
+
+        // Wait until the waiter arms its donation (bounded poll).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while m.effective_priority() != scheduler::Priority::Critical {
+            assert!(
+                Instant::now() < deadline,
+                "blocked waiter never armed its priority donation"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(m.waiter_count(), 1);
+
+        // Release: the waiter acquires, drops its registration, becomes holder.
+        drop(holder);
+        waiter.join().unwrap();
+        assert!(acquired.load(Ordering::SeqCst));
+        assert_eq!(m.waiter_count(), 0);
+
+        set_thread_priority(None);
+    }
+
+    // The guard is intentionally held across the spawn below: B's try_lock
+    // spin can only succeed once A releases the mutex inside wait(), which
+    // is what forces the wait()/re-acquire path (and the PI base refresh)
+    // to be exercised deterministically.
+    #[allow(clippy::significant_drop_tightening)]
+    #[test]
+    fn condvar_wait_refreshes_pi_holder_base() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let pair = Arc::new((Mutex::new(0u32), Condvar::new()));
+        let pair_b = Arc::clone(&pair);
+        let b_done = Arc::new(AtomicBool::new(false));
+        let b_done_b = Arc::clone(&b_done);
+
+        // Main thread: Critical holder that is about to wait on the condvar.
+        set_thread_priority(Some(crate::threading::Priority::Critical));
+        let (lock, cvar) = &*pair;
+        let guard = lock.lock();
+        assert_eq!(lock.effective_priority(), scheduler::Priority::Critical);
+
+        // Thread B: spins until A blocks in wait() (mutex becomes free), holds
+        // the mutex briefly at Low — moving the PI base to Low — then wakes A.
+        let handle = std::thread::spawn(move || {
+            set_thread_priority(Some(crate::threading::Priority::Low));
+            let (lock_b, cvar_b) = &*pair_b;
+            let b_guard = loop {
+                if let Some(g) = lock_b.try_lock() {
+                    break g;
+                }
+                std::thread::yield_now();
+            };
+            assert_eq!(lock_b.effective_priority(), scheduler::Priority::Low);
+            b_done_b.store(true, Ordering::SeqCst);
+            drop(b_guard);
+            cvar_b.notify_one();
+        });
+
+        let guard = cvar.wait_while(guard, |_| !b_done.load(Ordering::SeqCst));
+        // wait() re-acquired the mutex: the holder base must reflect A again,
+        // not the stale Low left behind by B.
+        assert_eq!(lock.effective_priority(), scheduler::Priority::Critical);
+        assert_eq!(lock.waiter_count(), 0);
+        drop(guard);
+        handle.join().unwrap();
+
+        set_thread_priority(None);
     }
 
     #[test]
