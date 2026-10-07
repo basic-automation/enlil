@@ -49,6 +49,11 @@ pub mod time;
 
 pub mod async_rt;
 pub mod io;
+// Freestanding `memcpy`/`memmove`/`memset`/`memcmp` for the bare-metal target.
+// Gated on the target OS (not just the feature) so a host build of the
+// bare-metal backend never exports `memcpy` next to libc's.
+#[cfg(all(feature = "platform-baremetal", target_os = "none"))]
+pub mod mem;
 
 /// Platform initialization — must be called before any other platform services.
 ///

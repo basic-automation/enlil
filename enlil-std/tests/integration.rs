@@ -61,10 +61,11 @@ fn async_await_block_on() {
 #[test]
 fn channel_communication() {
     let (tx, rx) = channel(16);
-    thread::spawn(move || {
+    let handle = thread::spawn(move || {
         tx.send(99).unwrap();
     });
     assert_eq!(rx.recv().unwrap(), 99);
+    handle.join().unwrap();
 }
 
 #[test]

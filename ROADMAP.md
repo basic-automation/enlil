@@ -66,7 +66,7 @@
 - [ ] 1.10 Port allocator/context-switch/sync/event/time components from Redox OS (relibc, ralloc, kernel context)
 - [x] 1.11 Milestone — prove full std API surface (thread/Mutex/Vec/HashMap/async/println/Instant) works via platform layer and compiles for baremetal
   - [x] Milestone binary exercising all std APIs on platform-linux backend (milestone_1_11.rs)
-  - [ ] Same binary compiles for platform-baremetal / real x86_64-unknown-enlil std build
+  - [x] Same binary compiles for platform-baremetal / real x86_64-unknown-enlil std build (T-1.7, 2026-10-07: `milestone_1_11` moved to `enlil-std/src/bin/`, `enlil-std` is `no_std`+`alloc` under `platform-baremetal` — collections from `alloc`+`hashbrown`, `Arc` from `alloc::sync`, threading via the platform `BareMetalScheduler` — with a freestanding `_start`/heap/panic-handler for the target; `enlil-platform` gained the freestanding `memcpy`/`memmove`/`memset`/`memcmp` the target's `-Zbuild-std` omits, and the target spec uses `gnu-lld` since LLD 23's `rust-lld` no longer self-dispatches. NOTE: the workspace-root form `cargo build --bin milestone_1_11 …` (no `-p`) does NOT work — cargo applies `--features`/`--no-default-features` inconsistently without `-p` in a virtual workspace (other members' `log/std` edges and enlil-platform's own default unify in); use `cargo build -p enlil-std --bin milestone_1_11 …` as in `scripts/build-baremetal.sh`.)
 
 ## Phase 2 — Multi-Guest CPU & Memory Partitioning
 - [x] 2.1 Guest configuration system — TOML guest defs (name, cpus, memory, kernel/initrd/cmdline, scheduling, serial) parsed in enlil-config with CPU/memory-overlap validation

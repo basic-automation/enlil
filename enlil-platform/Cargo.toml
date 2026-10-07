@@ -25,7 +25,12 @@ platform-baremetal = ["dep:linked_list_allocator"]
 # enlil-hal is no_std + alloc with no features, so this never perturbs the
 # bare-metal build.
 enlil-hal = { path = "../enlil-hal", version = "0.1.0" }
-log = "0.4"
+# `log` without default features: the `std` feature cannot build for the
+# `x86_64-unknown-enlil` target (`-Zbuild-std=core,alloc` provides no `std`
+# sysroot), and the platform layer is `no_std` under `platform-baremetal`
+# anyway. The macros and `set_logger` used here need only `core`. Host builds
+# still unify `log/std` via the other workspace crates' default-enabled edges.
+log = { version = "0.4", default-features = false }
 spin = "0.9"
 # Intrusive-free-list heap for the bare-metal GlobalAlloc. Pulled in only under
 # the platform-baremetal feature (no_std, no external OS deps).
@@ -36,5 +41,3 @@ linked_list_allocator = { version = "0.10", optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
-[dev-dependencies]
-env_logger = "0.11"
