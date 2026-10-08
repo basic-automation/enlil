@@ -8,4 +8,5 @@
 
 pub mod guest_tab;
 pub mod protocol;
+pub mod tui;
 pub mod usb_tab;

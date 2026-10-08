@@ -29,6 +29,12 @@ enum Commands {
     Status,
     /// Stop all guests
     Stop,
+    /// Launch the interactive management console (TUI)
+    Console {
+        /// Management socket address of the enlil-core daemon
+        #[arg(long, default_value = "127.0.0.1:9090")]
+        addr: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -118,6 +124,12 @@ fn main() -> anyhow::Result<()> {
         }
         Commands::Stop => {
             println!("Stop: not yet implemented (requires runtime state)");
+        }
+        Commands::Console { addr } => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(enlil_mgmt::tui::run_console(&addr))?;
         }
     }
 
