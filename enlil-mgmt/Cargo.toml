@@ -18,19 +18,18 @@ path = "src/main.rs"
 
 [dependencies]
 ratatui = "0.29"
-crossterm = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-uuid = { version = "1", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
 env_logger = "0.11"
 anyhow = "1"
-thiserror = "2"
 enlil-config = { path = "../enlil-config", version = "0.1.0" }
 enlil-core = { path = "../enlil-core", version = "0.1.0" }
+enlil-mgmt-proto = { path = "../enlil-mgmt-proto", version = "0.1.0" }
 
 [dev-dependencies]
 tempfile = "3"
+enlil-devices = { path = "../enlil-devices", version = "0.1.0" }

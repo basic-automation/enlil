@@ -14,3 +14,7 @@
 - [Dev environment](./dev-environment.md)
 - [Testing](./testing.md)
 - [Docs build & CI](./docs-ci.md)
+
+# Runbooks
+
+- [Live USB reassignment: two-mice/two-keyboards manual verification](./usb-live-reassignment-manual.md)

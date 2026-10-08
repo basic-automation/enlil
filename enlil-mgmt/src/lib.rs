@@ -8,5 +8,8 @@
 
 pub mod app;
 pub mod guest_tab;
-pub mod protocol;
+/// The management wire protocol, shared with the `enlil-core` daemon side —
+/// re-exported from the `enlil-mgmt-proto` crate so both ends of the socket
+/// speak the same types without a dependency cycle.
+pub use enlil_mgmt_proto as protocol;
 pub mod usb_tab;
