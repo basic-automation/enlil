@@ -145,7 +145,7 @@
   - [x] Identify devices by VID:PID, serial number, and physical port path
   - [x] Live device inventory queryable by port/VID:PID for the console
   - [x] Concrete Linux sysfs host-source enumeration backend wired to the monitor (usb::sysfs: parse_device/scan_devices/sync_monitor diff a /sys/bus/usb/devices scan into report_connect/report_disconnect; poll() self-throttles to the monitor's poll_interval)
-  - [ ] Bare-metal xHCI port-scan host-source backend (the sysfs backend covers the Linux dev path; the bare-metal source lands with Phase 6.5's xHCI driver)
+  - [x] Bare-metal xHCI port-scan host-source backend wired to the monitor (usb::xhci_scan: XhciPortReader abstraction + XhciMmioPortReader reading PORTSC via volatile MMIO at op-base+0x400+i*0x10; scan_xhci_ports/sync_xhci_monitor/poll_xhci mirror the sysfs API with the same connect/disconnect deltas and poll cadence; devices report with provisional zero-VID/PID descriptors until the Phase 6.5 xHCI driver re-enumerates the port and enriches them)
 - [x] 4.3 Routing policy engine mapping devices to guests with live re-routing and hot-plug attach
   - [x] Device matchers: VID:PID, vendor-only, port path, serial, class, and default (Any)
   - [x] RoutingTable/RoutingState resolving a device to its target guest by priority
