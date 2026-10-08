@@ -29,6 +29,33 @@ pub struct UsbConfig {
     /// Ordered routing rules (`[[usb.routing]]`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routing: Vec<UsbRoutingRule>,
+    /// VFIO whole-controller passthrough fallback (`[usb.vfio_fallback]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vfio_fallback: Option<UsbVfioFallback>,
+}
+
+/// VFIO whole-controller USB fallback (`[usb.vfio_fallback]`, Phase 4.4).
+///
+/// The escape hatch when per-device forwarding cannot handle a device: the
+/// host xHCI controller itself is passed through to one guest via the IOMMU.
+/// Disabled by default; when enabled, the controller address must be a valid
+/// PCI BDF and the target must name a defined guest.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsbVfioFallback {
+    /// Master switch — the fallback is only recommended/attempted when true.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Host xHCI controller PCI address (`"dddd:bb:dd.f"`).
+    #[serde(default)]
+    pub bdf: String,
+    /// Guest that receives the whole controller.
+    #[serde(default)]
+    pub target_guest: String,
+    /// Proceed even when the controller's FLR is unadvertised or on the
+    /// known-unstable list. This is the operator explicitly accepting that a
+    /// bad reset can hang the controller and take the bus down with it.
+    #[serde(default)]
+    pub allow_unstable_flr: bool,
 }
 
 impl UsbConfig {
@@ -36,7 +63,7 @@ impl UsbConfig {
     /// TOML so a config with no USB policy stays clean).
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.default_guest.is_none() && self.routing.is_empty()
+        self.default_guest.is_none() && self.routing.is_empty() && self.vfio_fallback.is_none()
     }
 }
 

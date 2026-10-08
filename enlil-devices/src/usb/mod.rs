@@ -39,6 +39,7 @@ pub mod registry;
 pub mod routing;
 pub mod sysfs;
 pub mod types;
+pub mod vfio_fallback;
 pub mod xhci;
 pub mod xhci_scan;
 
@@ -58,6 +59,12 @@ pub use monitor::{UsbHotplugEvent, UsbMonitor};
 pub use registry::{AttachOutcome, DevicePlacement, RegistryError, XhciRegistry};
 pub use routing::{RoutingRule, RoutingState, RoutingTable};
 pub use sysfs::{SYSFS_USB_DEVICES, poll, scan_devices, sync_monitor};
+pub use vfio_fallback::{
+    FallbackReason, FlrAssessment, VfioFallbackPolicy, VfioWarning, XHCI_CLASS_CODE,
+    flr_advertised, flr_quirk_note,
+};
+#[cfg(target_os = "linux")]
+pub use vfio_fallback::{VfioFallback, VfioFallbackError, VfioPassthrough};
 pub use xhci::{
     CONTROL_DCI, CapabilityRegisters, CommandRing, CommandTrb, DmaMemory, DoorbellArray,
     DoorbellTarget, EventRing, EventTrb, InterrupterRegisterSet, NormalTrb, OperationalRegisters,

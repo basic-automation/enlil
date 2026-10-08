@@ -1516,6 +1516,7 @@ mod tests {
                     target: "vm2".into(),
                     priority: 10,
                 }],
+                vfio_fallback: None,
             },
         }
     }

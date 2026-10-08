@@ -18,6 +18,7 @@ use super::device::UsbDevice;
 use super::monitor::{UsbHotplugEvent, UsbMonitor};
 use super::registry::{AttachOutcome, RegistryError, XhciRegistry};
 use super::types::UsbPortPath;
+use super::vfio_fallback::{FallbackReason, VfioFallbackPolicy};
 
 /// What servicing one hot-plug event did — the management console's
 /// notification feed.
@@ -45,6 +46,21 @@ pub enum HotplugOutcome {
         /// Why the attachment failed.
         error: RegistryError,
     },
+    /// Per-device forwarding could not take the device and a VFIO
+    /// whole-controller fallback is configured: recommends passing the host
+    /// xHCI controller through to the guest. Always follows the
+    /// [`AttachFailed`](HotplugOutcome::AttachFailed) it explains; the
+    /// operator (or the run loop) decides whether to act on it.
+    VfioFallbackRecommended {
+        /// Host bus address the monitor assigned.
+        bus_addr: u8,
+        /// Guest the fallback controller would go to.
+        guest: String,
+        /// Host xHCI controller BDF to pass through.
+        bdf: String,
+        /// Why per-device forwarding gave up.
+        reason: FallbackReason,
+    },
     /// A disconnected device was detached from its guest.
     Detached {
         /// Host bus address the device had.
@@ -67,6 +83,9 @@ pub struct HotplugDispatcher {
     /// Physical port path → host bus address, so a disconnect (which only
     /// names the port) finds the placement the connect created.
     by_port: HashMap<UsbPortPath, u8>,
+    /// Configured VFIO whole-controller fallback plan, consulted when a
+    /// routed device cannot be attached.
+    vfio_fallback: Option<VfioFallbackPolicy>,
 }
 
 impl HotplugDispatcher {
@@ -88,7 +107,22 @@ impl HotplugDispatcher {
         Self {
             events,
             by_port: HashMap::new(),
+            vfio_fallback: None,
         }
+    }
+
+    /// Install the VFIO whole-controller fallback plan: when a routed
+    /// device's attach fails, `service` additionally emits a
+    /// [`VfioFallbackRecommended`](HotplugOutcome::VfioFallbackRecommended)
+    /// outcome naming the host controller to pass through.
+    pub fn set_vfio_fallback(&mut self, policy: VfioFallbackPolicy) {
+        self.vfio_fallback = Some(policy);
+    }
+
+    /// Remove any fallback plan previously installed with
+    /// [`set_vfio_fallback`](Self::set_vfio_fallback).
+    pub fn clear_vfio_fallback(&mut self) {
+        self.vfio_fallback = None;
     }
 
     /// Drain every queued event, applying each to `registry`: connects are
@@ -98,40 +132,64 @@ impl HotplugDispatcher {
     pub fn service(&mut self, registry: &mut XhciRegistry) -> Vec<HotplugOutcome> {
         let mut outcomes = Vec::new();
         while let Ok(event) = self.events.try_recv() {
-            outcomes.push(match event {
+            match event {
                 UsbHotplugEvent::Connected(info) => {
                     let device = UsbDevice::new(&info);
                     self.by_port.insert(info.port_path, device.bus_address);
                     match registry.attach(device.bus_address, &device.id) {
-                        Ok(AttachOutcome::Attached(placement)) => HotplugOutcome::Attached {
-                            bus_addr: device.bus_address,
-                            guest: placement.guest,
-                            port: placement.port,
-                        },
-                        Ok(AttachOutcome::Unassigned) => HotplugOutcome::Unassigned {
-                            bus_addr: device.bus_address,
-                        },
-                        Err(error) => HotplugOutcome::AttachFailed {
-                            bus_addr: device.bus_address,
-                            error,
-                        },
+                        Ok(AttachOutcome::Attached(placement)) => {
+                            outcomes.push(HotplugOutcome::Attached {
+                                bus_addr: device.bus_address,
+                                guest: placement.guest,
+                                port: placement.port,
+                            });
+                        }
+                        Ok(AttachOutcome::Unassigned) => {
+                            outcomes.push(HotplugOutcome::Unassigned {
+                                bus_addr: device.bus_address,
+                            });
+                        }
+                        Err(error) => {
+                            let reason = FallbackReason::AttachFailed {
+                                error: error.to_string(),
+                            };
+                            outcomes.push(HotplugOutcome::AttachFailed {
+                                bus_addr: device.bus_address,
+                                error,
+                            });
+                            // The escape hatch: per-device forwarding could
+                            // not take this device, so recommend the
+                            // configured whole-controller passthrough. The
+                            // recommendation is advisory — the run loop
+                            // decides whether to attempt it (and the attempt
+                            // itself re-checks every gate).
+                            if let Some(policy) = &self.vfio_fallback {
+                                log::warn!("{}", policy.recommend(&reason));
+                                outcomes.push(HotplugOutcome::VfioFallbackRecommended {
+                                    bus_addr: device.bus_address,
+                                    guest: policy.target_guest.clone(),
+                                    bdf: policy.bdf.clone(),
+                                    reason,
+                                });
+                            }
+                        }
                     }
                 }
                 UsbHotplugEvent::Disconnected(port_path) => {
-                    self.by_port.remove(&port_path).map_or(
-                        HotplugOutcome::UnknownDisconnect { port_path },
-                        |bus_addr| match registry.detach(bus_addr) {
-                            Ok(placement) => HotplugOutcome::Detached {
+                    match self.by_port.remove(&port_path) {
+                        None => outcomes.push(HotplugOutcome::UnknownDisconnect { port_path }),
+                        Some(bus_addr) => match registry.detach(bus_addr) {
+                            Ok(placement) => outcomes.push(HotplugOutcome::Detached {
                                 bus_addr,
                                 guest: placement.guest,
-                            },
+                            }),
                             // Connected but never placed (unassigned or a
                             // failed attach) — nothing to detach.
-                            Err(_) => HotplugOutcome::Unassigned { bus_addr },
+                            Err(_) => outcomes.push(HotplugOutcome::Unassigned { bus_addr }),
                         },
-                    )
+                    }
                 }
-            });
+            }
         }
         outcomes
     }
@@ -273,6 +331,115 @@ mod tests {
         let outcomes = dispatcher.service(&mut registry);
         assert!(matches!(outcomes[0], HotplugOutcome::Unassigned { .. }));
         assert_eq!(registry.placements().len(), 0);
+    }
+
+    #[test]
+    fn attach_failure_recommends_the_configured_vfio_fallback() {
+        use super::super::vfio_fallback::{FallbackReason, VfioFallbackPolicy};
+
+        let monitor = UsbMonitor::new(Duration::from_millis(100));
+        let mut dispatcher = HotplugDispatcher::subscribe(&monitor);
+        dispatcher.set_vfio_fallback(VfioFallbackPolicy {
+            bdf: "0000:03:00.0".into(),
+            target_guest: "linux1".into(),
+            allow_unstable_flr: false,
+        });
+        // No controller registered for linux1: the routed attach fails.
+        let mut registry = XhciRegistry::new(RoutingState::new({
+            let mut table = RoutingTable::new();
+            table.add_rule(1, DeviceMatcher::Any, "linux1".into());
+            table
+        }));
+
+        monitor
+            .report_connect(
+                UsbPortPath::new(1, vec![9]),
+                descriptor(0x046D, 0xC077),
+                DeviceSpeed::Low,
+            )
+            .unwrap();
+        let outcomes = dispatcher.service(&mut registry);
+        assert_eq!(
+            outcomes.len(),
+            2,
+            "attach failure + fallback recommendation"
+        );
+        assert!(matches!(outcomes[0], HotplugOutcome::AttachFailed { .. }));
+        match &outcomes[1] {
+            HotplugOutcome::VfioFallbackRecommended {
+                bus_addr,
+                guest,
+                bdf,
+                reason,
+            } => {
+                assert_eq!(guest, "linux1");
+                assert_eq!(bdf, "0000:03:00.0");
+                assert!(matches!(
+                    reason,
+                    FallbackReason::AttachFailed { error } if error.contains("no xHCI controller")
+                ));
+                assert_eq!(
+                    *bus_addr,
+                    dispatcher
+                        .bus_addr_at(&UsbPortPath::new(1, vec![9]))
+                        .unwrap()
+                );
+            }
+            other => panic!("expected a fallback recommendation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_fallback_plan_means_no_recommendation() {
+        let monitor = UsbMonitor::new(Duration::from_millis(100));
+        let mut dispatcher = HotplugDispatcher::subscribe(&monitor);
+        // No fallback plan installed (the default).
+        let mut registry = XhciRegistry::new(RoutingState::new({
+            let mut table = RoutingTable::new();
+            table.add_rule(1, DeviceMatcher::Any, "linux1".into());
+            table
+        }));
+
+        monitor
+            .report_connect(
+                UsbPortPath::new(1, vec![9]),
+                descriptor(0x046D, 0xC077),
+                DeviceSpeed::Low,
+            )
+            .unwrap();
+        let outcomes = dispatcher.service(&mut registry);
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(outcomes[0], HotplugOutcome::AttachFailed { .. }));
+    }
+
+    #[test]
+    fn clearing_the_fallback_plan_restores_plain_failures() {
+        use super::super::vfio_fallback::VfioFallbackPolicy;
+
+        let monitor = UsbMonitor::new(Duration::from_millis(100));
+        let mut dispatcher = HotplugDispatcher::subscribe(&monitor);
+        dispatcher.set_vfio_fallback(VfioFallbackPolicy {
+            bdf: "0000:03:00.0".into(),
+            target_guest: "linux1".into(),
+            allow_unstable_flr: true,
+        });
+        dispatcher.clear_vfio_fallback();
+        let mut registry = XhciRegistry::new(RoutingState::new({
+            let mut table = RoutingTable::new();
+            table.add_rule(1, DeviceMatcher::Any, "linux1".into());
+            table
+        }));
+
+        monitor
+            .report_connect(
+                UsbPortPath::new(1, vec![9]),
+                descriptor(0x046D, 0xC077),
+                DeviceSpeed::Low,
+            )
+            .unwrap();
+        let outcomes = dispatcher.service(&mut registry);
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(outcomes[0], HotplugOutcome::AttachFailed { .. }));
     }
 
     #[test]

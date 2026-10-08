@@ -100,7 +100,52 @@ fn validate_usb_routing(config: &EnlilConfig) -> Vec<String> {
     errors
 }
 
-/// Validate every guest's NIC MAC: each configured address must be transparent
+/// Whether `bdf` is a well-formed PCI address (`"dddd:bb:dd.f"`, hex fields).
+fn is_valid_bdf(bdf: &str) -> bool {
+    let Some((domain, rest)) = bdf.split_once(':') else {
+        return false;
+    };
+    let Some((bus, rest)) = rest.split_once(':') else {
+        return false;
+    };
+    let Some((device, function)) = rest.split_once('.') else {
+        return false;
+    };
+    [(domain, 4), (bus, 2), (device, 2), (function, 1)]
+        .iter()
+        .all(|(field, width)| field.len() == *width && field.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Validate the `[usb.vfio_fallback]` block (Phase 4.4): when the fallback is
+/// enabled, the controller address must be a valid PCI BDF and the target
+/// must name a defined guest — a passthrough aimed at a nonexistent guest or
+/// a mistyped address would silently never fire.
+fn validate_usb_vfio_fallback(config: &EnlilConfig) -> Vec<String> {
+    let mut errors = Vec::new();
+    let Some(fallback) = &config.usb.vfio_fallback else {
+        return errors;
+    };
+    if !fallback.enabled {
+        return errors;
+    }
+    if fallback.bdf.trim().is_empty() {
+        errors.push("USB vfio_fallback is enabled but 'bdf' is empty".to_string());
+    } else if !is_valid_bdf(fallback.bdf.trim()) {
+        errors.push(format!(
+            "USB vfio_fallback bdf '{}' is not a valid PCI address (expected dddd:bb:dd.f)",
+            fallback.bdf
+        ));
+    }
+    if fallback.target_guest.trim().is_empty() {
+        errors.push("USB vfio_fallback is enabled but 'target_guest' is empty".to_string());
+    } else if !config.guest.contains_key(fallback.target_guest.trim()) {
+        errors.push(format!(
+            "USB vfio_fallback targets guest '{}', which is not defined",
+            fallback.target_guest
+        ));
+    }
+    errors
+}
 /// and well-formed (LOCKED PRINCIPLE 1 — no virtualization-vendor OUI, no
 /// multicast/broadcast source; Phase 5.8), and no two guests may share one
 /// (LOCKED PRINCIPLE 5 — a duplicate source MAC flaps the MAC-learning virtual
@@ -180,6 +225,7 @@ pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
 
     // USB peripheral routing (Phase 4.3): match specs parse, targets exist.
     errors.append(&mut validate_usb_routing(config));
+    errors.append(&mut validate_usb_vfio_fallback(config));
 
     // Check memory
     let total_guest_memory: u64 = config.guest.values().map(|g| g.memory_mb).sum();
@@ -425,6 +471,7 @@ mod tests {
                     priority: 1000,
                 },
             ],
+            vfio_fallback: None,
         };
         let errors = validate_config(&config);
         assert!(errors.is_empty(), "Expected no errors, got: {errors:?}");
@@ -473,6 +520,107 @@ mod tests {
                 .any(|e| e.contains("default_guest") && e.contains("ghost")),
             "unknown default_guest should be flagged: {errors:?}"
         );
+    }
+
+    #[test]
+    fn valid_usb_vfio_fallback_passes() {
+        let mut config = minimal_config();
+        config.usb.vfio_fallback = Some(UsbVfioFallback {
+            enabled: true,
+            bdf: "0000:03:00.0".into(),
+            target_guest: "vm1".into(),
+            allow_unstable_flr: false,
+        });
+        let errors = validate_config(&config);
+        assert!(errors.is_empty(), "Expected no errors, got: {errors:?}");
+    }
+
+    #[test]
+    fn disabled_usb_vfio_fallback_is_not_validated() {
+        let mut config = minimal_config();
+        // Disabled: a garbage BDF and unknown guest are ignored, exactly
+        // like an absent block.
+        config.usb.vfio_fallback = Some(UsbVfioFallback {
+            enabled: false,
+            bdf: "nonsense".into(),
+            target_guest: "ghost".into(),
+            allow_unstable_flr: false,
+        });
+        let errors = validate_config(&config);
+        assert!(errors.is_empty(), "Expected no errors, got: {errors:?}");
+    }
+
+    #[test]
+    fn detects_usb_vfio_fallback_with_bad_bdf_and_unknown_guest() {
+        let mut config = minimal_config();
+        config.usb.vfio_fallback = Some(UsbVfioFallback {
+            enabled: true,
+            bdf: "03:00.0".into(),
+            target_guest: "ghost".into(),
+            allow_unstable_flr: false,
+        });
+        let errors = validate_config(&config);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("bdf") && e.contains("03:00.0")),
+            "malformed BDF should be flagged: {errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("ghost") && e.contains("not defined")),
+            "unknown fallback target should be flagged: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn detects_usb_vfio_fallback_with_empty_fields() {
+        let mut config = minimal_config();
+        config.usb.vfio_fallback = Some(UsbVfioFallback::default());
+        config.usb.vfio_fallback.as_mut().unwrap().enabled = true;
+        let errors = validate_config(&config);
+        assert_eq!(errors.len(), 2, "empty bdf + empty target: {errors:?}");
+    }
+
+    #[test]
+    fn usb_vfio_fallback_parses_from_toml() {
+        let toml = r#"
+            [hypervisor]
+
+            [guest.vm1]
+            name = "VM 1"
+            cpus = [0]
+            memory_mb = 512
+
+            [usb.vfio_fallback]
+            enabled = true
+            bdf = "0000:03:00.0"
+            target_guest = "vm1"
+            allow_unstable_flr = true
+        "#;
+        let config: EnlilConfig = toml::from_str(toml).expect("parse");
+        let fallback = config.usb.vfio_fallback.as_ref().expect("fallback block");
+        assert!(fallback.enabled);
+        assert_eq!(fallback.bdf, "0000:03:00.0");
+        assert_eq!(fallback.target_guest, "vm1");
+        assert!(fallback.allow_unstable_flr);
+        // The block round-trips: `is_empty` must not swallow a configured
+        // fallback when the config is written back out.
+        assert!(!config.usb.is_empty());
+        let errors = validate_config(&config);
+        assert!(errors.is_empty(), "Expected no errors, got: {errors:?}");
+    }
+
+    #[test]
+    fn bdf_syntax_checker_accepts_canonical_forms_only() {
+        assert!(is_valid_bdf("0000:03:00.0"));
+        assert!(is_valid_bdf("ffff:ff:1f.7"));
+        assert!(!is_valid_bdf("0000:3:00.0"));
+        assert!(!is_valid_bdf("0000:03:00"));
+        assert!(!is_valid_bdf("0000:03:00.0 "));
+        assert!(!is_valid_bdf("0000:03:zz.0"));
+        assert!(!is_valid_bdf(""));
     }
 
     #[test]
