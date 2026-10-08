@@ -1,0 +1,17 @@
+# enlil-bridge-agent configuration.
+# Installed by the enlil-bridge-agent package; edit to suit the guest.
+
+[bridge]
+# Channel to the host bridge: a guest device node, a Unix socket, or TCP
+# (the latter two are mainly useful for testing).
+device = "/dev/enlil-bridge"
+# This guest's id on the bridge.
+guest_id = 1
+
+[agent]
+# Where drag-and-drop transfers are staged.
+drop_dir = "/var/lib/enlil-bridge/drops"
+# Root of the shared filesystem served to the bridge.
+sync_dir = "/var/lib/enlil-bridge/shared"
+# Log level: error, warn, info, debug, trace.
+log_level = "info"

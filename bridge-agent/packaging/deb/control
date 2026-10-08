@@ -1,0 +1,11 @@
+Package: enlil-bridge-agent
+Version: @VERSION@
+Section: admin
+Priority: optional
+Architecture: amd64
+Maintainer: Justin Icenhour <creative515.justin@gmail.com>
+Description: In-guest agent for the Enlil inter-guest bridge
+ The enlil-bridge-agent runs inside an Enlil guest and connects to the host
+ bridge over /dev/enlil-bridge (virtio-serial). It syncs the clipboard,
+ stages drag-and-drop file transfers, serves the shared filesystem and
+ forwards notifications between the guest and other guests on the bridge.

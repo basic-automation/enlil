@@ -10,14 +10,18 @@
 //! - `MemoryBackend` — a fixed-size in-memory backend for tests
 
 use crate::truncate::usize_of;
+#[cfg(target_os = "linux")]
 pub mod nvme;
 pub mod qcow;
 pub mod raw;
+#[cfg(target_os = "linux")]
 pub mod vfio;
 
+#[cfg(target_os = "linux")]
 pub use nvme::NvmePassthroughBackend;
 pub use qcow::QcowBackend;
 pub use raw::RawFileBackend;
+#[cfg(target_os = "linux")]
 pub use vfio::{NvmeCandidate, discover_nvme_controllers, iommu_available};
 
 use anyhow::Result;

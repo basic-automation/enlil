@@ -1,0 +1,17 @@
+# enlil-bridge-agent configuration (Windows).
+# Installed by the Enlil Bridge Agent MSI; edit to suit the guest.
+
+[bridge]
+# Channel to the host bridge. On Windows guests the hypervisor exposes the
+# bridge over TCP on the host-only link by default.
+device = "tcp://192.168.56.1:9418"
+# This guest's id on the bridge.
+guest_id = 1
+
+[agent]
+# Where drag-and-drop transfers are staged.
+drop_dir = "C:\\ProgramData\\Enlil\\drops"
+# Root of the shared filesystem served to the bridge.
+sync_dir = "C:\\ProgramData\\Enlil\\shared"
+# Log level: error, warn, info, debug, trace.
+log_level = "info"
