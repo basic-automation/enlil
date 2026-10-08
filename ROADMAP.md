@@ -98,7 +98,7 @@
   - [x] virtio-net backend device
   - [x] MAC-learning virtual switch (unicast forward + broadcast flood)
   - [x] host TAP uplink for external connectivity
-  - [ ] SR-IOV NIC passthrough when available
+  - [x] SR-IOV NIC passthrough when available
 - [x] 3.3 Interrupt virtualization — per-guest IOAPIC/LAPIC and MSI/MSI-X delivery
   - [x] virtual IOAPIC + LAPIC per guest
   - [x] MSI/MSI-X message delivery (deliver_msi)
