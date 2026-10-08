@@ -1,0 +1,27 @@
+[package]
+name = "bridge-agent"
+version = "0.1.0"
+edition.workspace = true
+description = "In-guest agent for the Enlil inter-guest bridge (clipboard, drag-and-drop, shared filesystem)"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Publishing guard. This repo runs an automated nightly routine that reshapes
+# these crates; they are tightly-coupled internals of an unfinished hypervisor,
+# not yet standalone libraries. Flip to `true` (or delete) per crate only when
+# its API is stable enough to maintain on crates.io under semver.
+publish = false
+
+[[bin]]
+name = "bridge-agent"
+path = "src/main.rs"
+
+[lib]
+name = "bridge_agent"
+path = "src/lib.rs"
+
+[dependencies]
+enlil-devices = { path = "../enlil-devices" }
+clap = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
