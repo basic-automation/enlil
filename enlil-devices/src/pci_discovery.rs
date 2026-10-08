@@ -551,6 +551,56 @@ pub fn is_sr_iov_capable(mem: &[u8], alloc: &McfgAllocation, func: &PciFunction)
         .any(|cap| cap.id == ExtendedCapability::SR_IOV)
 }
 
+/// Walk a function's PCI Express extended capability list in a raw config-space
+/// blob — e.g. the bytes read from `/sys/bus/pci/devices/<bdf>/config` — rather
+/// than an ECAM image.
+///
+/// Same walk as [`extended_capabilities`] but the blob *is* the function's own
+/// config space, so the list head is read at blob offset `0x100` directly. A
+/// blob shorter than the head (sysfs may hand back only the 256-byte legacy
+/// region) yields an empty list; the walk is cycle-guarded like the ECAM
+/// variant.
+#[must_use]
+pub fn extended_capabilities_in_config(config: &[u8]) -> Vec<ExtendedCapability> {
+    let mut off: u16 = 0x100;
+    let mut out = Vec::new();
+    let mut visited = Vec::new();
+    while off >= 0x100 && !visited.contains(&off) {
+        visited.push(off);
+        let start = usize::from(off);
+        let Some(bytes) = config.get(start..start + 4) else {
+            break;
+        };
+        let header = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let id = (header & 0xFFFF) as u16;
+        // All-ones (unimplemented) or a zero header ends the list.
+        if id == 0xFFFF || header == 0 {
+            break;
+        }
+        out.push(ExtendedCapability {
+            id,
+            version: ((header >> 16) & 0xF) as u8,
+            offset: off,
+        });
+        let next = ((header >> 20) & 0xFFF) as u16;
+        if next == 0 {
+            break;
+        }
+        off = next & 0xFFC;
+    }
+    out
+}
+
+/// Whether a raw config-space blob (e.g. from sysfs) advertises the SR-IOV
+/// extended capability — the NIC passthrough tier (Phase 3.2) gates VF
+/// enablement on this.
+#[must_use]
+pub fn is_sr_iov_capable_in_config(config: &[u8]) -> bool {
+    extended_capabilities_in_config(config)
+        .iter()
+        .any(|cap| cap.id == ExtendedCapability::SR_IOV)
+}
+
 /// The decoded fields of a Physical Function's SR-IOV extended capability — how
 /// many Virtual Functions it supports and where they land in config space.
 ///
@@ -1095,6 +1145,27 @@ mod tests {
             }]
         );
         assert!(is_sr_iov_capable(&mem, &alloc, &func));
+    }
+
+    #[test]
+    fn walks_extended_caps_in_a_raw_config_blob() {
+        let mut config = vec![0u8; 0x110];
+        // Extended cap head at 0x100: id 0x0010 (SR-IOV), version 1, next 0 (end).
+        let header = u32::from(ExtendedCapability::SR_IOV) | (1 << 16);
+        config[0x100..0x104].copy_from_slice(&header.to_le_bytes());
+
+        assert_eq!(
+            extended_capabilities_in_config(&config),
+            vec![ExtendedCapability {
+                id: 0x0010,
+                version: 1,
+                offset: 0x100,
+            }]
+        );
+        assert!(is_sr_iov_capable_in_config(&config));
+        // Legacy-only blob (no extended region) has no extended caps.
+        assert!(!is_sr_iov_capable_in_config(&vec![0u8; 256]));
+        assert!(extended_capabilities_in_config(&[]).is_empty());
     }
 
     #[test]
