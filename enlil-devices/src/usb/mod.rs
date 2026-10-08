@@ -38,6 +38,7 @@ pub mod routing;
 pub mod sysfs;
 pub mod types;
 pub mod xhci;
+pub mod xhci_scan;
 
 pub use controller::{
     MSIX_PBA_BAR_OFFSET, MSIX_TABLE_BAR_OFFSET, SharedXhci, VirtualXhciController,
@@ -60,4 +61,10 @@ pub use xhci::{
     DoorbellTarget, EventRing, EventTrb, InterrupterRegisterSet, NormalTrb, OperationalRegisters,
     PortRegisterSet, PortState, RuntimeRegisters, SetupPacket, TransferRing, TransferTrb,
     TransferType, Trb, TrbCompletionCode, TrbRing, TrbType, VecDmaMemory,
+};
+pub use xhci_scan::{
+    PORTSC_CCS, PORTSC_PED, PORTSC_PP, PORTSC_SPEED_MASK, PORTSC_SPEED_SHIFT,
+    XHCI_PORT_REGS_OFFSET, XHCI_PORT_REGS_STRIDE, XhciMmioPortReader, XhciPortReader,
+    XhciPortStatus, decode_port_speed, parse_portsc, poll_xhci, provisional_descriptor,
+    scan_xhci_ports, sync_xhci_monitor,
 };
