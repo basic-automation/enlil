@@ -1,0 +1,25 @@
+[package]
+name = "enlil-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Detached from the main workspace: the fuzz target builds enlil-devices with
+# libFuzzer instrumentation (RUSTFLAGS set by `cargo fuzz`), which must not
+# leak into normal builds.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+enlil-devices = { path = "../enlil-devices" }
+
+[[bin]]
+name = "aml"
+path = "fuzz_targets/aml.rs"
+
+# Keep debug info in the fuzzing profile so crashes symbolize.
+[profile.release]
+debug = true

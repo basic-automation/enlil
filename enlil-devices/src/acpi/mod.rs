@@ -21,6 +21,7 @@
 //! ```
 
 pub mod aml;
+pub mod aml_validate;
 pub mod bgrt;
 pub mod discover;
 pub mod dsdt;
