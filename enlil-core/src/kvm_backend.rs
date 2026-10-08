@@ -3917,6 +3917,173 @@ mod tests {
         );
     }
 
+    /// The in-guest detection agent (item 5.8, T-5.2) runs its CPUID + RDTSC
+    /// checks inside a booted guest and reports no hypervisor tells.
+    ///
+    /// The guest blob is the real-mode analogue of
+    /// `bridge_agent::stealth::run_detection`'s CPUID/timing collectors: it
+    /// reads CPUID.1:ECX (hypervisor-present bit), CPUID `0x40000000`
+    /// (vendor signature), CPUID 0 (CPU vendor string), then takes 9
+    /// RDTSC-bracketed CPUID timing samples, emitting 64 bytes on COM1 before
+    /// HLT. The host decodes them with the same
+    /// `enlil_devices::stealth::detection` primitives the agent uses and
+    /// asserts no tells. Self-skips without /dev/kvm.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guest_detection_agent_reports_no_hypervisor_tells() {
+        use enlil_devices::stealth::detection;
+
+        if !is_kvm_available() {
+            eprintln!("skipping guest_detection_agent_reports_no_hypervisor_tells: no /dev/kvm");
+            return;
+        }
+
+        // Byte emitters: 4 bytes of a 32-bit register, LSB first, on COM1.
+        // ECX: mov al,cl; out dx,al then 3x (shr ecx,8; mov al,cl; out dx,al).
+        const EMIT_ECX: &[u8] = &[
+            0x88, 0xC8, 0xEE, 0x66, 0xC1, 0xE9, 0x08, 0x88, 0xC8, 0xEE, 0x66, 0xC1, 0xE9, 0x08,
+            0x88, 0xC8, 0xEE, 0x66, 0xC1, 0xE9, 0x08, 0x88, 0xC8, 0xEE,
+        ];
+        // EBX: same shape with bl / shr ebx,8.
+        const EMIT_EBX: &[u8] = &[
+            0x88, 0xD8, 0xEE, 0x66, 0xC1, 0xEB, 0x08, 0x88, 0xD8, 0xEE, 0x66, 0xC1, 0xEB, 0x08,
+            0x88, 0xD8, 0xEE, 0x66, 0xC1, 0xEB, 0x08, 0x88, 0xD8, 0xEE,
+        ];
+        // EAX: al already holds the low byte: out dx,al then 3x (shr eax,8).
+        const EMIT_EAX: &[u8] = &[
+            0xEE, 0x66, 0xC1, 0xE8, 0x08, 0xEE, 0x66, 0xC1, 0xE8, 0x08, 0xEE, 0x66, 0xC1, 0xE8,
+            0x08, 0xEE,
+        ];
+        // One timing iteration: rdtsc; save t0 in EDI:ESI; cpuid(eax=0);
+        // rdtsc; delta = t1-t0 in EDX:EAX (caller emits EAX).
+        const TIMING_ITER: &[u8] = &[
+            0x0F, 0x31, // rdtsc
+            0x66, 0x89, 0xC6, // mov esi, eax
+            0x66, 0x89, 0xD7, // mov edi, edx
+            0x66, 0x31, 0xC0, // xor eax, eax
+            0x0F, 0xA2, // cpuid
+            0x0F, 0x31, // rdtsc
+            0x66, 0x29, 0xF0, // sub eax, esi
+            0x66, 0x19, 0xFA, // sbb edx, edi
+        ];
+
+        let mut code: Vec<u8> = Vec::new();
+        // CPUID.1:ECX -> emit 4 bytes.
+        code.extend_from_slice(&[
+            0x66, 0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+            0x0F, 0xA2, // cpuid
+            0xBA, 0xF8, 0x03, // mov dx, 0x3F8
+        ]);
+        code.extend_from_slice(EMIT_ECX);
+        // CPUID 0x40000000 -> emit EBX, ECX, EDX (12 bytes).
+        code.extend_from_slice(&[
+            0x66, 0xB8, 0x00, 0x00, 0x00, 0x40, // mov eax, 0x40000000
+            0x0F, 0xA2, // cpuid
+        ]);
+        code.extend_from_slice(EMIT_EBX);
+        code.extend_from_slice(EMIT_ECX);
+        code.extend_from_slice(&[0x66, 0x89, 0xD3]); // mov ebx, edx
+        code.extend_from_slice(EMIT_EBX);
+        // CPUID 0 -> emit EBX, EDX, ECX (leaf-0 vendor order, 12 bytes).
+        code.extend_from_slice(&[
+            0x66, 0xB8, 0x00, 0x00, 0x00, 0x00, // mov eax, 0
+            0x0F, 0xA2, // cpuid
+        ]);
+        code.extend_from_slice(EMIT_EBX);
+        code.extend_from_slice(&[0x66, 0x89, 0xD3]); // mov ebx, edx
+        code.extend_from_slice(EMIT_EBX);
+        code.extend_from_slice(&[0x66, 0x89, 0xCB]); // mov ebx, ecx
+        code.extend_from_slice(EMIT_EBX);
+        // 9 unrolled RDTSC-bracketed CPUID timing samples (4 bytes each).
+        for _ in 0..9 {
+            code.extend_from_slice(TIMING_ITER);
+            code.extend_from_slice(EMIT_EAX);
+        }
+        code.push(0xF4); // hlt
+
+        const ENTRY: u64 = 0x1000;
+        const SIZE: usize = 0x1000;
+        let mut ram = GuestRam::new(SIZE);
+        ram.as_mut_slice()[..code.len()].copy_from_slice(&code);
+        let host_addr = ram.host_addr();
+
+        let mut backend = KvmBackend::new_without_irqchip().expect("create KVM VM");
+        // SAFETY: `ram` outlives `backend` within this test scope.
+        unsafe { backend.map_memory(ENTRY, host_addr, ram.len() as u64) }
+            .expect("map guest memory");
+        backend.create_vcpu(0).expect("create vcpu");
+        // The exact stealth the orchestrator applies before a guest runs.
+        let table = enlil_devices::stealth::cpuid::CpuidStealthTable::build(
+            &enlil_devices::stealth::cpuid::CpuidStealthConfig::from_host(1, 1),
+        );
+        backend
+            .apply_topology_stealth(&table)
+            .expect("apply cpuid stealth");
+        backend
+            .prepare_real_mode_vcpu(0, ENTRY)
+            .expect("set real-mode entry");
+
+        struct EchoOut(Vec<u8>);
+        impl VmExitHandler for EchoOut {
+            fn io_out(&mut self, _port: u16, data: &[u8]) {
+                self.0.extend_from_slice(data);
+            }
+        }
+        let mut echo = EchoOut(Vec::new());
+
+        let mut halted = false;
+        for _ in 0..400 {
+            if backend.run_vcpu(0, &mut echo).expect("run vcpu") == GuestExit::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "guest never reached HLT");
+        assert_eq!(
+            echo.0.len(),
+            64,
+            "guest must emit all 64 detection-report bytes"
+        );
+
+        let leaf1_ecx = u32::from_le_bytes(echo.0[0..4].try_into().unwrap());
+        let hv_ebx = u32::from_le_bytes(echo.0[4..8].try_into().unwrap());
+        let hv_ecx = u32::from_le_bytes(echo.0[8..12].try_into().unwrap());
+        let hv_edx = u32::from_le_bytes(echo.0[12..16].try_into().unwrap());
+        let v_ebx = u32::from_le_bytes(echo.0[16..20].try_into().unwrap());
+        let v_edx = u32::from_le_bytes(echo.0[20..24].try_into().unwrap());
+        let v_ecx = u32::from_le_bytes(echo.0[24..28].try_into().unwrap());
+        let (chunks, _) = echo.0[28..64].as_chunks::<4>();
+        let deltas: Vec<u64> = chunks
+            .iter()
+            .map(|c| u32::from_le_bytes(*c) as u64)
+            .collect();
+
+        // The in-guest agent's verdict, via the shared detection primitives.
+        assert!(
+            !detection::cpuid_hypervisor_present(leaf1_ecx),
+            "guest saw CPUID.1:ECX[31] set: {leaf1_ecx:#010x}"
+        );
+        assert_eq!(
+            detection::hypervisor_vendor_from_signature(hv_ebx, hv_ecx, hv_edx),
+            None,
+            "guest saw a hypervisor vendor signature at CPUID 0x40000000"
+        );
+        assert!(
+            detection::is_genuine_cpu_vendor(v_ebx, v_edx, v_ecx),
+            "guest saw a non-genuine CPU vendor string"
+        );
+        let median = detection::median_cycles(&deltas).expect("guest must emit timing samples");
+        // The strict bare-metal ceiling is enlil's own TSC-offsetting claim
+        // (item 5.4), not KVM's exit cost: here we only require the in-guest
+        // timing path to work end to end with a sane median (no
+        // multi-millisecond trap per CPUID).
+        assert!(
+            median < 1_000_000,
+            "RDTSC-bracketed CPUID median absurdly high in guest: {median} cycles"
+        );
+        eprintln!("in-guest detection agent: no CPUID tells; timing median = {median} cycles");
+    }
+
     // apply_topology_stealth makes a guest see ITS OWN topology, not the host's.
     // KVM's supported leaf 0xB mirrors the host's logical-processor count; a
     // 2-vCPU guest reading leaf 0xB subleaf 1 EBX would otherwise find the host's
