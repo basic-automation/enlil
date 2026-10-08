@@ -17,6 +17,7 @@
 //! loopback with the same queue semantics.
 
 pub mod protocol;
+pub mod stealth;
 
 use std::sync::{
     Arc,

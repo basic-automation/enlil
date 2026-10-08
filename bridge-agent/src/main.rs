@@ -71,6 +71,9 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         max_messages: u64,
     },
+    /// Run the in-guest hypervisor-detection agent (item 5.8) and print its report.
+    #[command(name = "stealth-check")]
+    StealthCheck,
 }
 
 #[derive(Debug, Subcommand)]
@@ -143,6 +146,24 @@ fn main() -> Result<()> {
         Command::Dnd { op } => dnd_cmd(&client, cli.peer_id, op),
         Command::Sharedfs { op } => sharedfs_cmd(&client, cli.peer_id, op),
         Command::Run { max_messages } => run_loop(&client, max_messages),
+        Command::StealthCheck => {
+            stealth_check();
+            Ok(())
+        }
+    }
+}
+
+/// Run the in-guest hypervisor-detection agent and print its report.
+///
+/// Prints the full [`DetectionReport`](bridge_agent::stealth::DetectionReport)
+/// and exits non-zero when any check reports a hypervisor tell, so a CI gate
+/// can run `bridge-agent stealth-check` inside a booted guest as the automated
+/// 5.8 detection suite.
+fn stealth_check() {
+    let report = bridge_agent::stealth::run_detection();
+    println!("{report}");
+    if report.has_hypervisor_tell() {
+        std::process::exit(1);
     }
 }
 

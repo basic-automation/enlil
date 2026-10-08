@@ -28,6 +28,30 @@ enlil-bridge-agent send-text "hello" --to 0   # one-shot clipboard push
 enlil-bridge-agent doctor                     # check config + channel
 ```
 
+## Hypervisor-detection agent (`stealth-check`)
+
+The agent doubles as the in-guest automated detection suite (roadmap item
+5.8): `bridge-agent stealth-check` runs the pafish/al-khaser-style checklist
+from inside the guest — CPUID hypervisor-present bit, `0x40000000` vendor
+signature, leaf-0 CPU vendor genuineness, RDTSC-bracketed CPUID timing,
+PCI device-ID enumeration, NIC MAC OUI screening, and (on Windows) registry
+artifact inspection — then prints a per-check report. It exits `0` when no
+hypervisor tell is found and `1` when one is, so a CI gate can run it in a
+booted guest as the automated transparency check:
+
+```sh
+bridge-agent stealth-check
+# in-guest hypervisor detection report
+# [PASS] cpuid/hypervisor-present-bit — CPUID.1:ECX = 0x00000000 ...
+# verdict: 6 pass, 0 tell, 1 skipped — no hypervisor tells
+```
+
+The check logic lives in `src/stealth.rs` (`bridge_agent::stealth`):
+collection is OS/architecture-specific and best-effort, parsing and
+evaluation are pure and unit-tested, and the evaluation reuses the shared
+`enlil_devices::stealth::detection` primitives. Unsupported checks report
+`SKIP`, never a failure.
+
 ## Packaging
 
 `scripts/package-bridge-agent.sh` builds all three installers into `dist/`:
