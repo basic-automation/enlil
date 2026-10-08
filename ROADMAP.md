@@ -93,7 +93,7 @@
   - [x] StorageBackend trait (read/write/flush/trim/capacity)
   - [x] QcowBackend + RawFileBackend implementations
   - [x] virtio-blk device wired to backends (enlil-devices/block.rs)
-  - [ ] NVMe namespace passthrough via VFIO when IOMMU available
+  - [x] NVMe namespace passthrough via VFIO when IOMMU available — NvmePassthroughBackend (enlil-devices/src/storage/nvme.rs): VFIO container/IOMMU-group/device binding, Type-1 IOMMU DMA mapping, direct NVMe admin + I/O queue driver with polled completions (identify, read/write, flush, dataset-management deallocate), namespace exposed as a StorageBackend for virtio-blk; open() is IOMMU-gated — refuses when /sys/kernel/iommu_groups is missing/empty, the controller is not in an IOMMU group, or is not bound to vfio-pci. End-to-end driver logic verified against a fake NVMe controller in unit tests (init, PRP/PRP-list reads/writes, flush, deallocate).
 - [x] 3.2 VirtIO net device plus in-hypervisor virtual switch with inter-guest fast path
   - [x] virtio-net backend device
   - [x] MAC-learning virtual switch (unicast forward + broadcast flood)

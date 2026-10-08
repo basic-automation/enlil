@@ -5,14 +5,20 @@
 //! - `QcowBackend` — qcow2 disk images, read-write: copy-on-write over a backing
 //!   chain, cluster/L2/refcount allocation, trim/discard, and consistency
 //!   checking (a read-only mode is available by opening the image read-only)
+//! - `NvmePassthroughBackend` — a physical `NVMe` namespace driven directly via
+//!   VFIO (IOMMU-gated)
 //! - `MemoryBackend` — a fixed-size in-memory backend for tests
 
 use crate::truncate::usize_of;
+pub mod nvme;
 pub mod qcow;
 pub mod raw;
+pub mod vfio;
 
+pub use nvme::NvmePassthroughBackend;
 pub use qcow::QcowBackend;
 pub use raw::RawFileBackend;
+pub use vfio::{NvmeCandidate, discover_nvme_controllers, iommu_available};
 
 use anyhow::Result;
 
