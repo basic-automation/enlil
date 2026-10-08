@@ -166,7 +166,7 @@
   - [x] Enable/Disable/Address/Configure Slot and Set TR Dequeue command processing
   - [x] UsbDeviceModel seam with in-process LoopbackDevice and emulated HID boot keyboard
   - [x] libusb (rusb) forwarder (LibusbDevice) forwarding TDs to real host devices
-  - [ ] Isochronous endpoint forwarding via async libusb transfer path
+  - [x] Isochronous endpoint forwarding via async libusb transfer path
   - [ ] Fallback: VFIO whole-controller passthrough via IOMMU with FLR-stability warnings
 - [ ] 4.5 Management-console USB controls (device list, reassignment UI, hot-plug notifications) with two-mice/two-keyboards live-reassign milestone
   - [x] USB wire protocol surface (UsbDeviceEntry, UsbDeviceList, UsbHotplugNotice, UsbCommand/UsbAction Reassign+Detach)

@@ -32,6 +32,8 @@ pub mod emulated;
 #[cfg(target_os = "linux")]
 pub mod forwarder;
 pub mod hotplug;
+#[cfg(target_os = "linux")]
+pub mod iso;
 pub mod monitor;
 pub mod registry;
 pub mod routing;
