@@ -16,6 +16,8 @@
 
 extern crate alloc;
 
+pub mod apicv;
+pub mod avic;
 pub mod npt;
 pub mod region;
 pub mod svm;
