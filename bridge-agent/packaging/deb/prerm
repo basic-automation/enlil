@@ -1,0 +1,7 @@
+#!/bin/sh
+set -e
+if [ -d /run/systemd/system ]; then
+    deb-systemd-helper purge enlil-bridge-agent.service >/dev/null || true
+fi
+#DEBHELPER#
+exit 0

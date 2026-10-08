@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+# Enable (but do not start: the bridge device only exists inside an Enlil
+# guest) the agent service.
+if [ -d /run/systemd/system ]; then
+    systemctl --system daemon-reload >/dev/null || true
+    deb-systemd-helper enable enlil-bridge-agent.service >/dev/null || true
+fi
+#DEBHELPER#
+exit 0

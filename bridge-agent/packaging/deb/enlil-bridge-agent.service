@@ -1,0 +1,17 @@
+[Unit]
+Description=Enlil bridge agent (inter-guest clipboard/DnD/shared-fs)
+Documentation=https://github.com/basic-automation/enlil
+After=network.target
+ConditionPathExists=/dev/enlil-bridge
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/enlil-bridge-agent run
+Restart=on-failure
+RestartSec=5
+# The agent only needs its staging directories.
+ReadWritePaths=/var/lib/enlil-bridge
+StateDirectory=enlil-bridge
+
+[Install]
+WantedBy=multi-user.target

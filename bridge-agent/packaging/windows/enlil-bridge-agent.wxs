@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WiX authoring for the Enlil bridge-agent Windows installer.
+
+  Built with wixl (msitools) on Linux or the WiX Toolset on Windows:
+      wixl -D Version=0.1.0 -D BinDir=target/x86_64-pc-windows-gnu/release \
+           -o enlil-bridge-agent-0.1.0-x64.msi \
+           bridge-agent/packaging/windows/enlil-bridge-agent.wxs
+
+  Installs enlil-bridge-agent.exe as a Windows service (EnlilBridgeAgent)
+  plus the default config under %PROGRAMDATA%\Enlil.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="Enlil Bridge Agent"
+           Language="1033"
+           Version="$(var.Version)"
+           Manufacturer="Enlil"
+           UpgradeCode="A2CCE516-61CB-4191-ADEA-80E7F9A9DD71">
+    <Package InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Platform="x64" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of the Enlil Bridge Agent is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Feature Id="ProductFeature" Title="Enlil Bridge Agent" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+    </Feature>
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLDIR" Name="Enlil">
+          <Directory Id="BINDIR" Name="bin" />
+        </Directory>
+      </Directory>
+      <Directory Id="CommonAppDataFolder">
+        <Directory Id="PROGRAMDATADIR" Name="Enlil" />
+      </Directory>
+    </Directory>
+
+    <ComponentGroup Id="ProductComponents">
+      <Component Id="AgentExe" Guid="9AA416E9-9098-478A-967C-27ABC381E47C" Directory="BINDIR">
+        <File Id="AgentExeFile"
+              Source="$(var.BinDir)/enlil-bridge-agent.exe"
+              KeyPath="yes" />
+        <ServiceInstall Id="AgentService"
+                        Name="EnlilBridgeAgent"
+                        DisplayName="Enlil Bridge Agent"
+                        Description="In-guest agent for the Enlil inter-guest bridge (clipboard, drag-and-drop, shared filesystem, notifications)."
+                        Start="auto"
+                        Type="ownProcess"
+                        ErrorControl="normal" />
+        <ServiceControl Id="AgentServiceControl"
+                        Name="EnlilBridgeAgent"
+                        Start="install"
+                        Stop="both"
+                        Remove="uninstall"
+                        Wait="yes" />
+      </Component>
+
+      <Component Id="AgentConfig" Guid="52DE72E0-D723-45A8-9DF3-A46F5A37FEB0" Directory="PROGRAMDATADIR" NeverOverwrite="yes">
+        <File Id="AgentConfigFile"
+              Source="$(var.ConfigSrc)"
+              Name="bridge-agent.toml"
+              KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Product>
+</Wix>
