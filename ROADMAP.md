@@ -127,6 +127,7 @@
   - [x] fast inter-guest virtual network via the virtual switch (3.7.5)
   - [x] URL/protocol-handler scheme routing table + resolution logic (3.7.6)
   - [ ] guest bridge-agent packaging/installers (.deb/.rpm/.msi) (3.7.7)
+  - [x] in-guest bridge-agent binary: clipboard/DnD/shared-fs client speaking the bridge protocol (T-3.1b)
 - [x] 3.8 Production platform-clock cadence — advance_platform_clocks drives advance_clocks from guest ref-cycles in the run loop
 - [x] 3.9 LAPIC TSC-deadline timer mode (IA32_TSC_DEADLINE install + fire_due_tsc_deadlines against guest TSC)
 - [x] 3.10 qcow2 refcount-TABLE growth in storage/qcow.rs (live refcount-table geometry held in interior-mutable AtomicU64/AtomicU32 on QcowBackend so a &self allocation can grow it; grow_refcount_table appends one self-covering arena at EOF — enlarged table + covering refcount blocks built in memory and written in one pass — copies old entries forward, frees the old table's container clusters, and persists the new offset/clusters into the on-disk header so the grow survives reopen; a growth needing a slot the enlarged table still can't address is refused before any mutation; validated by writing past a 1-cluster table's reach and re-running check_consistency, incl. after reopen)
