@@ -11,6 +11,7 @@ members = [
     "enlil-boot",
     "enlil-setup",
     "enlil-std",
+    "enlil-mgmt-proto",
 ]
 
 [workspace.package]

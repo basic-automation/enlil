@@ -13,6 +13,7 @@ pub mod serial;
 pub mod stealth_msr;
 pub mod timing_stealth;
 pub mod usb_routing;
+pub mod usb_service;
 pub mod vcpu;
 pub mod vm;
 

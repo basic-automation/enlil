@@ -15,6 +15,7 @@ publish = false
 [dependencies]
 enlil-config = { path = "../enlil-config", version = "0.1.0" }
 enlil-devices = { path = "../enlil-devices", version = "0.1.0" }
+enlil-mgmt-proto = { path = "../enlil-mgmt-proto", version = "0.1.0" }
 enlil-platform = { path = "../enlil-platform", version = "0.1.0" }
 log = "0.4"
 thiserror = "2"
