@@ -9,14 +9,15 @@
 //! Two requests never reach the device raw: `SET_ADDRESS` is acknowledged
 //! locally (the host kernel owns real bus addressing), and
 //! `SET_CONFIGURATION` is mapped to libusb's configuration call only when
-//! the host's active configuration differs. Endpoint transfer kinds are
-//! captured from the active configuration descriptor at open time, so
-//! bulk and interrupt TDs dispatch to the matching libusb call.
+//! the host's active configuration differs. Endpoint transfer kinds (and
+//! isochronous `wMaxPacketSize`) are captured from the active configuration
+//! descriptor at open time, so bulk and interrupt TDs dispatch to the
+//! matching libusb call and isochronous TDs take the async path.
 //!
-//! Isochronous endpoints are not forwarded yet: libusb's synchronous API
-//! has no isochronous shape, so those TDs fail as transaction errors until
-//! the async transfer path lands (audio/video class devices — a Phase 4
-//! follow-up).
+//! Isochronous endpoints forward through the async transfer path in
+//! [`super::iso`]: libusb's synchronous API has no isochronous shape, so
+//! those TDs submit a raw `libusb_transfer` with iso packet descriptors
+//! and pump the event loop until it completes (audio/video class devices).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -25,6 +26,7 @@ use std::time::Duration;
 use rusb::{Context, DeviceHandle, UsbContext};
 
 use super::emulated::{UsbDeviceModel, UsbTransferResult};
+use super::iso::{iso_transfer_in, iso_transfer_out};
 use super::types::{UsbError, UsbResult};
 use super::xhci::transfer::SetupPacket;
 use crate::truncate::u8_of;
@@ -46,8 +48,10 @@ enum EndpointKind {
     Bulk,
     /// Interrupt endpoint.
     Interrupt,
-    /// Isochronous endpoint (not forwardable over the sync API).
-    Isochronous,
+    /// Isochronous endpoint, with the endpoint descriptor's
+    /// `wMaxPacketSize` (the async path masks out the high-speed
+    /// transactions-per-microframe bits when chunking frames).
+    Isochronous { max_packet_size: u16 },
 }
 
 /// A physical USB device forwarded through libusb.
@@ -109,7 +113,9 @@ impl LibusbDevice {
                     let kind = match endpoint.transfer_type() {
                         rusb::TransferType::Bulk => EndpointKind::Bulk,
                         rusb::TransferType::Interrupt => EndpointKind::Interrupt,
-                        rusb::TransferType::Isochronous => EndpointKind::Isochronous,
+                        rusb::TransferType::Isochronous => EndpointKind::Isochronous {
+                            max_packet_size: endpoint.max_packet_size(),
+                        },
                         rusb::TransferType::Control => continue,
                     };
                     let is_in = endpoint.direction() == rusb::Direction::In;
@@ -204,9 +210,20 @@ impl UsbDeviceModel for LibusbDevice {
             Some(EndpointKind::Interrupt) => {
                 self.handle.write_interrupt(address, data, TRANSFER_TIMEOUT)
             }
-            Some(EndpointKind::Isochronous) => {
-                log::warn!("isochronous OUT on EP{endpoint} not forwardable over the sync API");
-                return UsbTransferResult::Error;
+            Some(EndpointKind::Isochronous { max_packet_size }) => {
+                // The async path drives the same libusb context the
+                // synchronous calls use; raw pointers stay inside this
+                // call while `self.handle` is alive.
+                return unsafe {
+                    iso_transfer_out(
+                        self.handle.as_raw(),
+                        self.handle.context().as_raw(),
+                        address,
+                        data,
+                        *max_packet_size,
+                        TRANSFER_TIMEOUT,
+                    )
+                };
             }
             // An endpoint the device's configuration does not declare.
             None => return UsbTransferResult::Error,
@@ -226,9 +243,17 @@ impl UsbDeviceModel for LibusbDevice {
                 self.handle
                     .read_interrupt(address, &mut buf, TRANSFER_TIMEOUT)
             }
-            Some(EndpointKind::Isochronous) => {
-                log::warn!("isochronous IN on EP{endpoint} not forwardable over the sync API");
-                return UsbTransferResult::Error;
+            Some(EndpointKind::Isochronous { max_packet_size }) => {
+                return unsafe {
+                    iso_transfer_in(
+                        self.handle.as_raw(),
+                        self.handle.context().as_raw(),
+                        address,
+                        max_len,
+                        *max_packet_size,
+                        TRANSFER_TIMEOUT,
+                    )
+                };
             }
             None => return UsbTransferResult::Error,
         };
