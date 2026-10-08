@@ -372,6 +372,7 @@ dependencies = [
  "async-trait",
  "bitflags 2.11.0",
  "byteorder",
+ "enlil-hal",
  "libc",
  "log",
  "rusb",
