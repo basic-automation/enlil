@@ -6,6 +6,7 @@
 //! carries the pieces it shares with the `enlil-core` daemon side — most
 //! importantly the [`protocol`] spoken between them.
 
+pub mod app;
 pub mod guest_tab;
 pub mod protocol;
 pub mod usb_tab;
