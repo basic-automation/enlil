@@ -89,6 +89,48 @@ pub fn cpuid_reveals_hypervisor(leaf1_ecx: u32, ebx: u32, ecx: u32, edx: u32) ->
     cpuid_hypervisor_present(leaf1_ecx) || hypervisor_vendor_from_signature(ebx, ecx, edx).is_some()
 }
 
+/// PCI vendor ID for `VirtIO` paravirtual devices — every `0x1AF4` device is a
+/// KVM/QEMU paravirtual device, regardless of device ID.
+const VIRTIO_PCI_VENDOR_ID: u16 = 0x1AF4;
+
+/// `(vendor_id, device_id, description)` for PCI devices that only exist under a
+/// hypervisor — the device-ID tells a pafish/al-khaser-style guest agent looks
+/// for when it enumerates the PCI bus (the complement to the NIC-OUI check).
+const HYPERVISOR_PCI_DEVICES: [(u16, u16, &str); 10] = [
+    (0x15AD, 0x0405, "VMware SVGA II display adapter"),
+    (0x15AD, 0x07B0, "VMware VMXNET3 network adapter"),
+    (0x15AD, 0x07C0, "VMware PVSCSI storage adapter"),
+    (0x15AD, 0x0740, "VMware VMCI communication interface"),
+    (0x80EE, 0xBEEF, "VirtualBox graphics adapter"),
+    (0x80EE, 0xCAFE, "VirtualBox guest service device"),
+    (0x5853, 0x0001, "Xen platform device"),
+    (0x1414, 0x5353, "Microsoft Hyper-V VMBus device"),
+    (0x1B36, 0x0100, "QEMU QXL paravirtual graphics"),
+    (0x1B36, 0x0005, "QEMU PCI test device"),
+];
+
+/// Whether a PCI `(vendor_id, device_id)` pair is a known hypervisor device.
+///
+/// Returns a short description of the tell (e.g. `"VMware SVGA II display
+/// adapter"`), or `None` when the device is not a recognized virtualization
+/// device. Any device with the `VirtIO` vendor ID (`0x1AF4`) is flagged whatever
+/// its device ID — all `VirtIO` PCI devices are KVM/QEMU paravirtual devices.
+///
+/// This is the device-enumeration check an in-guest agent runs over the PCI
+/// bus; enlil's virtual PCI topology must keep these IDs out of the guest's
+/// view (or present them only where the guest explicitly opted into a
+/// paravirtual device).
+#[must_use]
+pub fn pci_device_reveals_hypervisor(vendor_id: u16, device_id: u16) -> Option<&'static str> {
+    if vendor_id == VIRTIO_PCI_VENDOR_ID {
+        return Some("VirtIO paravirtual device (KVM/QEMU)");
+    }
+    HYPERVISOR_PCI_DEVICES
+        .iter()
+        .find(|&&(v, d, _)| v == vendor_id && d == device_id)
+        .map(|&(_, _, desc)| desc)
+}
+
 /// The 12-byte CPU vendor string from CPUID leaf 0, assembled from its `EBX`,
 /// `EDX`, `ECX` registers.
 ///
@@ -255,6 +297,36 @@ mod tests {
             u32::from_le_bytes(*b"M\0\0\0"),
         );
         assert!(!is_genuine_cpu_vendor(kvm.0, kvm.1, kvm.2));
+    }
+
+    #[test]
+    fn pci_device_ids_flag_known_hypervisor_devices() {
+        // Every curated table entry is a tell.
+        assert_eq!(
+            pci_device_reveals_hypervisor(0x15AD, 0x0405),
+            Some("VMware SVGA II display adapter")
+        );
+        assert_eq!(
+            pci_device_reveals_hypervisor(0x80EE, 0xBEEF),
+            Some("VirtualBox graphics adapter")
+        );
+        assert_eq!(
+            pci_device_reveals_hypervisor(0x5853, 0x0001),
+            Some("Xen platform device")
+        );
+        assert_eq!(
+            pci_device_reveals_hypervisor(0x1414, 0x5353),
+            Some("Microsoft Hyper-V VMBus device")
+        );
+        // Any VirtIO vendor device is a tell, whatever the device ID.
+        assert!(pci_device_reveals_hypervisor(0x1AF4, 0x1000).is_some());
+        assert!(pci_device_reveals_hypervisor(0x1AF4, 0x1041).is_some());
+        // Ordinary physical devices are clean.
+        assert_eq!(pci_device_reveals_hypervisor(0x8086, 0x1237), None); // Intel PIIX
+        assert_eq!(pci_device_reveals_hypervisor(0x8086, 0x100E), None); // Intel e1000
+        assert_eq!(pci_device_reveals_hypervisor(0x10DE, 0x1B80), None); // NVIDIA GPU
+        // Right vendor, wrong device is not a tell (except the VirtIO wildcard).
+        assert_eq!(pci_device_reveals_hypervisor(0x15AD, 0x1234), None);
     }
 
     #[test]
