@@ -1,0 +1,3 @@
+# cargo-fuzz build outputs (libFuzzer-instrumented). Never commit the 300M+
+# build tree; CI rebuilds it. The seed corpus in corpus/ stays checked in.
+target/
