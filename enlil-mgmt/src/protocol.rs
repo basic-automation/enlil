@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 
 // ---------------------------------------------------------------------------
@@ -298,6 +299,75 @@ impl Connection {
             }
             self.decoder.push(&self.read_buf[..n]);
         }
+    }
+
+    /// Split the connection into independent read and write halves.
+    ///
+    /// The halves can be used concurrently from different tasks — the pattern
+    /// the console's event loop uses: one task `recv`s server messages while
+    /// the loop `send`s keystroke commands, with no lock shared between them.
+    #[must_use]
+    pub fn into_split(self) -> (ConnectionReader, ConnectionWriter) {
+        let (read, write) = self.stream.into_split();
+        (
+            ConnectionReader {
+                stream: read,
+                decoder: self.decoder,
+                read_buf: self.read_buf,
+            },
+            ConnectionWriter { stream: write },
+        )
+    }
+}
+
+/// The read half of a split [`Connection`](Connection::into_split):
+/// receives [`ServerMessage`]s.
+#[derive(Debug)]
+pub struct ConnectionReader {
+    stream: OwnedReadHalf,
+    decoder: FrameDecoder,
+    read_buf: Vec<u8>,
+}
+
+impl ConnectionReader {
+    /// Receive the next server message (blocks until one is available).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::Disconnected`] when the peer closes the
+    /// stream, or any decode/IO error from the incoming frame.
+    pub async fn recv(&mut self) -> Result<ServerMessage, ProtocolError> {
+        loop {
+            if let Some(msg) = self.decoder.decode()? {
+                return Ok(msg);
+            }
+            let n = self.stream.read(&mut self.read_buf).await?;
+            if n == 0 {
+                return Err(ProtocolError::Disconnected);
+            }
+            self.decoder.push(&self.read_buf[..n]);
+        }
+    }
+}
+
+/// The write half of a split [`Connection`](Connection::into_split):
+/// sends [`ClientMessage`]s.
+#[derive(Debug)]
+pub struct ConnectionWriter {
+    stream: OwnedWriteHalf,
+}
+
+impl ConnectionWriter {
+    /// Send a client message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::Json`] if the message cannot be serialized,
+    /// or [`ProtocolError::Io`] if the write fails.
+    pub async fn send(&mut self, msg: &ClientMessage) -> Result<(), ProtocolError> {
+        let bytes = encode(msg)?;
+        self.stream.write_all(&bytes).await?;
+        Ok(())
     }
 }
 

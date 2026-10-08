@@ -29,17 +29,33 @@ enum Commands {
     Status,
     /// Stop all guests
     Stop,
+    /// Launch the interactive ratatui management console (event loop + socket
+    /// glue driving the guest and USB tabs against enlil-core)
+    Tui {
+        /// enlil-core management socket address (host:port)
+        #[arg(long, default_value = "127.0.0.1:5150")]
+        addr: String,
+    },
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     env_logger::init();
     let cli = Cli::parse();
 
-    let config = enlil_config::load_config(&cli.config)?;
-    log::info!("Loaded config with {} guest(s)", config.guest.len());
+    // The TUI talks to a running enlil-core over the socket and needs no local
+    // config file; only the config-driven subcommands load it.
+    let config = if matches!(cli.command, Commands::Validate | Commands::Start) {
+        let config = enlil_config::load_config(&cli.config)?;
+        log::info!("Loaded config with {} guest(s)", config.guest.len());
+        Some(config)
+    } else {
+        None
+    };
 
     match cli.command {
         Commands::Validate => {
+            let config = config.expect("config loaded for Validate");
             println!("Configuration is valid.");
             for (id, guest) in &config.guest {
                 println!(
@@ -57,6 +73,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Start => {
+            let config = config.expect("config loaded for Start");
             println!("Starting guests...");
 
             // Determine total memory (use configured or default 16GB)
@@ -118,6 +135,9 @@ fn main() -> anyhow::Result<()> {
         }
         Commands::Stop => {
             println!("Stop: not yet implemented (requires runtime state)");
+        }
+        Commands::Tui { addr } => {
+            enlil_mgmt::app::run_tui(&addr).await?;
         }
     }
 
