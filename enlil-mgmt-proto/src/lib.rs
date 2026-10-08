@@ -15,8 +15,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 // ---------------------------------------------------------------------------
 // Domain types

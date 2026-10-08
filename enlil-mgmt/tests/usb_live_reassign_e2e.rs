@@ -279,7 +279,9 @@ fn reassign_unknown_device_reports_failure_to_console() {
     assert!(!success);
     // The console surfaces the failure on its status line; nothing moved.
     assert!(
-        app.latest_status().unwrap_or("").starts_with("command FAILED:"),
+        app.latest_status()
+            .unwrap_or("")
+            .starts_with("command FAILED:"),
         "status: {:?}",
         app.latest_status()
     );
