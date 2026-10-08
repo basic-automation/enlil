@@ -126,7 +126,7 @@
   - [x] notification forwarding (3.7.4)
   - [x] fast inter-guest virtual network via the virtual switch (3.7.5)
   - [x] URL/protocol-handler scheme routing table + resolution logic (3.7.6)
-  - [ ] guest bridge-agent packaging/installers (.deb/.rpm/.msi) (3.7.7)
+  - [x] guest bridge-agent packaging/installers (.deb/.rpm/.msi) (3.7.7) — packaging for the `bridge-agent` crate (T-3.1b, in-guest daemon speaking the bridge wire protocol: clipboard/DnD/shared-fs/notify over /dev/enlil-bridge, Unix socket or TCP) producing `dist/`: genuine .deb (dpkg-deb, systemd unit, /etc/enlil/bridge-agent.toml), genuine .rpm (native RPM v4 writer, no rpmbuild), genuine .msi (msibuild from IDT tables + embedded CAB with a mingw cross-compiled x86_64 .exe installed as the EnlilBridgeAgent service)
   - [x] in-guest bridge-agent binary: clipboard/DnD/shared-fs client speaking the bridge protocol (T-3.1b)
 - [x] 3.8 Production platform-clock cadence — advance_platform_clocks drives advance_clocks from guest ref-cycles in the run loop
 - [x] 3.9 LAPIC TSC-deadline timer mode (IA32_TSC_DEADLINE install + fire_due_tsc_deadlines against guest TSC)
