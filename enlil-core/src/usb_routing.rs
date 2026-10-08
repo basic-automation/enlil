@@ -13,7 +13,7 @@ use enlil_config::{UsbConfig, UsbMatchKind};
 use enlil_devices::usb::registry::XhciRegistry;
 use enlil_devices::usb::routing::{DeviceMatcher, RoutingState, RoutingTable};
 use enlil_devices::usb::types::{GuestId, UsbDeviceClass};
-use enlil_devices::usb::SharedXhci;
+use enlil_devices::usb::{SharedXhci, VfioFallbackPolicy};
 
 /// Map a config-layer USB device-class token to a [`UsbDeviceClass`].
 ///
@@ -187,6 +187,30 @@ where
     Ok(registry)
 }
 
+/// Build the VFIO whole-controller fallback policy from a parsed
+/// [`UsbConfig`] (Phase 4.4): when `[usb.vfio_fallback]` is present and
+/// enabled, the guest-setup path installs the returned policy on the
+/// [`HotplugDispatcher`](enlil_devices::usb::hotplug::HotplugDispatcher) via
+/// [`set_vfio_fallback`](enlil_devices::usb::hotplug::HotplugDispatcher::set_vfio_fallback),
+/// so a failed per-device attach recommends the configured passthrough
+/// instead of silently stranding the device.
+///
+/// Returns `None` when the block is absent or disabled. The config layer
+/// already validated the BDF shape and that `target_guest` names a defined
+/// guest, so this is a straight mapping.
+#[must_use]
+pub fn vfio_fallback_policy_from_config(usb: &UsbConfig) -> Option<VfioFallbackPolicy> {
+    let fallback = usb.vfio_fallback.as_ref()?;
+    if !fallback.enabled {
+        return None;
+    }
+    Some(VfioFallbackPolicy {
+        bdf: fallback.bdf.clone(),
+        target_guest: fallback.target_guest.clone(),
+        allow_unstable_flr: fallback.allow_unstable_flr,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +236,7 @@ mod tests {
                 rule("class:hid", "linux1", 50),
                 rule("*", "linux1", 1000),
             ],
+            vfio_fallback: None,
         };
         let table = routing_table_from_config(&usb).expect("build table");
         assert_eq!(table.default_guest().map(String::as_str), Some("linux1"));
@@ -277,6 +302,7 @@ mod tests {
                 rule("046d:c52b", "windows1", 10), // a specific mouse
                 rule("class:hid", "linux2", 50),   // any other HID
             ],
+            vfio_fallback: None,
         };
         let table = routing_table_from_config(&usb).expect("build");
 
@@ -305,6 +331,7 @@ mod tests {
         let usb = UsbConfig {
             default_guest: Some("linux1".into()),
             routing: vec![rule("046d:c52b", "windows1", 10)],
+            vfio_fallback: None,
         };
         let state = routing_state_from_config(&usb).expect("build state");
 
@@ -332,6 +359,7 @@ mod tests {
         let usb = UsbConfig {
             default_guest: None,
             routing: vec![rule("class:teleporter", "linux1", 10)],
+            vfio_fallback: None,
         };
         // `RoutingTable` isn't `Debug`; drop the Ok payload before unwrap_err.
         let err = routing_table_from_config(&usb).map(|_| ()).unwrap_err();
@@ -366,6 +394,7 @@ mod tests {
                 // A second rule to the same guest must not duplicate it.
                 rule("1532:0084", "linux2", 30),
             ],
+            vfio_fallback: None,
         };
         let targets = routing_targets(&usb).expect("enumerate targets");
         assert_eq!(targets, vec!["linux1", "linux2", "windows1"]);
@@ -378,6 +407,7 @@ mod tests {
         let usb = UsbConfig {
             default_guest: Some("linux1".into()),
             routing: vec![rule("046d:c52b", "windows1", 10)],
+            vfio_fallback: None,
         };
         // Both the rule target (windows1) and the default (linux1) have
         // controllers, so the assembly succeeds.
@@ -413,10 +443,42 @@ mod tests {
     }
 
     #[test]
+    fn vfio_fallback_policy_maps_the_config_block() {
+        use enlil_config::UsbVfioFallback;
+
+        let mut usb = UsbConfig::default();
+        assert_eq!(vfio_fallback_policy_from_config(&usb), None);
+
+        usb.vfio_fallback = Some(UsbVfioFallback {
+            enabled: false,
+            bdf: "0000:03:00.0".into(),
+            target_guest: "linux1".into(),
+            allow_unstable_flr: false,
+        });
+        assert_eq!(vfio_fallback_policy_from_config(&usb), None);
+
+        usb.vfio_fallback = Some(UsbVfioFallback {
+            enabled: true,
+            bdf: "0000:03:00.0".into(),
+            target_guest: "linux1".into(),
+            allow_unstable_flr: true,
+        });
+        assert_eq!(
+            vfio_fallback_policy_from_config(&usb),
+            Some(VfioFallbackPolicy {
+                bdf: "0000:03:00.0".into(),
+                target_guest: "linux1".into(),
+                allow_unstable_flr: true,
+            })
+        );
+    }
+
+    #[test]
     fn registry_rejects_a_routing_target_without_a_controller() {
         let usb = UsbConfig {
             default_guest: None,
             routing: vec![rule("046d:c52b", "windows1", 10)],
+            vfio_fallback: None,
         };
         // windows1 has no registered controller — the assembly must refuse.
         let err = usb_registry_from_config(&usb, [("linux1", running_controller(4))])
