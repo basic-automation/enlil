@@ -7,6 +7,7 @@
 //!  MSI/MSI-X (addr+data) -------------+--> LAPIC 1 --> vCPU 1
 //! ```
 
+mod accel;
 mod controller;
 mod ioapic;
 mod lapic;
@@ -59,6 +60,7 @@ pub struct InterruptEntry {
     pub level: bool,
 }
 
+pub use accel::{AccelMode, AccelPostAction, InterruptAccel};
 pub use controller::InterruptController;
 pub use ioapic::IOAPIC_BASE;
 pub use ioapic::{IoApic, RedirectionEntry};

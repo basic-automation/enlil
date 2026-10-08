@@ -89,6 +89,8 @@ pub mod feature {
     pub const PAUSE_FILTER_THRESHOLD: u32 = 1 << 12;
     /// Advanced virtual interrupt controller.
     pub const AVIC: u32 = 1 << 13;
+    /// x2AVIC: AVIC with x2APIC backing (extended APIC ID support).
+    pub const X2AVIC: u32 = 1 << 14;
     /// Virtualized VMSAVE/VMLOAD.
     pub const V_VMSAVE_VMLOAD: u32 = 1 << 15;
     /// Virtualized GIF.
@@ -196,6 +198,16 @@ pub mod control {
 
     /// `NESTED_CTL` bit 0: enable nested paging for this guest.
     pub const NESTED_CTL_NP_ENABLE: u64 = 1 << 0;
+    /// `INT_CONTROL` bit 13: enable AVIC for this vCPU (APM §15.29).
+    pub const INT_CTL_AVIC_ENABLE: u64 = 1 << 13;
+    /// AVIC backing-page pointer (u64): the vCPU's 4 KiB virtual-APIC state page.
+    pub const AVIC_BACKING_PAGE_PTR: usize = 0x0F0;
+    /// AVIC logical APIC ID table pointer (u64): per-VM guest-logical →
+    /// guest-physical APIC ID map.
+    pub const AVIC_LOGICAL_ID_TABLE_PTR: usize = 0x0F8;
+    /// AVIC physical APIC ID table pointer (u64): per-VM guest-physical →
+    /// host-physical APIC ID map with `IsRunning` bits.
+    pub const AVIC_PHYSICAL_ID_TABLE_PTR: usize = 0x100;
 }
 
 /// Byte offsets inside the VMCB state-save area (APM Appendix B, Table B-2).

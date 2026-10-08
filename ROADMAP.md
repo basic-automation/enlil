@@ -102,7 +102,11 @@
 - [x] 3.3 Interrupt virtualization — per-guest IOAPIC/LAPIC and MSI/MSI-X delivery
   - [x] virtual IOAPIC + LAPIC per guest
   - [x] MSI/MSI-X message delivery (deliver_msi)
-  - [ ] APICv / posted-interrupt (Intel) and AVIC (AMD) acceleration
+  - [x] APICv / posted-interrupt (Intel) and AVIC (AMD) acceleration
+    - [x] Intel APICv in enlil-hal/src/apicv.rs: posted-interrupt descriptor (64 B, PIR/ON/SN/NV/NDST) with post→notify protocol, APICv capability decode from TRUE_CTLS MSRs, VMCS field encodings (descriptor addr, notification vector, virtual-APIC/APIC-access pages, TPR threshold, EOI-exit bitmaps), EOI-exit bitmap builder, virtual-APIC page helpers, per-vCPU ApicvVcpu state; unit-tested (descriptor layout/bit ops, caps decode, VM-entry constraint recipe, address alignment checks)
+    - [x] AMD AVIC in enlil-hal/src/avic.rs: 4 KiB backing page (IRR/TPR/EOI/APIC-ID at xAPIC offsets), logical + physical APIC ID tables (valid/IsRunning bits), doorbell MSR C001_011B post protocol, VMCB arming (0xF0/0xF8/0x100 pointers + INT_CONTROL bit 13) in enlil-hal/src/svm.rs, per-vCPU AvicVcpu state; unit-tested (table entry encode/decode, post→doorbell decision, VMCB programming)
+    - [x] accel policy layer enlil-devices/src/interrupt/accel.rs: AccelMode::select (APICv > AVIC > software), InterruptAccel::post → AccelPostAction (Notify IPI / doorbell / Pending / software fallback), place_vcpu/set_running placement tracking; existing software LAPIC path untouched
+    - [x] hardware-gated E2E documented in docs/src/apic-acceleration.md (probe → arm → functional → perf → migration checklist; no /dev/kvm or bare-metal runner on dev host, so E2E runs on real hardware)
 - [x] 3.4 Virtual timer & clock — PIT, HPET, TSC offset, paravirt clocks
   - [x] emulated PIT (i8254) and HPET
   - [x] per-guest TSC offsetting (TSC starts at 0, no host leak)
