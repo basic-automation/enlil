@@ -80,7 +80,10 @@ fn run(config_path: &str, kernel_path: &str, cmdline: &str) -> anyhow::Result<()
             .map_or(String::new(), |i| format!(" + initrd ({} bytes)", i.len())),
     );
     // A generous per-boot entry bound; a real guest runs until it halts/resets.
-    let outcome = enlil_core::orchestrator::run_first_guest(
+    // The live USB registry comes back alongside the outcome — the T-4.3
+    // slice drives the UsbMonitor + hot-plug dispatcher service loop against
+    // it; for now it is kept alive for the duration of the run.
+    let (outcome, _usb_registry) = enlil_core::orchestrator::run_first_guest(
         &config,
         &kernel,
         initrd.as_deref(),

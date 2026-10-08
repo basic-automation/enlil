@@ -19,7 +19,7 @@
 //! `target_os = "linux"`-only, like the run loop it drives.
 
 #[cfg(target_os = "linux")]
-pub use linux::{run_first_guest, GuestBootSpec, GuestRuntime, KernelBoot};
+pub use linux::{run_first_guest, usb_registry_for_boot, GuestBootSpec, GuestRuntime, KernelBoot};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -35,6 +35,10 @@ mod linux {
     use enlil_devices::stealth::cpuid::{CpuidStealthConfig, CpuidStealthTable};
     use enlil_devices::stealth::lbr::LbrPlatform;
     use enlil_devices::tpm::VirtualTpm;
+    use enlil_devices::usb::registry::XhciRegistry;
+    use enlil_devices::usb::types::GuestId;
+    use enlil_devices::usb::SharedXhci;
+    use std::rc::Rc;
 
     /// What to boot: one guest's payload and the resources it runs in. The boot
     /// CPU mode is chosen by which `prepare_*` constructor is called.
@@ -115,6 +119,15 @@ mod linux {
         /// Guest-physical base the RAM is mapped at — used to translate a
         /// guest-physical address (e.g. the FACS) to an offset into `ram`.
         load_base: u64,
+        /// The guest's virtual xHCI controller — the same [`SharedXhci`] the
+        /// guest's MMIO window drives, cloned out of the [`StandardPc`](crate::device_bus::StandardPc)
+        /// before it moved into the run loop. The USB-routing wiring (T-4.2)
+        /// registers this handle in the live
+        /// [`XhciRegistry`](enlil_devices::usb::registry::XhciRegistry) at
+        /// boot, so a configured `[usb.routing]` block routes hot-plugged
+        /// devices to this guest and the attach raises the Port Status Change
+        /// interrupt on the right controller.
+        xhci: SharedXhci,
         /// Backing store for the guest's RAM. Must be declared *after* `run` so it
         /// is dropped last — the KVM VM (inside `run`) referencing this memory must
         /// tear down before the buffer is freed.
@@ -136,11 +149,12 @@ mod linux {
         /// [`KvmBackend`], [`StealthRunLoop::install`], `map_memory`,
         /// `create_vcpu`, and `prepare_real_mode_vcpu`.
         pub fn prepare_real_mode(spec: GuestBootSpec) -> Result<Self> {
-            let (mut run, ram, entry, load_base) = Self::assemble(spec)?;
+            let (mut run, ram, entry, load_base, xhci) = Self::assemble(spec)?;
             run.backend_mut().prepare_real_mode_vcpu(0, entry)?;
             Ok(Self {
                 run,
                 load_base,
+                xhci,
                 ram,
             })
         }
@@ -157,11 +171,12 @@ mod linux {
         /// As [`prepare_real_mode`](Self::prepare_real_mode), but propagating
         /// `prepare_protected_mode_vcpu`.
         pub fn prepare_protected_mode(spec: GuestBootSpec) -> Result<Self> {
-            let (mut run, ram, entry, load_base) = Self::assemble(spec)?;
+            let (mut run, ram, entry, load_base, xhci) = Self::assemble(spec)?;
             run.backend_mut().prepare_protected_mode_vcpu(0, entry)?;
             Ok(Self {
                 run,
                 load_base,
+                xhci,
                 ram,
             })
         }
@@ -205,7 +220,7 @@ mod linux {
                 )));
             }
 
-            let (mut run, mut ram, entry, load_base) = Self::assemble(spec)?;
+            let (mut run, mut ram, entry, load_base, xhci) = Self::assemble(spec)?;
             // Identity-map the low 2 MiB (covering the payload and the tables
             // themselves) with the reusable page-table builder (item 1.3).
             let layout = paging::build_identity_map_2mib(
@@ -222,6 +237,7 @@ mod linux {
             Ok(Self {
                 run,
                 load_base,
+                xhci,
                 ram,
             })
         }
@@ -230,7 +246,9 @@ mod linux {
         /// install the run loop, allocate+load+map guest RAM, and create the boot
         /// vCPU. Returns the run loop, the RAM to keep alive, and the entry point;
         /// the caller applies the mode-specific `prepare_*_vcpu`.
-        fn assemble(spec: GuestBootSpec) -> Result<(StealthRunLoop, GuestRam, u64, u64)> {
+        fn assemble(
+            spec: GuestBootSpec,
+        ) -> Result<(StealthRunLoop, GuestRam, u64, u64, SharedXhci)> {
             if spec.entry < spec.load_base {
                 return Err(Error::Config(format!(
                     "entry {:#x} is below the load base {:#x}",
@@ -259,6 +277,12 @@ mod linux {
             )
             .map_err(|e| Error::HypervisorError(format!("build standard pc: {e}")))?;
 
+            // Keep the guest's xHCI controller handle — the same SharedXhci
+            // the guest's MMIO window drives — before `pc` moves into the run
+            // loop. The USB-routing wiring (T-4.2) binds each booted guest's
+            // handle into the live XhciRegistry at boot.
+            let xhci = Rc::clone(&pc.xhci);
+
             let backend = KvmBackend::new_without_irqchip()?;
             let mut run = StealthRunLoop::install(backend, pc, spec.platform)?;
 
@@ -284,7 +308,7 @@ mod linux {
             run.apply_topology_stealth(&table)?;
             run.apply_pmu_stealth(&table)?;
 
-            Ok((run, ram, spec.entry, spec.load_base))
+            Ok((run, ram, spec.entry, spec.load_base, xhci))
         }
 
         /// Run the boot vCPU until it halts, resets to `reset_entry`, or commits a
@@ -300,6 +324,17 @@ mod linux {
         /// first run.
         pub const fn run_loop_mut(&mut self) -> &mut StealthRunLoop {
             &mut self.run
+        }
+
+        /// The guest's virtual xHCI controller handle — the same
+        /// [`SharedXhci`] the guest's MMIO window drives. The USB-routing
+        /// wiring (T-4.2) registers this handle in the live
+        /// [`XhciRegistry`](enlil_devices::usb::registry::XhciRegistry) at
+        /// boot, so a configured `[usb.routing]` block routes hot-plugged
+        /// devices to this guest.
+        #[must_use]
+        pub const fn xhci(&self) -> &SharedXhci {
+            &self.xhci
         }
 
         /// Snapshot the boot vCPU's architectural state (the item 2.3 primitive) —
@@ -617,6 +652,34 @@ mod linux {
         }
     }
 
+    /// Assemble the live USB hot-plug registry for the booted guests from the
+    /// config's `[usb.routing]` block (Phase 4.3, T-4.2).
+    ///
+    /// `guests` pairs each booted guest's name with its xHCI controller handle
+    /// — the [`SharedXhci`] each guest's
+    /// [`StandardPc`](crate::device_bus::StandardPc) built at boot (see
+    /// [`GuestRuntime::xhci`]). This is the guest-boot-path caller
+    /// [`usb_registry_from_config`](crate::usb_routing::usb_registry_from_config)
+    /// was built for: once the orchestration builds a StandardPc (hence a
+    /// SharedXhci) per guest, the configured `[usb.routing]` populates the
+    /// live [`XhciRegistry`] instead of being silently ignored.
+    ///
+    /// The caller owns the returned registry — the run path drives a
+    /// `UsbMonitor` + hot-plug dispatcher service loop against it (the T-4.3
+    /// slice).
+    ///
+    /// # Errors
+    /// Returns [`Error::Config`] if a routing rule's match spec fails to parse
+    /// or a rule target (or the `default_guest`) names a guest with no
+    /// registered controller — i.e. a target that isn't being booted.
+    pub fn usb_registry_for_boot<I, S>(config: &EnlilConfig, guests: I) -> Result<XhciRegistry>
+    where
+        I: IntoIterator<Item = (S, SharedXhci)>,
+        S: Into<GuestId>,
+    {
+        crate::usb_routing::usb_registry_from_config(&config.usb, guests).map_err(Error::Config)
+    }
+
     /// Boot the first guest defined in `config` from a Linux `bzImage`, running it
     /// until it halts / resets / sleeps or `max_entries` guest entries elapse.
     ///
@@ -627,16 +690,24 @@ mod linux {
     /// the kernel with `cmdline` and optional `initrd`,
     /// [`boot_kernel`](GuestRuntime::boot_kernel), and [`run`](GuestRuntime::run).
     ///
+    /// The configured `[usb.routing]` block is consulted at boot (T-4.2):
+    /// [`usb_registry_for_boot`] binds the booted guest's xHCI controller into
+    /// a live [`XhciRegistry`] per the routing config, returned alongside the
+    /// run outcome so the caller can drive the hot-plug service loop against
+    /// it — the routing config is no longer silently ignored.
+    ///
     /// # Errors
-    /// Returns [`Error::Config`] if `config` has no guests; otherwise propagates
-    /// the [`GuestRuntime`] preparation, load, and run errors.
+    /// Returns [`Error::Config`] if `config` has no guests, or if the
+    /// `[usb.routing]` block names a target guest that isn't being booted (a
+    /// rule that can never attach); otherwise propagates the [`GuestRuntime`]
+    /// preparation, load, and run errors.
     pub fn run_first_guest(
         config: &EnlilConfig,
         kernel: &[u8],
         initrd: Option<&[u8]>,
         cmdline: &str,
         max_entries: usize,
-    ) -> Result<LoopOutcome> {
+    ) -> Result<(LoopOutcome, XhciRegistry)> {
         let guest = config
             .guest
             .values()
@@ -653,9 +724,13 @@ mod linux {
             LbrPlatform::detect_host(),
         );
         let mut runtime = GuestRuntime::prepare_real_mode(spec)?;
+        // T-4.2: consult the configured [usb.routing] at boot — assemble the
+        // live hot-plug registry bound to the booted guest's xHCI controller
+        // instead of silently ignoring the routing config.
+        let usb_registry = usb_registry_for_boot(config, [(&guest.name, runtime.xhci().clone())])?;
         let boot = runtime.load_bzimage(kernel, cmdline, initrd)?;
         runtime.boot_kernel(&boot)?;
-        runtime.run(0, max_entries)
+        Ok((runtime.run(0, max_entries)?, usb_registry))
     }
 }
 
@@ -1004,7 +1079,7 @@ mod tests {
         };
 
         match run_first_guest(&config, &image, None, "console=ttyS0", 100) {
-            Ok(outcome) => assert_eq!(
+            Ok((outcome, _usb_registry)) => assert_eq!(
                 outcome,
                 LoopOutcome::Halted,
                 "the config-driven kernel booted and halted"
@@ -1409,6 +1484,150 @@ mod tests {
             &*sink.lock().unwrap(),
             b"P",
             "guest read high MMIO in protected mode and greeted"
+        );
+    }
+
+    /// A running xHCI controller for the boot-wiring tests: MaxSlotsEn set and
+    /// Run/Stop enabled so it accepts an attach (mirrors the helper in
+    /// [`crate::usb_routing`]'s tests).
+    fn running_controller(ports: u8) -> enlil_devices::usb::SharedXhci {
+        use enlil_devices::usb::VirtualXhciController;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut c = VirtualXhciController::new(ports);
+        let op = u32::from(c.caps.caplength);
+        c.write_register(op + 0x38, 8); // CONFIG: MaxSlotsEn
+        c.write_register(op, 1); // USBCMD: R/S
+        Rc::new(RefCell::new(c))
+    }
+
+    fn boot_config_with_routing() -> enlil_config::EnlilConfig {
+        use enlil_config::{EnlilConfig, HypervisorConfig, UsbConfig, UsbRoutingRule};
+        use std::collections::HashMap;
+
+        EnlilConfig {
+            hypervisor: HypervisorConfig::default(),
+            guest: HashMap::new(),
+            usb: UsbConfig {
+                default_guest: Some("vm1".into()),
+                routing: vec![UsbRoutingRule {
+                    match_spec: "046d:c52b".into(),
+                    target: "vm2".into(),
+                    priority: 10,
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn usb_registry_for_boot_consults_the_config_routing_block() {
+        use enlil_devices::usb::registry::AttachOutcome;
+        use enlil_devices::usb::types::{UsbDeviceClass, UsbDeviceId, UsbSpeed};
+
+        let config = boot_config_with_routing();
+        // Both routing targets — the rule target vm2 and the default vm1 —
+        // are booted, so the wiring binds both controllers into the live
+        // registry instead of silently ignoring the [usb.routing] block.
+        let mut registry = usb_registry_for_boot(
+            &config,
+            [
+                ("vm1".to_string(), running_controller(4)),
+                ("vm2".to_string(), running_controller(4)),
+            ],
+        )
+        .expect("assemble the live USB registry from the boot config");
+        assert!(
+            registry.controller("vm1").is_some(),
+            "the default guest's controller is registered"
+        );
+        assert!(
+            registry.controller("vm2").is_some(),
+            "the rule target's controller is registered"
+        );
+
+        // The configured rule drives live routing: the 046d:c52b mouse
+        // attaches to vm2's controller.
+        let mouse = UsbDeviceId {
+            vendor_id: 0x046d,
+            product_id: 0xc52b,
+            class: UsbDeviceClass::Hid,
+            speed: UsbSpeed::High,
+            serial: None,
+            manufacturer: None,
+            product: None,
+            port_path: None,
+        };
+        let outcome = registry.attach(3, &mouse).expect("attach routed device");
+        assert!(
+            matches!(outcome, AttachOutcome::Attached(ref p) if p.guest == "vm2"),
+            "the configured rule routes the mouse to vm2: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn usb_registry_for_boot_rejects_a_routing_target_that_is_not_booted() {
+        let config = boot_config_with_routing();
+        // vm2 is routed to but not booted — the wiring must refuse rather
+        // than silently ignore the rule.
+        let err = usb_registry_for_boot(&config, [("vm1".to_string(), running_controller(4))])
+            .map(|_| ())
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("vm2"),
+            "error names the target lacking a controller: {msg}"
+        );
+    }
+
+    #[test]
+    fn usb_registry_for_boot_with_no_routing_config_is_an_empty_registry() {
+        use enlil_config::{EnlilConfig, HypervisorConfig, UsbConfig};
+        use std::collections::HashMap;
+
+        let config = EnlilConfig {
+            hypervisor: HypervisorConfig::default(),
+            guest: HashMap::new(),
+            usb: UsbConfig::default(),
+        };
+        let guests: Vec<(String, enlil_devices::usb::SharedXhci)> = Vec::new();
+        let registry =
+            usb_registry_for_boot(&config, guests).expect("empty routing config assembles");
+        assert!(
+            registry.controller("vm1").is_none(),
+            "no controllers registered for an empty routing config"
+        );
+    }
+
+    #[test]
+    fn guest_runtime_exposes_its_boot_built_xhci_controller() {
+        if !is_kvm_available() {
+            eprintln!("skipping guest_runtime_exposes_its_boot_built_xhci_controller: no /dev/kvm");
+            return;
+        }
+        let spec = GuestBootSpec {
+            name: "xhci-check".into(),
+            serial: SerialOutput::new("xhci-check", SerialOutputMode::Null),
+            ram_bytes: 0x2000,
+            load_base: 0x1000,
+            entry: 0x1000,
+            image: vec![0xF4], // hlt
+            rtc_unix_secs: 0,
+            platform: LbrPlatform::AmdSvm,
+        };
+        let guest = match GuestRuntime::prepare_real_mode(spec) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping guest_runtime_exposes_its_boot_built_xhci_controller: {e}");
+                return;
+            }
+        };
+        // The exposed handle is the guest's live controller — the same one
+        // the boot wiring registers into the XhciRegistry.
+        let xhci = guest.xhci();
+        assert!(
+            xhci.borrow_mut().connect_device(0, 3),
+            "the exposed handle drives the guest's controller"
         );
     }
 }
