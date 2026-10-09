@@ -149,6 +149,14 @@ pub const GUEST_VMMCALL_NUMBER: u16 = 0;
 /// [`GUEST_VMMCALL_NUMBER`] hypercall; the guest `OUT`s its low byte.
 pub const GUEST_VMMCALL_RESULT: u8 = 0x2A;
 
+/// The port the `rdtsc`-emulate boot guest writes the low byte of its
+/// guest-visible TSC (`EAX` after `RDTSC`) to.
+///
+/// Proving the guest's `RDTSC` executed and enlil's intercept path observed it
+/// — or, where the intercept cannot fire, that the guest still ran cleanly to
+/// `HLT`.
+pub const GUEST_RDTSC_PORT: u8 = 0x8A;
+
 /// The port the boot guest writes the byte it read through its `GS` segment to.
 ///
 /// `VMRUN` does not load `FS`/`GS`/`TR`/`LDTR` — only `VMLOAD` does — so a
@@ -587,6 +595,9 @@ pub struct GuestRunOutcome {
     pub npf_write_faults: u32,
     /// Intercepted `VMMCALL` hypercalls serviced.
     pub vmmcall_exits: u32,
+    /// Intercepted `RDTSC` reads emulated (the `TSC_OFFSET` fallback path —
+    /// [`TscVirt::Intercept`](enlil_hal::svm::TscVirt::Intercept)).
+    pub rdtsc_exits: u32,
     /// Intercepted guest exceptions re-delivered to the guest's own IDT/IVT.
     pub exception_exits: u32,
     /// Vector of the last intercepted guest exception, if any.
@@ -632,6 +643,7 @@ impl GuestRunOutcome {
             cpuid_leaf0_ebx: None,
             final_exit: 0,
             vmmcall_exits: 0,
+            rdtsc_exits: 0,
             exception_exits: 0,
             last_exception_vector: None,
             npf_write_faults: 0,
@@ -973,13 +985,37 @@ fn write_long_mode_periodic_tick_program(ram: &mut [u8]) {
     write_long_mode_gdt_and_gate(ram);
 }
 
+/// Stamp the real-mode **rdtsc-emulate** guest into `ram`: a guest that reads
+/// the TSC and reports what it saw, so the run loop's `RDTSC`-intercept
+/// fallback path ([`TscVirt::Intercept`](enlil_hal::svm::TscVirt::Intercept))
+/// can be exercised.
+///
+/// Entry at GPA 0: `rdtsc ; out PORT, al ; hlt`. The guest `OUT`s the low byte
+/// of `EAX` — the low byte of the guest-visible TSC — to
+/// [`GUEST_RDTSC_PORT`], then `HLT`s. Where the intercept fires (physical AMD)
+/// the run loop emulates the read with the per-guest offset, so the `OUT`'d
+/// byte is the low byte of `host_tsc_at_exit − host_tsc_at_program` (near
+/// zero-based); where it cannot fire (the nested-KVM harness's L2-TSC gap) the
+/// `RDTSC` executes natively and the guest still `HLT`s cleanly — either way
+/// the guest terminates (no hang) and the kernel logs which case it observed.
+///
+/// Pure and host-testable; the firmware builder arms the `RDTSC` intercept.
+#[cfg(any(target_os = "uefi", test))]
+const fn write_rdtsc_emulate_program(ram: &mut [u8]) {
+    ram[0] = 0x0F; // \ RDTSC → EDX:EAX = TSC (intercepted + emulated where the
+    ram[1] = 0x31; // / intercept fires)
+    ram[2] = 0xE6; // OUT imm8, AL (low byte of the guest-visible TSC)
+    ram[3] = GUEST_RDTSC_PORT;
+    ram[4] = 0xF4; // HLT
+}
+
 #[cfg(target_os = "uefi")]
 pub use hw::{
     enable_svm, program_boot_vmcb, program_event_inj_resume_vmcb, program_event_inj_vmcb,
     program_host_save_area, program_irq_resume_vmcb, program_long_mode_event_inj_vmcb,
     program_long_mode_preempt_vmcb, program_long_mode_vintr_vmcb, program_long_mode_vmcb,
-    program_periodic_tick_vmcb, program_timer_preempt_vmcb, program_timer_tick_vmcb,
-    program_ud_exception_vmcb, program_wp_npf_vmcb, run_boot_guest_loop,
+    program_periodic_tick_vmcb, program_rdtsc_emulate_vmcb, program_timer_preempt_vmcb,
+    program_timer_tick_vmcb, program_ud_exception_vmcb, program_wp_npf_vmcb, run_boot_guest_loop,
     run_periodic_tick_guest_loop, run_timer_tick_guest_loop,
 };
 
@@ -997,7 +1033,8 @@ mod hw {
         LongModeGuestSetup, MinimalGuestSetup, VmcbSegment, control, enable_io_intercept,
         enable_msr_intercept, encode_event_inj, encode_vintr, event_type, intercept_vmmcall,
         program_long_mode_hlt_guest, program_minimal_hlt_guest, save, set_event_inj,
-        set_exception_intercept, set_int_control, set_intr_intercept, write_segment,
+        set_exception_intercept, set_int_control, set_intr_intercept, set_rdtsc_intercept,
+        set_tsc_offset, write_segment,
     };
 
     /// Read a 64-bit MSR.
@@ -1423,6 +1460,99 @@ mod hw {
         let vmcb_pa = vmcb.base_addr();
         core::mem::forget(vmcb); // the VMCB must outlive this call for VMRUN
         Some((vmcb_pa, ncr3, guest_code_gpa))
+    }
+
+    /// Build a `VMRUN`-ready VMCB that exercises the **RDTSC-intercept
+    /// fallback** ([`TscVirt::Intercept`](enlil_hal::svm::TscVirt::Intercept)),
+    /// returning `vmcb_pa`.
+    ///
+    /// The guest
+    /// ([`write_rdtsc_emulate_program`](super::write_rdtsc_emulate_program))
+    /// executes `RDTSC`, `OUT`s the low byte of the guest-visible TSC to
+    /// [`GUEST_RDTSC_PORT`](super::GUEST_RDTSC_PORT), and `HLT`s. The VMCB arms
+    /// the `RDTSC` intercept ([`set_rdtsc_intercept`]) plus the I/O intercept
+    /// (for the `OUT`), and programs the `TSC_OFFSET` field to `-host_tsc`
+    /// captured just before return — the same per-guest offset the
+    /// [`TscOffset`](enlil_hal::svm::TscVirt::TscOffset) hardware path would
+    /// use, so the fallback hands the guest an identical value and the two
+    /// mechanisms are interchangeable (T-6.7 is the fallback for T-6.6's
+    /// mechanism; both may coexist).
+    ///
+    /// Where the intercept fires (physical AMD) the run loop emulates each
+    /// read via [`emulate_rdtsc`], `outcome.rdtsc_exits` counts it, and the
+    /// guest observes a near-zero-based TSC; where it cannot fire (the
+    /// nested-KVM harness's L2-TSC gap) the `RDTSC` executes natively and the
+    /// guest still `HLT`s — either way the guest terminates, so the boot
+    /// sequence never hangs on the harness. Assembled entirely through
+    /// `enlil-hal`; all allocations are leaked to outlive `VMRUN`. Returns
+    /// `None` on any allocation/programming failure.
+    #[must_use]
+    pub fn program_rdtsc_emulate_vmcb() -> Option<u64> {
+        // Allocate the guest's isolated RAM (2 MiB, 2 MiB-aligned) and stamp
+        // the rdtsc-emulate program at GPA 0:
+        //   rdtsc         0F 31     (intercepted → emulated where it fires)
+        //   out 0x8A, al  E6 8A     (IOIO → low byte of the guest TSC)
+        //   hlt           F4        (clean stop)
+        // Planned guest region when available, kernel heap otherwise.
+        let ram_raw = alloc_guest_ram()?;
+        let guest_spa = ram_raw as u64;
+        // SAFETY: ram_raw owns GUEST_RAM_BYTES writable bytes (leaked below).
+        super::write_rdtsc_emulate_program(unsafe {
+            core::slice::from_raw_parts_mut(ram_raw, GUEST_RAM_BYTES)
+        });
+
+        // Nested page tables mapping guest GPA [0, 2 MiB) onto the isolated RAM
+        // window at `guest_spa` (GPA 0 → guest_spa) — not an identity map.
+        // SAFETY: NptBuf has a nonzero size; alloc_zeroed yields a zeroed,
+        // 4 KiB-aligned NptBuf-sized block or null.
+        let npt_raw = unsafe { alloc_zeroed(Layout::new::<NptBuf>()) };
+        if npt_raw.is_null() {
+            return None;
+        }
+        let npt_pa = npt_raw as u64;
+        // SAFETY: npt_raw points at a live, zeroed, exclusively-owned NptBuf;
+        // it is leaked below so the slice never outlives the allocation.
+        let npt_buf = unsafe { core::slice::from_raw_parts_mut(npt_raw, 3 * 4096) };
+        let ncr3 = build_npt_2mib(npt_buf, npt_pa, guest_spa, GUEST_RAM_BYTES as u64)
+            .ok()?
+            .ncr3;
+
+        // Program a VMCB to enter the guest code at GPA 0 under that NPT.
+        let mut vmcb = Vmcb::new().ok()?;
+        let setup = MinimalGuestSetup {
+            asid: 1,
+            nested_cr3: ncr3,
+            entry_ip: 0,
+            code_base: 0,
+            stack_pointer: 0,
+        };
+        program_minimal_hlt_guest(vmcb.as_bytes_mut(), &setup).ok()?;
+
+        // Arm port-I/O interception so the guest's OUT takes an IOIO #VMEXIT.
+        // The IOPM intercepts every port; it is leaked so it outlives the
+        // VMRUN the CPU checks it against.
+        let iopm = IoPermissionsMap::intercept_all().ok()?;
+        enable_io_intercept(vmcb.as_bytes_mut(), iopm.base_addr());
+        core::mem::forget(iopm);
+
+        // Arm the RDTSC intercept: the fallback that virtualizes the guest's
+        // TSC reads when the TSC_OFFSET hardware path is unavailable or
+        // untrusted. Safe where the intercept cannot fire (the nested-KVM
+        // L2-TSC gap) — the guest's RDTSC then executes natively.
+        set_rdtsc_intercept(vmcb.as_bytes_mut());
+
+        // Program the per-guest TSC offset the fallback emulates with: the
+        // negative of the host TSC captured just before the guest runs, so the
+        // guest's TSC starts near zero — the same value the TscOffset hardware
+        // path would add, keeping the two mechanisms interchangeable. The
+        // offset lives in the TSC_OFFSET field even though the intercept path
+        // does not need the hardware to honor it.
+        let host_tsc = crate::tsc::read_tsc();
+        set_tsc_offset(vmcb.as_bytes_mut(), host_tsc.wrapping_neg() as i64);
+
+        let vmcb_pa = vmcb.base_addr();
+        core::mem::forget(vmcb); // the VMCB must outlive this call for VMRUN
+        Some(vmcb_pa)
     }
 
     /// Build a `VMRUN`-ready VMCB that proves **event injection**, returning
@@ -2506,6 +2636,27 @@ mod hw {
         }
     }
 
+    /// Emulate an intercepted guest `RDTSC` (LOCKED PRINCIPLE 1).
+    ///
+    /// The fallback when the VMCB `TSC_OFFSET` hardware path is unavailable or
+    /// untrusted ([`TscVirt::Intercept`](enlil_hal::svm::TscVirt::Intercept)):
+    /// the guest's TSC read is answered with `host_tsc + offset` — the same
+    /// value the hardware path would hand it — where `offset` is the signed
+    /// per-guest offset the builder programmed into the VMCB's `TSC_OFFSET`
+    /// field (typically `-host_tsc` captured before `VMRUN`, so the guest's
+    /// TSC starts near zero and the host's absolute TSC never leaks). The
+    /// emulation math itself is the pure
+    /// [`emulate_rdtsc`](enlil_hal::svm::emulate_rdtsc) (host-tested); the low
+    /// 32 bits are delivered via the VMCB (`EAX`), the high 32 via the GPR
+    /// shell (`EDX`), mirroring [`emulate_msr`].
+    fn emulate_rdtsc(vmcb: &mut [u8], gprs: &mut super::GuestGprs) {
+        use enlil_hal::svm::{set_guest_rax, tsc_offset};
+
+        let tsc = enlil_hal::svm::emulate_rdtsc(crate::tsc::read_tsc(), tsc_offset(vmcb));
+        set_guest_rax(vmcb, tsc & 0xFFFF_FFFF);
+        gprs.rdx = tsc >> 32;
+    }
+
     /// Demand-map the 2 MiB guest page that faulted, reading the faulting GPA
     /// and NPT root from `vmcb`.
     ///
@@ -2851,10 +3002,11 @@ mod hw {
     /// Classifies the exit through the `enlil-hal` seam
     /// ([`classify_run_loop_exit`](enlil_hal::svm::classify_run_loop_exit)) onto
     /// the arch-neutral model (LOCKED PRINCIPLE 2): `HLT`/`SHUTDOWN`/invalid
-    /// stop; `CPUID`/`RDMSR`/`WRMSR` are emulated-and-skipped
-    /// ([`emulate_cpuid`]/[`emulate_msr`]); `IOIO` is decoded + captured and
-    /// resumed at the `EXITINFO2` RIP; `NPF` is demand-mapped ([`demand_map_npf`])
-    /// and resumed *without* advancing RIP so the access re-executes.
+    /// stop; `CPUID`/`RDMSR`/`WRMSR`/`RDTSC` are emulated-and-skipped
+    /// ([`emulate_cpuid`]/[`emulate_msr`]/[`emulate_rdtsc`]); `IOIO` is decoded
+    /// + captured and resumed at the `EXITINFO2` RIP; `NPF` is demand-mapped
+    /// ([`demand_map_npf`]) and resumed *without* advancing RIP so the access
+    /// re-executes.
     ///
     /// # Safety
     ///
@@ -2868,7 +3020,7 @@ mod hw {
     ) -> bool {
         use enlil_hal::VmExit;
         use enlil_hal::svm::{
-            CPUID_INSN_LEN, IoioExitInfo, MSR_INSN_LEN, NptFaultInfo, RunLoopExit,
+            CPUID_INSN_LEN, IoioExitInfo, MSR_INSN_LEN, NptFaultInfo, RDTSC_INSN_LEN, RunLoopExit,
             VMMCALL_INSN_LEN, classify_run_loop_exit, encode_event_inj, event_type,
             exception_has_error_code, exit_code, exit_info_1, exit_info_2, guest_rax, guest_rip,
             ioio_to_vmexit, next_rip, resume_rip_after, set_event_inj, set_guest_rip,
@@ -2913,6 +3065,13 @@ mod hw {
                 outcome.msr_exits += 1;
                 emulate_msr(vmcb, gprs, msr_shadow);
                 let rip = resume_rip_after(next_rip(vmcb), guest_rip(vmcb), MSR_INSN_LEN);
+                set_guest_rip(vmcb, rip);
+                return true;
+            }
+            RunLoopExit::Rdtsc => {
+                outcome.rdtsc_exits += 1;
+                emulate_rdtsc(vmcb, gprs);
+                let rip = resume_rip_after(next_rip(vmcb), guest_rip(vmcb), RDTSC_INSN_LEN);
                 set_guest_rip(vmcb, rip);
                 return true;
             }
@@ -3382,5 +3541,20 @@ mod tests {
         assert_eq!(cleared & VM_CR_SVMDIS, 0);
         assert_ne!(cleared & VM_CR_LOCK, 0);
         assert_ne!(cleared & 1, 0);
+    }
+
+    #[test]
+    fn rdtsc_emulate_program_is_rdtsc_out_hlt() {
+        let mut ram = vec![0u8; 0x1000];
+        write_rdtsc_emulate_program(&mut ram);
+
+        // Entry at GPA 0: RDTSC; OUT GUEST_RDTSC_PORT, AL; HLT.
+        assert_eq!(ram[0], 0x0F, "RDTSC opcode byte 1");
+        assert_eq!(ram[1], 0x31, "RDTSC opcode byte 2");
+        assert_eq!(ram[2], 0xE6, "OUT imm8, AL");
+        assert_eq!(ram[3], GUEST_RDTSC_PORT);
+        assert_eq!(ram[4], 0xF4, "HLT");
+        // Nothing else stamped — the rest of the page stays zeroed.
+        assert!(ram[5..].iter().all(|&b| b == 0));
     }
 }

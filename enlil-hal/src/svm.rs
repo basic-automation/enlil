@@ -377,6 +377,8 @@ pub mod exit_code {
     pub const NMI: u64 = 0x061;
     /// CPUID instruction.
     pub const CPUID: u64 = 0x072;
+    /// `RDTSC` instruction (intercepted — see [`super::set_rdtsc_intercept`]).
+    pub const RDTSC: u64 = 0x075;
     /// PAUSE instruction.
     pub const PAUSE: u64 = 0x077;
     /// HLT instruction.
@@ -681,6 +683,29 @@ pub fn intr_intercepted(region: &[u8]) -> bool {
     get_u32(region, control::INTERCEPT_MISC1) & intercept1::INTR != 0
 }
 
+/// Arm the `RDTSC` intercept on a programmed VMCB.
+///
+/// Sets the `RDTSC` intercept bit (preserving the other misc-1 intercepts).
+/// With it set, a guest `RDTSC` takes an [`RDTSC`](exit_code::RDTSC) `#VMEXIT`
+/// ([`RunLoopExit::Rdtsc`]) instead of reading the TSC directly — the fallback
+/// that virtualizes the guest's TSC reads when the `TSC_OFFSET` hardware path
+/// is unavailable or untrusted ([`TscVirt::Intercept`]; the run loop emulates
+/// the read with [`emulate_rdtsc`]). NOTE: the nested-KVM harness does not fire
+/// this intercept for an L2 guest (the L2-TSC gap documented at ROADMAP 6.2),
+/// so the intercept is physical-AMD-proven-only; arming it is still safe under
+/// the harness — the guest's `RDTSC` simply executes natively there.
+pub fn set_rdtsc_intercept(region: &mut [u8]) {
+    let misc1 = get_u32(region, control::INTERCEPT_MISC1) | intercept1::RDTSC;
+    put_u32(region, control::INTERCEPT_MISC1, misc1);
+}
+
+/// Whether the `RDTSC` intercept is armed on `region` (see
+/// [`set_rdtsc_intercept`]).
+#[must_use]
+pub fn rdtsc_intercepted(region: &[u8]) -> bool {
+    get_u32(region, control::INTERCEPT_MISC1) & intercept1::RDTSC != 0
+}
+
 /// Map a #VMEXIT code that needs no further VMCB reads onto the arch-neutral
 /// [`VmExit`](crate::VmExit).
 ///
@@ -735,10 +760,12 @@ pub const fn resume_rip_after(next_rip: u64, guest_rip: u64, insn_len: u64) -> u
 /// This is the single control-flow decision the [`run`-loop](exit_code) makes
 /// per exit — kept pure and host-tested here (the ISA seam, LOCKED PRINCIPLE
 /// 2) so the privileged `VMRUN` driver above it stays a thin dispatcher. The
-/// two resumable variants differ in how the loop advances RIP:
-/// [`Cpuid`](RunLoopExit::Cpuid) skips a fixed-length instruction via
-/// [`resume_rip_after`]; [`Io`](RunLoopExit::Io) advances to the `EXITINFO2`
-/// RIP the hardware saved past the `IN`/`OUT`.
+/// resumable variants differ in how the loop advances RIP:
+/// [`Cpuid`](RunLoopExit::Cpuid), [`Msr`](RunLoopExit::Msr),
+/// [`Rdtsc`](RunLoopExit::Rdtsc) and [`Vmmcall`](RunLoopExit::Vmmcall) skip
+/// their fixed-length instruction via [`resume_rip_after`];
+/// [`Io`](RunLoopExit::Io) advances to the `EXITINFO2` RIP the hardware saved
+/// past the `IN`/`OUT`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunLoopExit {
     /// Guest executed `HLT` — the minimal guest's expected clean stop.
@@ -759,6 +786,17 @@ pub enum RunLoopExit {
     /// read/write direction in `EXITINFO1` ([`msr_exit_is_write`]); emulate the
     /// stealth value, then resume past the fixed-length instruction.
     Msr,
+    /// Intercepted `RDTSC` — the timing-stealth fallback (ROADMAP 6.2, T-6.7):
+    /// when the VMCB `TSC_OFFSET` hardware path is unavailable or untrusted,
+    /// the run loop arms the `RDTSC` intercept ([`set_rdtsc_intercept`]) and
+    /// emulates each read with [`emulate_rdtsc`] — the guest sees
+    /// `host_tsc + offset`, the same value the hardware path would produce, so
+    /// the host's absolute TSC never leaks (LOCKED PRINCIPLE 1) — then resumes
+    /// past the fixed-length instruction. NOTE: the nested-KVM harness fires
+    /// this intercept for neither an L2 guest nor honors an L2 `TSC_OFFSET`,
+    /// so the boot proof of this path is physical-AMD-only; the
+    /// classification, intercept-arming, and emulation math are host-tested.
+    Rdtsc,
     /// Nested page fault — the guest touched a guest-physical address the NPT
     /// does not map. `EXITINFO1` is the fault error code ([`NptFaultInfo`]),
     /// `EXITINFO2` the faulting guest-physical address; the caller maps the page
@@ -804,13 +842,19 @@ pub const VMMCALL_INSN_LEN: u64 = 3;
 /// CPU does not save `NEXT_RIP` (see [`resume_rip_after`]).
 pub const MSR_INSN_LEN: u64 = 2;
 
+/// Length of the `RDTSC` instruction in bytes (opcode `0F 31`).
+///
+/// The amount to advance guest `RIP` past an intercepted `RDTSC` when the CPU
+/// does not save `NEXT_RIP` (see [`resume_rip_after`]).
+pub const RDTSC_INSN_LEN: u64 = 2;
+
 /// Classify a #VMEXIT code for the minimal guest-run loop (see
 /// [`RunLoopExit`]).
 ///
 /// An [`INVALID`](exit_code::INVALID) code maps to [`RunLoopExit::Invalid`];
-/// `HLT`/`SHUTDOWN` to their terminal variants; `CPUID`/`IOIO`/`MSR`/`NPF`/
-/// `VMMCALL` and an intercepted `INTR` to their resumable variants; everything
-/// else to [`RunLoopExit::Unhandled`].
+/// `HLT`/`SHUTDOWN` to their terminal variants; `CPUID`/`IOIO`/`MSR`/`RDTSC`/
+/// `NPF`/`VMMCALL` and an intercepted `INTR` to their resumable variants;
+/// everything else to [`RunLoopExit::Unhandled`].
 #[must_use]
 pub const fn classify_run_loop_exit(code: SvmExitCode) -> RunLoopExit {
     if code.is_invalid() {
@@ -825,6 +869,7 @@ pub const fn classify_run_loop_exit(code: SvmExitCode) -> RunLoopExit {
         exit_code::CPUID => RunLoopExit::Cpuid,
         exit_code::IOIO => RunLoopExit::Io,
         exit_code::MSR => RunLoopExit::Msr,
+        exit_code::RDTSC => RunLoopExit::Rdtsc,
         exit_code::NPF => RunLoopExit::Npf,
         exit_code::VMMCALL => RunLoopExit::Vmmcall,
         exit_code::INTR => RunLoopExit::Intr,
@@ -1300,6 +1345,48 @@ pub fn tsc_offset(region: &[u8]) -> i64 {
     get_u64(region, control::TSC_OFFSET).cast_signed()
 }
 
+/// How the run loop virtualizes a guest's TSC reads (`RDTSC`/`RDTSCP`).
+///
+/// The hardware path ([`TscOffset`](TscVirt::TscOffset)) programs the VMCB
+/// `TSC_OFFSET` field ([`set_tsc_offset`]): the CPU adds the signed offset to
+/// the physical TSC for every guest read with **no `#VMEXIT`**, so there is no
+/// trapped-read timing tell (LOCKED PRINCIPLE 1). The fallback
+/// ([`Intercept`](TscVirt::Intercept)) arms the `RDTSC` intercept
+/// ([`set_rdtsc_intercept`]) and emulates each read with [`emulate_rdtsc`].
+/// Both hand the guest the same value — `host_tsc + offset` — so the choice is
+/// purely about mechanism; a guest cannot distinguish which one served it.
+///
+/// enlil prefers the hardware path and takes the fallback when the offset is
+/// unavailable or untrusted: there is no CPUID bit reporting "the CPU honors
+/// `TSC_OFFSET`" — the proof is behavioral (ROADMAP 6.2 notes the nested-KVM
+/// harness silently ignores an L2 `TSC_OFFSET`). The boot kernel selects the
+/// policy per guest; the `rdtsc`-emulate boot guest exercises the fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TscVirt {
+    /// Offset the guest TSC in hardware via the VMCB `TSC_OFFSET` field.
+    TscOffset,
+    /// Intercept guest `RDTSC` and emulate each read with [`emulate_rdtsc`].
+    Intercept,
+}
+
+/// Emulate an intercepted guest `RDTSC`.
+///
+/// Returns the guest-visible TSC — `host_tsc + offset`, the same value the
+/// [`TscOffset`](TscVirt::TscOffset) hardware path would hand the guest (in
+/// `EDX`:`EAX` order when the caller splits it), so switching mechanisms never
+/// changes what the guest sees. `offset` is the signed per-guest TSC offset
+/// (what [`set_tsc_offset`] programs; typically `-host_tsc` captured just
+/// before `VMRUN`, making the guest's TSC start near zero and hiding the
+/// host's absolute TSC — LOCKED PRINCIPLE 1). Wrapping arithmetic, so an
+/// offset larger than the host TSC wraps instead of panicking. Pure (the
+/// caller supplies the raw `RDTSC` value read at `#VMEXIT` time) so it is
+/// host-testable; the privileged run loop delivers the low 32 bits through the
+/// VMCB (`EAX`) and the high 32 through the GPR shell (`EDX`).
+#[must_use]
+pub const fn emulate_rdtsc(host_tsc: u64, offset: i64) -> u64 {
+    host_tsc.wrapping_add(offset.cast_unsigned())
+}
+
 // ---------------------------------------------------------------------------
 // Event injection
 // ---------------------------------------------------------------------------
@@ -1607,6 +1694,51 @@ mod tests {
     }
 
     #[test]
+    fn set_rdtsc_intercept_arms_rdtsc_without_disturbing_other_intercepts() {
+        let mut region = [0u8; VMCB_SIZE];
+        let setup = MinimalGuestSetup {
+            asid: 1,
+            nested_cr3: 0x2000,
+            entry_ip: 0,
+            code_base: 0x1000,
+            stack_pointer: 0,
+        };
+        program_minimal_hlt_guest(&mut region, &setup).unwrap();
+        assert!(!rdtsc_intercepted(&region));
+        set_rdtsc_intercept(&mut region);
+        assert!(rdtsc_intercepted(&region));
+        let misc1 = get_u32(&region, control::INTERCEPT_MISC1);
+        assert_ne!(misc1 & intercept1::RDTSC, 0);
+        // The minimal guest's HLT/SHUTDOWN/CPUID intercepts are preserved, and
+        // arming RDTSC touches no permissions-map base pointer.
+        assert_ne!(misc1 & intercept1::HLT, 0);
+        assert_ne!(misc1 & intercept1::SHUTDOWN, 0);
+        assert_ne!(misc1 & intercept1::CPUID, 0);
+        assert_eq!(get_u64(&region, control::IOPM_BASE_PA), 0);
+        // Idempotent: a second arm leaves the bit set and nothing else changes.
+        set_rdtsc_intercept(&mut region);
+        assert_eq!(get_u32(&region, control::INTERCEPT_MISC1), misc1);
+    }
+
+    #[test]
+    fn emulate_rdtsc_matches_the_hardware_offset_value() {
+        // Zero offset: the guest sees the raw host TSC.
+        assert_eq!(emulate_rdtsc(0x1_0000_0005, 0), 0x1_0000_0005);
+        assert_eq!(emulate_rdtsc(0, 0), 0);
+        // The zero-based-TSC case: offset = -host_tsc ⇒ the guest sees ~0.
+        assert_eq!(
+            emulate_rdtsc(0x1234_5678_9ABC_DEF0, -0x1234_5678_9ABC_DEF0_i64),
+            0
+        );
+        // A small positive offset advances the guest TSC past the host's.
+        assert_eq!(emulate_rdtsc(100, 50), 150);
+        // Wrapping, not panicking, when the offset underflows the host TSC.
+        assert_eq!(emulate_rdtsc(10, -20), u64::MAX - 9);
+        // Carry into the high half: host TSC just below 2^32 with a +16 offset.
+        assert_eq!(emulate_rdtsc(0xFFFF_FFF0, 16), 0x1_0000_0000);
+    }
+
+    #[test]
     fn msrpm_read_bit_maps_the_three_windows() {
         // Low window (byte 0): 2 bits per MSR.
         assert_eq!(msrpm_read_bit(0x0000_0000), Some(0));
@@ -1708,6 +1840,12 @@ mod tests {
         assert_eq!(
             classify_run_loop_exit(SvmExitCode::from_raw(exit_code::MSR)),
             RunLoopExit::Msr
+        );
+        // An intercepted RDTSC is the timing-stealth fallback exit, routed for
+        // emulate-and-skip — distinct from an unrouted exit.
+        assert_eq!(
+            classify_run_loop_exit(SvmExitCode::from_raw(exit_code::RDTSC)),
+            RunLoopExit::Rdtsc
         );
         // Invalid guest state is distinct from an unrouted exit — the loop
         // aborts rather than re-VMRUNs.

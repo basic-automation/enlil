@@ -1286,6 +1286,12 @@ mod hw {
                         // the handler IRETQing back into the spin — the actual
                         // scheduled time-slice (ROADMAP 6.2 toward 6.7).
                         run_periodic_tick_guest(serial);
+                        // Fourteenth guest: exercise the RDTSC-intercept
+                        // fallback — the timing-stealth path taken when the
+                        // VMCB TSC_OFFSET hardware mechanism is unavailable or
+                        // untrusted (ROADMAP 6.2, T-6.7; physical-AMD-proven
+                        // only — the nested harness fires neither mechanism).
+                        run_rdtsc_emulate_guest(serial);
                     }
                     None => serial.write_str("enlil kernel: svm: vmcb VMRUN-ready FAILED\n"),
                 }
@@ -1994,6 +2000,57 @@ mod hw {
                 }
             }
             None => serial.write_str("enlil kernel: svm: wp-npf vmcb build FAILED\n"),
+        }
+    }
+
+    /// Build and run the RDTSC-intercept fallback guest, reporting whether
+    /// enlil's `RDTSC` intercept fired and virtualized the guest's TSC.
+    ///
+    /// The guest executes `RDTSC`, `OUT`s the low byte of the guest-visible TSC
+    /// to [`GUEST_RDTSC_PORT`](crate::svm::GUEST_RDTSC_PORT), and `HLT`s. Where
+    /// the intercept fires (physical AMD — the defined proof for this path,
+    /// T-6.7) the run loop emulates the read with the per-guest offset, so
+    /// `rdtsc_exits > 0` and the guest sees a near-zero-based TSC; where it
+    /// cannot fire (the nested-KVM harness's L2-TSC gap) the `RDTSC` executes
+    /// natively and the guest still `HLT`s. Either way the kernel logs which
+    /// case it observed — and the QEMU harness asserts the guest ran (ROADMAP
+    /// 6.2).
+    fn run_rdtsc_emulate_guest(serial: &SerialPort) {
+        use crate::svm::{GUEST_RDTSC_PORT, RunStop};
+        match crate::svm::program_rdtsc_emulate_vmcb() {
+            Some(vmcb) => {
+                // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
+                // is a VMRUN-ready VMCB from program_rdtsc_emulate_vmcb.
+                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                let mut vr = [0u8; 20];
+                let observed = run.io_out_to(u16::from(GUEST_RDTSC_PORT));
+                match run.stop {
+                    RunStop::Halted if run.rdtsc_exits > 0 => {
+                        serial.write_str(
+                            "enlil kernel: svm: rdtsc-emulate guest ran — RDTSC intercept fired (",
+                        );
+                        serial.write_str(format_u64(u64::from(run.rdtsc_exits), &mut vr));
+                        serial.write_str(" exits); guest TSC virtualized by enlil — RDTSC-intercept fallback works");
+                        if let Some(byte) = observed {
+                            serial.write_str(" (guest saw TSC low byte ");
+                            serial.write_str(format_u64(u64::from(byte), &mut vr));
+                            serial.write_str(")");
+                        }
+                        serial.write_str("\n");
+                    }
+                    RunStop::Halted => {
+                        serial.write_str(
+                            "enlil kernel: svm: rdtsc-emulate guest ran — RDTSC intercept did not fire (nested-KVM L2-TSC gap; the intercept path is physical-AMD-proven only)\n",
+                        );
+                    }
+                    _ => {
+                        serial.write_str(
+                            "enlil kernel: svm: rdtsc-emulate guest did NOT halt cleanly\n",
+                        );
+                    }
+                }
+            }
+            None => serial.write_str("enlil kernel: svm: rdtsc-emulate vmcb build FAILED\n"),
         }
     }
 
