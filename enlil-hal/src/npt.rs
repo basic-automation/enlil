@@ -101,6 +101,24 @@ pub enum NptError {
         /// The number of 2 MiB slots the map covers.
         num_2mib: u64,
     },
+    /// A [`NptDirtyLog::record`] GPA lay outside its tracked
+    /// `[base_gpa, base_gpa + num_pages * 2 MiB)` range.
+    GpaOutOfRange {
+        /// The offending guest-physical address.
+        gpa: u64,
+        /// The log's tracked range base.
+        base_gpa: u64,
+        /// The log's tracked 2 MiB page count.
+        num_pages: u64,
+    },
+    /// [`NptDirtyLog::new`]'s `[base_gpa, base_gpa + num_pages * 2 MiB)` range
+    /// overflowed the 64-bit address space.
+    DirtyRangeOverflow {
+        /// The rejected range base.
+        base_gpa: u64,
+        /// The rejected 2 MiB page count.
+        num_pages: u64,
+    },
 }
 
 /// Build a 2 MiB-huge-page identity map of `[0, bytes_to_map)` for use as an
@@ -325,6 +343,224 @@ pub fn set_npt_2mib_leaf_writable(
     };
     write_entry(buf, pd_off + pd_i * 8, updated);
     Ok(())
+}
+
+/// How many `u64` bitmap words an [`NptDirtyLog`] needs to track `num_pages`
+/// 2 MiB pages — one bit per page, rounded up.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)] // `usize` is 64 bits on every target
+// this crate builds for (`x86_64-unknown-{linux-gnu,uefi,enlil}`, Windows
+// x86-64), so the narrowing cannot truncate; `as` is the only conversion
+// available in a `const fn`.
+pub const fn dirty_bitmap_words(num_pages: u64) -> usize {
+    num_pages.div_ceil(64) as usize
+}
+
+/// A per-epoch dirty-page bitmap for NPT write-protection tracking.
+///
+/// The write-protect primitive ([`set_npt_2mib_leaf_writable`]) turns a guest
+/// write into a present+write nested page fault the backend observes — but a
+/// fault that is only recorded and granted makes tracking one-shot: the page
+/// stays writable, so later writes go untracked. A *true* per-epoch bitmap
+/// re-arms tracking after every record: the fault handler records the faulting
+/// page in the current epoch's bitmap, grants the write so the faulting store
+/// completes, and then **re-protects** the page — once the store has landed, at
+/// the next `#VMEXIT` — so the next write faults and is recorded again. The
+/// bitmap therefore answers "which pages were written at least once this
+/// epoch": the dirty set live migration and memory-pressure accounting
+/// consume. [`end_epoch`](Self::end_epoch) harvests that set, re-protects
+/// every recorded page, and clears the bitmap for the next epoch.
+///
+/// The log covers `num_pages` 2 MiB huge pages from the 2 MiB-aligned
+/// `base_gpa`; bit `i` covers
+/// `[base_gpa + i * 2 MiB, base_gpa + (i + 1) * 2 MiB)`. The bitmap is a
+/// caller-provided `u64` slice (no allocator — the boot kernel has none this
+/// early), sized with [`dirty_bitmap_words`].
+#[derive(Debug)]
+pub struct NptDirtyLog<'a> {
+    base_gpa: u64,
+    num_pages: u64,
+    bits: &'a mut [u64],
+}
+
+impl<'a> NptDirtyLog<'a> {
+    /// Track `num_pages` 2 MiB pages from `base_gpa`, recording into `bits`,
+    /// starting with a fresh (empty) epoch.
+    ///
+    /// # Errors
+    ///
+    /// - [`NptError::EmptyRegion`] if `num_pages == 0`;
+    /// - [`NptError::UnalignedBase`] if `base_gpa` is not 2 MiB-aligned;
+    /// - [`NptError::TablesExceedBuffer`] if `bits` holds fewer than
+    ///   [`dirty_bitmap_words`] words for `num_pages`;
+    /// - [`NptError::DirtyRangeOverflow`] if
+    ///   `[base_gpa, base_gpa + num_pages * 2 MiB)` overflows the address space.
+    pub fn new(base_gpa: u64, num_pages: u64, bits: &'a mut [u64]) -> Result<Self, NptError> {
+        if num_pages == 0 {
+            return Err(NptError::EmptyRegion);
+        }
+        if base_gpa & (HUGE_2MIB - 1) != 0 {
+            return Err(NptError::UnalignedBase);
+        }
+        let need = dirty_bitmap_words(num_pages);
+        if bits.len() < need {
+            return Err(NptError::TablesExceedBuffer {
+                needed: need * 8,
+                have: bits.len() * 8,
+            });
+        }
+        // Every page index the log hands out reconstructs its GPA as
+        // `base_gpa + page * 2 MiB`; reject a range whose end wraps.
+        let range_len = num_pages
+            .checked_mul(HUGE_2MIB)
+            .ok_or(NptError::DirtyRangeOverflow {
+                base_gpa,
+                num_pages,
+            })?;
+        base_gpa
+            .checked_add(range_len)
+            .ok_or(NptError::DirtyRangeOverflow {
+                base_gpa,
+                num_pages,
+            })?;
+        bits.fill(0);
+        Ok(Self {
+            base_gpa,
+            num_pages,
+            bits,
+        })
+    }
+
+    /// Guest-physical base of the tracked range.
+    #[must_use]
+    pub const fn base_gpa(&self) -> u64 {
+        self.base_gpa
+    }
+
+    /// Number of 2 MiB pages tracked.
+    #[must_use]
+    pub const fn num_pages(&self) -> u64 {
+        self.num_pages
+    }
+
+    /// Bitmap word index and bit mask for a page known to be in range.
+    const fn locate(page: u64) -> (usize, u64) {
+        // `page < num_pages <= u64::MAX` on a 64-bit target: no truncation.
+        let word = (page / 64) as usize;
+        let bit = page % 64;
+        (word, 1 << bit)
+    }
+
+    /// Page index of `gpa`, or `None` when it lies outside the tracked range.
+    const fn page_index(&self, gpa: u64) -> Option<u64> {
+        let Some(rel) = gpa.checked_sub(self.base_gpa) else {
+            return None;
+        };
+        let page = rel / HUGE_2MIB;
+        if page < self.num_pages {
+            Some(page)
+        } else {
+            None
+        }
+    }
+
+    /// Record a present+write nested page fault at `fault_gpa` in the current
+    /// epoch's bitmap. Any byte of the faulting 2 MiB page may have been
+    /// written — the page is the tracking granularity.
+    ///
+    /// Returns `true` when the page was not already dirty this epoch (a first
+    /// write), `false` when its bit was already set.
+    ///
+    /// # Errors
+    ///
+    /// - [`NptError::GpaOutOfRange`] if `fault_gpa` lies outside the tracked
+    ///   range.
+    pub fn record(&mut self, fault_gpa: u64) -> Result<bool, NptError> {
+        let page = self.page_index(fault_gpa).ok_or(NptError::GpaOutOfRange {
+            gpa: fault_gpa,
+            base_gpa: self.base_gpa,
+            num_pages: self.num_pages,
+        })?;
+        let (word, mask) = Self::locate(page);
+        let fresh = self.bits[word] & mask == 0;
+        self.bits[word] |= mask;
+        Ok(fresh)
+    }
+
+    /// Whether `gpa`'s page was written during the current epoch.
+    ///
+    /// # Errors
+    ///
+    /// - [`NptError::GpaOutOfRange`] if `gpa` lies outside the tracked range.
+    pub const fn is_dirty(&self, gpa: u64) -> Result<bool, NptError> {
+        let Some(page) = self.page_index(gpa) else {
+            return Err(NptError::GpaOutOfRange {
+                gpa,
+                base_gpa: self.base_gpa,
+                num_pages: self.num_pages,
+            });
+        };
+        let (word, mask) = Self::locate(page);
+        Ok(self.bits[word] & mask != 0)
+    }
+
+    /// How many pages were written during the current epoch.
+    #[must_use]
+    pub fn dirty_page_count(&self) -> u64 {
+        self.bits.iter().map(|w| u64::from(w.count_ones())).sum()
+    }
+
+    /// The guest-physical base of every page dirtied during the current epoch,
+    /// in ascending order — the epoch's dirty set, what a live-migration
+    /// collector sends before the next epoch begins.
+    pub fn dirty_pages(&self) -> impl Iterator<Item = u64> + '_ {
+        (0..self.num_pages).filter_map(|page| {
+            let (word, mask) = Self::locate(page);
+            if self.bits[word] & mask == 0 {
+                return None;
+            }
+            // `new` rejected a range whose end overflows, so this cannot fail.
+            self.base_gpa.checked_add(page * HUGE_2MIB)
+        })
+    }
+
+    /// Re-protect every page dirtied this epoch — clear `WRITABLE` on its NPT
+    /// leaf — **without** clearing the bitmap. This is the re-protect-after-
+    /// record step: the fault handler records the write ([`record`](Self::record))
+    /// and grants it so the faulting store completes, then re-protects (once
+    /// the store has landed — at the next `#VMEXIT`, whose re-`VMRUN` flushes
+    /// the TLB via `TLB_CONTROL_FLUSH_ALL`) so the *next* write faults and is
+    /// recorded again. Returns the number of pages re-protected.
+    ///
+    /// # Errors
+    ///
+    /// - [`NptError::NotAHugePageLeaf`] / [`NptError::IntermediateNotPresent`]
+    ///   from [`set_npt_2mib_leaf_writable`] when a recorded page's NPT leaf is
+    ///   missing or not a present 2 MiB huge-page leaf (the NPT changed under
+    ///   the log).
+    pub fn reprotect_recorded(&mut self, npt: &mut [u8], phys_base: u64) -> Result<u64, NptError> {
+        let mut count = 0u64;
+        for gpa in self.dirty_pages() {
+            set_npt_2mib_leaf_writable(npt, phys_base, gpa, false)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// End the epoch: re-protect every dirtied page
+    /// ([`reprotect_recorded`](Self::reprotect_recorded)) and clear the bitmap,
+    /// so the next epoch starts untracked. Returns the number of pages that
+    /// were dirty — the epoch's dirty set size.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`reprotect_recorded`](Self::reprotect_recorded); the bitmap is
+    /// cleared only when every re-protection succeeded.
+    pub fn end_epoch(&mut self, npt: &mut [u8], phys_base: u64) -> Result<u64, NptError> {
+        let count = self.reprotect_recorded(npt, phys_base)?;
+        self.bits.fill(0);
+        Ok(count)
+    }
 }
 
 /// Build a **4 KiB-granular** identity map of `num_pages` pages, leaving each
@@ -912,6 +1148,124 @@ mod tests {
             set_npt_2mib_leaf_writable(&mut buf, phys_base, 0x1000, false),
             Err(NptError::UnalignedBase)
         );
+    }
+
+    /// `true` when the 2 MiB leaf `index` in a single-PD map is writable.
+    fn leaf_writable(buf: &[u8], index: usize) -> bool {
+        read_entry(buf, 0x2000, index) & flags::WRITABLE != 0
+    }
+
+    #[test]
+    fn dirty_bitmap_words_rounds_up_to_whole_words() {
+        assert_eq!(dirty_bitmap_words(0), 0);
+        assert_eq!(dirty_bitmap_words(1), 1);
+        assert_eq!(dirty_bitmap_words(64), 1);
+        assert_eq!(dirty_bitmap_words(65), 2);
+        assert_eq!(dirty_bitmap_words(512), 8);
+    }
+
+    #[test]
+    fn dirty_log_rejects_bad_ranges() {
+        let mut words = [0u64; 2];
+        assert!(matches!(
+            NptDirtyLog::new(0, 0, &mut words),
+            Err(NptError::EmptyRegion)
+        ));
+        assert!(matches!(
+            NptDirtyLog::new(0x1000, 1, &mut words),
+            Err(NptError::UnalignedBase)
+        ));
+        // 65 pages need 2 words; 1 is short.
+        assert!(matches!(
+            NptDirtyLog::new(0, 65, &mut words[..1]),
+            Err(NptError::TablesExceedBuffer { .. })
+        ));
+        // A range whose end wraps the address space is rejected: 2 MiB-aligned
+        // base 2^64 - 2 MiB plus 2 pages overflows.
+        assert!(matches!(
+            NptDirtyLog::new(u64::MAX - HUGE_2MIB + 1, 2, &mut words),
+            Err(NptError::DirtyRangeOverflow { .. })
+        ));
+
+        // Fault/query GPAs outside the tracked range are rejected.
+        let mut log = NptDirtyLog::new(0, 2, &mut words).unwrap();
+        assert!(matches!(
+            log.record(2 * HUGE_2MIB),
+            Err(NptError::GpaOutOfRange { .. })
+        ));
+        assert!(matches!(
+            log.is_dirty(u64::MAX),
+            Err(NptError::GpaOutOfRange { .. })
+        ));
+        // Nothing was recorded by the rejected calls.
+        assert_eq!(log.dirty_page_count(), 0);
+    }
+
+    #[test]
+    fn dirty_log_records_reprotects_and_rotates_epochs() {
+        // Two 2 MiB pages mapped; both leaves start write-protected, as the
+        // run loop leaves them at an epoch's start.
+        let phys_base = 0x2_0000u64;
+        let mut npt = alloc::vec![0u8; 0x3000];
+        build_npt_2mib(&mut npt, phys_base, 0, 2 * HUGE_2MIB).unwrap();
+        set_npt_2mib_leaf_writable(&mut npt, phys_base, 0, false).unwrap();
+        set_npt_2mib_leaf_writable(&mut npt, phys_base, HUGE_2MIB, false).unwrap();
+
+        let mut words = [0u64; dirty_bitmap_words(2)];
+        let mut log = NptDirtyLog::new(0, 2, &mut words).unwrap();
+        assert_eq!(log.base_gpa(), 0);
+        assert_eq!(log.num_pages(), 2);
+
+        // First write to page 0 (any byte of the page): newly dirty.
+        assert_eq!(log.record(0x1234), Ok(true));
+        assert_eq!(log.is_dirty(0), Ok(true));
+        assert_eq!(log.is_dirty(HUGE_2MIB - 1), Ok(true));
+        assert_eq!(log.is_dirty(HUGE_2MIB), Ok(false));
+        assert_eq!(log.dirty_page_count(), 1);
+        // A second fault on the same page is not a *new* dirty page — the
+        // bitmap is per-epoch, not per-fault.
+        assert_eq!(log.record(HUGE_2MIB - 1), Ok(false));
+        assert_eq!(log.dirty_page_count(), 1);
+        // A fault on page 1 is.
+        assert_eq!(log.record(HUGE_2MIB + 0x42), Ok(true));
+        assert_eq!(log.dirty_page_count(), 2);
+        assert_eq!(
+            log.dirty_pages().collect::<alloc::vec::Vec<_>>(),
+            alloc::vec![0, HUGE_2MIB]
+        );
+
+        // Re-protect-after-record: the backend grants the write so the store
+        // completes, then re-protects. Both leaves go read-only again while
+        // the epoch bitmap keeps the dirty set.
+        set_npt_2mib_leaf_writable(&mut npt, phys_base, 0, true).unwrap();
+        set_npt_2mib_leaf_writable(&mut npt, phys_base, HUGE_2MIB, true).unwrap();
+        assert_eq!(log.reprotect_recorded(&mut npt, phys_base), Ok(2));
+        assert!(!leaf_writable(&npt, 0));
+        assert!(!leaf_writable(&npt, 1));
+        assert_eq!(log.dirty_page_count(), 2);
+
+        // End the epoch: the bitmap clears for the next epoch.
+        assert_eq!(log.end_epoch(&mut npt, phys_base), Ok(2));
+        assert_eq!(log.is_dirty(0), Ok(false));
+        assert_eq!(log.dirty_page_count(), 0);
+
+        // The next epoch tracks again — the one-shot trap is gone.
+        assert_eq!(log.record(0), Ok(true));
+        assert_eq!(log.dirty_page_count(), 1);
+    }
+
+    #[test]
+    fn dirty_log_reprotect_on_empty_epoch_touches_nothing() {
+        let phys_base = 0x2_0000u64;
+        let mut npt = alloc::vec![0u8; 0x3000];
+        build_npt_2mib(&mut npt, phys_base, 0, HUGE_2MIB).unwrap();
+
+        let mut words = [0u64; 1];
+        let mut log = NptDirtyLog::new(0, 1, &mut words).unwrap();
+        // No writes this epoch: nothing to re-protect, leaf stays writable.
+        assert_eq!(log.reprotect_recorded(&mut npt, phys_base), Ok(0));
+        assert!(leaf_writable(&npt, 0));
+        assert_eq!(log.end_epoch(&mut npt, phys_base), Ok(0));
     }
 
     #[test]
