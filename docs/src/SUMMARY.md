@@ -18,3 +18,4 @@
 # Runbooks
 
 - [Live USB reassignment: two-mice/two-keyboards manual verification](./usb-live-reassignment-manual.md)
+- [Anti-cheat validation (BattlEye/EAC/Vanguard) + pafish/al-khaser runbook](./anti-cheat-validation.md)

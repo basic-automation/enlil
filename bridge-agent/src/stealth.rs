@@ -25,10 +25,13 @@
 
 use enlil_devices::{
     net::MacAddress,
-    stealth::detection::{
-        BARE_METAL_CPUID_CYCLE_CEILING, cpuid_hypervisor_present, hypervisor_vendor_from_signature,
-        is_genuine_cpu_vendor, median_cycles, pci_device_reveals_hypervisor,
-        timing_reveals_hypervisor,
+    stealth::{
+        detection::{
+            BARE_METAL_CPUID_CYCLE_CEILING, cpuid_hypervisor_present,
+            hypervisor_vendor_from_signature, is_genuine_cpu_vendor, median_cycles,
+            pci_device_reveals_hypervisor, timing_reveals_hypervisor,
+        },
+        suites,
     },
 };
 
@@ -411,6 +414,32 @@ pub fn run_detection() -> DetectionReport {
     }
 
     DetectionReport { results }
+}
+
+/// Map a completed in-guest detection run onto the pafish + al-khaser check
+/// inventories (roadmap item 5.8, T-5.4).
+///
+/// This is the machine-readable form of "pafish and al-khaser run clean in an
+/// enlil guest": the agent's verdicts flow into
+/// [`suites::evaluate_both_suites`], so every inventory check the agent can
+/// automate is resolved to clean/tell/skipped, and the rest are marked
+/// mitigated (stealth primitive / by construction) or parked behind a real
+/// Windows-guest run of the suite binaries.
+#[must_use]
+pub fn suite_coverage_report(report: &DetectionReport) -> suites::SuiteRunReport<'static> {
+    let agent: Vec<(&str, suites::AgentVerdict)> = report
+        .results
+        .iter()
+        .map(|r| {
+            let verdict = match r.status {
+                CheckStatus::Pass => suites::AgentVerdict::Pass,
+                CheckStatus::Tell => suites::AgentVerdict::Tell,
+                CheckStatus::Skipped => suites::AgentVerdict::Skipped,
+            };
+            (r.check, verdict)
+        })
+        .collect();
+    suites::evaluate_both_suites(&agent)
 }
 
 // ---------------------------------------------------------------------------
@@ -979,6 +1008,61 @@ mod tests {
         assert_eq!(report.counts(), (7, 0, 0));
         let text = report.to_string();
         assert!(text.contains("no hypervisor tells"));
+    }
+
+    /// The pafish + al-khaser suite coverage report for a clean enlil guest:
+    /// every automatable check is clean, nothing is a tell, and the only
+    /// non-mitigated remainder is the documented Windows-guest runbook.
+    #[test]
+    fn suite_coverage_report_for_clean_guest_has_no_tells() {
+        let mut results = Vec::new();
+        results.extend(evaluate_cpuid(&clean_cpuid_readings()));
+        results.push(evaluate_timing(&TimingSample {
+            deltas: vec![200; 32],
+        }));
+        results.push(evaluate_pci(&[]));
+        results.push(evaluate_nics(&[NicInfo {
+            name: "eth0".to_string(),
+            mac: [0x02, 0x9a, 0x3c, 0x11, 0x22, 0x33],
+        }]));
+        results.push(evaluate_registry(&[]));
+        let report = DetectionReport { results };
+
+        let suite_report = suite_coverage_report(&report);
+        assert!(
+            !suite_report.any_tells(),
+            "a clean enlil guest must show no suite tells"
+        );
+        let (clean, tell, skipped, mitigated, windows) = suite_report.counts();
+        assert_eq!(tell, 0);
+        assert_eq!(skipped, 0, "a full agent run leaves no suite check skipped");
+        assert!(clean > 0, "automatable checks must resolve clean");
+        assert!(
+            mitigated > 0,
+            "stealth/by-construction checks must be mitigated"
+        );
+        assert!(windows > 0, "Windows-only checks stay in the runbook");
+        let text = suite_report.to_string();
+        assert!(text.contains("no hypervisor tells in automated coverage"));
+    }
+
+    /// A tell in the agent run surfaces as a tell in the suite report, so the
+    /// suite coverage can never silently launder a detection.
+    #[test]
+    fn suite_coverage_report_propagates_a_tell() {
+        let readings = CpuidReadings {
+            hv_ebx: u32::from_le_bytes(*b"KVMK"),
+            hv_ecx: u32::from_le_bytes(*b"VMKV"),
+            hv_edx: u32::from_le_bytes(*b"M\0\0\0"),
+            ..clean_cpuid_readings()
+        };
+        let report = DetectionReport {
+            results: evaluate_cpuid(&readings).to_vec(),
+        };
+        assert!(report.has_hypervisor_tell());
+        let suite_report = suite_coverage_report(&report);
+        assert!(suite_report.any_tells());
+        assert!(suite_report.to_string().contains("HYPERVISOR TELL FOUND"));
     }
 
     #[test]
