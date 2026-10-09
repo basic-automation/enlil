@@ -240,6 +240,13 @@ TIMER_PREEMPT_LINE="preempted by the host LAPIC timer"
 # sentinel and HLTs) — the full path a scheduler tick takes from a host hardware
 # clock into a running guest OS.
 TIMER_TICK_LINE="timer tick delivered into the guest"
+# Printed once enlil re-arms the host LAPIC timer on EVERY INTR exit and
+# re-posts the virtual tick, so a spinning guest is preempted every quantum —
+# the handler IRETQs back into the spin instead of halting. The actual
+# scheduled time-slice: periodic timer-driven preemption + tick delivery
+# (ROADMAP 6.2 toward 6.7). Two or more ticks prove the re-arm fired (a
+# one-shot timer could only ever produce one).
+PERIODIC_TICK_LINE="periodic LAPIC-timer preemption"
 # Printed once enlil traps a guest's own #UD (invalid-opcode fault), arms it via
 # the VMCB exception-intercept bitmap, and re-injects it into the guest's own
 # real-mode IVT handler — exception virtualization (trap + re-deliver a guest fault).
@@ -446,12 +453,13 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PREEMPT_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$TIMER_PREEMPT_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$TIMER_TICK_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$PERIODIC_TICK_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$UD_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$IRQ_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$WP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_TEXT_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, scheduler quantum driven by the LAPIC timer, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery incl. real VT-d DMAR remapping units + device scopes, SMP AP bring-up (INIT-SIPI-SIPI), PCI enumeration, own page tables (null-page guard) + 4 KiB split + kernel-owned guarded stack (bring-up continues on it), SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + interrupt IRET-resume round-trip + 64-bit long-mode guest + long-mode interrupt round-trip + virtual-interrupt masking + spinning-guest preemption + host-LAPIC-timer preemption (INTR intercept) + timer-tick delivery into the guest + guest-exception interception (#UD trap + re-inject) + interrupt round-trip (inject/handle/IRET/resume) + NPT write-protection dirty-tracking (trap+grant a guest store), and GOP draw observed on serial"
+    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, scheduler quantum driven by the LAPIC timer, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery incl. real VT-d DMAR remapping units + device scopes, SMP AP bring-up (INIT-SIPI-SIPI), PCI enumeration, own page tables (null-page guard) + 4 KiB split + kernel-owned guarded stack (bring-up continues on it), SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + interrupt IRET-resume round-trip + 64-bit long-mode guest + long-mode interrupt round-trip + virtual-interrupt masking + spinning-guest preemption + host-LAPIC-timer preemption (INTR intercept) + timer-tick delivery into the guest + PERIODIC timer preemption + tick delivery (host timer re-armed per quantum, handler IRETQ back into the spin — the guest time-slice) + guest-exception interception (#UD trap + re-inject) + interrupt round-trip (inject/handle/IRET/resume) + NPT write-protection dirty-tracking (trap+grant a guest store), and GOP draw observed on serial"
     exit 0
 fi
 

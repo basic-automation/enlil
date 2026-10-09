@@ -347,6 +347,17 @@ pub const GUEST_LM_PREEMPT_PORT: u8 = 0x8F;
 /// The byte the preemption guest's handler `OUT`s before halting.
 pub const GUEST_LM_PREEMPT_SENTINEL: u8 = 0x44;
 
+/// The port the long-mode **periodic-tick** guest's handler `OUT`s on *every*
+/// delivered tick.
+///
+/// Distinct from [`GUEST_LM_PREEMPT_PORT`] so the per-quantum tick count is
+/// separable from the one-shot preemption proof.
+pub const GUEST_LM_TICK_PORT: u8 = 0x90;
+
+/// The byte the periodic-tick guest's handler `OUT`s per tick before
+/// `IRETQ`ing back into the spin.
+pub const GUEST_LM_TICK_SENTINEL: u8 = 0x55;
+
 /// Iteration count for the long-mode **bounded-spin** guest
 /// ([`write_long_mode_bounded_spin_program`]).
 ///
@@ -580,6 +591,9 @@ pub struct GuestRunOutcome {
     pub exception_exits: u32,
     /// Vector of the last intercepted guest exception, if any.
     pub last_exception_vector: Option<u8>,
+    /// Physical timer interrupts serviced and re-posted to the guest as
+    /// virtual ticks (the periodic tick loop only).
+    pub timer_ticks: u32,
     /// The `(port, byte)` writes the guest performed, oldest first, up to
     /// [`MAX_IO_OUTS`](Self::MAX_IO_OUTS) — each captured through the
     /// arch-neutral `VmExit::IoOut`. Query with [`io_out_to`](Self::io_out_to).
@@ -621,6 +635,7 @@ impl GuestRunOutcome {
             exception_exits: 0,
             last_exception_vector: None,
             npf_write_faults: 0,
+            timer_ticks: 0,
         }
     }
 
@@ -916,13 +931,56 @@ fn write_long_mode_timer_tick_program(ram: &mut [u8]) {
     write_long_mode_gdt_and_gate(ram);
 }
 
+/// Stamp the long-mode **periodic-tick** guest into `ram`: like the timer-tick
+/// guest, but the handler `IRETQ`s back into the spin instead of `HLT`ing — so
+/// the guest survives each delivered tick and keeps spinning.
+///
+/// Entry at GVA 0: `sti ; mov ecx, N ; loop: dec ecx ; jnz loop ; hlt` (bounded,
+/// as [`write_long_mode_bounded_spin_program`]). When the host timer preempts it
+/// (`INTR` #VMEXIT) the run loop re-arms the host timer, posts a virtual
+/// interrupt for [`GUEST_EVENT_VECTOR`], and resumes; the guest's `IDT` gate
+/// vectors it to the handler at [`GUEST_LM_HANDLER_OFF`] which `OUT`s
+/// [`GUEST_LM_TICK_SENTINEL`] to [`GUEST_LM_TICK_PORT`] and `IRETQ`s — returning
+/// to the instruction boundary where the spin was interrupted. Each captured
+/// sentinel is one scheduler quantum delivered into a running guest and
+/// returned from; when the bounded spin finally completes, the guest `HLT`s on
+/// its own (no hang). This is the actual scheduled time-slice (ROADMAP 6.2
+/// toward 6.7). Reuses [`write_long_mode_gdt_and_gate`].
+///
+/// Pure and host-testable; the firmware builder arms the `INTR` intercept and
+/// the periodic run loop re-arms the host timer per tick.
+#[cfg(any(target_os = "uefi", test))]
+fn write_long_mode_periodic_tick_program(ram: &mut [u8]) {
+    // Entry at GVA 0: sti; mov ecx, SPIN; dec ecx; jnz -4; hlt (self-halt).
+    ram[0] = 0xFB; // STI
+    ram[1] = 0xB9; // MOV ECX, imm32
+    ram[2..6].copy_from_slice(&GUEST_LM_SPIN_ITERS.to_le_bytes());
+    ram[6] = 0xFF; // \\ DEC ECX
+    ram[7] = 0xC9; // /
+    ram[8] = 0x75; // \\ JNZ rel8
+    ram[9] = 0xFC; // / -4 → back to the DEC at ram[6]
+    ram[10] = 0xF4; // HLT
+
+    // 64-bit handler: mov al, SENTINEL; out PORT, al; iretq (back into the spin).
+    let h = GUEST_LM_HANDLER_OFF;
+    ram[h] = 0xB0; // MOV AL, imm8
+    ram[h + 1] = GUEST_LM_TICK_SENTINEL;
+    ram[h + 2] = 0xE6; // OUT imm8, AL
+    ram[h + 3] = GUEST_LM_TICK_PORT;
+    ram[h + 4] = 0x48; // \\ REX.W prefix for
+    ram[h + 5] = 0xCF; // / IRETQ — resume the interrupted spin
+
+    write_long_mode_gdt_and_gate(ram);
+}
+
 #[cfg(target_os = "uefi")]
 pub use hw::{
     enable_svm, program_boot_vmcb, program_event_inj_resume_vmcb, program_event_inj_vmcb,
     program_host_save_area, program_irq_resume_vmcb, program_long_mode_event_inj_vmcb,
     program_long_mode_preempt_vmcb, program_long_mode_vintr_vmcb, program_long_mode_vmcb,
-    program_timer_preempt_vmcb, program_timer_tick_vmcb, program_ud_exception_vmcb,
-    program_wp_npf_vmcb, run_boot_guest_loop, run_timer_tick_guest_loop,
+    program_periodic_tick_vmcb, program_timer_preempt_vmcb, program_timer_tick_vmcb,
+    program_ud_exception_vmcb, program_wp_npf_vmcb, run_boot_guest_loop,
+    run_periodic_tick_guest_loop, run_timer_tick_guest_loop,
 };
 
 #[cfg(target_os = "uefi")]
@@ -2147,6 +2205,27 @@ mod hw {
         )
     }
 
+    /// Build a `VMRUN`-ready VMCB whose guest receives *periodic* timer ticks.
+    ///
+    /// A spinning long-mode guest
+    /// ([`write_long_mode_periodic_tick_program`](super::write_long_mode_periodic_tick_program))
+    /// carrying a handler that `IRETQ`s back into the spin, with the `INTR`
+    /// intercept armed; returns `(vmcb_pa, guest_spa)`.
+    ///
+    /// Paired with [`run_periodic_tick_guest_loop`]: the host timer preempts
+    /// the guest (`INTR` #VMEXIT), the loop services the physical interrupt,
+    /// re-arms the host timer for the next quantum, re-posts a *virtual*
+    /// interrupt for [`GUEST_EVENT_VECTOR`](super::GUEST_EVENT_VECTOR), then
+    /// resumes — so the guest's own handler runs per tick and `IRETQ`s back
+    /// into the spin. The actual scheduled time-slice (ROADMAP 6.2 toward 6.7).
+    #[must_use]
+    pub fn program_periodic_tick_vmcb() -> Option<(u64, u64)> {
+        build_long_mode_vintr_guest(
+            super::write_long_mode_periodic_tick_program,
+            set_intr_intercept,
+        )
+    }
+
     /// Assemble a preemptible long-mode guest, running the program `write_program`
     /// stamps into its RAM and applying `arm` to finish the VMCB's interrupt
     /// setup.
@@ -2665,6 +2744,107 @@ mod hw {
         outcome
     }
 
+    /// Drive the **periodic-tick** guest: re-arm the host timer on *every*
+    /// `INTR` exit and re-post the virtual tick, so a long-running guest is
+    /// preempted every quantum — the scheduler time-slice on bare metal.
+    ///
+    /// On each
+    /// [`INTR`](enlil_hal::svm::exit_code::INTR) #VMEXIT the loop:
+    /// 1. lets the host take + EOI the pending physical interrupt (`sti; nop;
+    ///    cli` through the kernel's timer gate, whose handler signals EOI);
+    /// 2. **re-arms the one-shot host LAPIC timer** for the next quantum via
+    ///    [`crate::apic::arm_oneshot_timer`] — a one-shot timer does not
+    ///    repeat on its own, so without this the second tick never comes;
+    /// 3. re-posts a *virtual* interrupt for
+    ///    [`GUEST_EVENT_VECTOR`](super::GUEST_EVENT_VECTOR) via `INT_CONTROL`;
+    /// 4. resumes **without** advancing RIP (nothing was retired).
+    ///
+    /// The guest then vectors through its own long-mode `IDT` to a handler
+    /// that `OUT`s [`GUEST_LM_TICK_SENTINEL`](super::GUEST_LM_TICK_SENTINEL)
+    /// and `IRETQ`s back into the spin, so the next quantum preempts it again.
+    /// Each serviced `INTR` exit bumps
+    /// [`timer_ticks`](super::GuestRunOutcome::timer_ticks); a count ≥ 2 proves
+    /// the re-arm fired at least once (a one-shot timer could only ever
+    /// produce one). The guest's spin is bounded, so when the quanta run out
+    /// the guest self-`HLT`s (no hang) — or [`MAX_VMRUNS`] stops a pathological
+    /// run.
+    ///
+    /// # Safety
+    ///
+    /// As [`run_timer_tick_guest_loop`]: `vmcb_pa` must be a `VMRUN`-ready
+    /// VMCB (from [`program_periodic_tick_vmcb`]) with SVM enabled and
+    /// `VM_HSAVE_PA` programmed. The caller must have installed the kernel's
+    /// LAPIC timer gate and armed the timer; `timer_vector`/`timer_count` are
+    /// the same values it armed (the vector the gate handles, the one-shot
+    /// countdown per quantum).
+    #[must_use]
+    pub unsafe fn run_periodic_tick_guest_loop(
+        vmcb_pa: u64,
+        timer_vector: u8,
+        timer_count: u32,
+    ) -> super::GuestRunOutcome {
+        use enlil_hal::svm::{RunLoopExit, VMCB_SIZE, classify_run_loop_exit, exit_code};
+
+        /// Bound on total `VMRUN`s so a misbehaving guest cannot spin forever.
+        const MAX_VMRUNS: u32 = 32;
+
+        let mut gprs = super::GuestGprs::default();
+        let mut msr_shadow = super::MsrShadow::new();
+        let mut outcome = super::GuestRunOutcome::new();
+
+        // SAFETY: HsavePage is a nonzero 4 KiB page; alloc_zeroed yields a
+        // zeroed, page-aligned block or null.
+        let host_save = unsafe { alloc_zeroed(Layout::new::<HsavePage>()) };
+        if host_save.is_null() {
+            outcome.stop = super::RunStop::Invalid;
+            return outcome;
+        }
+        let host_save_pa = host_save as u64;
+        loop {
+            // SAFETY: the caller guarantees a VMRUN-ready VMCB with SVM on,
+            // `gprs` is a live local, and `host_save_pa` is our owned zeroed page.
+            unsafe { vmrun(vmcb_pa, host_save_pa, &raw mut gprs) };
+            outcome.vmruns += 1;
+
+            // SAFETY: vmcb_pa points at our live, page-sized VMCB.
+            let vmcb = unsafe { core::slice::from_raw_parts_mut(vmcb_pa as *mut u8, VMCB_SIZE) };
+            // Consume any armed EVENTINJ so an injected event fires exactly once.
+            set_event_inj(vmcb, 0);
+
+            let code = exit_code(vmcb);
+            if matches!(classify_run_loop_exit(code), RunLoopExit::Intr) {
+                outcome.final_exit = code.raw();
+                outcome.timer_ticks += 1;
+                // 1. Let the host take + EOI the pending physical interrupt, so
+                //    the next VMRUN does not immediately re-exit on it.
+                // SAFETY: the caller installed the LAPIC timer gate, whose handler
+                // signals EOI; only the armed timer can be pending here.
+                unsafe {
+                    core::arch::asm!(
+                        "sti",
+                        "nop",
+                        "cli",
+                        options(nomem, nostack, preserves_flags)
+                    );
+                }
+                // 2. Re-arm the one-shot timer: the next quantum's preemption.
+                // (A one-shot timer does not repeat by itself.)
+                crate::apic::arm_oneshot_timer(timer_vector, timer_count);
+                // 3. Deliver the tick to the guest as a virtual interrupt.
+                set_int_control(vmcb, encode_vintr(super::GUEST_EVENT_VECTOR, 0xF));
+                // 4. Resume without advancing RIP — nothing was retired.
+            } else if !unsafe { step_guest(vmcb, &mut gprs, &mut msr_shadow, &mut outcome) } {
+                // SAFETY: the VMCB's NPT root is identity-mapped.
+                break;
+            }
+            if outcome.vmruns >= MAX_VMRUNS {
+                outcome.stop = super::RunStop::IterationCap;
+                break;
+            }
+        }
+        outcome
+    }
+
     /// Handle one `#VMEXIT` on `vmcb`, returning `true` to keep running the
     /// guest or `false` to stop (setting `outcome.stop`).
     ///
@@ -3032,6 +3212,46 @@ mod tests {
         assert_eq!(ram[h + 2], 0xE6);
         assert_eq!(ram[h + 3], GUEST_LM_PREEMPT_PORT);
         assert_eq!(ram[h + 4], 0xF4);
+
+        // The IDT gate must vector the tick vector at that handler.
+        let gate = GUEST_LM_IDT_GPA + (GUEST_EVENT_VECTOR as usize) * 16;
+        assert_eq!(ram[gate + 5], 0x8E, "64-bit interrupt gate");
+        assert_eq!(
+            u16::from_le_bytes([ram[gate], ram[gate + 1]]),
+            u16::try_from(GUEST_LM_HANDLER_OFF).unwrap(),
+            "gate offset points at the handler"
+        );
+    }
+
+    #[test]
+    fn periodic_tick_program_handler_iretqs_back_into_the_spin() {
+        let mut ram = vec![0u8; 0x0020_0000];
+        write_long_mode_periodic_tick_program(&mut ram);
+
+        // Entry is the same bounded, terminating spin as the timer-tick guest —
+        // so the guest ends in a self-HLT once the quanta run out, not a hang.
+        assert_eq!(ram[0], 0xFB, "STI");
+        assert_eq!(ram[1], 0xB9, "MOV ECX, imm32");
+        assert_eq!(
+            u32::from_le_bytes([ram[2], ram[3], ram[4], ram[5]]),
+            GUEST_LM_SPIN_ITERS
+        );
+        assert_eq!(&ram[6..10], &[0xFF, 0xC9, 0x75, 0xFC], "DEC ECX; JNZ -4");
+        assert_eq!(ram[10], 0xF4, "HLT");
+
+        // Unlike the one-shot timer-tick handler (which HLTs), this handler
+        // OUTs the per-tick sentinel to the per-tick port and IRETQs — so the
+        // guest resumes the interrupted spin and can be preempted again.
+        let h = GUEST_LM_HANDLER_OFF;
+        assert_eq!(ram[h], 0xB0);
+        assert_eq!(ram[h + 1], GUEST_LM_TICK_SENTINEL);
+        assert_eq!(ram[h + 2], 0xE6);
+        assert_eq!(ram[h + 3], GUEST_LM_TICK_PORT);
+        assert_eq!(&ram[h + 4..h + 6], &[0x48, 0xCF], "IRETQ, not HLT");
+        assert_ne!(ram[h + 4], 0xF4, "must not halt in the handler");
+
+        // Distinct sentinel port from the one-shot preemption proof.
+        assert_ne!(GUEST_LM_TICK_PORT, GUEST_LM_PREEMPT_PORT);
 
         // The IDT gate must vector the tick vector at that handler.
         let gate = GUEST_LM_IDT_GPA + (GUEST_EVENT_VECTOR as usize) * 16;

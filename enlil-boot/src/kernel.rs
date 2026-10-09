@@ -1281,6 +1281,11 @@ mod hw {
                         // as a virtual interrupt so its own handler runs — how a
                         // guest OS receives its scheduler tick.
                         run_timer_tick_delivery_guest(serial);
+                        // Thirteenth guest: make it PERIODIC — re-arm the host
+                        // timer on each INTR exit and re-post the virtual tick,
+                        // the handler IRETQing back into the spin — the actual
+                        // scheduled time-slice (ROADMAP 6.2 toward 6.7).
+                        run_periodic_tick_guest(serial);
                     }
                     None => serial.write_str("enlil kernel: svm: vmcb VMRUN-ready FAILED\n"),
                 }
@@ -1805,6 +1810,83 @@ mod hw {
         } else {
             let mut e = [0u8; 18];
             serial.write_str("enlil kernel: svm: guest timer-tick delivery NOT observed (exit ");
+            serial.write_str(format_u64_hex(run.final_exit, &mut e));
+            serial.write_str(")\n");
+        }
+    }
+
+    /// Build and run the **periodic-tick** guest: the host LAPIC timer preempts
+    /// a spinning guest *every quantum*, and enlil delivers each tick into the
+    /// guest as a virtual interrupt whose handler `IRETQ`s back into the spin.
+    ///
+    /// [`run_timer_tick_delivery_guest`] proves one host-clock tick reaches a
+    /// running guest. This is the actual scheduled time-slice: driven by
+    /// [`run_periodic_tick_guest_loop`](crate::svm::run_periodic_tick_guest_loop),
+    /// each intercepted physical timer interrupt is serviced, the one-shot
+    /// host timer is re-armed for the next quantum, the tick is re-posted to
+    /// the guest as a virtual interrupt, and the guest is resumed — so the
+    /// guest's own handler runs per tick and `IRETQ`s back into the spin,
+    /// ready to be preempted again (ROADMAP 6.2 toward 6.7).
+    /// [`timer_ticks`](crate::svm::GuestRunOutcome::timer_ticks) ≥ 2 proves the
+    /// re-arm fired at least once (a one-shot timer could only ever produce
+    /// one), and a matching count of handler `OUT`s proves each tick was
+    /// delivered into the guest and returned from. The guest's spin is
+    /// bounded, so when the quanta run out the guest self-`HLT`s rather than
+    /// hanging; a harness that never surfaces the host timer as a guest `INTR`
+    /// intercept is reported honestly.
+    fn run_periodic_tick_guest(serial: &SerialPort) {
+        use crate::svm::{GUEST_LM_TICK_PORT, GUEST_LM_TICK_SENTINEL, RunStop};
+        /// The LAPIC timer vector (shared with the other timer paths).
+        const TIMER_VECTOR: u8 = 0x40;
+        /// A one-shot LAPIC countdown (divide-by-16, no TSC frequency needed)
+        /// small enough that several quanta fit in the guest's bounded spin —
+        /// a quarter of the one-shot tests' count, so the re-arm path is
+        /// exercised repeatedly rather than once.
+        const TIMER_COUNT: u32 = 0x0001_0000;
+        /// Minimum ticks for the periodic proof: one tick could come from a
+        /// one-shot timer; two proves the re-arm fired.
+        const MIN_TICKS: u32 = 2;
+
+        let Some((vmcb, _spa)) = crate::svm::program_periodic_tick_vmcb() else {
+            serial.write_str("enlil kernel: svm: periodic-tick vmcb build FAILED\n");
+            return;
+        };
+        crate::idt::install_timer_gate(TIMER_VECTOR);
+        crate::apic::arm_oneshot_timer(TIMER_VECTOR, TIMER_COUNT);
+        // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, `vmcb` is a
+        // VMRUN-ready long-mode VMCB from program_periodic_tick_vmcb, and the
+        // timer gate is installed (the loop briefly enables interrupts to EOI
+        // and re-arms the same vector/count).
+        let run =
+            unsafe { crate::svm::run_periodic_tick_guest_loop(vmcb, TIMER_VECTOR, TIMER_COUNT) };
+
+        // Count the handler's per-tick OUTs (recorded oldest first, so every
+        // matching entry is one delivered-and-handled tick).
+        let mut handled_ticks = 0u32;
+        for &(port, data) in &run.io_outs[..run.io_out_count] {
+            if port == u16::from(GUEST_LM_TICK_PORT) && data == u32::from(GUEST_LM_TICK_SENTINEL) {
+                handled_ticks += 1;
+            }
+        }
+
+        if run.timer_ticks >= MIN_TICKS && handled_ticks >= MIN_TICKS {
+            let mut n = [0u8; 20];
+            serial
+                .write_str("enlil kernel: svm: periodic LAPIC-timer preemption + tick delivery — ");
+            serial.write_str(format_u64(u64::from(run.timer_ticks), &mut n));
+            serial.write_str(
+                " ticks delivered into the guest, handler IRETQ'd back into the spin each time — guest time-slice works\n",
+            );
+        } else if run.stop == RunStop::Halted && run.timer_ticks == 0 {
+            serial.write_str(
+                "enlil kernel: svm: periodic-tick guest self-halted with no tick (host timer not surfaced as a guest INTR intercept under this harness)\n",
+            );
+        } else {
+            let mut e = [0u8; 18];
+            let mut n = [0u8; 20];
+            serial.write_str("enlil kernel: svm: periodic tick delivery NOT observed (ticks ");
+            serial.write_str(format_u64(u64::from(run.timer_ticks), &mut n));
+            serial.write_str(", exit ");
             serial.write_str(format_u64_hex(run.final_exit, &mut e));
             serial.write_str(")\n");
         }
