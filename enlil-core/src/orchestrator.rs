@@ -552,13 +552,17 @@ mod linux {
         /// The guest's RAM is untouched (S3 preserves it), so the OS's own
         /// resume trampoline at the waking vector restores the rest of its state.
         /// A real-mode waking vector (the common case) re-enters in real mode; a
-        /// 64-bit waking vector needs a long-mode entry, which the vCPU-prepare
-        /// helpers do not offer yet, so it is rejected rather than entered wrong.
+        /// 64-bit X waking vector (OSPM asked for it via the `64BIT_WAKE` flag)
+        /// re-enters in long mode through the minimal `[0, 2 MiB)` identity map —
+        /// the same trampoline tables [`boot_kernel_64`](Self::boot_kernel_64)
+        /// installs, so the X vector must lie in low memory (as ACPI 6.x §5.2.10
+        /// waking vectors do) and `load_base` must be 0.
         ///
         /// # Errors
         /// Returns [`Error::Config`] if `facs_gpa` is outside guest RAM, the FACS
-        /// is malformed, no waking vector is armed, or the armed vector needs an
-        /// unsupported long-mode entry; propagates `prepare_real_mode_vcpu`.
+        /// is malformed, no waking vector is armed, or a long-mode resume is
+        /// asked with `load_base != 0`; propagates the identity-table write and
+        /// `prepare_real_mode_vcpu` / `prepare_long_mode_vcpu`.
         pub fn resume_from_s3(&mut self, facs_gpa: u64) -> Result<ResumeTarget> {
             let facs = self.read_guest_bytes(facs_gpa, FACS_LENGTH as usize)?;
             let waking = FacsWaking::from_facs(&facs)
@@ -571,10 +575,24 @@ mod linux {
                         .prepare_real_mode_vcpu(0, u64::from(vector))?;
                     Ok(target)
                 }
-                ResumeTarget::Extended(vector) => Err(Error::Config(format!(
-                    "S3 X waking vector {vector:#x} needs a long-mode resume entry, \
-                     which is not implemented yet"
-                ))),
+                ResumeTarget::Extended(vector) => {
+                    // Long-mode resume per ACPI 6.x §5.2.10: the firmware hands
+                    // control to the 64-bit X waking vector in 64-bit mode with
+                    // paging on. Like `prepare_long_mode`, this needs the
+                    // identity map rooted at a guest-physical address, so the
+                    // guest's RAM must start at gpa 0.
+                    if self.load_base != 0 {
+                        return Err(Error::Config(format!(
+                            "S3 long-mode resume requires load_base 0, got {:#x}",
+                            self.load_base
+                        )));
+                    }
+                    let pml4 = self.install_identity_page_tables()?;
+                    self.run
+                        .backend_mut()
+                        .prepare_long_mode_vcpu(0, vector, pml4)?;
+                    Ok(target)
+                }
                 ResumeTarget::None => Err(Error::Config(
                     "no S3 waking vector armed in the FACS".into(),
                 )),
@@ -1431,6 +1449,101 @@ mod tests {
             guest2.resume_from_s3(0x1500).is_err(),
             "an unarmed FACS has no waking vector to resume to"
         );
+    }
+
+    #[test]
+    fn resume_from_s3_enters_long_mode_at_the_x_waking_vector() {
+        use enlil_devices::acpi::facs::{FacsBuilder, ResumeTarget};
+
+        if !is_kvm_available() {
+            eprintln!(
+                "skipping resume_from_s3_enters_long_mode_at_the_x_waking_vector: no /dev/kvm"
+            );
+            return;
+        }
+        // Lay out one image over guest RAM at gpa 0 (load_base 0):
+        //   offset 0x1500: the FACS, with OSPM's 64BIT_WAKE flag set and the
+        //     64-bit X waking vector = 0x1600
+        //   offset 0x1600: the resume payload — 64-bit: mov dx, 0x3F8; mov al,
+        //     'W'; out dx, al; hlt
+        let mut image = vec![0u8; 0x610];
+        #[rustfmt::skip]
+        let wake: [u8; 8] = [
+            0x66, 0xBA, 0xF8, 0x03, // mov dx, 0x3F8
+            0xB0, 0x57,             // mov al, 'W'
+            0xEE,                   // out dx, al
+            0xF4,                   // hlt
+        ];
+        image[0x600..0x600 + wake.len()].copy_from_slice(&wake);
+        let mut facs = FacsBuilder::new().build();
+        facs[24..32].copy_from_slice(&0x1600u64.to_le_bytes()); // X waking vector
+        facs[36] |= 0x1; // OSPM 64BIT_WAKE flag
+        image[0x500..0x500 + facs.len()].copy_from_slice(&facs);
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let spec = GuestBootSpec {
+            name: "s3-x".into(),
+            serial: SerialOutput::new("s3-x", SerialOutputMode::Shared(Arc::clone(&sink))),
+            ram_bytes: 0x7000,
+            load_base: 0,
+            entry: 0x1000,
+            image,
+            rtc_unix_secs: 0,
+            platform: LbrPlatform::AmdSvm,
+        };
+        let mut guest = match GuestRuntime::prepare_long_mode(spec) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping resume_from_s3_enters_long_mode_at_the_x_waking_vector: {e}");
+                return;
+            }
+        };
+
+        // Resume: read the FACS at gpa 0x1500, decode the X waking vector, and
+        // re-point the boot vCPU at 0x1600 in long mode.
+        let target = guest.resume_from_s3(0x1500).expect("resume from S3");
+        assert_eq!(target, ResumeTarget::Extended(0x1600));
+        assert_eq!(guest.run(0x1000, 100).unwrap(), LoopOutcome::Halted);
+        assert_eq!(
+            &*sink.lock().unwrap(),
+            b"W",
+            "guest re-entered in long mode at the FACS X waking vector"
+        );
+    }
+
+    #[test]
+    fn resume_from_s3_rejects_a_long_mode_resume_with_nonzero_load_base() {
+        use enlil_devices::acpi::facs::FacsBuilder;
+
+        // The long-mode resume path needs load_base 0 (like prepare_long_mode)
+        // so the fixed identity tables sit at guest-physical 0x4000.
+        let spec = GuestBootSpec {
+            name: "s3-x-badbase".into(),
+            serial: SerialOutput::new("s3-x-badbase", SerialOutputMode::Null),
+            ram_bytes: 0x7000,
+            load_base: 0x1000,
+            entry: 0x1000,
+            image: {
+                let mut img = vec![0u8; 0x610];
+                let mut facs = FacsBuilder::new().build();
+                facs[24..32].copy_from_slice(&0x1600u64.to_le_bytes());
+                facs[36] |= 0x1;
+                img[0x500..0x500 + facs.len()].copy_from_slice(&facs);
+                img
+            },
+            rtc_unix_secs: 0,
+            platform: LbrPlatform::AmdSvm,
+        };
+        let mut guest = match GuestRuntime::prepare_real_mode(spec) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!(
+                    "skipping resume_from_s3_rejects_a_long_mode_resume_with_nonzero_load_base: {e}"
+                );
+                return;
+            }
+        };
+        assert!(guest.resume_from_s3(0x1500).is_err());
     }
 
     #[test]
