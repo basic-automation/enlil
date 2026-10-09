@@ -17,6 +17,9 @@
 /// A 4 KiB page — the size and alignment of every nested page table.
 pub const PAGE_SIZE: u64 = 4096;
 
+/// [`PAGE_SIZE`] as a `usize`, for buffer indexing without a lossy `as` cast.
+const PAGE_SIZE_USIZE: usize = 4096;
+
 /// A 2 MiB huge page — the leaf mapping granularity.
 pub const HUGE_2MIB: u64 = 2 * 1024 * 1024;
 
@@ -100,6 +103,31 @@ pub enum NptError {
         index: u64,
         /// The number of 2 MiB slots the map covers.
         num_2mib: u64,
+    },
+    /// A [`NptMapper::map_range`] range reached past the 48-bit address space
+    /// the mapper lays tables for (GPA bits 47:39 index the `PML4`, so
+    /// anything at or past 2^48 would alias onto a lower slot).
+    AddressOutOfRange {
+        /// The first address past the supported space — or the range base
+        /// when `gpa + len` overflowed.
+        addr: u64,
+    },
+    /// A [`NptMapper::map_range`] range overlapped an already-mapped page. The
+    /// mapper never silently remaps: carve a finer hole out of an
+    /// already-mapped region with [`split_npt_2mib_leaf`] instead.
+    RangeOverlap {
+        /// The guest-physical page the overlapping range tried to claim.
+        gpa: u64,
+    },
+    /// A guard address given to [`NptMapper::map_range`] lay outside the
+    /// `[gpa, gpa + len)` range it was given with.
+    GuardAddressOutOfRange {
+        /// The offending guard address.
+        guard: u64,
+        /// The range's guest-physical base.
+        range_base: u64,
+        /// The range's length in bytes.
+        range_len: u64,
     },
 }
 
@@ -804,6 +832,330 @@ pub fn build_identity_npt_2mib_with_4kib_window(
     })
 }
 
+/// A mixed-granularity nested page-table mapper: the general primitive for
+/// mapping arbitrary guest-physical ranges at non-zero bases.
+///
+/// Where the fixed-pattern builders each cover one shape (a 2 MiB identity
+/// span, a 4 KiB identity span, one 4 KiB window inside a 2 MiB span), the
+/// mapper composes any number of `[gpa, gpa + len)` ranges into one hierarchy,
+/// mixing 2 MiB huge-page leaves with 4 KiB leaves: each maximal 2 MiB-aligned
+/// 2 MiB sub-range whose system-physical counterpart is also 2 MiB-aligned
+/// becomes a single huge-page leaf; the unaligned head and tail — and any 2 MiB
+/// chunk holding a guard address — become 4 KiB leaves in on-demand page
+/// tables. `gpa` and `spa` need be neither zero nor equal, so one mapper lays
+/// an MMIO window (a device's registers at their fixed guest-physical
+/// address), a relocated RAM window (GPA 0 onto a disjoint system-physical
+/// window), and not-present guard pages side by side.
+///
+/// Tables are allocated from the front of `buf` on demand — the `PML4` at
+/// [`new`](Self::new) time, then `PDPT`/`PD`/`PT` pages as ranges touch them —
+/// so the caller sizes `buf` for the tables the ranges will need (one page per
+/// touched `PDPT`/`PD`/`PT` plus the `PML4`; [`layout`](Self::layout) reports
+/// how many were actually laid). Every level sets `U/S = 1` (see module docs).
+/// Ranges may not overlap: a second range touching an already-mapped page is
+/// rejected with [`NptError::RangeOverlap`] rather than silently remapped —
+/// refine an already-mapped region with [`split_npt_2mib_leaf`] instead.
+/// Callers that mutate a built map must flush the TLB for the touched range
+/// afterwards (see [`split_npt_2mib_leaf`]).
+pub struct NptMapper<'a> {
+    buf: &'a mut [u8],
+    phys_base: u64,
+    /// Tables handed out so far; the next one goes at
+    /// `phys_base + tables_used * 4096` (`PML4` is table 0).
+    tables_used: usize,
+}
+
+/// What a `PD` entry holds from the mapper's point of view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MapperChild {
+    /// Nothing mapped yet — a fresh table can be linked here.
+    Absent,
+    /// A 2 MiB huge-page leaf already covers this slot.
+    HugeLeaf,
+    /// A page table the mapper installed earlier (`buf` offset).
+    Table(usize),
+}
+
+impl<'a> NptMapper<'a> {
+    /// Create a mapper writing tables into `buf`, whose first byte the caller
+    /// says sits at physical address `phys_base` (the same contract as
+    /// [`build_identity_npt_2mib`]).
+    ///
+    /// Only the `PML4` page is claimed up front; `PDPT`/`PD`/`PT` pages are
+    /// allocated by [`map_range`](Self::map_range) as ranges touch them.
+    ///
+    /// # Errors
+    ///
+    /// - [`NptError::UnalignedBase`] if `phys_base` is not 4 KiB-aligned;
+    /// - [`NptError::TablesExceedBuffer`] if `buf` cannot even hold the `PML4`.
+    pub fn new(buf: &'a mut [u8], phys_base: u64) -> Result<Self, NptError> {
+        if phys_base & (PAGE_SIZE - 1) != 0 {
+            return Err(NptError::UnalignedBase);
+        }
+        if buf.len() < PAGE_SIZE_USIZE {
+            return Err(NptError::TablesExceedBuffer {
+                needed: PAGE_SIZE_USIZE,
+                have: buf.len(),
+            });
+        }
+        let mut mapper = Self {
+            buf,
+            phys_base,
+            tables_used: 0,
+        };
+        // The PML4 is table 0; alloc_table zeroes it.
+        mapper.alloc_table()?;
+        Ok(mapper)
+    }
+
+    /// The value to program into `NESTED_CR3` (guest) or `CR3` (host) — the
+    /// `PML4`'s physical address, `== phys_base`.
+    #[must_use]
+    pub const fn ncr3(&self) -> u64 {
+        self.phys_base
+    }
+
+    /// Describe the tables laid so far, in the same shape the fixed-pattern
+    /// builders return.
+    #[must_use]
+    pub const fn layout(&self) -> NptLayout {
+        NptLayout {
+            ncr3: self.phys_base,
+            table_count: self.tables_used,
+            bytes: self.tables_used.saturating_mul(PAGE_SIZE_USIZE),
+        }
+    }
+
+    /// Map `[gpa, gpa + len)` onto `[spa, spa + len)`, leaving each address in
+    /// `guard_gpas` not-present so a touch of it faults.
+    ///
+    /// Granularity is chosen per 2 MiB chunk: a chunk that is 2 MiB-aligned on
+    /// both sides, fully inside the range, and free of guard addresses becomes
+    /// one huge-page leaf; everything else (the unaligned head/tail, or a
+    /// chunk with a guard punched in it) becomes 4 KiB leaves in a page table
+    /// allocated on demand. Guard addresses must be 4 KiB-aligned and lie
+    /// inside the range. A typical MMIO window is one call — e.g. the local
+    /// APIC's 4 KiB at a fixed guest-physical address — and a relocated RAM
+    /// window is another, both composed into the same hierarchy.
+    ///
+    /// # Errors
+    ///
+    /// - [`NptError::EmptyRegion`] if `len == 0`;
+    /// - [`NptError::UnalignedBase`] if `gpa`, `spa` or `len` is not
+    ///   4 KiB-aligned, or a guard address is not 4 KiB-aligned;
+    /// - [`NptError::AddressOutOfRange`] if the range reaches past the 48-bit
+    ///   address space the mapper lays tables for;
+    /// - [`NptError::GuardAddressOutOfRange`] if a guard address lies outside
+    ///   `[gpa, gpa + len)`;
+    /// - [`NptError::RangeOverlap`] if any page of the range is already
+    ///   mapped;
+    /// - [`NptError::TablesExceedBuffer`] if the on-demand tables do not fit
+    ///   in `buf`.
+    pub fn map_range(
+        &mut self,
+        gpa: u64,
+        spa: u64,
+        len: u64,
+        guard_gpas: &[u64],
+    ) -> Result<(), NptError> {
+        if len == 0 {
+            return Err(NptError::EmptyRegion);
+        }
+        if gpa & (PAGE_SIZE - 1) != 0 || spa & (PAGE_SIZE - 1) != 0 || len & (PAGE_SIZE - 1) != 0 {
+            return Err(NptError::UnalignedBase);
+        }
+        let end = gpa
+            .checked_add(len)
+            .ok_or(NptError::AddressOutOfRange { addr: gpa })?;
+        // The walker indexes the PML4 with GPA bits 47:39; anything at or past
+        // 2^48 would alias onto a lower PML4 slot.
+        if end > 1 << 48 {
+            return Err(NptError::AddressOutOfRange { addr: end - 1 });
+        }
+        for &guard in guard_gpas {
+            if guard & (PAGE_SIZE - 1) != 0 {
+                return Err(NptError::UnalignedBase);
+            }
+            if guard < gpa || guard >= end {
+                return Err(NptError::GuardAddressOutOfRange {
+                    guard,
+                    range_base: gpa,
+                    range_len: len,
+                });
+            }
+        }
+
+        let mut gpa = gpa;
+        let mut spa = spa;
+        let mut remaining = len;
+        while remaining > 0 {
+            // One huge-page leaf covers a 2 MiB chunk only when both addresses
+            // are 2 MiB-aligned, the chunk fits, and no guard punches a hole
+            // in it (a guard needs 4 KiB granularity).
+            let chunk_has_guard = guard_gpas
+                .iter()
+                .any(|&guard| guard >= gpa && guard < gpa + HUGE_2MIB);
+            if gpa & (HUGE_2MIB - 1) == 0
+                && spa & (HUGE_2MIB - 1) == 0
+                && remaining >= HUGE_2MIB
+                && !chunk_has_guard
+            {
+                self.map_huge_leaf(gpa, spa)?;
+                gpa += HUGE_2MIB;
+                spa += HUGE_2MIB;
+                remaining -= HUGE_2MIB;
+            } else {
+                // A guard page is left not-present (None); anything else
+                // becomes a 4 KiB leaf.
+                let target = (!guard_gpas.contains(&gpa)).then_some(spa);
+                self.map_small_page(gpa, target)?;
+                gpa += PAGE_SIZE;
+                spa += PAGE_SIZE;
+                remaining -= PAGE_SIZE;
+            }
+        }
+        Ok(())
+    }
+
+    /// Hand out the next 4 KiB table page: zero it, advance the cursor, and
+    /// return its physical address and `buf` offset.
+    fn alloc_table(&mut self) -> Result<(u64, usize), NptError> {
+        let off =
+            self.tables_used
+                .checked_mul(PAGE_SIZE_USIZE)
+                .ok_or(NptError::TablesExceedBuffer {
+                    needed: usize::MAX,
+                    have: self.buf.len(),
+                })?;
+        let end = off
+            .checked_add(PAGE_SIZE_USIZE)
+            .ok_or(NptError::TablesExceedBuffer {
+                needed: usize::MAX,
+                have: self.buf.len(),
+            })?;
+        if end > self.buf.len() {
+            return Err(NptError::TablesExceedBuffer {
+                needed: end,
+                have: self.buf.len(),
+            });
+        }
+        for byte in &mut self.buf[off..end] {
+            *byte = 0;
+        }
+        let pa = self.phys_base + off as u64;
+        self.tables_used += 1;
+        Ok((pa, off))
+    }
+
+    /// The `buf` offset of the table `table_off[index]` points at, allocating
+    /// and linking a fresh zeroed table when the entry is absent.
+    fn child_table_off(&mut self, table_off: usize, index: usize) -> Result<usize, NptError> {
+        let entry = read_entry(self.buf, table_off + index * 8)?;
+        if entry & flags::PRESENT != 0 {
+            // The mapper only ever installs table pointers above the PD, so a
+            // present entry here is one of ours — convert it back to a buffer
+            // offset the way child_offset does.
+            let child_pa = entry & ADDR_MASK;
+            return child_pa
+                .checked_sub(self.phys_base)
+                .and_then(|d| usize::try_from(d).ok())
+                .filter(|&off| {
+                    off.checked_add(PAGE_SIZE_USIZE)
+                        .is_some_and(|end| end <= self.buf.len())
+                })
+                .ok_or(NptError::IntermediateNotPresent);
+        }
+        let table_flags = flags::PRESENT | flags::WRITABLE | flags::USER;
+        let (pa, off) = self.alloc_table()?;
+        write_entry(
+            self.buf,
+            table_off + index * 8,
+            (pa & ADDR_MASK) | table_flags,
+        );
+        Ok(off)
+    }
+
+    /// The `buf` offset of the `PD` covering `gpa`, allocating the `PDPT` and
+    /// `PD` on demand.
+    fn pd_off_for(&mut self, gpa: u64) -> Result<usize, NptError> {
+        let pml4_i = ((gpa >> 39) & 0x1FF) as usize;
+        let pdpt_i = ((gpa >> 30) & 0x1FF) as usize;
+        let pdpt_off = self.child_table_off(0, pml4_i)?;
+        self.child_table_off(pdpt_off, pdpt_i)
+    }
+
+    /// Read the `PD` entry at `pd_off + index*8` and classify it.
+    fn pd_child(&self, pd_off: usize, index: usize) -> Result<MapperChild, NptError> {
+        let entry = read_entry(self.buf, pd_off + index * 8)?;
+        if entry & flags::PRESENT == 0 {
+            return Ok(MapperChild::Absent);
+        }
+        if entry & flags::HUGE_PAGE != 0 {
+            return Ok(MapperChild::HugeLeaf);
+        }
+        let child_pa = entry & ADDR_MASK;
+        let off = child_pa
+            .checked_sub(self.phys_base)
+            .and_then(|d| usize::try_from(d).ok())
+            .ok_or(NptError::IntermediateNotPresent)?;
+        if off
+            .checked_add(PAGE_SIZE_USIZE)
+            .is_none_or(|end| end > self.buf.len())
+        {
+            return Err(NptError::IntermediateNotPresent);
+        }
+        Ok(MapperChild::Table(off))
+    }
+
+    /// The `buf` offset of the `PT` covering `gpa`, allocating the `PDPT`,
+    /// `PD` and `PT` on demand. A huge-page leaf already covering the 2 MiB is
+    /// an overlap, not something to descend into.
+    fn pt_off_for(&mut self, gpa: u64) -> Result<usize, NptError> {
+        let pd_off = self.pd_off_for(gpa)?;
+        let pd_i = ((gpa >> 21) & 0x1FF) as usize;
+        match self.pd_child(pd_off, pd_i)? {
+            MapperChild::Table(off) => Ok(off),
+            MapperChild::Absent => {
+                let table_flags = flags::PRESENT | flags::WRITABLE | flags::USER;
+                let (pa, off) = self.alloc_table()?;
+                write_entry(self.buf, pd_off + pd_i * 8, (pa & ADDR_MASK) | table_flags);
+                Ok(off)
+            }
+            MapperChild::HugeLeaf => Err(NptError::RangeOverlap { gpa }),
+        }
+    }
+
+    /// Write one 2 MiB huge-page leaf for `gpa -> spa`, refusing to overwrite
+    /// an already-mapped slot.
+    fn map_huge_leaf(&mut self, gpa: u64, spa: u64) -> Result<(), NptError> {
+        let pd_off = self.pd_off_for(gpa)?;
+        let pd_i = ((gpa >> 21) & 0x1FF) as usize;
+        if self.pd_child(pd_off, pd_i)? != MapperChild::Absent {
+            return Err(NptError::RangeOverlap { gpa });
+        }
+        let leaf_flags = flags::PRESENT | flags::WRITABLE | flags::USER | flags::HUGE_PAGE;
+        write_entry(self.buf, pd_off + pd_i * 8, (spa & ADDR_MASK) | leaf_flags);
+        Ok(())
+    }
+
+    /// Write one 4 KiB leaf for `gpa -> spa` (`None` leaves a guard page
+    /// not-present), refusing to overwrite an already-mapped page.
+    fn map_small_page(&mut self, gpa: u64, spa: Option<u64>) -> Result<(), NptError> {
+        let pt_off = self.pt_off_for(gpa)?;
+        let leaf_i = ((gpa >> 12) & 0x1FF) as usize;
+        let off = pt_off + leaf_i * 8;
+        if read_entry(self.buf, off)? & flags::PRESENT != 0 {
+            return Err(NptError::RangeOverlap { gpa });
+        }
+        if let Some(spa) = spa {
+            let leaf_flags = flags::PRESENT | flags::WRITABLE | flags::USER;
+            write_entry(self.buf, off, (spa & ADDR_MASK) | leaf_flags);
+        }
+        // A guard (spa None) stays not-present — the table was zeroed.
+        Ok(())
+    }
+}
+
 /// Read the present table entry at `table_off + index*8` and return the `buf`
 /// offset of the table it points at (its physical address minus `phys_base`).
 fn child_offset(
@@ -1353,5 +1705,280 @@ mod tests {
                 num_pages: 512
             })
         );
+    }
+
+    #[test]
+    fn mapper_mixes_huge_and_small_leaves_at_nonzero_bases() {
+        // GPA [1 MiB, 5 MiB + 4 KiB) -> SPA [5 MiB, 9 MiB + 4 KiB): neither
+        // base is zero and the map is not identity. The 1 MiB unaligned head
+        // and the 1 MiB + 4 KiB tail become 4 KiB leaves; the middle 3 MiB...
+        // only the 2 MiB-aligned middle chunk becomes a huge leaf.
+        let phys_base = 0x1_0000u64;
+        let mut buf = alloc::vec![0u8; 0x6000];
+        let mut mapper = NptMapper::new(&mut buf, phys_base).unwrap();
+        let gpa = 0x10_0000u64; // 1 MiB
+        let spa = 0x50_0000u64; // 5 MiB
+        let len = 4 * 1024 * 1024 + PAGE_SIZE;
+        mapper.map_range(gpa, spa, len, &[]).unwrap();
+
+        // PML4 + PDPT + PD + two PTs (head chunk 0..2 MiB, tail chunk
+        // 4 MiB..6 MiB); the middle chunk 2 MiB..4 MiB is one huge leaf.
+        let layout = mapper.layout();
+        assert_eq!(layout.ncr3, phys_base);
+        assert_eq!(layout.table_count, 5);
+        assert_eq!(layout.bytes, 5 * 4096);
+
+        // Head: 4 KiB leaves, GPA 1 MiB -> SPA 5 MiB.
+        assert_eq!(translate_npt(&buf, phys_base, gpa), Some(spa));
+        assert_eq!(
+            translate_npt(&buf, phys_base, 0x1F_F000),
+            Some(0x5F_F000),
+            "last head page"
+        );
+        // Middle: one 2 MiB huge leaf, GPA 2 MiB -> SPA 6 MiB, offset carried.
+        assert_eq!(translate_npt(&buf, phys_base, 0x20_0000), Some(0x60_0000));
+        assert_eq!(
+            translate_npt(&buf, phys_base, 0x20_0000 + 0x1234),
+            Some(0x60_0000 + 0x1234)
+        );
+        assert_eq!(
+            translate_npt(&buf, phys_base, 0x3F_F000),
+            Some(0x7F_F000),
+            "last page of the huge chunk"
+        );
+        // Tail: 4 KiB leaves again, GPA 4 MiB -> SPA 8 MiB.
+        assert_eq!(translate_npt(&buf, phys_base, 0x40_0000), Some(0x80_0000));
+        assert_eq!(
+            translate_npt(&buf, phys_base, gpa + len - PAGE_SIZE),
+            Some(spa + len - PAGE_SIZE),
+            "last mapped page"
+        );
+        // Past the range: nothing mapped.
+        assert_eq!(translate_npt(&buf, phys_base, gpa + len), None);
+        assert_eq!(translate_npt(&buf, phys_base, gpa - PAGE_SIZE), None);
+    }
+
+    #[test]
+    fn mapper_composes_mmio_window_and_ram_window_in_one_hierarchy() {
+        // Two disjoint ranges at non-zero bases: a relocated RAM window
+        // (GPA 0 -> SPA 0x40_0000) and an MMIO window (GPA == SPA at a fixed
+        // device address, 4 KiB-aligned but not 2 MiB-aligned).
+        let phys_base = 0x2_0000u64;
+        let mut buf = alloc::vec![0u8; 0x8000];
+        let mut mapper = NptMapper::new(&mut buf, phys_base).unwrap();
+        // RAM: GPA [0, 2 MiB) -> SPA [4 MiB, 6 MiB) — one huge leaf.
+        mapper.map_range(0, 0x40_0000, HUGE_2MIB, &[]).unwrap();
+        // MMIO: 8 KiB at 0xFEC0_1000 (not 2 MiB-aligned) -> same SPA.
+        mapper
+            .map_range(0xFEC0_1000, 0xFEC0_1000, 2 * PAGE_SIZE, &[])
+            .unwrap();
+
+        assert_eq!(translate_npt(&buf, phys_base, 0), Some(0x40_0000));
+        assert_eq!(
+            translate_npt(&buf, phys_base, HUGE_2MIB - 1),
+            Some(0x40_0000 + HUGE_2MIB - 1)
+        );
+        assert_eq!(
+            translate_npt(&buf, phys_base, 0xFEC0_1000),
+            Some(0xFEC0_1000)
+        );
+        assert_eq!(
+            translate_npt(&buf, phys_base, 0xFEC0_2000),
+            Some(0xFEC0_2000)
+        );
+        // Between the windows: unmapped.
+        assert_eq!(translate_npt(&buf, phys_base, HUGE_2MIB), None);
+        assert_eq!(translate_npt(&buf, phys_base, 0xFEC0_0000), None);
+        // The RAM window's PD[0] (first PD at buf offset 2*4096: PML4 + PDPT,
+        // then the PD for PDPT[0]) is a 2 MiB huge-page leaf.
+        let pd_off = 2 * 4096;
+        let huge = flags::PRESENT | flags::WRITABLE | flags::USER | flags::HUGE_PAGE;
+        assert_eq!(read_entry(&buf, pd_off, 0) & huge, huge);
+        // The MMIO pages are 4 KiB leaves (no HUGE_PAGE bit) under a PD entry
+        // that is a table pointer; the RAM window is a huge leaf. The MMIO
+        // range (GPA ~4.27 GiB) lives under PDPT[3], i.e. a different PD than
+        // the RAM window's — walk there for the structural check.
+        let pdpt_off = 4096;
+        let mmio_pdpt_i = ((0xFEC0_1000u64 >> 30) & 0x1FF) as usize;
+        let mmio_pd_pa = read_entry(&buf, pdpt_off, mmio_pdpt_i) & ADDR_MASK;
+        let mmio_pd_off = usize::try_from(mmio_pd_pa - phys_base).unwrap();
+        let mmio_pd_i = ((0xFEC0_1000u64 >> 21) & 0x1FF) as usize;
+        let ptr = flags::PRESENT | flags::WRITABLE | flags::USER;
+        assert_eq!(read_entry(&buf, mmio_pd_off, mmio_pd_i) & ptr, ptr);
+        assert_eq!(
+            read_entry(&buf, mmio_pd_off, mmio_pd_i) & flags::HUGE_PAGE,
+            0
+        );
+    }
+
+    #[test]
+    fn mapper_guard_in_aligned_chunk_forces_4kib_rendering() {
+        // A 2 MiB-aligned range with a guard punched in the middle: the whole
+        // chunk renders at 4 KiB so the guard can stay absent.
+        let phys_base = 0x1_0000u64;
+        let mut buf = alloc::vec![0u8; 0x5000];
+        let mut mapper = NptMapper::new(&mut buf, phys_base).unwrap();
+        let gpa = 0x40_0000u64; // 4 MiB, 2 MiB-aligned
+        let guard = gpa + PAGE_SIZE;
+        mapper
+            .map_range(gpa, 0x80_0000, HUGE_2MIB, &[guard])
+            .unwrap();
+
+        // The PD entry is a table pointer, not a huge leaf.
+        let pd_off = 2 * 4096;
+        let pd_i = ((gpa >> 21) & 0x1FF) as usize;
+        assert_eq!(read_entry(&buf, pd_off, pd_i) & flags::HUGE_PAGE, 0);
+        assert_ne!(read_entry(&buf, pd_off, pd_i) & flags::PRESENT, 0);
+
+        // Guard absent, neighbours mapped to the right SPAs.
+        assert_eq!(translate_npt(&buf, phys_base, guard), None);
+        assert_eq!(translate_npt(&buf, phys_base, gpa), Some(0x80_0000));
+        assert_eq!(
+            translate_npt(&buf, phys_base, guard + PAGE_SIZE),
+            Some(0x80_0000 + 2 * PAGE_SIZE)
+        );
+        assert_eq!(
+            translate_npt(&buf, phys_base, gpa + HUGE_2MIB - PAGE_SIZE),
+            Some(0x80_0000 + HUGE_2MIB - PAGE_SIZE)
+        );
+    }
+
+    #[test]
+    fn mapper_crosses_pd_and_pdpt_boundaries() {
+        // A 4 MiB range straddling the 512 GiB PDPT boundary: the mapper
+        // allocates a second PDPT on demand instead of stopping at one.
+        let phys_base = 0x1_0000u64;
+        let mut buf = alloc::vec![0u8; 0x8000];
+        let mut mapper = NptMapper::new(&mut buf, phys_base).unwrap();
+        let gpa = 512 * 1024 * 1024 * 1024 - HUGE_2MIB; // 512 GiB - 2 MiB
+        let spa = 0x20_0000u64; // 2 MiB-aligned, so both chunks go huge
+        mapper.map_range(gpa, spa, 2 * HUGE_2MIB, &[]).unwrap();
+        // PML4 + 2 PDPTs + 2 PDs = 5 tables.
+        assert_eq!(mapper.layout().table_count, 5);
+
+        assert_eq!(translate_npt(&buf, phys_base, gpa), Some(spa));
+        assert_eq!(
+            translate_npt(&buf, phys_base, gpa + HUGE_2MIB),
+            Some(spa + HUGE_2MIB)
+        );
+        assert_eq!(
+            translate_npt(&buf, phys_base, gpa + 2 * HUGE_2MIB - 1),
+            Some(spa + 2 * HUGE_2MIB - 1)
+        );
+    }
+
+    #[test]
+    fn mapper_rejects_overlapping_ranges() {
+        let phys_base = 0x1_0000u64;
+        let mut buf = alloc::vec![0u8; 0x6000];
+        let mut mapper = NptMapper::new(&mut buf, phys_base).unwrap();
+        mapper
+            .map_range(0x10_0000, 0x50_0000, HUGE_2MIB, &[])
+            .unwrap();
+
+        // Exact re-map of the same huge page.
+        assert_eq!(
+            mapper.map_range(0x10_0000, 0x60_0000, HUGE_2MIB, &[]),
+            Err(NptError::RangeOverlap { gpa: 0x10_0000 })
+        );
+        // A 4 KiB range inside the mapped huge page.
+        assert_eq!(
+            mapper.map_range(0x10_1000, 0x60_1000, PAGE_SIZE, &[]),
+            Err(NptError::RangeOverlap { gpa: 0x10_1000 })
+        );
+        // Abutting is fine — the page right after is still free.
+        mapper
+            .map_range(0x10_0000 + HUGE_2MIB, 0x70_0000, PAGE_SIZE, &[])
+            .unwrap();
+        assert_eq!(
+            translate_npt(&buf, phys_base, 0x10_0000 + HUGE_2MIB),
+            Some(0x70_0000)
+        );
+
+        // A huge range over an already-mapped 4 KiB page (SPA 2 MiB-aligned so
+        // the huge path is taken and the PD entry is found non-absent).
+        let mut buf2 = alloc::vec![0u8; 0x6000];
+        let mut m2 = NptMapper::new(&mut buf2, phys_base).unwrap();
+        m2.map_range(0x20_1000, 0x90_1000, PAGE_SIZE, &[]).unwrap();
+        assert_eq!(
+            m2.map_range(0x20_0000, 0xA0_0000, HUGE_2MIB, &[]),
+            Err(NptError::RangeOverlap { gpa: 0x20_0000 })
+        );
+        // A guard on an already-mapped page is an overlap too.
+        assert_eq!(
+            m2.map_range(0x20_1000, 0x90_1000, PAGE_SIZE, &[0x20_1000]),
+            Err(NptError::RangeOverlap { gpa: 0x20_1000 })
+        );
+    }
+
+    #[test]
+    fn mapper_rejects_bad_inputs() {
+        let phys_base = 0x1_0000u64;
+        // Unaligned physical base (`NptMapper` is not `Debug`, so `matches!`
+        // rather than `assert_eq!` against the `Err`).
+        let mut buf = alloc::vec![0u8; 0x5000];
+        assert!(matches!(
+            NptMapper::new(&mut buf, 0x800),
+            Err(NptError::UnalignedBase)
+        ));
+        // Buffer too small for even the PML4.
+        let mut tiny = alloc::vec![0u8; 0x800];
+        assert!(matches!(
+            NptMapper::new(&mut tiny, phys_base),
+            Err(NptError::TablesExceedBuffer { .. })
+        ));
+
+        let mut mapper = NptMapper::new(&mut buf, phys_base).unwrap();
+        // Empty range.
+        assert_eq!(
+            mapper.map_range(0x10_0000, 0x50_0000, 0, &[]),
+            Err(NptError::EmptyRegion)
+        );
+        // Unaligned GPA / SPA / length.
+        assert_eq!(
+            mapper.map_range(0x10_0800, 0x50_0000, PAGE_SIZE, &[]),
+            Err(NptError::UnalignedBase)
+        );
+        assert_eq!(
+            mapper.map_range(0x10_0000, 0x50_0800, PAGE_SIZE, &[]),
+            Err(NptError::UnalignedBase)
+        );
+        assert_eq!(
+            mapper.map_range(0x10_0000, 0x50_0000, 0x800, &[]),
+            Err(NptError::UnalignedBase)
+        );
+        // Unaligned guard address.
+        assert_eq!(
+            mapper.map_range(0x10_0000, 0x50_0000, PAGE_SIZE, &[0x10_0400]),
+            Err(NptError::UnalignedBase)
+        );
+        // Guard outside the range.
+        assert_eq!(
+            mapper.map_range(0x10_0000, 0x50_0000, PAGE_SIZE, &[0x10_1000]),
+            Err(NptError::GuardAddressOutOfRange {
+                guard: 0x10_1000,
+                range_base: 0x10_0000,
+                range_len: PAGE_SIZE,
+            })
+        );
+        // Range past the 48-bit address space.
+        assert!(matches!(
+            mapper.map_range((1 << 48) - PAGE_SIZE, 0, 2 * PAGE_SIZE, &[]),
+            Err(NptError::AddressOutOfRange { .. })
+        ));
+        // gpa + len overflow.
+        assert!(matches!(
+            mapper.map_range(u64::MAX - PAGE_SIZE + 1, 0, 2 * PAGE_SIZE, &[]),
+            Err(NptError::AddressOutOfRange { .. })
+        ));
+
+        // Tables exhausted: one page holds only the PML4, so the first range's
+        // PDPT allocation fails.
+        let mut one_page = alloc::vec![0u8; 0x1000];
+        let mut m2 = NptMapper::new(&mut one_page, phys_base).unwrap();
+        assert!(matches!(
+            m2.map_range(0x10_0000, 0x50_0000, PAGE_SIZE, &[]),
+            Err(NptError::TablesExceedBuffer { .. })
+        ));
     }
 }
