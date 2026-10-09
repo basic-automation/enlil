@@ -332,6 +332,64 @@ pub fn tick() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Cooperative yield — the scheduler half of the sleep-lock
+// ---------------------------------------------------------------------------
+
+/// Yield the remainder of the current scheduling quantum.
+///
+/// This is the blocking primitive [`crate::sync::SleepLock`] waits on: a
+/// thread blocked on a contended sleep-lock calls this instead of
+/// busy-spinning, handing the CPU to whatever the scheduler runs next.
+///
+/// - **Linux:** `std::thread::yield_now()`.
+/// - **Bare metal:** when interrupts are enabled, sleeps in `hlt` until the
+///   next interrupt arrives (the scheduler's LAPIC timer tick guarantees a
+///   wakeup once preemption is live); when interrupts are masked, falls back
+///   to `pause` — halting with `IF=0` would hang the CPU, and executing
+///   `sti` would wrongly unmask interrupts the current holder deliberately
+///   masked.
+#[cfg(feature = "platform-linux")]
+pub fn yield_now() {
+    std::thread::yield_now();
+}
+
+/// Yield the remainder of the current scheduling quantum (bare metal).
+///
+/// See the Linux twin above for the contract.
+#[cfg(feature = "platform-baremetal")]
+pub fn yield_now() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: `pushfq`/`pop` only moves the flags word into a register;
+        // `sti; hlt` runs only when IF was observed set (below); `pause` is
+        // always safe. `sti` takes effect after the next instruction, so the
+        // unmask and the halt are atomic — no interrupt slips between the IF
+        // check and the sleep.
+        let interrupts_enabled: bool = unsafe {
+            let rflags: u64;
+            core::arch::asm!(
+                "pushfq",
+                "pop {0}",
+                out(reg) rflags,
+                options(preserves_flags)
+            );
+            rflags & (1 << 9) != 0
+        };
+        if interrupts_enabled {
+            unsafe {
+                core::arch::asm!("sti", "hlt", options(nomem, nostack, preserves_flags));
+            }
+        } else {
+            core::hint::spin_loop();
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        core::hint::spin_loop();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Current-task priority registry (priority-inheritance source)
 //
 // The platform Mutex (crate::sync) reads the calling thread's registered

@@ -2162,8 +2162,10 @@ mod hw {
 
     /// Self-test the bare-metal spinlock primitive — the mutual exclusion the
     /// kernel guards shared state with once SMP brings up more cores (6.2).
+    /// The primitive moved to enlil-platform (`sync::spinlock`, T-6.9); the
+    /// boot self-test exercises it from its new home.
     fn bring_up_locks(serial: &SerialPort) {
-        if crate::spinlock::selftest() {
+        if enlil_platform::sync::spinlock::selftest() {
             serial.write_str("enlil kernel: sync: spinlock acquire/release self-test ok\n");
         } else {
             serial.write_str("enlil kernel: sync: spinlock self-test FAILED\n");

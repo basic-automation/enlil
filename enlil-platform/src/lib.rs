@@ -31,8 +31,10 @@
 //! Under the `platform-baremetal` feature the crate is `#![no_std]` + `alloc`
 //! so it cross-compiles for the custom `x86_64-unknown-enlil` target (Phase
 //! 1.2). The modules whose backend is already host-agnostic — [`memory`]
-//! (buddy/slab/heap + the `map`/`paging` builders), [`sync`] (spin-backed
-//! Mutex/RwLock/Condvar + the bounded MPSC channel), [`time`], [`io`]
+//! (buddy/slab/heap + the `map`/`paging` builders), [`sync`] (Mutex/RwLock/
+//! Condvar, the bounded MPSC channel, and the backend-agnostic
+//! [`SpinLock`](sync::SpinLock)/[`SleepLock`](sync::SleepLock) primitives),
+//! [`time`], [`io`]
 //! (whose [`PlatformIo`](io::PlatformIo) trait reports the `no_std`
 //! [`IoError`](io::IoError) instead of `std::io::Error`), and [`async_rt`]
 //! (executor + reactor on `alloc`'s `BTreeMap`, `spin` locks, and

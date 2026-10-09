@@ -1,12 +1,18 @@
-//! A spinlock for the bare-metal enlil kernel (Phase 6.2).
+//! A spinlock for bare-metal and hosted targets (Phase 6.2, T-6.9).
 //!
-//! With no OS futex underneath it, the kernel guards shared state (device
-//! models, the per-CPU tables once SMP brings up more cores) with a spinning
-//! test-and-set lock. This one is a thin, audited primitive: an `AtomicBool`
-//! flag, acquire/release ordering so a critical section's writes are visible to
-//! the next holder, and a RAII guard that releases on drop. It is fully
-//! target-agnostic (only `core::sync::atomic`), so it compiles and is tested on
-//! the dev host as well as the firmware target.
+//! Moved here from `enlil-boot::spinlock` so the platform crate owns the sync
+//! primitives every backend reuses. With no OS futex underneath it, the kernel
+//! guards shared state (device models, the per-CPU tables once SMP brings up
+//! more cores) with a spinning test-and-set lock. This one is a thin, audited
+//! primitive: an `AtomicBool` flag, acquire/release ordering so a critical
+//! section's writes are visible to the next holder, and a RAII guard that
+//! releases on drop. It is fully target-agnostic (only `core::sync::atomic`),
+//! so it compiles for the bare-metal target, the UEFI target, and the dev
+//! host alike — no backend feature gates.
+//!
+//! Prefer [`super::sleep::SleepLock`] when the critical section is long or
+//! the waiter has better things to do than burn its quantum: a spinlock is
+//! for short, bounded critical sections only.
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
@@ -160,5 +166,25 @@ mod tests {
             *lock.lock() = 0xDEAD_BEEF;
         }
         assert_eq!(*lock.lock(), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn contended_acquire_from_threads_serializes() {
+        use std::sync::Arc;
+        let lock = Arc::new(SpinLock::new(0u64));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let lock = Arc::clone(&lock);
+                std::thread::spawn(move || {
+                    for _ in 0..500 {
+                        *lock.lock() += 1;
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(*lock.lock(), 8 * 500);
     }
 }

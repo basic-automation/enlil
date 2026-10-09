@@ -4,6 +4,20 @@
 //!
 //! - **Linux:** Delegates to `std::sync` (pthread-backed).
 //! - **Bare-metal:** Uses `spin` crate for spinlock-based implementations.
+//!
+//! Plus the backend-agnostic raw primitives, usable on every target with no
+//! feature gates:
+//!
+//! - [`SpinLock`]: a test-and-set spinlock for short, bounded critical
+//!   sections.
+//! - [`SleepLock`]: a blocking mutex — contended waiters sleep (futex on
+//!   Linux, scheduler yield / `hlt` on bare metal) instead of spinning.
+
+pub mod sleep;
+pub mod spinlock;
+
+pub use sleep::{SleepGuard, SleepLock};
+pub use spinlock::{SpinGuard, SpinLock};
 
 use core::ops::{Deref, DerefMut};
 
