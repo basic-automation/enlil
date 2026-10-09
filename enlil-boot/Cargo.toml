@@ -29,7 +29,11 @@ enlil-hal = { path = "../enlil-hal", version = "0.1.0" }
 # while boot services are up and from the kernel's own linked-list heap after
 # ExitBootServices — the uefi-rs one dies with boot services.
 [target.'cfg(target_os = "uefi")'.dependencies]
+# "alloc" unlocks uefi-rs's Vec-returning query APIs (e.g. find_handles);
+# the allocations are served by enlil-boot's own #[global_allocator] above,
+# not by uefi-rs's "global_allocator" feature (which stays off on purpose).
 uefi = { version = "0.33", default-features = false, features = [
+    "alloc",
     "logger",
     "panic_handler",
 ] }
