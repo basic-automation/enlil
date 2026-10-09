@@ -44,7 +44,8 @@ impl PixelFormat {
 ///
 /// `stride` is the number of pixels per scanline (which may exceed `width`
 /// when the mode is padded), so the byte offset of a pixel is
-/// `(y * stride + x) * bytes_per_pixel`.
+/// `(y * stride + x) * bytes_per_pixel`. `pixel_format` records the GOP
+/// channel order so the kernel's console writes color correctly (RGB vs BGR).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Framebuffer {
     /// Physical base address of the framebuffer.
@@ -57,6 +58,8 @@ pub struct Framebuffer {
     pub stride: u32,
     /// Bytes per pixel.
     pub bytes_per_pixel: u32,
+    /// The GOP pixel format (channel order) of this framebuffer.
+    pub pixel_format: PixelFormat,
 }
 
 impl Framebuffer {
@@ -77,6 +80,7 @@ impl Framebuffer {
                 height,
                 stride,
                 bytes_per_pixel,
+                pixel_format: format,
             }),
             None => None,
         }
@@ -165,6 +169,7 @@ mod tests {
             height: 1080,
             stride: 2048,
             bytes_per_pixel: 4,
+            pixel_format: PixelFormat::Bgr,
         }
     }
 
@@ -182,6 +187,7 @@ mod tests {
         let fb = Framebuffer::from_gop(0x8000_0000, 1280, 720, 1280, PixelFormat::Bgr)
             .expect("BGR is addressable");
         assert_eq!(fb.bytes_per_pixel, 4);
+        assert_eq!(fb.pixel_format, PixelFormat::Bgr);
         assert_eq!(fb.size_bytes(), 1280 * 720 * 4);
         // Blt-only yields no framebuffer.
         assert_eq!(

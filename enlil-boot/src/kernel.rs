@@ -2197,6 +2197,15 @@ mod hw {
                 } else {
                     serial.write_str("enlil kernel: gop: text console self-test FAILED\n");
                 }
+                // Bring up the real color management console: full-ASCII font,
+                // scrolling, and cursor, verified by pixel read-back.
+                if crate::framebuffer::draw_boot_console(fb) {
+                    serial.write_str(
+                        "enlil kernel: gop: color console ok (scroll+cursor verified)\n",
+                    );
+                } else {
+                    serial.write_str("enlil kernel: gop: color console self-test FAILED\n");
+                }
             }
             Some(_) => serial.write_str("enlil kernel: gop: framebuffer draw FAILED\n"),
             None => serial.write_str("enlil kernel: gop: no framebuffer in handoff\n"),
