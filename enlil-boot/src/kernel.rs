@@ -774,6 +774,83 @@ mod hw {
                 serial.write_str("\n");
             }
         }
+        // The AMD-Vi side (ROADMAP 6.4): each IOMMU's MMIO register block —
+        // where per-guest DMA isolation is programmed on AMD hardware — and
+        // the devices the first IOMMU's IVHD entries cover (LOCKED
+        // PRINCIPLE 5).
+        if summary.amd_unit_count > 0 {
+            let mut n = [0u8; 20];
+            serial.write_str("enlil kernel: iommu: ");
+            serial.write_str(format_u64(
+                u64::try_from(summary.amd_unit_count).unwrap_or(u64::MAX),
+                &mut n,
+            ));
+            serial.write_str(" AMD-Vi IOMMU(s):");
+            for unit in summary.amd_units.iter().take(summary.amd_unit_count) {
+                let mut base = [0u8; 18];
+                let mut seg = [0u8; 20];
+                let mut devid = [0u8; 20];
+                serial.write_str(" mmio@");
+                serial.write_str(format_u64_hex(unit.mmio_base, &mut base));
+                serial.write_str(" seg ");
+                serial.write_str(format_u64(u64::from(unit.pci_segment), &mut seg));
+                serial.write_str(" devid ");
+                serial.write_str(format_u64(u64::from(unit.iommu_devid), &mut devid));
+            }
+            serial.write_str("\n");
+
+            // Which devices that IOMMU governs — what can be put in a
+            // per-guest DMA domain. A device no IOMMU covers cannot be
+            // isolated, so passthrough must not be offered for it.
+            if summary.amd_device_entry_count > 0 {
+                let mut n = [0u8; 20];
+                serial.write_str("enlil kernel: iommu: unit 0 covers ");
+                serial.write_str(format_u64(
+                    u64::try_from(summary.amd_device_entry_count).unwrap_or(u64::MAX),
+                    &mut n,
+                ));
+                serial.write_str(" device(s):");
+                for entry in summary
+                    .amd_device_entries
+                    .iter()
+                    .take(summary.amd_device_entry_count)
+                {
+                    serial.write_str(" ");
+                    serial.write_str(entry.kind.name());
+                    match entry.kind {
+                        crate::acpi::IvrsEntryKind::All => {}
+                        crate::acpi::IvrsEntryKind::Special => {
+                            let mut h = [0u8; 20];
+                            serial.write_str("(");
+                            serial.write_str(
+                                if entry.variety == crate::acpi::IVHD_SPECIAL_IOAPIC {
+                                    "ioapic#"
+                                } else if entry.variety == crate::acpi::IVHD_SPECIAL_HPET {
+                                    "hpet#"
+                                } else {
+                                    "dev#"
+                                },
+                            );
+                            serial.write_str(format_u64(u64::from(entry.handle), &mut h));
+                            serial.write_str(")");
+                        }
+                        _ => {
+                            let (bus, dev, func) = crate::acpi::ivrs_devid_bdf(entry.devid);
+                            let mut b = [0u8; 20];
+                            let mut d = [0u8; 20];
+                            let mut f = [0u8; 20];
+                            serial.write_str("@");
+                            serial.write_str(format_u64(u64::from(bus), &mut b));
+                            serial.write_str(":");
+                            serial.write_str(format_u64(u64::from(dev), &mut d));
+                            serial.write_str(".");
+                            serial.write_str(format_u64(u64::from(func), &mut f));
+                        }
+                    }
+                }
+                serial.write_str("\n");
+            }
+        }
         if summary.ecam_base == 0 {
             return None;
         }
