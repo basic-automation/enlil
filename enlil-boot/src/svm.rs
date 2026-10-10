@@ -289,6 +289,14 @@ pub const GUEST_WP_VALUE: u8 = 0x71;
 /// The port the write-protection guest `OUT`s its read-back byte to.
 pub const GUEST_WP_PORT: u8 = 0x8E;
 
+/// The byte the write-protection guest stores on its *second* store — after
+/// enlil re-protected the leaf at the first store's exit — so the kernel can
+/// tell the two completions apart.
+pub const GUEST_WP_VALUE2: u8 = 0x72;
+
+/// The port the write-protection guest `OUT`s its second read-back byte to.
+pub const GUEST_WP_PORT2: u8 = 0x8F;
+
 /// The port the 64-bit long-mode guest `OUT`s its sentinel to. A capture here
 /// proves a guest ran in long mode (paging on, `CR3` walked through the NPT)
 /// under enlil.
@@ -1168,7 +1176,7 @@ pub use hw::{
     program_long_mode_exception_errcode_vmcb, program_long_mode_preempt_vmcb,
     program_long_mode_vintr_vmcb, program_long_mode_vmcb, program_periodic_tick_vmcb,
     program_rdtsc_emulate_vmcb, program_timer_preempt_vmcb, program_timer_tick_vmcb,
-    program_ud_exception_vmcb, program_wp_npf_vmcb, run_boot_guest_loop,
+    program_ud_exception_vmcb, program_wp_npf_vmcb, run_boot_guest_loop, run_boot_guest_loop_dirty,
     run_periodic_tick_guest_loop, run_timer_tick_guest_loop,
 };
 
@@ -1180,7 +1188,9 @@ mod hw {
         is_svm_enabled, is_valid_hsave_pa, svm_status, vm_cr_clear_svmdis,
     };
     use alloc::alloc::{Layout, alloc_zeroed};
-    use enlil_hal::npt::{build_identity_npt_2mib, build_npt_2mib, set_npt_2mib_leaf_writable};
+    use enlil_hal::npt::{
+        NptDirtyLog, build_identity_npt_2mib, build_npt_2mib, set_npt_2mib_leaf_writable,
+    };
     use enlil_hal::region::{IoPermissionsMap, MsrPermissionsMap, Vmcb};
     use enlil_hal::svm::{
         LongModeGuestSetup, MinimalGuestSetup, VmcbSegment, control, enable_io_intercept,
@@ -2113,6 +2123,8 @@ mod hw {
 
     /// Build a `VMRUN`-ready VMCB that proves **NPT write-protection** (the
     /// dirty-tracking / copy-on-write primitive), returning `(vmcb_pa, wp_gpa)`.
+    /// dirty-tracking / copy-on-write primitive) **as a true per-epoch
+    /// bitmap**, returning `(vmcb_pa, wp_gpa)`.
     ///
     /// After building the guest's NPT, enlil clears the `WRITABLE` bit on the
     /// leaf covering the guest's RAM ([`set_npt_2mib_leaf_writable`]), so the
@@ -2125,12 +2137,24 @@ mod hw {
     /// proves the store completed only after enlil granted write access, i.e.
     /// enlil observed the write before it landed (the signal live-migration
     /// dirty tracking and copy-on-write build on; ROADMAP 6.2 / Phase 8).
+    /// write in the epoch dirty log, clears the protection, resumes without
+    /// advancing RIP so the store re-executes). The guest reads the byte back,
+    /// `OUT`s it — a match proves the store completed only after enlil granted
+    /// write access — and then stores [`GUEST_WP_VALUE2`](super::GUEST_WP_VALUE2)
+    /// to the same address: the run loop re-protected the leaf at the first
+    /// store's `OUT` exit (re-protect-after-record), so this *second* store
+    /// faults too, is recorded in the same epoch, and completes after its own
+    /// grant. Two counted write-faults plus two matching `OUT`s prove dirty
+    /// tracking is per-epoch rather than one-shot: enlil observed every write
+    /// before it landed (the signal live-migration dirty tracking and
+    /// copy-on-write build on; ROADMAP 6.2 / Phase 8, T-6.12).
     ///
     /// Assembled through `enlil-hal` like the other proof guests; allocations
     /// are leaked to outlive `VMRUN`. Returns `None` on any allocation/
     /// programming failure.
     #[must_use]
     pub fn program_wp_npf_vmcb() -> Option<(u64, u64)> {
+        use super::{GUEST_WP_GPA, GUEST_WP_PORT, GUEST_WP_PORT2, GUEST_WP_VALUE, GUEST_WP_VALUE2};
         use super::{GUEST_WP_GPA, GUEST_WP_PORT, GUEST_WP_VALUE};
 
         let ram_raw = alloc_guest_ram()?;
@@ -2142,11 +2166,23 @@ mod hw {
         //   mov [WP_GPA], al    A2 lo hi   (store → present+write NPF, then granted)
         //   mov al, [WP_GPA]    A0 lo hi   (read the stored byte back)
         //   out WP_PORT, al     E6 8E      (IOIO → VALUE iff the store completed)
+        //   mov [WP_GPA], al    A2 lo hi   (store #1 → present+write NPF,
+        //                                  recorded + granted)
+        //   mov al, [WP_GPA]    A0 lo hi   (read the stored byte back)
+        //   out WP_PORT, al     E6 8E      (IOIO → VALUE iff store #1 completed;
+        //                                  the run loop re-protects the leaf
+        //                                  after this exit)
+        //   mov al, VALUE2      B0 72
+        //   mov [WP_GPA], al    A2 lo hi   (store #2 → present+write NPF *again*:
+        //                                  the leaf was re-protected)
+        //   mov al, [WP_GPA]    A0 lo hi   (read back)
+        //   out WP_PORT2, al    E6 8F      (IOIO → VALUE2 iff store #2 completed)
         //   hlt                 F4
         let off = GUEST_WP_GPA.to_le_bytes();
         ram[0] = 0xB0; // mov al, VALUE
         ram[1] = GUEST_WP_VALUE;
         ram[2] = 0xA2; // mov moffs16, al (store)
+        ram[2] = 0xA2; // mov moffs16, al (store #1)
         ram[3] = off[0];
         ram[4] = off[1];
         ram[5] = 0xA0; // mov al, moffs16 (load)
@@ -2155,6 +2191,17 @@ mod hw {
         ram[8] = 0xE6; // out imm8, al
         ram[9] = GUEST_WP_PORT;
         ram[10] = 0xF4; // hlt
+        ram[10] = 0xB0; // mov al, VALUE2
+        ram[11] = GUEST_WP_VALUE2;
+        ram[12] = 0xA2; // mov moffs16, al (store #2)
+        ram[13] = off[0];
+        ram[14] = off[1];
+        ram[15] = 0xA0; // mov al, moffs16 (load)
+        ram[16] = off[0];
+        ram[17] = off[1];
+        ram[18] = 0xE6; // out imm8, al
+        ram[19] = GUEST_WP_PORT2;
+        ram[20] = 0xF4; // hlt
 
         // NPT mapping guest GPA [0, 2 MiB) onto the isolated RAM window.
         // SAFETY: NptBuf is nonzero, 4 KiB-aligned; alloc_zeroed yields it or null.
@@ -2982,6 +3029,42 @@ mod hw {
         set_npt_2mib_leaf_writable(npt, ncr3, fault_gpa, true).is_ok()
     }
 
+    /// Record a present+write NPF's faulting page in the epoch dirty log.
+    ///
+    /// Reads the faulting GPA from `vmcb` like [`grant_npf_write`] does; returns
+    /// whether the GPA lay in the log's tracked range (a fault outside it means
+    /// the guest wrote outside its tracked RAM, which the run loop treats as
+    /// unhandled).
+    unsafe fn record_npf_write_dirty(vmcb: &[u8], log: &mut NptDirtyLog<'_>) -> bool {
+        use enlil_hal::npt::HUGE_2MIB;
+        use enlil_hal::svm::exit_info_2;
+
+        let fault_gpa = exit_info_2(vmcb) & !(HUGE_2MIB - 1);
+        log.record(fault_gpa).is_ok()
+    }
+
+    /// Re-protect-after-record: clear `WRITABLE` on every NPT leaf the current
+    /// epoch dirtied, so the next guest write faults and is recorded again.
+    ///
+    /// The run loop calls this once the faulting store has landed (at a later
+    /// `#VMEXIT`, never on the granting exit itself — re-protecting there
+    /// would fault the store again immediately). Returns the number of pages
+    /// re-protected; 0 when the epoch logged no writes or the NPT walk fails.
+    ///
+    /// # Safety
+    ///
+    /// `vmcb`'s `NESTED_CR3` must point at the identity-mapped NPT (3 pages).
+    unsafe fn reprotect_dirty_npt(vmcb: &[u8], log: &mut NptDirtyLog<'_>) -> u64 {
+        use enlil_hal::svm::control;
+
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&vmcb[control::NESTED_CR3..control::NESTED_CR3 + 8]);
+        let ncr3 = u64::from_le_bytes(b);
+        // SAFETY: ncr3 is the identity-mapped NPT root (3 pages) the guest runs on.
+        let npt = unsafe { core::slice::from_raw_parts_mut(ncr3 as *mut u8, 3 * 4096) };
+        log.reprotect_recorded(npt, ncr3).unwrap_or(0)
+    }
+
     /// Drive the guest at `vmcb_pa` through a real `#VMEXIT` dispatch loop,
     /// returning what the run observed ([`GuestRunOutcome`]).
     ///
@@ -3013,6 +3096,46 @@ mod hw {
     /// the CPU's own VMCB memory.
     #[must_use]
     pub unsafe fn run_boot_guest_loop(vmcb_pa: u64) -> super::GuestRunOutcome {
+        // SAFETY: the caller upholds `run_boot_guest_loop_inner`'s contract.
+        unsafe { run_boot_guest_loop_inner(vmcb_pa, None) }
+    }
+
+    /// [`run_boot_guest_loop`] with a per-epoch NPT dirty log attached.
+    ///
+    /// A present+write nested page fault (a guest write to a write-protected
+    /// page) is recorded in `dirty_log` ([`NptDirtyLog`]) as well as granted,
+    /// and — once the faulting store has landed, at a later `#VMEXIT`, never
+    /// on the granting exit itself — the loop re-protects every page the epoch
+    /// dirtied ([`reprotect_dirty_npt`]), so the next write faults and is
+    /// recorded again. Dirty tracking is therefore a true per-epoch bitmap,
+    /// not one-shot: the log answers "which pages were written at least once
+    /// this epoch". A run without a log behaves exactly as before.
+    ///
+    /// # Safety
+    ///
+    /// As [`run_boot_guest_loop`]: `vmcb_pa` must be a `VMRUN`-ready VMCB with
+    /// SVM enabled and `VM_HSAVE_PA` programmed. The log must cover the
+    /// guest's write-protected pages (a fault outside its range stops the run).
+    #[must_use]
+    pub unsafe fn run_boot_guest_loop_dirty(
+        vmcb_pa: u64,
+        dirty_log: &mut NptDirtyLog<'_>,
+    ) -> super::GuestRunOutcome {
+        // SAFETY: the caller upholds `run_boot_guest_loop_inner`'s contract.
+        unsafe { run_boot_guest_loop_inner(vmcb_pa, Some(dirty_log)) }
+    }
+
+    /// The [`run_boot_guest_loop`] dispatch loop; `dirty_log` attaches per-epoch
+    /// NPT dirty tracking (`None` = the plain loop).
+    ///
+    /// # Safety
+    ///
+    /// As [`run_boot_guest_loop`]: `vmcb_pa` must be a `VMRUN`-ready VMCB with
+    /// SVM enabled and `VM_HSAVE_PA` programmed.
+    unsafe fn run_boot_guest_loop_inner(
+        vmcb_pa: u64,
+        mut dirty_log: Option<&mut NptDirtyLog<'_>>,
+    ) -> super::GuestRunOutcome {
         use enlil_hal::svm::VMCB_SIZE;
 
         /// Bound on total `VMRUN`s so a misbehaving guest cannot spin forever.
@@ -3058,6 +3181,32 @@ mod hw {
             // SAFETY: the VMCB's NPT root is identity-mapped (for demand paging).
             if !unsafe { step_guest(vmcb, &mut gprs, &mut msr_shadow, &mut outcome) } {
                 break;
+            }
+            let wp_faults_before = outcome.npf_write_faults;
+            if !unsafe {
+                step_guest(
+                    vmcb,
+                    &mut gprs,
+                    &mut msr_shadow,
+                    &mut outcome,
+                    dirty_log.as_deref_mut(),
+                )
+            } {
+                break;
+            }
+            // Re-protect-after-record: the exit just handled may have recorded
+            // a write-protect fault and granted it; once the faulting store has
+            // re-executed — which any *later* exit proves — re-arm the dirtied
+            // leaves so the next write faults again. Skipped on the granting
+            // exit itself: the store has not landed yet, and re-protecting now
+            // would fault it again immediately. Every re-`VMRUN` flushes the
+            // TLB (`TLB_CONTROL_FLUSH_ALL`), so the cleared `WRITABLE` bit
+            // takes effect on the next entry.
+            if let Some(log) = dirty_log.as_deref_mut() {
+                if outcome.npf_write_faults == wp_faults_before {
+                    // SAFETY: the VMCB's NPT root is identity-mapped (3 pages).
+                    unsafe { reprotect_dirty_npt(vmcb, log) };
+                }
             }
             if outcome.vmruns >= MAX_VMRUNS {
                 outcome.stop = super::RunStop::IterationCap;
@@ -3148,6 +3297,7 @@ mod hw {
                 set_int_control(vmcb, encode_vintr(super::GUEST_EVENT_VECTOR, 0xF));
                 // 3. Resume without advancing RIP — nothing was retired.
             } else if !unsafe { step_guest(vmcb, &mut gprs, &mut msr_shadow, &mut outcome) } {
+            } else if !unsafe { step_guest(vmcb, &mut gprs, &mut msr_shadow, &mut outcome, None) } {
                 // SAFETY: the VMCB's NPT root is identity-mapped.
                 break;
             }
@@ -3249,6 +3399,7 @@ mod hw {
                 set_int_control(vmcb, encode_vintr(super::GUEST_EVENT_VECTOR, 0xF));
                 // 4. Resume without advancing RIP — nothing was retired.
             } else if !unsafe { step_guest(vmcb, &mut gprs, &mut msr_shadow, &mut outcome) } {
+            } else if !unsafe { step_guest(vmcb, &mut gprs, &mut msr_shadow, &mut outcome, None) } {
                 // SAFETY: the VMCB's NPT root is identity-mapped.
                 break;
             }
@@ -3281,6 +3432,7 @@ mod hw {
         gprs: &mut super::GuestGprs,
         msr_shadow: &mut super::MsrShadow,
         outcome: &mut super::GuestRunOutcome,
+        dirty_log: Option<&mut NptDirtyLog<'_>>,
     ) -> bool {
         use enlil_hal::VmExit;
         use enlil_hal::svm::{
@@ -3343,10 +3495,18 @@ mod hw {
                 let info = NptFaultInfo::from_raw(exit_info_1(vmcb));
                 if info.was_present() && info.was_write() {
                     // A write to a present-but-write-protected page — the dirty-
-                    // page / copy-on-write signal. Record it, grant write, and
-                    // re-run so the write completes (no RIP advance).
+                    // page / copy-on-write signal. Record it in the epoch dirty
+                    // log when one is attached (re-protect-after-record: the
+                    // loop re-arms the leaf at a later exit so the next write
+                    // faults again), grant write, and re-run so the write
+                    // completes (no RIP advance). A fault outside the log's
+                    // range stops the run as unhandled.
                     // SAFETY: the caller guarantees an identity-mapped NPT root.
-                    if unsafe { grant_npf_write(vmcb) } {
+                    let recorded = match dirty_log {
+                        Some(log) => unsafe { record_npf_write_dirty(vmcb, log) },
+                        None => true,
+                    };
+                    if recorded && unsafe { grant_npf_write(vmcb) } {
                         outcome.npf_write_faults += 1;
                         return true;
                     }
