@@ -265,6 +265,14 @@ WP_LINE="NPT dirty-tracking works"
 # physical-AMD-proven only, T-6.7), so this asserts only that the fallback
 # guest ran cleanly to HLT, not that the intercept fired (ROADMAP 6.2).
 RDTSC_LINE="rdtsc-emulate guest ran"
+# Printed once a paged (long-mode) guest deliberately raises #PF (supervisor
+# write to an unmapped guest-virtual page → error code 0x02) then #GP (a DS
+# load with a past-the-GDT selector → error code 0x40), enlil traps each via
+# the exception intercepts, and re-injects it into the guest's own 64-bit IDT
+# carrying the exact EXITINFO1 error code — the error-code re-delivery path
+# the #UD proof (no error code pushed) could not exercise (ROADMAP 6.2,
+# T-6.13).
+EXC_ERRCODE_LINE="exception error-code re-inject works"
 # Printed once the kernel draws to the GOP framebuffer and reads a pixel back
 # — proves the framebuffer I/O backend is wired with the firmware gone.
 GOP_LINE="framebuffer draw ok"
@@ -464,9 +472,10 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$IRQ_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$WP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$RDTSC_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$EXC_ERRCODE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_TEXT_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, scheduler quantum driven by the LAPIC timer, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery incl. real VT-d DMAR remapping units + device scopes, SMP AP bring-up (INIT-SIPI-SIPI), PCI enumeration, own page tables (null-page guard) + 4 KiB split + kernel-owned guarded stack (bring-up continues on it), SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + interrupt IRET-resume round-trip + 64-bit long-mode guest + long-mode interrupt round-trip + virtual-interrupt masking + spinning-guest preemption + host-LAPIC-timer preemption (INTR intercept) + timer-tick delivery into the guest + PERIODIC timer preemption + tick delivery (host timer re-armed per quantum, handler IRETQ back into the spin — the guest time-slice) + guest-exception interception (#UD trap + re-inject) + interrupt round-trip (inject/handle/IRET/resume) + NPT write-protection dirty-tracking (trap+grant a guest store) + RDTSC-intercept fallback guest runs (T-6.7; the intercept itself is physical-AMD-proven only), and GOP draw observed on serial"
+    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, scheduler quantum driven by the LAPIC timer, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery incl. real VT-d DMAR remapping units + device scopes, SMP AP bring-up (INIT-SIPI-SIPI), PCI enumeration, own page tables (null-page guard) + 4 KiB split + kernel-owned guarded stack (bring-up continues on it), SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + interrupt IRET-resume round-trip + 64-bit long-mode guest + long-mode interrupt round-trip + virtual-interrupt masking + spinning-guest preemption + host-LAPIC-timer preemption (INTR intercept) + timer-tick delivery into the guest + PERIODIC timer preemption + tick delivery (host timer re-armed per quantum, handler IRETQ back into the spin — the guest time-slice) + guest-exception interception (#UD trap + re-inject) + interrupt round-trip (inject/handle/IRET/resume) + NPT write-protection dirty-tracking (trap+grant a guest store) + RDTSC-intercept fallback guest runs (T-6.7; the intercept itself is physical-AMD-proven only) + exception error-code re-inject (#PF/#GP via a paged guest, exact codes re-delivered, T-6.13), and GOP draw observed on serial"
     exit 0
 fi
 

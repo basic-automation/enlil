@@ -376,6 +376,43 @@ pub const GUEST_LM_TICK_SENTINEL: u8 = 0x55;
 /// (no VMRUN hang). ~33.5 M iterations of a 2-instruction loop.
 pub const GUEST_LM_SPIN_ITERS: u32 = 0x0200_0000;
 
+/// `#PF` (vector 14): the first fault the error-code re-inject guest raises.
+///
+/// A supervisor *write* to an unmapped guest-virtual page faults not-present
+/// with the W/R bit set in the pushed error code.
+pub const GUEST_LM_EXC_PF_VECTOR: u8 = 14;
+
+/// `#GP` (vector 13): the second fault the error-code re-inject guest raises.
+///
+/// Loading `DS` with a selector past the guest `GDT`'s three descriptors
+/// faults with the selector itself as the pushed error code.
+pub const GUEST_LM_EXC_GP_VECTOR: u8 = 13;
+
+/// The unmapped guest-virtual address the `#PF` probe stores to: 1 GiB,
+/// canonical, outside the guest's `[0, 2 MiB)` identity map — so the guest's
+/// own page-table walk fails (a *guest* `#PF`, not a nested one).
+pub const GUEST_LM_EXC_PF_GVA: u64 = 0x0000_4000_0000;
+
+/// The bad segment selector the `#GP` probe loads into `DS`: index 8, past the
+/// guest `GDT`'s null/code/data descriptors.
+pub const GUEST_LM_EXC_GP_SELECTOR: u16 = 0x0040;
+
+/// The error code the `#PF` probe forces: not-present (`P=0`), caused by a
+/// write (`W/R=1`), supervisor (`U/S=0`).
+pub const GUEST_LM_EXC_PF_CODE: u32 = 0x02;
+
+/// The error code the `#GP` probe forces: the faulting selector itself.
+pub const GUEST_LM_EXC_GP_CODE: u32 = 0x0040;
+
+/// The port the `#PF` handler `OUT`s the trapped error-code byte to.
+///
+/// Distinct per vector so the harness can attribute each captured error code
+/// to the fault that carried it.
+pub const GUEST_LM_EXC_PF_PORT: u8 = 0x91;
+
+/// The port the `#GP` handler `OUT`s the trapped error-code byte to.
+pub const GUEST_LM_EXC_GP_PORT: u8 = 0x92;
+
 /// Guest-virtual/-physical offset of the long-mode event guest's handler (past
 /// the entry code, within the identity-mapped `[0, 2 MiB)` window).
 #[cfg(any(target_os = "uefi", test))]
@@ -390,6 +427,14 @@ const GUEST_LM_GDT_GPA: usize = 0x0000_1000;
 /// one 64-bit interrupt gate for [`GUEST_EVENT_VECTOR`] points at the handler.
 #[cfg(any(target_os = "uefi", test))]
 const GUEST_LM_IDT_GPA: usize = 0x0000_2000;
+
+/// Guest RAM offsets of the error-code re-inject guest's two 64-bit exception
+/// handlers — past the shared handler slot, below the `GDT`.
+#[cfg(any(target_os = "uefi", test))]
+const GUEST_LM_EXC_PF_HANDLER_OFF: usize = 0x0000_0140;
+/// Guest RAM offset of the `#GP` handler (after the `#PF` handler's 14 bytes).
+#[cfg(any(target_os = "uefi", test))]
+const GUEST_LM_EXC_GP_HANDLER_OFF: usize = 0x0000_0160;
 
 /// A small per-guest shadow of MSRs the guest has written with `WRMSR`.
 ///
@@ -985,6 +1030,113 @@ fn write_long_mode_periodic_tick_program(ram: &mut [u8]) {
     write_long_mode_gdt_and_gate(ram);
 }
 
+/// Stamp one 64-bit interrupt gate into the guest `IDT`: `IDT[vector]` →
+/// (selector `0x08`, `handler_off`); present, DPL 0, type `0xE`.
+///
+/// [`write_long_mode_gdt_and_gate`] stamps the `GDT` plus the event-vector
+/// gate; guests that vector other exceptions (the error-code re-inject guest
+/// needs `#PF`/`#GP`) stamp their own gates with this helper.
+#[cfg(any(target_os = "uefi", test))]
+const fn write_long_mode_idt_gate(ram: &mut [u8], vector: u8, handler_off: usize) {
+    let gate = GUEST_LM_IDT_GPA + (vector as usize) * 16;
+    let ob = (handler_off as u64).to_le_bytes();
+    ram[gate] = ob[0]; // offset 7:0
+    ram[gate + 1] = ob[1]; // offset 15:8
+    ram[gate + 2] = 0x08; // segment selector 7:0 (code)
+    ram[gate + 3] = 0x00; // segment selector 15:8
+    ram[gate + 4] = 0x00; // IST = 0 (use the current RSP)
+    ram[gate + 5] = 0x8E; // P=1, DPL=0, type=0xE (64-bit interrupt gate)
+    ram[gate + 6] = ob[2]; // offset 23:16
+    ram[gate + 7] = ob[3]; // offset 31:24
+    ram[gate + 8] = ob[4]; // offset 39:32
+    ram[gate + 9] = ob[5]; // offset 47:40
+    ram[gate + 10] = ob[6]; // offset 55:48
+    ram[gate + 11] = ob[7]; // offset 63:56
+}
+
+/// Stamp one 64-bit exception handler for the error-code re-inject guest at
+/// `ram[off]`.
+///
+/// On entry the CPU-pushed error code sits atop the stack (`[RSP]`), the saved
+/// `RIP` at `[RSP+8]`. The handler `OUT`s the error-code byte to `port` (so the
+/// run loop captures exactly what the guest received), advances the saved `RIP`
+/// past the 2-byte faulting instruction, and `IRETQ`s back into the guest
+/// stream — so the guest raises one fault, reports its code, and continues to
+/// the next probe instead of re-faulting.
+#[cfg(any(target_os = "uefi", test))]
+const fn write_exception_errcode_handler(ram: &mut [u8], off: usize, port: u8) {
+    ram[off] = 0x48; // \ REX.W
+    ram[off + 1] = 0x8B; // | MOV RAX, [RSP] — RAX = the pushed error code
+    ram[off + 2] = 0x04; // |
+    ram[off + 3] = 0x24; // /
+    ram[off + 4] = 0xE6; // OUT imm8, AL — report the error-code byte
+    ram[off + 5] = port;
+    ram[off + 6] = 0x48; // \ REX.W
+    ram[off + 7] = 0x83; // | ADD QWORD [RSP+8], 2 — saved RIP past the
+    ram[off + 8] = 0x44; // |   2-byte faulting instruction
+    ram[off + 9] = 0x24; // |
+    ram[off + 10] = 0x08; // |
+    ram[off + 11] = 0x02; // /
+    ram[off + 12] = 0x48; // \ REX.W prefix for
+    ram[off + 13] = 0xCF; // / IRETQ — resume the guest stream
+}
+
+/// Stamp the long-mode **exception error-code re-inject** guest into `ram`: a
+/// *paged* guest (its own `CR3` identity tables walked through the NPT) that
+/// deliberately raises two error-code-pushing faults, exercising the run
+/// loop's error-code re-delivery path at runtime.
+///
+/// Entry at GVA 0:
+/// - `mov eax, PF_GVA ; mov [rax], al` — a supervisor *write* to
+///   [`GUEST_LM_EXC_PF_GVA`] (1 GiB, outside the guest's `[0, 2 MiB)` identity
+///   map) fails the guest's own page-table walk → `#PF` with error code
+///   [`GUEST_LM_EXC_PF_CODE`] (`0x02`: not-present + write).
+/// - `mov eax, GP_SELECTOR ; mov ds, ax` — loading `DS` with
+///   [`GUEST_LM_EXC_GP_SELECTOR`] (index 8, past the 3-descriptor `GDT`) →
+///   `#GP` with error code [`GUEST_LM_EXC_GP_CODE`] (`0x40`: the selector).
+/// - `hlt`.
+///
+/// Both faults are intercepted (the firmware arms the `#PF`/`#GP` exception
+/// intercepts); the run loop re-injects each into the guest's own 64-bit `IDT`
+/// carrying the `EXITINFO1` error code via `EVENTINJ`. Each handler reports
+/// the received code and `IRETQ`s past its faulting instruction, so the guest
+/// raises `#PF`, reports it, raises `#GP`, reports it, then `HLT`s. Captured
+/// bytes equal to the two expected codes prove the exact error code travelled
+/// `#VMEXIT(EXITINFO1)` → `EVENTINJ` → the guest stack — the re-delivery path
+/// `#UD` (which pushes no error code) could not exercise. Reuses
+/// [`write_long_mode_gdt_and_gate`] for the `GDT`.
+///
+/// Pure and host-testable; the firmware builder allocates the RAM, guest page
+/// tables, and NPT, programs the VMCB `GDTR`/`IDTR`, and arms the intercepts.
+#[cfg(any(target_os = "uefi", test))]
+fn write_long_mode_exception_errcode_program(ram: &mut [u8]) {
+    // Entry at GVA 0: force #PF, then #GP, then halt.
+    // GUEST_LM_EXC_PF_GVA < 4 GiB by construction, so MOV EAX, imm32 loads it:
+    // encode the low 4 address bytes (the high 4 are zero).
+    let gva_bytes = GUEST_LM_EXC_PF_GVA.to_le_bytes();
+    debug_assert!(gva_bytes[4..].iter().all(|&b| b == 0));
+    ram[0] = 0xB8; // MOV EAX, imm32
+    ram[1..5].copy_from_slice(&gva_bytes[..4]);
+    ram[5] = 0x88; // \ MOV [RAX], AL — 2 bytes; the store faults #PF(0x02)
+    ram[6] = 0x08; // /
+    ram[7] = 0xB8; // MOV EAX, imm32
+    ram[8..12].copy_from_slice(&u32::from(GUEST_LM_EXC_GP_SELECTOR).to_le_bytes());
+    ram[12] = 0x8E; // \ MOV DS, AX — 2 bytes; the load faults #GP(0x40)
+    ram[13] = 0xD8; // /
+    ram[14] = 0xF4; // HLT
+
+    // The two 64-bit exception handlers (report the code, skip the faulting
+    // instruction, IRETQ back into the guest stream).
+    write_exception_errcode_handler(ram, GUEST_LM_EXC_PF_HANDLER_OFF, GUEST_LM_EXC_PF_PORT);
+    write_exception_errcode_handler(ram, GUEST_LM_EXC_GP_HANDLER_OFF, GUEST_LM_EXC_GP_PORT);
+
+    // GDT + the (unused by this guest) event-vector gate.
+    write_long_mode_gdt_and_gate(ram);
+    // The two gates this guest actually vectors through.
+    write_long_mode_idt_gate(ram, GUEST_LM_EXC_PF_VECTOR, GUEST_LM_EXC_PF_HANDLER_OFF);
+    write_long_mode_idt_gate(ram, GUEST_LM_EXC_GP_VECTOR, GUEST_LM_EXC_GP_HANDLER_OFF);
+}
+
 /// Stamp the real-mode **rdtsc-emulate** guest into `ram`: a guest that reads
 /// the TSC and reports what it saw, so the run loop's `RDTSC`-intercept
 /// fallback path ([`TscVirt::Intercept`](enlil_hal::svm::TscVirt::Intercept))
@@ -1013,9 +1165,10 @@ const fn write_rdtsc_emulate_program(ram: &mut [u8]) {
 pub use hw::{
     enable_svm, program_boot_vmcb, program_event_inj_resume_vmcb, program_event_inj_vmcb,
     program_host_save_area, program_irq_resume_vmcb, program_long_mode_event_inj_vmcb,
-    program_long_mode_preempt_vmcb, program_long_mode_vintr_vmcb, program_long_mode_vmcb,
-    program_periodic_tick_vmcb, program_rdtsc_emulate_vmcb, program_timer_preempt_vmcb,
-    program_timer_tick_vmcb, program_ud_exception_vmcb, program_wp_npf_vmcb, run_boot_guest_loop,
+    program_long_mode_exception_errcode_vmcb, program_long_mode_preempt_vmcb,
+    program_long_mode_vintr_vmcb, program_long_mode_vmcb, program_periodic_tick_vmcb,
+    program_rdtsc_emulate_vmcb, program_timer_preempt_vmcb, program_timer_tick_vmcb,
+    program_ud_exception_vmcb, program_wp_npf_vmcb, run_boot_guest_loop,
     run_periodic_tick_guest_loop, run_timer_tick_guest_loop,
 };
 
@@ -2242,6 +2395,117 @@ mod hw {
         Some((vmcb_pa, guest_spa))
     }
 
+    /// Build a `VMRUN`-ready VMCB that proves **exception error-code
+    /// re-injection**, returning `(vmcb_pa, guest_spa)`.
+    ///
+    /// The re-delivery path ([`RunLoopExit::Exception`](enlil_hal::svm::RunLoopExit::Exception)
+    /// → `EVENTINJ` carrying the `EXITINFO1` error code) has only been proven
+    /// with `#UD`, which pushes no error code. This guest is *paged* (its own
+    /// `CR3` identity tables walked through the NPT) and deliberately raises
+    /// two error-code-pushing faults
+    /// ([`write_long_mode_exception_errcode_program`](super::write_long_mode_exception_errcode_program)):
+    /// a supervisor write to an unmapped guest-virtual page → `#PF` with error
+    /// code `0x02`, then a `DS` load with a past-the-`GDT` selector → `#GP`
+    /// with error code `0x40`. enlil arms both exception intercepts; the run
+    /// loop traps each fault and re-injects it into the guest's own 64-bit
+    /// `IDT` with the trapped error code, and each handler `OUT`s the received
+    /// code byte. Captured bytes equal to the two expected codes prove the
+    /// exact error code travelled the re-delivery path (ROADMAP 6.2).
+    ///
+    /// Same long-mode `GDT`/`IDT`/paging/IOPM setup as
+    /// [`program_long_mode_event_inj_vmcb`]; no `EVENTINJ` is armed (the guest
+    /// raises the faults itself). All allocations are leaked to outlive
+    /// `VMRUN`. Returns `None` on any allocation/programming failure.
+    #[must_use]
+    pub fn program_long_mode_exception_errcode_vmcb() -> Option<(u64, u64)> {
+        use super::{
+            GUEST_LM_EXC_GP_VECTOR, GUEST_LM_EXC_PF_VECTOR, GUEST_LM_GDT_GPA, GUEST_LM_IDT_GPA,
+            GUEST_LM_PT_GPA, GUEST_LM_STACK,
+        };
+
+        // Allocate + populate the guest's isolated RAM.
+        // SAFETY: GuestRam is nonzero, 2 MiB-aligned; alloc_zeroed yields it or null.
+        let ram_raw = unsafe { alloc_zeroed(Layout::new::<GuestRam>()) };
+        if ram_raw.is_null() {
+            return None;
+        }
+        let guest_spa = ram_raw as u64;
+        // SAFETY: ram_raw owns GUEST_RAM_BYTES writable bytes.
+        let ram = unsafe { core::slice::from_raw_parts_mut(ram_raw, GUEST_RAM_BYTES) };
+        super::write_long_mode_exception_errcode_program(ram);
+        let pt = GUEST_LM_PT_GPA;
+        let guest_cr3 = build_identity_npt_2mib(
+            &mut ram[pt..pt + 3 * 4096],
+            GUEST_LM_PT_GPA as u64,
+            GUEST_RAM_BYTES as u64,
+        )
+        .ok()?
+        .ncr3;
+
+        // NPT mapping guest GPA [0, 2 MiB) onto the isolated RAM window.
+        // SAFETY: NptBuf is nonzero, 4 KiB-aligned; alloc_zeroed yields it or null.
+        let npt_raw = unsafe { alloc_zeroed(Layout::new::<NptBuf>()) };
+        if npt_raw.is_null() {
+            return None;
+        }
+        let npt_pa = npt_raw as u64;
+        // SAFETY: npt_raw owns a live, zeroed NptBuf, leaked below.
+        let npt_buf = unsafe { core::slice::from_raw_parts_mut(npt_raw, 3 * 4096) };
+        let ncr3 = build_npt_2mib(npt_buf, npt_pa, guest_spa, GUEST_RAM_BYTES as u64)
+            .ok()?
+            .ncr3;
+
+        // Program the VMCB for long mode entering the fault probes at GVA 0.
+        let mut vmcb = Vmcb::new().ok()?;
+        let setup = LongModeGuestSetup {
+            asid: 1,
+            nested_cr3: ncr3,
+            guest_cr3,
+            entry_ip: 0,
+            stack_pointer: GUEST_LM_STACK,
+        };
+        program_long_mode_hlt_guest(vmcb.as_bytes_mut(), &setup).ok()?;
+
+        // Point GDTR/IDTR at the guest's tables so fault delivery can read the
+        // gates and reload CS from the code descriptor. GDT: 3 descriptors
+        // (limit 0x17); IDT: 256 gates (limit 0xFFF, covering vectors 13/14).
+        write_segment(
+            vmcb.as_bytes_mut(),
+            save::GDTR,
+            VmcbSegment {
+                selector: 0,
+                attrib: 0,
+                limit: 0x0017,
+                base: GUEST_LM_GDT_GPA as u64,
+            },
+        );
+        write_segment(
+            vmcb.as_bytes_mut(),
+            save::IDTR,
+            VmcbSegment {
+                selector: 0,
+                attrib: 0,
+                limit: 0x0FFF,
+                base: GUEST_LM_IDT_GPA as u64,
+            },
+        );
+
+        // Arm port-I/O interception so each handler's OUT takes an IOIO #VMEXIT.
+        let iopm = IoPermissionsMap::intercept_all().ok()?;
+        enable_io_intercept(vmcb.as_bytes_mut(), iopm.base_addr());
+        core::mem::forget(iopm);
+
+        // Arm the #PF + #GP exception intercepts so the guest's faults take a
+        // #VMEXIT the run loop routes as RunLoopExit::Exception (then
+        // re-injects into the guest with the trapped error code).
+        set_exception_intercept(vmcb.as_bytes_mut(), GUEST_LM_EXC_PF_VECTOR);
+        set_exception_intercept(vmcb.as_bytes_mut(), GUEST_LM_EXC_GP_VECTOR);
+
+        let vmcb_pa = vmcb.base_addr();
+        core::mem::forget(vmcb); // must outlive VMRUN
+        Some((vmcb_pa, guest_spa))
+    }
+
     /// Build a `VMRUN`-ready VMCB that proves **virtual-interrupt masking**.
     ///
     /// A 64-bit long-mode guest runs with interrupts masked, `STI`s, and only
@@ -3294,6 +3558,81 @@ mod tests {
         let gate = GUEST_LM_IDT_GPA + (GUEST_EVENT_VECTOR as usize) * 16;
         assert_eq!(ram[gate + 2], 0x08, "gate selector (code)");
         assert_eq!(ram[gate + 5], 0x8E, "64-bit interrupt gate");
+    }
+
+    #[test]
+    fn exception_errcode_program_forces_pf_then_gp_and_reports_both_codes() {
+        // Compile-time layout facts: the handlers are disjoint and sit below
+        // the GDT.
+        const _: () = assert!(GUEST_LM_EXC_GP_HANDLER_OFF >= GUEST_LM_EXC_PF_HANDLER_OFF + 14);
+        const _: () = assert!(GUEST_LM_EXC_GP_HANDLER_OFF + 14 <= GUEST_LM_GDT_GPA);
+
+        let mut ram = vec![0u8; 0x0020_0000];
+        write_long_mode_exception_errcode_program(&mut ram);
+
+        // Entry at GVA 0: mov eax, PF_GVA; mov [rax], al (#PF probe);
+        // mov eax, GP_SELECTOR; mov ds, ax (#GP probe); hlt.
+        assert_eq!(ram[0], 0xB8, "MOV EAX, imm32");
+        assert_eq!(
+            u32::from_le_bytes([ram[1], ram[2], ram[3], ram[4]]),
+            // GUEST_LM_EXC_PF_GVA's low 32 bits (it is < 4 GiB).
+            0x4000_0000u32,
+            "unmapped 1 GiB GVA"
+        );
+        assert_eq!(&ram[5..7], &[0x88, 0x08], "MOV [RAX], AL (the #PF probe)");
+        assert_eq!(ram[7], 0xB8, "MOV EAX, imm32");
+        assert_eq!(
+            u32::from_le_bytes([ram[8], ram[9], ram[10], ram[11]]),
+            u32::from(GUEST_LM_EXC_GP_SELECTOR),
+            "past-the-GDT selector"
+        );
+        assert_eq!(&ram[12..14], &[0x8E, 0xD8], "MOV DS, AX (the #GP probe)");
+        assert_eq!(ram[14], 0xF4, "HLT");
+
+        // Both handlers: mov rax, [rsp]; out PORT, al; add [rsp+8], 2; iretq.
+        for (off, port) in [
+            (GUEST_LM_EXC_PF_HANDLER_OFF, GUEST_LM_EXC_PF_PORT),
+            (GUEST_LM_EXC_GP_HANDLER_OFF, GUEST_LM_EXC_GP_PORT),
+        ] {
+            assert_eq!(
+                &ram[off..off + 4],
+                &[0x48, 0x8B, 0x04, 0x24],
+                "MOV RAX,[RSP]"
+            );
+            assert_eq!(&ram[off + 4..off + 6], &[0xE6, port], "OUT port, AL");
+            assert_eq!(
+                &ram[off + 6..off + 12],
+                &[0x48, 0x83, 0x44, 0x24, 0x08, 0x02],
+                "ADD QWORD [RSP+8], 2"
+            );
+            assert_eq!(&ram[off + 12..off + 14], &[0x48, 0xCF], "IRETQ");
+        }
+        // IDT gates for vectors 13 (#GP) and 14 (#PF) → the right handlers,
+        // present 64-bit interrupt gates on the code selector.
+        for (vector, off) in [
+            (GUEST_LM_EXC_PF_VECTOR, GUEST_LM_EXC_PF_HANDLER_OFF),
+            (GUEST_LM_EXC_GP_VECTOR, GUEST_LM_EXC_GP_HANDLER_OFF),
+        ] {
+            let gate = GUEST_LM_IDT_GPA + (vector as usize) * 16;
+            let ob = (off as u64).to_le_bytes();
+            assert_eq!(ram[gate], ob[0], "offset 7:0");
+            assert_eq!(ram[gate + 1], ob[1], "offset 15:8");
+            assert_eq!(ram[gate + 2], 0x08, "gate selector (code)");
+            assert_eq!(ram[gate + 3], 0x00, "gate selector high");
+            assert_eq!(ram[gate + 4], 0x00, "IST");
+            assert_eq!(ram[gate + 5], 0x8E, "64-bit interrupt gate");
+            assert_eq!(ram[gate + 6], ob[2], "offset 23:16");
+            assert_eq!(ram[gate + 7], ob[3], "offset 31:24");
+        }
+
+        // Reuses the shared long-mode GDT (code selector 0x08 exists, so the
+        // re-injected faults can reload CS from it).
+        let g = GUEST_LM_GDT_GPA;
+        assert_eq!(
+            u64::from_le_bytes(ram[g + 8..g + 16].try_into().unwrap()),
+            0x00AF_9B00_0000_FFFF,
+            "64-bit code descriptor"
+        );
     }
 
     #[test]

@@ -1292,6 +1292,12 @@ mod hw {
                         // untrusted (ROADMAP 6.2, T-6.7; physical-AMD-proven
                         // only — the nested harness fires neither mechanism).
                         run_rdtsc_emulate_guest(serial);
+                        // Fifteenth guest: exercise the exception error-code
+                        // re-inject path at runtime — a paged guest forcing
+                        // #PF (error code 0x02) then #GP (error code 0x40);
+                        // enlil traps each and re-delivers it with the exact
+                        // trapped code (ROADMAP 6.2, T-6.13).
+                        run_exception_errcode_guest(serial);
                     }
                     None => serial.write_str("enlil kernel: svm: vmcb VMRUN-ready FAILED\n"),
                 }
@@ -2051,6 +2057,49 @@ mod hw {
                 }
             }
             None => serial.write_str("enlil kernel: svm: rdtsc-emulate vmcb build FAILED\n"),
+        }
+    }
+
+    /// Build and run the exception error-code re-inject guest, reporting
+    /// whether enlil trapped a paged guest's `#PF`/`#GP` and re-delivered each
+    /// with its exact error code.
+    ///
+    /// A long-mode (paged) guest deliberately raises `#PF` (supervisor write
+    /// to an unmapped guest-virtual page → error code `0x02`) then `#GP` (a
+    /// `DS` load with a past-the-`GDT` selector → error code `0x40`). enlil
+    /// arms both exception intercepts; the run loop traps each fault and
+    /// re-injects it into the guest's own 64-bit `IDT` carrying the `EXITINFO1`
+    /// error code via `EVENTINJ`, and each handler `OUT`s the received code
+    /// byte. Captured bytes equal to the two expected codes prove the exact
+    /// error code travelled the re-delivery path — which the `#UD` proof (no
+    /// error code pushed) could not exercise (ROADMAP 6.2, T-6.13).
+    fn run_exception_errcode_guest(serial: &SerialPort) {
+        use crate::svm::{
+            GUEST_LM_EXC_GP_CODE, GUEST_LM_EXC_GP_PORT, GUEST_LM_EXC_PF_CODE, GUEST_LM_EXC_PF_PORT,
+        };
+        match crate::svm::program_long_mode_exception_errcode_vmcb() {
+            Some((vmcb, _spa)) => {
+                // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
+                // is a VMRUN-ready VMCB from
+                // program_long_mode_exception_errcode_vmcb.
+                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                let pf =
+                    run.io_out_to(u16::from(GUEST_LM_EXC_PF_PORT)) == Some(GUEST_LM_EXC_PF_CODE);
+                let gp =
+                    run.io_out_to(u16::from(GUEST_LM_EXC_GP_PORT)) == Some(GUEST_LM_EXC_GP_CODE);
+                if run.exception_exits >= 2 && pf && gp {
+                    serial.write_str(
+                        "enlil kernel: svm: guest #PF/#GP trapped + re-injected WITH error codes (pf=0x02 gp=0x40) — exception error-code re-inject works\n",
+                    );
+                } else {
+                    serial.write_str(
+                        "enlil kernel: svm: exception error-code re-inject NOT observed (faults not trapped or codes mismatched)\n",
+                    );
+                }
+            }
+            None => {
+                serial.write_str("enlil kernel: svm: exception-errcode vmcb build FAILED\n");
+            }
         }
     }
 
