@@ -281,6 +281,632 @@ pub fn dmar_remapping_units(dmar: &[u8], out: &mut [RemappingUnit]) -> usize {
     found
 }
 
+// ---------------------------------------------------------------------------
+// `IVRS` (AMD-Vi) body parsing.
+//
+// The VT-d/`DMAR` side above is done; this is the AMD side — the IOMMU this
+// project's physical hardware actually has. QEMU cannot emulate AMD-Vi, so
+// this decode is host-tested against synthetic tables until a physical run
+// (the roadmap's own precedent). Layouts follow the AMD I/O Virtualization
+// Technology (IOMMU) Specification, §5.2 (IVRS / IVHD / IVMD).
+// ---------------------------------------------------------------------------
+
+/// Offset of the `IVinfo` field within an `IVRS` table.
+///
+/// The table is the 36-byte SDT header, then the 4-byte `IVinfo`, then 8
+/// reserved bytes before the first IVDB (spec §5.2.1, Table 83).
+pub const IVRS_INFO_OFFSET: usize = SDT_HEADER_LEN;
+
+/// Offset of the first I/O Virtualization Definition Block (IVDB) in an
+/// `IVRS` table: SDT header (36) + `IVinfo` (4) + reserved (8).
+pub const IVRS_IVDBS_OFFSET: usize = SDT_HEADER_LEN + 12;
+
+/// IVHD block type 10h: fixed-length assigned-DeviceID entries, legacy format.
+pub const IVHD_TYPE_10: u8 = 0x10;
+/// IVHD block type 11h: fixed-length entries plus IOMMU attributes and the EFR
+/// images.
+pub const IVHD_TYPE_11: u8 = 0x11;
+/// IVHD block type 40h: mixed format — fixed entries plus variable-length ACPI
+/// HID entries.
+pub const IVHD_TYPE_40: u8 = 0x40;
+
+/// IVMD block type 20h: memory definition for all peripherals.
+pub const IVMD_TYPE_ALL: u8 = 0x20;
+/// IVMD block type 21h: memory definition for one specified peripheral.
+pub const IVMD_TYPE_ONE: u8 = 0x21;
+/// IVMD block type 22h: memory definition for a peripheral range.
+pub const IVMD_TYPE_RANGE: u8 = 0x22;
+
+/// Offset of the first device entry in a type 10h IVHD (24-byte fixed header).
+pub const IVHD_10_ENTRIES_OFFSET: usize = 24;
+/// Offset of the first device entry in a type 11h/40h IVHD (40-byte fixed
+/// header).
+pub const IVHD_11_40_ENTRIES_OFFSET: usize = 40;
+
+/// Fixed length of an IVMD block in bytes (spec Table 109).
+pub const IVMD_BLOCK_LEN: usize = 32;
+
+/// IVHD flag: recommended `HtTunEn` setting (bit 0).
+pub const IVHD_FLAG_HT_TUN_EN: u8 = 1 << 0;
+/// IVHD flag: recommended `PassPW` setting (bit 1).
+pub const IVHD_FLAG_PASS_PW: u8 = 1 << 1;
+/// IVHD flag: recommended `ResPassPW` setting (bit 2).
+pub const IVHD_FLAG_RES_PASS_PW: u8 = 1 << 2;
+/// IVHD flag: recommended `Isoc` setting (bit 3).
+pub const IVHD_FLAG_ISOC: u8 = 1 << 3;
+/// IVHD flag: remote IOTLB support, `IotlbSup` (bit 4).
+pub const IVHD_FLAG_IOTLB_SUP: u8 = 1 << 4;
+/// IVHD flag: recommended `Coherent` setting (bit 5).
+pub const IVHD_FLAG_COHERENT: u8 = 1 << 5;
+/// IVHD flag: `PreFSup` — type 10h only (bit 6).
+pub const IVHD_FLAG_PRE_F_SUP: u8 = 1 << 6;
+/// IVHD flag: `PPRSup` — type 10h only (bit 7).
+pub const IVHD_FLAG_PPR_SUP: u8 = 1 << 7;
+
+/// IVMD flag: unity mapping — virtual addresses must equal physical (bit 0).
+pub const IVMD_FLAG_UNITY: u8 = 1 << 0;
+/// IVMD flag: peripherals may read the range, `IR` (bit 1).
+pub const IVMD_FLAG_IR: u8 = 1 << 1;
+/// IVMD flag: peripherals may write the range, `IW` (bit 2).
+pub const IVMD_FLAG_IW: u8 = 1 << 2;
+/// IVMD flag: the range is excluded from every peripheral's address space
+/// (bit 3).
+pub const IVMD_FLAG_EXCLUSION: u8 = 1 << 3;
+
+/// IVHD 4-byte device-entry type 1: the DTE setting applies to all `DeviceID`s
+/// the IOMMU controls.
+pub const IVHD_ENTRY_ALL: u8 = 1;
+/// IVHD 4-byte device-entry type 2: the DTE setting applies to one `DeviceID`.
+pub const IVHD_ENTRY_SELECT: u8 = 2;
+/// IVHD 4-byte device-entry type 3: first `DeviceID` of an inclusive range (ends
+/// at a type 4 entry).
+pub const IVHD_ENTRY_RANGE_START: u8 = 3;
+/// IVHD 4-byte device-entry type 4: last `DeviceID` of an inclusive range.
+pub const IVHD_ENTRY_RANGE_END: u8 = 4;
+/// IVHD 8-byte device-entry type 42h: alias select — the peripheral's `DeviceID`
+/// is remapped to the entry's second `DeviceID` as its source ID.
+pub const IVHD_ENTRY_ALIAS_SELECT: u8 = 0x42;
+/// IVHD 8-byte device-entry type 43h: alias start of range (ends at a type 4
+/// entry).
+pub const IVHD_ENTRY_ALIAS_RANGE_START: u8 = 0x43;
+/// IVHD 8-byte device-entry type 46h: extended select, with an extended DTE
+/// setting word.
+pub const IVHD_ENTRY_EXT_SELECT: u8 = 0x46;
+/// IVHD 8-byte device-entry type 47h: extended start of range (ends at a type
+/// 4 entry).
+pub const IVHD_ENTRY_EXT_RANGE_START: u8 = 0x47;
+/// IVHD 8-byte device-entry type 48h: special device — an I/O APIC or HPET
+/// named by handle, not by PCI enumeration.
+pub const IVHD_ENTRY_SPECIAL: u8 = 0x48;
+/// IVHD variable-length device-entry type F0h: ACPI HID-named device.
+pub const IVHD_ENTRY_ACPI_HID: u8 = 0xF0;
+
+/// Special-device variety 01h: I/O APIC — the handle is the APIC ID from the
+/// MADT.
+pub const IVHD_SPECIAL_IOAPIC: u8 = 0x01;
+/// Special-device variety 02h: HPET — the handle is the HPET number.
+pub const IVHD_SPECIAL_HPET: u8 = 0x02;
+
+/// The `IVinfo` field shared by every IOMMU in an `IVRS` table (spec Table 85).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IvrsInfo {
+    /// Extended Feature Register support (`EFRSup`, bit 0).
+    pub efr_supported: bool,
+    /// Pre-boot DMA protection: the IOMMU remaps device-accessed memory after
+    /// the OS loads (`DMA remap support`, bit 1).
+    pub dma_remap: bool,
+    /// Guest virtual address width (`GVAsize`, bits 7:5).
+    pub gva_size: u8,
+    /// System physical address width (`PAsize`, bits 14:8).
+    pub pa_size: u8,
+    /// Guest physical address width when guest translation is supported
+    /// (`VAsize`, bits 21:15).
+    pub va_size: u8,
+    /// ATS response address-translation range reserved (`HtAtsResv`, bit 22).
+    pub ht_ats_resv: bool,
+}
+
+/// Decode the `IVinfo` field at `IVRS` offset 36, or `None` when the table is
+/// too short to hold it.
+#[must_use]
+pub fn ivrs_info(ivrs: &[u8]) -> Option<IvrsInfo> {
+    let raw = read_u32(ivrs, IVRS_INFO_OFFSET)?;
+    Some(IvrsInfo {
+        efr_supported: raw & 0x1 != 0,
+        dma_remap: raw & 0x2 != 0,
+        gva_size: u8::try_from((raw >> 5) & 0x7).unwrap_or(0),
+        pa_size: u8::try_from((raw >> 8) & 0x7f).unwrap_or(0),
+        va_size: u8::try_from((raw >> 15) & 0x7f).unwrap_or(0),
+        ht_ats_resv: raw & (0x1 << 22) != 0,
+    })
+}
+
+/// One AMD-Vi IOMMU from an `IVRS` table's IVHD blocks (spec §5.2.2.1).
+///
+/// An IVHD block describes one physical IOMMU: where its register block lives
+/// and which PCI segment and devices it governs. Programming DMA remapping on
+/// AMD hardware (ROADMAP 6.4) starts here — every device-table and page-table
+/// write goes through this MMIO base, and the IOMMU's own `DeviceID` selects its
+/// PCI capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AmdIommuUnit {
+    /// The IVHD block type: `0x10`, `0x11` or `0x40`.
+    pub block_type: u8,
+    /// Recommended IOMMU control-field settings (spec Tables 89/94).
+    pub flags: u8,
+    /// The IOMMU's own `DeviceID` (selects its PCI capability via `cap_offset`).
+    pub iommu_devid: u16,
+    /// Offset in PCI capability space of the IOMMU's control fields.
+    pub cap_offset: u16,
+    /// Physical base of the IOMMU's MMIO register block.
+    pub mmio_base: u64,
+    /// PCI segment group the IOMMU and its peripherals share.
+    pub pci_segment: u16,
+    /// IOMMU info: `UnitID` (bits 12:8) and event-log MSI number (bits 4:0).
+    pub info: u16,
+    /// The `u32` at IVHD offset 20: IOMMU Attributes (11h/40h) or IOMMU
+    /// Feature Reporting (10h).
+    pub attributes: u32,
+    /// Image of the IOMMU Extended Feature Register (11h/40h; 0 for 10h).
+    pub efr: u64,
+    /// Image of the IOMMU Extended Feature 2 Register (11h/40h; 0 for 10h).
+    pub efr2: u64,
+    /// Bytes of device entries following the fixed IVHD fields.
+    pub device_entry_bytes: usize,
+    /// Byte offset of this unit's first device entry within the `IVRS`
+    /// table — where [`ivrs_device_entries`] reads from.
+    pub entry_offset: usize,
+}
+
+impl AmdIommuUnit {
+    /// The IOMMU's `UnitID` number (`info` bits 12:8).
+    #[must_use]
+    pub const fn unit_id(self) -> u8 {
+        self.info.to_le_bytes()[1] & 0x1f
+    }
+
+    /// The event-log MSI message number (`info` bits 4:0).
+    #[must_use]
+    pub const fn msi_num(self) -> u8 {
+        self.info.to_le_bytes()[0] & 0x1f
+    }
+}
+
+/// What kind of device an IVHD device entry names (spec §5.2.2.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IvrsEntryKind {
+    /// All `DeviceID`s the IOMMU controls (type 1).
+    All,
+    /// One `DeviceID` (type 2).
+    Select,
+    /// First `DeviceID` of an inclusive range (type 3; ends at a
+    /// [`RangeEnd`](Self::RangeEnd)).
+    RangeStart,
+    /// Last `DeviceID` of an inclusive range (type 4).
+    RangeEnd,
+    /// Alias select: the peripheral at [`IvrsDeviceEntry::devid`] uses
+    /// [`IvrsDeviceEntry::devid_b`] as its source `DeviceID` (type 42h).
+    AliasSelect,
+    /// Alias start of range (type 43h; ends at a [`RangeEnd`](Self::RangeEnd)).
+    AliasRangeStart,
+    /// Extended select, with an extended DTE setting word (type 46h).
+    ExtSelect,
+    /// Extended start of range (type 47h; ends at a [`RangeEnd`](Self::RangeEnd)).
+    ExtRangeStart,
+    /// Special device: an I/O APIC or HPET named by handle (type 48h).
+    Special,
+    /// ACPI HID-named device, variable-length (type F0h).
+    AcpiHid,
+    /// A type this decoder does not recognise.
+    #[default]
+    Unknown,
+}
+
+impl IvrsEntryKind {
+    /// Decode the device-entry type byte.
+    #[must_use]
+    pub const fn from_type(raw: u8) -> Self {
+        match raw {
+            IVHD_ENTRY_ALL => Self::All,
+            IVHD_ENTRY_SELECT => Self::Select,
+            IVHD_ENTRY_RANGE_START => Self::RangeStart,
+            IVHD_ENTRY_RANGE_END => Self::RangeEnd,
+            IVHD_ENTRY_ALIAS_SELECT => Self::AliasSelect,
+            IVHD_ENTRY_ALIAS_RANGE_START => Self::AliasRangeStart,
+            IVHD_ENTRY_EXT_SELECT => Self::ExtSelect,
+            IVHD_ENTRY_EXT_RANGE_START => Self::ExtRangeStart,
+            IVHD_ENTRY_SPECIAL => Self::Special,
+            IVHD_ENTRY_ACPI_HID => Self::AcpiHid,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// A short human name for the serial report.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Select => "select",
+            Self::RangeStart => "range-start",
+            Self::RangeEnd => "range-end",
+            Self::AliasSelect => "alias",
+            Self::AliasRangeStart => "alias-range",
+            Self::ExtSelect => "ext-select",
+            Self::ExtRangeStart => "ext-range",
+            Self::Special => "special",
+            Self::AcpiHid => "acpi-hid",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// One device an AMD-Vi IOMMU governs, decoded from an IVHD device entry.
+///
+/// Says *which* devices an IOMMU virtualizes — the input to assigning a
+/// passed-through device to a per-guest DMA domain (LOCKED PRINCIPLE 5). A
+/// device no IOMMU covers cannot be isolated, so passthrough must not be
+/// offered for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IvrsDeviceEntry {
+    /// What kind of device the entry names.
+    pub kind: IvrsEntryKind,
+    /// The `DeviceID` (for alias entries, the peripheral's actual `DeviceID`).
+    pub devid: u16,
+    /// The alias source `DeviceID`: the `DeviceID` used as source by the
+    /// peripheral (42h/43h), or the special device's source `DeviceID` (48h).
+    pub devid_b: u16,
+    /// The DTE setting byte (spec Table 103): LINT/NMI/ExtInt/INIT passthrough
+    /// and system-management-message capability.
+    pub dte: u8,
+    /// The extended DTE setting word (46h/47h; bit 31 is `AtsDisabled`).
+    pub ext_dte: u32,
+    /// Special-device handle (48h): the I/O APIC ID or HPET number.
+    pub handle: u8,
+    /// Special-device variety (48h): `01h` I/O APIC, `02h` HPET.
+    pub variety: u8,
+    /// The ACPI Hardware ID bytes (F0h): an 8-byte ACPI/PNP string, or a
+    /// 32-bit integer in the low 4 bytes.
+    pub hid: u64,
+    /// Length of the F0h entry's UID field in bytes (0 when absent).
+    pub uid_len: u8,
+}
+
+/// Which peripherals an `IVMD` memory-definition block applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IvmdKind {
+    /// Type 20h: all peripherals.
+    All,
+    /// Type 21h: the one peripheral in [`IvmdRange::devid`].
+    Specified,
+    /// Type 22h: the inclusive `DeviceID` range from
+    /// [`IvmdRange::devid`] to [`IvmdRange::devid_end`].
+    Range,
+    /// A type this decoder does not recognise.
+    #[default]
+    Unknown,
+}
+
+impl IvmdKind {
+    /// Decode the IVMD block type byte.
+    #[must_use]
+    pub const fn from_type(raw: u8) -> Self {
+        match raw {
+            IVMD_TYPE_ALL => Self::All,
+            IVMD_TYPE_ONE => Self::Specified,
+            IVMD_TYPE_RANGE => Self::Range,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// A short human name for the serial report.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Specified => "specified",
+            Self::Range => "range",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// One `IVMD` memory-definition block from an `IVRS` table (spec §5.2.2.2).
+///
+/// Firmware-declared memory ranges the IOMMU must (or must not) map for
+/// peripherals: unity-mapped BIOS regions, and exclusion ranges DMA must never
+/// touch. Programming the IOMMU (ROADMAP 6.4) has to honour these — mapping an
+/// exclusion range into a guest would hand it firmware memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IvmdRange {
+    /// Which peripherals the range applies to.
+    pub kind: IvmdKind,
+    /// Type 21h: the peripheral's `DeviceID`; type 22h: the range's first
+    /// `DeviceID`.
+    pub devid: u16,
+    /// Type 22h: the range's last `DeviceID` (inclusive).
+    pub devid_end: u16,
+    /// System physical address where the range starts.
+    pub start: u64,
+    /// Length of the range in bytes.
+    pub length: u64,
+    /// The raw flags byte: `Unity`/`IR`/`IW`/`ExclusionRange`
+    /// (`IVMD_FLAG_*`).
+    pub flags: u8,
+}
+
+impl IvmdRange {
+    /// Peripherals may read the range (`IR`).
+    #[must_use]
+    pub const fn readable(self) -> bool {
+        self.flags & IVMD_FLAG_IR != 0
+    }
+
+    /// Peripherals may write the range (`IW`).
+    #[must_use]
+    pub const fn writable(self) -> bool {
+        self.flags & IVMD_FLAG_IW != 0
+    }
+
+    /// Virtual addresses must equal physical addresses (`Unity`).
+    #[must_use]
+    pub const fn unity(self) -> bool {
+        self.flags & IVMD_FLAG_UNITY != 0
+    }
+
+    /// The range is excluded from every peripheral's address space
+    /// (`ExclusionRange`).
+    #[must_use]
+    pub const fn exclusion(self) -> bool {
+        self.flags & IVMD_FLAG_EXCLUSION != 0
+    }
+}
+
+/// Split an AMD-Vi `DeviceID` into `(bus, device, function)`.
+///
+/// The `DeviceID` packs the PCI BDF as `(bus << 8) | (device << 3) | function`
+/// (spec §5.2.2.1).
+#[must_use]
+pub const fn ivrs_devid_bdf(devid: u16) -> (u8, u8, u8) {
+    let bytes = devid.to_le_bytes();
+    (bytes[1], (bytes[0] >> 3) & 0x1f, bytes[0] & 0x7)
+}
+
+/// The next IVDB at `*off`: `(block type, block start, block length)`.
+///
+/// Advances `*off` past the block. Returns `None` when the table ends, the
+/// block header is truncated, or a block has a zero/under-header length or
+/// runs past the table — a malformed block ends the walk rather than looping
+/// or over-reading.
+fn next_ivdb(ivrs: &[u8], off: &mut usize, end: usize) -> Option<(u8, usize, usize)> {
+    if off.checked_add(4)? > end {
+        return None;
+    }
+    let block_type = ivrs.get(*off).copied()?;
+    let block_len = usize::from(read_u16(ivrs, off.checked_add(2)?)?);
+    let block_end = off.checked_add(block_len)?;
+    if block_len < 4 || block_end > end {
+        return None;
+    }
+    let start = *off;
+    *off = block_end;
+    Some((block_type, start, block_len))
+}
+
+/// Parse the `IVRS` table's body, collecting each AMD-Vi IOMMU into `out`, and
+/// return how many were found.
+///
+/// Walks the IVDBs after the 48-byte `IVRS` header, selecting the IVHD blocks
+/// (types 10h/11h/40h) and decoding each one's flags, `DeviceID`, capability
+/// offset, MMIO base, PCI segment, IOMMU info, attributes and EFR images
+/// (spec §5.2.2.1). `IVMD` blocks and reserved types are skipped by their
+/// length.
+///
+/// The returned count is the true number present even if it exceeds `out`, so
+/// a caller can tell it needs a bigger buffer. A malformed block ends the walk
+/// rather than looping or reading past the table.
+#[must_use]
+pub fn ivrs_iommu_units(ivrs: &[u8], out: &mut [AmdIommuUnit]) -> usize {
+    let Some(length) = sdt_length(ivrs) else {
+        return 0;
+    };
+    let end = (length as usize).min(ivrs.len());
+    let mut off = IVRS_IVDBS_OFFSET;
+    let mut found = 0usize;
+
+    while let Some((block_type, start, block_len)) = next_ivdb(ivrs, &mut off, end) {
+        let entries_offset = match block_type {
+            IVHD_TYPE_10 => IVHD_10_ENTRIES_OFFSET,
+            IVHD_TYPE_11 | IVHD_TYPE_40 => IVHD_11_40_ENTRIES_OFFSET,
+            // `IVMD` blocks and reserved types describe no IOMMU: skip them.
+            _ => continue,
+        };
+        if block_len < entries_offset {
+            // Malformed: the fixed header does not fit; skip the block.
+            continue;
+        }
+        // The fixed header fits inside the block, so these reads are in
+        // bounds; the `let-else` is belt-and-braces.
+        let (Some(iommu_devid), Some(cap_offset), Some(mmio_base), Some(pci_segment), Some(info)) = (
+            read_u16(ivrs, start + 4),
+            read_u16(ivrs, start + 6),
+            read_u64(ivrs, start + 8),
+            read_u16(ivrs, start + 16),
+            read_u16(ivrs, start + 18),
+        ) else {
+            continue;
+        };
+        let (attributes, efr, efr2) = match block_type {
+            IVHD_TYPE_11 | IVHD_TYPE_40 => {
+                let (Some(attributes), Some(efr), Some(efr2)) = (
+                    read_u32(ivrs, start + 20),
+                    read_u64(ivrs, start + 24),
+                    read_u64(ivrs, start + 32),
+                ) else {
+                    continue;
+                };
+                (attributes, efr, efr2)
+            }
+            // Type 10h carries the IOMMU Feature Reporting word at offset 20.
+            _ => (read_u32(ivrs, start + 20).unwrap_or(0), 0, 0),
+        };
+        if let Some(slot) = out.get_mut(found) {
+            *slot = AmdIommuUnit {
+                block_type,
+                flags: ivrs[start + 1],
+                iommu_devid,
+                cap_offset,
+                mmio_base,
+                pci_segment,
+                info,
+                attributes,
+                efr,
+                efr2,
+                device_entry_bytes: block_len - entries_offset,
+                entry_offset: start + entries_offset,
+            };
+        }
+        found += 1;
+    }
+    found
+}
+
+/// Decode one IVHD device entry, already sliced to its exact length.
+///
+/// Returns `None` for the type-0 pad entry, which is alignment filler and
+/// names no device. Reserved fixed-length types decode as
+/// [`IvrsEntryKind::Unknown`] but still advance the walk.
+fn decode_ivhd_entry(entry: &[u8]) -> Option<IvrsDeviceEntry> {
+    let raw = entry.first().copied()?;
+    if raw == 0 {
+        return None;
+    }
+    let mut decoded = IvrsDeviceEntry {
+        kind: IvrsEntryKind::from_type(raw),
+        devid: u16::from_le_bytes([entry[1], entry[2]]),
+        dte: entry[3],
+        ..IvrsDeviceEntry::default()
+    };
+    match raw {
+        IVHD_ENTRY_ALIAS_SELECT | IVHD_ENTRY_ALIAS_RANGE_START => {
+            decoded.devid_b = u16::from_le_bytes([entry[5], entry[6]]);
+        }
+        IVHD_ENTRY_EXT_SELECT | IVHD_ENTRY_EXT_RANGE_START => {
+            decoded.ext_dte = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
+        }
+        IVHD_ENTRY_SPECIAL => {
+            decoded.handle = entry[4];
+            decoded.devid_b = u16::from_le_bytes([entry[5], entry[6]]);
+            decoded.variety = entry[7];
+        }
+        IVHD_ENTRY_ACPI_HID => {
+            decoded.hid = u64::from_le_bytes(entry[4..12].try_into().ok()?);
+            decoded.uid_len = entry[21];
+        }
+        _ => {}
+    }
+    Some(decoded)
+}
+
+/// Parse the device entries of one AMD-Vi IOMMU into `out`, returning how many
+/// were found.
+///
+/// `ivrs` is the whole table and `unit` an [`AmdIommuUnit`] from
+/// [`ivrs_iommu_units`]. Entry lengths come from the type byte's upper bits
+/// (spec Table 100): types `00h`–`3Fh` are 4 bytes, `40h`–`7Fh` are 8 bytes,
+/// and only `F0h` has a defined variable-length layout (`22 + UID length`).
+/// A reserved variable-length type ends the walk — its size is unknowable, so
+/// guessing would desynchronise every entry after it.
+///
+/// The returned count is the true number present even if it exceeds `out`.
+#[must_use]
+pub fn ivrs_device_entries(ivrs: &[u8], unit: &AmdIommuUnit, out: &mut [IvrsDeviceEntry]) -> usize {
+    let end = unit
+        .entry_offset
+        .saturating_add(unit.device_entry_bytes)
+        .min(ivrs.len());
+    let mut off = unit.entry_offset;
+    let mut found = 0usize;
+
+    while off < end {
+        let Some(raw) = ivrs.get(off).copied() else {
+            break;
+        };
+        let entry_len = if raw < 0x40 {
+            4
+        } else if raw < 0x80 {
+            8
+        } else if raw == IVHD_ENTRY_ACPI_HID {
+            let Some(uid_len) = ivrs.get(off + 21).copied() else {
+                break;
+            };
+            22 + usize::from(uid_len)
+        } else {
+            // Reserved variable-length type: the size cannot be known, so the
+            // walk ends rather than misaligning everything after it.
+            break;
+        };
+        if off + entry_len > end {
+            break;
+        }
+        if let Some(entry) = decode_ivhd_entry(&ivrs[off..off + entry_len]) {
+            if let Some(slot) = out.get_mut(found) {
+                *slot = entry;
+            }
+            found += 1;
+        }
+        off += entry_len;
+    }
+    found
+}
+
+/// Parse the `IVRS` table's `IVMD` memory-definition blocks into `out`,
+/// returning how many were found.
+///
+/// Each IVMD (types 20h/21h/22h, always 32 bytes) names a physical range with
+/// read/write/unity/exclusion permissions for all, one, or a range of
+/// peripherals (spec §5.2.2.2). Other IVDB types are skipped by their length.
+///
+/// The returned count is the true number present even if it exceeds `out`. A
+/// malformed block ends the walk rather than looping or reading past the
+/// table.
+#[must_use]
+pub fn ivrs_memory_definitions(ivrs: &[u8], out: &mut [IvmdRange]) -> usize {
+    let Some(length) = sdt_length(ivrs) else {
+        return 0;
+    };
+    let end = (length as usize).min(ivrs.len());
+    let mut off = IVRS_IVDBS_OFFSET;
+    let mut found = 0usize;
+
+    while let Some((block_type, start, block_len)) = next_ivdb(ivrs, &mut off, end) {
+        let kind = IvmdKind::from_type(block_type);
+        if kind == IvmdKind::Unknown || block_len != IVMD_BLOCK_LEN {
+            continue;
+        }
+        let (Some(devid), Some(aux), Some(range_start), Some(range_length)) = (
+            read_u16(ivrs, start + 4),
+            read_u16(ivrs, start + 6),
+            read_u64(ivrs, start + 16),
+            read_u64(ivrs, start + 24),
+        ) else {
+            continue;
+        };
+        let flags = ivrs[start + 1];
+        if let Some(slot) = out.get_mut(found) {
+            *slot = IvmdRange {
+                kind,
+                devid,
+                devid_end: aux,
+                start: range_start,
+                length: range_length,
+                flags,
+            };
+        }
+        found += 1;
+    }
+    found
+}
+
 /// Read a little-endian `u16` at `off`, or `None` past the end.
 fn read_u16(bytes: &[u8], off: usize) -> Option<u16> {
     let raw = bytes.get(off..off.checked_add(2)?)?;
@@ -483,6 +1109,21 @@ pub struct AcpiSummary {
     pub device_scopes: [DeviceScope; MAX_REPORTED_DEVICE_SCOPES],
     /// How many device scopes the first unit declared (may exceed the array).
     pub device_scope_count: usize,
+    /// The first [`MAX_REPORTED_AMD_UNITS`] AMD-Vi IOMMUs from the `IVRS` —
+    /// the MMIO register blocks Phase 6.4 programs on AMD hardware.
+    pub amd_units: [AmdIommuUnit; MAX_REPORTED_AMD_UNITS],
+    /// How many IVHD blocks the `IVRS` declared (may exceed the array).
+    pub amd_unit_count: usize,
+    /// The devices the **first** AMD-Vi IOMMU governs — which hardware it
+    /// virtualizes, and so what can be isolated for passthrough.
+    pub amd_device_entries: [IvrsDeviceEntry; MAX_REPORTED_AMD_ENTRIES],
+    /// How many device entries the first IVHD declared (may exceed the array).
+    pub amd_device_entry_count: usize,
+    /// The first [`MAX_REPORTED_IVMDS`] `IVMD` memory definitions from the
+    /// `IVRS` — unity/exclusion ranges DMA programming must honour.
+    pub ivmds: [IvmdRange; MAX_REPORTED_IVMDS],
+    /// How many `IVMD` blocks the `IVRS` declared (may exceed the array).
+    pub ivmd_count: usize,
 }
 
 /// How many device-scope entries the summary keeps for the first unit.
@@ -494,17 +1135,30 @@ pub const MAX_REPORTED_DEVICE_SCOPES: usize = 4;
 /// for the boot report without a heap allocation.
 pub const MAX_REPORTED_REMAPPING_UNITS: usize = 4;
 
+/// How many AMD-Vi IOMMUs the summary keeps.
+///
+/// Real AMD platforms have one IOMMU per PCI segment; a handful is ample for
+/// the boot report without a heap allocation.
+pub const MAX_REPORTED_AMD_UNITS: usize = 4;
+
+/// How many IVHD device entries the summary keeps for the first AMD-Vi IOMMU.
+pub const MAX_REPORTED_AMD_ENTRIES: usize = 8;
+
+/// How many `IVMD` memory definitions the summary keeps.
+pub const MAX_REPORTED_IVMDS: usize = 4;
+
 #[cfg(target_os = "uefi")]
 pub use hw::discover;
 
 #[cfg(target_os = "uefi")]
 mod hw {
     use super::{
-        AcpiSummary, DMAR_SIGNATURE, DeviceScope, IommuKind, MADT_SIGNATURE, MAX_REPORTED_APIC_IDS,
-        MCFG_SIGNATURE, RemappingUnit, SDT_HEADER_LEN, dmar_device_scopes, dmar_remapping_units,
-        iommu_kind_from_signature, madt_enabled_apic_ids, madt_enabled_cpu_count,
-        mcfg_first_allocation, rsdp_xsdt_address, sdt_length, sdt_signature, xsdt_entry,
-        xsdt_entry_count,
+        AcpiSummary, AmdIommuUnit, DMAR_SIGNATURE, DeviceScope, IVRS_SIGNATURE, IommuKind,
+        IvmdRange, IvrsDeviceEntry, MADT_SIGNATURE, MAX_REPORTED_APIC_IDS, MCFG_SIGNATURE,
+        RemappingUnit, SDT_HEADER_LEN, dmar_device_scopes, dmar_remapping_units,
+        iommu_kind_from_signature, ivrs_device_entries, ivrs_iommu_units, ivrs_memory_definitions,
+        madt_enabled_apic_ids, madt_enabled_cpu_count, mcfg_first_allocation, rsdp_xsdt_address,
+        sdt_length, sdt_signature, xsdt_entry, xsdt_entry_count,
     };
 
     /// View `len` bytes of identity-mapped physical memory at `phys`.
@@ -555,6 +1209,12 @@ mod hw {
             remapping_unit_count: 0,
             device_scopes: [DeviceScope::default(); super::MAX_REPORTED_DEVICE_SCOPES],
             device_scope_count: 0,
+            amd_units: [AmdIommuUnit::default(); super::MAX_REPORTED_AMD_UNITS],
+            amd_unit_count: 0,
+            amd_device_entries: [IvrsDeviceEntry::default(); super::MAX_REPORTED_AMD_ENTRIES],
+            amd_device_entry_count: 0,
+            ivmds: [IvmdRange::default(); super::MAX_REPORTED_IVMDS],
+            ivmd_count: 0,
         };
 
         // Scan the referenced tables for the MADT (enabled CPUs) and the MCFG
@@ -595,6 +1255,19 @@ mod hw {
                             &mut summary.device_scopes,
                         );
                     }
+                } else if sig == *IVRS_SIGNATURE {
+                    // The MMIO register blocks DMA remapping is programmed
+                    // through on AMD hardware, which devices the first IOMMU
+                    // governs, and the firmware's unity/exclusion ranges.
+                    summary.amd_unit_count = ivrs_iommu_units(table, &mut summary.amd_units);
+                    if summary.amd_unit_count > 0 {
+                        summary.amd_device_entry_count = ivrs_device_entries(
+                            table,
+                            &summary.amd_units[0],
+                            &mut summary.amd_device_entries,
+                        );
+                    }
+                    summary.ivmd_count = ivrs_memory_definitions(table, &mut summary.ivmds);
                 }
             }
             i += 1;
@@ -947,5 +1620,543 @@ mod tests {
         // A malformed zero-length structure must not spin.
         madt.extend_from_slice(&[MADT_LOCAL_APIC, 0, 0, 0]);
         assert_eq!(madt_enabled_cpu_count(&madt), 0);
+    }
+}
+
+#[cfg(test)]
+mod ivrs_tests {
+    use super::*;
+
+    /// Build a minimal SDT header with `sig` and `length`.
+    fn sdt_header(sig: [u8; 4], length: u32) -> [u8; SDT_HEADER_LEN] {
+        let mut h = [0u8; SDT_HEADER_LEN];
+        h[..4].copy_from_slice(&sig);
+        h[4..8].copy_from_slice(&length.to_le_bytes());
+        h
+    }
+
+    /// Build an `IVRS` table: SDT header + `IVinfo` + 8 reserved bytes + IVDBs.
+    fn ivrs_table(ivinfo: u32, blocks: &[Vec<u8>]) -> Vec<u8> {
+        let body: Vec<u8> = blocks.concat();
+        let length = u32::try_from(IVRS_IVDBS_OFFSET + body.len()).unwrap();
+        let mut table = sdt_header(*IVRS_SIGNATURE, length).to_vec();
+        table.extend_from_slice(&ivinfo.to_le_bytes());
+        table.extend_from_slice(&[0u8; 8]); // reserved
+        table.extend_from_slice(&body);
+        table
+    }
+
+    /// The 19 bytes after an IVHD block's type byte: flags(1), length
+    /// placeholder(2), `DeviceID`(2), capability offset(2), MMIO base(8),
+    /// PCI segment(2), IOMMU info(2).
+    fn ivhd_head(flags: u8, devid: u16, cap: u16, mmio: u64, seg: u16, info: u16) -> [u8; 19] {
+        let mut h = [0u8; 19];
+        h[0] = flags;
+        // Bytes 1..3 stay zero: the length placeholder `ivhd` fills in.
+        h[3..5].copy_from_slice(&devid.to_le_bytes());
+        h[5..7].copy_from_slice(&cap.to_le_bytes());
+        h[7..15].copy_from_slice(&mmio.to_le_bytes());
+        h[15..17].copy_from_slice(&seg.to_le_bytes());
+        h[17..19].copy_from_slice(&info.to_le_bytes());
+        h
+    }
+
+    /// An IVHD block: type byte, `head`, `tail`, then raw device entries.
+    ///
+    /// `tail` is the bytes between offset 20 and the first device entry: the
+    /// 4-byte feature-reporting word for 10h, or attributes(4) + EFR(8) +
+    /// EFR2(8) for 11h/40h.
+    fn ivhd(block_type: u8, head: &[u8; 19], tail: &[u8], entries: &[u8]) -> Vec<u8> {
+        let fixed = match block_type {
+            IVHD_TYPE_10 => IVHD_10_ENTRIES_OFFSET,
+            _ => IVHD_11_40_ENTRIES_OFFSET,
+        };
+        assert_eq!(tail.len(), fixed - 20);
+        let mut b = Vec::new();
+        b.push(block_type);
+        b.extend_from_slice(head);
+        b.extend_from_slice(tail);
+        b.extend_from_slice(entries);
+        let len = u16::try_from(b.len()).unwrap();
+        b[2..4].copy_from_slice(&len.to_le_bytes());
+        b
+    }
+
+    /// A 4-byte IVHD device entry.
+    fn entry4(raw: u8, devid: u16, dte: u8) -> Vec<u8> {
+        let mut e = vec![raw];
+        e.extend_from_slice(&devid.to_le_bytes());
+        e.push(dte);
+        e
+    }
+
+    /// An 8-byte IVHD device entry.
+    fn entry8(raw: u8, payload: [u8; 7]) -> Vec<u8> {
+        let mut e = vec![raw];
+        e.extend_from_slice(&payload);
+        e
+    }
+
+    /// A variable-length F0h ACPI HID entry. An empty `uid` means no UID field
+    /// (format 0); otherwise the UID is a string (format 2).
+    fn entry_f0(devid: u16, dte: u8, hid: [u8; 8], uid: &[u8]) -> Vec<u8> {
+        let mut e = vec![IVHD_ENTRY_ACPI_HID];
+        e.extend_from_slice(&devid.to_le_bytes());
+        e.push(dte);
+        e.extend_from_slice(&hid);
+        e.extend_from_slice(&[0u8; 8]); // CID absent
+        e.push(if uid.is_empty() { 0 } else { 2 }); // UID format
+        e.push(u8::try_from(uid.len()).unwrap()); // UID length
+        e.extend_from_slice(uid);
+        e
+    }
+
+    /// An IVMD block (always 32 bytes).
+    fn ivmd(block_type: u8, flags: u8, devid: u16, aux: u16, start: u64, len: u64) -> Vec<u8> {
+        let mut b = vec![block_type, flags];
+        b.extend_from_slice(&u16::try_from(IVMD_BLOCK_LEN).unwrap().to_le_bytes());
+        b.extend_from_slice(&devid.to_le_bytes());
+        b.extend_from_slice(&aux.to_le_bytes());
+        b.extend_from_slice(&[0u8; 8]); // reserved
+        b.extend_from_slice(&start.to_le_bytes());
+        b.extend_from_slice(&len.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn ivrs_info_decodes_the_ivinfo_field() {
+        let ivinfo: u32 = 0x1                // EFRSup
+            | 0x2                            // DMA remap support
+            | (0x5 << 5)                     // GVAsize
+            | (0x30 << 8)                    // PAsize
+            | (0x40 << 15)                   // VAsize
+            | (0x1 << 22); // HtAtsResv
+        let table = ivrs_table(ivinfo, &[]);
+        let info = ivrs_info(&table).unwrap();
+        assert!(info.efr_supported);
+        assert!(info.dma_remap);
+        assert_eq!(info.gva_size, 0x5);
+        assert_eq!(info.pa_size, 0x30);
+        assert_eq!(info.va_size, 0x40);
+        assert!(info.ht_ats_resv);
+
+        let plain = ivrs_table(0, &[]);
+        let info = ivrs_info(&plain).unwrap();
+        assert!(!info.efr_supported);
+        assert_eq!(info.va_size, 0);
+
+        // Too short to hold the IVinfo field.
+        assert_eq!(ivrs_info(&[0u8; 36]), None);
+    }
+
+    #[test]
+    fn ivrs_decodes_iommu_units_from_ivhd_blocks() {
+        let entries_a = [entry4(1, 0, 0), entry4(2, 0x0118, 0xC0)].concat();
+        let table = ivrs_table(
+            0x1, // EFRSup
+            &[
+                // Type 11h unit with attributes + both EFR images.
+                ivhd(
+                    IVHD_TYPE_11,
+                    &ivhd_head(
+                        IVHD_FLAG_COHERENT | IVHD_FLAG_IOTLB_SUP,
+                        0x0002,
+                        0x40,
+                        0xFEB0_0000,
+                        0,
+                        0x0103,
+                    ),
+                    // UnitID 1, MSInum 3
+                    &[
+                        0x00, 0xAB, 0xCD, 0xEF, // attributes
+                        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // EFR
+                        0x00, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x99, // EFR2
+                    ],
+                    &entries_a,
+                ),
+                // An IVMD block interleaved: skipped by the unit walk.
+                ivmd(IVMD_TYPE_ALL, 0x07, 0, 0, 0x1000, 0x2000),
+                // Type 10h unit: feature reporting word, no EFR images.
+                ivhd(
+                    IVHD_TYPE_10,
+                    &ivhd_head(
+                        IVHD_FLAG_PPR_SUP | IVHD_FLAG_PRE_F_SUP,
+                        0x0004,
+                        0x40,
+                        0xFEB1_0000,
+                        0,
+                        0x0205,
+                    ),
+                    &0x1234_5678u32.to_le_bytes(),
+                    &[],
+                ),
+                // Type 40h unit.
+                ivhd(
+                    IVHD_TYPE_40,
+                    &ivhd_head(IVHD_FLAG_COHERENT, 0x0006, 0x40, 0xFEB2_0000, 0, 0),
+                    &[0u8; 20],
+                    &[],
+                ),
+            ],
+        );
+
+        let mut units = [AmdIommuUnit::default(); 4];
+        assert_eq!(ivrs_iommu_units(&table, &mut units), 3);
+
+        let a = units[0];
+        assert_eq!(a.block_type, IVHD_TYPE_11);
+        assert_eq!(a.flags, IVHD_FLAG_COHERENT | IVHD_FLAG_IOTLB_SUP);
+        assert_eq!(a.iommu_devid, 0x0002);
+        assert_eq!(a.cap_offset, 0x40);
+        assert_eq!(a.mmio_base, 0xFEB0_0000);
+        assert_eq!(a.pci_segment, 0);
+        assert_eq!(a.unit_id(), 1);
+        assert_eq!(a.msi_num(), 3);
+        assert_eq!(a.attributes, 0xEFCD_AB00);
+        assert_eq!(a.efr, 0x1122_3344_5566_7788);
+        assert_eq!(a.efr2, 0x99AA_BBCC_DDEE_FF00);
+        assert_eq!(a.device_entry_bytes, entries_a.len());
+        assert_eq!(
+            a.entry_offset,
+            IVRS_IVDBS_OFFSET + IVHD_11_40_ENTRIES_OFFSET
+        );
+
+        let b = units[1];
+        assert_eq!(b.block_type, IVHD_TYPE_10);
+        assert_eq!(b.flags, IVHD_FLAG_PPR_SUP | IVHD_FLAG_PRE_F_SUP);
+        assert_eq!(b.iommu_devid, 0x0004);
+        assert_eq!(b.mmio_base, 0xFEB1_0000);
+        assert_eq!(b.attributes, 0x1234_5678, "10h feature reporting word");
+        assert_eq!(b.efr, 0);
+        assert_eq!(b.efr2, 0);
+        assert_eq!(b.device_entry_bytes, 0);
+
+        assert_eq!(units[2].block_type, IVHD_TYPE_40);
+        assert_eq!(units[2].mmio_base, 0xFEB2_0000);
+    }
+
+    #[test]
+    fn ivrs_unit_walk_skips_short_blocks_and_stops_on_malformed_ones() {
+        let mut units = [AmdIommuUnit::default(); 4];
+
+        // A type 11h block whose length cannot hold the fixed header is
+        // skipped, not counted — the walk continues past it.
+        let mut short = ivhd(
+            IVHD_TYPE_11,
+            &ivhd_head(0, 0x0002, 0x40, 0x1000, 0, 0),
+            &[0u8; 20],
+            &[],
+        );
+        short[2..4].copy_from_slice(&30u16.to_le_bytes());
+        let mut table = ivrs_table(
+            0,
+            &[
+                ivhd(
+                    IVHD_TYPE_10,
+                    &ivhd_head(0, 0x0004, 0x40, 0x2000, 0, 0),
+                    &[0u8; 4],
+                    &[],
+                ),
+                short,
+            ],
+        );
+        assert_eq!(ivrs_iommu_units(&table, &mut units), 1);
+        assert_eq!(units[0].mmio_base, 0x2000);
+
+        // A zero-length block ends the walk instead of spinning.
+        table.extend_from_slice(&[IVHD_TYPE_10, 0, 0, 0]);
+        let new_len = u32::try_from(table.len()).unwrap();
+        table[4..8].copy_from_slice(&new_len.to_le_bytes());
+        assert_eq!(ivrs_iommu_units(&table, &mut units), 1);
+
+        // A block claiming to run past the table end is refused.
+        let mut overlong = ivrs_table(
+            0,
+            &[ivhd(
+                IVHD_TYPE_10,
+                &ivhd_head(0, 0x0004, 0x40, 0x2000, 0, 0),
+                &[0u8; 4],
+                &[],
+            )],
+        );
+        overlong.extend_from_slice(&[IVHD_TYPE_11, 0, 0xFF, 0xFF]);
+        let new_len = u32::try_from(overlong.len()).unwrap();
+        overlong[4..8].copy_from_slice(&new_len.to_le_bytes());
+        assert_eq!(ivrs_iommu_units(&overlong, &mut units), 1);
+
+        // A truncated table is not read past its end.
+        assert_eq!(ivrs_iommu_units(&[0u8; 8], &mut units), 0);
+    }
+
+    #[test]
+    fn ivrs_decodes_device_entries() {
+        let entries = [
+            entry4(0, 0, 0), // pad: skipped, not counted
+            entry4(1, 0, 0xC0),
+            entry4(2, 0x0118, 0xC0),
+            entry4(3, 0x0200, 0xC0),
+            entry4(4, 0x02FF, 0x00),
+            entry8(
+                IVHD_ENTRY_ALIAS_SELECT,
+                [0x18, 0x01, 0xC0, 0x00, 0x20, 0x00, 0x00],
+            ),
+            entry8(
+                IVHD_ENTRY_ALIAS_RANGE_START,
+                [0x00, 0x02, 0xC0, 0x00, 0x20, 0x00, 0x00],
+            ),
+            entry8(
+                IVHD_ENTRY_EXT_SELECT,
+                [0x18, 0x01, 0xC0, 0x01, 0x00, 0x00, 0x80],
+            ),
+            entry8(
+                IVHD_ENTRY_EXT_RANGE_START,
+                [0x00, 0x03, 0xC0, 0x00, 0x00, 0x00, 0x00],
+            ),
+            entry8(
+                IVHD_ENTRY_SPECIAL,
+                [0x00, 0x00, 0xC0, 0x02, 0x20, 0x00, 0x01],
+            ),
+            entry8(0x44, [0; 7]), // reserved fixed type: Unknown, still counted
+            entry_f0(0x0005, 0xC0, *b"AMDI0040", &[]),
+            entry_f0(0x0006, 0xC0, *b"AMDI0050", b"_SB.FUR0"),
+        ]
+        .concat();
+        let table = ivrs_table(
+            0x1,
+            &[ivhd(
+                IVHD_TYPE_11,
+                &ivhd_head(0, 0x0002, 0x40, 0x1000, 0, 0),
+                &[0u8; 20],
+                &entries,
+            )],
+        );
+
+        let mut units = [AmdIommuUnit::default(); 2];
+        assert_eq!(ivrs_iommu_units(&table, &mut units), 1);
+
+        let mut found = [IvrsDeviceEntry::default(); 16];
+        assert_eq!(ivrs_device_entries(&table, &units[0], &mut found), 12);
+
+        assert_eq!(found[0].kind, IvrsEntryKind::All);
+
+        assert_eq!(found[1].kind, IvrsEntryKind::Select);
+        assert_eq!(found[1].devid, 0x0118);
+        assert_eq!(found[1].dte, 0xC0);
+        assert_eq!(ivrs_devid_bdf(found[1].devid), (1, 3, 0));
+
+        assert_eq!(found[2].kind, IvrsEntryKind::RangeStart);
+        assert_eq!(found[2].devid, 0x0200);
+        assert_eq!(found[3].kind, IvrsEntryKind::RangeEnd);
+        assert_eq!(found[3].devid, 0x02FF);
+
+        assert_eq!(found[4].kind, IvrsEntryKind::AliasSelect);
+        assert_eq!(found[4].devid, 0x0118);
+        assert_eq!(found[4].devid_b, 0x0020);
+
+        assert_eq!(found[5].kind, IvrsEntryKind::AliasRangeStart);
+        assert_eq!(found[5].devid, 0x0200);
+        assert_eq!(found[5].devid_b, 0x0020);
+
+        assert_eq!(found[6].kind, IvrsEntryKind::ExtSelect);
+        assert_eq!(found[6].devid, 0x0118);
+        assert_eq!(found[6].ext_dte, 0x8000_0001, "AtsDisabled bit");
+
+        assert_eq!(found[7].kind, IvrsEntryKind::ExtRangeStart);
+        assert_eq!(found[7].devid, 0x0300);
+
+        assert_eq!(found[8].kind, IvrsEntryKind::Special);
+        assert_eq!(found[8].handle, 2);
+        assert_eq!(found[8].variety, IVHD_SPECIAL_IOAPIC);
+        assert_eq!(found[8].devid_b, 0x0020);
+
+        assert_eq!(found[9].kind, IvrsEntryKind::Unknown);
+
+        assert_eq!(found[10].kind, IvrsEntryKind::AcpiHid);
+        assert_eq!(found[10].devid, 0x0005);
+        assert_eq!(found[10].hid.to_le_bytes(), *b"AMDI0040");
+        assert_eq!(found[10].uid_len, 0);
+
+        assert_eq!(found[11].kind, IvrsEntryKind::AcpiHid);
+        assert_eq!(found[11].devid, 0x0006);
+        assert_eq!(found[11].hid.to_le_bytes(), *b"AMDI0050");
+        assert_eq!(found[11].uid_len, 8);
+    }
+
+    #[test]
+    fn ivrs_device_entry_walk_stops_at_reserved_variable_types() {
+        // 0x81 is a reserved variable-length type: its size is unknowable, so
+        // the walk ends instead of misaligning everything after it.
+        let entries = [
+            entry4(2, 0x0118, 0),
+            vec![0x81, 0, 0, 0],
+            entry4(2, 0x0220, 0),
+        ]
+        .concat();
+        let table = ivrs_table(
+            0,
+            &[ivhd(
+                IVHD_TYPE_40,
+                &ivhd_head(0, 0x0002, 0x40, 0x1000, 0, 0),
+                &[0u8; 20],
+                &entries,
+            )],
+        );
+
+        let mut units = [AmdIommuUnit::default(); 1];
+        assert_eq!(ivrs_iommu_units(&table, &mut units), 1);
+        let mut found = [IvrsDeviceEntry::default(); 4];
+        assert_eq!(ivrs_device_entries(&table, &units[0], &mut found), 1);
+        assert_eq!(found[0].devid, 0x0118);
+    }
+
+    #[test]
+    fn ivrs_device_entry_walk_stops_on_truncation() {
+        // The last entry is cut off mid-way: the walk stops, no over-read.
+        let entries = [entry4(2, 0x0118, 0), vec![0x02, 0x18]].concat();
+        let table = ivrs_table(
+            0,
+            &[ivhd(
+                IVHD_TYPE_10,
+                &ivhd_head(0, 0x0002, 0x40, 0x1000, 0, 0),
+                &[0u8; 4],
+                &entries,
+            )],
+        );
+
+        let mut units = [AmdIommuUnit::default(); 1];
+        assert_eq!(ivrs_iommu_units(&table, &mut units), 1);
+        let mut found = [IvrsDeviceEntry::default(); 4];
+        assert_eq!(ivrs_device_entries(&table, &units[0], &mut found), 1);
+    }
+
+    #[test]
+    fn ivrs_decodes_ivmd_ranges() {
+        let table = ivrs_table(
+            0,
+            &[
+                ivmd(
+                    IVMD_TYPE_ALL,
+                    IVMD_FLAG_UNITY | IVMD_FLAG_IR | IVMD_FLAG_IW,
+                    0,
+                    0,
+                    0x1000,
+                    0x2000,
+                ),
+                ivmd(IVMD_TYPE_ONE, IVMD_FLAG_IR, 0x0118, 0, 0xB_0000, 0x1_0000),
+                ivmd(
+                    IVMD_TYPE_RANGE,
+                    IVMD_FLAG_EXCLUSION,
+                    0x0200,
+                    0x02FF,
+                    0xC_0000,
+                    0x1000,
+                ),
+                // Wrong length for an IVMD: skipped.
+                {
+                    let mut bad = ivmd(IVMD_TYPE_ONE, 0, 0, 0, 0, 0);
+                    bad[2..4].copy_from_slice(&16u16.to_le_bytes());
+                    bad.truncate(16);
+                    bad
+                },
+            ],
+        );
+
+        let mut ranges = [IvmdRange::default(); 4];
+        assert_eq!(ivrs_memory_definitions(&table, &mut ranges), 3);
+
+        assert_eq!(ranges[0].kind, IvmdKind::All);
+        assert_eq!((ranges[0].start, ranges[0].length), (0x1000, 0x2000));
+        assert!(ranges[0].readable() && ranges[0].writable() && ranges[0].unity());
+        assert!(!ranges[0].exclusion());
+
+        assert_eq!(ranges[1].kind, IvmdKind::Specified);
+        assert_eq!(ranges[1].devid, 0x0118);
+        assert!(ranges[1].readable());
+        assert!(!ranges[1].writable());
+
+        assert_eq!(ranges[2].kind, IvmdKind::Range);
+        assert_eq!(ranges[2].devid, 0x0200);
+        assert_eq!(ranges[2].devid_end, 0x02FF);
+        assert!(ranges[2].exclusion());
+    }
+
+    #[test]
+    fn ivrs_reports_true_counts_past_short_buffers() {
+        let table = ivrs_table(
+            0,
+            &[
+                ivhd(
+                    IVHD_TYPE_10,
+                    &ivhd_head(0, 0x0002, 0x40, 0x1000, 0, 0),
+                    &[0u8; 4],
+                    &[],
+                ),
+                ivhd(
+                    IVHD_TYPE_10,
+                    &ivhd_head(0, 0x0004, 0x40, 0x2000, 0, 0),
+                    &[0u8; 4],
+                    &[],
+                ),
+                ivhd(
+                    IVHD_TYPE_10,
+                    &ivhd_head(0, 0x0006, 0x40, 0x3000, 0, 0),
+                    &[0u8; 4],
+                    &[],
+                ),
+                ivmd(IVMD_TYPE_ALL, 0, 0, 0, 0x1000, 0x1000),
+                ivmd(IVMD_TYPE_ALL, 0, 0, 0, 0x2000, 0x1000),
+            ],
+        );
+
+        let mut one = [AmdIommuUnit::default(); 1];
+        assert_eq!(ivrs_iommu_units(&table, &mut one), 3);
+        assert_eq!(one[0].mmio_base, 0x1000);
+
+        let mut one_range = [IvmdRange::default(); 1];
+        assert_eq!(ivrs_memory_definitions(&table, &mut one_range), 2);
+        assert_eq!(one_range[0].start, 0x1000);
+
+        // Entries too: three selects, one slot.
+        let entries = [entry4(2, 1, 0), entry4(2, 2, 0), entry4(2, 3, 0)].concat();
+        let table = ivrs_table(
+            0,
+            &[ivhd(
+                IVHD_TYPE_10,
+                &ivhd_head(0, 0x0002, 0x40, 0x1000, 0, 0),
+                &[0u8; 4],
+                &entries,
+            )],
+        );
+        let mut units = [AmdIommuUnit::default(); 1];
+        assert_eq!(ivrs_iommu_units(&table, &mut units), 1);
+        let mut one_entry = [IvrsDeviceEntry::default(); 1];
+        assert_eq!(ivrs_device_entries(&table, &units[0], &mut one_entry), 3);
+        assert_eq!(one_entry[0].devid, 1);
+    }
+
+    #[test]
+    fn ivrs_devid_bdf_splits_bus_device_function() {
+        assert_eq!(ivrs_devid_bdf(0x0118), (1, 3, 0));
+        assert_eq!(ivrs_devid_bdf(0xFFFF), (0xFF, 0x1F, 7));
+        assert_eq!(ivrs_devid_bdf(0x0000), (0, 0, 0));
+    }
+
+    #[test]
+    fn ivrs_entry_and_ivmd_kinds_decode_and_name() {
+        assert_eq!(IvrsEntryKind::from_type(1), IvrsEntryKind::All);
+        assert_eq!(IvrsEntryKind::from_type(4), IvrsEntryKind::RangeEnd);
+        assert_eq!(IvrsEntryKind::from_type(0x42), IvrsEntryKind::AliasSelect);
+        assert_eq!(IvrsEntryKind::from_type(0x47), IvrsEntryKind::ExtRangeStart);
+        assert_eq!(IvrsEntryKind::from_type(0x48), IvrsEntryKind::Special);
+        assert_eq!(IvrsEntryKind::from_type(0xF0), IvrsEntryKind::AcpiHid);
+        assert_eq!(IvrsEntryKind::from_type(0x05), IvrsEntryKind::Unknown);
+        assert_eq!(IvrsEntryKind::Unknown.name(), "unknown");
+        assert_eq!(IvrsEntryKind::AcpiHid.name(), "acpi-hid");
+
+        assert_eq!(IvmdKind::from_type(0x20), IvmdKind::All);
+        assert_eq!(IvmdKind::from_type(0x21), IvmdKind::Specified);
+        assert_eq!(IvmdKind::from_type(0x22), IvmdKind::Range);
+        assert_eq!(IvmdKind::from_type(0x23), IvmdKind::Unknown);
+        assert_eq!(IvmdKind::Range.name(), "range");
     }
 }
