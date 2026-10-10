@@ -38,6 +38,7 @@ pub mod smp;
 pub mod stack;
 pub mod svm;
 pub mod tsc;
+pub mod xhci;
 
 /// Console/serial banner the payload emits once it has taken control.
 ///
