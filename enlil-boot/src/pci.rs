@@ -121,6 +121,19 @@ pub const fn cap_next_of(cap_dword: u32) -> u8 {
     ((cap_dword >> 8) & 0xFC) as u8
 }
 
+/// The subclass byte (second byte of the class dword at config offset 0x08).
+#[must_use]
+pub const fn subclass_of(config_dword_at_08: u32) -> u8 {
+    ((config_dword_at_08 >> 16) & 0xFF) as u8
+}
+
+/// The programming-interface byte (third byte of the class dword at config
+/// offset 0x08).
+#[must_use]
+pub const fn prog_if_of(config_dword_at_08: u32) -> u8 {
+    ((config_dword_at_08 >> 8) & 0xFF) as u8
+}
+
 /// Config offset of Base Address Register 0. BARs 0–5 are the six dwords at
 /// `0x10, 0x14, … 0x24`.
 pub const BAR0_OFFSET: u8 = 0x10;
@@ -268,7 +281,9 @@ impl PciScan {
 }
 
 #[cfg(target_os = "uefi")]
-pub use hw::{first_memory_bar, scan_bus0, scan_ecam, scan_memory_bars};
+pub use hw::{
+    XhciFunction, find_xhci_controllers, first_memory_bar, scan_bus0, scan_ecam, scan_memory_bars,
+};
 
 #[cfg(target_os = "uefi")]
 mod hw {
@@ -276,7 +291,7 @@ mod hw {
         BAR0_OFFSET, CAP_ID_MSIX, EcamScan, MemoryBar, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA,
         PciScan, bar_is_io, bar_is_mem_64, bar_mem_base, bar_mem_base_64, bar_mem_size,
         bar_mem_size_64, cap_id_of, cap_next_of, class_of, config_address, device_of,
-        ecam_config_address, status_has_caps, vendor_of, vendor_present,
+        ecam_config_address, prog_if_of, status_has_caps, subclass_of, vendor_of, vendor_present,
     };
 
     /// Write a 32-bit `value` to `port`.
@@ -638,6 +653,97 @@ mod hw {
         }
         scan
     }
+
+    /// An xHCI host controller function found by [`find_xhci_controllers`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct XhciFunction {
+        /// PCI bus number.
+        pub bus: u8,
+        /// PCI device number.
+        pub device: u8,
+        /// PCI function number.
+        pub function: u8,
+        /// BAR0 memory base — the xHCI register window; 0 when BAR0 is not
+        /// a memory BAR.
+        pub bar0: u64,
+    }
+
+    impl XhciFunction {
+        /// Placeholder for caller-provided output buffers.
+        pub const EMPTY: Self = Self {
+            bus: 0,
+            device: 0,
+            function: 0,
+            bar0: 0,
+        };
+    }
+
+    /// Decode BAR0 as a memory base; 0 when it is an I/O BAR.
+    fn memory_bar0(bus: u8, device: u8, function: u8) -> u64 {
+        let lo = config_read(bus, device, function, BAR0_OFFSET);
+        if bar_is_io(lo) {
+            return 0;
+        }
+        if bar_is_mem_64(lo) {
+            let hi = config_read(bus, device, function, BAR0_OFFSET + 4);
+            bar_mem_base_64(lo, hi)
+        } else {
+            u64::from(bar_mem_base(lo))
+        }
+    }
+
+    /// Find xHCI USB host controllers on bus 0 via the legacy config
+    /// mechanism, filling the caller's buffer; returns how many were found.
+    ///
+    /// For each xHCI function (class 0x0C/0x03, prog-if 0x30 — see
+    /// [`crate::xhci::is_xhci_function`]) the BAR0 memory base is decoded:
+    /// the register window the [`crate::xhci`] driver maps. Read-only — no
+    /// BAR sizing, no config writes.
+    pub fn find_xhci_controllers(out: &mut [XhciFunction]) -> usize {
+        /// Config offset of the header-type byte (bits: 7 = multifunction).
+        const HEADER_TYPE_OFFSET: u8 = 0x0C;
+        const HEADER_MULTIFUNCTION: u32 = 0x0080_0000; // bit 23 (byte 0x0E)
+        /// Config offset of the class-code dword (revision/prog-if/subclass/class).
+        const CLASS_OFFSET: u8 = 0x08;
+
+        let mut found = 0;
+        for device in 0u8..32 {
+            if !vendor_present(vendor_of(config_read(0, device, 0, 0))) {
+                continue;
+            }
+            let mut check = |function: u8| {
+                let class_dword = config_read(0, device, function, CLASS_OFFSET);
+                if found < out.len()
+                    && crate::xhci::is_xhci_function(
+                        class_of(class_dword),
+                        subclass_of(class_dword),
+                        prog_if_of(class_dword),
+                    )
+                {
+                    out[found] = XhciFunction {
+                        bus: 0,
+                        device,
+                        function,
+                        bar0: memory_bar0(0, device, function),
+                    };
+                    found += 1;
+                }
+            };
+            check(0);
+            // Probe the other functions only if function 0 is multifunction.
+            if config_read(0, device, 0, HEADER_TYPE_OFFSET) & HEADER_MULTIFUNCTION != 0 {
+                for function in 1u8..8 {
+                    if vendor_present(vendor_of(config_read(0, device, function, 0))) {
+                        check(function);
+                    }
+                }
+            }
+            if found == out.len() {
+                break;
+            }
+        }
+        found
+    }
 }
 
 #[cfg(test)]
@@ -772,6 +878,20 @@ mod tests {
         assert_eq!(scan.storage, 2);
         assert_eq!(scan.network, 1);
         assert_eq!(scan.display, 0);
+    }
+
+    #[test]
+    fn class_subclass_progif_decode() {
+        // Class dword: revision 0x01, prog-if 0x30, subclass 0x03, class 0x0C.
+        let dword: u32 = 0x0C03_3001;
+        assert_eq!(class_of(dword), 0x0C);
+        assert_eq!(subclass_of(dword), 0x03);
+        assert_eq!(prog_if_of(dword), 0x30);
+        assert!(crate::xhci::is_xhci_function(
+            class_of(dword),
+            subclass_of(dword),
+            prog_if_of(dword)
+        ));
     }
 
     #[test]

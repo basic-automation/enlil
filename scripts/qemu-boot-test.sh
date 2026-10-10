@@ -132,6 +132,11 @@ PCI_BAR_LINE="pci: BAR"
 # Printed once the kernel summarizes every memory BAR on bus 0 — the total MMIO
 # footprint (count + summed sizes) the hypervisor accounts for in passthrough.
 PCI_BARS_LINE="memory BARs on bus 0 totaling"
+# Printed once the kernel's bare-metal xHCI driver (ROADMAP 6.5, T-6.18) finds
+# the USB host controller via the PCI class scan, probes its capability
+# registers through BAR0, resets it, starts its schedule, and scans its
+# root-hub ports. The QEMU command line provides an emulated qemu-xhci device.
+XHCI_LINE="enlil kernel: xhci: controller enumerated"
 # Printed once the kernel builds its own identity page tables and reloads CR3
 # off the firmware's — reaching this line proves the map covers the kernel.
 PAGING_LINE="off firmware page tables"
@@ -352,6 +357,11 @@ QEMU_ARGS=(
     # emulates VT-d regardless of the host CPU vendor, so this works on this AMD
     # workstation; enlil's own SVM path is unaffected.
     -device intel-iommu
+    # An emulated xHCI USB host controller for the bare-metal xHCI driver
+    # (ROADMAP 6.5, T-6.18): the kernel enumerates it on the bare-metal path
+    # via the PCI class scan, probes its BAR0 capability registers, resets
+    # it, and scans its root-hub ports.
+    -device qemu-xhci
     -drive "format=raw,file=fat:rw:$ESP"
     -serial "file:$SERIAL_LOG"
     -display none
@@ -439,6 +449,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ECAM_SCAN_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PCI_BAR_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PCI_BARS_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$XHCI_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PAGING_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$NULLGUARD_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$SPLIT_LINE" "$SERIAL_LOG" 2>/dev/null \
@@ -475,7 +486,11 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$EXC_ERRCODE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_TEXT_LINE" "$SERIAL_LOG" 2>/dev/null; then
+<<<<<<< HEAD
     echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, scheduler quantum driven by the LAPIC timer, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery incl. real VT-d DMAR remapping units + device scopes, SMP AP bring-up (INIT-SIPI-SIPI), PCI enumeration, own page tables (null-page guard) + 4 KiB split + kernel-owned guarded stack (bring-up continues on it), SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + interrupt IRET-resume round-trip + 64-bit long-mode guest + long-mode interrupt round-trip + virtual-interrupt masking + spinning-guest preemption + host-LAPIC-timer preemption (INTR intercept) + timer-tick delivery into the guest + PERIODIC timer preemption + tick delivery (host timer re-armed per quantum, handler IRETQ back into the spin — the guest time-slice) + guest-exception interception (#UD trap + re-inject) + interrupt round-trip (inject/handle/IRET/resume) + NPT write-protection dirty-tracking (trap+grant+re-protect a guest store twice — per-epoch bitmap) + RDTSC-intercept fallback guest runs (T-6.7; the intercept itself is physical-AMD-proven only) + exception error-code re-inject (#PF/#GP via a paged guest, exact codes re-delivered, T-6.13), and GOP draw observed on serial"
+=======
+    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, scheduler quantum driven by the LAPIC timer, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery incl. real VT-d DMAR remapping units + device scopes, SMP AP bring-up (INIT-SIPI-SIPI), PCI enumeration, own page tables (null-page guard) + 4 KiB split + kernel-owned guarded stack (bring-up continues on it), SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + interrupt IRET-resume round-trip + 64-bit long-mode guest + long-mode interrupt round-trip + virtual-interrupt masking + spinning-guest preemption + host-LAPIC-timer preemption (INTR intercept) + timer-tick delivery into the guest + PERIODIC timer preemption + tick delivery (host timer re-armed per quantum, handler IRETQ back into the spin — the guest time-slice) + guest-exception interception (#UD trap + re-inject) + interrupt round-trip (inject/handle/IRET/resume) + NPT write-protection dirty-tracking (trap+grant a guest store) + RDTSC-intercept fallback guest runs (T-6.7; the intercept itself is physical-AMD-proven only) + exception error-code re-inject (#PF/#GP via a paged guest, exact codes re-delivered, T-6.13) + bare-metal xHCI USB host controller enumerated (probe + reset + schedule + port scan, T-6.18), and GOP draw observed on serial"
+>>>>>>> ab0873c (feat(boot): bare-metal xHCI USB host driver (T-6.18, phase 6.5))
     exit 0
 fi
 
