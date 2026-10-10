@@ -1977,31 +1977,48 @@ mod hw {
     }
 
     /// Build and run the NPT write-protection guest, reporting whether enlil
-    /// trapped the guest's store to a write-protected page and let it complete.
+    /// tracked the guest's stores as a true per-epoch dirty bitmap.
     ///
-    /// enlil marks the guest's RAM leaf read-only, so the guest's store takes a
-    /// present+write nested page fault; the run loop records it, grants write,
-    /// and resumes so the store completes. The guest reads the byte back and
-    /// `OUT`s [`GUEST_WP_VALUE`](crate::svm::GUEST_WP_VALUE) — a match plus a
-    /// counted write-fault proves enlil observed the write before it landed, the
-    /// signal live-migration dirty tracking and copy-on-write build on (ROADMAP
-    /// 6.2 / Phase 8).
+    /// enlil marks the guest's RAM leaf read-only and attaches an
+    /// [`NptDirtyLog`](enlil_hal::npt::NptDirtyLog) covering it; the guest
+    /// stores twice with an `OUT` between. Each store takes a present+write
+    /// nested page fault — the *second* only because the run loop re-protected
+    /// the leaf after recording the first (re-protect-after-record) — and the
+    /// run loop records each fault in the epoch bitmap, grants the write, and
+    /// resumes so the store completes. The guest reads each byte back and
+    /// `OUT`s it. Two counted write-faults, two matching `OUT`s, and exactly
+    /// the one dirtied page in the epoch bitmap prove enlil observed every
+    /// write before it landed — the signal live-migration dirty tracking and
+    /// copy-on-write build on (ROADMAP 6.2 / Phase 8, T-6.12).
     fn run_wp_npf_guest(serial: &SerialPort) {
-        use crate::svm::{GUEST_WP_PORT, GUEST_WP_VALUE};
+        use crate::svm::{GUEST_WP_PORT, GUEST_WP_PORT2, GUEST_WP_VALUE, GUEST_WP_VALUE2};
+        use enlil_hal::npt::{NptDirtyLog, dirty_bitmap_words};
         match crate::svm::program_wp_npf_vmcb() {
             Some((vmcb, _gpa)) => {
+                // One 2 MiB page tracked: the guest's write-protected RAM leaf.
+                let mut words = [0u64; dirty_bitmap_words(1)];
+                let Ok(mut log) = NptDirtyLog::new(0, 1, &mut words) else {
+                    serial.write_str("enlil kernel: svm: wp-npf dirty log setup FAILED\n");
+                    return;
+                };
                 // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
                 // is a VMRUN-ready VMCB from program_wp_npf_vmcb.
-                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
-                if run.npf_write_faults > 0
-                    && run.io_out_to(u16::from(GUEST_WP_PORT)) == Some(u32::from(GUEST_WP_VALUE))
-                {
+                let run = unsafe { crate::svm::run_boot_guest_loop_dirty(vmcb, &mut log) };
+                let first =
+                    run.io_out_to(u16::from(GUEST_WP_PORT)) == Some(u32::from(GUEST_WP_VALUE));
+                let second =
+                    run.io_out_to(u16::from(GUEST_WP_PORT2)) == Some(u32::from(GUEST_WP_VALUE2));
+                // Two faults (the second store faulted because the leaf was
+                // re-protected after the first record — per-epoch, not
+                // one-shot) and one dirtied page in the epoch bitmap.
+                let epoch_tracked = log.dirty_page_count() == 1 && log.is_dirty(0).unwrap_or(false);
+                if run.npf_write_faults == 2 && first && second && epoch_tracked {
                     serial.write_str(
-                        "enlil kernel: svm: guest write to a write-protected page trapped + granted by enlil — NPT dirty-tracking works\n",
+                        "enlil kernel: svm: guest writes to a write-protected page trapped + granted + re-protected — NPT dirty-tracking works (per-epoch bitmap)\n",
                     );
                 } else {
                     serial.write_str(
-                        "enlil kernel: svm: NPT write-protection NOT observed (no write fault or store did not complete)\n",
+                        "enlil kernel: svm: NPT per-epoch dirty-tracking NOT observed (expected two write faults, two matching OUTs, one dirtied page)\n",
                     );
                 }
             }
