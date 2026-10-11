@@ -794,6 +794,7 @@ mod tests {
             serial: SerialPortConfig::default(),
             mac: None,
             firmware: None,
+            gpu: None,
         };
         let spec = GuestBootSpec::from_guest_config(
             &config,
@@ -1089,6 +1090,7 @@ mod tests {
                 serial: SerialPortConfig::default(),
                 mac: None,
                 firmware: None,
+                gpu: None,
             },
         );
         let config = EnlilConfig {
