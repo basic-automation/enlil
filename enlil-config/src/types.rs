@@ -14,6 +14,59 @@ pub struct EnlilConfig {
     /// USB peripheral routing (`[usb]`).
     #[serde(default, skip_serializing_if = "UsbConfig::is_empty")]
     pub usb: UsbConfig,
+    /// GPU sharing strategy (`[gpu]`).
+    #[serde(default, skip_serializing_if = "GpuConfig::is_empty")]
+    pub gpu: GpuConfig,
+}
+
+/// GPU sharing strategy selection (`[gpu]`).
+///
+/// Phase 7.1: the hypervisor detects each physical GPU's capabilities and
+/// recommends a sharing tier (see `enlil_devices::gpu`); this block lets the
+/// operator pin a tier instead of taking the recommendation. The full `[gpu]`
+/// schema (per-device BDF pinning, timeslice quanta, VRAM splits) is T-7.6 —
+/// this task only needs the strategy knob the recommendation layer validates
+/// against.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GpuConfig {
+    /// Tier to use for every detected GPU (`None` = `auto`: take the
+    /// per-GPU recommendation from capability detection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<GpuStrategy>,
+}
+
+impl GpuConfig {
+    /// Whether no GPU strategy is configured (so `[gpu]` round-trips away).
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.strategy.is_none()
+    }
+}
+
+/// The GPU sharing tiers (Phase 7) a strategy can name.
+///
+/// `Auto` takes the per-GPU recommendation from capability detection
+/// (`enlil_devices::gpu::recommend_tier`); `None` explicitly assigns no GPU to
+/// any guest. The concrete tiers mirror `enlil_devices::gpu::GpuTier`; the
+/// config crate cannot depend on `enlil-devices` (dependency direction), so the
+/// two enums are kept in sync by name and both use kebab-case TOML spellings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GpuStrategy {
+    /// Take the per-GPU recommendation from capability detection.
+    Auto,
+    /// Tier 1: assign a whole GPU's IOMMU group to one guest via VFIO.
+    Passthrough,
+    /// Tier 2: SR-IOV VFs / NVIDIA MIG instances, one per guest.
+    SrIov,
+    /// Tier 2.5: VirtIO-GPU paravirtual device (software rendering fallback).
+    VirtioGpu,
+    /// Tier 3: mediated passthrough (post-1.0, T-7.4).
+    Mediated,
+    /// Tier 4: time-sliced exclusive access (post-1.0, T-7.5).
+    TimeSliced,
+    /// Explicitly assign no GPU to any guest.
+    None,
 }
 
 /// USB peripheral-routing configuration (`[usb]`).

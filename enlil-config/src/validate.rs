@@ -146,7 +146,34 @@ fn validate_usb_vfio_fallback(config: &EnlilConfig) -> Vec<String> {
     }
     errors
 }
-/// and well-formed (LOCKED PRINCIPLE 1 — no virtualization-vendor OUI, no
+
+/// Validate the `[gpu]` strategy (Phase 7.1).
+///
+/// The mediated (T-7.4) and time-sliced (T-7.5) tier *implementations* are
+/// post-1.0, so pinning one of them is rejected at config load with a pointer
+/// at the right roadmap task — failing loudly here instead of silently
+/// ignoring the request (or crashing) when a guest boots. `auto` and the
+/// implemented tiers need no static check: the capability match happens per
+/// GPU in `enlil_devices::gpu::resolve_strategy`.
+fn validate_gpu_strategy(config: &EnlilConfig) -> Vec<String> {
+    let mut errors = Vec::new();
+    match config.gpu.strategy {
+        Some(crate::GpuStrategy::Mediated) => errors.push(
+            "gpu.strategy 'mediated' (Tier 3 mediated passthrough) is not implemented in \
+             Enlil 1.0 — it is roadmap task T-7.4. Use 'auto', 'passthrough', \
+             'sr-iov', 'virtio-gpu', or 'none'"
+                .to_string(),
+        ),
+        Some(crate::GpuStrategy::TimeSliced) => errors.push(
+            "gpu.strategy 'time-sliced' (Tier 4 time-sliced passthrough) is not implemented in \
+             Enlil 1.0 — it is roadmap task T-7.5. Use 'auto', 'passthrough', \
+             'sr-iov', 'virtio-gpu', or 'none'"
+                .to_string(),
+        ),
+        _ => {}
+    }
+    errors
+}
 /// multicast/broadcast source; Phase 5.8), and no two guests may share one
 /// (LOCKED PRINCIPLE 5 — a duplicate source MAC flaps the MAC-learning virtual
 /// switch between ports and misdelivers inter-guest traffic). Duplicates are
@@ -226,6 +253,10 @@ pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
     // USB peripheral routing (Phase 4.3): match specs parse, targets exist.
     errors.append(&mut validate_usb_routing(config));
     errors.append(&mut validate_usb_vfio_fallback(config));
+
+    // GPU sharing strategy (Phase 7.1): post-1.0 tiers are rejected here
+    // instead of failing silently at guest boot.
+    errors.append(&mut validate_gpu_strategy(config));
 
     // Check memory
     let total_guest_memory: u64 = config.guest.values().map(|g| g.memory_mb).sum();
@@ -408,6 +439,7 @@ mod tests {
             hypervisor: HypervisorConfig::default(),
             guest: guests,
             usb: UsbConfig::default(),
+            gpu: GpuConfig::default(),
         }
     }
 
@@ -1138,5 +1170,54 @@ mod tests {
                 .any(|e| e.contains("firmware.vars") && e.contains("firmware.code")),
             "{errors:?}"
         );
+    }
+
+    #[test]
+    fn gpu_strategy_parses_from_toml() {
+        let config: EnlilConfig =
+            toml::from_str("[gpu]\nstrategy = \"sr-iov\"\n[guest.vm1]\nname = \"v\"\ncpus = [0]\nmemory_mb = 2048\n")
+                .unwrap();
+        assert_eq!(config.gpu.strategy, Some(crate::GpuStrategy::SrIov));
+        assert!(!config.gpu.is_empty());
+        let bare: EnlilConfig = toml::from_str("").unwrap();
+        assert!(bare.gpu.is_empty());
+    }
+
+    #[test]
+    fn gpu_strategy_rejects_unknown_spelling() {
+        let result = toml::from_str::<EnlilConfig>("[gpu]\nstrategy = \"magic\"\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn gpu_strategy_rejects_post_1_0_tiers() {
+        for (strategy, task) in [
+            (crate::GpuStrategy::Mediated, "T-7.4"),
+            (crate::GpuStrategy::TimeSliced, "T-7.5"),
+        ] {
+            let mut config = minimal_config();
+            config.gpu.strategy = Some(strategy);
+            let errors = validate_config(&config);
+            assert!(
+                errors.iter().any(|e| e.contains(task)),
+                "expected {task} in errors for {strategy:?}, got {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_strategy_accepts_implemented_tiers() {
+        for strategy in [
+            crate::GpuStrategy::Auto,
+            crate::GpuStrategy::Passthrough,
+            crate::GpuStrategy::SrIov,
+            crate::GpuStrategy::VirtioGpu,
+            crate::GpuStrategy::None,
+        ] {
+            let mut config = minimal_config();
+            config.gpu.strategy = Some(strategy);
+            let errors = validate_gpu_strategy(&config);
+            assert!(errors.is_empty(), "{strategy:?}: {errors:?}");
+        }
     }
 }
