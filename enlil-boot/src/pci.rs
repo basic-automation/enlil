@@ -280,18 +280,43 @@ impl PciScan {
     }
 }
 
+/// A network-class PCI function the management-NIC driver can bind to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkFunction {
+    /// PCI device number on bus 0.
+    pub device: u8,
+    /// PCI function number.
+    pub function: u8,
+    /// PCI vendor id.
+    pub vendor: u16,
+    /// PCI device id.
+    pub device_id: u16,
+}
+
 #[cfg(target_os = "uefi")]
 pub use hw::{
+<<<<<<< HEAD
     XhciFunction, find_xhci_controllers, first_memory_bar, scan_bus0, scan_ecam, scan_memory_bars,
+=======
+    bar0_mmio_base, first_memory_bar, first_network_function, scan_bus0, scan_ecam,
+    scan_memory_bars,
+>>>>>>> 90c0666 (feat(boot): minimal bare-metal management-network driver (T-6.20))
 };
 
 #[cfg(target_os = "uefi")]
 mod hw {
     use super::{
+<<<<<<< HEAD
         BAR0_OFFSET, CAP_ID_MSIX, EcamScan, MemoryBar, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA,
         PciScan, bar_is_io, bar_is_mem_64, bar_mem_base, bar_mem_base_64, bar_mem_size,
         bar_mem_size_64, cap_id_of, cap_next_of, class_of, config_address, device_of,
         ecam_config_address, prog_if_of, status_has_caps, subclass_of, vendor_of, vendor_present,
+=======
+        BAR0_OFFSET, CAP_ID_MSIX, CLASS_NETWORK, EcamScan, MemoryBar, NetworkFunction,
+        PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA, PciScan, bar_is_io, bar_is_mem_64, bar_mem_base,
+        bar_mem_base_64, bar_mem_size, bar_mem_size_64, cap_id_of, cap_next_of, class_of,
+        config_address, device_of, ecam_config_address, status_has_caps, vendor_of, vendor_present,
+>>>>>>> 90c0666 (feat(boot): minimal bare-metal management-network driver (T-6.20))
     };
 
     /// Write a 32-bit `value` to `port`.
@@ -588,6 +613,71 @@ mod hw {
             }
         }
         summary
+    }
+
+    /// The first network-class (0x02) function on PCI bus 0 — the management
+    /// NIC the bare-metal network driver binds to.
+    ///
+    /// Probes function 0 of each device, then functions 1–7 when device 0 is
+    /// multifunction (the same enumeration as [`scan_bus0`]). Read-only.
+    #[must_use]
+    pub fn first_network_function() -> Option<NetworkFunction> {
+        const HEADER_TYPE_OFFSET: u8 = 0x0C;
+        const HEADER_MULTIFUNCTION: u32 = 0x0080_0000;
+        const CLASS_OFFSET: u8 = 0x08;
+
+        for device in 0u8..32 {
+            let dword0 = config_read(0, device, 0, 0);
+            if !vendor_present(vendor_of(dword0)) {
+                continue;
+            }
+            if class_of(config_read(0, device, 0, CLASS_OFFSET)) == CLASS_NETWORK {
+                return Some(NetworkFunction {
+                    device,
+                    function: 0,
+                    vendor: vendor_of(dword0),
+                    device_id: device_of(dword0),
+                });
+            }
+            let multifunction =
+                config_read(0, device, 0, HEADER_TYPE_OFFSET) & HEADER_MULTIFUNCTION != 0;
+            if multifunction {
+                for function in 1u8..8 {
+                    let d0 = config_read(0, device, function, 0);
+                    if vendor_present(vendor_of(d0))
+                        && class_of(config_read(0, device, function, CLASS_OFFSET)) == CLASS_NETWORK
+                    {
+                        return Some(NetworkFunction {
+                            device,
+                            function,
+                            vendor: vendor_of(d0),
+                            device_id: device_of(d0),
+                        });
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The MMIO base BAR0 of bus-0 `device.function` maps, if it is a memory
+    /// BAR with a non-zero base — the register window a driver binds to.
+    ///
+    /// Follows a 64-bit BAR into its high dword. Returns `None` for I/O BARs
+    /// and unimplemented (zero-base) BARs. Read-only; no write-probe.
+    #[must_use]
+    pub fn bar0_mmio_base(device: u8, function: u8) -> Option<u64> {
+        let bar = config_read(0, device, function, BAR0_OFFSET);
+        if bar_is_io(bar) {
+            return None;
+        }
+        let base = if bar_is_mem_64(bar) {
+            let high = config_read(0, device, function, BAR0_OFFSET + 4);
+            bar_mem_base_64(bar, high)
+        } else {
+            u64::from(bar_mem_base(bar))
+        };
+        if base == 0 { None } else { Some(base) }
     }
 
     /// Read config dword `offset` of `bus:device.function` through the ECAM

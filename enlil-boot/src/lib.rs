@@ -30,6 +30,7 @@ pub mod gdt;
 pub mod handoff;
 pub mod idt;
 pub mod kernel;
+pub mod net;
 pub mod paging;
 pub mod pci;
 pub mod percpu;
