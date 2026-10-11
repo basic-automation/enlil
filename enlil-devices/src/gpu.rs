@@ -946,3 +946,1025 @@ mod tests {
         assert_eq!(parse_sysfs_bdf("0000:00:02"), None);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tier 1 GPU passthrough (Phase 7.2) — Linux-only
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+mod tier1_passthrough {
+    // ---------------------------------------------------------------------------
+    // Constants
+    // ---------------------------------------------------------------------------
+
+    /// PCI base class for display controllers (GPUs).
+    pub const PCI_CLASS_DISPLAY: u8 = 0x03;
+    /// AMD vendor ID (`0x1002`).
+    pub const AMD_VENDOR_ID: u16 = 0x1002;
+    /// NVIDIA vendor ID (`0x10DE`).
+    pub const NVIDIA_VENDOR_ID: u16 = 0x10DE;
+    /// Intel vendor ID (`0x8086`).
+    pub const INTEL_VENDOR_ID: u16 = 0x8086;
+    /// The driver a GPU's IOMMU-group functions are bound to for passthrough.
+    pub const VFIO_PCI_DRIVER: &str = "vfio-pci";
+    /// PCI capability ID for PCI Express.
+    const PCI_CAP_ID_EXP: u8 = 0x10;
+    /// PCI Express Device Capabilities register offset (from the cap start).
+    const PCIE_DEVCAP_OFFSET: usize = 0x04;
+    /// PCI Express Device Control register offset (from the cap start).
+    const PCIE_DEVCTL_OFFSET: usize = 0x08;
+    /// Bit 28 of Device Capabilities: the function supports FLR.
+    const PCIE_DEVCAP_FLR: u32 = 1 << 28;
+    /// Bit 15 of Device Control: writing 1 initiates a Function-Level Reset.
+    const PCIE_DEVCTL_INITIATE_FLR: u16 = 1 << 15;
+    /// Expansion ROM signature (`0xAA55` little-endian).
+    const ROM_SIGNATURE: u16 = 0xAA55;
+    /// PCI Data Structure signature (`"PCIR"`).
+    const ROM_PCID_SIG: &[u8; 4] = b"PCIR";
+
+    // ---------------------------------------------------------------------------
+    // Enumeration
+    // ---------------------------------------------------------------------------
+
+    /// A GPU found on the host: a PCI display controller plus its IOMMU group.
+    #[derive(Debug, Clone)]
+    pub struct HostGpu {
+        /// Canonical BDF of the display function (e.g. `0000:01:00.0`).
+        pub bdf: String,
+        /// PCI vendor ID (`vendor` sysfs attribute).
+        pub vendor_id: u16,
+        /// PCI device ID (`device` sysfs attribute).
+        pub device_id: u16,
+        /// Subsystem vendor ID (`subsystem_vendor` sysfs attribute).
+        pub subsystem_vendor_id: u16,
+        /// Subsystem ID (`subsystem_device` sysfs attribute).
+        pub subsystem_id: u16,
+        /// IOMMU group number, when the kernel exposes one.
+        pub iommu_group: Option<u32>,
+        /// Every PCI function in the GPU's IOMMU group, including `bdf` itself,
+        /// sorted for deterministic guest device order. Empty when the group is
+        /// unknown — assignment refuses to proceed on an empty list.
+        pub group_functions: Vec<String>,
+    }
+
+    impl HostGpu {
+        /// Human-readable `vendor:device` label (e.g. `1002:731f`).
+        #[must_use]
+        pub fn label(&self) -> String {
+            format!("{:04x}:{:04x}", self.vendor_id, self.device_id)
+        }
+
+        /// Whether the function at `bdf` is part of this GPU's assignment unit.
+        #[must_use]
+        pub fn owns_function(&self, bdf: &str) -> bool {
+            self.group_functions.iter().any(|f| f == bdf)
+        }
+    }
+
+    /// Enumerate every GPU (PCI base class `0x03`) visible under `pci_devices`.
+    ///
+    /// `pci_devices` is normally `/sys/bus/pci/devices` and `iommu_groups`
+    /// normally `/sys/kernel/iommu_groups`; both are parameters so tests can use
+    /// fake sysfs trees. Each GPU's IOMMU group and its member functions are
+    /// resolved from `iommu_groups`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when either root cannot be listed. Individual devices with
+    /// unreadable attributes are skipped, not fatal — a half-populated sysfs
+    /// snapshot still yields the GPUs it can describe.
+    pub fn enumerate_gpus(pci_devices: &Path, iommu_groups: &Path) -> Result<Vec<HostGpu>> {
+        let entries =
+            fs::read_dir(pci_devices).with_context(|| format!("listing {}", pci_devices.display()))?;
+        let mut gpus = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let bdf = entry.file_name().to_string_lossy().into_owned();
+            if validate_bdf(&bdf).is_err() {
+                continue;
+            }
+            let Ok(class) = pci_attr_hex(pci_devices, &bdf, "class") else {
+                continue;
+            };
+            if ((class >> 16) & 0xFF) as u8 != PCI_CLASS_DISPLAY {
+                continue;
+            }
+            let Ok(vendor_id) = pci_attr_u16(pci_devices, &bdf, "vendor") else {
+                continue;
+            };
+            let Ok(device_id) = pci_attr_u16(pci_devices, &bdf, "device") else {
+                continue;
+            };
+            let subsystem_vendor_id = pci_attr_u16(pci_devices, &bdf, "subsystem_vendor").unwrap_or(0);
+            let subsystem_id = pci_attr_u16(pci_devices, &bdf, "subsystem_device").unwrap_or(0);
+            let iommu_group = iommu_group_of(pci_devices, &bdf).unwrap_or(None);
+            let mut group_functions = if let Some(group) = iommu_group
+                && let Ok(members) = group_functions_of(iommu_groups, group)
+            {
+                members
+            } else {
+                Vec::new()
+            };
+            if !group_functions.contains(&bdf) {
+                group_functions.push(bdf.clone());
+            }
+            group_functions.sort();
+            gpus.push(HostGpu {
+                bdf,
+                vendor_id,
+                device_id,
+                subsystem_vendor_id,
+                subsystem_id,
+                iommu_group,
+                group_functions,
+            });
+        }
+        gpus.sort_by(|a, b| a.bdf.cmp(&b.bdf));
+        Ok(gpus)
+    }
+
+    /// Enumerate the GPUs on this host from the real sysfs.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `/sys/bus/pci/devices` cannot be listed.
+    pub fn enumerate_host_gpus() -> Result<Vec<HostGpu>> {
+        enumerate_gpus(
+            Path::new("/sys/bus/pci/devices"),
+            Path::new("/sys/kernel/iommu_groups"),
+        )
+    }
+
+    /// All PCI functions in IOMMU group `group`, sorted, as canonical BDFs.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the group's `devices` directory cannot be listed.
+    fn group_functions_of(iommu_groups: &Path, group: u32) -> Result<Vec<String>> {
+        let dir = iommu_groups.join(group.to_string()).join("devices");
+        let entries = fs::read_dir(&dir).with_context(|| format!("listing {}", dir.display()))?;
+        let mut functions = Vec::new();
+        for entry in entries {
+            let bdf = entry?.file_name().to_string_lossy().into_owned();
+            if validate_bdf(&bdf).is_ok() {
+                functions.push(bdf);
+            }
+        }
+        functions.sort();
+        Ok(functions)
+    }
+
+    // ---------------------------------------------------------------------------
+    // Assignment — bind the whole IOMMU group to vfio-pci and open VFIO fds
+    // ---------------------------------------------------------------------------
+
+    /// A whole GPU (its entire IOMMU group) assigned to one guest via VFIO.
+    ///
+    /// Built by [`GpuPassthrough::assign`]; the VFIO container, group, and per
+    /// function device fds stay open for the guest's lifetime. Drop order closes
+    /// devices, then the group, then the container.
+    pub struct GpuPassthrough {
+        /// The enumerated GPU this assignment was built from.
+        pub gpu: HostGpu,
+        container: VfioContainer,
+        group: VfioGroup,
+        devices: Vec<VfioPciDevice>,
+        pci_devices: PathBuf,
+    }
+
+    /// Read a 16-bit hex sysfs attribute (`vendor`, `device`, ...) for a PCI
+    /// device, rejecting values that do not fit in 16 bits.
+    fn pci_attr_u16(pci_devices: &Path, bdf: &str, attr: &str) -> Result<u16> {
+        let raw = pci_attr_hex(pci_devices, bdf, attr)?;
+        u16::try_from(raw).with_context(|| format!("{attr} of {bdf} out of 16-bit range: {raw:#x}"))
+    }
+
+    impl GpuPassthrough {
+        /// Assign the GPU to a guest: bind every function in the GPU's IOMMU
+        /// group to `vfio-pci`, then open the VFIO container, group, and a
+        /// device fd per function.
+        ///
+        /// `pci_devices` is `/sys/bus/pci/devices`, `drivers` is
+        /// `/sys/bus/pci/drivers` (both injectable for tests).
+        ///
+        /// # Errors
+        ///
+        /// Fails when the GPU has no known IOMMU group or no group members
+        /// (there is nothing safe to assign), when a driver bind fails, or when
+        /// `/dev/vfio/vfio` / the group device is unavailable.
+        pub fn assign(pci_devices: &Path, drivers: &Path, gpu: &HostGpu) -> Result<Self> {
+            let Some(group_id) = gpu.iommu_group else {
+                bail!(
+                    "GPU {} has no IOMMU group: cannot assign a group-less device",
+                    gpu.bdf
+                );
+            };
+            if gpu.group_functions.is_empty() {
+                bail!("GPU {} has no IOMMU group members to assign", gpu.bdf);
+            }
+            for bdf in &gpu.group_functions {
+                bind_driver(pci_devices, drivers, bdf, VFIO_PCI_DRIVER)
+                    .with_context(|| format!("binding {bdf} (GPU {}) to {VFIO_PCI_DRIVER}", gpu.bdf))?;
+            }
+            let container = VfioContainer::open().context("opening VFIO container")?;
+            let group = VfioGroup::open(group_id)
+                .with_context(|| format!("opening VFIO group {group_id} for GPU {}", gpu.bdf))?;
+            group
+                .set_container(&container)
+                .context("attaching VFIO group to container")?;
+            let mut devices = Vec::with_capacity(gpu.group_functions.len());
+            for bdf in &gpu.group_functions {
+                let dev = group
+                    .device(bdf)
+                    .with_context(|| format!("getting VFIO device fd for {bdf}"))?;
+                devices.push(dev);
+            }
+            Ok(Self {
+                gpu: gpu.clone(),
+                container,
+                group,
+                devices,
+                pci_devices: pci_devices.to_path_buf(),
+            })
+        }
+
+        /// The BDFs handed to the guest, in assignment order.
+        #[must_use]
+        pub fn assigned_functions(&self) -> Vec<&str> {
+            self.devices.iter().map(|d| d.bdf.as_str()).collect()
+        }
+
+        /// The VFIO container backing this assignment — guest memory is mapped
+        /// for DMA through it.
+        #[must_use]
+        pub const fn container(&self) -> &VfioContainer {
+            &self.container
+        }
+
+        /// The VFIO group backing this assignment.
+        #[must_use]
+        pub const fn group(&self) -> &VfioGroup {
+            &self.group
+        }
+
+        /// Perform a Function-Level Reset on every assigned function — the guest
+        /// reboot path. Tries `VFIO_DEVICE_RESET` first (the supported kernel
+        /// path); when the kernel rejects it, falls back to setting the `PCIe`
+        /// `InitiateFLR` bit directly in config space.
+        ///
+        /// Returns one outcome per function, in assignment order. Callers treat
+        /// any `Err` as "the GPU may be wedged after reboot" and should surface
+        /// [`amd_passthrough_warnings`] guidance (or `no_reset` config) rather
+        /// than silently continuing.
+        #[must_use]
+        pub fn reset_gpu(&self) -> Vec<GpuFunctionReset> {
+            self.devices
+                .iter()
+                .map(|dev| match dev.reset() {
+                    Ok(()) => GpuFunctionReset {
+                        bdf: dev.bdf.clone(),
+                        method: GpuResetMethod::VfioDeviceReset,
+                        result: Ok(()),
+                    },
+                    Err(vfio_err) => match initiate_flr(&self.pci_devices, &dev.bdf) {
+                        Ok(()) => GpuFunctionReset {
+                            bdf: dev.bdf.clone(),
+                            method: GpuResetMethod::ConfigSpaceFlr,
+                            result: Ok(()),
+                        },
+                        Err(flr_err) => GpuFunctionReset {
+                            bdf: dev.bdf.clone(),
+                            method: GpuResetMethod::ConfigSpaceFlr,
+                            result: Err(
+                                flr_err.context(format!("VFIO_DEVICE_RESET also failed: {vfio_err:#}"))
+                            ),
+                        },
+                    },
+                })
+                .collect()
+        }
+    }
+
+    /// Which reset path a [`GpuFunctionReset`] took.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum GpuResetMethod {
+        /// `VFIO_DEVICE_RESET` ioctl on the VFIO device fd.
+        VfioDeviceReset,
+        /// `PCIe` config-space `InitiateFLR` bit (fallback when the ioctl fails).
+        ConfigSpaceFlr,
+    }
+
+    /// Outcome of resetting one GPU function at guest reboot.
+    pub struct GpuFunctionReset {
+        /// The function that was reset.
+        pub bdf: String,
+        /// Which reset path ran.
+        pub method: GpuResetMethod,
+        /// Whether the kernel accepted the reset.
+        pub result: Result<()>,
+    }
+
+    // ---------------------------------------------------------------------------
+    // Function-Level Reset via PCI config space (VFIO_DEVICE_RESET fallback)
+    // ---------------------------------------------------------------------------
+
+    /// Locate the PCI Express capability in a config-space image.
+    ///
+    /// Walks the legacy capability list from offset `0x34`, gated on the
+    /// Capabilities List status bit, cycle-guarded like `pci_discovery`.
+    const fn find_pcie_capability(config: &[u8]) -> Option<u16> {
+        if config.len() < 0x40 {
+            return None;
+        }
+        let status = u16::from_le_bytes([config[0x06], config[0x07]]);
+        if status & 0x10 == 0 {
+            return None;
+        }
+        let mut ptr = config[0x34] as u16;
+        let mut guard = 0;
+        while ptr != 0 && guard < 48 {
+            let p = ptr as usize;
+            if p + 2 > config.len() {
+                return None;
+            }
+            if config[p] == PCI_CAP_ID_EXP {
+                return Some(ptr);
+            }
+            ptr = config[p + 1] as u16;
+            guard += 1;
+        }
+        None
+    }
+
+    /// Whether the `PCIe` function at `cap` advertises FLR (Device Capabilities
+    /// bit 28).
+    fn pcie_flr_capable(config: &[u8], cap: u16) -> bool {
+        let start = cap as usize + PCIE_DEVCAP_OFFSET;
+        if start + 4 > config.len() {
+            return false;
+        }
+        let devcap = u32::from_le_bytes(
+            config[start..start + 4]
+                .try_into()
+                .expect("bounds checked above"),
+        );
+        devcap & PCIE_DEVCAP_FLR != 0
+    }
+
+    /// Initiate a Function-Level Reset by setting the `PCIe` `InitiateFLR` bit
+    /// (Device Control bit 15) through the sysfs `config` file.
+    ///
+    /// This is the fallback for when `VFIO_DEVICE_RESET` is rejected; it needs
+    /// the same privileges as VFIO itself (root / the device's sysfs owner).
+    ///
+    /// # Errors
+    ///
+    /// Fails when the BDF is malformed, the config file cannot be opened, the
+    /// device is not `PCIe`, or the function does not advertise FLR support.
+    pub fn initiate_flr(pci_devices: &Path, bdf: &str) -> Result<()> {
+        validate_bdf(bdf)?;
+        let path = pci_devices.join(bdf).join("config");
+        let mut f = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        let mut config = vec![0u8; 4096];
+        let n = f.read(&mut config).context("reading PCI config space")?;
+        let config = &config[..n];
+        let cap =
+            find_pcie_capability(config).context("no PCI Express capability: not a PCIe function")?;
+        if !pcie_flr_capable(config, cap) {
+            bail!("function {bdf} does not advertise FLR (DevCap bit 28 clear)");
+        }
+        let ctl_off = u64::from(cap) + PCIE_DEVCTL_OFFSET as u64;
+        f.seek(SeekFrom::Start(ctl_off))
+            .context("seeking to PCIe Device Control")?;
+        let mut ctl = [0u8; 2];
+        f.read_exact(&mut ctl)
+            .context("reading PCIe Device Control")?;
+        let updated = u16::from_le_bytes(ctl) | PCIE_DEVCTL_INITIATE_FLR;
+        f.seek(SeekFrom::Start(ctl_off))
+            .context("seeking to PCIe Device Control")?;
+        f.write_all(&updated.to_le_bytes())
+            .context("setting PCIe InitiateFLR")?;
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------------
+    // Option ROM / vBIOS
+    // ---------------------------------------------------------------------------
+
+    /// The code type of one expansion-ROM image (PCI Data Structure offset
+    /// `0x14`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum RomCodeType {
+        /// `0x00` — IA-32 PC-AT (classic x86 vBIOS).
+        PcAt,
+        /// `0x02` — `OpenFirmware`.
+        OpenFirmware,
+        /// `0x03` — EFI (UEFI driver image).
+        Efi,
+        /// Any other code type, carried verbatim.
+        Unknown(u8),
+    }
+
+    impl RomCodeType {
+        const fn decode(code: u8) -> Self {
+            match code {
+                0x00 => Self::PcAt,
+                0x02 => Self::OpenFirmware,
+                0x03 => Self::Efi,
+                other => Self::Unknown(other),
+            }
+        }
+    }
+
+    /// One image inside an expansion ROM (ROMs can chain several images; the
+    /// indicator byte's bit 7 marks the last one).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct RomImage {
+        /// Byte offset of the image from the ROM start.
+        pub offset: usize,
+        /// Image length in bytes (the PCI Data Structure length field counts
+        /// 512-byte blocks).
+        pub len: usize,
+        /// What machine code this image carries.
+        pub code_type: RomCodeType,
+        /// Whether this is the last image in the chain.
+        pub last: bool,
+    }
+
+    /// Validate and decode an expansion-ROM image's structure.
+    ///
+    /// Checks the `0x55AA` signature of every image, the `PCIR` PCI Data
+    /// Structure signature, and that image lengths stay inside `data` — without
+    /// executing anything.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the ROM is too small, a signature is wrong, the PCI Data
+    /// Structure pointer runs out of bounds, or an image length overruns `data`.
+    pub fn parse_option_rom(data: &[u8]) -> Result<Vec<RomImage>> {
+        if data.len() < 512 {
+            bail!(
+                "option ROM too small to hold an image header: {} bytes",
+                data.len()
+            );
+        }
+        let mut images = Vec::new();
+        let mut offset = 0usize;
+        for _ in 0..16 {
+            if offset + 0x1A > data.len() {
+                bail!("ROM image at {offset:#x} is truncated");
+            }
+            let sig = u16::from_le_bytes([data[offset], data[offset + 1]]);
+            if sig != ROM_SIGNATURE {
+                bail!("bad expansion ROM signature {sig:#06x} at {offset:#x}");
+            }
+            let ds_ptr = u16::from_le_bytes([data[offset + 0x18], data[offset + 0x19]]) as usize;
+            let ds = offset + ds_ptr;
+            if ds + 0x16 > data.len() {
+                bail!("PCI Data Structure pointer {ds_ptr:#x} at {offset:#x} runs out of bounds");
+            }
+            if &data[ds..ds + 4] != ROM_PCID_SIG {
+                bail!("bad PCI Data Structure signature at {ds:#x}");
+            }
+            let blocks = u16::from_le_bytes([data[ds + 0x10], data[ds + 0x11]]) as usize;
+            if blocks == 0 {
+                bail!("zero-length ROM image at {offset:#x}");
+            }
+            let len = blocks * 512;
+            if offset + len > data.len() {
+                bail!(
+                    "ROM image at {offset:#x} claims {len} bytes but only {} remain",
+                    data.len() - offset
+                );
+            }
+            let code_type = RomCodeType::decode(data[ds + 0x14]);
+            let indicator = data[ds + 0x15];
+            let last = indicator & 0x80 != 0;
+            images.push(RomImage {
+                offset,
+                len,
+                code_type,
+                last,
+            });
+            if last {
+                return Ok(images);
+            }
+            offset += len;
+        }
+        bail!("ROM image chain did not terminate after 16 images");
+    }
+
+    /// Load a GPU's option ROM (vBIOS) from sysfs and validate its structure.
+    ///
+    /// Reads `rom` under the device's sysfs directory (enabling it first, as
+    /// the kernel requires). The returned image is ready to hand to the guest's
+    /// firmware; [`parse_option_rom`] has already validated the signatures.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the BDF is malformed, the `rom` attribute cannot be enabled
+    /// or read (the device is usually unbound or its ROM is unreadable), or the
+    /// image fails structural validation.
+    pub fn read_option_rom(pci_devices: &Path, bdf: &str) -> Result<VbiosImage> {
+        validate_bdf(bdf)?;
+        let rom = pci_devices.join(bdf).join("rom");
+        fs::write(&rom, b"1").with_context(|| format!("enabling option ROM at {}", rom.display()))?;
+        let data = fs::read(&rom).with_context(|| format!("reading {}", rom.display()));
+        // Best effort: leave the ROM disabled even when the read failed.
+        let _ = fs::write(&rom, b"0");
+        let data = data?;
+        let images = parse_option_rom(&data)?;
+        Ok(VbiosImage { data, images })
+    }
+
+    /// A GPU's validated option ROM (vBIOS) image.
+    pub struct VbiosImage {
+        /// The raw ROM bytes, as read from sysfs.
+        pub data: Vec<u8>,
+        /// The decoded image chain (offsets into `data`).
+        pub images: Vec<RomImage>,
+    }
+
+    impl VbiosImage {
+        /// Whether any image in the ROM is a UEFI (EFI) driver image.
+        #[must_use]
+        pub fn has_efi_image(&self) -> bool {
+            self.images
+                .iter()
+                .any(|img| img.code_type == RomCodeType::Efi)
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // AMD GPU generation detection and passthrough warnings
+    // ---------------------------------------------------------------------------
+
+    /// The AMD GPU generation, from PCI vendor/device IDs. Best-effort: IDs the
+    /// table does not know return [`AmdGpuFamily::Unknown`] rather than a guess.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum AmdGpuFamily {
+        /// Not an AMD GPU, or an AMD device ID this table does not recognize.
+        Unknown,
+        /// AMD APU integrated graphics (Raven Ridge, Renoir, Van Gogh,
+        /// Rembrandt, Phoenix, Strix Point, ...).
+        Integrated,
+        /// Pre-Polaris GCN (Southern/Caribbean/Arctic Islands: HD 7000 through
+        /// R9 Fury).
+        LegacyGcn,
+        /// GCN 4 "Polaris" (RX 400/500 series) — famous reset bug.
+        Polaris,
+        /// GCN 5 "Vega" (RX Vega, Radeon VII) — reset quirks.
+        Vega,
+        /// RDNA 1 "Navi 1x" (RX 5000 series) — reset bug.
+        Navi1x,
+        /// RDNA 2 "Navi 2x" (RX 6000 series).
+        Navi2x,
+        /// RDNA 3 "Navi 3x" (RX 7000 series).
+        Navi3x,
+        /// RDNA 4 "Navi 4x" (RX 9000 series).
+        Navi4x,
+        /// CDNA (Instinct MI100/MI200 compute cards).
+        Cdna,
+    }
+
+    /// Whether `device_id` is an AMD APU integrated GPU.
+    const fn is_amd_igpu(device_id: u16) -> bool {
+        matches!(
+            device_id,
+            0x15D8 | 0x15DD | // Raven Ridge
+            0x1636 | 0x1638 | // Renoir
+            0x164C | // Van Gogh (Steam Deck APU)
+            0x1681 | // Rembrandt
+            0x15BF | 0x15C8 | // Phoenix
+            0x13C0 // Strix Point
+        )
+    }
+
+    /// Classify an AMD GPU (`vendor_id` should be [`AMD_VENDOR_ID`]) into its
+    /// generation.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use enlil_devices::gpu::{AMD_VENDOR_ID, AmdGpuFamily, amd_gpu_family};
+    ///
+    /// assert_eq!(
+    ///     amd_gpu_family(AMD_VENDOR_ID, 0x731F),
+    ///     AmdGpuFamily::Navi1x
+    /// );
+    /// ```
+    #[must_use]
+    pub fn amd_gpu_family(vendor_id: u16, device_id: u16) -> AmdGpuFamily {
+        if vendor_id != AMD_VENDOR_ID {
+            return AmdGpuFamily::Unknown;
+        }
+        if is_amd_igpu(device_id) {
+            return AmdGpuFamily::Integrated;
+        }
+        if (0x67C0..=0x67DF).contains(&device_id) || matches!(device_id, 0x67EF | 0x6FDF) {
+            AmdGpuFamily::Polaris
+        } else if (0x6860..=0x687F).contains(&device_id) || device_id == 0x66AF {
+            AmdGpuFamily::Vega
+        } else if (0x7310..=0x731F).contains(&device_id)
+            || matches!(device_id, 0x7340 | 0x7341 | 0x7347)
+        {
+            AmdGpuFamily::Navi1x
+        } else if (0x73A0..=0x73FF).contains(&device_id) {
+            AmdGpuFamily::Navi2x
+        } else if (0x7440..=0x745F).contains(&device_id) {
+            AmdGpuFamily::Navi3x
+        } else if (0x7590..=0x75BF).contains(&device_id) {
+            AmdGpuFamily::Navi4x
+        } else if matches!(device_id, 0x738C | 0x7408 | 0x740C | 0x740F) {
+            AmdGpuFamily::Cdna
+        } else if (0x6700..0x7400).contains(&device_id) {
+            AmdGpuFamily::LegacyGcn
+        } else {
+            AmdGpuFamily::Unknown
+        }
+    }
+
+    /// A known passthrough hazard for an AMD GPU.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum AmdPassthroughWarning {
+        /// AMD APU integrated graphics: unbinding the iGPU from the host is
+        /// unstable on most platforms (shared memory controller / firmware with
+        /// the host CPU) and can hang the host.
+        IgpuInstability,
+        /// The card's generation has the well-known AMD GPU reset bug: VFIO FLR
+        /// may leave the card wedged after a guest reboot, needing the
+        /// out-of-tree `vendor-reset` module or a host reboot.
+        ResetBug,
+    }
+
+    impl AmdPassthroughWarning {
+        /// The user-facing explanation of the hazard.
+        #[must_use]
+        pub const fn describe(self) -> &'static str {
+            match self {
+                Self::IgpuInstability => {
+                    "AMD iGPU passthrough is unstable: the APU graphics share the \
+                     memory controller and firmware with the host CPU, and unbinding \
+                     them from the host can hang the machine. Keep the iGPU for the \
+                     host console and pass through a discrete GPU instead."
+                }
+                Self::ResetBug => {
+                    "This AMD GPU generation has a known reset bug: FLR may leave \
+                     the card wedged after a guest reboot. The out-of-tree \
+                     vendor-reset kernel module is the usual workaround; otherwise \
+                     expect to reboot the host between guest runs."
+                }
+            }
+        }
+    }
+
+    /// The passthrough hazards that apply to the GPU with these PCI IDs. Empty
+    /// for non-AMD GPUs and for AMD GPUs with no known hazards.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use enlil_devices::gpu::{AMD_VENDOR_ID, AmdPassthroughWarning, amd_passthrough_warnings};
+    ///
+    /// let warnings = amd_passthrough_warnings(AMD_VENDOR_ID, 0x67DF); // RX 480
+    /// assert_eq!(warnings, vec![AmdPassthroughWarning::ResetBug]);
+    /// ```
+    #[must_use]
+    pub fn amd_passthrough_warnings(vendor_id: u16, device_id: u16) -> Vec<AmdPassthroughWarning> {
+        match amd_gpu_family(vendor_id, device_id) {
+            AmdGpuFamily::Integrated => vec![AmdPassthroughWarning::IgpuInstability],
+            AmdGpuFamily::Polaris | AmdGpuFamily::Vega | AmdGpuFamily::Navi1x => {
+                vec![AmdPassthroughWarning::ResetBug]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The passthrough warnings for an enumerated GPU, as display strings.
+    #[must_use]
+    pub fn gpu_passthrough_warnings(gpu: &HostGpu) -> Vec<String> {
+        amd_passthrough_warnings(gpu.vendor_id, gpu.device_id)
+            .into_iter()
+            .map(|w| w.describe().to_string())
+            .collect()
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests
+    // ---------------------------------------------------------------------------
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::os::unix::fs::symlink;
+
+        /// Synthesize an expansion ROM from `(code_type, last)` image specs; each
+        /// image is one 512-byte block with a valid header and PCIR structure.
+        fn synth_rom(images: &[(u8, bool)]) -> Vec<u8> {
+            let mut data = Vec::new();
+            for (code, last) in images {
+                let mut img = vec![0u8; 512];
+                img[0] = 0x55;
+                img[1] = 0xAA;
+                let ds = 0x20;
+                img[0x18] = 0x20;
+                img[0x19] = 0x00;
+                img[ds..ds + 4].copy_from_slice(b"PCIR");
+                img[ds + 0x10] = 1; // one 512-byte block
+                img[ds + 0x11] = 0;
+                img[ds + 0x14] = *code;
+                img[ds + 0x15] = if *last { 0x80 } else { 0x00 };
+                data.extend_from_slice(&img);
+            }
+            data
+        }
+
+        /// Synthesize a 256-byte config space with a `PCIe` capability at 0x40.
+        fn synth_pcie_config(flr_capable: bool) -> Vec<u8> {
+            let mut cfg = vec![0u8; 256];
+            cfg[0x06] = 0x10; // STATUS: Capabilities List
+            cfg[0x34] = 0x40; // first capability at 0x40
+            cfg[0x40] = PCI_CAP_ID_EXP;
+            cfg[0x41] = 0x00; // end of chain
+            let devcap: u32 = if flr_capable { PCIE_DEVCAP_FLR } else { 0 };
+            cfg[0x44..0x48].copy_from_slice(&devcap.to_le_bytes());
+            cfg
+        }
+
+        // -- option ROM parsing ----------------------------------------------
+
+        #[test]
+        fn parses_single_x86_vbios_image() {
+            let rom = synth_rom(&[(0x00, true)]);
+            let images = parse_option_rom(&rom).unwrap();
+            assert_eq!(images.len(), 1);
+            assert_eq!(images[0].offset, 0);
+            assert_eq!(images[0].len, 512);
+            assert_eq!(images[0].code_type, RomCodeType::PcAt);
+            assert!(images[0].last);
+        }
+
+        #[test]
+        fn parses_chained_x86_then_efi_images() {
+            let rom = synth_rom(&[(0x00, false), (0x03, true)]);
+            let images = parse_option_rom(&rom).unwrap();
+            assert_eq!(images.len(), 2);
+            assert_eq!(images[0].code_type, RomCodeType::PcAt);
+            assert!(!images[0].last);
+            assert_eq!(images[1].offset, 512);
+            assert_eq!(images[1].code_type, RomCodeType::Efi);
+            assert!(images[1].last);
+
+            let vbios = VbiosImage { data: rom, images };
+            assert!(vbios.has_efi_image());
+        }
+
+        #[test]
+        fn rejects_bad_rom_signature() {
+            let mut rom = synth_rom(&[(0x00, true)]);
+            rom[0] = 0x00;
+            assert!(parse_option_rom(&rom).is_err());
+        }
+
+        #[test]
+        fn rejects_truncated_rom() {
+            assert!(parse_option_rom(&[0x55, 0xAA]).is_err());
+        }
+
+        #[test]
+        fn rejects_zero_length_image() {
+            let mut rom = synth_rom(&[(0x00, true)]);
+            rom[0x20 + 0x10] = 0; // image length blocks = 0
+            assert!(parse_option_rom(&rom).is_err());
+        }
+
+        #[test]
+        fn unknown_code_type_is_preserved() {
+            let rom = synth_rom(&[(0x42, true)]);
+            let images = parse_option_rom(&rom).unwrap();
+            assert_eq!(images[0].code_type, RomCodeType::Unknown(0x42));
+        }
+
+        // -- PCIe capability walk / FLR ----------------------------------------
+
+        #[test]
+        fn finds_pcie_capability_in_chain() {
+            let cfg = synth_pcie_config(true);
+            assert_eq!(find_pcie_capability(&cfg), Some(0x40));
+            assert!(pcie_flr_capable(&cfg, 0x40));
+        }
+
+        #[test]
+        fn flr_capability_bit_matters() {
+            let cfg = synth_pcie_config(false);
+            assert_eq!(find_pcie_capability(&cfg), Some(0x40));
+            assert!(!pcie_flr_capable(&cfg, 0x40));
+        }
+
+        #[test]
+        fn no_capability_list_means_no_pcie_cap() {
+            let mut cfg = synth_pcie_config(true);
+            cfg[0x06] = 0x00; // clear Capabilities List status bit
+            assert_eq!(find_pcie_capability(&cfg), None);
+        }
+
+        #[test]
+        fn initiate_flr_sets_device_control_bit() {
+            let dir = tempfile::tempdir().unwrap();
+            let dev = dir.path().join("0000:01:00.0");
+            fs::create_dir(&dev).unwrap();
+            fs::write(dev.join("config"), synth_pcie_config(true)).unwrap();
+
+            initiate_flr(dir.path(), "0000:01:00.0").unwrap();
+
+            let cfg = fs::read(dev.join("config")).unwrap();
+            let ctl = u16::from_le_bytes([cfg[0x48], cfg[0x49]]);
+            assert_eq!(ctl & PCIE_DEVCTL_INITIATE_FLR, PCIE_DEVCTL_INITIATE_FLR);
+        }
+
+        #[test]
+        fn initiate_flr_refuses_non_flr_function() {
+            let dir = tempfile::tempdir().unwrap();
+            let dev = dir.path().join("0000:01:00.0");
+            fs::create_dir(&dev).unwrap();
+            fs::write(dev.join("config"), synth_pcie_config(false)).unwrap();
+
+            let err = initiate_flr(dir.path(), "0000:01:00.0").unwrap_err();
+            assert!(format!("{err:#}").contains("does not advertise FLR"));
+        }
+
+        // -- AMD generation detection ------------------------------------------
+
+        #[test]
+        fn classifies_known_amd_generations() {
+            let cases = [
+                (0x67DF, AmdGpuFamily::Polaris),    // RX 480
+                (0x687F, AmdGpuFamily::Vega),       // RX Vega 64
+                (0x66AF, AmdGpuFamily::Vega),       // Radeon VII
+                (0x731F, AmdGpuFamily::Navi1x),     // RX 5700 XT
+                (0x73BF, AmdGpuFamily::Navi2x),     // RX 6800 XT
+                (0x744C, AmdGpuFamily::Navi3x),     // RX 7900 XTX
+                (0x7590, AmdGpuFamily::Navi4x),     // RX 9070
+                (0x738C, AmdGpuFamily::Cdna),       // Instinct MI100
+                (0x1636, AmdGpuFamily::Integrated), // Renoir iGPU
+                (0x679A, AmdGpuFamily::LegacyGcn),  // Tahiti (HD 7970)
+            ];
+            for (device_id, family) in cases {
+                assert_eq!(
+                    amd_gpu_family(AMD_VENDOR_ID, device_id),
+                    family,
+                    "device {device_id:#06x}"
+                );
+            }
+        }
+
+        #[test]
+        fn non_amd_and_unknown_ids_are_unknown() {
+            assert_eq!(
+                amd_gpu_family(NVIDIA_VENDOR_ID, 0x1E04),
+                AmdGpuFamily::Unknown
+            );
+            assert_eq!(
+                amd_gpu_family(INTEL_VENDOR_ID, 0x9BC5),
+                AmdGpuFamily::Unknown
+            );
+            assert_eq!(amd_gpu_family(AMD_VENDOR_ID, 0xFFFF), AmdGpuFamily::Unknown);
+        }
+
+        #[test]
+        fn reset_bug_and_igpu_warnings_fire() {
+            assert_eq!(
+                amd_passthrough_warnings(AMD_VENDOR_ID, 0x67DF),
+                vec![AmdPassthroughWarning::ResetBug]
+            );
+            assert_eq!(
+                amd_passthrough_warnings(AMD_VENDOR_ID, 0x1636),
+                vec![AmdPassthroughWarning::IgpuInstability]
+            );
+            assert!(amd_passthrough_warnings(AMD_VENDOR_ID, 0x73BF).is_empty());
+            assert!(amd_passthrough_warnings(NVIDIA_VENDOR_ID, 0x1E04).is_empty());
+        }
+
+        // -- enumeration -------------------------------------------------------
+
+        /// Build a fake sysfs: `pci/devices/<bdf>/{class,vendor,device,...}` plus
+        /// `groups/<n>/devices/<bdf>` trees. Returns `(pci_devices, iommu_groups)`.
+        fn fake_sysfs() -> (tempfile::TempDir, PathBuf, PathBuf) {
+            let tmp = tempfile::tempdir().unwrap();
+            let pci = tmp.path().join("pci");
+            let groups = tmp.path().join("groups");
+            let mkdev = |bdf: &str, class: &str, vendor: &str, device: &str, group: u32| {
+                let dev = pci.join(bdf);
+                fs::create_dir_all(&dev).unwrap();
+                fs::write(dev.join("class"), class).unwrap();
+                fs::write(dev.join("vendor"), vendor).unwrap();
+                fs::write(dev.join("device"), device).unwrap();
+                fs::write(dev.join("subsystem_vendor"), "0x0000").unwrap();
+                fs::write(dev.join("subsystem_device"), "0x0000").unwrap();
+                let gdev = groups.join(group.to_string()).join("devices");
+                fs::create_dir_all(&gdev).unwrap();
+                fs::write(gdev.join(bdf), "").unwrap();
+                symlink(format!("../../../groups/{group}"), dev.join("iommu_group")).unwrap();
+            };
+            // AMD dGPU + its audio function in group 5.
+            mkdev("0000:01:00.0", "0x030000", "0x1002", "0x731f", 5);
+            mkdev("0000:01:00.1", "0x040300", "0x1002", "0xab38", 5);
+            // Intel iGPU in group 1.
+            mkdev("0000:00:02.0", "0x030000", "0x8086", "0x9bc5", 1);
+            // USB controller: not a GPU, must be ignored.
+            mkdev("0000:00:14.0", "0x0c0330", "0x8086", "0x7ae0", 2);
+            (tmp, pci, groups)
+        }
+
+        #[test]
+        fn enumerates_gpus_with_iommu_groups() {
+            let (_tmp, pci, groups) = fake_sysfs();
+            let gpus = enumerate_gpus(&pci, &groups).unwrap();
+            assert_eq!(gpus.len(), 2);
+
+            let dgpu = gpus.iter().find(|g| g.bdf == "0000:01:00.0").unwrap();
+            assert_eq!(dgpu.vendor_id, 0x1002);
+            assert_eq!(dgpu.device_id, 0x731F);
+            assert_eq!(dgpu.iommu_group, Some(5));
+            assert_eq!(
+                dgpu.group_functions,
+                vec!["0000:01:00.0".to_string(), "0000:01:00.1".to_string()]
+            );
+            assert!(dgpu.owns_function("0000:01:00.1"));
+            assert!(!dgpu.owns_function("0000:00:02.0"));
+            assert_eq!(dgpu.label(), "1002:731f");
+
+            let igpu = gpus.iter().find(|g| g.bdf == "0000:00:02.0").unwrap();
+            assert_eq!(igpu.iommu_group, Some(1));
+            assert_eq!(igpu.group_functions, vec!["0000:00:02.0".to_string()]);
+        }
+
+        #[test]
+        fn enumerate_gpus_is_sorted_and_skips_garbage() {
+            let (_tmp, pci, groups) = fake_sysfs();
+            // A non-BDF directory entry must be skipped, not fatal.
+            fs::create_dir(pci.join("not-a-device")).unwrap();
+            let gpus = enumerate_gpus(&pci, &groups).unwrap();
+            let bdfs: Vec<&str> = gpus.iter().map(|g| g.bdf.as_str()).collect();
+            assert_eq!(bdfs, vec!["0000:00:02.0", "0000:01:00.0"]);
+        }
+
+        #[test]
+        fn assign_fails_cleanly_without_vfio() {
+            let (_tmp, pci, groups) = fake_sysfs();
+            let gpus = enumerate_gpus(&pci, &groups).unwrap();
+            let gpu = gpus.iter().find(|g| g.bdf == "0000:01:00.0").unwrap();
+            // No vfio-pci driver in the fake drivers dir and no /dev/vfio/vfio:
+            // assignment must fail with an error, never panic.
+            let drivers = groups.join("drivers");
+            fs::create_dir_all(&drivers).unwrap();
+            let Err(err) = GpuPassthrough::assign(&pci, &drivers, gpu) else {
+                panic!("assign should fail without VFIO");
+            };
+            assert!(!format!("{err:#}").is_empty());
+        }
+
+        #[test]
+        fn assign_refuses_group_less_gpu() {
+            let gpu = HostGpu {
+                bdf: "0000:01:00.0".to_string(),
+                vendor_id: AMD_VENDOR_ID,
+                device_id: 0x731F,
+                subsystem_vendor_id: 0,
+                subsystem_id: 0,
+                iommu_group: None,
+                group_functions: Vec::new(),
+            };
+            let Err(err) =
+                GpuPassthrough::assign(Path::new("/nonexistent"), Path::new("/nonexistent"), &gpu)
+            else {
+                panic!("assign should refuse a group-less GPU");
+            };
+            assert!(format!("{err:#}").contains("no IOMMU group"));
+        }
+
+        #[test]
+        fn gpu_warnings_surface_as_strings() {
+            let gpu = HostGpu {
+                bdf: "0000:01:00.0".to_string(),
+                vendor_id: AMD_VENDOR_ID,
+                device_id: 0x67DF,
+                subsystem_vendor_id: 0,
+                subsystem_id: 0,
+                iommu_group: Some(5),
+                group_functions: vec!["0000:01:00.0".to_string()],
+            };
+            let warnings = gpu_passthrough_warnings(&gpu);
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains("reset bug"));
+        }
+    }
+
+}
+
+#[cfg(target_os = "linux")]
+pub use tier1_passthrough::*;
