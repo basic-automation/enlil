@@ -51,6 +51,7 @@ pub mod display;
 pub mod dma;
 pub mod fw_cfg;
 pub mod fw_cfg_loader;
+pub mod gpu;
 pub mod hda;
 pub mod interrupt;
 pub mod net;
