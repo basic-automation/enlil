@@ -374,6 +374,9 @@ pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
     // Per-guest virtual UEFI firmware blocks (Phase 0.3).
     errors.append(&mut validate_guest_firmware(config));
 
+    // Per-guest Tier-1 GPU passthrough blocks (Phase 7.2).
+    errors.append(&mut validate_guest_gpu(config));
+
     errors
 }
 
@@ -406,6 +409,40 @@ fn validate_guest_firmware(config: &EnlilConfig) -> Vec<String> {
                 "Guest '{id}': firmware.vars must not be the same file as firmware.code; \
                  the variable store is writable and would corrupt the code image"
             ));
+        }
+    }
+    errors
+}
+
+/// Validate per-guest Tier-1 GPU passthrough blocks (`[guest.<id>.gpu]`,
+/// Phase 7.2): the device BDF must be well-formed, and no two guests may
+/// claim the same GPU — the whole IOMMU group moves as one unit, so a
+/// shared claim would hand one card to two guests.
+fn validate_guest_gpu(config: &EnlilConfig) -> Vec<String> {
+    let mut errors = Vec::new();
+    let mut claimed: Vec<(&str, &str)> = Vec::new();
+    for (id, guest) in &config.guest {
+        let Some(gpu) = &guest.gpu else {
+            continue;
+        };
+        if gpu.device_bdf.trim().is_empty() {
+            errors.push(format!(
+                "Guest '{id}': gpu.device_bdf must name the GPU's PCI address"
+            ));
+        } else if !is_valid_bdf(gpu.device_bdf.trim()) {
+            errors.push(format!(
+                "Guest '{id}': gpu.device_bdf '{}' is not a valid PCI address (expected dddd:bb:dd.f)",
+                gpu.device_bdf
+            ));
+        } else {
+            let bdf = gpu.device_bdf.trim();
+            if let Some((other_id, _)) = claimed.iter().find(|(_, c)| *c == bdf) {
+                errors.push(format!(
+                    "Guest '{id}': gpu.device_bdf '{bdf}' is already claimed by guest '{other_id}'"
+                ));
+            } else {
+                claimed.push((id, bdf));
+            }
         }
     }
     errors

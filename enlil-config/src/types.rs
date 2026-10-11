@@ -301,6 +301,35 @@ pub struct GuestConfig {
     /// kernel/initrd boot.
     #[serde(default)]
     pub firmware: Option<FirmwareConfig>,
+    /// Tier-1 full GPU passthrough for this guest (`[guest.<id>.gpu]`,
+    /// Phase 7.2): one whole GPU (its entire IOMMU group) via VFIO.
+    /// At most one guest may claim a given GPU.
+    #[serde(default)]
+    pub gpu: Option<GpuPassthroughConfig>,
+}
+
+/// Tier-1 full GPU passthrough for one guest (`[guest.<id>.gpu]`,
+/// Phase 7.2).
+///
+/// Hands an entire GPU — every function in its IOMMU group — to a single
+/// guest via VFIO. This is the Tier-1 story only (one guest gets a whole
+/// GPU); tier selection and the broader `[gpu]` strategy schema arrive in
+/// Phase 7.1/7.6.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuPassthroughConfig {
+    /// BDF of any function of the GPU (e.g. `0000:01:00.0`); the hypervisor
+    /// resolves the IOMMU group and assigns every function in it.
+    pub device_bdf: String,
+    /// Optional path to a vBIOS/option-ROM image to expose to the guest.
+    /// When unset, the hypervisor reads the ROM from the device's sysfs
+    /// `rom` attribute at assignment time.
+    #[serde(default)]
+    pub rom_path: Option<PathBuf>,
+    /// Skip the Function-Level Reset on guest reboot. Only for cards whose
+    /// FLR is known-broken (see the AMD reset-bug warnings in
+    /// `enlil_devices::gpu`); the guest may see a wedged GPU after reboot.
+    #[serde(default)]
+    pub no_reset: bool,
 }
 
 /// Virtual UEFI firmware images for one guest (`[guest.<id>.firmware]`).
