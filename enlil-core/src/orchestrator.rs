@@ -1056,7 +1056,8 @@ mod tests {
     #[test]
     fn run_first_guest_boots_a_bzimage_kernel_to_halt() {
         use enlil_config::{
-            EnlilConfig, GuestConfig, HypervisorConfig, SchedulingMode, SerialPortConfig, UsbConfig,
+            EnlilConfig, GpuConfig, GuestConfig, HypervisorConfig, SchedulingMode,
+            SerialPortConfig, UsbConfig,
         };
         use std::collections::HashMap;
 
@@ -1094,6 +1095,7 @@ mod tests {
             hypervisor: HypervisorConfig::default(),
             guest: guests,
             usb: UsbConfig::default(),
+            gpu: GpuConfig::default(),
         };
 
         match run_first_guest(&config, &image, None, "console=ttyS0", 100) {
@@ -1616,7 +1618,7 @@ mod tests {
     }
 
     fn boot_config_with_routing() -> enlil_config::EnlilConfig {
-        use enlil_config::{EnlilConfig, HypervisorConfig, UsbConfig, UsbRoutingRule};
+        use enlil_config::{EnlilConfig, GpuConfig, HypervisorConfig, UsbConfig, UsbRoutingRule};
         use std::collections::HashMap;
 
         EnlilConfig {
@@ -1631,6 +1633,7 @@ mod tests {
                 }],
                 vfio_fallback: None,
             },
+            gpu: GpuConfig::default(),
         }
     }
 
@@ -1696,13 +1699,14 @@ mod tests {
 
     #[test]
     fn usb_registry_for_boot_with_no_routing_config_is_an_empty_registry() {
-        use enlil_config::{EnlilConfig, HypervisorConfig, UsbConfig};
+        use enlil_config::{EnlilConfig, GpuConfig, HypervisorConfig, UsbConfig};
         use std::collections::HashMap;
 
         let config = EnlilConfig {
             hypervisor: HypervisorConfig::default(),
             guest: HashMap::new(),
             usb: UsbConfig::default(),
+            gpu: GpuConfig::default(),
         };
         let guests: Vec<(String, enlil_devices::usb::SharedXhci)> = Vec::new();
         let registry =
