@@ -7,6 +7,7 @@
 //! importantly the [`protocol`] spoken between them.
 
 pub mod app;
+pub mod display_tab;
 pub mod guest_tab;
 /// The management wire protocol, shared with the `enlil-core` daemon side —
 /// re-exported from the `enlil-mgmt-proto` crate so both ends of the socket

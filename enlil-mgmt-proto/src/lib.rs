@@ -93,6 +93,56 @@ impl std::fmt::Display for UsbDeviceEntry {
     }
 }
 
+/// One display timing, as the console's display tab shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoModeEntry {
+    pub width: u32,
+    pub height: u32,
+    pub refresh_hz: u32,
+}
+
+impl std::fmt::Display for VideoModeEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}x{}@{}", self.width, self.height, self.refresh_hz)
+    }
+}
+
+/// One physical monitor as the console's display tab shows it: identity from
+/// the EDID, plus where the display router currently places it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayMonitorEntry {
+    /// Router's monitor id.
+    pub id: u32,
+    /// Connector label ("DP", "HDMI", ...).
+    pub connector: String,
+    /// EDID monitor name, if the block carried one.
+    pub name: Option<String>,
+    /// EDID manufacturer code, e.g. "DEL".
+    pub manufacturer: Option<String>,
+    /// Native timing.
+    pub preferred: VideoModeEntry,
+    /// How many timings the EDID listed (beyond the preferred one).
+    pub mode_count: usize,
+    /// Guest currently holding the monitor (`None` = with the hypervisor).
+    pub assigned_guest: Option<GuestId>,
+    /// Whether the cable is currently plugged in.
+    pub plugged: bool,
+}
+
+impl std::fmt::Display for DisplayMonitorEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} \"{}\" {} [{}]",
+            self.id,
+            self.connector,
+            self.name.as_deref().unwrap_or("Unknown Monitor"),
+            self.preferred,
+            self.assigned_guest.as_deref().unwrap_or("unassigned"),
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Wire messages
 // ---------------------------------------------------------------------------
@@ -119,6 +169,16 @@ pub enum ServerMessage {
         message: String,
         device: Option<UsbDeviceEntry>,
     },
+    /// Full physical-monitor inventory with current routing assignments
+    /// (answer to [`ClientMessage::RequestDisplayMonitors`], and pushed after
+    /// changes).
+    DisplayMonitorList(Vec<DisplayMonitorEntry>),
+    /// A display hot-plug, EDID change, or routing change the console
+    /// surfaces as a notification. `monitor` is `None` for a disconnect.
+    DisplayHotplugNotice {
+        message: String,
+        monitor: Option<DisplayMonitorEntry>,
+    },
 }
 
 /// Messages sent from enlil-mgmt → enlil-core.
@@ -139,6 +199,11 @@ pub enum ClientMessage {
     /// USB routing command (answered by a `CommandResponse` with the same
     /// `id`, followed by a fresh `UsbDeviceList`).
     UsbCommand { id: u64, action: UsbAction },
+    /// Request the physical-monitor inventory.
+    RequestDisplayMonitors,
+    /// Display routing command (answered by a `CommandResponse` with the same
+    /// `id`, followed by a fresh `DisplayMonitorList`).
+    DisplayCommand { id: u64, action: DisplayAction },
 }
 
 /// A USB routing action from the console's USB tab.
@@ -158,6 +223,33 @@ impl std::fmt::Display for UsbAction {
                 target_guest,
             } => write!(f, "Reassign device {bus_addr} -> {target_guest}"),
             Self::Detach { bus_addr } => write!(f, "Detach device {bus_addr}"),
+        }
+    }
+}
+
+/// A display routing action from the console's display tab.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisplayAction {
+    /// Give a monitor to a guest (replacing any previous holder).
+    Assign {
+        monitor_id: u32,
+        target_guest: GuestId,
+    },
+    /// Take a monitor back from its guest (to the hypervisor).
+    Release { monitor_id: u32 },
+    /// KVM-switch straight to a guest (its monitors + switched inputs).
+    KvmSwitchTo { guest_id: GuestId },
+}
+
+impl std::fmt::Display for DisplayAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Assign {
+                monitor_id,
+                target_guest,
+            } => write!(f, "Assign monitor {monitor_id} -> {target_guest}"),
+            Self::Release { monitor_id } => write!(f, "Release monitor {monitor_id}"),
+            Self::KvmSwitchTo { guest_id } => write!(f, "KVM switch to {guest_id}"),
         }
     }
 }
@@ -672,6 +764,140 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    fn monitor(id: u32, assigned: Option<&str>) -> DisplayMonitorEntry {
+        DisplayMonitorEntry {
+            id,
+            connector: "DP".into(),
+            name: Some(format!("Monitor {id}")),
+            manufacturer: Some("ENC".into()),
+            preferred: VideoModeEntry {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+            },
+            mode_count: 4,
+            assigned_guest: assigned.map(String::from),
+            plugged: true,
+        }
+    }
+
+    #[test]
+    fn roundtrip_display_monitor_list() {
+        let msg = ServerMessage::DisplayMonitorList(vec![
+            monitor(0, Some("vm1")),
+            DisplayMonitorEntry {
+                assigned_guest: None,
+                plugged: false,
+                ..monitor(1, None)
+            },
+        ]);
+        let encoded = encode(&msg).unwrap();
+        let mut decoder = FrameDecoder::new();
+        decoder.push(&encoded);
+        let got: ServerMessage = decoder.decode().unwrap().unwrap();
+        match got {
+            ServerMessage::DisplayMonitorList(entries) => {
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0], monitor(0, Some("vm1")));
+                assert_eq!(entries[1].assigned_guest, None);
+                assert!(!entries[1].plugged);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_display_command() {
+        let msg = ClientMessage::DisplayCommand {
+            id: 3,
+            action: DisplayAction::Assign {
+                monitor_id: 0,
+                target_guest: "vm2".into(),
+            },
+        };
+        let encoded = encode(&msg).unwrap();
+        let mut decoder = FrameDecoder::new();
+        decoder.push(&encoded);
+        let got: ClientMessage = decoder.decode().unwrap().unwrap();
+        match got {
+            ClientMessage::DisplayCommand { id, action } => {
+                assert_eq!(id, 3);
+                assert_eq!(
+                    action,
+                    DisplayAction::Assign {
+                        monitor_id: 0,
+                        target_guest: "vm2".into()
+                    }
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let encoded = encode(&ClientMessage::RequestDisplayMonitors).unwrap();
+        let mut decoder = FrameDecoder::new();
+        decoder.push(&encoded);
+        let got: ClientMessage = decoder.decode().unwrap().unwrap();
+        assert!(matches!(got, ClientMessage::RequestDisplayMonitors));
+    }
+
+    #[test]
+    fn roundtrip_display_hotplug_notice() {
+        let msg = ServerMessage::DisplayHotplugNotice {
+            message: "monitor 0 replugged".into(),
+            monitor: Some(monitor(0, None)),
+        };
+        let encoded = encode(&msg).unwrap();
+        let mut decoder = FrameDecoder::new();
+        decoder.push(&encoded);
+        let got: ServerMessage = decoder.decode().unwrap().unwrap();
+        match got {
+            ServerMessage::DisplayHotplugNotice {
+                message,
+                monitor: got,
+            } => {
+                assert!(message.contains("replugged"));
+                assert_eq!(got, Some(monitor(0, None)));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn display_entry_display_forms() {
+        assert_eq!(
+            monitor(0, Some("vm1")).to_string(),
+            "0 DP \"Monitor 0\" 1920x1080@60 [vm1]"
+        );
+        let unnamed = DisplayMonitorEntry {
+            name: None,
+            assigned_guest: None,
+            ..monitor(2, None)
+        };
+        assert_eq!(
+            unnamed.to_string(),
+            "2 DP \"Unknown Monitor\" 1920x1080@60 [unassigned]"
+        );
+        assert_eq!(
+            DisplayAction::Assign {
+                monitor_id: 0,
+                target_guest: "vm2".into()
+            }
+            .to_string(),
+            "Assign monitor 0 -> vm2"
+        );
+        assert_eq!(
+            DisplayAction::Release { monitor_id: 1 }.to_string(),
+            "Release monitor 1"
+        );
+        assert_eq!(
+            DisplayAction::KvmSwitchTo {
+                guest_id: "vm1".into()
+            }
+            .to_string(),
+            "KVM switch to vm1"
+        );
     }
 
     #[test]
