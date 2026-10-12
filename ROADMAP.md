@@ -301,7 +301,7 @@
   - [ ] Per-guest volume/mute control via console and hotkeys; single-guest microphone routing with hotkey switch
   - [ ] Full audio-device IOMMU passthrough mode (single guest)
   - [ ] Enlil Zones per-zone audio focus (focused zone gets mic priority + louder audio)
-- [ ] 8.3 Physical display routing — assign each monitor to a guest, EDID/resolution hot-plug handling, KVM-switch hotkey to swap guest-to-monitor mapping
+- [x] 8.3 Physical display routing — assign each monitor to a guest, EDID/resolution hot-plug handling, KVM-switch hotkey to swap guest-to-monitor mapping — LANDED (2026-10-10): `enlil-devices::display::routing` carries `Edid::{parse,synthesize}` (128-byte base-block decode/encode with checksum, preferred-timing round-trip), `PhysicalMonitor`, `DisplayRouter` (monitor→guest mapping, hot-plug `MonitorEvent` folding that releases a guest on unplug, `tile_plugged_monitors` driving the 3.6 `ZoneLayoutEngine` per connected display), `KvmSwitch` guest rotation plus a `KvmSwitchHotkey` chord detector wired to the new `HotkeyConfig::kvm_switch` (Ctrl+Alt+K) chord; the management console gained the display tab (monitor inventory, assign/release/cycle, `k KVM switch`) with matching `enlil-mgmt-proto` messages (`DisplayMonitorList`/`DisplayHotplugNotice`/`DisplayCommand`). E2E against real monitors is hardware-gated.
 - [ ] 8.4 Suspend/resume and hypervisor live-update
   - [ ] Save full guest state to disk (hibernation) and resume after host power cycle
   - [ ] Hypervisor live-update: capture all VM state, hot-swap the Enlil binary in memory, restore VMs without guest reboot
