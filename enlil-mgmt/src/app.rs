@@ -13,7 +13,7 @@
 //! periodic refresh tick, and terminal setup/teardown.
 
 use crate::display_tab::DisplayTabController;
-use crate::guest_tab::GuestTabController;
+use crate::guest_tab::{fmt_throughput, GuestTabController};
 use crate::protocol::{ClientMessage, Connection, GuestId, ServerMessage};
 use crate::usb_tab::UsbTabController;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -198,6 +198,7 @@ impl App {
                 self.push_status(format!("display: {message}"));
             }
             ServerMessage::StatusUpdate(_)
+            | ServerMessage::HostMetrics(_)
             | ServerMessage::UsbDeviceList(_)
             | ServerMessage::DisplayMonitorList(_)
             | ServerMessage::SerialData { .. } => {}
@@ -384,10 +385,19 @@ impl App {
         );
     }
 
-    /// Draw the guest tab: per-guest id/name/state/CPU/memory/uptime table.
+    /// Draw the guest tab: per-guest id/name/state/CPU/memory/IO/uptime table,
+    /// with the latest host-wide snapshot in the title when one has arrived.
     fn render_guests(&self, frame: &mut Frame, area: Rect) {
-        let header = Row::new(["Id", "Name", "State", "CPU%", "Mem (MiB)", "Uptime"])
-            .style(Style::default().add_modifier(Modifier::BOLD));
+        let header = Row::new([
+            "Id",
+            "Name",
+            "State",
+            "CPU%",
+            "Mem (MiB)",
+            "IO R/W",
+            "Uptime",
+        ])
+        .style(Style::default().add_modifier(Modifier::BOLD));
         let rows = self.guests.state().guests().iter().map(|guest| {
             let state_style = match guest.state {
                 crate::protocol::GuestState::Running => Style::default().fg(Color::Green),
@@ -403,9 +413,18 @@ impl App {
                     "{}/{}",
                     guest.memory_used_mib, guest.memory_total_mib
                 )),
+                Cell::from(format!(
+                    "{}/{}",
+                    fmt_throughput(guest.io_read_bytes_per_sec),
+                    fmt_throughput(guest.io_write_bytes_per_sec),
+                )),
                 Cell::from(format_uptime(guest.uptime_secs)),
             ])
         });
+        let title = self.guests.state().host_summary().map_or_else(
+            || " Guests ".to_string(),
+            |summary| format!(" Guests · {summary} "),
+        );
         let table = Table::new(
             rows,
             [
@@ -414,11 +433,12 @@ impl App {
                 Constraint::Length(10),
                 Constraint::Length(8),
                 Constraint::Length(14),
+                Constraint::Length(15),
                 Constraint::Min(8),
             ],
         )
         .header(header)
-        .block(Block::default().borders(Borders::ALL).title(" Guests "))
+        .block(Block::default().borders(Borders::ALL).title(title))
         .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
         let mut table_state = TableState::default();
         table_state.select(Some(self.guests.state().selected()));
@@ -734,6 +754,8 @@ mod tests {
             memory_used_mib: 512,
             memory_total_mib: 1024,
             uptime_secs: 3661,
+            io_read_bytes_per_sec: 1_500_000,
+            io_write_bytes_per_sec: 250_000,
         }
     }
 
@@ -1020,6 +1042,45 @@ mod tests {
         assert_eq!(format_uptime(0), "0:00:00");
         assert_eq!(format_uptime(61), "0:01:01");
         assert_eq!(format_uptime(3661), "1:01:01");
+    }
+
+    #[test]
+    fn host_metrics_render_in_the_guest_table_title() {
+        use crate::protocol::HostMetrics;
+
+        let mut app = app_with_guests();
+        // Without a host snapshot the title is plain.
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let plain: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(!plain.contains("host CPU"), "no snapshot yet");
+
+        app.on_server_message(&ServerMessage::HostMetrics(HostMetrics {
+            cpu_percent: 12.5,
+            memory_pressure_percent: 45.0,
+            swap_used_mib: 128,
+            disk_read_bytes_per_sec: 1_500_000,
+            disk_write_bytes_per_sec: 250_000,
+        }));
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(text.contains("host CPU 12.5%"), "host summary in title");
+        assert!(text.contains("1.4M/244.1K"), "per-guest IO rates in table");
     }
 
     /// Render the full console into a headless backend and check the content.

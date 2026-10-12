@@ -305,7 +305,7 @@
 - [ ] 8.4 Suspend/resume and hypervisor live-update
   - [ ] Save full guest state to disk (hibernation) and resume after host power cycle
   - [ ] Hypervisor live-update: capture all VM state, hot-swap the Enlil binary in memory, restore VMs without guest reboot
-- [ ] 8.5 Performance monitoring — collect per-guest CPU, memory-pressure, GPU, and IO throughput metrics and expose them via the management console
+- [x] 8.5 Performance monitoring — collect per-guest CPU, memory-pressure, GPU, and IO throughput metrics and expose them via the management console
 - [ ] 8.6 Security hardening — runtime verification that IOMMU is active/enforced (block inter-guest DMA) plus fuzzing of guest/virtual-device interactions
 - [ ] 8.7 Confidential-VM support (AMD SEV-SNP and Intel TDX) with vendor-independent attestation
   - [ ] SEV-SNP: C-bit NPT encryption marking, GHCB protocol, #VC handling, ASP attestation reports, VMPL paravisor support

@@ -10,14 +10,33 @@
 //! [`selected_guest`](GuestTabState::selected_guest).
 
 use crate::protocol::{
-    ClientMessage, GuestAction, GuestId, GuestState, GuestStatus, ServerMessage,
+    ClientMessage, GuestAction, GuestId, GuestState, GuestStatus, HostMetrics, ServerMessage,
 };
+
+/// Human form of a bytes-per-second rate for the console tables: `0`,
+/// `1.5K`, `2.4M`, `3.1G` (binary units, one decimal).
+#[allow(clippy::cast_precision_loss)] // informational display; the lost bits are invisible
+#[must_use]
+pub fn fmt_throughput(bytes_per_sec: u64) -> String {
+    const KIB: f64 = 1024.0;
+    let bps = bytes_per_sec as f64;
+    if bps < KIB {
+        format!("{bytes_per_sec}")
+    } else if bps < KIB * KIB {
+        format!("{:.1}K", bps / KIB)
+    } else if bps < KIB * KIB * KIB {
+        format!("{:.1}M", bps / (KIB * KIB))
+    } else {
+        format!("{:.1}G", bps / (KIB * KIB * KIB))
+    }
+}
 
 /// State backing the console's guest tab.
 #[derive(Debug, Clone, Default)]
 pub struct GuestTabState {
     guests: Vec<GuestStatus>,
     selected: usize,
+    host_metrics: Option<HostMetrics>,
 }
 
 impl GuestTabState {
@@ -55,6 +74,32 @@ impl GuestTabState {
     #[must_use]
     pub fn selected_guest(&self) -> Option<&GuestStatus> {
         self.guests.get(self.selected)
+    }
+
+    /// Record the latest host-wide snapshot (from a `HostMetrics` message).
+    pub const fn set_host_metrics(&mut self, metrics: HostMetrics) {
+        self.host_metrics = Some(metrics);
+    }
+
+    /// The latest host-wide snapshot, if one has arrived.
+    #[must_use]
+    pub const fn host_metrics(&self) -> Option<HostMetrics> {
+        self.host_metrics
+    }
+
+    /// One-line host summary for the guest table's title bar, or `None` when
+    /// no host snapshot has arrived yet.
+    #[must_use]
+    pub fn host_summary(&self) -> Option<String> {
+        self.host_metrics.map(|m| {
+            format!(
+                "host CPU {:.1}% · mem {:.1}% · disk {}/{}",
+                m.cpu_percent,
+                m.memory_pressure_percent,
+                fmt_throughput(m.disk_read_bytes_per_sec),
+                fmt_throughput(m.disk_write_bytes_per_sec),
+            )
+        })
     }
 
     /// Move the selection down one row (wrapping to the top), a no-op when empty.
@@ -135,6 +180,10 @@ impl GuestTabController {
                 self.state.set_guests(guests.clone());
                 true
             }
+            ServerMessage::HostMetrics(metrics) => {
+                self.state.set_host_metrics(*metrics);
+                true
+            }
             _ => false,
         }
     }
@@ -192,7 +241,41 @@ mod tests {
             memory_used_mib: 0,
             memory_total_mib: 1024,
             uptime_secs: 0,
+            io_read_bytes_per_sec: 0,
+            io_write_bytes_per_sec: 0,
         }
+    }
+
+    #[test]
+    fn fmt_throughput_uses_binary_units() {
+        assert_eq!(fmt_throughput(0), "0");
+        assert_eq!(fmt_throughput(999), "999");
+        assert_eq!(fmt_throughput(1024), "1.0K");
+        assert_eq!(fmt_throughput(1_500_000), "1.4M");
+        assert_eq!(fmt_throughput(3 * 1024 * 1024 * 1024), "3.0G");
+    }
+
+    #[test]
+    fn host_metrics_fold_into_state_and_summarize() {
+        let mut ctl = GuestTabController::new();
+        assert!(ctl.state().host_summary().is_none());
+        assert!(
+            ctl.handle_server_message(&ServerMessage::HostMetrics(HostMetrics {
+                cpu_percent: 12.5,
+                memory_pressure_percent: 45.0,
+                swap_used_mib: 128,
+                disk_read_bytes_per_sec: 1_500_000,
+                disk_write_bytes_per_sec: 250_000,
+            }))
+        );
+        let summary = ctl.state().host_summary().unwrap();
+        assert!(summary.contains("host CPU 12.5%"), "{summary}");
+        assert!(summary.contains("mem 45.0%"), "{summary}");
+        assert!(summary.contains("1.4M"), "{summary}");
+        assert!(summary.contains("244.1K"), "{summary}");
+        // A status update does not clobber the host snapshot.
+        assert!(ctl.handle_server_message(&ServerMessage::StatusUpdate(vec![])));
+        assert!(ctl.state().host_summary().is_some());
     }
 
     #[test]
