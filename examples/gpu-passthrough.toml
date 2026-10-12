@@ -1,0 +1,53 @@
+# Example: Tier 1 full-GPU passthrough for one guest (roadmap 7.6).
+#
+# The [gpu] block pins the GPU sharing strategy plus the per-device and
+# per-mode tables the tiers consume: [gpu.passthrough] (device BDF +
+# target guest), [gpu.timeslice] (quantum + priorities), and [gpu.mediated]
+# (VRAM split). The time-slice and mediated tables *parse* but are rejected
+# by config validation as post-1.0 — only the passthrough pin below loads
+# cleanly on Enlil 1.0.
+
+[hypervisor]
+reserved_memory_mb = 1024
+log_level = "info"
+management_port = 9100
+
+[guest.workstation]
+name = "GPU Workstation"
+cpus = [0, 1, 2, 3]
+memory_mb = 16384
+kernel = "/path/to/bzImage"
+cmdline = "console=ttyS0 root=/dev/vda"
+scheduling = "dedicated"
+
+[gpu]
+# Tier to use for every detected GPU: auto | passthrough | sr-iov |
+# virtio-gpu | mediated | time-sliced | none. mediated and time-sliced are
+# post-1.0 and rejected with a clear error (roadmap 7.4 / 7.5).
+strategy = "passthrough"
+
+[gpu.passthrough]
+# Host GPU PCI address to assign to the guest via VFIO (whole IOMMU group).
+device = "0000:0a:00.0"
+# Guest receiving the GPU — must name a defined [guest.*].
+target_guest = "workstation"
+# iommu_group is optional; omit it and the hypervisor auto-detects the
+# group from the device BDF at boot.
+# iommu_group = 12
+
+# --- Post-1.0 tiers (parsed, rejected by validation) ----------------------
+# The tables below parse so the intent is expressible in TOML, but loading
+# this config fails: Tier 3 mediated passthrough is roadmap section 7.4 and
+# Tier 4 time-sliced passthrough is roadmap section 7.5 — neither is
+# implemented in Enlil 1.0. Uncomment to see the rejection.
+#
+# [gpu.timeslice]
+# quantum_ms = 16
+#
+# [[gpu.timeslice.shares]]
+# guest = "workstation"
+# priority = 0
+#
+# [gpu.mediated]
+# device = "0000:0a:00.0"
+# vram_split_mb = [8192, 8192]
