@@ -147,17 +147,29 @@ fn validate_usb_vfio_fallback(config: &EnlilConfig) -> Vec<String> {
     errors
 }
 
-/// Validate the `[gpu]` strategy (Phase 7.1).
+/// Validate the `[gpu]` block (Phases 7.1/7.6).
 ///
-/// The mediated (T-7.4) and time-sliced (T-7.5) tier *implementations* are
-/// post-1.0, so pinning one of them is rejected at config load with a pointer
-/// at the right roadmap task — failing loudly here instead of silently
-/// ignoring the request (or crashing) when a guest boots. `auto` and the
-/// implemented tiers need no static check: the capability match happens per
-/// GPU in `enlil_devices::gpu::resolve_strategy`.
-fn validate_gpu_strategy(config: &EnlilConfig) -> Vec<String> {
+/// The strategy pins come from Phase 7.1: `mediated` and `time-sliced` are
+/// rejected because those tier *implementations* are post-1.0 (roadmap 7.4 /
+/// 7.5) — failing loudly at config load instead of silently ignoring the
+/// request (or crashing) when a guest boots. The Phase 7.6 sub-tables mirror
+/// that split:
+/// - `[gpu.passthrough]` is the Tier 1 pin: with `strategy = "passthrough"`
+///   the device must be a valid PCI BDF and the target must name a defined
+///   guest, or the assignment would silently never fire. A passthrough block
+///   under any other strategy is rejected as contradictory, and pinning
+///   `passthrough` with no block is rejected because there is nothing to
+///   assign.
+/// - `[gpu.timeslice]` / `[gpu.mediated]` *parse* (so the intent is
+///   expressible in TOML) but are always rejected: the time-slice and
+///   mediated implementations do not exist in Enlil 1.0.
+fn validate_gpu(config: &EnlilConfig) -> Vec<String> {
     let mut errors = Vec::new();
-    match config.gpu.strategy {
+    let gpu = &config.gpu;
+
+    // Post-1.0 tier pins: rejected here instead of failing silently at guest
+    // boot.
+    match gpu.strategy {
         Some(crate::GpuStrategy::Mediated) => errors.push(
             "gpu.strategy 'mediated' (Tier 3 mediated passthrough) is not implemented in \
              Enlil 1.0 — it is roadmap task T-7.4. Use 'auto', 'passthrough', \
@@ -172,8 +184,72 @@ fn validate_gpu_strategy(config: &EnlilConfig) -> Vec<String> {
         ),
         _ => {}
     }
+
+    // Post-1.0 sub-tables: they parse, they are never honored.
+    if gpu.timeslice.is_some() {
+        errors.push(
+            "a [gpu.timeslice] block is present, but time-sliced GPU sharing (Tier 4) is not \
+             implemented in Enlil 1.0 — it is roadmap section 7.5 (post-1.0); remove the block"
+                .to_string(),
+        );
+    }
+    if gpu.mediated.is_some() {
+        errors.push(
+            "a [gpu.mediated] block is present, but mediated GPU passthrough (Tier 3) is not \
+             implemented in Enlil 1.0 — it is roadmap section 7.4 (post-1.0); remove the block"
+                .to_string(),
+        );
+    }
+
+    // Tier 1 passthrough pin.
+    match (&gpu.passthrough, gpu.strategy) {
+        (Some(pin), Some(crate::GpuStrategy::Passthrough)) => {
+            let bdf = pin.device.trim();
+            if bdf.is_empty() {
+                errors.push(
+                    "gpu.passthrough is configured but 'device' is empty; name the host GPU \
+                     PCI address (dddd:bb:dd.f)"
+                        .to_string(),
+                );
+            } else if !is_valid_bdf(bdf) {
+                errors.push(format!(
+                    "gpu.passthrough device '{bdf}' is not a valid PCI address \
+                     (expected dddd:bb:dd.f)"
+                ));
+            }
+            let target = pin.target_guest.trim();
+            if target.is_empty() {
+                errors.push(
+                    "gpu.passthrough is configured but 'target_guest' is empty; name the guest \
+                     receiving the GPU"
+                        .to_string(),
+                );
+            } else if !config.guest.contains_key(target) {
+                errors.push(format!(
+                    "gpu.passthrough targets guest '{target}', which is not defined"
+                ));
+            }
+        }
+        (Some(_), strategy) => {
+            let name = strategy.map_or("unset", crate::GpuStrategy::as_str);
+            errors.push(format!(
+                "a [gpu.passthrough] block is present but gpu.strategy is '{name}'; set \
+                 strategy = \"passthrough\" to enable full-GPU passthrough or remove the block"
+            ));
+        }
+        (None, Some(crate::GpuStrategy::Passthrough)) => {
+            errors.push(
+                "gpu.strategy is 'passthrough' but no [gpu.passthrough] block names the device; \
+                 add [gpu.passthrough] with device (dddd:bb:dd.f) and target_guest"
+                    .to_string(),
+            );
+        }
+        (None, _) => {}
+    }
+
     errors
 }
+/// and well-formed (LOCKED PRINCIPLE 1 — no virtualization-vendor OUI, no
 /// multicast/broadcast source; Phase 5.8), and no two guests may share one
 /// (LOCKED PRINCIPLE 5 — a duplicate source MAC flaps the MAC-learning virtual
 /// switch between ports and misdelivers inter-guest traffic). Duplicates are
@@ -254,9 +330,10 @@ pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
     errors.append(&mut validate_usb_routing(config));
     errors.append(&mut validate_usb_vfio_fallback(config));
 
-    // GPU sharing strategy (Phase 7.1): post-1.0 tiers are rejected here
-    // instead of failing silently at guest boot.
-    errors.append(&mut validate_gpu_strategy(config));
+    // GPU sharing block (Phases 7.1/7.6): strategy pins validated, the Tier 1
+    // passthrough pin checked for a valid BDF and a defined target guest, and
+    // the post-1.0 time-slice/mediated tables rejected.
+    errors.append(&mut validate_gpu(config));
 
     // Check memory
     let total_guest_memory: u64 = config.guest.values().map(|g| g.memory_mb).sum();
@@ -374,9 +451,6 @@ pub fn validate_config(config: &EnlilConfig) -> Vec<String> {
     // Per-guest virtual UEFI firmware blocks (Phase 0.3).
     errors.append(&mut validate_guest_firmware(config));
 
-    // Per-guest Tier-1 GPU passthrough blocks (Phase 7.2).
-    errors.append(&mut validate_guest_gpu(config));
-
     errors
 }
 
@@ -409,40 +483,6 @@ fn validate_guest_firmware(config: &EnlilConfig) -> Vec<String> {
                 "Guest '{id}': firmware.vars must not be the same file as firmware.code; \
                  the variable store is writable and would corrupt the code image"
             ));
-        }
-    }
-    errors
-}
-
-/// Validate per-guest Tier-1 GPU passthrough blocks (`[guest.<id>.gpu]`,
-/// Phase 7.2): the device BDF must be well-formed, and no two guests may
-/// claim the same GPU — the whole IOMMU group moves as one unit, so a
-/// shared claim would hand one card to two guests.
-fn validate_guest_gpu(config: &EnlilConfig) -> Vec<String> {
-    let mut errors = Vec::new();
-    let mut claimed: Vec<(&str, &str)> = Vec::new();
-    for (id, guest) in &config.guest {
-        let Some(gpu) = &guest.gpu else {
-            continue;
-        };
-        if gpu.device_bdf.trim().is_empty() {
-            errors.push(format!(
-                "Guest '{id}': gpu.device_bdf must name the GPU's PCI address"
-            ));
-        } else if !is_valid_bdf(gpu.device_bdf.trim()) {
-            errors.push(format!(
-                "Guest '{id}': gpu.device_bdf '{}' is not a valid PCI address (expected dddd:bb:dd.f)",
-                gpu.device_bdf
-            ));
-        } else {
-            let bdf = gpu.device_bdf.trim();
-            if let Some((other_id, _)) = claimed.iter().find(|(_, c)| *c == bdf) {
-                errors.push(format!(
-                    "Guest '{id}': gpu.device_bdf '{bdf}' is already claimed by guest '{other_id}'"
-                ));
-            } else {
-                claimed.push((id, bdf));
-            }
         }
     }
     errors
@@ -1209,15 +1249,64 @@ mod tests {
         );
     }
 
+    /// A valid Tier 1 passthrough pin: strategy plus a device BDF and a
+    /// defined target guest.
+    fn gpu_passthrough_config() -> EnlilConfig {
+        let mut config = minimal_config();
+        config.gpu = GpuConfig {
+            strategy: Some(GpuStrategy::Passthrough),
+            passthrough: Some(GpuPassthroughConfig {
+                device: "0000:0a:00.0".into(),
+                target_guest: "vm1".into(),
+                iommu_group: None,
+            }),
+            timeslice: None,
+            mediated: None,
+        };
+        config
+    }
+
     #[test]
-    fn gpu_strategy_parses_from_toml() {
-        let config: EnlilConfig =
-            toml::from_str("[gpu]\nstrategy = \"sr-iov\"\n[guest.vm1]\nname = \"v\"\ncpus = [0]\nmemory_mb = 2048\n")
-                .unwrap();
-        assert_eq!(config.gpu.strategy, Some(crate::GpuStrategy::SrIov));
+    fn gpu_block_parses_from_toml() {
+        let toml = r#"
+[gpu]
+strategy = "passthrough"
+
+[gpu.passthrough]
+device = "0000:0a:00.0"
+target_guest = "vm1"
+iommu_group = 12
+
+[gpu.timeslice]
+quantum_ms = 32
+
+[[gpu.timeslice.shares]]
+guest = "vm1"
+priority = 1
+
+[gpu.mediated]
+device = "0000:0a:00.0"
+vram_split_mb = [4096, 4096]
+"#;
+        let config: EnlilConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.gpu.strategy, Some(GpuStrategy::Passthrough));
+        let pin = config.gpu.passthrough.as_ref().unwrap();
+        assert_eq!(pin.device, "0000:0a:00.0");
+        assert_eq!(pin.target_guest, "vm1");
+        assert_eq!(pin.iommu_group, Some(12));
+        let ts = config.gpu.timeslice.as_ref().unwrap();
+        assert_eq!(ts.quantum_ms, 32);
+        assert_eq!(ts.shares.len(), 1);
+        assert_eq!(ts.shares[0].guest, "vm1");
+        assert_eq!(ts.shares[0].priority, 1);
+        let med = config.gpu.mediated.as_ref().unwrap();
+        assert_eq!(med.vram_split_mb, vec![4096, 4096]);
         assert!(!config.gpu.is_empty());
+
         let bare: EnlilConfig = toml::from_str("").unwrap();
         assert!(bare.gpu.is_empty());
+        let out = toml::to_string(&bare).unwrap();
+        assert!(!out.contains("[gpu]"), "unset [gpu] must serialize away");
     }
 
     #[test]
@@ -1227,10 +1316,98 @@ mod tests {
     }
 
     #[test]
+    fn gpu_valid_passthrough_pin_passes() {
+        let errors = validate_config(&gpu_passthrough_config());
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+    }
+
+    #[test]
+    fn gpu_passthrough_rejects_bad_bdf() {
+        let mut config = gpu_passthrough_config();
+        config.gpu.passthrough.as_mut().unwrap().device = "not-a-bdf".into();
+        let errors = validate_config(&config);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("device") && e.contains("not-a-bdf")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn gpu_passthrough_rejects_unknown_target_guest() {
+        let mut config = gpu_passthrough_config();
+        config.gpu.passthrough.as_mut().unwrap().target_guest = "ghost".into();
+        let errors = validate_config(&config);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("ghost") && e.contains("not defined")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn gpu_passthrough_strategy_needs_a_block() {
+        let mut config = minimal_config();
+        config.gpu.strategy = Some(GpuStrategy::Passthrough);
+        let errors = validate_config(&config);
+        assert!(
+            errors.iter().any(|e| e.contains("[gpu.passthrough]")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn gpu_passthrough_block_needs_passthrough_strategy() {
+        for strategy in [Some(GpuStrategy::Auto), Some(GpuStrategy::None), None] {
+            let mut config = gpu_passthrough_config();
+            config.gpu.strategy = strategy;
+            let errors = validate_config(&config);
+            let name = strategy.map_or("unset", GpuStrategy::as_str);
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.contains("[gpu.passthrough]") && e.contains(name)),
+                "strategy {name}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_post_1_0_blocks_are_parsed_but_rejected() {
+        let mut config = gpu_passthrough_config();
+        config.gpu.timeslice = Some(GpuTimesliceConfig {
+            quantum_ms: 16,
+            shares: vec![GpuTimesliceShare {
+                guest: "vm1".into(),
+                priority: 0,
+            }],
+        });
+        config.gpu.mediated = Some(GpuMediatedConfig {
+            device: "0000:0a:00.0".into(),
+            vram_split_mb: vec![2048, 2048],
+        });
+        let errors = validate_config(&config);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("[gpu.timeslice]") && e.contains("7.5")),
+            "{errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("[gpu.mediated]") && e.contains("7.4")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
     fn gpu_strategy_rejects_post_1_0_tiers() {
         for (strategy, task) in [
-            (crate::GpuStrategy::Mediated, "T-7.4"),
-            (crate::GpuStrategy::TimeSliced, "T-7.5"),
+            (GpuStrategy::Mediated, "T-7.4"),
+            (GpuStrategy::TimeSliced, "T-7.5"),
         ] {
             let mut config = minimal_config();
             config.gpu.strategy = Some(strategy);
@@ -1245,15 +1422,14 @@ mod tests {
     #[test]
     fn gpu_strategy_accepts_implemented_tiers() {
         for strategy in [
-            crate::GpuStrategy::Auto,
-            crate::GpuStrategy::Passthrough,
-            crate::GpuStrategy::SrIov,
-            crate::GpuStrategy::VirtioGpu,
-            crate::GpuStrategy::None,
+            GpuStrategy::Auto,
+            GpuStrategy::SrIov,
+            GpuStrategy::VirtioGpu,
+            GpuStrategy::None,
         ] {
             let mut config = minimal_config();
             config.gpu.strategy = Some(strategy);
-            let errors = validate_gpu_strategy(&config);
+            let errors = validate_config(&config);
             assert!(errors.is_empty(), "{strategy:?}: {errors:?}");
         }
     }

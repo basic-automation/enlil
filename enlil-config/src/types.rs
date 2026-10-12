@@ -14,32 +14,48 @@ pub struct EnlilConfig {
     /// USB peripheral routing (`[usb]`).
     #[serde(default, skip_serializing_if = "UsbConfig::is_empty")]
     pub usb: UsbConfig,
-    /// GPU sharing strategy (`[gpu]`).
+    /// GPU sharing configuration (`[gpu]`, Phases 7.1/7.6).
     #[serde(default, skip_serializing_if = "GpuConfig::is_empty")]
     pub gpu: GpuConfig,
 }
 
-/// GPU sharing strategy selection (`[gpu]`).
+/// GPU sharing configuration (`[gpu]`).
 ///
-/// Phase 7.1: the hypervisor detects each physical GPU's capabilities and
-/// recommends a sharing tier (see `enlil_devices::gpu`); this block lets the
-/// operator pin a tier instead of taking the recommendation. The full `[gpu]`
-/// schema (per-device BDF pinning, timeslice quanta, VRAM splits) is T-7.6 —
-/// this task only needs the strategy knob the recommendation layer validates
-/// against.
+/// Phase 7.1 contributes the strategy knob (pin a tier, or `auto` to take the
+/// per-GPU recommendation from capability detection in `enlil_devices::gpu`);
+/// Phase 7.6 adds the per-device and per-mode tables the tiers consume — the
+/// passthrough device pin, the time-slice schedule, and the mediated VRAM
+/// split. The time-slice and mediated tables *parse* (so the intent is
+/// expressible in TOML) but are rejected by [`validate_gpu`] as post-1.0:
+/// roadmap 7.5 (time-sliced) and 7.4 (mediated) have no implementation in
+/// Enlil 1.0.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GpuConfig {
-    /// Tier to use for every detected GPU (`None` = `auto`: take the
-    /// per-GPU recommendation from capability detection).
+    /// Tier to use for every detected GPU (`None` = unset, same as `auto`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy: Option<GpuStrategy>,
+    /// Tier 1 full-GPU passthrough pin (`[gpu.passthrough]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passthrough: Option<GpuPassthroughConfig>,
+    /// Tier 4 time-slice schedule (`[gpu.timeslice]`). Parsed but rejected:
+    /// post-1.0 (roadmap 7.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeslice: Option<GpuTimesliceConfig>,
+    /// Tier 3 mediated-device split (`[gpu.mediated]`). Parsed but rejected:
+    /// post-1.0 (roadmap 7.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mediated: Option<GpuMediatedConfig>,
 }
 
 impl GpuConfig {
-    /// Whether no GPU strategy is configured (so `[gpu]` round-trips away).
+    /// Whether no GPU sharing is configured (used to omit `[gpu]` from
+    /// written TOML so a config with no GPU policy stays clean).
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.strategy.is_none()
+            && self.passthrough.is_none()
+            && self.timeslice.is_none()
+            && self.mediated.is_none()
     }
 }
 
@@ -48,8 +64,9 @@ impl GpuConfig {
 /// `Auto` takes the per-GPU recommendation from capability detection
 /// (`enlil_devices::gpu::recommend_tier`); `None` explicitly assigns no GPU to
 /// any guest. The concrete tiers mirror `enlil_devices::gpu::GpuTier`; the
-/// config crate cannot depend on `enlil-devices` (dependency direction), so the
-/// two enums are kept in sync by name and both use kebab-case TOML spellings.
+/// config crate cannot depend on `enlil-devices` (dependency direction), so
+/// the two enums are kept in sync by name and both use kebab-case TOML
+/// spellings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum GpuStrategy {
@@ -61,12 +78,94 @@ pub enum GpuStrategy {
     SrIov,
     /// Tier 2.5: VirtIO-GPU paravirtual device (software rendering fallback).
     VirtioGpu,
-    /// Tier 3: mediated passthrough (post-1.0, T-7.4).
+    /// Tier 3: mediated passthrough (post-1.0, roadmap 7.4).
     Mediated,
-    /// Tier 4: time-sliced exclusive access (post-1.0, T-7.5).
+    /// Tier 4: time-sliced exclusive access (post-1.0, roadmap 7.5).
     TimeSliced,
     /// Explicitly assign no GPU to any guest.
     None,
+}
+
+impl GpuStrategy {
+    /// The kebab-case TOML spelling of this strategy (mirrors the serde
+    /// `rename_all`), for human-readable diagnostics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Passthrough => "passthrough",
+            Self::SrIov => "sr-iov",
+            Self::VirtioGpu => "virtio-gpu",
+            Self::Mediated => "mediated",
+            Self::TimeSliced => "time-sliced",
+            Self::None => "none",
+        }
+    }
+}
+
+/// Tier 1 full-GPU passthrough pin (`[gpu.passthrough]`, Phases 7.2/7.6).
+///
+/// Names the single host GPU to assign to one guest via VFIO (whole IOMMU
+/// group). The hypervisor enumerates the device, performs FLR, and binds it
+/// (Phase 7.2); this block only pins *which* device and *which* guest.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GpuPassthroughConfig {
+    /// Host GPU PCI address (`"dddd:bb:dd.f"`).
+    #[serde(default)]
+    pub device: String,
+    /// Guest that receives the whole GPU.
+    #[serde(default)]
+    pub target_guest: String,
+    /// IOMMU group to bind. `None` (the default) means the hypervisor
+    /// auto-detects the group from the device BDF at boot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iommu_group: Option<u32>,
+}
+
+/// Tier 4 time-slice schedule (`[gpu.timeslice]`, roadmap 7.5).
+///
+/// Round-robin exclusive GPU access with per-guest state save/restore. The
+/// table parses so the schedule is expressible in TOML, but validation
+/// rejects it: the time-slice implementation is post-1.0.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuTimesliceConfig {
+    /// Exclusive-access quantum per scheduling round, in milliseconds.
+    #[serde(default = "default_gpu_quantum_ms")]
+    pub quantum_ms: u64,
+    /// Per-guest shares (`[[gpu.timeslice.shares]]`), scheduled in priority
+    /// order each round.
+    #[serde(default)]
+    pub shares: Vec<GpuTimesliceShare>,
+}
+
+const fn default_gpu_quantum_ms() -> u64 {
+    16
+}
+
+/// One guest's share of a time-sliced GPU (`[[gpu.timeslice.shares]]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuTimesliceShare {
+    /// Guest holding the GPU during its slice — must name a defined guest.
+    pub guest: String,
+    /// Slice priority: lower numbers are scheduled first each round.
+    #[serde(default)]
+    pub priority: u32,
+}
+
+/// Tier 3 mediated-device split (`[gpu.mediated]`, roadmap 7.4).
+///
+/// Intercept GPU command submission and multiplex a shared GPU across guests
+/// via mediated devices (e.g. GVT-g style). The table parses so the VRAM
+/// carve-up is expressible in TOML, but validation rejects it: the mediated
+/// implementation is post-1.0.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GpuMediatedConfig {
+    /// Host GPU PCI address (`"dddd:bb:dd.f"`) to create mediated devices on.
+    #[serde(default)]
+    pub device: String,
+    /// VRAM carve-up per mediated device, in MB — one entry per guest slice.
+    #[serde(default)]
+    pub vram_split_mb: Vec<u64>,
 }
 
 /// USB peripheral-routing configuration (`[usb]`).
@@ -301,35 +400,6 @@ pub struct GuestConfig {
     /// kernel/initrd boot.
     #[serde(default)]
     pub firmware: Option<FirmwareConfig>,
-    /// Tier-1 full GPU passthrough for this guest (`[guest.<id>.gpu]`,
-    /// Phase 7.2): one whole GPU (its entire IOMMU group) via VFIO.
-    /// At most one guest may claim a given GPU.
-    #[serde(default)]
-    pub gpu: Option<GpuPassthroughConfig>,
-}
-
-/// Tier-1 full GPU passthrough for one guest (`[guest.<id>.gpu]`,
-/// Phase 7.2).
-///
-/// Hands an entire GPU — every function in its IOMMU group — to a single
-/// guest via VFIO. This is the Tier-1 story only (one guest gets a whole
-/// GPU); tier selection and the broader `[gpu]` strategy schema arrive in
-/// Phase 7.1/7.6.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GpuPassthroughConfig {
-    /// BDF of any function of the GPU (e.g. `0000:01:00.0`); the hypervisor
-    /// resolves the IOMMU group and assigns every function in it.
-    pub device_bdf: String,
-    /// Optional path to a vBIOS/option-ROM image to expose to the guest.
-    /// When unset, the hypervisor reads the ROM from the device's sysfs
-    /// `rom` attribute at assignment time.
-    #[serde(default)]
-    pub rom_path: Option<PathBuf>,
-    /// Skip the Function-Level Reset on guest reboot. Only for cards whose
-    /// FLR is known-broken (see the AMD reset-bug warnings in
-    /// `enlil_devices::gpu`); the guest may see a wedged GPU after reboot.
-    #[serde(default)]
-    pub no_reset: bool,
 }
 
 /// Virtual UEFI firmware images for one guest (`[guest.<id>.firmware]`).

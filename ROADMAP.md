@@ -291,7 +291,7 @@
   - [ ] GPU reset (FLR or engine-level) between guest switches
   - [ ] Drain/sync command queues at switch points before switching
   - [ ] Start with paused-rendering model (only foreground guest renders), evolve to true VRAM-remap time-slicing
-- [ ] 7.6 GPU configuration schema — [gpu] TOML block for strategy/passthrough/timeslice/mediated (device BDF, quantum, priorities, VRAM split)
+- [x] 7.6 GPU configuration schema — [gpu] TOML block for strategy/passthrough/timeslice/mediated (device BDF, quantum, priorities, VRAM split)
 
 ## Phase 8 — Polish, Hardening & Advanced Features
 - [ ] 8.1 Runtime live migration between GPU-sharing strategies (e.g. timeslice→passthrough on guest shutdown) plus live USB device reassignment
