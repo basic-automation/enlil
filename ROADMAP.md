@@ -296,8 +296,8 @@
 ## Phase 8 — Polish, Hardening & Advanced Features
 - [ ] 8.1 Runtime live migration between GPU-sharing strategies (e.g. timeslice→passthrough on guest shutdown) plus live USB device reassignment
 - [ ] 8.2 Audio subsystem — per-guest VirtIO-sound device plus hypervisor mixing engine
-  - [ ] Present a VirtIO-sound device to each guest (spec 1.2+) with PCM stream queues
-  - [ ] Hypervisor audio engine: receive per-guest PCM, mix with sample-rate conversion, output to physical hardware at <10ms latency
+  - [x] Present a VirtIO-sound device to each guest (spec 1.2+) with PCM stream queues
+  - [x] Hypervisor audio engine: receive per-guest PCM, mix with sample-rate conversion, output to physical hardware at <10ms latency
   - [ ] Per-guest volume/mute control via console and hotkeys; single-guest microphone routing with hotkey switch
   - [ ] Full audio-device IOMMU passthrough mode (single guest)
   - [ ] Enlil Zones per-zone audio focus (focused zone gets mic priority + louder audio)
@@ -306,7 +306,7 @@
   - [ ] Save full guest state to disk (hibernation) and resume after host power cycle
   - [ ] Hypervisor live-update: capture all VM state, hot-swap the Enlil binary in memory, restore VMs without guest reboot
 - [ ] 8.5 Performance monitoring — collect per-guest CPU, memory-pressure, GPU, and IO throughput metrics and expose them via the management console
-- [ ] 8.6 Security hardening — runtime verification that IOMMU is active/enforced (block inter-guest DMA) plus fuzzing of guest/virtual-device interactions
+- [x] 8.6 Security hardening — runtime verification that IOMMU is active/enforced (block inter-guest DMA) plus fuzzing of guest/virtual-device interactions — landed 2026-10-10 (T-8.3): new `no_std` `enlil-boot::iommu` module with `verify_enforcement`, a fail-closed runtime check run at boot (serial: `enlil kernel: iommu: enforcement <verdict>`). It requires an advertised IOMMU with usable remapping units (non-zero register block), every assigned device covered by some unit's device scope (endpoint scope = exact BDF match, sub-hierarchy = bus+device of the first path hop; an uncovered device blocks passthrough per LOCKED PRINCIPLE 5), no device shared between guests, no overlapping guest DMA ranges, and no malformed (zero-length/wrapping) ranges — 13 unit tests, `cargo test -p enlil-boot iommu` green. Guest/device fuzzing: new total-by-construction virtio descriptor-chain walker (`enlil-devices::virtio::chain::walk_chain` — cycle detection, per-level visited bitsets, single-level indirect tables capped at the queue size, wrapping/escaping buffer rejection, hard link budget) hammered by the new libFuzzer target `fuzz/fuzz_targets/virtio.rs` (which also drives adversarial MMIO-transport register traffic), plus deterministic regression tests in `enlil-devices/tests/virtio_fuzz.rs` (adversarial tables, MMIO traffic campaigns, seeded 12k-mutation campaign asserting totality). SECURITY.md scope section updated: IOMMU-enforcement bypass now counts as a DMA-escape-class vulnerability; per-guest DMA isolation stays out-of-scope end-to-end until the remapping tables are programmed on real hardware.
 - [ ] 8.7 Confidential-VM support (AMD SEV-SNP and Intel TDX) with vendor-independent attestation
   - [ ] SEV-SNP: C-bit NPT encryption marking, GHCB protocol, #VC handling, ASP attestation reports, VMPL paravisor support
   - [ ] TDX: SEAMCALL/TDCALL handling, TDX-Module-controlled EPT, TD Partitioning (1.5), Intel attestation quoting
