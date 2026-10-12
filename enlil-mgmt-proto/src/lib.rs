@@ -57,6 +57,28 @@ pub struct GuestStatus {
     pub memory_total_mib: u64,
     /// Uptime in seconds (0 when stopped).
     pub uptime_secs: u64,
+    /// Guest disk read throughput in bytes per second, sampled over the
+    /// daemon's status window.
+    pub io_read_bytes_per_sec: u64,
+    /// Guest disk write throughput in bytes per second.
+    pub io_write_bytes_per_sec: u64,
+}
+
+/// Host-wide performance snapshot, sampled by the daemon on the same cadence
+/// as [`ServerMessage::StatusUpdate`] so the console can show host CPU /
+/// memory-pressure / disk-IO next to the per-guest numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HostMetrics {
+    /// Aggregate host CPU busy percentage (0.0 – 100.0).
+    pub cpu_percent: f64,
+    /// Host memory pressure: (`MemTotal` - `MemAvailable`) / `MemTotal` * 100.
+    pub memory_pressure_percent: f64,
+    /// Host swap in use, in MiB.
+    pub swap_used_mib: u64,
+    /// Whole-disk read throughput, bytes per second.
+    pub disk_read_bytes_per_sec: u64,
+    /// Whole-disk write throughput, bytes per second.
+    pub disk_write_bytes_per_sec: u64,
 }
 
 /// One physical USB device as the console's USB tab shows it: identity from
@@ -152,6 +174,8 @@ impl std::fmt::Display for DisplayMonitorEntry {
 pub enum ServerMessage {
     /// Full status update for all guests.
     StatusUpdate(Vec<GuestStatus>),
+    /// Host-wide CPU/memory/IO snapshot, pushed on the status cadence.
+    HostMetrics(HostMetrics),
     /// Serial output from a guest.
     SerialData { guest_id: GuestId, data: Vec<u8> },
     /// Response to a command.
@@ -506,6 +530,8 @@ mod tests {
                 memory_used_mib: 1024,
                 memory_total_mib: 4096,
                 uptime_secs: 3600,
+                io_read_bytes_per_sec: 1_500_000,
+                io_write_bytes_per_sec: 250_000,
             },
             GuestStatus {
                 id: "vm-2".into(),
@@ -515,6 +541,8 @@ mod tests {
                 memory_used_mib: 0,
                 memory_total_mib: 8192,
                 uptime_secs: 0,
+                io_read_bytes_per_sec: 0,
+                io_write_bytes_per_sec: 0,
             },
         ]);
 
@@ -528,7 +556,34 @@ mod tests {
                 assert_eq!(guests.len(), 2);
                 assert_eq!(guests[0].id, "vm-1");
                 assert_eq!(guests[0].state, GuestState::Running);
+                assert_eq!(guests[0].io_read_bytes_per_sec, 1_500_000);
+                assert_eq!(guests[0].io_write_bytes_per_sec, 250_000);
                 assert_eq!(guests[1].state, GuestState::Stopped);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_host_metrics() {
+        let msg = ServerMessage::HostMetrics(HostMetrics {
+            cpu_percent: 12.5,
+            memory_pressure_percent: 45.0,
+            swap_used_mib: 128,
+            disk_read_bytes_per_sec: 2_000_000,
+            disk_write_bytes_per_sec: 500_000,
+        });
+        let encoded = encode(&msg).unwrap();
+        let mut decoder = FrameDecoder::new();
+        decoder.push(&encoded);
+        let got: ServerMessage = decoder.decode().unwrap().unwrap();
+        match got {
+            ServerMessage::HostMetrics(m) => {
+                assert_eq!(m.cpu_percent, 12.5);
+                assert_eq!(m.memory_pressure_percent, 45.0);
+                assert_eq!(m.swap_used_mib, 128);
+                assert_eq!(m.disk_read_bytes_per_sec, 2_000_000);
+                assert_eq!(m.disk_write_bytes_per_sec, 500_000);
             }
             _ => panic!("wrong variant"),
         }
