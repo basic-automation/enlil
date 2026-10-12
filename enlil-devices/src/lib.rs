@@ -38,11 +38,13 @@
 //! - Virtual TPM 2.0
 //! - PS/2 keyboard/mouse
 //! - Intel HDA audio controller
+//! - VirtIO-sound device plus hypervisor audio mixing engine
 //! - PCI Express root complex
 //! - QEMU `fw_cfg` firmware configuration
 //! - VirtIO-GPU basic 2D backend (framebuffer-backed guest display)
 
 pub mod acpi;
+pub mod audio;
 pub mod block;
 pub mod bridge;
 pub mod bus;
