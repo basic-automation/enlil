@@ -296,8 +296,8 @@
 ## Phase 8 — Polish, Hardening & Advanced Features
 - [ ] 8.1 Runtime live migration between GPU-sharing strategies (e.g. timeslice→passthrough on guest shutdown) plus live USB device reassignment
 - [ ] 8.2 Audio subsystem — per-guest VirtIO-sound device plus hypervisor mixing engine
-  - [ ] Present a VirtIO-sound device to each guest (spec 1.2+) with PCM stream queues
-  - [ ] Hypervisor audio engine: receive per-guest PCM, mix with sample-rate conversion, output to physical hardware at <10ms latency
+  - [x] Present a VirtIO-sound device to each guest (spec 1.2+) with PCM stream queues
+  - [x] Hypervisor audio engine: receive per-guest PCM, mix with sample-rate conversion, output to physical hardware at <10ms latency
   - [ ] Per-guest volume/mute control via console and hotkeys; single-guest microphone routing with hotkey switch
   - [ ] Full audio-device IOMMU passthrough mode (single guest)
   - [ ] Enlil Zones per-zone audio focus (focused zone gets mic priority + louder audio)

@@ -3,6 +3,7 @@
 //! Provides the core types shared across `VirtIO` device implementations
 //! and the MMIO transport layer.
 
+pub mod chain;
 pub mod transport;
 
 use bitflags::bitflags;
@@ -21,6 +22,7 @@ pub enum VirtioDeviceType {
     GPU = 16,
     Input = 18,
     Socket = 19,
+    Sound = 25,
 }
 
 bitflags! {
