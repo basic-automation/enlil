@@ -40,6 +40,7 @@
 //! - Intel HDA audio controller
 //! - PCI Express root complex
 //! - QEMU `fw_cfg` firmware configuration
+//! - VirtIO-GPU basic 2D backend (framebuffer-backed guest display)
 
 pub mod acpi;
 pub mod block;
@@ -67,3 +68,4 @@ pub mod tpm;
 mod truncate;
 pub mod usb;
 pub mod virtio;
+pub mod virtio_gpu;
