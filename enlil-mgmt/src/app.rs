@@ -12,6 +12,7 @@
 //! `enlil-core`, a crossterm key-reader thread, a socket-reader task, a
 //! periodic refresh tick, and terminal setup/teardown.
 
+use crate::display_tab::DisplayTabController;
 use crate::guest_tab::GuestTabController;
 use crate::protocol::{ClientMessage, Connection, GuestId, ServerMessage};
 use crate::usb_tab::UsbTabController;
@@ -49,6 +50,7 @@ const MAX_NOTICES_SHOWN: u16 = 4;
 enum ActiveTab {
     Guests,
     Usb,
+    Displays,
 }
 
 impl ActiveTab {
@@ -57,6 +59,7 @@ impl ActiveTab {
         match self {
             Self::Guests => 0,
             Self::Usb => 1,
+            Self::Displays => 2,
         }
     }
 }
@@ -68,8 +71,8 @@ enum NetEvent {
     Disconnected,
 }
 
-/// Headless interactive-console state: the two tab controllers, the active tab,
-/// a bounded status-line history, and the quit/connected flags.
+/// Headless interactive-console state: the three tab controllers, the active
+/// tab, a bounded status-line history, and the quit/connected flags.
 ///
 /// Keystrokes go in through [`on_key`](App::on_key) (which returns the
 /// [`ClientMessage`]s the host must send), server traffic comes in through
@@ -80,6 +83,7 @@ enum NetEvent {
 pub struct App {
     guests: GuestTabController,
     usb: UsbTabController,
+    display: DisplayTabController,
     tab: ActiveTab,
     status: VecDeque<String>,
     connected: bool,
@@ -95,6 +99,7 @@ impl App {
         Self {
             guests: GuestTabController::new(),
             usb: UsbTabController::new(),
+            display: DisplayTabController::new(),
             tab: ActiveTab::Guests,
             status: VecDeque::new(),
             connected: true,
@@ -113,6 +118,12 @@ impl App {
     #[must_use]
     pub const fn usb_tab(&self) -> &UsbTabController {
         &self.usb
+    }
+
+    /// The display tab controller (for tests and the render layer).
+    #[must_use]
+    pub const fn display_tab(&self) -> &DisplayTabController {
+        &self.display
     }
 
     /// Whether the socket to `enlil-core` is still up.
@@ -159,6 +170,7 @@ impl App {
             KeyCode::Tab => return self.cycle_tab(),
             KeyCode::Char('1') => return self.goto_tab(ActiveTab::Guests),
             KeyCode::Char('2') => return self.goto_tab(ActiveTab::Usb),
+            KeyCode::Char('3') => return self.goto_tab(ActiveTab::Displays),
             KeyCode::Down | KeyCode::Char('j') => self.select_next(),
             KeyCode::Up | KeyCode::Char('k') => self.select_prev(),
             KeyCode::Char('R') => return vec![self.refresh_request()],
@@ -171,6 +183,7 @@ impl App {
     pub fn on_server_message(&mut self, msg: &ServerMessage) {
         self.guests.handle_server_message(msg);
         self.usb.handle_server_message(msg);
+        self.display.handle_server_message(msg);
         match msg {
             ServerMessage::CommandResponse {
                 success, message, ..
@@ -181,8 +194,12 @@ impl App {
             ServerMessage::UsbHotplugNotice { message, .. } => {
                 self.push_status(format!("usb: {message}"));
             }
+            ServerMessage::DisplayHotplugNotice { message, .. } => {
+                self.push_status(format!("display: {message}"));
+            }
             ServerMessage::StatusUpdate(_)
             | ServerMessage::UsbDeviceList(_)
+            | ServerMessage::DisplayMonitorList(_)
             | ServerMessage::SerialData { .. } => {}
         }
     }
@@ -199,6 +216,7 @@ impl App {
         match self.tab {
             ActiveTab::Guests => ClientMessage::RequestStatus,
             ActiveTab::Usb => ClientMessage::RequestUsbDevices,
+            ActiveTab::Displays => ClientMessage::RequestDisplayMonitors,
         }
     }
 
@@ -212,7 +230,8 @@ impl App {
     fn cycle_tab(&mut self) -> Vec<ClientMessage> {
         let next = match self.tab {
             ActiveTab::Guests => ActiveTab::Usb,
-            ActiveTab::Usb => ActiveTab::Guests,
+            ActiveTab::Usb => ActiveTab::Displays,
+            ActiveTab::Displays => ActiveTab::Guests,
         };
         self.goto_tab(next)
     }
@@ -222,6 +241,7 @@ impl App {
         match self.tab {
             ActiveTab::Guests => self.guests.state_mut().select_next(),
             ActiveTab::Usb => self.usb.state_mut().select_next(),
+            ActiveTab::Displays => self.display.state_mut().select_next(),
         }
     }
 
@@ -230,11 +250,23 @@ impl App {
         match self.tab {
             ActiveTab::Guests => self.guests.state_mut().select_prev(),
             ActiveTab::Usb => self.usb.state_mut().select_prev(),
+            ActiveTab::Displays => self.display.state_mut().select_prev(),
         }
     }
 
+    /// The guest ids in the guest tab's list (routing targets for the USB and
+    /// display tabs' "cycle" keystrokes).
+    fn guest_ids(&self) -> Vec<GuestId> {
+        self.guests
+            .state()
+            .guests()
+            .iter()
+            .map(|guest| guest.id.clone())
+            .collect()
+    }
+
     /// Tab-local keystrokes: guest lifecycle on the guest tab, USB routing on
-    /// the USB tab.
+    /// the USB tab, monitor routing + KVM-switch on the display tab.
     fn on_tab_key(&mut self, code: KeyCode) -> Vec<ClientMessage> {
         match self.tab {
             ActiveTab::Guests => match code {
@@ -245,16 +277,20 @@ impl App {
             },
             ActiveTab::Usb => match code {
                 KeyCode::Char('c') => {
-                    let ids: Vec<GuestId> = self
-                        .guests
-                        .state()
-                        .guests()
-                        .iter()
-                        .map(|guest| guest.id.clone())
-                        .collect();
+                    let ids = self.guest_ids();
                     self.usb.cycle_selected(&ids).into_iter().collect()
                 }
                 KeyCode::Char('d') => self.usb.detach_selected().into_iter().collect(),
+                _ => Vec::new(),
+            },
+            ActiveTab::Displays => match code {
+                KeyCode::Char('c') => {
+                    let ids = self.guest_ids();
+                    self.display.cycle_selected(&ids).into_iter().collect()
+                }
+                KeyCode::Char('d') => self.display.release_selected().into_iter().collect(),
+                // Uppercase K: lowercase k is cursor-up on every tab.
+                KeyCode::Char('K') => self.display.switch_selected_guest().into_iter().collect(),
                 _ => Vec::new(),
             },
         }
@@ -307,7 +343,7 @@ impl App {
         );
 
         frame.render_widget(
-            Tabs::new(vec![" Guests ", " USB "])
+            Tabs::new(vec![" Guests ", " USB ", " Displays "])
                 .block(Block::default().borders(Borders::ALL))
                 .select(self.tab.index())
                 .highlight_style(
@@ -321,13 +357,19 @@ impl App {
         match self.tab {
             ActiveTab::Guests => self.render_guests(frame, chunks[2]),
             ActiveTab::Usb => self.render_usb(frame, chunks[2]),
+            ActiveTab::Displays => self.render_displays(frame, chunks[2]),
         }
 
         let hints = match self.tab {
             ActiveTab::Guests => {
-                "1/2 tabs · j/k move · s start · x stop · r reboot · R refresh · q quit"
+                "1/2/3 tabs · j/k move · s start · x stop · r reboot · R refresh · q quit"
             }
-            ActiveTab::Usb => "1/2 tabs · j/k move · c cycle guest · d detach · R refresh · q quit",
+            ActiveTab::Usb => {
+                "1/2/3 tabs · j/k move · c cycle guest · d detach · R refresh · q quit"
+            }
+            ActiveTab::Displays => {
+                "1/2/3 tabs · j/k move · c cycle guest · d release · K KVM switch · R refresh · q quit"
+            }
         };
         let status = self.latest_status().unwrap_or("waiting for data");
         frame.render_widget(
@@ -453,6 +495,84 @@ impl App {
             chunks[1],
         );
     }
+
+    /// Draw the display tab: physical-monitor inventory table plus the
+    /// hot-plug/EDID notice ring.
+    fn render_displays(&self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(6),
+                Constraint::Length(MAX_NOTICES_SHOWN + 2),
+            ])
+            .split(area);
+
+        let header = Row::new(["Mon", "Conn", "Name", "Native mode", "Assigned", "Link"])
+            .style(Style::default().add_modifier(Modifier::BOLD));
+        let rows = self.display.state().monitors().iter().map(|mon| {
+            let assigned_style = if mon.assigned_guest.is_some() {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            Row::new([
+                Cell::from(format!("{}", mon.id)),
+                Cell::from(mon.connector.clone()),
+                Cell::from(
+                    mon.name
+                        .clone()
+                        .unwrap_or_else(|| "Unknown Monitor".to_string()),
+                ),
+                Cell::from(mon.preferred.to_string()),
+                Cell::from(Span::styled(
+                    mon.assigned_guest
+                        .clone()
+                        .unwrap_or_else(|| "unassigned".to_string()),
+                    assigned_style,
+                )),
+                Cell::from(if mon.plugged { "up" } else { "DOWN" }),
+            ])
+        });
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(5),
+                Constraint::Length(6),
+                Constraint::Length(24),
+                Constraint::Length(16),
+                Constraint::Length(14),
+                Constraint::Min(6),
+            ],
+        )
+        .header(header)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Physical monitors "),
+        )
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        let mut table_state = TableState::default();
+        table_state.select(Some(self.display.state().selected()));
+        frame.render_stateful_widget(table, chunks[0], &mut table_state);
+
+        let notices: Vec<Line> = self
+            .display
+            .state()
+            .notices()
+            .iter()
+            .rev()
+            .take(usize::from(MAX_NOTICES_SHOWN))
+            .map(|notice| Line::from(notice.as_str()))
+            .collect();
+        frame.render_widget(
+            Paragraph::new(notices).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Hot-plug notices "),
+            ),
+            chunks[1],
+        );
+    }
 }
 
 /// Format seconds as `H:MM:SS` for the guest table's uptime column.
@@ -526,9 +646,10 @@ pub async fn run_tui(addr: &str) -> anyhow::Result<()> {
 
     let mut app = App::new(addr);
 
-    // Seed both tabs so the first paint is not empty.
+    // Seed all tabs so the first paint is not empty.
     writer.send(&ClientMessage::RequestStatus).await?;
     writer.send(&ClientMessage::RequestUsbDevices).await?;
+    writer.send(&ClientMessage::RequestDisplayMonitors).await?;
 
     let (key_tx, mut key_rx) = mpsc::channel::<KeyEvent>(KEY_QUEUE);
     tokio::task::spawn_blocking(move || key_reader(&key_tx));
@@ -593,7 +714,8 @@ pub async fn run_tui(addr: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::protocol::{
-        encode, GuestAction, GuestState, GuestStatus, UsbAction, UsbDeviceEntry,
+        encode, DisplayAction, DisplayMonitorEntry, GuestAction, GuestState, GuestStatus,
+        UsbAction, UsbDeviceEntry, VideoModeEntry,
     };
     use ratatui::backend::TestBackend;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -627,6 +749,23 @@ mod tests {
             speed: "Low".into(),
             assigned_guest: assigned.map(String::from),
             guest_port: assigned.map(|_| 0),
+        }
+    }
+
+    fn monitor(id: u32, assigned: Option<&str>) -> DisplayMonitorEntry {
+        DisplayMonitorEntry {
+            id,
+            connector: "DP".into(),
+            name: Some(format!("Test Monitor {id}")),
+            manufacturer: Some("ENC".into()),
+            preferred: VideoModeEntry {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+            },
+            mode_count: 3,
+            assigned_guest: assigned.map(String::from),
+            plugged: true,
         }
     }
 
@@ -672,15 +811,31 @@ mod tests {
             outbound.as_slice(),
             [ClientMessage::RequestUsbDevices]
         ));
+        let outbound = app.on_key(press(KeyCode::Char('3')));
+        assert!(matches!(
+            outbound.as_slice(),
+            [ClientMessage::RequestDisplayMonitors]
+        ));
         let outbound = app.on_key(press(KeyCode::Char('1')));
         assert!(matches!(
             outbound.as_slice(),
             [ClientMessage::RequestStatus]
         ));
+        // Tab cycles Guests -> USB -> Displays -> Guests.
         let outbound = app.on_key(press(KeyCode::Tab));
         assert!(matches!(
             outbound.as_slice(),
             [ClientMessage::RequestUsbDevices]
+        ));
+        let outbound = app.on_key(press(KeyCode::Tab));
+        assert!(matches!(
+            outbound.as_slice(),
+            [ClientMessage::RequestDisplayMonitors]
+        ));
+        let outbound = app.on_key(press(KeyCode::Tab));
+        assert!(matches!(
+            outbound.as_slice(),
+            [ClientMessage::RequestStatus]
         ));
     }
 
@@ -761,6 +916,56 @@ mod tests {
     }
 
     #[test]
+    fn display_keys_route_monitors_and_kvm_switch() {
+        let mut app = app_with_guests();
+        app.on_server_message(&ServerMessage::DisplayMonitorList(vec![
+            monitor(0, Some("vm1")),
+            monitor(1, None),
+        ]));
+        let _ = app.on_key(press(KeyCode::Char('3'))); // Displays tab
+
+        // 'c' cycles the selected monitor (on vm1) to the next guest, vm2.
+        match app.on_key(press(KeyCode::Char('c'))).as_slice() {
+            [ClientMessage::DisplayCommand { id, action }] => {
+                assert_eq!(*id, 0);
+                assert_eq!(
+                    *action,
+                    DisplayAction::Assign {
+                        monitor_id: 0,
+                        target_guest: "vm2".into()
+                    }
+                );
+            }
+            other => panic!("expected an assign command, got {other:?}"),
+        }
+        // 'K' KVM-switches to the selected monitor's guest (vm1).
+        match app.on_key(press(KeyCode::Char('K'))).as_slice() {
+            [ClientMessage::DisplayCommand { id, action }] => {
+                assert_eq!(*id, 1);
+                assert_eq!(
+                    *action,
+                    DisplayAction::KvmSwitchTo {
+                        guest_id: "vm1".into()
+                    }
+                );
+            }
+            other => panic!("expected a KVM-switch command, got {other:?}"),
+        }
+        // 'd' releases the monitor back to the hypervisor.
+        match app.on_key(press(KeyCode::Char('d'))).as_slice() {
+            [ClientMessage::DisplayCommand { id, action }] => {
+                assert_eq!(*id, 2);
+                assert_eq!(action, &DisplayAction::Release { monitor_id: 0 });
+            }
+            other => panic!("expected a release command, got {other:?}"),
+        }
+        // Move to the unassigned monitor: 'K' and 'd' are no-ops there.
+        let _ = app.on_key(press(KeyCode::Char('j')));
+        assert!(app.on_key(press(KeyCode::Char('K'))).is_empty());
+        assert!(app.on_key(press(KeyCode::Char('d'))).is_empty());
+    }
+
+    #[test]
     fn guest_tab_keys_are_ignored_on_the_usb_tab() {
         let mut app = app_with_guests();
         let _ = app.on_key(press(KeyCode::Char('2'))); // USB tab, empty device list
@@ -788,6 +993,16 @@ mod tests {
         assert_eq!(
             app.usb_tab().state().latest_notice(),
             Some("mouse attached")
+        );
+        app.on_server_message(&ServerMessage::DisplayHotplugNotice {
+            message: "monitor 0 replugged".into(),
+            monitor: None,
+        });
+        assert_eq!(app.latest_status(), Some("display: monitor 0 replugged"));
+        // The display tab's own notice ring got it too.
+        assert_eq!(
+            app.display_tab().state().latest_notice(),
+            Some("monitor 0 replugged")
         );
     }
 
@@ -848,6 +1063,35 @@ mod tests {
         assert!(text.contains("046d:c077"), "VID:PID rendered");
         assert!(text.contains("Test Mouse attached"), "notice rendered");
         assert!(text.contains("c cycle guest"), "USB key hints rendered");
+
+        // Displays tab.
+        app.on_server_message(&ServerMessage::DisplayMonitorList(vec![
+            monitor(0, Some("vm1")),
+            monitor(1, None),
+        ]));
+        app.on_server_message(&ServerMessage::DisplayHotplugNotice {
+            message: "Test Monitor 1 unplugged".into(),
+            monitor: None,
+        });
+        let _ = app.on_key(press(KeyCode::Char('3')));
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(text.contains("Test Monitor 0"), "monitor rendered");
+        assert!(text.contains("1920x1080@60"), "native mode rendered");
+        assert!(text.contains("vm1"), "assignment rendered");
+        assert!(
+            text.contains("Test Monitor 1 unplugged"),
+            "display notice rendered"
+        );
+        assert!(text.contains("K KVM switch"), "display key hints rendered");
     }
 
     /// Headless socket-glue check: the app's `Connection` talks to a fake

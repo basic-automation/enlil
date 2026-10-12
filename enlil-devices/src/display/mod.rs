@@ -7,6 +7,8 @@
 //! - Picture-in-Picture support
 //! - Configuration via serde
 
+pub mod routing;
+
 use crate::truncate::{Widen, u32_of};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -696,12 +698,22 @@ pub enum DisplayMode {
     PiP,
 }
 
+/// The default KVM-switch chord: Ctrl+Alt+K (roadmap 8.3).
+fn default_kvm_switch() -> Vec<u16> {
+    vec![29, 56, 37]
+}
+
 /// Hotkey configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HotkeyConfig {
     pub toggle_pip: Vec<u16>,
     pub cycle_zones: Vec<u16>,
     pub reset_layout: Vec<u16>,
+    /// Chord that advances the KVM switch to the next guest
+    /// ([`routing::KvmSwitchHotkey`]). `serde(default)` so configs written
+    /// before 8.3 still load.
+    #[serde(default = "default_kvm_switch")]
+    pub kvm_switch: Vec<u16>,
 }
 
 impl Default for HotkeyConfig {
@@ -710,6 +722,7 @@ impl Default for HotkeyConfig {
             toggle_pip: vec![29, 56, 25],   // Ctrl+Alt+P
             cycle_zones: vec![29, 56, 9],   // Ctrl+Alt+Tab
             reset_layout: vec![29, 56, 19], // Ctrl+Alt+R
+            kvm_switch: default_kvm_switch(),
         }
     }
 }
