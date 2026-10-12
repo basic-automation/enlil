@@ -55,6 +55,8 @@ fn guest_status(id: &str) -> GuestStatus {
         memory_used_mib: 1024,
         memory_total_mib: 4096,
         uptime_secs: 300,
+        io_read_bytes_per_sec: 0,
+        io_write_bytes_per_sec: 0,
     }
 }
 
