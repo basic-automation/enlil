@@ -1,27 +1,34 @@
-[package]
-name = "bridge-agent"
+[workspace]
+resolver = "2"
+members = [
+    "bridge-agent",
+    "enlil-platform",
+    "enlil-hal",
+    "enlil-core",
+    "enlil-devices",
+    "enlil-config",
+    "enlil-mgmt",
+    "enlil-boot",
+    "enlil-setup",
+    "enlil-std",
+    "enlil-mgmt-proto",
+]
+
+[workspace.package]
 version = "1.0.0"
-edition.workspace = true
-description = "In-guest agent for the Enlil inter-guest bridge (clipboard, drag-and-drop, shared filesystem)"
-license.workspace = true
-repository.workspace = true
-authors.workspace = true
-# Publishing guard. This repo runs an automated nightly routine that reshapes
-# these crates; they are tightly-coupled internals of an unfinished hypervisor,
-# not yet standalone libraries. Flip to `true` (or delete) per crate only when
-# its API is stable enough to maintain on crates.io under semver.
-publish = false
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/basic-automation/enlil"
+homepage = "https://github.com/basic-automation/enlil"
+readme = "README.md"
+authors = ["Justin Icenhour"]
+keywords = ["hypervisor", "virtualization", "bare-metal", "no-std", "x86-64"]
+categories = ["virtualization", "no-std", "os"]
 
-[[bin]]
-name = "bridge-agent"
-path = "src/main.rs"
-
-[lib]
-name = "bridge_agent"
-path = "src/lib.rs"
-
-[dependencies]
-enlil-devices = { path = "../enlil-devices" }
-clap = { workspace = true }
-anyhow = { workspace = true }
-thiserror = { workspace = true }
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+thiserror = "2"
+log = "0.4"
+clap = { version = "4", features = ["derive"] }
