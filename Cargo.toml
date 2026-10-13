@@ -1,8 +1,8 @@
 [package]
-name = "enlil-std"
+name = "enlil-core"
 version = "1.0.0"
-edition = "2024"
-description = "Enlil standard library compatibility layer — std-like APIs backed by enlil-platform"
+edition = "2021"
+description = "Enlil hypervisor core — VMM entry, vCPU management, memory partitioning"
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
@@ -12,24 +12,23 @@ authors.workspace = true
 # its API is stable enough to maintain on crates.io under semver.
 publish = false
 
-[features]
-default = ["platform-linux"]
-platform-linux = ["enlil-platform/platform-linux"]
-# The bare-metal backend is `no_std` + `alloc`: `HashMap`/`HashSet` come from
-# hashbrown (no_std-compatible) instead of `std::collections`.
-platform-baremetal = ["enlil-platform/platform-baremetal", "dep:hashbrown"]
-
-[[bin]]
-name = "milestone_1_11"
-path = "src/bin/milestone_1_11.rs"
-
 [dependencies]
-enlil-platform = { path = "../enlil-platform", version = "1.0.0", default-features = false }
-# Lazy global bare-metal task scheduler for `thread::spawn` (no_std has no
-# `std::sync::OnceLock`).
-spin = "0.9"
-# no_std HashMap/HashSet for the bare-metal backend.
-hashbrown = { version = "0.15", default-features = false, features = [
-    "default-hasher",
-], optional = true }
+enlil-config = { path = "../enlil-config", version = "1.0.0" }
+enlil-devices = { path = "../enlil-devices", version = "1.0.0" }
+enlil-mgmt-proto = { path = "../enlil-mgmt-proto", version = "1.0.0" }
+enlil-platform = { path = "../enlil-platform", version = "1.0.0" }
+log = "0.4"
+thiserror = "2"
+anyhow = "1"
 
+# rust-vmm crates — Linux/KVM only
+[target.'cfg(target_os = "linux")'.dependencies]
+kvm-ioctls = "0.19"
+kvm-bindings = { version = "0.10", features = ["fam-wrappers"] }
+vm-memory = { version = "0.16", features = ["backend-mmap"] }
+vm-superio = "0.8"
+linux-loader = { version = "0.13", features = ["bzimage", "elf"] }
+vm-allocator = "0.1"
+event-manager = "0.4"
+vmm-sys-util = "0.12"
+libc = "0.2"
