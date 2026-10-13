@@ -1,8 +1,8 @@
 [package]
-name = "enlil-platform"
+name = "enlil-devices"
 version = "1.0.0"
 edition = "2024"
-description = "Enlil platform abstraction layer — threading, alloc, sync, async runtime, I/O"
+description = "Virtual device backends — USB router, GPU arbiter, storage, network"
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
@@ -12,32 +12,29 @@ authors.workspace = true
 # its API is stable enough to maintain on crates.io under semver.
 publish = false
 
-[features]
-default = ["platform-linux"]
-platform-linux = []
-# The bare-metal backend backs GlobalAlloc with the audited linked_list_allocator
-# heap rather than the Linux system allocator.
-platform-baremetal = ["dep:linked_list_allocator"]
-
 [dependencies]
-# The ISA seam (LOCKED PRINCIPLE 2): threading::context keeps each task's
-# XSAVE area in enlil-hal's XSaveArea rather than re-deriving the layout.
-# enlil-hal is no_std + alloc with no features, so this never perturbs the
-# bare-metal build.
 enlil-hal = { path = "../enlil-hal", version = "1.0.0" }
-# `log` without default features: the `std` feature cannot build for the
-# `x86_64-unknown-enlil` target (`-Zbuild-std=core,alloc` provides no `std`
-# sysroot), and the platform layer is `no_std` under `platform-baremetal`
-# anyway. The macros and `set_logger` used here need only `core`. Host builds
-# still unify `log/std` via the other workspace crates' default-enabled edges.
-log = { version = "0.4", default-features = false }
-spin = "0.9"
-# Intrusive-free-list heap for the bare-metal GlobalAlloc. Pulled in only under
-# the platform-baremetal feature (no_std, no external OS deps).
-linked_list_allocator = { version = "0.10", optional = true }
+enlil-config = { path = "../enlil-config", version = "1.0.0" }
+log = "0.4"
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+tokio = { version = "1", features = ["fs", "io-util", "sync", "rt"] }
+byteorder = "1"
+bitflags = "2"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { version = "1.0.149", features = ["std"] }
 
-# The Linux epoll I/O reactor source (async_rt::epoll) needs raw epoll
-# syscalls; gated to the Linux dev host so the bare-metal target never pulls it.
+[dev-dependencies]
+tokio = { version = "1", features = ["fs", "io-util", "sync", "rt", "macros"] }
+tempfile = "3"
+
 [target.'cfg(target_os = "linux")'.dependencies]
+vm-memory = { version = "0.16", features = ["backend-mmap"] }
+vm-device = "0.1"
+vm-superio = "0.8"
+vmm-sys-util = "0.12"
 libc = "0.2"
-
+# `vendored` builds libusb from source so runners without the system
+# library (and CI) still compile the physical-device forwarder.
+rusb = { version = "0.9", features = ["vendored"] }
