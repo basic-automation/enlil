@@ -295,28 +295,18 @@ pub struct NetworkFunction {
 
 #[cfg(target_os = "uefi")]
 pub use hw::{
-<<<<<<< HEAD
-    XhciFunction, find_xhci_controllers, first_memory_bar, scan_bus0, scan_ecam, scan_memory_bars,
-=======
-    bar0_mmio_base, first_memory_bar, first_network_function, scan_bus0, scan_ecam,
-    scan_memory_bars,
->>>>>>> 90c0666 (feat(boot): minimal bare-metal management-network driver (T-6.20))
+    XhciFunction, bar0_mmio_base, find_xhci_controllers, first_memory_bar, first_network_function,
+    scan_bus0, scan_ecam, scan_memory_bars,
 };
 
 #[cfg(target_os = "uefi")]
 mod hw {
     use super::{
-<<<<<<< HEAD
-        BAR0_OFFSET, CAP_ID_MSIX, EcamScan, MemoryBar, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA,
-        PciScan, bar_is_io, bar_is_mem_64, bar_mem_base, bar_mem_base_64, bar_mem_size,
-        bar_mem_size_64, cap_id_of, cap_next_of, class_of, config_address, device_of,
-        ecam_config_address, prog_if_of, status_has_caps, subclass_of, vendor_of, vendor_present,
-=======
         BAR0_OFFSET, CAP_ID_MSIX, CLASS_NETWORK, EcamScan, MemoryBar, NetworkFunction,
         PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA, PciScan, bar_is_io, bar_is_mem_64, bar_mem_base,
         bar_mem_base_64, bar_mem_size, bar_mem_size_64, cap_id_of, cap_next_of, class_of,
-        config_address, device_of, ecam_config_address, status_has_caps, vendor_of, vendor_present,
->>>>>>> 90c0666 (feat(boot): minimal bare-metal management-network driver (T-6.20))
+        config_address, device_of, ecam_config_address, prog_if_of, status_has_caps, subclass_of,
+        vendor_of, vendor_present,
     };
 
     /// Write a 32-bit `value` to `port`.
