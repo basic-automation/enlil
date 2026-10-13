@@ -449,6 +449,14 @@ impl MemoryMap {
     /// window is carved first (it is the most constrained — it must fall under
     /// 4 GiB), then the heap, then each guest's RAM.
     ///
+    /// When `req.preclaimed_heap` is `Some`, the heap is not carved: the span
+    /// was already claimed (installed before any `MemoryMap` existed and
+    /// [`reserve_span`](Self::reserve_span)'d ahead of planning), so the planner
+    /// only validates it is fully `Reserved` and at least `req.heap_size` bytes,
+    /// then adopts it as the plan's heap. This is how the boot path ends up
+    /// with exactly one heap — the live bootstrap heap, not a second carved
+    /// span shadowing it.
+    ///
     /// # Panics
     /// Panics if `req.align` is not a power of two.
     #[must_use]
@@ -458,7 +466,20 @@ impl MemoryMap {
     ) -> Option<HypervisorRegions> {
         let mut trial = self.clone();
         let dma_base = trial.carve_below(req.dma_size, req.align, 1u64 << 32)?;
-        let heap_base = trial.carve(req.heap_size, req.align)?;
+        let heap = if let Some((base, size)) = req.preclaimed_heap {
+            // Carves only touch usable regions, so the DMA carve above
+            // cannot have disturbed this already-reserved span; still, a
+            // span that is not fully Reserved or is too small means the
+            // caller's reservation did not take — fail the whole plan
+            // rather than adopt a heap that overlaps live memory.
+            if size < req.heap_size || !trial.span_is_reserved(base, size) {
+                return None;
+            }
+            MemoryRegion::new(PhysAddr::new(base), size, MemoryKind::Reserved)
+        } else {
+            let heap_base = trial.carve(req.heap_size, req.align)?;
+            MemoryRegion::new(heap_base, req.heap_size, MemoryKind::Reserved)
+        };
         let mut guest_ram = Vec::with_capacity(req.guest_ram_sizes.len());
         for &size in &req.guest_ram_sizes {
             let base = trial.carve(size, req.align)?;
@@ -468,9 +489,45 @@ impl MemoryMap {
         *self = trial;
         Some(HypervisorRegions {
             dma: MemoryRegion::new(dma_base, req.dma_size, MemoryKind::Reserved),
-            heap: MemoryRegion::new(heap_base, req.heap_size, MemoryKind::Reserved),
+            heap,
             guest_ram,
         })
+    }
+
+    /// Whether every byte of `[base, base + size)` sits inside
+    /// [`Reserved`](MemoryKind::Reserved) regions — i.e. the span is fully
+    /// claimed and no later [`carve`](Self::carve) can hand any of it out.
+    ///
+    /// Used to validate a [`MemoryPlanRequest::preclaimed_heap`] span before
+    /// the planner adopts it.
+    #[must_use]
+    pub fn span_is_reserved(&self, base: u64, size: u64) -> bool {
+        let Some(end) = base.checked_add(size) else {
+            return false;
+        };
+        if size == 0 {
+            return false;
+        }
+        let mut cursor = base;
+        for region in &self.regions {
+            if region.kind != MemoryKind::Reserved {
+                continue;
+            }
+            let (region_base, region_end) = (region.base.as_u64(), region.end());
+            if region_end <= cursor {
+                continue;
+            }
+            // Regions are sorted and non-overlapping: a gap before this
+            // region can never be covered by a later one.
+            if region_base > cursor {
+                return false;
+            }
+            cursor = region_end;
+            if cursor >= end {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -485,6 +542,11 @@ pub struct MemoryPlanRequest {
     pub guest_ram_sizes: Vec<u64>,
     /// Alignment applied to every carved region (a power of two, e.g. 2 MiB).
     pub align: u64,
+    /// Already-claimed hypervisor heap span `(base, size)`, or `None` to carve
+    /// a fresh one. The boot path installs its heap before any `MemoryMap` can
+    /// exist and reserves the span ahead of planning; the planner then adopts
+    /// it instead of carving a second, shadowing heap.
+    pub preclaimed_heap: Option<(u64, u64)>,
 }
 
 /// The physical regions the hypervisor carved for itself at boot.
@@ -905,6 +967,7 @@ mod tests {
             dma_size: 0x10_0000,  // 1 MiB
             guest_ram_sizes: vec![0x100_0000, 0x80_0000],
             align: 0x20_0000, // 2 MiB
+            preclaimed_heap: None,
         };
         let plan = map.plan_hypervisor_regions(&req).expect("plan fits");
 
@@ -938,6 +1001,7 @@ mod tests {
             dma_size: 0x10_0000,
             guest_ram_sizes: vec![0x40_0000], // no room left for this
             align: 0x20_0000,
+            preclaimed_heap: None,
         };
         assert!(
             map.plan_hypervisor_regions(&req).is_none(),
@@ -960,6 +1024,7 @@ mod tests {
             dma_size: 0x20_0000,
             guest_ram_sizes: vec![],
             align: 0x20_0000,
+            preclaimed_heap: None,
         };
         assert!(
             map.plan_hypervisor_regions(&req).is_none(),
@@ -977,5 +1042,96 @@ mod tests {
         let ra = MemoryRegion::new(a, 0x1000, MemoryKind::Reserved);
         let rb = MemoryRegion::new(b, 0x1000, MemoryKind::Reserved);
         assert!(!ra.overlaps(&rb), "two carves never overlap");
+    }
+
+    #[test]
+    fn span_is_reserved_detects_fully_and_partially_claimed_spans() {
+        let mut map = MemoryMap::from_regions(vec![
+            usable(0x1000, 0x1000),
+            reserved(0x2000, 0x2000),
+            usable(0x4000, 0x1000),
+        ]);
+        assert!(map.span_is_reserved(0x2000, 0x2000));
+        assert!(map.span_is_reserved(0x2800, 0x800));
+        assert!(!map.span_is_reserved(0x1000, 0x1000), "usable span");
+        assert!(
+            !map.span_is_reserved(0x1800, 0x1000),
+            "straddles usable and reserved"
+        );
+        assert!(
+            !map.span_is_reserved(0x2000, 0x2001),
+            "one byte past the end"
+        );
+        assert!(!map.span_is_reserved(0x2000, 0), "empty span");
+        assert!(!map.span_is_reserved(u64::MAX, 2), "overflow");
+        // A span covered by two adjacent reserved regions still counts.
+        assert!(map.reserve_span(0x4000, 0x1000));
+        assert!(map.span_is_reserved(0x2000, 0x3000));
+    }
+
+    #[test]
+    fn plan_adopts_preclaimed_heap_instead_of_carving() {
+        let mut map = MemoryMap::from_regions(vec![
+            usable(0x10_0000, 0x20_0000),       // 1 MiB..3 MiB, under 4 GiB
+            usable(0x1_0000_0000, 0x1000_0000), // 4 GiB.., 256 MiB
+        ]);
+        // The boot path installed its heap here before the map existed and
+        // reserved it ahead of planning.
+        assert!(map.reserve_span(0x1_0200_0000, 0x400_0000)); // 64 MiB at 4 GiB + 32 MiB
+        let req = MemoryPlanRequest {
+            heap_size: 0x400_0000,
+            dma_size: 0x10_0000,
+            guest_ram_sizes: vec![0x100_0000],
+            align: 0x20_0000,
+            preclaimed_heap: Some((0x1_0200_0000, 0x400_0000)),
+        };
+        let plan = map.plan_hypervisor_regions(&req).expect("plan fits");
+        // The plan's heap IS the live heap — no second carved span.
+        assert_eq!(plan.heap.base.as_u64(), 0x1_0200_0000);
+        assert_eq!(plan.heap.size, 0x400_0000);
+        // DMA and guest RAM were still carved, disjoint from the heap.
+        assert!(plan.dma.end() <= (1u64 << 32));
+        let guest = plan.guest_ram[0];
+        assert!(
+            !guest.overlaps(&plan.heap),
+            "guest RAM clears the live heap"
+        );
+        assert!(!plan.dma.overlaps(&plan.heap), "DMA clears the live heap");
+        assert!(map.is_consistent(), "map stays consistent after planning");
+    }
+
+    #[test]
+    fn plan_rejects_preclaimed_heap_that_is_not_reserved() {
+        let mut map = MemoryMap::from_regions(vec![usable(0x10_0000, 0x40_0000)]);
+        let before = map.clone();
+        // Claimed at a span the caller forgot to reserve_span: the planner
+        // must fail rather than adopt a heap carved from under live memory.
+        let req = MemoryPlanRequest {
+            heap_size: 0x10_0000,
+            dma_size: 0x10_0000,
+            guest_ram_sizes: vec![],
+            align: 0x20_0000,
+            preclaimed_heap: Some((0x10_0000, 0x10_0000)),
+        };
+        assert!(map.plan_hypervisor_regions(&req).is_none());
+        assert_eq!(
+            map.regions(),
+            before.regions(),
+            "a failed plan leaves the map untouched"
+        );
+    }
+
+    #[test]
+    fn plan_rejects_preclaimed_heap_smaller_than_requested() {
+        let mut map = MemoryMap::from_regions(vec![usable(0x10_0000, 0x40_0000)]);
+        assert!(map.reserve_span(0x10_0000, 0x10_0000));
+        let req = MemoryPlanRequest {
+            heap_size: 0x20_0000, // asks for more than the claimed span
+            dma_size: 0x10_0000,
+            guest_ram_sizes: vec![],
+            align: 0x20_0000,
+            preclaimed_heap: Some((0x10_0000, 0x10_0000)),
+        };
+        assert!(map.plan_hypervisor_regions(&req).is_none());
     }
 }
