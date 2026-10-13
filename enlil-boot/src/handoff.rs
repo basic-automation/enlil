@@ -103,6 +103,54 @@ impl Framebuffer {
     }
 }
 
+/// Maximum guests whose ESP firmware the boot app stages into the handoff.
+pub const MAX_BOOT_GUESTS: usize = 16;
+
+/// One guest's OVMF images as staged from the ESP into boot-services memory.
+///
+/// Both extents live in `LOADER_DATA` pages allocated before
+/// `ExitBootServices()`; the kernel must treat them as reserved, never as
+/// free conventional memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestFirmware {
+    /// Guest id as NUL-terminated ASCII (`firmware::MAX_GUEST_ID_LEN` + NUL).
+    pub id: [u8; 33],
+    /// Physical base of the staged `OVMF_CODE.fd` (`0` when not staged).
+    pub code_base: u64,
+    /// Valid bytes at `code_base`.
+    pub code_len: usize,
+    /// Physical base of the staged `OVMF_VARS.fd` template (`0` when not
+    /// staged).
+    pub vars_base: u64,
+    /// Valid bytes at `vars_base`.
+    pub vars_len: usize,
+}
+
+impl GuestFirmware {
+    /// An empty (unstaged) entry.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            id: [0; 33],
+            code_base: 0,
+            code_len: 0,
+            vars_base: 0,
+            vars_len: 0,
+        }
+    }
+
+    /// The guest id as a string (bytes up to the first NUL).
+    #[must_use]
+    pub fn id_str(&self) -> &str {
+        let len = self
+            .id
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.id.len());
+        core::str::from_utf8(&self.id[..len]).unwrap_or("?")
+    }
+}
+
 /// Everything the UEFI stage collects before `ExitBootServices()` and hands
 /// to the enlil kernel.
 ///
@@ -122,6 +170,16 @@ pub struct BootHandoff {
     pub acpi_rsdp: u64,
     /// The GOP framebuffer, if the firmware provided a graphics console.
     pub framebuffer: Option<Framebuffer>,
+    /// Physical base of the staged `EFI/enlil/config.toml` (`0` when the ESP
+    /// had none); `LOADER_DATA` pages, valid for `config_len` bytes.
+    pub config_base: u64,
+    /// Valid bytes at `config_base`.
+    pub config_len: usize,
+    /// Per-guest OVMF extents staged from the ESP; only the first
+    /// `guest_firmware_count` entries are valid.
+    pub guest_firmwares: [GuestFirmware; MAX_BOOT_GUESTS],
+    /// Number of valid entries in `guest_firmwares` (`<= MAX_BOOT_GUESTS`).
+    pub guest_firmware_count: usize,
 }
 
 impl BootHandoff {
@@ -139,6 +197,12 @@ impl BootHandoff {
     #[must_use]
     pub const fn has_acpi(&self) -> bool {
         self.acpi_rsdp != 0
+    }
+
+    /// Whether the boot app staged a config from the ESP.
+    #[must_use]
+    pub const fn has_config(&self) -> bool {
+        self.config_base != 0 && self.config_len != 0
     }
 
     /// Whether a usable graphics framebuffer was handed over.
@@ -223,6 +287,10 @@ mod tests {
             memory_descriptor_size: 48,
             acpi_rsdp: 0xE_0000,
             framebuffer: None,
+            config_base: 0,
+            config_len: 0,
+            guest_firmwares: [GuestFirmware::empty(); MAX_BOOT_GUESTS],
+            guest_firmware_count: 0,
         };
         assert_eq!(h.descriptor_count(), 10);
     }
@@ -235,6 +303,10 @@ mod tests {
             memory_descriptor_size: 0,
             acpi_rsdp: 0xE_0000,
             framebuffer: None,
+            config_base: 0,
+            config_len: 0,
+            guest_firmwares: [GuestFirmware::empty(); MAX_BOOT_GUESTS],
+            guest_firmware_count: 0,
         };
         assert_eq!(h.descriptor_count(), 0);
     }
@@ -247,6 +319,10 @@ mod tests {
             memory_descriptor_size: 48,
             acpi_rsdp: 0xE_0000,
             framebuffer: Some(sample_fb()),
+            config_base: 0x9_0000,
+            config_len: 128,
+            guest_firmwares: [GuestFirmware::empty(); MAX_BOOT_GUESTS],
+            guest_firmware_count: 0,
         };
         assert!(good.is_valid());
         assert!(good.has_acpi());
@@ -283,6 +359,48 @@ mod tests {
                 ..good
             }
             .is_valid()
+        );
+    }
+
+    fn empty_handoff() -> BootHandoff {
+        BootHandoff {
+            memory_map_base: 0x1000,
+            memory_map_len: 48,
+            memory_descriptor_size: 48,
+            acpi_rsdp: 0xE_0000,
+            framebuffer: None,
+            config_base: 0,
+            config_len: 0,
+            guest_firmwares: [GuestFirmware::empty(); MAX_BOOT_GUESTS],
+            guest_firmware_count: 0,
+        }
+    }
+
+    #[test]
+    fn guest_firmware_id_str_reads_nul_terminated_id() {
+        let mut g = GuestFirmware::empty();
+        g.id[..6].copy_from_slice(b"linux1");
+        assert_eq!(g.id_str(), "linux1");
+        assert_eq!(GuestFirmware::empty().id_str(), "");
+    }
+
+    #[test]
+    fn has_config_requires_base_and_len() {
+        assert!(!empty_handoff().has_config());
+        assert!(
+            BootHandoff {
+                config_base: 0x9_0000,
+                config_len: 128,
+                ..empty_handoff()
+            }
+            .has_config()
+        );
+        assert!(
+            !BootHandoff {
+                config_base: 0x9_0000,
+                ..empty_handoff()
+            }
+            .has_config()
         );
     }
 }
