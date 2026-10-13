@@ -13,7 +13,7 @@ This book is the developer-facing companion to the repository's front door:
   the development roadmap: a `[ ]`/`[x]` task checklist of every phase, from
   scaffold through to the multi-machine mesh.
 - [**SECURITY.md**](https://github.com/basic-automation/enlil/blob/master/SECURITY.md) —
-  security model. Enlil is pre-1.0 research software: **do not run untrusted
+  security model. Enlil 1.0.0 is released but unaudited: **do not run untrusted
   guests**.
 
 ## What this book covers
