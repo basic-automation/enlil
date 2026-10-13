@@ -1,61 +1,52 @@
-//! Thread spawning backed by enlil-platform.
+//! Thread spawning backed by `enlil_platform::sys::thread`.
 //!
-//! Provides a `spawn()` function matching `std::thread::spawn` semantics,
-//! but routing through the enlil platform threading layer.
+//! Provides `spawn`/`sleep`/`current_thread_name` with `std::thread`-like
+//! semantics, routed through the platform's `sys` bindings — the
+//! `std::sys`-equivalent layer both backends implement — so this module is
+//! backend-agnostic: one implementation serves Linux and
+//! `x86_64-unknown-enlil`.
 //!
-//! On the hosted (`platform-linux`) backend each task runs on a real OS thread
-//! via [`enlil_platform::threading::spawn_hosted`]. On the bare-metal backend
-//! tasks are submitted to a lazily-initialized global
-//! [`enlil_platform::threading::BareMetalScheduler`] and pumped to completion
-//! by [`JoinHandle::join`], so the same `spawn`/`join` source builds and runs
-//! on the `x86_64-unknown-enlil` target.
+//! On Linux each task runs on a real OS thread; on bare metal tasks are
+//! submitted to the `sys` scheduler and pumped to completion by
+//! [`JoinHandle::join`].
 
-#[cfg(feature = "platform-baremetal")]
 use alloc::boxed::Box;
-#[cfg(feature = "platform-baremetal")]
 use alloc::string::String;
-#[cfg(feature = "platform-baremetal")]
 use alloc::sync::Arc;
-#[cfg(feature = "platform-linux")]
 use core::any::Any;
-#[cfg(feature = "platform-baremetal")]
-use core::any::Any;
-#[cfg(feature = "platform-baremetal")]
-use enlil_platform::sync::Mutex;
-#[cfg(feature = "platform-baremetal")]
-use enlil_platform::threading::BareMetalScheduler;
-#[cfg(feature = "platform-linux")]
-use std::sync::{Arc, Mutex};
+use core::time::Duration;
 
-// ---------------------------------------------------------------------------
-// Hosted backend (`platform-linux`)
-// ---------------------------------------------------------------------------
+use enlil_platform::sync::Mutex;
+use enlil_platform::sys::thread as sys_thread;
 
 /// Handle to a spawned thread, similar to `std::thread::JoinHandle`.
-#[cfg(feature = "platform-linux")]
 pub struct JoinHandle<T> {
-    inner: std::thread::JoinHandle<()>,
+    inner: sys_thread::JoinHandle<()>,
     result: Arc<Mutex<Option<T>>>,
 }
 
-#[cfg(feature = "platform-linux")]
 impl<T> JoinHandle<T> {
     /// Block until the thread finishes and return its result.
     ///
+    /// On bare metal this pumps the `sys` scheduler until the task
+    /// completes.
+    ///
     /// # Errors
     ///
-    /// Returns `Err` if the spawned thread panicked.
+    /// Returns `Err` if the spawned thread panicked or vanished without
+    /// producing a result.
     ///
     /// # Panics
     ///
-    /// Panics if the result mutex is poisoned or the thread completed
-    /// without producing a result (should not happen in normal operation).
+    /// Panics if the thread completed without producing a result (should
+    /// not happen in normal operation).
     pub fn join(self) -> Result<T, Box<dyn Any + Send>> {
-        self.inner.join()?;
+        self.inner
+            .join()
+            .map_err(|e| Box::new(e) as Box<dyn Any + Send>)?;
         let val = self
             .result
             .lock()
-            .unwrap()
             .take()
             .expect("thread completed but produced no result");
         Ok(val)
@@ -64,100 +55,12 @@ impl<T> JoinHandle<T> {
 
 /// Spawn a new thread, returning a `JoinHandle`.
 ///
-/// This mirrors `std::thread::spawn` but routes through `enlil_platform::threading`.
-/// On the linux backend, this ultimately uses `std::thread` under the hood.
-/// On bare-metal, it uses the platform scheduler.
+/// Mirrors `std::thread::spawn`, routed through
+/// `enlil_platform::sys::thread::spawn`.
 ///
 /// # Panics
 ///
-/// Panics if the result mutex is poisoned when the thread completes.
-#[cfg(feature = "platform-linux")]
-#[must_use]
-pub fn spawn<F, T>(f: F) -> JoinHandle<T>
-where
-    F: FnOnce() -> T + Send + 'static,
-    T: Send + 'static,
-{
-    let result = Arc::new(Mutex::new(None));
-    let result_clone = result.clone();
-
-    // Create an enlil-platform Task that captures the closure
-    let task = enlil_platform::threading::Task::spawn("enlil-std-thread", move || {
-        let val = f();
-        *result_clone.lock().unwrap() = Some(val);
-    });
-
-    // Use the platform's hosted spawn mechanism
-    let handle = enlil_platform::threading::spawn_hosted(task);
-
-    JoinHandle {
-        inner: handle,
-        result,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Bare-metal backend (`platform-baremetal`)
-// ---------------------------------------------------------------------------
-
-/// Lazily-initialized global scheduler for bare-metal `spawn`.
-///
-/// `no_std` has no `std::sync::OnceLock`, so this uses `spin::Once` (already a
-/// workspace dependency of the platform layer).
-#[cfg(feature = "platform-baremetal")]
-static SCHEDULER: spin::Once<BareMetalScheduler> = spin::Once::new();
-
-/// The shared bare-metal scheduler, initialized on first use.
-#[cfg(feature = "platform-baremetal")]
-fn scheduler() -> &'static BareMetalScheduler {
-    SCHEDULER.call_once(|| BareMetalScheduler::new(1))
-}
-
-/// Handle to a spawned bare-metal task, similar to `std::thread::JoinHandle`.
-///
-/// `join` pumps the global [`BareMetalScheduler`] until the task's result is
-/// available.
-#[cfg(feature = "platform-baremetal")]
-pub struct JoinHandle<T> {
-    result: Arc<Mutex<Option<T>>>,
-}
-
-#[cfg(feature = "platform-baremetal")]
-impl<T> JoinHandle<T> {
-    /// Pump the scheduler until the task finishes and return its result.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if the spawned task panicked. With the bare-metal
-    /// `panic = "abort"` target strategy a panic never unwinds, so the error
-    /// variant is unreachable in practice; it exists for API parity with
-    /// `std::thread::JoinHandle::join`.
-    pub fn join(self) -> Result<T, Box<dyn Any + Send>> {
-        let sched = scheduler();
-        loop {
-            {
-                let mut guard = self.result.lock();
-                if let Some(val) = guard.take() {
-                    return Ok(val);
-                }
-            }
-            if !sched.run_one(0) {
-                // No runnable task and no result yet — spin briefly and retry.
-                core::hint::spin_loop();
-            }
-        }
-    }
-}
-
-/// Spawn a new bare-metal task, returning a `JoinHandle`.
-///
-/// The task is submitted to the global [`BareMetalScheduler`]; it runs when
-/// [`JoinHandle::join`] (or any other scheduler pump) executes it.
-///
-/// # Panics
-///
-/// Panics if the task cannot be submitted to the scheduler.
-#[cfg(feature = "platform-baremetal")]
+/// Panics if the platform refuses to spawn the thread.
 #[must_use]
 pub fn spawn<F, T>(f: F) -> JoinHandle<T>
 where
@@ -167,40 +70,27 @@ where
     let result = Arc::new(Mutex::new(None));
     let result_clone = Arc::clone(&result);
 
-    let task = enlil_platform::threading::Task::spawn("enlil-std-thread", move || {
+    let inner = sys_thread::spawn(Some("enlil-std-thread"), move || {
         let val = f();
         *result_clone.lock() = Some(val);
-    });
+    })
+    .expect("enlil sys thread spawn failed");
 
-    scheduler()
-        .submit(task)
-        .expect("bare-metal scheduler rejected enlil-std task");
-
-    JoinHandle { result }
+    JoinHandle { inner, result }
 }
 
 /// Put the current thread to sleep for the given duration.
-pub fn sleep(dur: core::time::Duration) {
-    enlil_platform::time::sleep(dur);
+pub fn sleep(dur: Duration) {
+    sys_thread::sleep(dur);
 }
 
 /// Get the current thread's name.
 ///
-/// Delegates to `std` on the hosted backend; bare-metal tasks are unnamed, so
-/// this returns `None` there.
-#[cfg(feature = "platform-linux")]
+/// Delegates to the `sys` thread handle; bare-metal contexts are unnamed,
+/// so this returns `None` there.
 #[must_use]
 pub fn current_thread_name() -> Option<String> {
-    std::thread::current()
-        .name()
-        .map(std::string::ToString::to_string)
-}
-
-/// Get the current thread's name (bare-metal: tasks are unnamed).
-#[cfg(feature = "platform-baremetal")]
-#[must_use]
-pub fn current_thread_name() -> Option<String> {
-    None
+    sys_thread::current().name().map(String::from)
 }
 
 #[cfg(test)]

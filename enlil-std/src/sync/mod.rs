@@ -1,13 +1,14 @@
 //! Synchronization primitives — `std::sync` compatible API backed by enlil-platform.
 //!
-//! Re-exports platform Mutex, `RwLock`, Condvar, and mpsc channels.
+//! Routes through `enlil_platform::sys::sync` (the `std::sys`-equivalent
+//! bindings) so the hosted and bare-metal backends share one path.
 //! Also provides Arc and atomic types: from `std` on the hosted backend,
 //! from `alloc`/`core` (these are compiler intrinsics, not OS-dependent)
 //! on the bare-metal backend.
 
-// Platform sync primitives
-pub use enlil_platform::sync::{
-    Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
+// Platform sync primitives, via the sys bindings.
+pub use enlil_platform::sys::sync::{
+    Condvar, Mutex, MutexGuard, Once, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
 
 // Channels

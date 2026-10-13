@@ -19,7 +19,7 @@
 //! (Phase 1.11): collections fall back to `alloc` (plus `hashbrown` for
 //! `HashMap`/`HashSet`), `Arc`/`Weak` to `alloc::sync`, atomics to
 //! `core::sync::atomic`, and thread spawning to the platform's
-//! `BareMetalScheduler`.
+//! `sys::thread` bindings.
 //!
 //! ## Phase 1.11 Milestone
 //!
@@ -27,7 +27,6 @@
 //! surface needed by the hypervisor: threads, sync primitives, collections,
 //! async/await, time, and formatted I/O.
 
-#[cfg(feature = "platform-baremetal")]
 extern crate alloc;
 
 pub mod collections;
