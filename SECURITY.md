@@ -2,10 +2,11 @@
 
 ## Project status — read this first
 
-**Enlil is pre-1.0 research software and is not production-ready.** It is at Phase 6 of 11:
-the bare-metal kernel boots and runs guests under AMD SVM, but the hypervisor cannot yet
-boot standalone into a service VM, the IOMMU is discovered but not yet programmed for
-per-guest DMA isolation, and none of it has been independently audited.
+**Enlil 1.0.0 is released but has not been independently audited.** It is at Phase 6
+of 11: the bare-metal kernel boots and runs guests under AMD SVM, but the
+hypervisor cannot yet boot standalone into a service VM, the IOMMU is
+discovered but not yet programmed for per-guest DMA isolation, and none of it
+has been independently audited.
 
 Concretely, **do not run untrusted or hostile guests under Enlil**, and do not rely on it
 to isolate workloads that matter. Treat every guest as if it shares a trust domain with
@@ -15,11 +16,11 @@ the host until the isolation work in Phases 6–8 is complete and reviewed.
 
 | Version | Supported |
 | --- | --- |
-| `0.1.0-beta.*` (current prereleases) | ⚠️ Best effort, no guarantees |
+| `1.0.x` | ⚠️ Best effort, no guarantees — no independent audit yet |
 | Anything older | ❌ No |
 
 There is no long-term support branch yet. Fixes land on `master` and appear in the next
-prerelease; there are no backports.
+release; there are no backports.
 
 ## Reporting a vulnerability
 
