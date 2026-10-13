@@ -1,6 +1,6 @@
 [package]
 name = "enlil-devices"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 description = "Virtual device backends — USB router, GPU arbiter, storage, network"
 license.workspace = true
@@ -13,8 +13,8 @@ authors.workspace = true
 publish = false
 
 [dependencies]
-enlil-hal = { path = "../enlil-hal", version = "0.1.0" }
-enlil-config = { path = "../enlil-config", version = "0.1.0" }
+enlil-hal = { path = "../enlil-hal", version = "1.0.0" }
+enlil-config = { path = "../enlil-config", version = "1.0.0" }
 log = "0.4"
 anyhow = "1"
 thiserror = "2"
