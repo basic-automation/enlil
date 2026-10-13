@@ -2,24 +2,41 @@
 
 ## Project status — read this first
 
-**Enlil is pre-1.0 research software and is not production-ready.** It is at Phase 6 of 11:
-the bare-metal kernel boots and runs guests under AMD SVM, but the hypervisor cannot yet
-boot standalone into a service VM, the IOMMU is discovered but not yet programmed for
-per-guest DMA isolation, and none of it has been independently audited.
+**Enlil 1.0.0 is the first stable release. It has not been independently audited.**
 
-Concretely, **do not run untrusted or hostile guests under Enlil**, and do not rely on it
-to isolate workloads that matter. Treat every guest as if it shares a trust domain with
-the host until the isolation work in Phases 6–8 is complete and reviewed.
+The bare-metal path boots from UEFI, enters AMD SVM guest mode, and runs real
+guests directly on the hardware with no host OS underneath. Per-guest isolation
+in 1.0 rests on nested page tables (mixed 2 MiB / 4 KiB granularity with guard
+pages), carved memory regions, VMCB intercept control (CPUID / MSR / RDTSC /
+exception virtualization), and the transparency (stealth) layer.
+
+The full production picture is not finished:
+
+- The privileged service VM (ROADMAP.md Phase 6.6) and the end-to-end
+  bare-metal milestone (Phase 6.7) remain open.
+- Enlil's own IOMMU DMA-remapping programming (Phase 6.4) is **not** in place:
+  DMAR/IVRS tables are discovered and parsed, but remapping tables are not
+  programmed, so **passed-through devices are not DMA-confined by Enlil on the
+  bare-metal path**.
+- Side channels inherent to shared hardware (timing, cache/memory-bus
+  contention, transient execution) are not mitigated.
+- Nothing above has been independently audited.
+
+Concretely, **do not run untrusted or hostile guests under Enlil if your threat
+model requires containment of DMA-capable devices or side-channel resistance**,
+and do not rely on it to isolate workloads that matter until the gaps above are
+closed and reviewed. Treat every guest as sharing a trust domain with the host
+for those vectors.
 
 ## Supported versions
 
 | Version | Supported |
 | --- | --- |
-| `0.1.0-beta.*` (current prereleases) | ⚠️ Best effort, no guarantees |
-| Anything older | ❌ No |
+| `1.0.x` | ✅ Security fixes |
+| `0.1.0-beta.*` and anything older | ❌ No |
 
-There is no long-term support branch yet. Fixes land on `master` and appear in the next
-prerelease; there are no backports.
+There is no long-term support branch. Fixes land on `master` and appear in the
+next 1.0.x release; there are no backports.
 
 ## Reporting a vulnerability
 
@@ -49,10 +66,12 @@ everything it should not reach:
 - **Guest-to-host escape** — any path by which guest code executes, reads, or writes
   outside its own VM: hypervisor memory, the kernel heap, page tables, or host devices.
 - **Guest-to-guest isolation failure** — one guest reading, writing, or influencing
-  another's memory, vCPU state, or devices. The EPT/NPT separation and the per-guest
+  another's memory, vCPU state, or devices. The NPT/EPT separation and the per-guest
   memory carve are the load-bearing pieces here.
 - **DMA escape** — a passed-through device programmed to DMA outside its guest's assigned
-  memory, or IOMMU domain assignment that does not actually constrain a device.
+  memory. This is a known residual gap on the bare-metal path (see above), so reports in
+  this area are welcome as hardening input even though the underlying work is tracked in
+  [`ROADMAP.md`](ROADMAP.md) Phase 6.4 rather than treated as a surprise.
 - **Hypervisor detection** — Enlil's stated goal is that a guest cannot tell it is
   virtualized, so a reliable detection vector (a CPUID tell, a timing side channel that
   distinguishes trapped from native execution, an ACPI/SMBIOS artifact, an inconsistent
@@ -66,11 +85,13 @@ everything it should not reach:
 
 These are known gaps, already tracked in [`ROADMAP.md`](ROADMAP.md) rather than secrets:
 
-- Anything that requires the bare-metal production path to be finished (Phase 6.7). Running
-  the KVM-backed development VMM means you are relying on the **host kernel's** isolation,
-  not Enlil's.
-- Per-guest DMA isolation. The IOMMU (VT-d DMAR / AMD-Vi IVRS) is discovered and parsed but
-  its remapping tables are not yet programmed, so device passthrough is not confined.
+- Anything that requires the bare-metal production path to be finished (Phase 6.7).
+  Running the KVM-backed development VMM means you are relying on the **host kernel's**
+  isolation, not Enlil's.
+- Per-guest DMA isolation on the bare-metal path. The IOMMU (VT-d DMAR / AMD-Vi IVRS)
+  is discovered and parsed but its remapping tables are not yet programmed, so device
+  passthrough is not confined (Phase 6.4). Do not expose passthrough devices to
+  untrusted guests on bare metal.
 - Side channels inherent to sharing physical hardware (Spectre/Meltdown-class transient
   execution, cache and memory-bus contention). Mitigations are not yet implemented.
 - Findings that require host root, physical access, or modifying the hypervisor binary —
