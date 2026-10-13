@@ -205,6 +205,10 @@ impl Console {
     }
 
     /// Write a string to the console.
+    // The bare-metal branch is currently a no-op stub, which clippy wants
+    // as `const`; the Linux branch writes to stdout, so this cannot be
+    // const there (and a future serial-port backend won't be either).
+    #[allow(clippy::missing_const_for_fn)]
     pub fn write_str(s: &str) {
         #[cfg(feature = "platform-linux")]
         {

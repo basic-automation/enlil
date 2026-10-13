@@ -565,6 +565,9 @@ impl Reactor {
     /// [`interrupts::InterruptEventSource::poll`](interrupts::InterruptEventSource::poll),
     /// which halts the CPU until a device interrupt or IPI marks a token
     /// ready.
+    // The bare-metal cfg branch is a no-op, which clippy wants as `const`;
+    // the Linux branch sleeps, so this cannot be const there.
+    #[allow(clippy::missing_const_for_fn)]
     pub fn wait(&self, timeout_ms: Option<u64>) {
         #[cfg(feature = "platform-linux")]
         {
