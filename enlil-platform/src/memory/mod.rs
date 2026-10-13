@@ -9,6 +9,8 @@
 //! - **Bare-metal:** Buddy allocator over physical memory with slab allocator
 //!   for small objects. Implemented in Phase 6.
 
+#[cfg(target_arch = "x86_64")]
+pub mod host_mm;
 pub mod map;
 pub mod paging;
 
