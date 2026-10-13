@@ -9,10 +9,16 @@
 //! with no firmware services left — walking the raw UEFI memory descriptor
 //! array and reporting the machine's usable RAM on the serial console.
 //!
-//! The descriptor walk and number formatting are pure (`no_std`, no `alloc`
-//! — the firmware allocator is gone by the time they run) and are unit-tested
-//! on the dev host; only the serial output and the `hlt` park are gated to
-//! the firmware target.
+//! The descriptor walk and number formatting are pure (`no_std`; the early
+//! walk is `alloc`-free — the firmware allocator is gone by the time it runs,
+//! while the plan-time span collection may allocate from the installed kernel
+//! heap) and are unit-tested on the dev host; only the serial output and the
+//! `hlt` park are gated to the firmware target.
+
+// On the firmware target `Vec` comes from `alloc` (declared in lib.rs); on
+// the dev host it comes from the std prelude.
+#[cfg(target_os = "uefi")]
+use alloc::vec::Vec;
 
 /// EFI memory types that `enlil-platform`'s `MemoryMap::from_uefi` treats as
 /// usable RAM: loader code/data (1, 2), boot-services code/data (3, 4), and
@@ -25,6 +31,50 @@ const USABLE_EFI_TYPES: [u32; 5] = [1, 2, 3, 4, 7];
 /// when the kernel enters: the loaded image (1, 2), and the boot stack plus
 /// the handed-off memory-map buffer (3, 4).
 const EFI_CONVENTIONAL: u32 = 7;
+
+/// EFI memory types that still hold live boot state when the kernel enters
+/// after `ExitBootServices()`: the loaded kernel image (loader code/data) and
+/// the firmware boot stack plus the handed-off memory-map buffer (boot-
+/// services code/data). `MemoryMap::from_uefi` counts them as usable — the
+/// planner must be told they are spoken for before it carves.
+#[cfg(any(target_os = "uefi", test))]
+const FIRMWARE_CLAIMED_EFI_TYPES: [u32; 4] = [1, 2, 3, 4];
+
+/// Collect the `[base, end)` spans of every raw firmware descriptor whose type
+/// is loader or boot-services memory (see [`FIRMWARE_CLAIMED_EFI_TYPES`]).
+///
+/// At `ExitBootServices()` those descriptors are the loaded kernel image, the
+/// stack this code still runs on, and the handed-off memory-map buffer —
+/// memory the planner must never carve guest RAM out of. Runs at plan time
+/// (after the kernel heap is installed, so the returned `Vec` can allocate);
+/// the caller [`reserve_span`](`enlil_platform::memory::map::MemoryMap::reserve_span`)s
+/// each span into the map before planning. Zero-page descriptors are skipped,
+/// mirroring `MemoryMap::from_uefi`.
+#[cfg(any(target_os = "uefi", test))]
+fn firmware_claimed_spans(bytes: &[u8], descriptor_size: usize) -> Vec<(u64, u64)> {
+    let mut spans = Vec::new();
+    if descriptor_size < DESC_MIN_SIZE {
+        return spans;
+    }
+    for desc in bytes.chunks_exact(descriptor_size) {
+        let (Some(efi_type), Some(phys_start), Some(pages)) = (
+            read_u32_le(desc, DESC_TYPE_OFFSET),
+            read_u64_le(desc, DESC_PHYS_START_OFFSET),
+            read_u64_le(desc, DESC_NUM_PAGES_OFFSET),
+        ) else {
+            break;
+        };
+        if pages == 0 || !FIRMWARE_CLAIMED_EFI_TYPES.contains(&efi_type) {
+            continue;
+        }
+        let size = pages.saturating_mul(UEFI_PAGE_SIZE);
+        if size == 0 {
+            continue;
+        }
+        spans.push((phys_start, phys_start.saturating_add(size)));
+    }
+    spans
+}
 
 // Field offsets inside an EFI_MEMORY_DESCRIPTOR (UEFI spec §7.2): Type is a
 // u32 at +0, PhysicalStart a u64 at +8, NumberOfPages a u64 at +24. The
@@ -459,6 +509,7 @@ mod hw {
                 handoff.memory_descriptor_size,
                 &summary,
                 heap_span,
+                handoff,
             );
             bring_up_ap_trampoline_page(&serial, bytes, handoff.memory_descriptor_size);
         } else {
@@ -2570,16 +2621,22 @@ mod hw {
     /// Rebuilds the typed `UefiMemoryDescriptor` array from the same raw firmware
     /// bytes the kernel's own alloc-free [`summarize_memory_map`] walked, feeds it
     /// to [`MemoryMap::from_uefi`], and cross-checks the two independent readers
-    /// agree on total usable RAM. Then runs `plan_hypervisor_regions` to carve a
-    /// low DMA window, the hypervisor heap, and one disjoint per-guest RAM span
-    /// (LOCKED PRINCIPLE 5 — isolation), reporting their bases. Conservative sizes
-    /// so the plan fits QEMU's default RAM as well as real hardware.
+    /// agree on total usable RAM. Then reserves every span the firmware still
+    /// owns at `ExitBootServices()` — the handed-off map buffer, the
+    /// loader/boot-services descriptors (loaded image + the stack this code
+    /// still runs on), and the GOP framebuffer's MMIO window — and runs
+    /// `plan_hypervisor_regions` to carve a low DMA window and one disjoint
+    /// per-guest RAM span (LOCKED PRINCIPLE 5 — isolation), adopting the live
+    /// bootstrap heap as the plan's heap instead of carving a second one.
+    /// Conservative sizes so the plan fits QEMU's default RAM as well as real
+    /// hardware.
     fn bring_up_memory_plan(
         serial: &SerialPort,
         bytes: &[u8],
         descriptor_size: usize,
         summary: &MemorySummary,
         heap_span: Option<(u64, u64)>,
+        handoff: &BootHandoff,
     ) {
         use enlil_platform::memory::map::{MemoryMap, MemoryPlanRequest, UefiMemoryDescriptor};
 
@@ -2646,11 +2703,62 @@ mod hw {
             serial.write_str(" — planner cannot carve over it\n");
         }
 
+        // Spans the firmware still owns at ExitBootServices() that from_uefi
+        // counts as usable: the handed-off map buffer itself, every
+        // loader/boot-services descriptor (the loaded kernel image and the
+        // stack this code still runs on), and the GOP framebuffer's MMIO
+        // window. Reserve them all before planning — without this the carver
+        // would happily hand guest RAM out of live memory. (The map buffer
+        // sits inside one of the loader/boot-services descriptors, so it is
+        // covered twice; reserve_span tolerates the overlap.)
+        let mut claimed: Vec<(u64, u64)> = Vec::new();
+        if handoff.memory_map_base != 0 && handoff.memory_map_len != 0 {
+            claimed.push((
+                handoff.memory_map_base,
+                handoff
+                    .memory_map_base
+                    .saturating_add(handoff.memory_map_len as u64),
+            ));
+        }
+        claimed.extend(super::firmware_claimed_spans(bytes, descriptor_size));
+        if let Some(fb) = &handoff.framebuffer {
+            let size = fb.size_bytes();
+            if size != 0 {
+                claimed.push((fb.base, fb.base.saturating_add(size)));
+            }
+        }
+        let mut newly_reserved: u64 = 0;
+        for &(base, end) in &claimed {
+            if map.reserve_span(base, end.saturating_sub(base)) {
+                newly_reserved += 1;
+            }
+        }
+        {
+            let mut nbuf = [0u8; 20];
+            let mut tbuf = [0u8; 20];
+            serial.write_str("enlil kernel: memplan: reserved ");
+            serial.write_str(format_u64(newly_reserved, &mut nbuf));
+            serial.write_str(" of ");
+            serial.write_str(format_u64(claimed.len() as u64, &mut tbuf));
+            serial.write_str(
+                " firmware-claimed spans (map buffer, loader/boot-services image, GOP MMIO)\n",
+            );
+        }
+
+        // The live heap is the plan's heap: the planner adopts the reserved
+        // span instead of carving a second one (see preclaimed_heap). Without
+        // a live heap there is nothing to adopt, so fall back to the old
+        // carve-a-fresh-heap request.
+        let (heap_size, preclaimed_heap) = match heap_span {
+            Some((base, size)) => (size, Some((base, size))),
+            None => (8 * MIB, None),
+        };
         let req = MemoryPlanRequest {
-            heap_size: 8 * MIB,
+            heap_size,
             dma_size: 2 * MIB,
             guest_ram_sizes: alloc::vec![16 * MIB],
             align: 2 * MIB,
+            preclaimed_heap,
         };
         match map.plan_hypervisor_regions(&req) {
             Some(regions) => {
@@ -2661,6 +2769,9 @@ mod hw {
                 serial.write_str(format_u64_hex(regions.dma.base.as_u64(), &mut dma_buf));
                 serial.write_str(" heap@");
                 serial.write_str(format_u64_hex(regions.heap.base.as_u64(), &mut heap_buf));
+                if preclaimed_heap.is_some() {
+                    serial.write_str(" (live heap, adopted — no second heap)");
+                }
                 serial.write_str(" guest0@");
                 serial.write_str(format_u64_hex(
                     regions.guest_ram.first().map_or(0, |r| r.base.as_u64()),
@@ -2668,15 +2779,36 @@ mod hw {
                 ));
                 serial.write_str(" — disjoint per-guest RAM (LOCKED PRINCIPLE 5)\n");
 
-                // Every carved region must now clear the live heap. Checking it
-                // here is what makes the reservation above a proof rather than a
-                // claim: before it, guest0 landed inside the heap.
-                if let Some((heap_base, heap_size)) = heap_span {
-                    let heap_end = heap_base + heap_size;
-                    let clears =
-                        |base: u64, size: u64| base + size <= heap_base || base >= heap_end;
-                    let all_clear = clears(regions.dma.base.as_u64(), regions.dma.size)
-                        && clears(regions.heap.base.as_u64(), regions.heap.size)
+                // Proof that the reservations above are real: every carved
+                // region must clear every claimed span — the live heap, the
+                // firmware map buffer, the loaded image / boot stack, and the
+                // GOP MMIO window. Checking it here is what makes the
+                // reservation a proof rather than a claim: before the heap
+                // reservation existed, guest0 landed inside the heap. The
+                // adopted plan heap trivially overlaps its own reservation, so
+                // it is only checked for identity with the live heap span (the
+                // planner already validated that span is fully Reserved; it
+                // cannot overlap the other claimed spans by firmware typing —
+                // the heap is conventional memory, the rest are loader,
+                // boot-services, or MMIO types).
+                if heap_span.is_some() {
+                    let mut spans: Vec<(u64, u64)> = Vec::new();
+                    if let Some((base, size)) = heap_span {
+                        spans.push((base, base.saturating_add(size)));
+                    }
+                    spans.extend(claimed.iter().copied());
+                    let clears = |base: u64, size: u64| {
+                        let end = base.saturating_add(size);
+                        spans.iter().all(|&(rb, re)| end <= rb || base >= re)
+                    };
+                    let heap_ok = match preclaimed_heap {
+                        Some((base, size)) => {
+                            regions.heap.base.as_u64() == base && regions.heap.size == size
+                        }
+                        None => clears(regions.heap.base.as_u64(), regions.heap.size),
+                    };
+                    let all_clear = heap_ok
+                        && clears(regions.dma.base.as_u64(), regions.dma.size)
                         && regions
                             .guest_ram
                             .iter()
@@ -2686,10 +2818,16 @@ mod hw {
                     } else {
                         "enlil kernel: memplan: CARVED REGION OVERLAPS THE LIVE HEAP\n"
                     });
+                    if all_clear {
+                        serial.write_str(
+                            "enlil kernel: memplan: carved regions clear all firmware-claimed spans (image, map buffer, MMIO)\n",
+                        );
+                    }
 
                     // Publish the guest window only once it is known disjoint
-                    // from the heap — otherwise guests would be handed the
-                    // hypervisor's own allocator memory.
+                    // from everything claimed above — otherwise guests would be
+                    // handed the hypervisor's own allocator memory, the loaded
+                    // image, or an MMIO window.
                     if all_clear && let Some(g0) = regions.guest_ram.first() {
                         crate::kernel::guest_ram::publish(g0.base.as_u64(), g0.size);
                     }
@@ -2915,5 +3053,36 @@ mod tests {
         assert_eq!(format_u64(9, &mut buf), "9");
         assert_eq!(format_u64(4096, &mut buf), "4096");
         assert_eq!(format_u64(u64::MAX, &mut buf), "18446744073709551615");
+    }
+
+    #[test]
+    fn firmware_claimed_spans_cover_loader_and_boot_services_memory() {
+        let stride = 48;
+        let bytes = map(&[
+            desc(1, 0x10_0000, 16, stride),   // loader code: the image
+            desc(2, 0x20_0000, 32, stride),   // loader data: the image/stack
+            desc(3, 0x30_0000, 8, stride),    // boot-services code
+            desc(4, 0x40_0000, 64, stride),   // boot-services data: map buffer
+            desc(7, 0x100_0000, 256, stride), // conventional: NOT claimed
+            desc(11, 0xFEC0_0000, 1, stride), // MMIO: not a firmware span
+            desc(2, 0x50_0000, 0, stride),    // zero pages: skipped
+        ]);
+        let spans = firmware_claimed_spans(&bytes, stride);
+        assert_eq!(
+            spans,
+            vec![
+                (0x10_0000, 0x10_0000 + 16 * 4096),
+                (0x20_0000, 0x20_0000 + 32 * 4096),
+                (0x30_0000, 0x30_0000 + 8 * 4096),
+                (0x40_0000, 0x40_0000 + 64 * 4096),
+            ]
+        );
+    }
+
+    #[test]
+    fn firmware_claimed_spans_refuses_a_malformed_stride() {
+        let bytes = map(&[desc(1, 0x10_0000, 16, 48)]);
+        assert_eq!(firmware_claimed_spans(&bytes, 4), [] as [(u64, u64); 0]);
+        assert_eq!(firmware_claimed_spans(&[], 48), [] as [(u64, u64); 0]);
     }
 }
