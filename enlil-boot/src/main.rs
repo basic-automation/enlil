@@ -44,6 +44,12 @@ fn efi_main() -> uefi::Status {
         None => log::warn!("no addressable GOP framebuffer available"),
     }
 
+    // Load the hypervisor config + per-guest OVMF firmware from the ESP
+    // (ROADMAP 0.3 / T-0.6) while boot services are still up. Anything missing
+    // is a warning, not a boot failure: the corresponding handoff fields stay
+    // empty and the kernel reports that on serial after ExitBootServices().
+    let esp_payload = enlil_boot::esp::load_esp_payload();
+
     // Take full control of the machine. After this returns, the firmware boot
     // services — including the uefi-rs logger and allocator — are gone, so all
     // further output must go straight to hardware. The returned map is the
@@ -58,6 +64,10 @@ fn efi_main() -> uefi::Status {
         memory_descriptor_size: meta.desc_size,
         acpi_rsdp,
         framebuffer,
+        config_base: esp_payload.config.map_or(0, |f| f.base),
+        config_len: esp_payload.config.map_or(0, |f| f.len),
+        guest_firmwares: esp_payload.guests,
+        guest_firmware_count: esp_payload.guest_count,
     };
     // Keep the memory-map buffer alive for the kernel: dropping the owned map
     // would call the now-defunct boot-services `FreePool`. Its base and extent

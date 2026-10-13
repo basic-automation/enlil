@@ -24,6 +24,7 @@ extern crate alloc;
 pub mod acpi;
 pub mod allocator;
 pub mod apic;
+pub mod esp;
 pub mod firmware;
 pub mod framebuffer;
 pub mod gdt;

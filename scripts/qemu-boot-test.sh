@@ -284,6 +284,13 @@ GOP_LINE="framebuffer draw ok"
 # Printed once the kernel draws its 8x8 text banner over the framebuffer and
 # verifies the blit — visible on-screen output without a serial cable.
 GOP_TEXT_LINE="text console banner drawn"
+# T-0.6: printed once the kernel reports the config.toml byte count the boot
+# app staged from the ESP. The exact line (with byte counts) is composed after
+# the ESP tree is staged below, since the counts come from the staged files.
+#ESP_CONFIG_LINE set below
+# T-0.6: printed once per config guest with that guest's staged OVMF CODE/VARS
+# byte counts. Composed below from the staged firmware files.
+#ESP_GUEST_LINE set below
 TIMEOUT_SECS=60
 
 mkdir -p "$OUTDIR"
@@ -343,6 +350,28 @@ ESP="$OUTDIR/esp"
 rm -rf "$ESP"
 mkdir -p "$ESP/EFI/BOOT"
 cp "$EFI" "$ESP/EFI/BOOT/BOOTX64.EFI"
+
+# --- Stage the T-0.6 payload: config + per-guest OVMF on the ESP -------------
+# The boot app loads EFI/enlil/config.toml and each [guest.<id>]'s OVMF pair
+# from the ESP into boot-services memory (ROADMAP 0.3); the kernel reports the
+# staged byte counts on serial, asserted below.
+ESP_GUEST_ID="qemutest"
+mkdir -p "$ESP/EFI/enlil/firmware/$ESP_GUEST_ID"
+printf '[guest.%s]\ncpus = 1\nmemory_mb = 512\n' "$ESP_GUEST_ID" \
+    > "$ESP/EFI/enlil/config.toml"
+cp "$OVMF" "$ESP/EFI/enlil/firmware/$ESP_GUEST_ID/OVMF_CODE.fd"
+if [ -n "$OVMF_VARS" ]; then
+    cp "$OVMF_VARS" "$ESP/EFI/enlil/firmware/$ESP_GUEST_ID/OVMF_VARS.fd"
+else
+    # Legacy -bios firmware has no separate vars image: stage a zeroed
+    # placeholder so the VARS load path is still exercised.
+    truncate -s 1M "$ESP/EFI/enlil/firmware/$ESP_GUEST_ID/OVMF_VARS.fd"
+fi
+ESP_CONFIG_BYTES="$(stat -c%s "$ESP/EFI/enlil/config.toml")"
+ESP_CODE_BYTES="$(stat -c%s "$ESP/EFI/enlil/firmware/$ESP_GUEST_ID/OVMF_CODE.fd")"
+ESP_VARS_BYTES="$(stat -c%s "$ESP/EFI/enlil/firmware/$ESP_GUEST_ID/OVMF_VARS.fd")"
+ESP_CONFIG_LINE="enlil kernel: esp: config loaded: $ESP_CONFIG_BYTES bytes"
+ESP_GUEST_LINE="enlil kernel: esp: guest '$ESP_GUEST_ID': OVMF_CODE $ESP_CODE_BYTES bytes, OVMF_VARS $ESP_VARS_BYTES bytes"
 
 # --- Boot headless under QEMU + OVMF, capture serial ------------------------
 SERIAL_LOG="$OUTDIR/serial.log"
@@ -485,10 +514,12 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$RDTSC_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$EXC_ERRCODE_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null \
-    && grep -q "$GOP_TEXT_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, scheduler quantum driven by the LAPIC timer, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery incl. real VT-d DMAR remapping units + device scopes, SMP AP bring-up (INIT-SIPI-SIPI), PCI enumeration, own page tables (null-page guard) + 4 KiB split + kernel-owned guarded stack (bring-up continues on it), SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + interrupt IRET-resume round-trip + 64-bit long-mode guest + long-mode interrupt round-trip + virtual-interrupt masking + spinning-guest preemption + host-LAPIC-timer preemption (INTR intercept) + timer-tick delivery into the guest + PERIODIC timer preemption + tick delivery (host timer re-armed per quantum, handler IRETQ back into the spin — the guest time-slice) + guest-exception interception (#UD trap + re-inject) + interrupt round-trip (inject/handle/IRET/resume) + NPT write-protection dirty-tracking (trap+grant+re-protect a guest store twice — per-epoch bitmap) + RDTSC-intercept fallback guest runs (T-6.7; the intercept itself is physical-AMD-proven only) + exception error-code re-inject (#PF/#GP via a paged guest, exact codes re-delivered, T-6.13) + bare-metal xHCI USB host controller enumerated (probe + reset + schedule + port scan, T-6.18), and GOP draw observed on serial"
+    && grep -q "$GOP_TEXT_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$ESP_CONFIG_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$ESP_GUEST_LINE" "$SERIAL_LOG" 2>/dev/null; then
+    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, scheduler quantum driven by the LAPIC timer, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery incl. real VT-d DMAR remapping units + device scopes, SMP AP bring-up (INIT-SIPI-SIPI), PCI enumeration, own page tables (null-page guard) + 4 KiB split + kernel-owned guarded stack (bring-up continues on it), SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + interrupt IRET-resume round-trip + 64-bit long-mode guest + long-mode interrupt round-trip + virtual-interrupt masking + spinning-guest preemption + host-LAPIC-timer preemption (INTR intercept) + timer-tick delivery into the guest + PERIODIC timer preemption + tick delivery (host timer re-armed per quantum, handler IRETQ back into the spin — the guest time-slice) + guest-exception interception (#UD trap + re-inject) + interrupt round-trip (inject/handle/IRET/resume) + NPT write-protection dirty-tracking (trap+grant+re-protect a guest store twice — per-epoch bitmap) + RDTSC-intercept fallback guest runs (T-6.7; the intercept itself is physical-AMD-proven only) + exception error-code re-inject (#PF/#GP via a paged guest, exact codes re-delivered, T-6.13) + bare-metal xHCI USB host controller enumerated (probe + reset + schedule + port scan, T-6.18), GOP draw observed on serial, and the ESP payload staged at boot (config.toml + per-guest OVMF CODE/VARS byte counts, T-0.6)"
     exit 0
 fi
 
-echo "FAIL: not all of banner/kernel-line/heap/idt/apic/svm/hsave/vmcb/vmrun/dispatch/ioio/cpuid/stealth/msr/msrw/npf/compute/gop observed (qemu rc=$QEMU_RC)"
+echo "FAIL: not all of banner/kernel-line/heap/idt/apic/svm/hsave/vmcb/vmrun/dispatch/ioio/cpuid/stealth/msr/msrw/npf/compute/gop/esp-payload observed (qemu rc=$QEMU_RC)"
 exit 1
