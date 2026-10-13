@@ -1,6 +1,6 @@
 [package]
 name = "enlil-std"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 description = "Enlil standard library compatibility layer — std-like APIs backed by enlil-platform"
 license.workspace = true
@@ -24,7 +24,7 @@ name = "milestone_1_11"
 path = "src/bin/milestone_1_11.rs"
 
 [dependencies]
-enlil-platform = { path = "../enlil-platform", version = "0.1.0", default-features = false }
+enlil-platform = { path = "../enlil-platform", version = "1.0.0", default-features = false }
 # Lazy global bare-metal task scheduler for `thread::spawn` (no_std has no
 # `std::sync::OnceLock`).
 spin = "0.9"

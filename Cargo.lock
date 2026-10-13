@@ -104,7 +104,7 @@ checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 
 [[package]]
 name = "bridge-agent"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -283,7 +283,7 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
 name = "enlil-boot"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "enlil-hal",
  "enlil-platform",
@@ -294,7 +294,7 @@ dependencies = [
 
 [[package]]
 name = "enlil-config"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "log",
@@ -305,7 +305,7 @@ dependencies = [
 
 [[package]]
 name = "enlil-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "enlil-config",
@@ -327,7 +327,7 @@ dependencies = [
 
 [[package]]
 name = "enlil-devices"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -351,11 +351,11 @@ dependencies = [
 
 [[package]]
 name = "enlil-hal"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "enlil-mgmt"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -375,7 +375,7 @@ dependencies = [
 
 [[package]]
 name = "enlil-mgmt-proto"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -385,7 +385,7 @@ dependencies = [
 
 [[package]]
 name = "enlil-platform"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "enlil-hal",
  "libc",
@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "enlil-setup"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -408,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "enlil-std"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "enlil-platform",
  "hashbrown 0.15.5",

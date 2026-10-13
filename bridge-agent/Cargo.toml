@@ -1,6 +1,6 @@
 [package]
 name = "bridge-agent"
-version = "0.1.0"
+version = "1.0.0"
 edition.workspace = true
 description = "In-guest agent for the Enlil inter-guest bridge (clipboard, drag-and-drop, shared filesystem)"
 license.workspace = true

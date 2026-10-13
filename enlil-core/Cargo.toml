@@ -1,6 +1,6 @@
 [package]
 name = "enlil-core"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "Enlil hypervisor core — VMM entry, vCPU management, memory partitioning"
 license.workspace = true
@@ -13,10 +13,10 @@ authors.workspace = true
 publish = false
 
 [dependencies]
-enlil-config = { path = "../enlil-config", version = "0.1.0" }
-enlil-devices = { path = "../enlil-devices", version = "0.1.0" }
-enlil-mgmt-proto = { path = "../enlil-mgmt-proto", version = "0.1.0" }
-enlil-platform = { path = "../enlil-platform", version = "0.1.0" }
+enlil-config = { path = "../enlil-config", version = "1.0.0" }
+enlil-devices = { path = "../enlil-devices", version = "1.0.0" }
+enlil-mgmt-proto = { path = "../enlil-mgmt-proto", version = "1.0.0" }
+enlil-platform = { path = "../enlil-platform", version = "1.0.0" }
 log = "0.4"
 thiserror = "2"
 anyhow = "1"

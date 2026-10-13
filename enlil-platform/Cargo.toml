@@ -1,6 +1,6 @@
 [package]
 name = "enlil-platform"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 description = "Enlil platform abstraction layer — threading, alloc, sync, async runtime, I/O"
 license.workspace = true
@@ -24,7 +24,7 @@ platform-baremetal = ["dep:linked_list_allocator"]
 # XSAVE area in enlil-hal's XSaveArea rather than re-deriving the layout.
 # enlil-hal is no_std + alloc with no features, so this never perturbs the
 # bare-metal build.
-enlil-hal = { path = "../enlil-hal", version = "0.1.0" }
+enlil-hal = { path = "../enlil-hal", version = "1.0.0" }
 # `log` without default features: the `std` feature cannot build for the
 # `x86_64-unknown-enlil` target (`-Zbuild-std=core,alloc` provides no `std`
 # sysroot), and the platform layer is `no_std` under `platform-baremetal`
