@@ -40,12 +40,19 @@
 //! (executor + reactor on `alloc`'s `BTreeMap`, `spin` locks, and
 //! `alloc::task`'s `Wake` — only its Linux epoll event source and
 //! [`Executor::run_with_poller`](async_rt::Executor::run_with_poller) stay
-//! gated to `platform-linux`) — build for bare metal today.
+//! gated to `platform-linux`) — build for bare metal today. [`sys`] (the
+//! `std::sys`-equivalent platform bindings: thread, sync, time, io, fs,
+//! net, env, process, random, os — with Linux and bare-metal Enlil
+//! backends) is `core` + `alloc` only and cross-compiles as well.
 
 extern crate alloc;
 
 pub mod memory;
 pub mod sync;
+// `std::sys`-equivalent platform bindings. Gated on a backend feature being
+// selected so no-backend builds keep compiling exactly as before.
+#[cfg(any(feature = "platform-linux", feature = "platform-baremetal"))]
+pub mod sys;
 pub mod threading;
 pub mod time;
 

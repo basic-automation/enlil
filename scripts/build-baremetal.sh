@@ -27,11 +27,14 @@ TARGET="$REPO_ROOT/x86_64-unknown-enlil.json"
 # with BAREMETAL_CRATES: enlil-platform needs its bare-metal backend feature
 # selected (and default features off — platform-linux gates the remaining
 # std-only bits such as async_rt::epoll; io and async_rt themselves are
-# no_std-clean since T-1.2/T-1.3).
-BAREMETAL_CRATES=(enlil-hal enlil-platform)
+# no_std-clean since T-1.2/T-1.3). enlil-std — the Enlil "full std"
+# compatibility layer — builds through the enlil-platform::sys bindings
+# (T-1.8), so it needs the same bare-metal feature selection.
+BAREMETAL_CRATES=(enlil-hal enlil-platform enlil-std)
 BAREMETAL_EXTRA_FLAGS=(
     ""                                                # enlil-hal: no_std + alloc, no features at all
     "--no-default-features --features platform-baremetal" # enlil-platform: no_std + alloc backend
+    "--no-default-features --features platform-baremetal" # enlil-std: full std API surface via sys bindings
 )
 
 if [ "${#BAREMETAL_CRATES[@]}" -ne "${#BAREMETAL_EXTRA_FLAGS[@]}" ]; then
