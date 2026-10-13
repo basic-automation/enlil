@@ -11,7 +11,7 @@ sharing, and a path toward pooling hardware across many physical machines.
 - **Target hardware:** x86-64 desktops with Intel VT-x/VT-d or AMD-V/AMD-Vi (ARM & RISC-V planned)
 - **Boot model:** a UEFI application on a USB stick — non-destructive, coexists with your existing OS
 - **License:** [MIT](LICENSE)
-- **Security:** pre-1.0 research software — do **not** run untrusted guests. See [SECURITY.md](SECURITY.md).
+- **Security:** Enlil 1.0.0 is stable but has **not** been independently audited — do **not** run untrusted guests. See [SECURITY.md](SECURITY.md).
 
 ---
 
@@ -119,9 +119,10 @@ Transparency is **per-guest-family**: Enlil presents whatever machine model each
 
 ## Status
 
-Enlil is **pre-alpha** and under active, incremental development. Work happens on a
-KVM-backed development path on a Linux host first; the bare-metal VMX/SVM backend comes
-later (this is the same pragmatic strategy Firecracker and Cloud Hypervisor used).
+**Enlil 1.0.0** — the feature set below is implemented, unit-tested, and (for
+the bare-metal kernel) asserted nightly under QEMU+OVMF. Work continues on the
+longer-term phases in [ROADMAP.md](ROADMAP.md); anything marked ⏳ is planned,
+not shipped.
 
 | Area | State |
 |------|-------|
