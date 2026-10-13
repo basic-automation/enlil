@@ -4,8 +4,10 @@
 //! which live in boot-services memory it is free to reclaim. This module gives
 //! the kernel its own: it builds a 2 MiB-huge-page identity map (reusing
 //! `enlil-hal`'s page-table builder — the x86-64 host-paging and NPT formats
-//! are identical) and loads it into `CR3`, so every later step — the SVM guests,
-//! the framebuffer draw — runs on enlil's own tables, not the firmware's.
+//! are identical) and loads it into `CR3` via
+//! `enlil-platform::memory::host_mm::load_cr3` (the platform ISA seam —
+//! LOCKED PRINCIPLE 2), so every later step — the SVM guests, the framebuffer
+//! draw — runs on enlil's own tables, not the firmware's.
 //!
 //! Reaching the post-`CR3` report line is itself the proof the map is correct:
 //! the kernel's code, stack, heap, the ACPI tables, and the framebuffer must
@@ -70,6 +72,10 @@ mod hw {
     use enlil_hal::npt::{
         HUGE_2MIB, build_identity_npt_2mib_with_4kib_window, split_npt_2mib_leaf, translate_npt,
     };
+    // The CR3 install is the platform ISA seam (LOCKED PRINCIPLE 2):
+    // enlil-platform::memory::host_mm owns `mov cr3`, the boot kernel just
+    // calls it.
+    use enlil_platform::memory::host_mm::load_cr3;
 
     /// Table pages the kernel's identity map needs: PML4 + PDPT + one PD per GiB
     /// (`ceil(span / 1 GiB)`) + one PT for the low 2 MiB slot, which is rendered
@@ -146,19 +152,6 @@ mod hw {
             next_spare_pa: phys_base + (layout_info.table_count as u64) * 4096,
             spare_end_pa: phys_base + layout.size() as u64,
         })
-    }
-
-    /// Load `CR3`, which also flushes every non-global TLB entry.
-    ///
-    /// # Safety
-    ///
-    /// `cr3` must be a page-table root mapping everything the kernel touches
-    /// next, or the very next instruction fetch faults.
-    unsafe fn load_cr3(cr3: u64) {
-        // SAFETY: the caller guarantees cr3 maps the running kernel.
-        unsafe {
-            core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
-        }
     }
 
     /// The kernel's own live host page tables, retained so regions can be
