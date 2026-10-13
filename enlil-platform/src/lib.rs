@@ -44,10 +44,16 @@
 //! `std::sys`-equivalent platform bindings: thread, sync, time, io, fs,
 //! net, env, process, random, os — with Linux and bare-metal Enlil
 //! backends) is `core` + `alloc` only and cross-compiles as well.
+//!
+//! [`redox`] ports five Redox OS subsystems into the platform layer
+//! (roadmap 1.10): the `ralloc` slab allocator, the kernel context model,
+//! the kernel `WaitQueue`, the kernel `EventQueue`, and the kernel
+//! `TimeSpec` clocks.
 
 extern crate alloc;
 
 pub mod memory;
+pub mod redox;
 pub mod sync;
 // `std::sys`-equivalent platform bindings. Gated on a backend feature being
 // selected so no-backend builds keep compiling exactly as before.
