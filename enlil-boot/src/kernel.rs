@@ -522,7 +522,7 @@ mod hw {
         bring_up_reactor_event_source(&serial, apic_id);
         bring_up_percpu(&serial, apic_id.unwrap_or(0));
         bring_up_gdt(&serial);
-        bring_up_timer(&serial);
+        bring_up_timer(&serial, apic_id);
         bring_up_deadline_timer(&serial);
         let tsc_hz = bring_up_time(&serial);
         if let Some(hz) = tsc_hz {
@@ -572,6 +572,18 @@ mod hw {
     static ECAM_END_BUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     /// The e1000 MMIO base discovered pre-paging, plus 1 (0 = no e1000 found).
     static NET_MMIO_PLUS1: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    /// Set when the privileged service VM domain finished assembling
+    /// (ROADMAP 6.6) — the "service VM" link of the 6.7 milestone chain gate.
+    static SERVICE_VM_UP: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    /// How many proof-guest scenarios actually executed through a guest run
+    /// loop (ROADMAP 6.7) — the "guests" link of the milestone chain gate.
+    static GUEST_SCENARIOS_RUN: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+    /// Set when the framebuffer text console drew + verified its banner
+    /// (ROADMAP 6.7) — the "console" link of the milestone chain gate.
+    static CONSOLE_LIVE: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
 
     /// Publish the continuation's inputs before the stack switch.
     fn publish_continuation(handoff: &BootHandoff, ecam: Option<(u64, u8)>) {
@@ -617,12 +629,54 @@ mod hw {
         if net_mmio != 0 {
             bring_up_net_mac(&serial, net_mmio - 1);
         }
+        // The privileged domain is carved before the SVM proof guests take
+        // their RAM (ROADMAP 6.6).
+        bring_up_service_vm(&serial, handoff);
         bring_up_virtualization(&serial);
         if let Some(handoff) = handoff {
             bring_up_framebuffer(&serial, handoff);
         }
+        // The 6.7 milestone chain gate: one machine-checkable summary of the
+        // whole UEFI -> kernel -> service VM -> guests -> console chain. It
+        // runs last so its presence means every stage's own proof lines
+        // precede it; scripts/qemu-boot-test.sh asserts both the line and
+        // that chain order.
+        bring_up_milestone(&serial);
 
         park()
+    }
+
+    /// Report the 6.7 milestone chain as one machine-checkable line (ROADMAP
+    /// 6.7): UEFI handed off to the kernel, the kernel brought up its phases,
+    /// the privileged service VM assembled, proof guests ran, and the
+    /// management console went live.
+    ///
+    /// COMPLETE means every link verified this boot; anything else is
+    /// DEGRADED with the honest per-link state (a skipped service VM, zero
+    /// guest runs on a CPU without SVM, or no console are reported, not
+    /// claimed). The nightly harness asserts the COMPLETE line and that it is
+    /// the last chain line on serial.
+    fn bring_up_milestone(serial: &SerialPort) {
+        use core::sync::atomic::Ordering;
+        let service_vm_up = SERVICE_VM_UP.load(Ordering::Acquire);
+        let guests = GUEST_SCENARIOS_RUN.load(Ordering::Acquire);
+        let console_live = CONSOLE_LIVE.load(Ordering::Acquire);
+        let mut n = [0u8; 20];
+        serial.write_str("enlil kernel: milestone 6.7: boot chain ");
+        serial.write_str(
+            if super::milestone_chain_verdict(service_vm_up, guests, console_live) {
+                "COMPLETE"
+            } else {
+                "DEGRADED"
+            },
+        );
+        serial.write_str(" — uefi->kernel ok, service vm ");
+        serial.write_str(if service_vm_up { "up" } else { "skipped" });
+        serial.write_str(", ");
+        serial.write_str(format_u64(u64::from(guests), &mut n));
+        serial.write_str(" guest scenarios ran, console ");
+        serial.write_str(if console_live { "live" } else { "absent" });
+        serial.write_str("\n");
     }
 
     /// Report which stack the kernel is actually running on now.
@@ -1373,7 +1427,7 @@ mod hw {
     /// enables interrupts, and waits (bounded) for the tick — then disables
     /// interrupts again and reports. A bounded wait means a timer that never
     /// fires is reported, not a hang.
-    fn bring_up_timer(serial: &SerialPort) {
+    fn bring_up_timer(serial: &SerialPort, apic: Option<u32>) {
         /// The IDT vector the LAPIC timer delivers on (above the 0x20 legacy
         /// range, clear of exceptions).
         const TIMER_VECTOR: u8 = 0x40;
@@ -1382,6 +1436,18 @@ mod hw {
         const TIMER_COUNT: u32 = 0x0010_0000;
         /// Cap on the wait spins so a non-firing timer is reported, not hung.
         const WAIT_SPINS: u32 = 200_000_000;
+
+        // Without an APIC the timer cannot be armed (arm_oneshot_timer programs
+        // x2APIC MSRs) and no interrupt can fire: skip the wait, which would
+        // otherwise burn the full spin budget on emulators without x2APIC
+        // (ROADMAP 6.7 — the boot chain must complete on the harness, not stall
+        // proving a negative). Reported, not treated as a boot failure.
+        if apic.is_none() {
+            serial.write_str(
+                "enlil kernel: apic: LAPIC timer skipped — no APIC (x2APIC unavailable)\n",
+            );
+            return;
+        }
 
         crate::idt::install_timer_gate(TIMER_VECTOR);
         let before = crate::idt::timer_ticks();
@@ -1452,6 +1518,309 @@ mod hw {
         }
     }
 
+    /// Boot the privileged service VM (ROADMAP 6.6): the Xen Dom0-style domain
+    /// that owns the hardware drivers, runs the management console, and
+    /// provides the device backends guests consume.
+    ///
+    /// Carves the service VM's RAM from the planned guest-RAM window *first*
+    /// (the privileged domain is carved before the throwaway SVM proof guests
+    /// take theirs), assembles the device-ownership table from the bus-0 MMIO
+    /// inventory (every function starts service-VM-owned; passthrough moves
+    /// ownership to a guest later), registers the virtio-blk/net/console
+    /// backends, and lays the domain's nested page tables (RAM + MMIO
+    /// identity-mapped) through enlil-hal. A refused assembly or a failed NPT
+    /// build is reported, not a boot failure.
+    fn bring_up_service_vm(serial: &SerialPort, handoff: Option<&BootHandoff>) {
+        use crate::service_vm::{
+            BackendKind, DriverKind, MAX_SERVICE_VM_DEVICES, MAX_WINDOWS_PER_DEVICE, MmioWindow,
+            OwnedDevice, ServiceVmSpec,
+        };
+        use core::sync::atomic::Ordering;
+
+        // vCPUs: the MADT AP inventory.
+        let mut ids = [0u32; crate::kernel::ap_trampoline::MAX_APIC_IDS];
+        let vcpus = u32::try_from(crate::kernel::ap_trampoline::apic_ids(&mut ids)).unwrap_or(0);
+
+        // RAM: the privileged domain's carve comes first. Falls back to the
+        // kernel heap when no planned window was published.
+        let (ram_base, ram_from_plan) = match crate::kernel::guest_ram::take(
+            crate::service_vm::SERVICE_VM_RAM_BYTES,
+            crate::service_vm::SERVICE_VM_RAM_ALIGN,
+        ) {
+            Some(base) => (base, true),
+            None => {
+                // SAFETY: like the SVM guests' heap fallback — alloc_zeroed
+                // yields a zeroed, aligned block or null.
+                match Layout::from_size_align(
+                    crate::service_vm::SERVICE_VM_RAM_BYTES as usize,
+                    crate::service_vm::SERVICE_VM_RAM_ALIGN as usize,
+                )
+                .ok()
+                .and_then(|layout| {
+                    let raw = unsafe { alloc::alloc::alloc_zeroed(layout) };
+                    (!raw.is_null()).then_some(raw as u64)
+                }) {
+                    Some(base) => (base, false),
+                    None => {
+                        serial.write_str(
+                            "enlil kernel: service VM: no RAM carve available — service VM skipped\n",
+                        );
+                        return;
+                    }
+                }
+            }
+        };
+
+        // Device-ownership table: every present bus-0 function starts owned by
+        // the service VM.
+        let inventory = crate::pci::scan_bus0_mmio();
+        let mut devices: [OwnedDevice; MAX_SERVICE_VM_DEVICES] =
+            core::array::from_fn(|_| OwnedDevice::default());
+        let mut device_count = 0usize;
+        for entry in inventory
+            .functions
+            .iter()
+            .take(usize::from(inventory.captured))
+        {
+            if device_count >= MAX_SERVICE_VM_DEVICES {
+                break;
+            }
+            let mut bars = [(0u64, 0u64); MAX_WINDOWS_PER_DEVICE];
+            for (slot, bar) in bars
+                .iter_mut()
+                .zip(entry.bars.iter().take(usize::from(entry.bar_count)))
+            {
+                *slot = (bar.base, bar.size);
+            }
+            if let Some(device) = OwnedDevice::from_inventory(
+                entry.device,
+                entry.function,
+                entry.class,
+                &bars[..usize::from(entry.bar_count)],
+            ) {
+                devices[device_count] = device;
+                device_count += 1;
+            }
+        }
+
+        // The ECAM window (the service VM's config-space access) and the GOP
+        // framebuffer (the management console's display) join the MMIO set.
+        let ecam = {
+            let base_plus1 = ECAM_BASE_PLUS1.load(Ordering::Acquire);
+            (base_plus1 != 0).then(|| {
+                let end_bus = u8::try_from(ECAM_END_BUS.load(Ordering::Acquire)).unwrap_or(u8::MAX);
+                MmioWindow {
+                    base: base_plus1 - 1,
+                    size: (u64::from(end_bus) + 1) << 20,
+                }
+            })
+        };
+        let framebuffer = handoff.and_then(|h| h.framebuffer).map(|fb| MmioWindow {
+            base: fb.base,
+            size: fb.size_bytes(),
+        });
+
+        let spec = ServiceVmSpec {
+            vcpus,
+            ram_base,
+            ram_size: crate::service_vm::SERVICE_VM_RAM_BYTES,
+            devices: &devices[..device_count],
+            backends: &crate::service_vm::DEFAULT_BACKENDS,
+            ecam,
+            framebuffer,
+            console_serial: true,
+        };
+        let plan = match crate::service_vm::assemble(&spec) {
+            Ok(plan) => plan,
+            Err(err) => {
+                serial.write_str("enlil kernel: service VM: assembly refused (");
+                serial.write_str(match err {
+                    crate::service_vm::ServiceVmError::NoVcpus => "no vCPUs",
+                    crate::service_vm::ServiceVmError::RamTooSmall { .. } => "RAM too small",
+                    crate::service_vm::ServiceVmError::RamUnaligned { .. } => "RAM unaligned",
+                    crate::service_vm::ServiceVmError::RamOverflow => "RAM overflow",
+                    crate::service_vm::ServiceVmError::RamOverlapsMmio { .. } => {
+                        "MMIO overlaps RAM"
+                    }
+                    crate::service_vm::ServiceVmError::TooManyDevices { .. } => "too many devices",
+                    crate::service_vm::ServiceVmError::TooManyMmioWindows { .. } => {
+                        "too many MMIO windows"
+                    }
+                    crate::service_vm::ServiceVmError::TooManyBackends { .. } => {
+                        "too many backends"
+                    }
+                    crate::service_vm::ServiceVmError::DeviceNotServiceVmOwned { .. } => {
+                        "device not service-VM-owned"
+                    }
+                    crate::service_vm::ServiceVmError::Npt(_) => "NPT build refused",
+                });
+                serial.write_str(") — service VM skipped\n");
+                return;
+            }
+        };
+
+        // The domain's nested page tables: RAM + MMIO identity-mapped. The
+        // kernel runs identity-mapped, so the heap buffer's VA is its PA.
+        let table_pages = plan.npt_table_pages();
+        let ncr3 = Layout::from_size_align(table_pages * 4096, 4096)
+            .ok()
+            .and_then(|layout| {
+                let raw = unsafe { alloc::alloc::alloc_zeroed(layout) };
+                if raw.is_null() {
+                    return None;
+                }
+                // SAFETY: the layout just allocated `table_pages * 4096`
+                // zeroed bytes at `raw`; the tables are leaked by design so
+                // they outlive the boot.
+                let buf = unsafe { core::slice::from_raw_parts_mut(raw, table_pages * 4096) };
+                plan.build_npt(buf, raw as u64).ok()
+            });
+
+        // --- report ---
+        let mut n = [0u8; 20];
+        let mut base = [0u8; 18];
+        // The domain assembled: the "service VM" link of the 6.7 milestone
+        // chain is up (its NPT result is reported separately below).
+        SERVICE_VM_UP.store(true, Ordering::Release);
+        serial.write_str("enlil kernel: service VM: privileged domain up (dom0-style): ");
+        serial.write_str(format_u64(u64::from(vcpus), &mut n));
+        serial.write_str(" vCPUs, RAM ");
+        serial.write_str(format_u64_hex(ram_base, &mut base));
+        serial.write_str(" (");
+        serial.write_str(format_u64(crate::service_vm::SERVICE_VM_RAM_MIB, &mut n));
+        serial.write_str(if ram_from_plan {
+            " MiB, planned carve), "
+        } else {
+            " MiB, heap fallback), "
+        });
+        serial.write_str(format_u64(device_count as u64, &mut n));
+        serial.write_str(" PCI functions owned");
+        let truncated = u64::from(inventory.captured) < u64::from(inventory.examined);
+        if truncated {
+            serial.write_str(" (");
+            serial.write_str(format_u64(
+                u64::from(inventory.examined) - u64::from(inventory.captured),
+                &mut n,
+            ));
+            serial.write_str(" beyond inventory cap — examined, not captured)");
+        }
+        serial.write_str("\n");
+
+        // The management console: the service VM owns the serial line and,
+        // when the firmware handed one over, the GOP framebuffer.
+        match handoff.and_then(|h| h.framebuffer) {
+            Some(fb) => {
+                serial.write_str("enlil kernel: service VM: management console owned — serial COM1 + GOP framebuffer ");
+                serial.write_str(format_u64(u64::from(fb.width), &mut n));
+                serial.write_str("x");
+                serial.write_str(format_u64(u64::from(fb.height), &mut n));
+                serial.write_str("\n");
+            }
+            None => serial.write_str(
+                "enlil kernel: service VM: management console owned — serial COM1 only (no GOP framebuffer)\n",
+            ),
+        }
+
+        // Driver assignment: which physical driver each owned function gets
+        // (the drivers themselves land in 6.5).
+        let mut counts = [0u64; 5];
+        for device in plan.devices.iter().take(plan.device_count) {
+            let slot = match device.driver {
+                DriverKind::Storage => 0,
+                DriverKind::Network => 1,
+                DriverKind::Display => 2,
+                DriverKind::Usb => 3,
+                DriverKind::Other => 4,
+            };
+            counts[slot] += 1;
+        }
+        serial.write_str("enlil kernel: service VM: drivers assigned: ");
+        serial.write_str(format_u64(counts[0], &mut n));
+        serial.write_str(" storage, ");
+        serial.write_str(format_u64(counts[1], &mut n));
+        serial.write_str(" net, ");
+        serial.write_str(format_u64(counts[2], &mut n));
+        serial.write_str(" display, ");
+        serial.write_str(format_u64(counts[3], &mut n));
+        serial.write_str(" usb, ");
+        serial.write_str(format_u64(counts[4], &mut n));
+        serial.write_str(" other (loaded by 6.5)\n");
+
+        // The device backends guests' frontends attach to.
+        serial.write_str("enlil kernel: service VM: device backends registered:");
+        for backend in plan.backends.iter().take(plan.backend_count) {
+            serial.write_str(" ");
+            serial.write_str(match backend.kind {
+                BackendKind::Block => "virtio-blk",
+                BackendKind::Net => "virtio-net",
+                BackendKind::Console => "virtio-console",
+            });
+            serial.write_str(" ");
+            serial.write_str(backend.name);
+            serial.write_str(",");
+        }
+        serial.write_str("\n");
+
+        match ncr3 {
+            Some(ncr3) => {
+                serial.write_str("enlil kernel: service VM: NPT built — nCR3 ");
+                serial.write_str(format_u64_hex(ncr3, &mut base));
+                serial.write_str(", RAM + ");
+                serial.write_str(format_u64(plan.mmio_window_count as u64, &mut n));
+                serial.write_str(" MMIO windows identity-mapped (");
+                serial.write_str(format_u64(plan.total_mmio_bytes / (1024 * 1024), &mut n));
+                serial.write_str(" MiB MMIO)\n");
+            }
+            None => serial.write_str(
+                "enlil kernel: service VM: NPT build FAILED — domain has no nested tables\n",
+            ),
+        }
+    }
+
+    /// Run one proof guest through the #VMEXIT dispatch loop and tally it toward
+    /// the 6.7 milestone's guest-scenario count (ROADMAP 6.7).
+    ///
+    /// # Safety
+    /// Same contract as [`run_boot_guest_loop`](crate::svm::run_boot_guest_loop):
+    /// SVM enabled, VM_HSAVE_PA programmed, `vmcb` VMRUN-ready.
+    unsafe fn run_milestone_guest(vmcb: u64) -> crate::svm::GuestRunOutcome {
+        // SAFETY: the caller upholds the run_boot_guest_loop contract.
+        let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+        GUEST_SCENARIOS_RUN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        run
+    }
+
+    /// Run one proof guest through the timer-tick dispatch loop and tally it
+    /// toward the 6.7 milestone's guest-scenario count (ROADMAP 6.7).
+    ///
+    /// # Safety
+    /// Same contract as
+    /// [`run_timer_tick_guest_loop`](crate::svm::run_timer_tick_guest_loop).
+    unsafe fn run_milestone_timer_tick_guest(vmcb: u64) -> crate::svm::GuestRunOutcome {
+        // SAFETY: the caller upholds the run_timer_tick_guest_loop contract.
+        let run = unsafe { crate::svm::run_timer_tick_guest_loop(vmcb) };
+        GUEST_SCENARIOS_RUN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        run
+    }
+
+    /// Run one proof guest through the periodic-tick dispatch loop and tally it
+    /// toward the 6.7 milestone's guest-scenario count (ROADMAP 6.7).
+    ///
+    /// # Safety
+    /// Same contract as
+    /// [`run_periodic_tick_guest_loop`](crate::svm::run_periodic_tick_guest_loop).
+    unsafe fn run_milestone_periodic_tick_guest(
+        vmcb: u64,
+        timer_vector: u8,
+        timer_count: u32,
+    ) -> crate::svm::GuestRunOutcome {
+        // SAFETY: the caller upholds the run_periodic_tick_guest_loop contract.
+        let run =
+            unsafe { crate::svm::run_periodic_tick_guest_loop(vmcb, timer_vector, timer_count) };
+        GUEST_SCENARIOS_RUN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        run
+    }
+
     /// Turn on the CPU's virtualization extension (AMD SVM) so the kernel can
     /// later run a guest with `VMRUN` — the second live-boot sub-milestone's
     /// enable gate.
@@ -1492,7 +1861,7 @@ mod hw {
                         // arch-neutral model (LOCKED PRINCIPLE 2).
                         // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and
                         // `vmcb` is a VMRUN-ready VMCB from program_boot_vmcb.
-                        let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                        let run = unsafe { run_milestone_guest(vmcb) };
                         report_guest_run(serial, &run);
                         // Second guest: prove EVENTINJ delivers an injected
                         // interrupt through the guest's real-mode IVT.
@@ -1713,7 +2082,7 @@ mod hw {
             Some((vmcb, _handler)) => {
                 // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
                 // is a VMRUN-ready VMCB from program_event_inj_vmcb.
-                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                let run = unsafe { run_milestone_guest(vmcb) };
                 if run.io_out_to(u16::from(GUEST_EVENT_PORT))
                     == Some(u32::from(GUEST_EVENT_SENTINEL))
                 {
@@ -1757,7 +2126,7 @@ mod hw {
             Some((vmcb, guest_spa)) => {
                 // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
                 // is a VMRUN-ready VMCB from program_event_inj_resume_vmcb.
-                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                let run = unsafe { run_milestone_guest(vmcb) };
                 if run.io_out_to(u16::from(GUEST_EVENT_RESUME_PORT))
                     == Some(u32::from(GUEST_EVENT_RESUME_SENTINEL))
                 {
@@ -1804,7 +2173,7 @@ mod hw {
             Some((vmcb, _cr3)) => {
                 // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
                 // is a VMRUN-ready long-mode VMCB from program_long_mode_vmcb.
-                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                let run = unsafe { run_milestone_guest(vmcb) };
                 if run.io_out_to(u16::from(GUEST_LM_PORT)) == Some(u32::from(GUEST_LM_SENTINEL)) {
                     serial.write_str(
                         "enlil kernel: svm: 64-bit long-mode guest ran to its OUT — long-mode guest works\n",
@@ -1843,7 +2212,7 @@ mod hw {
                 // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
                 // is a VMRUN-ready long-mode VMCB from
                 // program_long_mode_event_inj_vmcb.
-                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                let run = unsafe { run_milestone_guest(vmcb) };
                 if run.io_out_to(u16::from(GUEST_LM_EVENT_PORT))
                     == Some(u32::from(GUEST_LM_EVENT_SENTINEL))
                 {
@@ -1891,7 +2260,7 @@ mod hw {
             Some((vmcb, _spa)) => {
                 // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
                 // is a VMRUN-ready long-mode VMCB from program_long_mode_vintr_vmcb.
-                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                let run = unsafe { run_milestone_guest(vmcb) };
                 // The index of the first OUT matching (port, sentinel), if any.
                 let pos = |port: u8, val: u8| -> Option<usize> {
                     let mut i = 0;
@@ -1946,7 +2315,7 @@ mod hw {
             Some((vmcb, _spa)) => {
                 // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
                 // is a VMRUN-ready long-mode VMCB from program_long_mode_preempt_vmcb.
-                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                let run = unsafe { run_milestone_guest(vmcb) };
                 if run.stop == RunStop::Halted
                     && run.io_out_to(u16::from(GUEST_LM_PREEMPT_PORT))
                         == Some(u32::from(GUEST_LM_PREEMPT_SENTINEL))
@@ -2003,7 +2372,7 @@ mod hw {
         crate::apic::arm_oneshot_timer(TIMER_VECTOR, TIMER_COUNT);
         // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb` is a
         // VMRUN-ready long-mode VMCB from program_timer_preempt_vmcb.
-        let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+        let run = unsafe { run_milestone_guest(vmcb) };
         // Drain any still-pending timer interrupt so it does not disturb later
         // bring-up: briefly enable interrupts so the host handler takes + EOIs it.
         // SAFETY: the timer gate is installed and its handler signals EOI; only
@@ -2064,7 +2433,7 @@ mod hw {
         // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, `vmcb` is a
         // VMRUN-ready long-mode VMCB from program_timer_tick_vmcb, and the timer
         // gate is installed (the loop briefly enables interrupts to EOI).
-        let run = unsafe { crate::svm::run_timer_tick_guest_loop(vmcb) };
+        let run = unsafe { run_milestone_timer_tick_guest(vmcb) };
 
         if run.stop == RunStop::Halted
             && run.io_out_to(u16::from(GUEST_LM_PREEMPT_PORT))
@@ -2123,8 +2492,7 @@ mod hw {
         // VMRUN-ready long-mode VMCB from program_periodic_tick_vmcb, and the
         // timer gate is installed (the loop briefly enables interrupts to EOI
         // and re-arms the same vector/count).
-        let run =
-            unsafe { crate::svm::run_periodic_tick_guest_loop(vmcb, TIMER_VECTOR, TIMER_COUNT) };
+        let run = unsafe { run_milestone_periodic_tick_guest(vmcb, TIMER_VECTOR, TIMER_COUNT) };
 
         // Count the handler's per-tick OUTs (recorded oldest first, so every
         // matching entry is one delivered-and-handled tick).
@@ -2174,7 +2542,7 @@ mod hw {
             Some((vmcb, _handler)) => {
                 // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
                 // is a VMRUN-ready VMCB from program_ud_exception_vmcb.
-                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                let run = unsafe { run_milestone_guest(vmcb) };
                 if run.exception_exits > 0
                     && run.io_out_to(u16::from(GUEST_UD_PORT)) == Some(u32::from(GUEST_UD_SENTINEL))
                 {
@@ -2211,7 +2579,7 @@ mod hw {
             Some((vmcb, _handler)) => {
                 // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
                 // is a VMRUN-ready VMCB from program_irq_resume_vmcb.
-                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                let run = unsafe { run_milestone_guest(vmcb) };
                 let handled = run.io_out_to(u16::from(GUEST_IRQ_HANDLER_PORT))
                     == Some(u32::from(GUEST_IRQ_HANDLER_SENTINEL));
                 let resumed = run.io_out_to(u16::from(GUEST_IRQ_RESUME_PORT))
@@ -2258,6 +2626,9 @@ mod hw {
                 // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
                 // is a VMRUN-ready VMCB from program_wp_npf_vmcb.
                 let run = unsafe { crate::svm::run_boot_guest_loop_dirty(vmcb, &mut log) };
+                // Tally toward the 6.7 milestone's guest-scenario count (the
+                // run_milestone_guest wrapper can't take the dirty log).
+                GUEST_SCENARIOS_RUN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 let first =
                     run.io_out_to(u16::from(GUEST_WP_PORT)) == Some(u32::from(GUEST_WP_VALUE));
                 let second =
@@ -2298,7 +2669,7 @@ mod hw {
             Some(vmcb) => {
                 // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
                 // is a VMRUN-ready VMCB from program_rdtsc_emulate_vmcb.
-                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                let run = unsafe { run_milestone_guest(vmcb) };
                 let mut vr = [0u8; 20];
                 let observed = run.io_out_to(u16::from(GUEST_RDTSC_PORT));
                 match run.stop {
@@ -2353,7 +2724,7 @@ mod hw {
                 // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
                 // is a VMRUN-ready VMCB from
                 // program_long_mode_exception_errcode_vmcb.
-                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                let run = unsafe { run_milestone_guest(vmcb) };
                 let pf =
                     run.io_out_to(u16::from(GUEST_LM_EXC_PF_PORT)) == Some(GUEST_LM_EXC_PF_CODE);
                 let gp =
@@ -2514,6 +2885,9 @@ mod hw {
                 // without a serial cable — the console the service VM will use).
                 if crate::framebuffer::draw_text_banner(fb) {
                     serial.write_str("enlil kernel: gop: text console banner drawn + verified\n");
+                    // The management console is live: the "console" link of
+                    // the 6.7 milestone chain gate.
+                    CONSOLE_LIVE.store(true, core::sync::atomic::Ordering::Release);
                 } else {
                     serial.write_str("enlil kernel: gop: text console self-test FAILED\n");
                 }
@@ -3055,6 +3429,22 @@ mod hw {
     }
 }
 
+/// Pure verdict for the 6.7 milestone chain gate (ROADMAP 6.7).
+///
+/// `true` (COMPLETE) only when every link verified this boot: the privileged
+/// service VM assembled, at least one proof-guest scenario ran, and the
+/// management console went live. Anything else is DEGRADED. Pure so the dev
+/// host can unit-test the gate's truth table; the firmware target feeds it
+/// the live bring-up statics in `bring_up_milestone`.
+#[must_use]
+pub const fn milestone_chain_verdict(
+    service_vm_up: bool,
+    guest_scenarios_run: u32,
+    console_live: bool,
+) -> bool {
+    service_vm_up && guest_scenarios_run > 0 && console_live
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3249,5 +3639,17 @@ mod tests {
         let bytes = map(&[desc(1, 0x10_0000, 16, 48)]);
         assert_eq!(firmware_claimed_spans(&bytes, 4), [] as [(u64, u64); 0]);
         assert_eq!(firmware_claimed_spans(&[], 48), [] as [(u64, u64); 0]);
+    }
+
+    #[test]
+    fn milestone_verdict_truth_table() {
+        // Every link verified -> COMPLETE.
+        assert!(milestone_chain_verdict(true, 15, true));
+        assert!(milestone_chain_verdict(true, 1, true));
+        // Any missing link -> DEGRADED.
+        assert!(!milestone_chain_verdict(false, 15, true)); // service VM skipped
+        assert!(!milestone_chain_verdict(true, 0, true)); // no guest ran (no SVM)
+        assert!(!milestone_chain_verdict(true, 15, false)); // console absent
+        assert!(!milestone_chain_verdict(false, 0, false)); // nothing verified
     }
 }
