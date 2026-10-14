@@ -39,6 +39,7 @@ pub mod paging;
 pub mod pci;
 pub mod percpu;
 pub mod serial;
+pub mod service_vm;
 pub mod smp;
 pub mod stack;
 pub mod svm;
