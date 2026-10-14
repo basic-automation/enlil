@@ -2134,6 +2134,11 @@ mod hw {
                         // Third guest: prove a 64-bit long-mode guest runs (the
                         // mode a real OS boots in).
                         run_long_mode_guest(serial);
+                        // LDTR/TR guest: prove VMSAVE/VMLOAD swaps the guest's
+                        // extended segment state (its own LDT + task register)
+                        // while the host's TR/LDTR survive (ROADMAP 6.2,
+                        // T-6.4).
+                        run_ldtr_tr_guest(serial);
                         // Fourth guest: prove an injected interrupt's handler
                         // does work and IRETs back to resume the interrupted
                         // guest — the full interrupt round-trip a real OS does.
@@ -2453,6 +2458,45 @@ mod hw {
                 }
             }
             None => serial.write_str("enlil kernel: svm: long-mode vmcb build FAILED\n"),
+        }
+    }
+
+    /// Build and run the LDTR/TR proof guest, reporting whether `VMLOAD`/
+    /// `VMSAVE` swapped the guest's extended segment state.
+    ///
+    /// enlil programs the VMCB's `LDTR`/`TR` save-area slots with the guest's
+    /// own LDT and busy-TSS descriptors; the run shell's entry `VMLOAD`
+    /// installs them and its exit `VMSAVE` captures them back while restoring
+    /// the host's. The guest `STR`s its `TR` and `SLDT`s its `LDTR`, `OUT`ing
+    /// each selector byte. Capturing [`GUEST_LM_TR_SELECTOR`] and
+    /// [`GUEST_LM_LDTR_SELECTOR`] proves the guest's registers were loaded; the
+    /// kernel continuing afterwards proves the host's own `TR`/`LDTR` were
+    /// restored (ROADMAP 6.2, T-6.4).
+    fn run_ldtr_tr_guest(serial: &SerialPort) {
+        use crate::svm::{
+            GUEST_LM_LDTR_PORT, GUEST_LM_LDTR_SELECTOR, GUEST_LM_TR_PORT, GUEST_LM_TR_SELECTOR,
+        };
+        match crate::svm::program_ldtr_tr_vmcb() {
+            Some((vmcb, _cr3)) => {
+                // SAFETY: SVM is enabled, VM_HSAVE_PA is programmed, and `vmcb`
+                // is a VMRUN-ready long-mode VMCB from program_ldtr_tr_vmcb.
+                let run = unsafe { crate::svm::run_boot_guest_loop(vmcb) };
+                let tr = run.io_out_to(u16::from(GUEST_LM_TR_PORT));
+                let ldtr = run.io_out_to(u16::from(GUEST_LM_LDTR_PORT));
+                if tr == Some(u32::from(GUEST_LM_TR_SELECTOR))
+                    && ldtr == Some(u32::from(GUEST_LM_LDTR_SELECTOR))
+                {
+                    serial.write_str(
+                        "enlil kernel: svm: guest STR/SLDT reported its own TR/LDTR — guest LDTR/TR VMSAVE/VMLOAD swap works\n",
+                    );
+                } else {
+                    let mut e = [0u8; 18];
+                    serial.write_str("enlil kernel: svm: guest LDTR/TR NOT observed (final exit ");
+                    serial.write_str(format_u64_hex(run.final_exit, &mut e));
+                    serial.write_str(")\n");
+                }
+            }
+            None => serial.write_str("enlil kernel: svm: ldtr-tr vmcb build FAILED\n"),
         }
     }
 
