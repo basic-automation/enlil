@@ -440,9 +440,12 @@ const GUEST_LM_IDT_GPA: usize = 0x0000_2000;
 /// handlers — past the shared handler slot, below the `GDT`.
 #[cfg(any(target_os = "uefi", test))]
 const GUEST_LM_EXC_PF_HANDLER_OFF: usize = 0x0000_0140;
-/// Guest RAM offset of the `#GP` handler (after the `#PF` handler's 14 bytes).
+/// Guest RAM offset of the `#GP` handler (after the `#PF` handler's 18 bytes).
 #[cfg(any(target_os = "uefi", test))]
 const GUEST_LM_EXC_GP_HANDLER_OFF: usize = 0x0000_0160;
+/// The `#PF` handler (18 bytes) must fit below the `#GP` handler's slot.
+#[cfg(any(target_os = "uefi", test))]
+const _: () = assert!(GUEST_LM_EXC_PF_HANDLER_OFF + 18 <= GUEST_LM_EXC_GP_HANDLER_OFF);
 
 /// A small per-guest shadow of MSRs the guest has written with `WRMSR`.
 ///
@@ -1068,7 +1071,9 @@ const fn write_long_mode_idt_gate(ram: &mut [u8], vector: u8, handler_off: usize
 /// On entry the CPU-pushed error code sits atop the stack (`[RSP]`), the saved
 /// `RIP` at `[RSP+8]`. The handler `OUT`s the error-code byte to `port` (so the
 /// run loop captures exactly what the guest received), advances the saved `RIP`
-/// past the 2-byte faulting instruction, and `IRETQ`s back into the guest
+/// past the 2-byte faulting instruction, discards the error code (`ADD RSP, 8`
+/// — `IRETQ` expects the saved `RIP` at `[RSP]`, so leaving the code there makes
+/// it pop the code as `RIP` and fault again), and `IRETQ`s back into the guest
 /// stream — so the guest raises one fault, reports its code, and continues to
 /// the next probe instead of re-faulting.
 #[cfg(any(target_os = "uefi", test))]
@@ -1085,8 +1090,12 @@ const fn write_exception_errcode_handler(ram: &mut [u8], off: usize, port: u8) {
     ram[off + 9] = 0x24; // |
     ram[off + 10] = 0x08; // |
     ram[off + 11] = 0x02; // /
-    ram[off + 12] = 0x48; // \ REX.W prefix for
-    ram[off + 13] = 0xCF; // / IRETQ — resume the guest stream
+    ram[off + 12] = 0x48; // \ REX.W
+    ram[off + 13] = 0x83; // | ADD RSP, 8 — discard the error code so RSP points
+    ram[off + 14] = 0xC4; // |   at the saved RIP; IRETQ does not pop it itself
+    ram[off + 15] = 0x08; // /
+    ram[off + 16] = 0x48; // \ REX.W prefix for
+    ram[off + 17] = 0xCF; // / IRETQ — resume the guest stream
 }
 
 /// Stamp the long-mode **exception error-code re-inject** guest into `ram`: a
@@ -3347,6 +3356,8 @@ mod hw {
 
         /// Bound on total `VMRUN`s so a misbehaving guest cannot spin forever.
         const MAX_VMRUNS: u32 = 32;
+        /// `V_INTR_MASKING` (`INT_CONTROL` bit 24), cleared on each posted tick.
+        const V_INTR_MASKING: u64 = 1 << 24;
 
         let mut gprs = super::GuestGprs::default();
         let mut msr_shadow = super::MsrShadow::new();
@@ -3390,8 +3401,18 @@ mod hw {
                 // 2. Re-arm the one-shot timer: the next quantum's preemption.
                 // (A one-shot timer does not repeat by itself.)
                 crate::apic::arm_oneshot_timer(timer_vector, timer_count);
-                // 3. Deliver the tick to the guest as a virtual interrupt.
-                set_int_control(vmcb, encode_vintr(super::GUEST_EVENT_VECTOR, 0xF));
+                // 3. Deliver the tick to the guest as a virtual interrupt. Clear
+                //    V_INTR_MASKING (bit 24) that `encode_vintr` sets: with it on,
+                //    the *host's* RFLAGS.IF gates physical interrupts while the
+                //    guest runs, and this loop runs with host IF=0, so the
+                //    re-armed timer would sit pending in the LAPIC forever and
+                //    never surface as the next INTR #VMEXIT (one tick, then the
+                //    guest spins to its HLT). With it off the guest's own IF
+                //    gates the physical timer, as on the first tick.
+                set_int_control(
+                    vmcb,
+                    encode_vintr(super::GUEST_EVENT_VECTOR, 0xF) & !V_INTR_MASKING,
+                );
                 // 4. Resume without advancing RIP — nothing was retired.
             } else if !unsafe { step_guest(vmcb, &mut gprs, &mut msr_shadow, &mut outcome, None) } {
                 // SAFETY: the VMCB's NPT root is identity-mapped.
@@ -3743,7 +3764,8 @@ mod tests {
         assert_eq!(&ram[12..14], &[0x8E, 0xD8], "MOV DS, AX (the #GP probe)");
         assert_eq!(ram[14], 0xF4, "HLT");
 
-        // Both handlers: mov rax, [rsp]; out PORT, al; add [rsp+8], 2; iretq.
+        // Both handlers: mov rax, [rsp]; out PORT, al; add [rsp+8], 2;
+        // add rsp, 8 (drop the error code so IRETQ finds RIP at [RSP]); iretq.
         for (off, port) in [
             (GUEST_LM_EXC_PF_HANDLER_OFF, GUEST_LM_EXC_PF_PORT),
             (GUEST_LM_EXC_GP_HANDLER_OFF, GUEST_LM_EXC_GP_PORT),
@@ -3759,7 +3781,12 @@ mod tests {
                 &[0x48, 0x83, 0x44, 0x24, 0x08, 0x02],
                 "ADD QWORD [RSP+8], 2"
             );
-            assert_eq!(&ram[off + 12..off + 14], &[0x48, 0xCF], "IRETQ");
+            assert_eq!(
+                &ram[off + 12..off + 16],
+                &[0x48, 0x83, 0xC4, 0x08],
+                "ADD RSP, 8 (discard the error code)"
+            );
+            assert_eq!(&ram[off + 16..off + 18], &[0x48, 0xCF], "IRETQ");
         }
         // IDT gates for vectors 13 (#GP) and 14 (#PF) → the right handlers,
         // present 64-bit interrupt gates on the code selector.
