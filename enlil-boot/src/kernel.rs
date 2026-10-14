@@ -1539,6 +1539,32 @@ mod hw {
         }
     }
 
+    /// Register-window bytes the `NVMe` driver touches: the controller registers
+    /// (`0x1000`) plus the doorbells of the admin and one I/O queue pair.
+    const NVME_BAR_BYTES: u64 = 0x4000;
+    /// Register-window bytes the `AHCI` driver touches: the generic host control
+    /// block plus the per-port register files.
+    const AHCI_BAR_BYTES: u64 = 0x2000;
+
+    /// Make a storage controller's `BAR0` reachable on the kernel's own page
+    /// tables. A 64-bit `BAR` can sit far above the identity map (OVMF places an
+    /// `NVMe` controller's at `0x3800_0000_0000`), so map it uncached first;
+    /// logs and returns `false` if that fails so the caller skips the driver
+    /// instead of faulting on the first register read.
+    fn map_controller_bar(serial: &SerialPort, what: &str, bar: u64, len: u64) -> bool {
+        // SAFETY: runs on the kernel's own tables after the guarded-stack
+        // switch, single-CPU; the boot-time `HostMap` is no longer used.
+        let mapped = unsafe { crate::paging::map_mmio_range(bar, len) };
+        serial.write_str("enlil kernel: storage: ");
+        serial.write_str(what);
+        serial.write_str(if mapped {
+            ": BAR0 mapped uncached on the kernel page tables\n"
+        } else {
+            ": BAR0 could not be mapped — cannot drive\n"
+        });
+        mapped
+    }
+
     /// Drive the first `NVMe` controller: init, report, block r/w self-test.
     fn bring_up_nvme(serial: &SerialPort, c: crate::pci::StorageController) {
         serial.write_str("enlil kernel: storage: NVMe controller at ");
@@ -1552,6 +1578,9 @@ mod hw {
             return;
         }
         crate::pci::enable_mem_bus_master(c.bus, c.device, c.function);
+        if !map_controller_bar(serial, "nvme", c.bar0_base, NVME_BAR_BYTES) {
+            return;
+        }
         let mmio = crate::mmio::PhysMmio::new(c.bar0_base);
         let mut ctl = match crate::nvme::NvmeController::init(mmio, 1) {
             Ok(ctl) => ctl,
@@ -1598,6 +1627,9 @@ mod hw {
             return;
         }
         crate::pci::enable_mem_bus_master(c.bus, c.device, c.function);
+        if !map_controller_bar(serial, "ahci", c.bar0_base, AHCI_BAR_BYTES) {
+            return;
+        }
         let mmio = crate::mmio::PhysMmio::new(c.bar0_base);
         let mut ctl = match crate::ahci::AhciController::init(mmio) {
             Ok(ctl) => ctl,

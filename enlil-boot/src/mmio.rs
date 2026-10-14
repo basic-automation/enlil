@@ -29,7 +29,8 @@ pub trait Mmio {
 /// # Safety contract
 ///
 /// The caller must guarantee `base` maps the device's registers (the kernel's
-/// identity map covers the low 4 GiB, where `PCI` BARs live) and that no other
+/// identity map covers the low 4 GiB; a `BAR` placed above that must first be
+/// mapped with [`map_mmio_range`](crate::paging::map_mmio_range)) and that no other
 /// live reference aliases the window while this handle exists.
 #[derive(Debug, Clone, Copy)]
 pub struct PhysMmio {
