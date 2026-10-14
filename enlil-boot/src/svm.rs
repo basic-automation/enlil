@@ -436,6 +436,34 @@ const GUEST_LM_GDT_GPA: usize = 0x0000_1000;
 #[cfg(any(target_os = "uefi", test))]
 const GUEST_LM_IDT_GPA: usize = 0x0000_2000;
 
+/// Guest-physical base of the LDTR/TR proof guest's LDT: a 16-byte data
+/// descriptor at entry 0 (a real table the guest's `LDTR` can point at).
+#[cfg(any(target_os = "uefi", test))]
+const GUEST_LM_LDT_GPA: usize = 0x0000_3000;
+
+/// Guest-physical base of the LDTR/TR proof guest's TSS: a 104-byte zeroed
+/// task-state segment whose I/O-map base (offset 102) is set past the limit.
+#[cfg(any(target_os = "uefi", test))]
+const GUEST_LM_TSS_GPA: usize = 0x0000_4000;
+
+/// The LDTR/TR proof guest's `LDTR` selector: `GDT` entry 3 (a 16-byte LDT
+/// descriptor occupies entries 3+4).
+#[cfg(any(target_os = "uefi", test))]
+pub const GUEST_LM_LDTR_SELECTOR: u16 = 0x18;
+
+/// The LDTR/TR proof guest's `TR` selector: `GDT` entry 5 (a 16-byte busy-TSS
+/// descriptor occupies entries 5+6).
+#[cfg(any(target_os = "uefi", test))]
+pub const GUEST_LM_TR_SELECTOR: u16 = 0x28;
+
+/// The port the LDTR/TR proof guest `OUT`s its `TR` selector (read via `STR`)
+/// to — proving `VMLOAD` installed the guest's task register on entry.
+pub const GUEST_LM_TR_PORT: u8 = 0x93;
+
+/// The port the LDTR/TR proof guest `OUT`s its `LDTR` selector (read via
+/// `SLDT`) to — proving `VMLOAD` installed the guest's LDT on entry.
+pub const GUEST_LM_LDTR_PORT: u8 = 0x94;
+
 /// Guest RAM offsets of the error-code re-inject guest's two 64-bit exception
 /// handlers — past the shared handler slot, below the `GDT`.
 #[cfg(any(target_os = "uefi", test))]
@@ -856,6 +884,99 @@ fn write_long_mode_gdt_and_gate(ram: &mut [u8]) {
     ram[gate + 11] = ob[7]; // offset 63:56
 }
 
+/// Stamp the LDTR/TR proof guest's 64-bit `LDT` and busy `TSS` descriptors into
+/// the guest `GDT` (extending [`write_long_mode_gdt_and_gate`], which the
+/// caller runs first), plus the tables they point at.
+///
+/// - `GDT` entries 3+4 (offset `g+24`, 16 bytes): an LDT descriptor (selector
+///   [`GUEST_LM_LDTR_SELECTOR`], type `0x2`, present) whose base is
+///   [`GUEST_LM_LDT_GPA`].
+/// - `GDT` entries 5+6 (offset `g+40`, 16 bytes): a *busy* 64-bit TSS
+///   descriptor (selector [`GUEST_LM_TR_SELECTOR`], type `0xB`, present, limit
+///   `0x67` = 104 bytes) whose base is [`GUEST_LM_TSS_GPA`].
+/// - [`GUEST_LM_LDT_GPA`]: the LDT itself — a null entry plus one 16-byte data
+///   descriptor (base 0, present, DPL 0, read/write), so the table is a real
+///   LDT the guest could load segment selectors from.
+/// - [`GUEST_LM_TSS_GPA`]: a 104-byte zeroed TSS; the I/O-map base at offset
+///   102 is set to `0x68` (just past the limit), the standard "no I/O bitmap"
+///   value.
+///
+/// 16-byte system descriptors (LDT/TSS) always occupy two `GDT` slots, hence
+/// the selectors `0x18`/`0x28`. Pure and host-testable; the firmware builder
+/// allocates the RAM and programs the VMCB `LDTR`/`TR` slots to match.
+#[cfg(any(target_os = "uefi", test))]
+fn write_long_mode_ldt_and_tss(ram: &mut [u8]) {
+    let g = GUEST_LM_GDT_GPA;
+    // LDT descriptor: limit 0xFFFF, base GUEST_LM_LDT_GPA, type 0x82.
+    let ldt_base = GUEST_LM_LDT_GPA as u64;
+    ram[g + 24] = 0xFF; // limit 15:0
+    ram[g + 25] = 0xFF;
+    ram[g + 26] = (ldt_base & 0xFF) as u8; // base 15:0
+    ram[g + 27] = ((ldt_base >> 8) & 0xFF) as u8;
+    ram[g + 28] = ((ldt_base >> 16) & 0xFF) as u8; // base 23:16
+    ram[g + 29] = 0x82; // P=1, DPL=0, S=0, type=0x2 (LDT)
+    ram[g + 30] = 0x0F; // G=0, limit 19:16 = 0xF
+    ram[g + 31] = ((ldt_base >> 24) & 0xFF) as u8; // base 31:24
+    ram[g + 32..g + 40].copy_from_slice(&(ldt_base >> 32).to_le_bytes()); // base 63:32
+    // Busy-TSS descriptor: limit 0x67, base GUEST_LM_TSS_GPA, type 0x8B.
+    let tss_base = GUEST_LM_TSS_GPA as u64;
+    ram[g + 40] = 0x67; // limit 15:0 = 104 - 1
+    ram[g + 41] = 0x00;
+    ram[g + 42] = (tss_base & 0xFF) as u8; // base 15:0
+    ram[g + 43] = ((tss_base >> 8) & 0xFF) as u8;
+    ram[g + 44] = ((tss_base >> 16) & 0xFF) as u8; // base 23:16
+    ram[g + 45] = 0x8B; // P=1, DPL=0, S=0, type=0xB (busy TSS)
+    ram[g + 46] = 0x00; // G=0, limit 19:16 = 0x0
+    ram[g + 47] = ((tss_base >> 24) & 0xFF) as u8; // base 31:24
+    ram[g + 48..g + 56].copy_from_slice(&(tss_base >> 32).to_le_bytes()); // base 63:32
+
+    // The LDT: null entry + one 16-byte data descriptor (base 0, limit 0xFFFF,
+    // present/DPL0/read-write, byte-granular).
+    let l = GUEST_LM_LDT_GPA;
+    ram[l + 16..l + 24].copy_from_slice(&0x0000_9200_0000_FFFFu64.to_le_bytes());
+
+    // The TSS: zeroed (the RAM is already zero) except the I/O-map base at
+    // offset 102, set just past the limit — no I/O permission bitmap.
+    let t = GUEST_LM_TSS_GPA;
+    ram[t + 102] = 0x68;
+    ram[t + 103] = 0x00;
+}
+
+/// Stamp the LDTR/TR proof guest's program at GVA 0: read the guest's own
+/// `TR` and `LDTR` and `OUT` their selectors, then halt.
+///
+/// `VMRUN` never loads `TR`/`LDTR` — only the run shell's entry `VMLOAD` does —
+/// so the guest observing [`GUEST_LM_TR_SELECTOR`] via `STR` and
+/// [`GUEST_LM_LDTR_SELECTOR`] via `SLDT` proves the guest's extended state was
+/// installed, and the host's own `TR`/`LDTR` surviving the run (the kernel
+/// keeps running) proves the exit `VMSAVE`/`VMLOAD` restored them.
+///
+/// Layout: `str ax ; out TR_PORT, al ; sldt ax ; out LDTR_PORT, al ; mov al,
+/// GUEST_LM_SENTINEL ; out GUEST_LM_PORT, al ; hlt`. The final `OUT` proves the
+/// guest completed the sequence; the two selector `OUT`s are captured by the
+/// run loop's IOIO decoding.
+///
+/// Pure and host-testable; the firmware builder allocates the RAM, the guest
+/// page tables, and the NPT, and programs the VMCB `GDTR` + `LDTR`/`TR` slots.
+#[cfg(any(target_os = "uefi", test))]
+const fn write_ldtr_tr_program(ram: &mut [u8]) {
+    ram[0] = 0x0F; // STR AX — guest TR selector into AX
+    ram[1] = 0x00;
+    ram[2] = 0xD8;
+    ram[3] = 0xE6; // OUT imm8, AL
+    ram[4] = GUEST_LM_TR_PORT;
+    ram[5] = 0x0F; // SLDT AX — guest LDTR selector into AX
+    ram[6] = 0x00;
+    ram[7] = 0xD0;
+    ram[8] = 0xE6; // OUT imm8, AL
+    ram[9] = GUEST_LM_LDTR_PORT;
+    ram[10] = 0xB0; // MOV AL, imm8
+    ram[11] = GUEST_LM_SENTINEL;
+    ram[12] = 0xE6; // OUT imm8, AL
+    ram[13] = GUEST_LM_PORT;
+    ram[14] = 0xF4; // HLT
+}
+
 /// Stamp the long-mode **virtual-interrupt (masking)** guest's program into
 /// `ram`: an interrupted stream that runs with interrupts masked, `STI`s, and
 /// takes a *pending* virtual interrupt through the shared long-mode `IDT`.
@@ -1181,12 +1302,12 @@ const fn write_rdtsc_emulate_program(ram: &mut [u8]) {
 #[cfg(target_os = "uefi")]
 pub use hw::{
     enable_svm, program_boot_vmcb, program_event_inj_resume_vmcb, program_event_inj_vmcb,
-    program_host_save_area, program_irq_resume_vmcb, program_long_mode_event_inj_vmcb,
-    program_long_mode_exception_errcode_vmcb, program_long_mode_preempt_vmcb,
-    program_long_mode_vintr_vmcb, program_long_mode_vmcb, program_periodic_tick_vmcb,
-    program_rdtsc_emulate_vmcb, program_timer_preempt_vmcb, program_timer_tick_vmcb,
-    program_ud_exception_vmcb, program_wp_npf_vmcb, run_boot_guest_loop, run_boot_guest_loop_dirty,
-    run_periodic_tick_guest_loop, run_timer_tick_guest_loop,
+    program_host_save_area, program_irq_resume_vmcb, program_ldtr_tr_vmcb,
+    program_long_mode_event_inj_vmcb, program_long_mode_exception_errcode_vmcb,
+    program_long_mode_preempt_vmcb, program_long_mode_vintr_vmcb, program_long_mode_vmcb,
+    program_periodic_tick_vmcb, program_rdtsc_emulate_vmcb, program_timer_preempt_vmcb,
+    program_timer_tick_vmcb, program_ud_exception_vmcb, program_wp_npf_vmcb, run_boot_guest_loop,
+    run_boot_guest_loop_dirty, run_periodic_tick_guest_loop, run_timer_tick_guest_loop,
 };
 
 #[cfg(target_os = "uefi")]
@@ -2320,6 +2441,128 @@ mod hw {
         program_long_mode_hlt_guest(vmcb.as_bytes_mut(), &setup).ok()?;
 
         // Arm port-I/O interception so the guest's OUT takes an IOIO #VMEXIT.
+        let iopm = IoPermissionsMap::intercept_all().ok()?;
+        enable_io_intercept(vmcb.as_bytes_mut(), iopm.base_addr());
+        core::mem::forget(iopm);
+
+        let vmcb_pa = vmcb.base_addr();
+        core::mem::forget(vmcb); // must outlive VMRUN
+        Some((vmcb_pa, guest_cr3))
+    }
+
+    /// Build a `VMRUN`-ready VMCB that proves **guest `LDTR`/`TR` save/restore
+    /// through `VMSAVE`/`VMLOAD`**, returning `(vmcb_pa, guest_cr3)`.
+    ///
+    /// A guest using an LDT or task gates needs its own `LDTR`/`TR`, but
+    /// `VMRUN` never loads those registers — only `VMLOAD` does (APM §15.5.2).
+    /// This guest boots in long mode with a real `GDT` extended with an LDT
+    /// descriptor (selector [`GUEST_LM_LDTR_SELECTOR`](super::GUEST_LM_LDTR_SELECTOR))
+    /// and a busy-TSS descriptor (selector
+    /// [`GUEST_LM_TR_SELECTOR`](super::GUEST_LM_TR_SELECTOR)), plus the LDT and
+    /// TSS tables they point at
+    /// ([`write_long_mode_ldt_and_tss`](super::write_long_mode_ldt_and_tss)).
+    /// The VMCB's `GDTR` points at the guest `GDT` (7 descriptors, limit
+    /// `0x37`), and the `LDTR`/`TR` save-area slots are programmed via
+    /// [`program_guest_ldtr_tr`](enlil_hal::svm::program_guest_ldtr_tr) so the
+    /// run shell's entry `VMLOAD` installs the guest's registers.
+    ///
+    /// The guest ([`write_ldtr_tr_program`](super::write_ldtr_tr_program))
+    /// reads its own `TR` via `STR` and `LDTR` via `SLDT`, `OUT`s each selector
+    /// byte, then `OUT`s [`GUEST_LM_SENTINEL`](super::GUEST_LM_SENTINEL) and
+    /// halts. Observing the two selectors proves the guest's extended state
+    /// was installed; the host kernel continuing afterwards proves the exit
+    /// `VMSAVE`/`VMLOAD` restored the host's own `TR`/`LDTR`. Without the swap
+    /// a guest writing its task register would corrupt the host's.
+    ///
+    /// Layout in the guest's isolated `[0, 2 MiB)` RAM: entry at GVA 0, `GDT`
+    /// at [`GUEST_LM_GDT_GPA`](super::GUEST_LM_GDT_GPA), `LDT` at
+    /// [`GUEST_LM_LDT_GPA`](super::GUEST_LM_LDT_GPA), `TSS` at
+    /// [`GUEST_LM_TSS_GPA`](super::GUEST_LM_TSS_GPA), stack at
+    /// [`GUEST_LM_STACK`](super::GUEST_LM_STACK), and the guest's own identity
+    /// page tables at [`GUEST_LM_PT_GPA`](super::GUEST_LM_PT_GPA) — all inside
+    /// the NPT-mapped window. All allocations are leaked to outlive `VMRUN`.
+    /// Returns `None` on any allocation/programming failure.
+    #[must_use]
+    pub fn program_ldtr_tr_vmcb() -> Option<(u64, u64)> {
+        use super::{
+            GUEST_LM_GDT_GPA, GUEST_LM_LDT_GPA, GUEST_LM_LDTR_SELECTOR, GUEST_LM_PT_GPA,
+            GUEST_LM_STACK, GUEST_LM_TR_SELECTOR, GUEST_LM_TSS_GPA,
+        };
+        use enlil_hal::svm::{VmcbSegment, program_guest_ldtr_tr};
+
+        // Allocate + populate the guest's isolated RAM.
+        // Planned guest region when available, kernel heap otherwise.
+        let ram_raw = alloc_guest_ram()?;
+        let guest_spa = ram_raw as u64;
+        // SAFETY: ram_raw owns GUEST_RAM_BYTES writable bytes (leaked below).
+        let ram = unsafe { core::slice::from_raw_parts_mut(ram_raw, GUEST_RAM_BYTES) };
+        // Guest program at GVA/GPA 0: STR/SLDT + OUT the selectors, then halt.
+        super::write_ldtr_tr_program(ram);
+        // Guest GDT (null, code, data) extended with the LDT + busy-TSS
+        // descriptors and the tables they point at.
+        super::write_long_mode_gdt_and_gate(ram);
+        super::write_long_mode_ldt_and_tss(ram);
+
+        // The guest's own page tables (identity GVA→GPA over [0, 2 MiB)) at
+        // GUEST_LM_PT_GPA — CR3 points here; the NPT resolves the GPAs the walk
+        // reads. build_identity_npt_2mib emits the shared x86-64 table format.
+        let pt = GUEST_LM_PT_GPA;
+        let guest_cr3 = build_identity_npt_2mib(
+            &mut ram[pt..pt + 3 * 4096],
+            GUEST_LM_PT_GPA as u64,
+            GUEST_RAM_BYTES as u64,
+        )
+        .ok()?
+        .ncr3;
+
+        // NPT mapping guest GPA [0, 2 MiB) onto the isolated RAM window.
+        // SAFETY: NptBuf is nonzero, 4 KiB-aligned; alloc_zeroed yields it or null.
+        let npt_raw = unsafe { alloc_zeroed(Layout::new::<NptBuf>()) };
+        if npt_raw.is_null() {
+            return None;
+        }
+        let npt_pa = npt_raw as u64;
+        // SAFETY: npt_raw owns a live, zeroed NptBuf, leaked below.
+        let npt_buf = unsafe { core::slice::from_raw_parts_mut(npt_raw, 3 * 4096) };
+        let ncr3 = build_npt_2mib(npt_buf, npt_pa, guest_spa, GUEST_RAM_BYTES as u64)
+            .ok()?
+            .ncr3;
+
+        // Program the VMCB for long mode entering the code at GVA 0.
+        let mut vmcb = Vmcb::new().ok()?;
+        let setup = LongModeGuestSetup {
+            asid: 1,
+            nested_cr3: ncr3,
+            guest_cr3,
+            entry_ip: 0,
+            stack_pointer: GUEST_LM_STACK,
+        };
+        program_long_mode_hlt_guest(vmcb.as_bytes_mut(), &setup).ok()?;
+
+        // Point GDTR at the guest's GDT (7 descriptors: null, code, data, the
+        // 16-byte LDT pair, the 16-byte TSS pair — limit 0x37), so a real
+        // guest's descriptor references resolve.
+        write_segment(
+            vmcb.as_bytes_mut(),
+            save::GDTR,
+            VmcbSegment {
+                selector: 0,
+                attrib: 0,
+                limit: 0x0037,
+                base: GUEST_LM_GDT_GPA as u64,
+            },
+        );
+        // Program the guest's LDTR/TR save-area slots: the run shell's entry
+        // VMLOAD installs these, its exit VMSAVE captures them back, and the
+        // host's own TR/LDTR are restored from the host-save page.
+        program_guest_ldtr_tr(
+            vmcb.as_bytes_mut(),
+            &VmcbSegment::ldt(GUEST_LM_LDTR_SELECTOR, GUEST_LM_LDT_GPA as u64),
+            &VmcbSegment::tss_busy(GUEST_LM_TR_SELECTOR, GUEST_LM_TSS_GPA as u64),
+        )
+        .ok()?;
+
+        // Arm port-I/O interception so the guest's OUTs take IOIO #VMEXITs.
         let iopm = IoPermissionsMap::intercept_all().ok()?;
         enable_io_intercept(vmcb.as_bytes_mut(), iopm.base_addr());
         core::mem::forget(iopm);
@@ -3694,6 +3937,89 @@ mod tests {
         assert_eq!(ram[gate + 5], 0x8E, "P|DPL0|64-bit interrupt gate");
         assert_eq!(ram[gate + 6], ob[2], "offset 23:16");
         assert_eq!(ram[gate + 7], ob[3], "offset 31:24");
+    }
+
+    #[test]
+    fn ldtr_tr_program_outs_tr_and_ldtr_selectors() {
+        let mut ram = vec![0u8; 0x0020_0000];
+        write_ldtr_tr_program(&mut ram);
+
+        // STR AX; OUT TR_PORT, AL — the guest's TR selector low byte.
+        assert_eq!(ram[0], 0x0F);
+        assert_eq!(ram[1], 0x00);
+        assert_eq!(ram[2], 0xD8, "STR AX");
+        assert_eq!(ram[3], 0xE6);
+        assert_eq!(ram[4], GUEST_LM_TR_PORT);
+        // SLDT AX; OUT LDTR_PORT, AL — the guest's LDTR selector low byte.
+        assert_eq!(ram[5], 0x0F);
+        assert_eq!(ram[6], 0x00);
+        assert_eq!(ram[7], 0xD0, "SLDT AX");
+        assert_eq!(ram[8], 0xE6);
+        assert_eq!(ram[9], GUEST_LM_LDTR_PORT);
+        // Completion OUT + HLT.
+        assert_eq!(ram[10], 0xB0);
+        assert_eq!(ram[11], GUEST_LM_SENTINEL);
+        assert_eq!(ram[12], 0xE6);
+        assert_eq!(ram[13], GUEST_LM_PORT);
+        assert_eq!(ram[14], 0xF4, "HLT");
+    }
+
+    #[test]
+    fn ldt_and_tss_descriptors_land_in_the_guest_gdt() {
+        let mut ram = vec![0u8; 0x0020_0000];
+        write_long_mode_gdt_and_gate(&mut ram);
+        write_long_mode_ldt_and_tss(&mut ram);
+
+        // The base GDT is untouched: [0] null, [1] code, [2] data.
+        let g = GUEST_LM_GDT_GPA;
+        assert_eq!(
+            u64::from_le_bytes(ram[g + 8..g + 16].try_into().unwrap()),
+            0x00AF_9B00_0000_FFFF,
+            "64-bit code descriptor"
+        );
+
+        // GDT entries 3+4: 16-byte LDT descriptor → base GUEST_LM_LDT_GPA,
+        // type 0x82 (present, system, LDT), limit 0xFFFF.
+        let ldt_base = GUEST_LM_LDT_GPA as u64;
+        assert_eq!(ram[g + 24], 0xFF, "LDT limit 15:0");
+        assert_eq!(ram[g + 25], 0xFF);
+        assert_eq!(ram[g + 26], (ldt_base & 0xFF) as u8, "LDT base 15:8");
+        assert_eq!(ram[g + 29], 0x82, "P|DPL0|S=0|LDT");
+        assert_eq!(ram[g + 30], 0x0F, "limit 19:16");
+        let ldt_high = u64::from_le_bytes(ram[g + 32..g + 40].try_into().unwrap());
+        assert_eq!(ldt_high, ldt_base >> 32, "LDT base 63:32");
+
+        // GDT entries 5+6: 16-byte busy-TSS descriptor → base GUEST_LM_TSS_GPA,
+        // type 0x8B (present, system, busy TSS), limit 0x67 (104 bytes).
+        let tss_base = GUEST_LM_TSS_GPA as u64;
+        assert_eq!(ram[g + 40], 0x67, "TSS limit 15:0");
+        assert_eq!(ram[g + 41], 0x00);
+        assert_eq!(ram[g + 42], (tss_base & 0xFF) as u8, "TSS base 15:8");
+        assert_eq!(ram[g + 45], 0x8B, "P|DPL0|S=0|busy TSS");
+        assert_eq!(ram[g + 46], 0x00, "limit 19:16");
+        let tss_high = u64::from_le_bytes(ram[g + 48..g + 56].try_into().unwrap());
+        assert_eq!(tss_high, tss_base >> 32, "TSS base 63:32");
+
+        // The selectors the VMCB slots will carry index those descriptors:
+        // 0x18 = entry 3, 0x28 = entry 5.
+        assert_eq!(GUEST_LM_LDTR_SELECTOR, 0x18);
+        assert_eq!(GUEST_LM_TR_SELECTOR, 0x28);
+
+        // The LDT: null entry + one 16-byte data descriptor.
+        let l = GUEST_LM_LDT_GPA;
+        assert!(ram[l..l + 16].iter().all(|&b| b == 0), "LDT null entry");
+        assert_eq!(
+            u64::from_le_bytes(ram[l + 16..l + 24].try_into().unwrap()),
+            0x0000_9200_0000_FFFF,
+            "LDT data descriptor"
+        );
+
+        // The TSS: zeroed except the I/O-map base at offset 102, just past
+        // the 0x67 limit — the standard "no I/O bitmap" value.
+        let t = GUEST_LM_TSS_GPA;
+        assert!(ram[t..t + 102].iter().all(|&b| b == 0), "TSS body zeroed");
+        assert_eq!(ram[t + 102], 0x68, "I/O-map base low");
+        assert_eq!(ram[t + 103], 0x00, "I/O-map base high");
     }
 
     #[test]
