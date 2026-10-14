@@ -126,6 +126,108 @@ pub const LEAF7_ECX_PASSTHROUGH: u32 = (1 << 2)  // UMIP
     | (1 << 10) // VPCLMULQDQ
     | (1 << 22); // RDPID
 
+/// Leaf 1 ECX bits safe to advertise for a **cross-vendor** identity.
+///
+/// The vendor-neutral instruction-set extensions both vendors define
+/// identically and the virtual platform genuinely backs. Deliberately
+/// **excluded**: every vendor-specific bit whose presence would name the host
+/// vendor — VMX (5), SMX (6), EIST (7), TM2 (8) are Intel-only; DTES64 (2),
+/// DS-CPL (4), CNXT-ID (10), SDBG (11), XTPR (14), PDCM (15), DCA (18) are
+/// Intel-defined debug/power hints AMD leaves reserved; PCID (17) is dropped
+/// conservatively (under-advertising a feature is never a tell). MONITOR (3)
+/// and the hypervisor bit (31) are cleared separately by `build_leaf_1`.
+pub const LEAF1_ECX_CROSS_VENDOR: u32 = (1 << 0)  // SSE3
+    | (1 << 1)  // PCLMULQDQ
+    | (1 << 9)  // SSSE3
+    | (1 << 12) // FMA
+    | (1 << 13) // CMPXCHG16B
+    | (1 << 19) // SSE4.1
+    | (1 << 20) // SSE4.2
+    | (1 << 21) // X2APIC (the run loop stamps per-vCPU x2APIC IDs)
+    | (1 << 22) // MOVBE
+    | (1 << 23) // POPCNT
+    | (1 << 24) // TSC-DEADLINE (IA32_TSC_DEADLINE is LAPIC-emulated)
+    | (1 << 25) // AESNI
+    | (1 << 26) // XSAVE
+    | (1 << 27) // OSXSAVE
+    | (1 << 28) // AVX
+    | (1 << 29) // F16C
+    | (1 << 30); // RDRAND
+
+/// Leaf 1 EDX bits safe to advertise for a **cross-vendor** identity.
+///
+/// The classic feature flags both vendors define identically. Deliberately
+/// **excluded**: the vendor-specific tells — PSN (18, Intel processor serial
+/// number), DS (21, Intel debug store), TM (29, Intel thermal monitor),
+/// PBE (31, Intel pending-break enable).
+pub const LEAF1_EDX_CROSS_VENDOR: u32 = (1 << 0)  // FPU
+    | (1 << 1)  // VME
+    | (1 << 2)  // DE
+    | (1 << 3)  // PSE
+    | (1 << 4)  // TSC
+    | (1 << 5)  // MSR
+    | (1 << 6)  // PAE
+    | (1 << 7)  // MCE
+    | (1 << 8)  // CX8
+    | (1 << 9)  // APIC
+    | (1 << 11) // SEP
+    | (1 << 12) // MTRR
+    | (1 << 13) // PGE
+    | (1 << 14) // MCA
+    | (1 << 15) // CMOV
+    | (1 << 16) // PAT
+    | (1 << 17) // PSE36
+    | (1 << 19) // CLFSH
+    | (1 << 22) // ACPI
+    | (1 << 23) // MMX
+    | (1 << 24) // FXSR
+    | (1 << 25) // SSE
+    | (1 << 26) // SSE2
+    | (1 << 27) // SS (self snoop)
+    | (1 << 28); // HTT
+
+/// A synthetic-but-real CPU identity for a cross-vendor masquerade: the
+/// family/model/stepping, brand string, and frequencies of an actual retail
+/// part of the presented vendor, kept mutually coherent (the brand names the
+/// part the FMS encodes; the frequencies are that part's spec).
+///
+/// Only used by [`CpuidStealthConfig::cross_vendor`], which is x86-64-only.
+#[cfg(target_arch = "x86_64")]
+struct SyntheticPart {
+    family_model_stepping: u32,
+    brand: &'static str,
+    base_frequency_mhz: u32,
+    max_frequency_mhz: u32,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl SyntheticPart {
+    /// Intel Core i7-8700K (Coffee Lake-S): family 6, model 0x9E, stepping 0xA.
+    const INTEL: Self = Self {
+        family_model_stepping: 0x0009_06EA,
+        brand: "Intel(R) Core(TM) i7-8700K CPU @ 3.70GHz",
+        base_frequency_mhz: 3700,
+        max_frequency_mhz: 4700,
+    };
+    /// AMD Ryzen 9 5950X (Vermeer / Zen 3): family 0x19, model 0x21, stepping 0.
+    /// Zen 3 predates `PerfMonV2`, so a synthetic identity that omits the
+    /// `0x8000_0022` leaf is coherent with the part (cf. the `perfmon_v2`
+    /// capture, which must stay `None` here).
+    const AMD: Self = Self {
+        family_model_stepping: 0x00A2_0F10,
+        brand: "AMD Ryzen 9 5950X 16-Core Processor",
+        base_frequency_mhz: 3400,
+        max_frequency_mhz: 4900,
+    };
+
+    const fn for_vendor(vendor: CpuVendor) -> Self {
+        match vendor {
+            CpuVendor::Intel => Self::INTEL,
+            CpuVendor::Amd => Self::AMD,
+        }
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 impl CpuidStealthConfig {
     /// Build a stealth config **from the host CPU's own CPUID**, so the
@@ -251,6 +353,61 @@ impl CpuidStealthConfig {
             base_frequency_mhz,
             max_frequency_mhz,
             perfmon_v2,
+        }
+    }
+
+    /// Build a stealth config presenting `presented` — possibly a **different**
+    /// vendor than the physical host — so the synthesized table can masquerade
+    /// as the other vendor at runtime (e.g. Intel-on-AMD).
+    ///
+    /// When `presented` equals the host vendor this is exactly
+    /// [`from_host`](Self::from_host). Otherwise the vendor-neutral facts are
+    /// still captured from the host CPU (the instruction set the physical CPU
+    /// executes is real, and advertising *less* than the host has is never a
+    /// tell), but every vendor-specific identity fact is synthesized for the
+    /// presented vendor, because the host's own identity facts describe a
+    /// machine the guest must not see:
+    /// - the vendor string, family/model/stepping, and brand string become a
+    ///   coherent synthetic retail part ([`SyntheticPart`]);
+    /// - the cache geometry is synthesized for the presented vendor (the host
+    ///   leaf-4 pass-through is the *host* vendor's geometry);
+    /// - the leaf-1 feature flags are masked to [`LEAF1_ECX_CROSS_VENDOR`] /
+    ///   [`LEAF1_EDX_CROSS_VENDOR`], dropping vendor-specific bits (VMX, TM,
+    ///   PSN, …) that would name the host vendor — `build`'s leaf-7 allowlists
+    ///   already do the same for the structured features;
+    /// - `perfmon_v2` stays `None`: the synthetic AMD part (Zen 3) predates
+    ///   `PerfMonV2`, so omitting the leaf is coherent with the part.
+    ///
+    /// A cross-vendor table is only half of the switch: the guest will probe
+    /// the presented vendor's MSRs, so pair this with vendor-appropriate MSR
+    /// emulation — `StealthMsrRouter::with_emulated_vendor` /
+    /// `StandardPc::install_stealth_msr_routers_for_identity` /
+    /// `StealthRunLoop::install_cross_vendor` (in `enlil-core`) — and install
+    /// the table with `apply_topology_stealth`, or the CPUID/MSR views will
+    /// disagree and the masquerade is worse than no masquerade.
+    #[must_use]
+    pub fn cross_vendor(presented: CpuVendor, vcpu_count: u32, threads_per_core: u32) -> Self {
+        if presented == CpuVendor::detect_host() {
+            return Self::from_host(vcpu_count, threads_per_core);
+        }
+        let host = Self::from_host(vcpu_count, threads_per_core);
+        let part = SyntheticPart::for_vendor(presented);
+        Self {
+            vendor: presented,
+            family_model_stepping: part.family_model_stepping,
+            features_ecx: host.features_ecx & LEAF1_ECX_CROSS_VENDOR,
+            features_edx: host.features_edx & LEAF1_EDX_CROSS_VENDOR,
+            brand_string: brand_string_from_str(part.brand),
+            // The host's cache_info is the host vendor's geometry (Intel
+            // leaf-4 pass-through); drop it so `build` synthesizes the
+            // presented vendor's hierarchy instead.
+            cache_info: Vec::new(),
+            base_frequency_mhz: part.base_frequency_mhz,
+            max_frequency_mhz: part.max_frequency_mhz,
+            // The synthetic AMD part predates PerfMonV2; the synthetic Intel
+            // part never had it. Never claim a PMU capability beyond the part.
+            perfmon_v2: None,
+            ..host
         }
     }
 }
@@ -1818,5 +1975,124 @@ mod tests {
         let result = table.lookup(0, 0);
         let ebx_bytes = result.ebx.to_le_bytes();
         assert_eq!(&ebx_bytes, b"Genu");
+    }
+
+    /// Presenting the host's own vendor through `cross_vendor` is exactly
+    /// `from_host` — no synthetic rewriting fires.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn cross_vendor_with_host_vendor_is_from_host() {
+        let host = CpuVendor::detect_host();
+        let a = CpuidStealthConfig::cross_vendor(host, 4, 2);
+        let b = CpuidStealthConfig::from_host(4, 2);
+        assert_eq!(a.vendor, b.vendor);
+        assert_eq!(a.family_model_stepping, b.family_model_stepping);
+        assert_eq!(a.brand_string, b.brand_string);
+        assert_eq!(a.features_ecx, b.features_ecx);
+        assert_eq!(a.features_edx, b.features_edx);
+        assert_eq!(a.cache_info, b.cache_info);
+        assert_eq!(a.base_frequency_mhz, b.base_frequency_mhz);
+        assert_eq!(a.max_frequency_mhz, b.max_frequency_mhz);
+    }
+
+    /// Read back the 48-byte brand string from leaves 0x80000002-4.
+    #[cfg(target_arch = "x86_64")]
+    fn brand_of(table: &CpuidStealthTable) -> String {
+        let mut brand = Vec::with_capacity(48);
+        for leaf in 0x8000_0002..=0x8000_0004 {
+            let r = table.lookup(leaf, 0);
+            for reg in [r.eax, r.ebx, r.ecx, r.edx] {
+                brand.extend_from_slice(&reg.to_le_bytes());
+            }
+        }
+        std::str::from_utf8(&brand)
+            .unwrap()
+            .trim_end_matches('\0')
+            .to_owned()
+    }
+
+    /// A cross-vendor table for the *other* vendor than this host carries a
+    /// coherent synthetic identity: the presented vendor string, a matching
+    /// synthetic FMS + brand, masked feature flags, and vendor-correct leaves —
+    /// with no hypervisor tells under the detection primitives.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn cross_vendor_foreign_identity_is_synthetic_and_coherent() {
+        use super::super::detection::{cpuid_reveals_hypervisor, is_genuine_cpu_vendor};
+
+        let foreign = match CpuVendor::detect_host() {
+            CpuVendor::Intel => CpuVendor::Amd,
+            CpuVendor::Amd => CpuVendor::Intel,
+        };
+        let table = CpuidStealthTable::build(&CpuidStealthConfig::cross_vendor(foreign, 8, 2));
+
+        // The presented vendor string is genuine and names the foreign vendor.
+        let r0 = table.lookup(0, 0);
+        assert_eq!((r0.ebx, r0.edx, r0.ecx), foreign.vendor_regs());
+        assert!(is_genuine_cpu_vendor(r0.ebx, r0.edx, r0.ecx));
+
+        // Synthetic FMS + brand cohere with the presented vendor's part.
+        let (fms, brand_prefix) = match foreign {
+            CpuVendor::Intel => (0x0009_06EAu32, "Intel(R) Core(TM) i7-8700K"),
+            CpuVendor::Amd => (0x00A2_0F10u32, "AMD Ryzen 9 5950X"),
+        };
+        assert_eq!(table.lookup(1, 0).eax, fms);
+        let brand = brand_of(&table);
+        assert!(
+            brand.starts_with(brand_prefix),
+            "brand string must name the synthetic part, got {brand:?}"
+        );
+
+        // No feature bit outside the cross-vendor allowlists survives — in
+        // particular no vendor-specific bit (VMX, TM, PSN, …) leaks the host.
+        let leaf1 = table.lookup(1, 0);
+        assert_eq!(leaf1.ecx & !LEAF1_ECX_CROSS_VENDOR, 0, "ECX allowlist");
+        assert_eq!(leaf1.edx & !LEAF1_EDX_CROSS_VENDOR, 0, "EDX allowlist");
+        assert_eq!(leaf1.ecx & (1 << 31), 0, "hypervisor bit");
+
+        match foreign {
+            CpuVendor::Intel => {
+                assert_eq!(table.lookup(0, 0).eax, 0x16);
+                // Architectural PMU v5, consistent with the PMC shadow.
+                assert_eq!(table.lookup(0xA, 0).eax & 0xFF, 5);
+                // Synthetic frequencies: 3700/4700, TSC rate = base exactly.
+                let r16 = table.lookup(0x16, 0);
+                assert_eq!((r16.eax, r16.ebx), (3700, 4700));
+                let r15 = table.lookup(0x15, 0);
+                assert_eq!(
+                    u64::from(r15.ecx) * u64::from(r15.ebx) / u64::from(r15.eax),
+                    3700 * 1_000_000
+                );
+                // No AMD TOPOEXT on an Intel identity.
+                assert_eq!(table.lookup(0x8000_0001, 0).ecx & (1 << 22), 0);
+                // Turbo headroom covers the PMC rate model's core/ref ratio.
+                let model = crate::stealth::pmc::PmcRateModel::DEFAULT;
+                assert!(u64::from(r16.ebx) * 1000 >= u64::from(r16.eax) * model.core_per_kilo_ref);
+            }
+            CpuVendor::Amd => {
+                assert_eq!(table.lookup(0, 0).eax, 0x10);
+                assert_eq!(table.lookup(0x8000_0000, 0).eax, 0x8000_001F);
+                // TOPOEXT gates the topology leaves; both present together.
+                assert_ne!(table.lookup(0x8000_0001, 0).ecx & (1 << 22), 0);
+                assert_ne!(table.lookup(0x8000_001D, 0).eax & 0x1F, 0);
+                assert_ne!(table.lookup(0x8000_001E, 0).ebx, 0);
+                // Legacy cache leaves populated for the synthetic hierarchy.
+                assert_ne!(table.lookup(0x8000_0005, 0).ecx, 0);
+                assert_ne!(table.lookup(0x8000_0006, 0).ecx, 0);
+                // The synthetic Zen-3 part predates PerfMonV2: no 0x80000022.
+                assert_eq!(table.lookup(0x8000_0022, 0), CpuidResult::default());
+                // No Intel-only leaves on an AMD identity.
+                assert_eq!(table.lookup(0xA, 0), CpuidResult::default());
+                assert_eq!(table.lookup(0x15, 0), CpuidResult::default());
+                assert_eq!(table.lookup(0x16, 0), CpuidResult::default());
+            }
+        }
+
+        // The detection primitives find no hypervisor tell in the masquerade.
+        let hv = table.lookup(0x4000_0000, 0);
+        assert!(
+            !cpuid_reveals_hypervisor(leaf1.ecx, hv.ebx, hv.ecx, hv.edx),
+            "cross-vendor identity must be undetectable"
+        );
     }
 }
