@@ -536,7 +536,7 @@ mod hw {
         if let Some(hz) = tsc_hz {
             bring_up_smp(&serial, apic_id.unwrap_or(0), hz);
         }
-        bring_up_pci(&serial);
+        bring_up_pci(&serial, handoff);
         bring_up_xhci(&serial);
         bring_up_net(&serial);
         let map = bring_up_paging(&serial, handoff, highest_usable_end);
@@ -1130,8 +1130,30 @@ mod hw {
     /// device discovery every passthrough/IOMMU step builds on (ROADMAP 6.3).
     ///
     /// Reads the host bridge (00:00.0) identity as a proof the config reads
-    /// reach real hardware and counts the present functions on bus 0.
-    fn bring_up_pci(serial: &SerialPort) {
+    /// reach real hardware and counts the present functions on bus 0. Also
+    /// reports the PCI root-bridge inventory the UEFI stage collected from
+    /// the firmware's PCI Root Bridge I/O protocol handles (roadmap 6.1) —
+    /// the segment + bus-range record the boot device tree consumes.
+    fn bring_up_pci(serial: &SerialPort, handoff: &BootHandoff) {
+        let bridges = handoff.pci_root_bridges();
+        let mut n = [0u8; 20];
+        serial.write_str("enlil kernel: pci: firmware reported ");
+        serial.write_str(format_u64(bridges.len() as u64, &mut n));
+        serial.write_str(" PCI root bridge(s)");
+        for bridge in bridges {
+            let mut seg = [0u8; 20];
+            let mut lo = [0u8; 20];
+            let mut hi = [0u8; 20];
+            serial.write_str(" [seg ");
+            serial.write_str(format_u64(u64::from(bridge.segment), &mut seg));
+            serial.write_str(" buses ");
+            serial.write_str(format_u64(u64::from(bridge.bus_start), &mut lo));
+            serial.write_str("-");
+            serial.write_str(format_u64(u64::from(bridge.bus_end), &mut hi));
+            serial.write_str("]");
+        }
+        serial.write_str("\n");
+
         let scan = crate::pci::scan_bus0();
         let mut ven = [0u8; 18];
         let mut dev = [0u8; 18];
