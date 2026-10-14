@@ -182,7 +182,7 @@ mod linux {
     use super::{GuestExit, VmExitHandler};
     use crate::error::{Error, Result};
     use enlil_devices::usb::xhci::transfer::DmaMemory;
-    use kvm_bindings::{kvm_run, kvm_userspace_memory_region};
+    use kvm_bindings::{kvm_run, kvm_userspace_memory_region, KVM_MEM_READONLY};
     use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
     use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
     use std::ptr::NonNull;
@@ -1310,6 +1310,50 @@ mod linux {
             Ok(entry)
         }
 
+        /// Map a guest-physical region as **read-only** (`KVM_MEM_READONLY`).
+        ///
+        /// Used for the OVMF CODE flash (item 5.6): the code image may be
+        /// shared between guests, and a guest write to it must trap as MMIO
+        /// rather than silently corrupting the shared image.
+        ///
+        /// # Safety
+        /// As [`map_memory`](Self::map_memory).
+        ///
+        /// # Errors
+        /// Returns [`Error::HypervisorError`] if `KVM_SET_USER_MEMORY_REGION`
+        /// fails.
+        pub unsafe fn map_memory_readonly(
+            &mut self,
+            guest_phys_addr: u64,
+            host_addr: u64,
+            size: u64,
+        ) -> Result<MemSlot> {
+            validate_region(guest_phys_addr, host_addr, size)?;
+            let slot = self.next_slot;
+            let region = kvm_userspace_memory_region {
+                slot,
+                flags: KVM_MEM_READONLY,
+                guest_phys_addr,
+                memory_size: size,
+                userspace_addr: host_addr,
+            };
+            // SAFETY: forwarded from this function's safety contract.
+            unsafe {
+                self.vm.set_user_memory_region(region).map_err(|e| {
+                    Error::HypervisorError(format!("KVM_SET_USER_MEMORY_REGION (readonly): {e}"))
+                })?;
+            }
+            self.next_slot += 1;
+            let entry = MemSlot {
+                slot,
+                guest_phys_addr,
+                size,
+                host_addr,
+            };
+            self.slots.push(entry);
+            Ok(entry)
+        }
+
         /// Create a vCPU with the given APIC id and return its index.
         ///
         /// # Errors
@@ -1632,6 +1676,52 @@ mod linux {
                 .get_regs()
                 .map_err(|e| Error::Vcpu(format!("KVM_GET_REGS: {e}")))?;
             regs.rip = entry;
+            regs.rflags = 0x2;
+            vcpu.set_regs(&regs)
+                .map_err(|e| Error::Vcpu(format!("KVM_SET_REGS: {e}")))?;
+            Ok(())
+        }
+
+        /// Prepare vCPU `index` for the x86 **firmware reset vector**: real
+        /// mode with `CS = 0xF000` (base `0xFFFF_0000`) and `RIP = 0xFFF0`,
+        /// i.e. the linear address `0xFFFF_FFF0` where an OVMF CODE flash
+        /// image's SEC entry point lives (item 5.6). This is the state real
+        /// hardware powers on in; OVMF transitions itself to protected/long
+        /// mode from here.
+        ///
+        /// # Errors
+        /// Returns [`Error::Vcpu`] if `index` is out of range or any of the
+        /// `KVM_{GET,SET}_{SREGS,REGS}` ioctls fail.
+        pub fn prepare_reset_vector_vcpu(&self, index: usize) -> Result<()> {
+            let vcpu = self
+                .vcpus
+                .get(index)
+                .ok_or_else(|| Error::Vcpu(format!("no vcpu at index {index}")))?;
+
+            let mut sregs = vcpu
+                .get_sregs()
+                .map_err(|e| Error::Vcpu(format!("KVM_GET_SREGS: {e}")))?;
+            for seg in [
+                &mut sregs.ds,
+                &mut sregs.es,
+                &mut sregs.fs,
+                &mut sregs.gs,
+                &mut sregs.ss,
+            ] {
+                seg.base = 0;
+                seg.selector = 0;
+            }
+            // Power-on reset state: CS points at the top 64 KiB of the 4 GiB
+            // address space, IP at the reset vector offset.
+            sregs.cs.selector = 0xF000;
+            sregs.cs.base = 0xFFFF_0000;
+            vcpu.set_sregs(&sregs)
+                .map_err(|e| Error::Vcpu(format!("KVM_SET_SREGS: {e}")))?;
+
+            let mut regs = vcpu
+                .get_regs()
+                .map_err(|e| Error::Vcpu(format!("KVM_GET_REGS: {e}")))?;
+            regs.rip = 0xFFF0;
             regs.rflags = 0x2;
             vcpu.set_regs(&regs)
                 .map_err(|e| Error::Vcpu(format!("KVM_SET_REGS: {e}")))?;

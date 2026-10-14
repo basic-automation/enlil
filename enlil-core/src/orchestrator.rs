@@ -16,10 +16,19 @@
 //! [`boot_kernel`](GuestRuntime::boot_kernel) enters it per the 32-bit boot
 //! protocol. [`run_first_guest`] does the whole config→boot path end to end.
 //!
+//! [`GuestRuntime::prepare_uefi_boot`] instead boots a guest through its own
+//! virtual UEFI firmware (item 5.6): the OVMF CODE image mapped read-only
+//! below 4 GiB, a per-guest writable VARS store below it, and the boot vCPU
+//! starting at the x86 reset vector — the path Windows boots through in UEFI
+//! mode. [`boot_first_guest_uefi`] is the config-driven entry point.
+//!
 //! `target_os = "linux"`-only, like the run loop it drives.
 
 #[cfg(target_os = "linux")]
-pub use linux::{run_first_guest, usb_registry_for_boot, GuestBootSpec, GuestRuntime, KernelBoot};
+pub use linux::{
+    boot_first_guest_uefi, run_first_guest, usb_registry_for_boot, GuestBootSpec, GuestRuntime,
+    KernelBoot,
+};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -29,6 +38,7 @@ mod linux {
     use crate::kvm_backend::{GuestRam, KvmBackend, KvmVcpuState};
     use crate::run_loop::{LoopOutcome, StealthRunLoop};
     use crate::serial::{SerialOutput, SerialOutputMode};
+    use crate::uefi_firmware::{FlashBuffers, UefiFlashImage, RESET_VECTOR_GPA};
     use crate::Result;
     use enlil_config::{EnlilConfig, GuestConfig};
     use enlil_devices::acpi::facs::{FacsWaking, ResumeTarget, FACS_LENGTH};
@@ -38,7 +48,10 @@ mod linux {
     use enlil_devices::usb::registry::XhciRegistry;
     use enlil_devices::usb::types::GuestId;
     use enlil_devices::usb::SharedXhci;
+    use std::fs;
+    use std::path::{Path, PathBuf};
     use std::rc::Rc;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     /// What to boot: one guest's payload and the resources it runs in. The boot
     /// CPU mode is chosen by which `prepare_*` constructor is called.
@@ -82,13 +95,8 @@ mod linux {
             rtc_unix_secs: u64,
             platform: LbrPlatform,
         ) -> Self {
-            let mode = if config.serial.enabled {
-                SerialOutputMode::from_output_spec(&config.serial.output)
-            } else {
-                SerialOutputMode::Null
-            };
             Self {
-                serial: SerialOutput::new(&config.name, mode),
+                serial: serial_for_config(config),
                 name: config.name.clone(),
                 ram_bytes: (config.memory_mb as usize).saturating_mul(1024 * 1024),
                 load_base,
@@ -98,6 +106,41 @@ mod linux {
                 platform,
             }
         }
+
+        /// Build a boot spec for a guest that boots through its own virtual
+        /// UEFI firmware (item 5.6): no direct payload — the firmware flash
+        /// (mapped by [`GuestRuntime::prepare_uefi_boot`]) is the entry
+        /// point, so the vCPU starts at the x86 reset vector and the guest
+        /// RAM sits at guest-physical 0 below the flash window.
+        #[must_use]
+        pub fn uefi_from_guest_config(
+            config: &GuestConfig,
+            rtc_unix_secs: u64,
+            platform: LbrPlatform,
+        ) -> Self {
+            Self {
+                serial: serial_for_config(config),
+                name: config.name.clone(),
+                ram_bytes: (config.memory_mb as usize).saturating_mul(1024 * 1024),
+                load_base: 0,
+                entry: RESET_VECTOR_GPA,
+                image: Vec::new(),
+                rtc_unix_secs,
+                platform,
+            }
+        }
+    }
+
+    /// The guest's COM1 sink from its config: the configured output mode, or
+    /// [`Null`](SerialOutputMode::Null) when the config disables the serial
+    /// console.
+    fn serial_for_config(config: &GuestConfig) -> SerialOutput {
+        let mode = if config.serial.enabled {
+            SerialOutputMode::from_output_spec(&config.serial.output)
+        } else {
+            SerialOutputMode::Null
+        };
+        SerialOutput::new(&config.name, mode)
     }
 
     /// Where [`GuestRuntime::load_bzimage`] placed a loaded kernel — the entry
@@ -132,6 +175,11 @@ mod linux {
         /// is dropped last — the KVM VM (inside `run`) referencing this memory must
         /// tear down before the buffer is freed.
         ram: GuestRam,
+        /// The guest's virtual UEFI flash buffers (item 5.6): CODE mapped
+        /// read-only just below 4 GiB, the private VARS store writable just
+        /// below it. `None` for direct payload/kernel boots. Declared after
+        /// `run` for the same drop-ordering reason as `ram`.
+        flash: Option<FlashBuffers>,
     }
 
     impl GuestRuntime {
@@ -156,6 +204,7 @@ mod linux {
                 load_base,
                 xhci,
                 ram,
+                flash: None,
             })
         }
 
@@ -178,6 +227,7 @@ mod linux {
                 load_base,
                 xhci,
                 ram,
+                flash: None,
             })
         }
 
@@ -239,15 +289,17 @@ mod linux {
                 load_base,
                 xhci,
                 ram,
+                flash: None,
             })
         }
 
-        /// Shared setup for both boot modes: validate the spec, build the PC,
-        /// install the run loop, allocate+load+map guest RAM, and create the boot
-        /// vCPU. Returns the run loop, the RAM to keep alive, and the entry point;
-        /// the caller applies the mode-specific `prepare_*_vcpu`.
+        /// Shared setup for the direct-payload boot modes: validate the spec,
+        /// build the PC, install the run loop, allocate+load+map guest RAM,
+        /// and create the boot vCPU. Returns the run loop, the RAM to keep
+        /// alive, and the entry point; the caller applies the mode-specific
+        /// `prepare_*_vcpu`.
         fn assemble(
-            spec: GuestBootSpec,
+            mut spec: GuestBootSpec,
         ) -> Result<(StealthRunLoop, GuestRam, u64, u64, SharedXhci)> {
             if spec.entry < spec.load_base {
                 return Err(Error::Config(format!(
@@ -269,6 +321,21 @@ mod linux {
                 })?;
             debug_assert!(end <= spec.ram_bytes);
 
+            // Take the payload out before `spec` moves into `assemble_common`.
+            let image = std::mem::take(&mut spec.image);
+            let entry = spec.entry;
+            let load_base = spec.load_base;
+            let (run, mut ram, xhci) = Self::assemble_common(spec)?;
+            ram.as_mut_slice()[offset..end].copy_from_slice(&image);
+            Ok((run, ram, entry, load_base, xhci))
+        }
+
+        /// Boot-mode-independent half of [`assemble`](Self::assemble): build
+        /// the standard PC, install the stealth run loop, allocate and map
+        /// guest RAM, create the boot vCPU, and apply CPUID stealth. The
+        /// caller loads the payload (or maps firmware flash, for UEFI boot)
+        /// and prepares the vCPU.
+        fn assemble_common(spec: GuestBootSpec) -> Result<(StealthRunLoop, GuestRam, SharedXhci)> {
             let pc = DeviceBus::standard_pc_complete_seeded(
                 spec.serial,
                 spec.rtc_unix_secs,
@@ -286,8 +353,7 @@ mod linux {
             let backend = KvmBackend::new_without_irqchip()?;
             let mut run = StealthRunLoop::install(backend, pc, spec.platform)?;
 
-            let mut ram = GuestRam::new(spec.ram_bytes);
-            ram.as_mut_slice()[offset..end].copy_from_slice(&spec.image);
+            let ram = GuestRam::new(spec.ram_bytes);
             let host_addr = ram.host_addr();
             // SAFETY: `ram` is returned to and owned by the GuestRuntime, dropped
             // after `run`, so the mapped host buffer outlives the KVM VM slot.
@@ -308,7 +374,86 @@ mod linux {
             run.apply_topology_stealth(&table)?;
             run.apply_pmu_stealth(&table)?;
 
-            Ok((run, ram, spec.entry, spec.load_base, xhci))
+            Ok((run, ram, xhci))
+        }
+
+        /// Assemble a runnable single-vCPU guest that boots through its own
+        /// virtual UEFI firmware (item 5.6): map the OVMF CODE image
+        /// **read-only** just below the top of 4 GiB and the guest's private
+        /// VARS store **writable** just below the code, then start the boot
+        /// vCPU at the x86 reset vector (`0xFFFF_FFF0`) — exactly the state
+        /// power-on hardware starts in. OVMF brings itself up from there and
+        /// boots the guest's disks in UEFI mode (the Windows boot path).
+        ///
+        /// The CODE image may be shared between guests (it is never written);
+        /// the VARS buffer is per-guest and writable, owned by this runtime
+        /// for the VM's lifetime. The guest RAM (`spec.load_base` /
+        /// `spec.ram_bytes`) must not reach into the flash window — that is
+        /// checked before any KVM state is created.
+        ///
+        /// # Errors
+        /// Returns [`Error::Config`] if the guest RAM overlaps the firmware
+        /// flash window; otherwise as [`prepare_real_mode`](Self::prepare_real_mode),
+        /// propagating [`KvmBackend::map_memory`] and
+        /// `prepare_reset_vector_vcpu`.
+        pub fn prepare_uefi_boot(spec: GuestBootSpec, image: UefiFlashImage) -> Result<Self> {
+            image
+                .layout()
+                .check_ram_no_overlap(spec.load_base, spec.ram_bytes)?;
+            let load_base = spec.load_base;
+            let (mut run, ram, xhci) = Self::assemble_common(spec)?;
+            let buffers = image.into_buffers();
+            let layout = buffers.layout;
+            // SAFETY: `buffers` moves into the returned GuestRuntime (its
+            // `flash` field is declared after `run`, so it is dropped after
+            // the KVM VM tears down), keeping both mapped host buffers alive
+            // for the VM's lifetime — the same contract as `ram`.
+            unsafe {
+                run.backend_mut().map_memory_readonly(
+                    layout.code_gpa,
+                    buffers.code.host_addr(),
+                    layout.code_size,
+                )?;
+                run.backend_mut().map_memory(
+                    layout.vars_gpa,
+                    buffers.vars.host_addr(),
+                    layout.vars_size,
+                )?;
+            }
+            run.backend_mut().prepare_reset_vector_vcpu(0)?;
+            Ok(Self {
+                run,
+                load_base,
+                xhci,
+                ram,
+                flash: Some(buffers),
+            })
+        }
+
+        /// Run a UEFI-booted guest until it halts, resets to the firmware
+        /// reset vector, or commits a sleep transition — or `max_entries`
+        /// guest entries elapse.
+        ///
+        /// # Errors
+        /// Propagates [`StealthRunLoop::run_uefi`].
+        pub fn run_uefi(&mut self, max_entries: usize) -> Result<LoopOutcome> {
+            self.run.run_uefi(0, max_entries)
+        }
+
+        /// Write the guest's (possibly guest-modified) firmware variable store
+        /// back to `path` — the staged per-guest VARS file
+        /// [`boot_first_guest_uefi`] created — so NVRAM changes (boot order,
+        /// enrolled keys) survive the run. Does nothing for guests booted
+        /// without firmware.
+        ///
+        /// # Errors
+        /// [`Error::Io`] if the write fails.
+        pub fn persist_firmware_vars(&self, path: &Path) -> Result<()> {
+            if let Some(flash) = &self.flash {
+                let len = flash.layout.vars_size as usize;
+                fs::write(path, &flash.vars.as_slice()[..len])?;
+            }
+            Ok(())
         }
 
         /// Run the boot vCPU until it halts, resets to `reset_entry`, or commits a
@@ -372,6 +517,37 @@ mod linux {
                     Error::Config(format!("gpa {gpa:#x}+{len:#x} overruns guest RAM"))
                 })?;
             Ok(start..end)
+        }
+
+        /// Read `len` bytes from the guest's firmware flash (the CODE or VARS
+        /// window) at guest-physical `gpa` — e.g. to inspect what the guest's
+        /// virtual UEFI actually contains. Bounds-checked against both flash
+        /// windows.
+        ///
+        /// # Errors
+        /// Returns [`Error::Config`] if the guest was not booted with
+        /// firmware or `[gpa, gpa+len)` lies outside both flash windows.
+        pub fn read_flash_bytes(&self, gpa: u64, len: usize) -> Result<Vec<u8>> {
+            let flash = self
+                .flash
+                .as_ref()
+                .ok_or_else(|| Error::Config("guest was not booted with firmware".into()))?;
+            let layout = flash.layout;
+            let end = gpa.checked_add(len as u64).ok_or_else(|| {
+                Error::Config(format!("flash read [{gpa:#x}, +{len:#x}) overflows"))
+            })?;
+            for (buf, base, size) in [
+                (&flash.code, layout.code_gpa, layout.code_size),
+                (&flash.vars, layout.vars_gpa, layout.vars_size),
+            ] {
+                if gpa >= base && end <= base + size {
+                    let off = (gpa - base) as usize;
+                    return Ok(buf.as_slice()[off..off + len].to_vec());
+                }
+            }
+            Err(Error::Config(format!(
+                "flash read [{gpa:#x}, +{len:#x}) is outside the firmware windows"
+            )))
         }
 
         /// Write `bytes` into guest RAM at guest-physical `gpa` — e.g. to load a
@@ -750,6 +926,61 @@ mod linux {
         runtime.boot_kernel(&boot)?;
         Ok((runtime.run(0, max_entries)?, usb_registry))
     }
+
+    /// Boot the first guest defined in `config` through its own virtual UEFI
+    /// firmware (item 5.6), running it until it halts / resets / sleeps or
+    /// `max_entries` guest entries elapse.
+    ///
+    /// The guest must carry a `[guest.<id>.firmware]` block naming its OVMF
+    /// CODE image and VARS template: the CODE image is mapped read-only just
+    /// below 4 GiB (a shared image stays shared — the guest can never write
+    /// through it), the VARS template is staged to a per-guest writable store
+    /// under `state_dir` (created from the template on first boot, preserved
+    /// afterwards so NVRAM survives reboots, written back after the run), and
+    /// the boot vCPU starts at the x86 reset vector exactly like power-on
+    /// hardware — the path Windows boots through in UEFI mode.
+    ///
+    /// Returns the run outcome, the live USB hot-plug registry (T-4.2, as in
+    /// [`run_first_guest`]), and the staged per-guest VARS path.
+    ///
+    /// # Errors
+    /// Returns [`Error::Config`] if `config` has no guests, the guest has no
+    /// firmware block, or the firmware images fail to load/validate; if the
+    /// `[usb.routing]` block names a target guest that isn't being booted; or
+    /// propagates the [`GuestRuntime`] preparation, run, and VARS-persist
+    /// errors.
+    pub fn boot_first_guest_uefi(
+        config: &EnlilConfig,
+        state_dir: &Path,
+        max_entries: usize,
+    ) -> Result<(LoopOutcome, XhciRegistry, PathBuf)> {
+        let (id, guest) = config
+            .guest
+            .iter()
+            .next()
+            .ok_or_else(|| Error::Config("configuration has no guests to boot".into()))?;
+        let fw = guest.firmware.as_ref().ok_or_else(|| {
+            Error::Config(format!(
+                "guest '{id}': UEFI boot needs a [guest.<id>.firmware] block naming \
+                 the OVMF code and vars images"
+            ))
+        })?;
+        let (image, staged_vars) = UefiFlashImage::load_for_guest(fw, id, state_dir)?;
+        // Windows reads wall-clock time from the CMOS; seed the RTC calendar
+        // with now rather than the epoch.
+        let rtc_unix_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let spec =
+            GuestBootSpec::uefi_from_guest_config(guest, rtc_unix_secs, LbrPlatform::detect_host());
+        let mut runtime = GuestRuntime::prepare_uefi_boot(spec, image)?;
+        // T-4.2: consult the configured [usb.routing] at boot, as in run_first_guest.
+        let usb_registry = usb_registry_for_boot(config, [(&guest.name, runtime.xhci().clone())])?;
+        let outcome = runtime.run_uefi(max_entries)?;
+        runtime.persist_firmware_vars(&staged_vars)?;
+        Ok((outcome, usb_registry, staged_vars))
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -758,7 +989,9 @@ mod tests {
     use crate::kvm_backend::is_kvm_available;
     use crate::run_loop::LoopOutcome;
     use crate::serial::{SerialOutput, SerialOutputMode};
+    use crate::uefi_firmware::{UefiFlashImage, RESET_VECTOR_GPA};
     use enlil_devices::stealth::lbr::LbrPlatform;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -824,6 +1057,158 @@ mod tests {
             platform: LbrPlatform::AmdSvm,
         };
         assert!(GuestRuntime::prepare_real_mode(spec).is_err());
+    }
+
+    /// Unwrap the `Err` side of a `Result` whose `Ok` type is not `Debug`
+    /// (so neither `unwrap_err` nor `expect_err` can be used).
+    fn expect_err<T>(result: std::result::Result<T, crate::Error>, what: &str) -> crate::Error {
+        match result {
+            Ok(_) => panic!("expected {what} to fail"),
+            Err(err) => err,
+        }
+    }
+
+    /// Minimal plausible flash image for validation-only tests: 64 KiB with
+    /// the `_FVH` firmware-volume signature at the header offset.
+    fn fake_firmware_image() -> Vec<u8> {
+        let mut img = vec![0u8; 64 * 1024];
+        img[0x28..0x2C].copy_from_slice(b"_FVH");
+        img
+    }
+
+    fn uefi_test_guest(
+        firmware: Option<enlil_config::FirmwareConfig>,
+    ) -> enlil_config::GuestConfig {
+        enlil_config::GuestConfig {
+            name: "Windows 11".into(),
+            cpus: vec![0],
+            memory_mb: 3072,
+            kernel: None,
+            initrd: None,
+            cmdline: String::new(),
+            scheduling: enlil_config::SchedulingMode::Auto,
+            disks: vec![],
+            serial: enlil_config::SerialPortConfig::default(),
+            mac: None,
+            firmware,
+        }
+    }
+
+    fn uefi_boot_test_config(
+        firmware: Option<enlil_config::FirmwareConfig>,
+    ) -> enlil_config::EnlilConfig {
+        let mut guests = std::collections::HashMap::new();
+        guests.insert("win11".to_string(), uefi_test_guest(firmware));
+        enlil_config::EnlilConfig {
+            hypervisor: enlil_config::HypervisorConfig::default(),
+            guest: guests,
+            usb: enlil_config::UsbConfig::default(),
+            gpu: enlil_config::GpuConfig::default(),
+        }
+    }
+
+    #[test]
+    fn uefi_boot_spec_from_guest_config_starts_at_the_reset_vector() {
+        // Pure config mapping — no KVM needed.
+        let config = uefi_test_guest(None);
+        let spec = GuestBootSpec::uefi_from_guest_config(&config, 42, LbrPlatform::AmdSvm);
+        assert_eq!(spec.name, "Windows 11");
+        assert_eq!(spec.ram_bytes, 3072 * 1024 * 1024);
+        assert_eq!(spec.load_base, 0);
+        assert_eq!(spec.entry, RESET_VECTOR_GPA);
+        assert!(spec.image.is_empty(), "UEFI boot has no direct payload");
+        assert_eq!(spec.rtc_unix_secs, 42);
+    }
+
+    #[test]
+    fn uefi_boot_rejects_ram_overlapping_flash_without_kvm() {
+        // Pure validation — no KVM needed. 8 GiB of RAM at 0 reaches into the
+        // firmware flash window, so prepare_uefi_boot must fail before any
+        // KVM state is created.
+        let spec = GuestBootSpec {
+            name: "win11".into(),
+            serial: SerialOutput::new("win11", SerialOutputMode::Null),
+            ram_bytes: 8 * 1024 * 1024 * 1024,
+            load_base: 0,
+            entry: RESET_VECTOR_GPA,
+            image: Vec::new(),
+            rtc_unix_secs: 0,
+            platform: LbrPlatform::AmdSvm,
+        };
+        let image = UefiFlashImage::new(fake_firmware_image(), fake_firmware_image()).unwrap();
+        let err = expect_err(
+            GuestRuntime::prepare_uefi_boot(spec, image),
+            "RAM overlapping the flash window",
+        );
+        assert!(
+            err.to_string().contains("overlaps the firmware flash"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn boot_first_guest_uefi_rejects_a_guest_without_a_firmware_block() {
+        // Pure config error — no KVM needed.
+        let config = uefi_boot_test_config(None);
+        let err = expect_err(
+            boot_first_guest_uefi(&config, Path::new("/tmp/enlil-uefi-nope"), 1),
+            "guest without firmware",
+        );
+        assert!(err.to_string().contains("firmware"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn uefi_boot_runs_a_firmware_reset_vector_to_hlt() {
+        if !is_kvm_available() {
+            eprintln!("skipping uefi_boot_runs_a_firmware_reset_vector_to_hlt: no /dev/kvm");
+            return;
+        }
+        // Fake 64 KiB firmware: a valid _FVH header plus a single HLT at the
+        // reset-vector offset (image_size - 0x10), i.e. guest-physical
+        // 0xFFFF_FFF0 where the boot vCPU starts.
+        let mut code = fake_firmware_image();
+        code[64 * 1024 - 0x10] = 0xF4; // hlt
+        let image = UefiFlashImage::new(code, fake_firmware_image()).unwrap();
+        let spec = GuestBootSpec {
+            name: "uefi-hlt".into(),
+            serial: SerialOutput::new("uefi-hlt", SerialOutputMode::Null),
+            ram_bytes: 64 * 1024 * 1024,
+            load_base: 0,
+            entry: RESET_VECTOR_GPA,
+            image: Vec::new(),
+            rtc_unix_secs: 0,
+            platform: LbrPlatform::AmdSvm,
+        };
+        let mut runtime = GuestRuntime::prepare_uefi_boot(spec, image).unwrap();
+        // The firmware flash is visible to the guest at the top of 4 GiB.
+        let hlt = runtime
+            .read_flash_bytes(RESET_VECTOR_GPA, 1)
+            .expect("reset vector readable");
+        assert_eq!(hlt, vec![0xF4], "reset vector holds the firmware HLT");
+        let outcome = runtime.run_uefi(16).expect("run uefi guest");
+        assert_eq!(
+            outcome,
+            LoopOutcome::Halted,
+            "firmware halts at the reset vector"
+        );
+    }
+
+    #[test]
+    fn boot_first_guest_uefi_rejects_unreadable_firmware_images() {
+        // Pure config/IO error — fails while loading images, before KVM.
+        let firmware = enlil_config::FirmwareConfig {
+            code: PathBuf::from("/nonexistent/OVMF_CODE.fd"),
+            vars: PathBuf::from("/nonexistent/OVMF_VARS.fd"),
+        };
+        let config = uefi_boot_test_config(Some(firmware));
+        let err = expect_err(
+            boot_first_guest_uefi(&config, Path::new("/tmp/enlil-uefi-nope"), 1),
+            "unreadable firmware images",
+        );
+        assert!(
+            err.to_string().contains("firmware.code"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]

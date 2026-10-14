@@ -1,0 +1,39 @@
+# Example: a Windows 11 guest booting through its own virtual UEFI firmware
+# (item 5.6).
+#
+# The `[guest.<id>.firmware]` block names the OVMF CODE image and VARS
+# template for this guest. The launcher (`boot_first_guest_uefi`):
+#   - maps CODE read-only just below 4 GiB (a shared image stays shared —
+#     the guest can never write through it),
+#   - stages the VARS template to a per-guest writable store under the
+#     launcher's state dir (created from the template on first boot and
+#     preserved afterwards, so NVRAM — boot order, enrolled keys —
+#     survives reboots),
+#   - starts the boot vCPU at the x86 reset vector (0xFFFF_FFF0), exactly
+#     like power-on hardware.
+#
+# memory_mb must keep the guest RAM below the firmware flash window at the
+# top of 4 GiB (the launcher rejects a RAM region that overlaps it — e.g.
+# 8192 MiB at base 0 would collide with a 4 MiB CODE + 512 KiB VARS pair).
+# Point ENLIL_OVMF_CODE / ENLIL_OVMF_VARS at your firmware to override the
+# paths below. Windows itself boots from the guest's disks in UEFI mode.
+[hypervisor]
+reserved_memory_mb = 512
+log_level = "info"
+management_port = 9100
+
+[guest.windows11]
+name = "Windows 11"
+cpus = [0, 1, 2, 3]
+memory_mb = 3072
+scheduling = "dedicated"
+
+[guest.windows11.firmware]
+code = "/usr/share/OVMF/OVMF_CODE_4M.fd"
+vars = "/usr/share/OVMF/OVMF_VARS_4M.fd"
+
+[[guest.windows11.disks]]
+path = "/var/lib/enlil/guests/windows11/system.vhdx"
+
+[[guest.windows11.disks]]
+path = "/var/lib/enlil/guests/windows11/data.vhdx"
