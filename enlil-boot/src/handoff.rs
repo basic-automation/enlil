@@ -2,7 +2,8 @@
 //!
 //! Before calling `ExitBootServices()` the UEFI stage collects the platform
 //! resources the enlil kernel needs to bring the machine up on its own:
-//! the UEFI memory map, the ACPI RSDP, and the GOP framebuffer. Those are
+//! the UEFI memory map, the ACPI RSDP, the GOP framebuffer, and the PCI root
+//! bridges inventoried from the firmware's PCI protocol handles. Those are
 //! packed into a [`BootHandoff`] and passed to the kernel entry.
 //!
 //! The types here are `no_std`-clean and host-agnostic (no `alloc`, no
@@ -151,6 +152,44 @@ impl GuestFirmware {
     }
 }
 
+/// Maximum PCI root bridges recorded in a [`BootHandoff`].
+///
+/// One bridge per firmware-enumerated PCI segment is the norm (usually one);
+/// the bound keeps the handoff `Copy` and alloc-free. Bridges past the bound
+/// are still logged by the firmware collector, just not recorded.
+pub const MAX_PCI_ROOT_BRIDGES: usize = 8;
+
+/// One PCI root bridge as inventoried from the firmware's PCI Root Bridge
+/// I/O protocol handles, collected before `ExitBootServices()`.
+///
+/// After exit the protocol is gone, so this is the durable record the
+/// kernel's boot device tree (roadmap 6.3) consumes: which segment each
+/// firmware-enumerated root bridge lives on and which bus range it decodes.
+/// The range is the firmware's own report (`Configuration()`); firmware
+/// that publishes no bus aperture yields a degenerate `0-0`, so consumers
+/// treat it as advisory next to the MCFG/ECAM discovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PciRootBridge {
+    /// PCI segment group number (0 on single-segment machines).
+    pub segment: u16,
+    /// First bus number this root bridge decodes.
+    pub bus_start: u8,
+    /// Last bus number this root bridge decodes (inclusive).
+    pub bus_end: u8,
+    /// Firmware-reported attributes (`EFI_PCI_ATTRIBUTE_*`), truncated to 32
+    /// bits — every attribute the spec defines fits there. Advisory: the
+    /// kernel re-derives what it needs from config space.
+    pub attributes: u32,
+}
+
+impl PciRootBridge {
+    /// Whether this bridge decodes `bus`.
+    #[must_use]
+    pub const fn covers_bus(self, bus: u8) -> bool {
+        bus >= self.bus_start && bus <= self.bus_end
+    }
+}
+
 /// Everything the UEFI stage collects before `ExitBootServices()` and hands
 /// to the enlil kernel.
 ///
@@ -180,6 +219,12 @@ pub struct BootHandoff {
     pub guest_firmwares: [GuestFirmware; MAX_BOOT_GUESTS],
     /// Number of valid entries in `guest_firmwares` (`<= MAX_BOOT_GUESTS`).
     pub guest_firmware_count: usize,
+    /// PCI root bridges inventoried from the firmware's PCI Root Bridge I/O
+    /// protocol handles; only the first `pci_root_bridge_count` entries are
+    /// valid. Advisory: a PCI-less boot is still a valid handoff.
+    pub pci_root_bridges: [PciRootBridge; MAX_PCI_ROOT_BRIDGES],
+    /// Number of valid entries in `pci_root_bridges`.
+    pub pci_root_bridge_count: u8,
 }
 
 impl BootHandoff {
@@ -209,6 +254,30 @@ impl BootHandoff {
     #[must_use]
     pub const fn has_framebuffer(&self) -> bool {
         self.framebuffer.is_some()
+    }
+
+    /// The PCI root bridges the firmware reported (empty when none).
+    ///
+    /// The count is clamped to [`MAX_PCI_ROOT_BRIDGES`] so a hand-built
+    /// handoff with a wild count can never read past the array.
+    #[must_use]
+    pub fn pci_root_bridges(&self) -> &[PciRootBridge] {
+        let n = (self.pci_root_bridge_count as usize).min(MAX_PCI_ROOT_BRIDGES);
+        &self.pci_root_bridges[..n]
+    }
+
+    /// Whether the firmware handed us any PCI root bridge inventory.
+    #[must_use]
+    pub const fn has_pci_root_bridges(&self) -> bool {
+        self.pci_root_bridge_count != 0
+    }
+
+    /// The recorded root bridge for `segment`, if the firmware reported one.
+    #[must_use]
+    pub fn root_bridge_for_segment(&self, segment: u16) -> Option<&PciRootBridge> {
+        self.pci_root_bridges()
+            .iter()
+            .find(|bridge| bridge.segment == segment)
     }
 
     /// Whether this handoff carries the minimum the kernel needs to boot: a
@@ -291,6 +360,8 @@ mod tests {
             config_len: 0,
             guest_firmwares: [GuestFirmware::empty(); MAX_BOOT_GUESTS],
             guest_firmware_count: 0,
+            pci_root_bridges: [PciRootBridge::default(); MAX_PCI_ROOT_BRIDGES],
+            pci_root_bridge_count: 0,
         };
         assert_eq!(h.descriptor_count(), 10);
     }
@@ -307,6 +378,8 @@ mod tests {
             config_len: 0,
             guest_firmwares: [GuestFirmware::empty(); MAX_BOOT_GUESTS],
             guest_firmware_count: 0,
+            pci_root_bridges: [PciRootBridge::default(); MAX_PCI_ROOT_BRIDGES],
+            pci_root_bridge_count: 0,
         };
         assert_eq!(h.descriptor_count(), 0);
     }
@@ -323,6 +396,8 @@ mod tests {
             config_len: 128,
             guest_firmwares: [GuestFirmware::empty(); MAX_BOOT_GUESTS],
             guest_firmware_count: 0,
+            pci_root_bridges: [PciRootBridge::default(); MAX_PCI_ROOT_BRIDGES],
+            pci_root_bridge_count: 0,
         };
         assert!(good.is_valid());
         assert!(good.has_acpi());
@@ -373,6 +448,37 @@ mod tests {
             config_len: 0,
             guest_firmwares: [GuestFirmware::empty(); MAX_BOOT_GUESTS],
             guest_firmware_count: 0,
+            pci_root_bridges: [PciRootBridge::default(); MAX_PCI_ROOT_BRIDGES],
+            pci_root_bridge_count: 0,
+        }
+    }
+
+    fn handoff_with_bridges() -> BootHandoff {
+        let mut bridges = [PciRootBridge::default(); MAX_PCI_ROOT_BRIDGES];
+        bridges[0] = PciRootBridge {
+            segment: 0,
+            bus_start: 0,
+            bus_end: 0xFF,
+            attributes: 0x1,
+        };
+        bridges[1] = PciRootBridge {
+            segment: 1,
+            bus_start: 0,
+            bus_end: 0x0F,
+            attributes: 0x1,
+        };
+        BootHandoff {
+            memory_map_base: 0x1000,
+            memory_map_len: 48,
+            memory_descriptor_size: 48,
+            acpi_rsdp: 0xE_0000,
+            framebuffer: None,
+            config_base: 0,
+            config_len: 0,
+            guest_firmwares: [GuestFirmware::empty(); MAX_BOOT_GUESTS],
+            guest_firmware_count: 0,
+            pci_root_bridges: bridges,
+            pci_root_bridge_count: 2,
         }
     }
 
@@ -402,5 +508,59 @@ mod tests {
             }
             .has_config()
         );
+    }
+    #[test]
+    fn pci_bridges_slice_honors_count_and_clamps_wild_counts() {
+        let h = handoff_with_bridges();
+        assert!(h.has_pci_root_bridges());
+        let list = h.pci_root_bridges();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].segment, 0);
+        assert!(list[0].covers_bus(0x00));
+        assert!(list[0].covers_bus(0xFF));
+        assert_eq!(list[1].segment, 1);
+        assert_eq!(list[1].bus_end, 0x0F);
+        assert!(list[1].covers_bus(0x0F));
+        assert!(!list[1].covers_bus(0x10));
+
+        // A wild count can never read past the array.
+        let wild = BootHandoff {
+            pci_root_bridge_count: u8::MAX,
+            ..h
+        };
+        assert_eq!(wild.pci_root_bridges().len(), MAX_PCI_ROOT_BRIDGES);
+    }
+
+    #[test]
+    fn empty_pci_inventory_is_still_a_valid_handoff() {
+        let h = BootHandoff {
+            pci_root_bridge_count: 0,
+            ..handoff_with_bridges()
+        };
+        assert!(!h.has_pci_root_bridges());
+        assert_eq!(h.pci_root_bridges(), []);
+        assert_eq!(h.root_bridge_for_segment(0), None);
+        // PCI inventory is advisory: a PCI-less boot still boots.
+        assert!(h.is_valid());
+    }
+
+    #[test]
+    fn root_bridge_for_segment_finds_each_segment() {
+        let h = handoff_with_bridges();
+        assert_eq!(h.root_bridge_for_segment(0).unwrap().bus_end, 0xFF);
+        assert_eq!(h.root_bridge_for_segment(1).unwrap().bus_start, 0);
+        assert_eq!(h.root_bridge_for_segment(2), None);
+    }
+
+    #[test]
+    fn default_bridge_is_zeroed() {
+        let b = PciRootBridge::default();
+        assert_eq!(
+            (b.segment, b.bus_start, b.bus_end, b.attributes),
+            (0, 0, 0, 0)
+        );
+        // Degenerate zero range: covers only bus 0, nothing else.
+        assert!(b.covers_bus(0));
+        assert!(!b.covers_bus(1));
     }
 }
