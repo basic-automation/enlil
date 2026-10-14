@@ -33,6 +33,10 @@ pub const DMAR_SIGNATURE: &[u8; 4] = b"DMAR";
 /// The `IVRS` table signature — AMD-Vi (I/O virtualization) remapping.
 pub const IVRS_SIGNATURE: &[u8; 4] = b"IVRS";
 
+/// The `SRAT` (System Resource Affinity Table) signature — the firmware's NUMA
+/// topology: which CPUs and which RAM ranges belong to which proximity domain.
+pub const SRAT_SIGNATURE: &[u8; 4] = b"SRAT";
+
 /// Which IOMMU the firmware advertises (the DMA-remapping engine Phase 6.4
 /// programs for per-guest device isolation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1073,6 +1077,161 @@ pub fn mcfg_first_allocation(mcfg: &[u8]) -> Option<(u64, u16, u8, u8)> {
     Some((base, segment, start_bus, end_bus))
 }
 
+/// A NUMA memory range from an `SRAT` Memory Affinity structure: which
+/// proximity domain owns which physical RAM span — the placement primitive a
+/// guest's vCPUs and RAM are co-located on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NumaMemoryRange {
+    /// The proximity (NUMA) domain the range belongs to.
+    pub domain: u32,
+    /// Physical base address of the range.
+    pub base: u64,
+    /// Length of the range in bytes.
+    pub length: u64,
+}
+
+/// A CPU→NUMA-node binding from an `SRAT` processor-affinity structure: which
+/// APIC (or x2APIC) ID belongs to which proximity domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NumaCpuAffinity {
+    /// The processor's local APIC or x2APIC ID (widened to `u32` so x2APIC IDs
+    /// above 255 fit).
+    pub apic_id: u32,
+    /// The proximity (NUMA) domain the processor belongs to.
+    pub domain: u32,
+}
+
+/// Walk an `SRAT`'s affinity structures, calling `visit(entry_type, entry)` for
+/// each well-formed one (`entry[0]` is the type, `entry[1]` its length). The
+/// `SRAT` header is 48 bytes (36-byte SDT header + revision + 8 reserved); each
+/// structure is a `(type, length)` pair. A truncated or self-referential entry
+/// (`length < 2`, or one that runs past the table) stops the walk — the same
+/// shape as `enlil-devices`' reader.
+fn for_each_srat_structure(srat: &[u8], mut visit: impl FnMut(u8, &[u8])) {
+    /// Offset of the first affinity structure.
+    const STRUCTURES_OFFSET: usize = 48;
+    let mut off = STRUCTURES_OFFSET;
+    while off + 2 <= srat.len() {
+        let entry_type = srat[off];
+        let len = srat[off + 1] as usize;
+        if len < 2 || off + len > srat.len() {
+            break;
+        }
+        visit(entry_type, &srat[off..off + len]);
+        off += len;
+    }
+}
+
+/// Whether an affinity structure's flags dword at `flags_off` has the enabled
+/// bit (bit 0) set — disabled structures carry stale topology and are skipped.
+fn srat_structure_enabled(entry: &[u8], flags_off: usize) -> bool {
+    read_u32(entry, flags_off).is_some_and(|flags| flags & 1 != 0)
+}
+
+/// The proximity domain of a Processor Local APIC Affinity (type 0) structure,
+/// reassembled from its low byte (+2) and high three bytes (+9..+12).
+fn srat_processor_domain(entry: &[u8]) -> u32 {
+    u32::from(entry[2])
+        | (u32::from(entry[9]) << 8)
+        | (u32::from(entry[10]) << 16)
+        | (u32::from(entry[11]) << 24)
+}
+
+/// The distinct NUMA proximity domains an `SRAT` advertises, from its enabled
+/// Processor Local APIC Affinity (type 0) and Memory Affinity (type 1)
+/// structures.
+///
+/// Writes at most `out.len()` domains (deduplicated by a linear scan — node
+/// counts are small) and returns the total distinct count, which may exceed
+/// `out.len()`.
+#[must_use]
+pub fn srat_numa_domains(srat: &[u8], out: &mut [u32]) -> usize {
+    let mut total: usize = 0;
+    for_each_srat_structure(srat, |entry_type, entry| {
+        let domain = match entry_type {
+            // Processor Local APIC Affinity: flags at +4 (bit 0 enabled).
+            0 if entry.len() >= 16 && srat_structure_enabled(entry, 4) => {
+                Some(srat_processor_domain(entry))
+            }
+            // Memory Affinity: proximity domain (u32) at +2, flags at +28.
+            1 if entry.len() >= 40 && srat_structure_enabled(entry, 28) => {
+                Some(read_u32(entry, 2).unwrap_or(0))
+            }
+            _ => None,
+        };
+        if let Some(domain) = domain
+            && !out[..total.min(out.len())].contains(&domain)
+        {
+            if total < out.len() {
+                out[total] = domain;
+            }
+            total += 1;
+        }
+    });
+    total
+}
+
+/// The enabled Memory Affinity (type 1) ranges an `SRAT` declares: the
+/// proximity domain, physical base, and length of each.
+///
+/// Base is at +8 (`u64`), length at +16 (`u64`), flags at +28 (bit 0 enabled —
+/// disabled ranges are skipped). Writes at most `out.len()` ranges and returns
+/// the total declared count, which may exceed `out.len()`.
+#[must_use]
+pub fn srat_memory_ranges(srat: &[u8], out: &mut [NumaMemoryRange]) -> usize {
+    let mut total: usize = 0;
+    for_each_srat_structure(srat, |entry_type, entry| {
+        if entry_type == 1 && entry.len() >= 40 && srat_structure_enabled(entry, 28) {
+            if total < out.len() {
+                out[total] = NumaMemoryRange {
+                    domain: read_u32(entry, 2).unwrap_or(0),
+                    base: read_u64(entry, 8).unwrap_or(0),
+                    length: read_u64(entry, 16).unwrap_or(0),
+                };
+            }
+            total += 1;
+        }
+    });
+    total
+}
+
+/// The enabled processor→NUMA bindings an `SRAT` declares.
+///
+/// Covers both Processor Local APIC Affinity (type 0: 8-bit APIC ID at +3,
+/// flags at +4) and Processor Local x2APIC Affinity (type 2: proximity domain
+/// at +4, 32-bit x2APIC ID at +8, flags at +12) — the latter carries CPUs with
+/// APIC IDs above 255.
+///
+/// Writes at most `out.len()` bindings and returns the total declared count,
+/// which may exceed `out.len()`.
+#[must_use]
+pub fn srat_cpu_affinities(srat: &[u8], out: &mut [NumaCpuAffinity]) -> usize {
+    let mut total: usize = 0;
+    for_each_srat_structure(srat, |entry_type, entry| {
+        let affinity = match entry_type {
+            // Processor Local APIC Affinity: 8-bit APIC ID at +3, flags at +4.
+            0 if entry.len() >= 16 && srat_structure_enabled(entry, 4) => Some(NumaCpuAffinity {
+                apic_id: u32::from(entry[3]),
+                domain: srat_processor_domain(entry),
+            }),
+            // Processor Local x2APIC Affinity: domain at +4 (u32), 32-bit
+            // x2APIC ID at +8, flags at +12.
+            2 if entry.len() >= 24 && srat_structure_enabled(entry, 12) => Some(NumaCpuAffinity {
+                apic_id: read_u32(entry, 8).unwrap_or(0),
+                domain: read_u32(entry, 4).unwrap_or(0),
+            }),
+            _ => None,
+        };
+        if let Some(affinity) = affinity {
+            if total < out.len() {
+                out[total] = affinity;
+            }
+            total += 1;
+        }
+    });
+    total
+}
+
 /// How many enabled-processor APIC IDs [`AcpiSummary`] records inline.
 ///
 /// The BSP plus a handful of APs — enough to report the SMP inventory on serial
@@ -1124,10 +1283,39 @@ pub struct AcpiSummary {
     pub ivmds: [IvmdRange; MAX_REPORTED_IVMDS],
     /// How many `IVMD` blocks the `IVRS` declared (may exceed the array).
     pub ivmd_count: usize,
+    /// The NUMA proximity domains the `SRAT` advertises (empty when the
+    /// firmware has no `SRAT` — treat as one implicit node).
+    pub numa_domains: [u32; MAX_REPORTED_NUMA_DOMAINS],
+    /// How many distinct NUMA domains the `SRAT` declared (may exceed the
+    /// array).
+    pub numa_domain_count: usize,
+    /// The enabled `SRAT` memory ranges — which proximity domain owns which
+    /// RAM span.
+    pub numa_memory: [NumaMemoryRange; MAX_REPORTED_NUMA_RANGES],
+    /// How many memory ranges the `SRAT` declared (may exceed the array).
+    pub numa_memory_count: usize,
+    /// The enabled `SRAT` CPU→node bindings (APIC/x2APIC ID → domain).
+    pub numa_cpu_affinities: [NumaCpuAffinity; MAX_REPORTED_NUMA_CPU_AFFINITIES],
+    /// How many CPU affinities the `SRAT` declared (may exceed the array).
+    pub numa_cpu_affinity_count: usize,
 }
 
 /// How many device-scope entries the summary keeps for the first unit.
 pub const MAX_REPORTED_DEVICE_SCOPES: usize = 4;
+
+/// How many NUMA proximity domains the summary keeps.
+///
+/// Real servers top out at a handful of nodes; the true declared count
+/// ([`AcpiSummary::numa_domain_count`]) may exceed this.
+pub const MAX_REPORTED_NUMA_DOMAINS: usize = 8;
+
+/// How many SRAT memory ranges the summary keeps (the true declared count may
+/// exceed it).
+pub const MAX_REPORTED_NUMA_RANGES: usize = 8;
+
+/// How many SRAT CPU→node bindings the summary keeps (the true declared count
+/// may exceed it).
+pub const MAX_REPORTED_NUMA_CPU_AFFINITIES: usize = 8;
 
 /// How many DMA-remapping hardware units the summary keeps.
 ///
@@ -1155,10 +1343,11 @@ mod hw {
     use super::{
         AcpiSummary, AmdIommuUnit, DMAR_SIGNATURE, DeviceScope, IVRS_SIGNATURE, IommuKind,
         IvmdRange, IvrsDeviceEntry, MADT_SIGNATURE, MAX_REPORTED_APIC_IDS, MCFG_SIGNATURE,
-        RemappingUnit, SDT_HEADER_LEN, dmar_device_scopes, dmar_remapping_units,
-        iommu_kind_from_signature, ivrs_device_entries, ivrs_iommu_units, ivrs_memory_definitions,
-        madt_enabled_apic_ids, madt_enabled_cpu_count, mcfg_first_allocation, rsdp_xsdt_address,
-        sdt_length, sdt_signature, xsdt_entry, xsdt_entry_count,
+        NumaCpuAffinity, NumaMemoryRange, RemappingUnit, SDT_HEADER_LEN, SRAT_SIGNATURE,
+        dmar_device_scopes, dmar_remapping_units, iommu_kind_from_signature, ivrs_device_entries,
+        ivrs_iommu_units, ivrs_memory_definitions, madt_enabled_apic_ids, madt_enabled_cpu_count,
+        mcfg_first_allocation, rsdp_xsdt_address, sdt_length, sdt_signature, srat_cpu_affinities,
+        srat_memory_ranges, srat_numa_domains, xsdt_entry, xsdt_entry_count,
     };
 
     /// View `len` bytes of identity-mapped physical memory at `phys`.
@@ -1215,6 +1404,13 @@ mod hw {
             amd_device_entry_count: 0,
             ivmds: [IvmdRange::default(); super::MAX_REPORTED_IVMDS],
             ivmd_count: 0,
+            numa_domains: [0; super::MAX_REPORTED_NUMA_DOMAINS],
+            numa_domain_count: 0,
+            numa_memory: [NumaMemoryRange::default(); super::MAX_REPORTED_NUMA_RANGES],
+            numa_memory_count: 0,
+            numa_cpu_affinities: [NumaCpuAffinity::default();
+                super::MAX_REPORTED_NUMA_CPU_AFFINITIES],
+            numa_cpu_affinity_count: 0,
         };
 
         // Scan the referenced tables for the MADT (enabled CPUs) and the MCFG
@@ -1268,6 +1464,13 @@ mod hw {
                         );
                     }
                     summary.ivmd_count = ivrs_memory_definitions(table, &mut summary.ivmds);
+                } else if sig == *SRAT_SIGNATURE {
+                    // The NUMA topology: proximity domains, per-node RAM
+                    // ranges, and CPU→node bindings.
+                    summary.numa_domain_count = srat_numa_domains(table, &mut summary.numa_domains);
+                    summary.numa_memory_count = srat_memory_ranges(table, &mut summary.numa_memory);
+                    summary.numa_cpu_affinity_count =
+                        srat_cpu_affinities(table, &mut summary.numa_cpu_affinities);
                 }
             }
             i += 1;
@@ -1594,6 +1797,162 @@ mod tests {
             mcfg_first_allocation(&mcfg),
             Some((0xB000_0000, 0, 0x00, 0xFF))
         );
+    }
+
+    /// A Processor Local APIC Affinity (type 0) entry: 8-bit APIC ID at +3,
+    /// flags at +4, proximity domain split low byte +2 / high bytes +9..+12.
+    fn srat_proc(apic_id: u8, domain: u32, enabled: bool) -> Vec<u8> {
+        let dom = domain.to_le_bytes();
+        let mut e = vec![0u8; 16];
+        e[0] = 0;
+        e[1] = 16;
+        e[2] = dom[0];
+        e[3] = apic_id;
+        e[4] = u8::from(enabled);
+        e[9] = dom[1];
+        e[10] = dom[2];
+        e[11] = dom[3];
+        e
+    }
+
+    /// A Memory Affinity (type 1) entry: domain u32 at +2, base u64 at +8,
+    /// length u64 at +16, flags u32 at +28.
+    fn srat_mem(domain: u32, base: u64, length: u64, enabled: bool) -> Vec<u8> {
+        let mut e = vec![0u8; 40];
+        e[0] = 1;
+        e[1] = 40;
+        e[2..6].copy_from_slice(&domain.to_le_bytes());
+        e[8..16].copy_from_slice(&base.to_le_bytes());
+        e[16..24].copy_from_slice(&length.to_le_bytes());
+        e[28] = u8::from(enabled);
+        e
+    }
+
+    /// A Processor Local x2APIC Affinity (type 2) entry: domain u32 at +4,
+    /// 32-bit x2APIC ID at +8, flags u32 at +12.
+    fn srat_x2apic(apic_id: u32, domain: u32, enabled: bool) -> Vec<u8> {
+        let mut e = vec![0u8; 24];
+        e[0] = 2;
+        e[1] = 24;
+        e[4..8].copy_from_slice(&domain.to_le_bytes());
+        e[8..12].copy_from_slice(&apic_id.to_le_bytes());
+        e[12] = u8::from(enabled);
+        e
+    }
+
+    /// A minimal SRAT: 48-byte header (36 SDT + revision + 8 reserved) plus the
+    /// given affinity structures.
+    fn srat_table(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut t = sdt_header(*SRAT_SIGNATURE, 0).to_vec();
+        t.extend_from_slice(&[0u8; 12]); // revision + reserved → 48 bytes
+        for e in entries {
+            t.extend_from_slice(e);
+        }
+        t
+    }
+
+    #[test]
+    fn srat_parses_domains_ranges_and_cpu_affinities() {
+        let table = srat_table(&[
+            srat_proc(0, 0, true),
+            srat_proc(1, 1, true),
+            srat_proc(2, 0, false),          // disabled — skipped everywhere
+            srat_proc(3, 0x00AB_CDEF, true), // split-domain form (high bytes)
+            srat_mem(0, 0x0, 0x8000_0000, true),
+            srat_mem(1, 0x8000_0000, 0x8000_0000, true),
+            srat_mem(0, 0x1_0000_0000, 0x4000_0000, false), // disabled — skipped
+            srat_x2apic(300, 1, true),
+            srat_x2apic(400, 0, false), // disabled — skipped
+        ]);
+
+        // Domains are deduplicated across structure kinds (0 from both a
+        // processor and a memory entry counts once).
+        let mut domains = [0u32; 8];
+        assert_eq!(srat_numa_domains(&table, &mut domains), 3);
+        assert_eq!(&domains[..3], &[0, 1, 0x00AB_CDEF]);
+
+        let mut ranges = [NumaMemoryRange::default(); 4];
+        assert_eq!(srat_memory_ranges(&table, &mut ranges), 2);
+        assert_eq!(
+            ranges[0],
+            NumaMemoryRange {
+                domain: 0,
+                base: 0x0,
+                length: 0x8000_0000,
+            }
+        );
+        assert_eq!(
+            ranges[1],
+            NumaMemoryRange {
+                domain: 1,
+                base: 0x8000_0000,
+                length: 0x8000_0000,
+            }
+        );
+
+        let mut affinities = [NumaCpuAffinity::default(); 8];
+        assert_eq!(srat_cpu_affinities(&table, &mut affinities), 4);
+        assert_eq!(
+            affinities[0],
+            NumaCpuAffinity {
+                apic_id: 0,
+                domain: 0,
+            }
+        );
+        assert_eq!(
+            affinities[1],
+            NumaCpuAffinity {
+                apic_id: 1,
+                domain: 1,
+            }
+        );
+        assert_eq!(
+            affinities[2],
+            NumaCpuAffinity {
+                apic_id: 3,
+                domain: 0x00AB_CDEF,
+            }
+        );
+        // The x2APIC affinity carries an APIC ID above 255.
+        assert_eq!(
+            affinities[3],
+            NumaCpuAffinity {
+                apic_id: 300,
+                domain: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn srat_reports_the_true_count_past_a_short_buffer() {
+        let table = srat_table(&[
+            srat_mem(0, 0x0, 0x8000_0000, true),
+            srat_mem(1, 0x8000_0000, 0x8000_0000, true),
+        ]);
+        let mut one = [NumaMemoryRange::default(); 1];
+        // The caller learns it needs a bigger buffer, and the first still lands.
+        assert_eq!(srat_memory_ranges(&table, &mut one), 2);
+        assert_eq!(one[0].domain, 0);
+    }
+
+    #[test]
+    fn srat_rejects_malformed_structures_without_looping_or_overreading() {
+        // A zero-length structure would spin forever if not caught.
+        let mut zero_len = srat_table(&[srat_proc(0, 0, true)]);
+        zero_len.extend_from_slice(&[0u8, 0]); // type 0, length 0
+        let mut domains = [0u32; 4];
+        assert_eq!(srat_numa_domains(&zero_len, &mut domains), 1);
+
+        // A structure claiming to run past the table end is refused.
+        let mut overlong = srat_table(&[srat_proc(0, 0, true)]);
+        overlong.extend_from_slice(&[1, 0xFF]); // type 1, length 255
+        let mut ranges = [NumaMemoryRange::default(); 4];
+        assert_eq!(srat_memory_ranges(&overlong, &mut ranges), 0);
+
+        // A table with no body yields nothing.
+        assert_eq!(srat_numa_domains(&srat_table(&[]), &mut domains), 0);
+        // A truncated header is not read past its end.
+        assert_eq!(srat_numa_domains(&[0u8; 8], &mut domains), 0);
     }
 
     #[test]

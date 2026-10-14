@@ -348,9 +348,12 @@ pub struct CpuNode {
 ///
 /// The culmination of Phase 6.3 discovery: which CPUs (and their NUMA nodes),
 /// which RAM ranges belong to which node and how far apart the nodes are, which
-/// PCI functions exist (and the xHCI controllers among them), and which IOMMU
-/// the platform has. This is the model the bare-metal boot path builds once it
-/// hands the real host tables in (Phase 6.1).
+/// PCI functions exist (and the xHCI controllers among them), the ECAM windows
+/// that PCI topology was walked through, and which IOMMU the platform has.
+/// This is the model the bare-metal boot path builds once it hands the real
+/// host tables in (Phase 6.1), and the input the guest device model is
+/// constructed from: a guest's PCI topology is routed through these ECAM
+/// windows and its DMA isolation through this IOMMU.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostDeviceTree {
     /// The enabled CPUs with their NUMA affinity.
@@ -365,6 +368,9 @@ pub struct HostDeviceTree {
     pub xhci_controllers: Vec<crate::pci_discovery::XhciController>,
     /// The IOMMU the firmware advertises, if any.
     pub iommu: Option<IommuKind>,
+    /// The `PCIe` ECAM allocations from the MCFG — the config-space windows
+    /// the guest device model's PCI topology is discovered and routed through.
+    pub ecam: Vec<super::mcfg::McfgAllocation>,
 }
 
 /// Build the whole [`HostDeviceTree`] from the live ACPI tables in one call.
@@ -375,7 +381,9 @@ pub struct HostDeviceTree {
 ///
 /// Each CPU's NUMA domain is resolved by matching its MADT APIC ID against the
 /// SRAT's processor affinities; a CPU with no matching affinity gets
-/// `proximity_domain: None`.
+/// `proximity_domain: None`. The MCFG's ECAM allocations feed the tree too, so
+/// the guest device model knows which config-space windows the PCI topology
+/// was walked through.
 #[must_use]
 pub fn build_device_tree(mem: &[u8], rsdp_gpa: u64) -> HostDeviceTree {
     let affinities = host_cpu_affinities(mem, rsdp_gpa);
@@ -396,6 +404,7 @@ pub fn build_device_tree(mem: &[u8], rsdp_gpa: u64) -> HostDeviceTree {
         pci_functions: host_pci_functions(mem, rsdp_gpa),
         xhci_controllers: host_xhci_controllers(mem, rsdp_gpa),
         iommu: host_iommu_kind(mem, rsdp_gpa),
+        ecam: host_ecam_allocations(mem, rsdp_gpa),
     }
 }
 
@@ -586,6 +595,9 @@ mod tests {
         let d = tree.numa_distances.expect("SLIT parsed");
         assert_eq!(d.distance(0, 1), Some(21));
         assert_eq!(tree.iommu, Some(IommuKind::IntelVtd));
+        // The MCFG's ECAM windows feed the guest device model too.
+        assert_eq!(tree.ecam.len(), 1);
+        assert_eq!(tree.ecam[0].base_address, 0xE000_0000);
         // The ECAM window is not backed by this small image, so no PCI
         // functions are discovered — but the walk does not panic.
         assert!(tree.pci_functions.is_empty());
@@ -618,6 +630,8 @@ mod tests {
         assert!(tree.memory.is_empty());
         assert!(tree.numa_distances.is_none());
         assert_eq!(tree.iommu, None);
+        // No MCFG in this table set → no ECAM windows either.
+        assert!(tree.ecam.is_empty());
     }
 
     #[test]
