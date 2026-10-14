@@ -621,6 +621,9 @@ mod hw {
         // on the identity map with the kernel heap live — the drivers need
         // both for BAR MMIO and DMA buffers.
         bring_up_storage(&serial);
+        // The privileged domain is carved before the SVM proof guests take
+        // their RAM (ROADMAP 6.6).
+        bring_up_service_vm(&serial, handoff);
         bring_up_virtualization(&serial);
         if let Some(handoff) = handoff {
             bring_up_framebuffer(&serial, handoff);
@@ -1824,6 +1827,262 @@ mod hw {
             );
         } else {
             serial.write_str("enlil kernel: apic: LAPIC TSC-deadline timer did NOT fire\n");
+        }
+    }
+
+    /// Boot the privileged service VM (ROADMAP 6.6): the Xen Dom0-style domain
+    /// that owns the hardware drivers, runs the management console, and
+    /// provides the device backends guests consume.
+    ///
+    /// Carves the service VM's RAM from the planned guest-RAM window *first*
+    /// (the privileged domain is carved before the throwaway SVM proof guests
+    /// take theirs), assembles the device-ownership table from the bus-0 MMIO
+    /// inventory (every function starts service-VM-owned; passthrough moves
+    /// ownership to a guest later), registers the virtio-blk/net/console
+    /// backends, and lays the domain's nested page tables (RAM + MMIO
+    /// identity-mapped) through enlil-hal. A refused assembly or a failed NPT
+    /// build is reported, not a boot failure.
+    fn bring_up_service_vm(serial: &SerialPort, handoff: Option<&BootHandoff>) {
+        use crate::service_vm::{
+            BackendKind, DriverKind, MAX_SERVICE_VM_DEVICES, MAX_WINDOWS_PER_DEVICE, MmioWindow,
+            OwnedDevice, ServiceVmSpec,
+        };
+        use core::sync::atomic::Ordering;
+
+        // vCPUs: the MADT AP inventory.
+        let mut ids = [0u32; crate::kernel::ap_trampoline::MAX_APIC_IDS];
+        let vcpus = u32::try_from(crate::kernel::ap_trampoline::apic_ids(&mut ids)).unwrap_or(0);
+
+        // RAM: the privileged domain's carve comes first. Falls back to the
+        // kernel heap when no planned window was published.
+        let (ram_base, ram_from_plan) = match crate::kernel::guest_ram::take(
+            crate::service_vm::SERVICE_VM_RAM_BYTES,
+            crate::service_vm::SERVICE_VM_RAM_ALIGN,
+        ) {
+            Some(base) => (base, true),
+            None => {
+                // SAFETY: like the SVM guests' heap fallback — alloc_zeroed
+                // yields a zeroed, aligned block or null.
+                match Layout::from_size_align(
+                    crate::service_vm::SERVICE_VM_RAM_BYTES as usize,
+                    crate::service_vm::SERVICE_VM_RAM_ALIGN as usize,
+                )
+                .ok()
+                .and_then(|layout| {
+                    let raw = unsafe { alloc::alloc::alloc_zeroed(layout) };
+                    (!raw.is_null()).then_some(raw as u64)
+                }) {
+                    Some(base) => (base, false),
+                    None => {
+                        serial.write_str(
+                            "enlil kernel: service VM: no RAM carve available — service VM skipped\n",
+                        );
+                        return;
+                    }
+                }
+            }
+        };
+
+        // Device-ownership table: every present bus-0 function starts owned by
+        // the service VM.
+        let inventory = crate::pci::scan_bus0_mmio();
+        let mut devices: [OwnedDevice; MAX_SERVICE_VM_DEVICES] =
+            core::array::from_fn(|_| OwnedDevice::default());
+        let mut device_count = 0usize;
+        for entry in inventory
+            .functions
+            .iter()
+            .take(usize::from(inventory.captured))
+        {
+            if device_count >= MAX_SERVICE_VM_DEVICES {
+                break;
+            }
+            let mut bars = [(0u64, 0u64); MAX_WINDOWS_PER_DEVICE];
+            for (slot, bar) in bars
+                .iter_mut()
+                .zip(entry.bars.iter().take(usize::from(entry.bar_count)))
+            {
+                *slot = (bar.base, bar.size);
+            }
+            if let Some(device) = OwnedDevice::from_inventory(
+                entry.device,
+                entry.function,
+                entry.class,
+                &bars[..usize::from(entry.bar_count)],
+            ) {
+                devices[device_count] = device;
+                device_count += 1;
+            }
+        }
+
+        // The ECAM window (the service VM's config-space access) and the GOP
+        // framebuffer (the management console's display) join the MMIO set.
+        let ecam = {
+            let base_plus1 = ECAM_BASE_PLUS1.load(Ordering::Acquire);
+            (base_plus1 != 0).then(|| {
+                let end_bus = u8::try_from(ECAM_END_BUS.load(Ordering::Acquire)).unwrap_or(u8::MAX);
+                MmioWindow {
+                    base: base_plus1 - 1,
+                    size: (u64::from(end_bus) + 1) << 20,
+                }
+            })
+        };
+        let framebuffer = handoff.and_then(|h| h.framebuffer).map(|fb| MmioWindow {
+            base: fb.base,
+            size: fb.size_bytes(),
+        });
+
+        let spec = ServiceVmSpec {
+            vcpus,
+            ram_base,
+            ram_size: crate::service_vm::SERVICE_VM_RAM_BYTES,
+            devices: &devices[..device_count],
+            backends: &crate::service_vm::DEFAULT_BACKENDS,
+            ecam,
+            framebuffer,
+            console_serial: true,
+        };
+        let plan = match crate::service_vm::assemble(&spec) {
+            Ok(plan) => plan,
+            Err(err) => {
+                serial.write_str("enlil kernel: service VM: assembly refused (");
+                serial.write_str(match err {
+                    crate::service_vm::ServiceVmError::NoVcpus => "no vCPUs",
+                    crate::service_vm::ServiceVmError::RamTooSmall { .. } => "RAM too small",
+                    crate::service_vm::ServiceVmError::RamUnaligned { .. } => "RAM unaligned",
+                    crate::service_vm::ServiceVmError::RamOverflow => "RAM overflow",
+                    crate::service_vm::ServiceVmError::RamOverlapsMmio { .. } => {
+                        "MMIO overlaps RAM"
+                    }
+                    crate::service_vm::ServiceVmError::TooManyDevices { .. } => "too many devices",
+                    crate::service_vm::ServiceVmError::TooManyMmioWindows { .. } => {
+                        "too many MMIO windows"
+                    }
+                    crate::service_vm::ServiceVmError::TooManyBackends { .. } => {
+                        "too many backends"
+                    }
+                    crate::service_vm::ServiceVmError::DeviceNotServiceVmOwned { .. } => {
+                        "device not service-VM-owned"
+                    }
+                    crate::service_vm::ServiceVmError::Npt(_) => "NPT build refused",
+                });
+                serial.write_str(") — service VM skipped\n");
+                return;
+            }
+        };
+
+        // The domain's nested page tables: RAM + MMIO identity-mapped. The
+        // kernel runs identity-mapped, so the heap buffer's VA is its PA.
+        let table_pages = plan.npt_table_pages();
+        let ncr3 = Layout::from_size_align(table_pages * 4096, 4096)
+            .ok()
+            .and_then(|layout| {
+                let raw = unsafe { alloc::alloc::alloc_zeroed(layout) };
+                if raw.is_null() {
+                    return None;
+                }
+                // SAFETY: the layout just allocated `table_pages * 4096`
+                // zeroed bytes at `raw`; the tables are leaked by design so
+                // they outlive the boot.
+                let buf = unsafe { core::slice::from_raw_parts_mut(raw, table_pages * 4096) };
+                plan.build_npt(buf, raw as u64).ok()
+            });
+
+        // --- report ---
+        let mut n = [0u8; 20];
+        let mut base = [0u8; 18];
+        serial.write_str("enlil kernel: service VM: privileged domain up (dom0-style): ");
+        serial.write_str(format_u64(u64::from(vcpus), &mut n));
+        serial.write_str(" vCPUs, RAM ");
+        serial.write_str(format_u64_hex(ram_base, &mut base));
+        serial.write_str(" (");
+        serial.write_str(format_u64(crate::service_vm::SERVICE_VM_RAM_MIB, &mut n));
+        serial.write_str(if ram_from_plan {
+            " MiB, planned carve), "
+        } else {
+            " MiB, heap fallback), "
+        });
+        serial.write_str(format_u64(device_count as u64, &mut n));
+        serial.write_str(" PCI functions owned");
+        let truncated = u64::from(inventory.captured) < u64::from(inventory.examined);
+        if truncated {
+            serial.write_str(" (");
+            serial.write_str(format_u64(
+                u64::from(inventory.examined) - u64::from(inventory.captured),
+                &mut n,
+            ));
+            serial.write_str(" beyond inventory cap — examined, not captured)");
+        }
+        serial.write_str("\n");
+
+        // The management console: the service VM owns the serial line and,
+        // when the firmware handed one over, the GOP framebuffer.
+        match handoff.and_then(|h| h.framebuffer) {
+            Some(fb) => {
+                serial.write_str("enlil kernel: service VM: management console owned — serial COM1 + GOP framebuffer ");
+                serial.write_str(format_u64(u64::from(fb.width), &mut n));
+                serial.write_str("x");
+                serial.write_str(format_u64(u64::from(fb.height), &mut n));
+                serial.write_str("\n");
+            }
+            None => serial.write_str(
+                "enlil kernel: service VM: management console owned — serial COM1 only (no GOP framebuffer)\n",
+            ),
+        }
+
+        // Driver assignment: which physical driver each owned function gets
+        // (the drivers themselves land in 6.5).
+        let mut counts = [0u64; 5];
+        for device in plan.devices.iter().take(plan.device_count) {
+            let slot = match device.driver {
+                DriverKind::Storage => 0,
+                DriverKind::Network => 1,
+                DriverKind::Display => 2,
+                DriverKind::Usb => 3,
+                DriverKind::Other => 4,
+            };
+            counts[slot] += 1;
+        }
+        serial.write_str("enlil kernel: service VM: drivers assigned: ");
+        serial.write_str(format_u64(counts[0], &mut n));
+        serial.write_str(" storage, ");
+        serial.write_str(format_u64(counts[1], &mut n));
+        serial.write_str(" net, ");
+        serial.write_str(format_u64(counts[2], &mut n));
+        serial.write_str(" display, ");
+        serial.write_str(format_u64(counts[3], &mut n));
+        serial.write_str(" usb, ");
+        serial.write_str(format_u64(counts[4], &mut n));
+        serial.write_str(" other (loaded by 6.5)\n");
+
+        // The device backends guests' frontends attach to.
+        serial.write_str("enlil kernel: service VM: device backends registered:");
+        for backend in plan.backends.iter().take(plan.backend_count) {
+            serial.write_str(" ");
+            serial.write_str(match backend.kind {
+                BackendKind::Block => "virtio-blk",
+                BackendKind::Net => "virtio-net",
+                BackendKind::Console => "virtio-console",
+            });
+            serial.write_str(" ");
+            serial.write_str(backend.name);
+            serial.write_str(",");
+        }
+        serial.write_str("\n");
+
+        match ncr3 {
+            Some(ncr3) => {
+                serial.write_str("enlil kernel: service VM: NPT built — nCR3 ");
+                serial.write_str(format_u64_hex(ncr3, &mut base));
+                serial.write_str(", RAM + ");
+                serial.write_str(format_u64(plan.mmio_window_count as u64, &mut n));
+                serial.write_str(" MMIO windows identity-mapped (");
+                serial.write_str(format_u64(plan.total_mmio_bytes / (1024 * 1024), &mut n));
+                serial.write_str(" MiB MMIO)\n");
+            }
+            None => serial.write_str(
+                "enlil kernel: service VM: NPT build FAILED — domain has no nested tables\n",
+            ),
         }
     }
 

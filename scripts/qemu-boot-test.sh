@@ -145,6 +145,10 @@ PCI_BARS_LINE="memory BARs on bus 0 totaling"
 # registers through BAR0, resets it, starts its schedule, and scans its
 # root-hub ports. The QEMU command line provides an emulated qemu-xhci device.
 XHCI_LINE="enlil kernel: xhci: controller enumerated"
+# Printed once the kernel boots the privileged service VM (ROADMAP 6.6): the
+# Xen Dom0-style domain that owns the hardware drivers, runs the management
+# console, and provides the device backends guests consume.
+SERVICE_VM_LINE="service VM: privileged domain up"
 # Printed once the kernel builds its own identity page tables and reloads CR3
 # off the firmware's — reaching this line proves the map covers the kernel.
 PAGING_LINE="off firmware page tables"
@@ -515,6 +519,7 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PCI_BAR_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PCI_BARS_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$XHCI_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$SERVICE_VM_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PAGING_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$NULLGUARD_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$SPLIT_LINE" "$SERIAL_LOG" 2>/dev/null \
@@ -555,9 +560,9 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ESP_CONFIG_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ESP_GUEST_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_TEXT_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, scheduler quantum driven by the LAPIC timer, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery incl. real VT-d DMAR remapping units + device scopes, SMP AP bring-up (INIT-SIPI-SIPI), PCI enumeration, own page tables (null-page guard) + 4 KiB split + kernel-owned guarded stack (bring-up continues on it), SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + interrupt IRET-resume round-trip + 64-bit long-mode guest + long-mode interrupt round-trip + virtual-interrupt masking + spinning-guest preemption + host-LAPIC-timer preemption (INTR intercept) + timer-tick delivery into the guest + PERIODIC timer preemption + tick delivery (host timer re-armed per quantum, handler IRETQ back into the spin — the guest time-slice) + guest-exception interception (#UD trap + re-inject) + interrupt round-trip (inject/handle/IRET/resume) + NPT write-protection dirty-tracking (trap+grant+re-protect a guest store twice — per-epoch bitmap) + RDTSC-intercept fallback guest runs (T-6.7; the intercept itself is physical-AMD-proven only) + exception error-code re-inject (#PF/#GP via a paged guest, exact codes re-delivered, T-6.13) + bare-metal xHCI USB host controller enumerated (probe + reset + schedule + port scan, T-6.18), bare-metal NVMe init + block read/write self-test on the last LBA (T-6.19), GOP draw observed on serial, and the ESP payload staged at boot (config.toml + per-guest OVMF CODE/VARS byte counts, T-0.6)"
+    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, scheduler quantum driven by the LAPIC timer, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery incl. real VT-d DMAR remapping units + device scopes, SMP AP bring-up (INIT-SIPI-SIPI), PCI enumeration, own page tables (null-page guard) + 4 KiB split + kernel-owned guarded stack (bring-up continues on it), SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + interrupt IRET-resume round-trip + 64-bit long-mode guest + long-mode interrupt round-trip + virtual-interrupt masking + spinning-guest preemption + host-LAPIC-timer preemption (INTR intercept) + timer-tick delivery into the guest + PERIODIC timer preemption + tick delivery (host timer re-armed per quantum, handler IRETQ back into the spin — the guest time-slice) + guest-exception interception (#UD trap + re-inject) + interrupt round-trip (inject/handle/IRET/resume) + NPT write-protection dirty-tracking (trap+grant+re-protect a guest store twice — per-epoch bitmap) + RDTSC-intercept fallback guest runs (T-6.7; the intercept itself is physical-AMD-proven only) + exception error-code re-inject (#PF/#GP via a paged guest, exact codes re-delivered, T-6.13) + bare-metal xHCI USB host controller enumerated (probe + reset + schedule + port scan, T-6.18), bare-metal NVMe init + block read/write self-test on the last LBA (T-6.19), service VM boot (privileged dom0-style domain: device-ownership table, driver assignment, management console, virtio-blk/net/console backends, NPT with RAM + MMIO identity-mapped), GOP draw observed on serial, and the ESP payload staged at boot (config.toml + per-guest OVMF CODE/VARS byte counts, T-0.6)"
     exit 0
 fi
 
-echo "FAIL: not all of banner/kernel-line/heap/idt/apic/svm/hsave/vmcb/vmrun/dispatch/ioio/cpuid/stealth/msr/msrw/npf/compute/gop/nvme/esp-payload observed (qemu rc=$QEMU_RC)"
+echo "FAIL: not all of banner/kernel-line/heap/idt/apic/svm/hsave/vmcb/vmrun/dispatch/ioio/cpuid/stealth/msr/msrw/npf/compute/gop/nvme/service-vm/esp-payload observed (qemu rc=$QEMU_RC)"
 exit 1
