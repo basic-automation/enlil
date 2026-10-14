@@ -332,19 +332,17 @@ impl QueuePair {
         loop {
             let off = usize::from(self.cq_head) * CQ_ENTRY_SIZE;
             // Read DW3 volatile: the device writes the completion queue, so
-            // the read must not be hoisted out of the poll loop.
+            // the read must not be hoisted out of the poll loop. It must also
+            // be ONE aligned 32-bit load: the device DMA-writes the entry
+            // concurrently, and reading the dword a byte at a time can tear —
+            // CID bytes from before the write, phase byte from after — which
+            // surfaces as a "completed" entry with command id 0.
             let base = self.cq.as_slice().as_ptr();
-            // SAFETY: `cq_head < size`, so the four bytes are in-bounds of the
-            // exclusively-owned CQ buffer; byte reads are always aligned.
-            let dw3 = unsafe {
-                let p = base.add(off + 12);
-                u32::from_le_bytes([
-                    p.read_volatile(),
-                    p.add(1).read_volatile(),
-                    p.add(2).read_volatile(),
-                    p.add(3).read_volatile(),
-                ])
-            };
+            // SAFETY: `cq_head < size`, so the dword is in-bounds of the
+            // exclusively-owned CQ buffer; the buffer is 4 KiB-aligned and each
+            // entry is 16 bytes, so `off + 12` is 4-byte aligned.
+            #[allow(clippy::cast_ptr_alignment)]
+            let dw3 = u32::from_le(unsafe { base.add(off + 12).cast::<u32>().read_volatile() });
             // DW3: bits 15:0 CID, bit 16 phase tag, bits 31:17 status.
             if (dw3 >> 16) & 1 == u32::from(self.cq_phase) {
                 let cid = (dw3 & 0xffff) as u16;
