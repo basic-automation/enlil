@@ -2155,7 +2155,6 @@ mod hw {
     #[must_use]
     pub fn program_wp_npf_vmcb() -> Option<(u64, u64)> {
         use super::{GUEST_WP_GPA, GUEST_WP_PORT, GUEST_WP_PORT2, GUEST_WP_VALUE, GUEST_WP_VALUE2};
-        use super::{GUEST_WP_GPA, GUEST_WP_PORT, GUEST_WP_VALUE};
 
         let ram_raw = alloc_guest_ram()?;
         let guest_spa = ram_raw as u64;
@@ -3178,11 +3177,8 @@ mod hw {
             // VMRUN just delivered it, and leaving the valid bit set would
             // re-inject on every re-entry. A no-op when nothing was armed.
             set_event_inj(vmcb, 0);
-            // SAFETY: the VMCB's NPT root is identity-mapped (for demand paging).
-            if !unsafe { step_guest(vmcb, &mut gprs, &mut msr_shadow, &mut outcome) } {
-                break;
-            }
             let wp_faults_before = outcome.npf_write_faults;
+            // SAFETY: the VMCB's NPT root is identity-mapped (for demand paging).
             if !unsafe {
                 step_guest(
                     vmcb,
@@ -3296,7 +3292,6 @@ mod hw {
                 // 2. Deliver the tick to the guest as a virtual interrupt.
                 set_int_control(vmcb, encode_vintr(super::GUEST_EVENT_VECTOR, 0xF));
                 // 3. Resume without advancing RIP — nothing was retired.
-            } else if !unsafe { step_guest(vmcb, &mut gprs, &mut msr_shadow, &mut outcome) } {
             } else if !unsafe { step_guest(vmcb, &mut gprs, &mut msr_shadow, &mut outcome, None) } {
                 // SAFETY: the VMCB's NPT root is identity-mapped.
                 break;
@@ -3398,7 +3393,6 @@ mod hw {
                 // 3. Deliver the tick to the guest as a virtual interrupt.
                 set_int_control(vmcb, encode_vintr(super::GUEST_EVENT_VECTOR, 0xF));
                 // 4. Resume without advancing RIP — nothing was retired.
-            } else if !unsafe { step_guest(vmcb, &mut gprs, &mut msr_shadow, &mut outcome) } {
             } else if !unsafe { step_guest(vmcb, &mut gprs, &mut msr_shadow, &mut outcome, None) } {
                 // SAFETY: the VMCB's NPT root is identity-mapped.
                 break;

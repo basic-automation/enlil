@@ -953,6 +953,17 @@ mod tests {
 
 #[cfg(target_os = "linux")]
 mod tier1_passthrough {
+    use std::fs;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::path::{Path, PathBuf};
+
+    use anyhow::{Context, Result, bail};
+
+    use crate::net::{
+        VfioContainer, VfioGroup, VfioPciDevice, bind_driver, iommu_group_of, pci_attr_hex,
+        validate_bdf,
+    };
+
     // ---------------------------------------------------------------------------
     // Constants
     // ---------------------------------------------------------------------------
@@ -1034,8 +1045,8 @@ mod tier1_passthrough {
     /// unreadable attributes are skipped, not fatal — a half-populated sysfs
     /// snapshot still yields the GPUs it can describe.
     pub fn enumerate_gpus(pci_devices: &Path, iommu_groups: &Path) -> Result<Vec<HostGpu>> {
-        let entries =
-            fs::read_dir(pci_devices).with_context(|| format!("listing {}", pci_devices.display()))?;
+        let entries = fs::read_dir(pci_devices)
+            .with_context(|| format!("listing {}", pci_devices.display()))?;
         let mut gpus = Vec::new();
         for entry in entries {
             let entry = entry?;
@@ -1055,7 +1066,8 @@ mod tier1_passthrough {
             let Ok(device_id) = pci_attr_u16(pci_devices, &bdf, "device") else {
                 continue;
             };
-            let subsystem_vendor_id = pci_attr_u16(pci_devices, &bdf, "subsystem_vendor").unwrap_or(0);
+            let subsystem_vendor_id =
+                pci_attr_u16(pci_devices, &bdf, "subsystem_vendor").unwrap_or(0);
             let subsystem_id = pci_attr_u16(pci_devices, &bdf, "subsystem_device").unwrap_or(0);
             let iommu_group = iommu_group_of(pci_devices, &bdf).unwrap_or(None);
             let mut group_functions = if let Some(group) = iommu_group
@@ -1163,8 +1175,9 @@ mod tier1_passthrough {
                 bail!("GPU {} has no IOMMU group members to assign", gpu.bdf);
             }
             for bdf in &gpu.group_functions {
-                bind_driver(pci_devices, drivers, bdf, VFIO_PCI_DRIVER)
-                    .with_context(|| format!("binding {bdf} (GPU {}) to {VFIO_PCI_DRIVER}", gpu.bdf))?;
+                bind_driver(pci_devices, drivers, bdf, VFIO_PCI_DRIVER).with_context(|| {
+                    format!("binding {bdf} (GPU {}) to {VFIO_PCI_DRIVER}", gpu.bdf)
+                })?;
             }
             let container = VfioContainer::open().context("opening VFIO container")?;
             let group = VfioGroup::open(group_id)
@@ -1235,9 +1248,8 @@ mod tier1_passthrough {
                         Err(flr_err) => GpuFunctionReset {
                             bdf: dev.bdf.clone(),
                             method: GpuResetMethod::ConfigSpaceFlr,
-                            result: Err(
-                                flr_err.context(format!("VFIO_DEVICE_RESET also failed: {vfio_err:#}"))
-                            ),
+                            result: Err(flr_err
+                                .context(format!("VFIO_DEVICE_RESET also failed: {vfio_err:#}"))),
                         },
                     },
                 })
@@ -1332,8 +1344,8 @@ mod tier1_passthrough {
         let mut config = vec![0u8; 4096];
         let n = f.read(&mut config).context("reading PCI config space")?;
         let config = &config[..n];
-        let cap =
-            find_pcie_capability(config).context("no PCI Express capability: not a PCIe function")?;
+        let cap = find_pcie_capability(config)
+            .context("no PCI Express capability: not a PCIe function")?;
         if !pcie_flr_capable(config, cap) {
             bail!("function {bdf} does not advertise FLR (DevCap bit 28 clear)");
         }
@@ -1472,7 +1484,8 @@ mod tier1_passthrough {
     pub fn read_option_rom(pci_devices: &Path, bdf: &str) -> Result<VbiosImage> {
         validate_bdf(bdf)?;
         let rom = pci_devices.join(bdf).join("rom");
-        fs::write(&rom, b"1").with_context(|| format!("enabling option ROM at {}", rom.display()))?;
+        fs::write(&rom, b"1")
+            .with_context(|| format!("enabling option ROM at {}", rom.display()))?;
         let data = fs::read(&rom).with_context(|| format!("reading {}", rom.display()));
         // Best effort: leave the ROM disabled even when the read failed.
         let _ = fs::write(&rom, b"0");
@@ -1963,7 +1976,6 @@ mod tier1_passthrough {
             assert!(warnings[0].contains("reset bug"));
         }
     }
-
 }
 
 #[cfg(target_os = "linux")]

@@ -1197,8 +1197,173 @@ mod hw {
         serial.write_str(" bytes MMIO\n");
     }
 
-        bring_up_xhci(&serial);
-        bring_up_net(&serial);
+    /// Bring up the bare-metal xHCI USB host controller driver (ROADMAP 6.5,
+    /// T-6.18): find xHCI functions via the PCI class scan, probe each
+    /// controller's capability registers through its BAR0 window, reset it,
+    /// start its schedule, and scan its root-hub ports.
+    ///
+    /// This is the production-path replacement for libusb/VFIO on bare
+    /// metal — the host side of bare-metal USB routing (Phase 4's 1.0
+    /// promise). The full transfer machinery (command/event rings, control
+    /// and bulk transfers, hot-plug events) lives in [`crate::xhci`] and is
+    /// logic-tested on the host; the boot kernel drives init + port routing
+    /// against the real (emulated) controller here.
+    ///
+    /// Every hardware wait is bounded: a wedged controller is reported, not
+    /// a hang.
+    fn bring_up_xhci(serial: &SerialPort) {
+        /// Volatile-read poll budget for reset/run completion.
+        const POLL_BUDGET: u32 = 1_000_000;
+
+        let mut funcs = [crate::pci::XhciFunction::EMPTY; 4];
+        let n = crate::pci::find_xhci_controllers(&mut funcs);
+        if n == 0 {
+            serial.write_str("enlil kernel: xhci: no xHCI controller on bus 0\n");
+            return;
+        }
+
+        let mut up = 0u32;
+        for f in funcs.iter().take(n) {
+            let mut d = [0u8; 20];
+            let mut fun = [0u8; 20];
+            let mut base = [0u8; 18];
+            serial.write_str("enlil kernel: xhci: 00:");
+            serial.write_str(format_u64(u64::from(f.device), &mut d));
+            serial.write_str(".");
+            serial.write_str(format_u64(u64::from(f.function), &mut fun));
+            serial.write_str(" BAR0 ");
+            serial.write_str(format_u64_hex(f.bar0, &mut base));
+            serial.write_str("\n");
+            if f.bar0 == 0 {
+                serial.write_str("enlil kernel: xhci: BAR0 is not a memory BAR — skipped\n");
+                continue;
+            }
+            // SAFETY: BAR0 is the controller's MMIO window, programmed by
+            // the firmware and identity-mapped on the firmware page tables
+            // this still runs on.
+            let mmio = unsafe { crate::xhci::VolatileMmio::at(f.bar0) };
+            let mut op = match crate::xhci::Op::new(mmio) {
+                Ok(op) => op,
+                Err(_) => {
+                    serial.write_str("enlil kernel: xhci: capability probe FAILED\n");
+                    continue;
+                }
+            };
+            let caps = *op.caps();
+            let mut ver = [0u8; 18];
+            let mut ports = [0u8; 20];
+            let mut slots = [0u8; 20];
+            serial.write_str("enlil kernel: xhci: version ");
+            serial.write_str(format_u64_hex(u64::from(caps.hciversion()), &mut ver));
+            serial.write_str(", ");
+            serial.write_str(format_u64(u64::from(caps.max_ports()), &mut ports));
+            serial.write_str(" ports, ");
+            serial.write_str(format_u64(u64::from(caps.max_slots()), &mut slots));
+            serial.write_str(" slots\n");
+
+            if op.reset(POLL_BUDGET).is_err() {
+                serial.write_str("enlil kernel: xhci: controller reset FAILED\n");
+                continue;
+            }
+            if op.run(POLL_BUDGET).is_err() {
+                serial.write_str("enlil kernel: xhci: schedule start FAILED\n");
+                continue;
+            }
+            serial.write_str("enlil kernel: xhci: reset ok, schedule running\n");
+
+            for port in 1..=caps.max_ports() {
+                if let Some(info) = op.port(port) {
+                    let mut p = [0u8; 20];
+                    serial.write_str("enlil kernel: xhci: port ");
+                    serial.write_str(format_u64(u64::from(info.port), &mut p));
+                    serial.write_str(": ");
+                    serial.write_str(if info.connected() {
+                        "connected "
+                    } else {
+                        "disconnected "
+                    });
+                    serial.write_str(xhci_speed_name(info.speed()));
+                    serial.write_str(if info.enabled() { " enabled" } else { "" });
+                    serial.write_str("\n");
+                }
+            }
+            up += 1;
+        }
+        if up > 0 {
+            serial.write_str("enlil kernel: xhci: controller enumerated\n");
+        } else {
+            serial.write_str("enlil kernel: xhci: enumeration FAILED\n");
+        }
+    }
+
+    /// Short name for a [`crate::xhci::PortSpeed`] on the serial log.
+    fn xhci_speed_name(speed: crate::xhci::PortSpeed) -> &'static str {
+        use crate::xhci::PortSpeed;
+        match speed {
+            PortSpeed::Full => "FullSpeed",
+            PortSpeed::Low => "LowSpeed",
+            PortSpeed::High => "HighSpeed",
+            PortSpeed::Super => "SuperSpeed",
+            PortSpeed::SuperPlus => "SuperSpeedPlus",
+            PortSpeed::Unknown => "UnknownSpeed",
+        }
+    }
+
+    /// Bring up the bare-metal management network (ROADMAP 6.5, T-6.20):
+    /// find the first PCI network controller on bus 0 and record its BAR0
+    /// MMIO base for the post-paging station-MAC read.
+    ///
+    /// Config-space reads only — no MMIO is touched before paging is up,
+    /// so this is safe on the firmware page tables. Only an e1000-class
+    /// NIC is claimed; anything else is reported and skipped.
+    fn bring_up_net(serial: &SerialPort) {
+        use core::sync::atomic::Ordering;
+
+        let Some(nic) = crate::pci::first_network_function() else {
+            serial.write_str("enlil kernel: net: no network controller on bus 0\n");
+            return;
+        };
+        if !crate::net::is_e1000_device(nic.vendor, nic.device_id) {
+            let mut v = [0u8; 18];
+            let mut d = [0u8; 18];
+            serial.write_str("enlil kernel: net: NIC is not e1000 (vendor ");
+            serial.write_str(format_u64_hex(u64::from(nic.vendor), &mut v));
+            serial.write_str(" device ");
+            serial.write_str(format_u64_hex(u64::from(nic.device_id), &mut d));
+            serial.write_str("), skipped\n");
+            return;
+        }
+        let Some(mmio) = crate::pci::bar0_mmio_base(nic.device, nic.function) else {
+            serial.write_str("enlil kernel: net: BAR0 is not a memory BAR, skipped\n");
+            return;
+        };
+        NET_MMIO_PLUS1.store(mmio + 1, Ordering::Release);
+        let mut dev = [0u8; 20];
+        let mut fun = [0u8; 20];
+        let mut b = [0u8; 18];
+        serial.write_str("enlil kernel: net: e1000 00:");
+        serial.write_str(format_u64(u64::from(nic.device), &mut dev));
+        serial.write_str(".");
+        serial.write_str(format_u64(u64::from(nic.function), &mut fun));
+        serial.write_str(" BAR0 ");
+        serial.write_str(format_u64_hex(mmio, &mut b));
+        serial.write_str("\n");
+    }
+
+    /// Read the NIC's station MAC from RAR[0] (ROADMAP 6.5, T-6.20) and
+    /// report it on serial.
+    ///
+    /// Runs post-paging on the kernel's identity map, which covers BAR0
+    /// (sub-4 GiB MMIO). `mmio_base` is the e1000 BAR0 `bring_up_net`
+    /// stashed pre-paging, so the RAR layout applies.
+    fn bring_up_net_mac(serial: &SerialPort, mmio_base: u64) {
+        // SAFETY: the caller runs on the identity map covering BAR0, and
+        // `mmio_base` is the e1000 BAR0 discovered pre-paging.
+        let mac = unsafe { crate::net::read_mac(mmio_base) };
+        let mut buf = [0u8; 18];
+        serial.write_str("enlil kernel: net: station MAC ");
+        serial.write_str(crate::net::format_mac(&mac, &mut buf));
+        serial.write_str("\n");
     }
 
     /// Arm the LAPIC timer once and prove it fires an interrupt into the kernel.
