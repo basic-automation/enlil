@@ -859,6 +859,60 @@ mod hw {
                 serial.write_str("\n");
             }
         }
+        // The NUMA topology from the SRAT: proximity domains, per-node RAM
+        // ranges, and CPU→node bindings — the placement input for per-guest
+        // vCPU/RAM co-location (ROADMAP 6.3). No SRAT means one implicit node.
+        if summary.numa_domain_count > 0 {
+            let mut n = [0u8; 20];
+            serial.write_str("enlil kernel: acpi: SRAT NUMA ");
+            serial.write_str(format_u64(
+                u64::try_from(summary.numa_domain_count).unwrap_or(u64::MAX),
+                &mut n,
+            ));
+            serial.write_str(" domain(s):");
+            for d in summary.numa_domains.iter().take(
+                summary
+                    .numa_domain_count
+                    .min(crate::acpi::MAX_REPORTED_NUMA_DOMAINS),
+            ) {
+                let mut b = [0u8; 20];
+                serial.write_str(" ");
+                serial.write_str(format_u64(u64::from(*d), &mut b));
+            }
+            serial.write_str("\n");
+            for r in summary.numa_memory.iter().take(
+                summary
+                    .numa_memory_count
+                    .min(crate::acpi::MAX_REPORTED_NUMA_RANGES),
+            ) {
+                let mut d = [0u8; 20];
+                let mut b = [0u8; 18];
+                let mut l = [0u8; 18];
+                serial.write_str("enlil kernel: acpi: NUMA RAM node ");
+                serial.write_str(format_u64(u64::from(r.domain), &mut d));
+                serial.write_str(" base ");
+                serial.write_str(format_u64_hex(r.base, &mut b));
+                serial.write_str(" len ");
+                serial.write_str(format_u64_hex(r.length, &mut l));
+                serial.write_str("\n");
+            }
+            serial.write_str("enlil kernel: acpi: NUMA CPUs:");
+            for a in summary.numa_cpu_affinities.iter().take(
+                summary
+                    .numa_cpu_affinity_count
+                    .min(crate::acpi::MAX_REPORTED_NUMA_CPU_AFFINITIES),
+            ) {
+                let mut id = [0u8; 20];
+                let mut dom = [0u8; 20];
+                serial.write_str(" apic ");
+                serial.write_str(format_u64(u64::from(a.apic_id), &mut id));
+                serial.write_str("->node ");
+                serial.write_str(format_u64(u64::from(a.domain), &mut dom));
+            }
+            serial.write_str("\n");
+        } else {
+            serial.write_str("enlil kernel: acpi: SRAT NUMA: no SRAT (single implicit node)\n");
+        }
         if summary.ecam_base == 0 {
             return None;
         }
@@ -1195,6 +1249,43 @@ mod hw {
         serial.write_str(" memory BARs on bus 0 totaling ");
         serial.write_str(format_u64_hex(bars.total_bytes, &mut t));
         serial.write_str(" bytes MMIO\n");
+        // The bounded per-function BAR inventory — each implemented memory
+        // BAR's BDF + index + base + sized region, the device-tree input
+        // passthrough claims MMIO windows from (ROADMAP 6.3).
+        let inventory = crate::pci::scan_bar_inventory();
+        if inventory.count == 0 {
+            serial.write_str("enlil kernel: pci: BAR inventory: no memory BARs on bus 0\n");
+        } else {
+            let mut e = [0u8; 20];
+            serial.write_str("enlil kernel: pci: BAR inventory ");
+            serial.write_str(format_u64(
+                u64::try_from(inventory.count).unwrap_or(u64::MAX),
+                &mut e,
+            ));
+            serial.write_str(" entries:\n");
+            for bar in inventory.entries.iter().take(inventory.count) {
+                let mut d = [0u8; 20];
+                let mut f = [0u8; 20];
+                let mut idx = [0u8; 20];
+                let mut base = [0u8; 18];
+                let mut size = [0u8; 18];
+                serial.write_str("enlil kernel: pci:   00:");
+                serial.write_str(format_u64(u64::from(bar.device), &mut d));
+                serial.write_str(".");
+                serial.write_str(format_u64(u64::from(bar.function), &mut f));
+                serial.write_str(" BAR");
+                serial.write_str(format_u64(u64::from(bar.index), &mut idx));
+                serial.write_str(" base ");
+                serial.write_str(format_u64_hex(bar.base, &mut base));
+                serial.write_str(" size ");
+                serial.write_str(format_u64_hex(bar.size, &mut size));
+                serial.write_str(if bar.is_64 {
+                    " (64-bit)\n"
+                } else {
+                    " (32-bit)\n"
+                });
+            }
+        }
     }
 
     /// Bring up the bare-metal xHCI USB host controller driver (ROADMAP 6.5,
