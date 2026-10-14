@@ -536,7 +536,7 @@ mod hw {
         if let Some(hz) = tsc_hz {
             bring_up_smp(&serial, apic_id.unwrap_or(0), hz);
         }
-        bring_up_pci(&serial);
+        bring_up_pci(&serial, handoff);
         bring_up_xhci(&serial);
         bring_up_net(&serial);
         let map = bring_up_paging(&serial, handoff, highest_usable_end);
@@ -629,6 +629,10 @@ mod hw {
         if net_mmio != 0 {
             bring_up_net_mac(&serial, net_mmio - 1);
         }
+        // Bare-metal storage (ROADMAP 6.5): NVMe first, AHCI fallback. Runs
+        // on the identity map with the kernel heap live — the drivers need
+        // both for BAR MMIO and DMA buffers.
+        bring_up_storage(&serial);
         // The privileged domain is carved before the SVM proof guests take
         // their RAM (ROADMAP 6.6).
         bring_up_service_vm(&serial, handoff);
@@ -913,6 +917,60 @@ mod hw {
                 serial.write_str("\n");
             }
         }
+        // The NUMA topology from the SRAT: proximity domains, per-node RAM
+        // ranges, and CPU→node bindings — the placement input for per-guest
+        // vCPU/RAM co-location (ROADMAP 6.3). No SRAT means one implicit node.
+        if summary.numa_domain_count > 0 {
+            let mut n = [0u8; 20];
+            serial.write_str("enlil kernel: acpi: SRAT NUMA ");
+            serial.write_str(format_u64(
+                u64::try_from(summary.numa_domain_count).unwrap_or(u64::MAX),
+                &mut n,
+            ));
+            serial.write_str(" domain(s):");
+            for d in summary.numa_domains.iter().take(
+                summary
+                    .numa_domain_count
+                    .min(crate::acpi::MAX_REPORTED_NUMA_DOMAINS),
+            ) {
+                let mut b = [0u8; 20];
+                serial.write_str(" ");
+                serial.write_str(format_u64(u64::from(*d), &mut b));
+            }
+            serial.write_str("\n");
+            for r in summary.numa_memory.iter().take(
+                summary
+                    .numa_memory_count
+                    .min(crate::acpi::MAX_REPORTED_NUMA_RANGES),
+            ) {
+                let mut d = [0u8; 20];
+                let mut b = [0u8; 18];
+                let mut l = [0u8; 18];
+                serial.write_str("enlil kernel: acpi: NUMA RAM node ");
+                serial.write_str(format_u64(u64::from(r.domain), &mut d));
+                serial.write_str(" base ");
+                serial.write_str(format_u64_hex(r.base, &mut b));
+                serial.write_str(" len ");
+                serial.write_str(format_u64_hex(r.length, &mut l));
+                serial.write_str("\n");
+            }
+            serial.write_str("enlil kernel: acpi: NUMA CPUs:");
+            for a in summary.numa_cpu_affinities.iter().take(
+                summary
+                    .numa_cpu_affinity_count
+                    .min(crate::acpi::MAX_REPORTED_NUMA_CPU_AFFINITIES),
+            ) {
+                let mut id = [0u8; 20];
+                let mut dom = [0u8; 20];
+                serial.write_str(" apic ");
+                serial.write_str(format_u64(u64::from(a.apic_id), &mut id));
+                serial.write_str("->node ");
+                serial.write_str(format_u64(u64::from(a.domain), &mut dom));
+            }
+            serial.write_str("\n");
+        } else {
+            serial.write_str("enlil kernel: acpi: SRAT NUMA: no SRAT (single implicit node)\n");
+        }
         if summary.ecam_base == 0 {
             return None;
         }
@@ -1184,8 +1242,30 @@ mod hw {
     /// device discovery every passthrough/IOMMU step builds on (ROADMAP 6.3).
     ///
     /// Reads the host bridge (00:00.0) identity as a proof the config reads
-    /// reach real hardware and counts the present functions on bus 0.
-    fn bring_up_pci(serial: &SerialPort) {
+    /// reach real hardware and counts the present functions on bus 0. Also
+    /// reports the PCI root-bridge inventory the UEFI stage collected from
+    /// the firmware's PCI Root Bridge I/O protocol handles (roadmap 6.1) —
+    /// the segment + bus-range record the boot device tree consumes.
+    fn bring_up_pci(serial: &SerialPort, handoff: &BootHandoff) {
+        let bridges = handoff.pci_root_bridges();
+        let mut n = [0u8; 20];
+        serial.write_str("enlil kernel: pci: firmware reported ");
+        serial.write_str(format_u64(bridges.len() as u64, &mut n));
+        serial.write_str(" PCI root bridge(s)");
+        for bridge in bridges {
+            let mut seg = [0u8; 20];
+            let mut lo = [0u8; 20];
+            let mut hi = [0u8; 20];
+            serial.write_str(" [seg ");
+            serial.write_str(format_u64(u64::from(bridge.segment), &mut seg));
+            serial.write_str(" buses ");
+            serial.write_str(format_u64(u64::from(bridge.bus_start), &mut lo));
+            serial.write_str("-");
+            serial.write_str(format_u64(u64::from(bridge.bus_end), &mut hi));
+            serial.write_str("]");
+        }
+        serial.write_str("\n");
+
         let scan = crate::pci::scan_bus0();
         let mut ven = [0u8; 18];
         let mut dev = [0u8; 18];
@@ -1249,6 +1329,43 @@ mod hw {
         serial.write_str(" memory BARs on bus 0 totaling ");
         serial.write_str(format_u64_hex(bars.total_bytes, &mut t));
         serial.write_str(" bytes MMIO\n");
+        // The bounded per-function BAR inventory — each implemented memory
+        // BAR's BDF + index + base + sized region, the device-tree input
+        // passthrough claims MMIO windows from (ROADMAP 6.3).
+        let inventory = crate::pci::scan_bar_inventory();
+        if inventory.count == 0 {
+            serial.write_str("enlil kernel: pci: BAR inventory: no memory BARs on bus 0\n");
+        } else {
+            let mut e = [0u8; 20];
+            serial.write_str("enlil kernel: pci: BAR inventory ");
+            serial.write_str(format_u64(
+                u64::try_from(inventory.count).unwrap_or(u64::MAX),
+                &mut e,
+            ));
+            serial.write_str(" entries:\n");
+            for bar in inventory.entries.iter().take(inventory.count) {
+                let mut d = [0u8; 20];
+                let mut f = [0u8; 20];
+                let mut idx = [0u8; 20];
+                let mut base = [0u8; 18];
+                let mut size = [0u8; 18];
+                serial.write_str("enlil kernel: pci:   00:");
+                serial.write_str(format_u64(u64::from(bar.device), &mut d));
+                serial.write_str(".");
+                serial.write_str(format_u64(u64::from(bar.function), &mut f));
+                serial.write_str(" BAR");
+                serial.write_str(format_u64(u64::from(bar.index), &mut idx));
+                serial.write_str(" base ");
+                serial.write_str(format_u64_hex(bar.base, &mut base));
+                serial.write_str(" size ");
+                serial.write_str(format_u64_hex(bar.size, &mut size));
+                serial.write_str(if bar.is_64 {
+                    " (64-bit)\n"
+                } else {
+                    " (32-bit)\n"
+                });
+            }
+        }
     }
 
     /// Bring up the bare-metal xHCI USB host controller driver (ROADMAP 6.5,
@@ -1418,6 +1535,203 @@ mod hw {
         serial.write_str("enlil kernel: net: station MAC ");
         serial.write_str(crate::net::format_mac(&mac, &mut buf));
         serial.write_str("\n");
+    }
+
+    /// Report a `bus:device.function` triple on the serial console.
+    fn report_bdf(serial: &SerialPort, bus: u8, device: u8, function: u8) {
+        let mut b = [0u8; 20];
+        let mut d = [0u8; 20];
+        let mut f = [0u8; 20];
+        serial.write_str(format_u64(u64::from(bus), &mut b));
+        serial.write_str(":");
+        serial.write_str(format_u64(u64::from(device), &mut d));
+        serial.write_str(".");
+        serial.write_str(format_u64(u64::from(function), &mut f));
+    }
+
+    /// Report a driver error (Display-formatted through the heap) on serial.
+    fn report_storage_error(serial: &SerialPort, prefix: &str, e: &dyn core::fmt::Display) {
+        serial.write_str(prefix);
+        serial.write_str(&alloc::format!("{e}\n"));
+    }
+
+    /// Bring up bare-metal storage (ROADMAP 6.5, T-6.19): find `NVMe`/`AHCI`
+    /// controllers on PCI bus 0 and drive them directly from the kernel.
+    ///
+    /// `NVMe` is preferred; `AHCI` is the fallback. On the `NVMe` path the kernel
+    /// enables memory-space decoding + bus mastering, initializes the
+    /// controller, reports the namespace size, and runs a block read/write
+    /// self-test on the LAST LBA of namespace 1 -- the nightly QEMU harness
+    /// attaches a blank 64 MiB `NVMe` image, so the self-test never touches
+    /// real data there. On real hardware this write is destructive to that
+    /// one sector; a config-gated policy for production disks is a later
+    /// slice.
+    ///
+    /// On the `AHCI` path the kernel starts each port with a SATA disk and
+    /// reports its IDENTIFY model string (no destructive self-test there).
+    fn bring_up_storage(serial: &SerialPort) {
+        let (count, controllers) = crate::pci::find_storage_controllers();
+        if count == 0 {
+            serial.write_str("enlil kernel: storage: no NVMe/AHCI controller on bus 0\n");
+            return;
+        }
+        let mut nvme = None;
+        let mut ahci = None;
+        for c in controllers.iter().take(count) {
+            if c.is_nvme {
+                if nvme.is_none() {
+                    nvme = Some(*c);
+                }
+            } else if ahci.is_none() {
+                ahci = Some(*c);
+            }
+        }
+        if let Some(c) = nvme {
+            bring_up_nvme(serial, c);
+        } else if let Some(c) = ahci {
+            bring_up_ahci(serial, c);
+        }
+    }
+
+    /// Register-window bytes the `NVMe` driver touches: the controller registers
+    /// (`0x1000`) plus the doorbells of the admin and one I/O queue pair.
+    const NVME_BAR_BYTES: u64 = 0x4000;
+    /// Register-window bytes the `AHCI` driver touches: the generic host control
+    /// block plus the per-port register files.
+    const AHCI_BAR_BYTES: u64 = 0x2000;
+
+    /// Make a storage controller's `BAR0` reachable on the kernel's own page
+    /// tables. A 64-bit `BAR` can sit far above the identity map (OVMF places an
+    /// `NVMe` controller's at `0x3800_0000_0000`), so map it uncached first;
+    /// logs and returns `false` if that fails so the caller skips the driver
+    /// instead of faulting on the first register read.
+    fn map_controller_bar(serial: &SerialPort, what: &str, bar: u64, len: u64) -> bool {
+        // SAFETY: runs on the kernel's own tables after the guarded-stack
+        // switch, single-CPU; the boot-time `HostMap` is no longer used.
+        let mapped = unsafe { crate::paging::map_mmio_range(bar, len) };
+        serial.write_str("enlil kernel: storage: ");
+        serial.write_str(what);
+        serial.write_str(if mapped {
+            ": BAR0 mapped uncached on the kernel page tables\n"
+        } else {
+            ": BAR0 could not be mapped — cannot drive\n"
+        });
+        mapped
+    }
+
+    /// Drive the first `NVMe` controller: init, report, block r/w self-test.
+    fn bring_up_nvme(serial: &SerialPort, c: crate::pci::StorageController) {
+        serial.write_str("enlil kernel: storage: NVMe controller at ");
+        report_bdf(serial, c.bus, c.device, c.function);
+        let mut base = [0u8; 18];
+        serial.write_str(", BAR0 ");
+        serial.write_str(format_u64_hex(c.bar0_base, &mut base));
+        serial.write_str("\n");
+        if c.bar0_base == 0 {
+            serial.write_str("enlil kernel: storage: nvme: no memory BAR0 — cannot drive\n");
+            return;
+        }
+        crate::pci::enable_mem_bus_master(c.bus, c.device, c.function);
+        if !map_controller_bar(serial, "nvme", c.bar0_base, NVME_BAR_BYTES) {
+            return;
+        }
+        let mmio = crate::mmio::PhysMmio::new(c.bar0_base);
+        let mut ctl = match crate::nvme::NvmeController::init(mmio, 1) {
+            Ok(ctl) => ctl,
+            Err(e) => {
+                report_storage_error(serial, "enlil kernel: storage: nvme: init failed: ", &e);
+                return;
+            }
+        };
+        let mut n = [0u8; 20];
+        serial.write_str("enlil kernel: storage: nvme: controller ready, ");
+        serial.write_str(format_u64(ctl.namespace_blocks(), &mut n));
+        serial.write_str(" 512-byte blocks\n");
+
+        // Block r/w self-test on the last LBA: write a pattern, read it back,
+        // compare, flush. Destructive to that one sector by design (see the
+        // `bring_up_storage` contract above).
+        let last = ctl.namespace_blocks() - 1;
+        let mut wbuf = [0u8; 512];
+        for (i, b) in wbuf.iter_mut().enumerate() {
+            *b = ((i ^ 0xA5) & 0xFF) as u8;
+        }
+        let mut rbuf = [0u8; 512];
+        let ok = ctl.write_blocks(last, &wbuf).is_ok()
+            && ctl.read_blocks(last, &mut rbuf).is_ok()
+            && rbuf == wbuf
+            && ctl.flush().is_ok();
+        if ok {
+            serial.write_str("enlil kernel: storage: nvme: block r/w self-test ok\n");
+        } else {
+            serial.write_str("enlil kernel: storage: nvme: block r/w self-test FAILED\n");
+        }
+    }
+
+    /// Drive the first `AHCI` controller: start SATA ports, report disks.
+    fn bring_up_ahci(serial: &SerialPort, c: crate::pci::StorageController) {
+        serial.write_str("enlil kernel: storage: AHCI controller at ");
+        report_bdf(serial, c.bus, c.device, c.function);
+        let mut base = [0u8; 18];
+        serial.write_str(", BAR0 ");
+        serial.write_str(format_u64_hex(c.bar0_base, &mut base));
+        serial.write_str("\n");
+        if c.bar0_base == 0 {
+            serial.write_str("enlil kernel: storage: ahci: no memory BAR0 — cannot drive\n");
+            return;
+        }
+        crate::pci::enable_mem_bus_master(c.bus, c.device, c.function);
+        if !map_controller_bar(serial, "ahci", c.bar0_base, AHCI_BAR_BYTES) {
+            return;
+        }
+        let mmio = crate::mmio::PhysMmio::new(c.bar0_base);
+        let mut ctl = match crate::ahci::AhciController::init(mmio) {
+            Ok(ctl) => ctl,
+            Err(e) => {
+                report_storage_error(serial, "enlil kernel: storage: ahci: init failed: ", &e);
+                return;
+            }
+        };
+        let mask = ctl.implemented_ports();
+        let mut m = [0u8; 20];
+        serial.write_str("enlil kernel: storage: ahci: controller ready, ports mask ");
+        serial.write_str(format_u64(u64::from(mask), &mut m));
+        serial.write_str("\n");
+        for port in 0..32u8 {
+            if mask >> port & 1 == 0 || !ctl.device_present(port) {
+                continue;
+            }
+            match ctl.start_port(port) {
+                Ok(()) => match ctl.identify(port) {
+                    Ok(id) => {
+                        let mut p = [0u8; 20];
+                        serial.write_str("enlil kernel: storage: ahci: port ");
+                        serial.write_str(format_u64(u64::from(port), &mut p));
+                        serial.write_str(": disk ");
+                        let model = crate::ahci::identify_model(&id);
+                        for &b in &model {
+                            if b == 0 {
+                                break;
+                            }
+                            serial.write_byte(b);
+                        }
+                        serial.write_str("\n");
+                    }
+                    Err(e) => report_storage_error(
+                        serial,
+                        "enlil kernel: storage: ahci: identify failed: ",
+                        &e,
+                    ),
+                },
+                Err(e) => {
+                    report_storage_error(
+                        serial,
+                        "enlil kernel: storage: ahci: port start failed: ",
+                        &e,
+                    );
+                }
+            }
+        }
     }
 
     /// Arm the LAPIC timer once and prove it fires an interrupt into the kernel.
