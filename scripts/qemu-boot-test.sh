@@ -3,13 +3,15 @@
 #
 # Builds enlil-boot for x86_64-unknown-uefi, drops it as the default UEFI
 # boot application (EFI/BOOT/BOOTX64.EFI) on a virtual FAT ESP, boots it under
-# QEMU with OVMF firmware, and asserts the payload's serial banner. This is the
+# QEMU with OVMF firmware, and asserts the full 6.7 milestone boot chain on
+# serial: every bring-up stage's proof line in chain order, ending with the
+# kernel's milestone summary (which must be COMPLETE and last). This is the
 # nightly boot proof for a bare-metal increment — a build step is proven by
 # BUILDING for the uefi target, and a boot step by BOOTING here and matching
 # the expected serial output. It never touches the workstation's boot config.
 #
 # Exit codes:
-#   0  boot proof passed (banner observed on serial)
+#   0  boot proof passed (milestone 6.7 chain COMPLETE, in order, on serial)
 #   1  build or boot FAILED (banner not observed)
 #   2  SKIPPED: qemu-system-x86_64 and/or OVMF firmware not installed
 #      (install with: sudo apt-get install -y qemu-system-x86 ovmf, or point
@@ -311,6 +313,12 @@ NVME_LINE="nvme: controller ready"
 # test image, reads it back, and the bytes match — the bare-metal block r/w
 # path proven on hardware (no OS underneath).
 NVME_RW_LINE="nvme: block r/w self-test ok"
+# Printed once the kernel's 6.7 milestone chain gate runs after the framebuffer
+# stage: the single machine-checkable summary of the UEFI -> kernel ->
+# service VM -> guests -> console chain. COMPLETE means every link verified
+# this boot; anything else prints DEGRADED with the honest per-link state, so
+# the harness asserts the COMPLETE line (not just the prefix).
+MILESTONE_LINE="milestone 6.7: boot chain COMPLETE"
 TIMEOUT_SECS=60
 
 mkdir -p "$OUTDIR"
@@ -457,10 +465,12 @@ else
     QEMU_ARGS+=(-cpu max)
 fi
 
-# The payload halts (hlt loop) after its banner, so QEMU never exits on its
-# own: run it in the background and poll the serial log, killing QEMU as soon
-# as the banner (or the timeout) arrives instead of always burning the full
-# timeout.
+# The payload halts (hlt loop) after the milestone summary, so QEMU never exits
+# on its own: run it in the background and poll the serial log, killing QEMU as
+# soon as the milestone summary (or the timeout) arrives instead of always
+# burning the full timeout. The milestone line is the LAST chain line, so
+# waiting for it (not an earlier line) guarantees the whole boot chain — every
+# stage the summary covers — is in the log before QEMU dies.
 : > "$SERIAL_LOG"
 "$QEMU" "${QEMU_ARGS[@]}" &
 QEMU_PID=$!
@@ -471,7 +481,7 @@ for _ in $(seq "$TIMEOUT_SECS"); do
         QEMU_RC=$?
         break
     fi
-    if grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null; then
+    if grep -q "$MILESTONE_LINE" "$SERIAL_LOG" 2>/dev/null; then
         break
     fi
     sleep 1
@@ -483,6 +493,25 @@ fi
 
 echo "==> serial output:"
 sed 's/^/    /' "$SERIAL_LOG" 2>/dev/null || true
+
+# --- Milestone chain-order gate (ROADMAP 6.7) --------------------------------
+# Presence alone could pass with the stage lines in any order (or the summary
+# printed before the stages it summarizes). The milestone line must be the
+# LAST chain line: UEFI banner, kernel memory, service VM, first guest
+# scenario, last guest scenario, text console, then the summary.
+ln_of() { grep -n -m1 -F "$1" "$SERIAL_LOG" 2>/dev/null | cut -d: -f1; }
+chain_order_ok=1
+prev_ln=0
+for pat in "$BANNER" "$KERNEL_LINE" "$SERVICE_VM_LINE" "$VMCB_LINE" \
+           "$EXC_ERRCODE_LINE" "$GOP_TEXT_LINE" "$MILESTONE_LINE"; do
+    ln=$(ln_of "$pat")
+    if [ -z "$ln" ] || [ "$ln" -le "$prev_ln" ]; then
+        chain_order_ok=0
+        echo "milestone chain order broken at: $pat"
+        break
+    fi
+    prev_ln=$ln
+done
 
 if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$KERNEL_LINE" "$SERIAL_LOG" 2>/dev/null \
@@ -559,10 +588,12 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$GOP_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ESP_CONFIG_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ESP_GUEST_LINE" "$SERIAL_LOG" 2>/dev/null \
-    && grep -q "$GOP_TEXT_LINE" "$SERIAL_LOG" 2>/dev/null; then
-    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, scheduler quantum driven by the LAPIC timer, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery incl. real VT-d DMAR remapping units + device scopes, SMP AP bring-up (INIT-SIPI-SIPI), PCI enumeration, own page tables (null-page guard) + 4 KiB split + kernel-owned guarded stack (bring-up continues on it), SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + interrupt IRET-resume round-trip + 64-bit long-mode guest + long-mode interrupt round-trip + virtual-interrupt masking + spinning-guest preemption + host-LAPIC-timer preemption (INTR intercept) + timer-tick delivery into the guest + PERIODIC timer preemption + tick delivery (host timer re-armed per quantum, handler IRETQ back into the spin — the guest time-slice) + guest-exception interception (#UD trap + re-inject) + interrupt round-trip (inject/handle/IRET/resume) + NPT write-protection dirty-tracking (trap+grant+re-protect a guest store twice — per-epoch bitmap) + RDTSC-intercept fallback guest runs (T-6.7; the intercept itself is physical-AMD-proven only) + exception error-code re-inject (#PF/#GP via a paged guest, exact codes re-delivered, T-6.13) + bare-metal xHCI USB host controller enumerated (probe + reset + schedule + port scan, T-6.18), bare-metal NVMe init + block read/write self-test on the last LBA (T-6.19), service VM boot (privileged dom0-style domain: device-ownership table, driver assignment, management console, virtio-blk/net/console backends, NPT with RAM + MMIO identity-mapped), GOP draw observed on serial, and the ESP payload staged at boot (config.toml + per-guest OVMF CODE/VARS byte counts, T-0.6)"
+    && grep -q "$GOP_TEXT_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$MILESTONE_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && [ "$chain_order_ok" = "1" ]; then
+    echo "PASS: banner, kernel memory, heap, enlil-platform scheduler, scheduler quantum driven by the LAPIC timer, IDT, spinlock, x2APIC, per-CPU GS-base TLS, LAPIC timer, LAPIC TSC-deadline timer, TSC calibration, ACPI discovery incl. real VT-d DMAR remapping units + device scopes, SMP AP bring-up (INIT-SIPI-SIPI), PCI enumeration, own page tables (null-page guard) + 4 KiB split + kernel-owned guarded stack (bring-up continues on it), SVM enable + host-save + VMRUN-ready guest + VMRUN to #VMEXIT(HLT) + multi-instruction dispatch loop + IOIO exit-handling + CPUID emulation + in-guest stealth + MSR read/write emulation + NPF demand-paging + native compute loop + VMSAVE/VMLOAD extended-state swap + VMMCALL hypercall + event injection + interrupt IRET-resume round-trip + 64-bit long-mode guest + long-mode interrupt round-trip + virtual-interrupt masking + spinning-guest preemption + host-LAPIC-timer preemption (INTR intercept) + timer-tick delivery into the guest + PERIODIC timer preemption + tick delivery (host timer re-armed per quantum, handler IRETQ back into the spin — the guest time-slice) + guest-exception interception (#UD trap + re-inject) + interrupt round-trip (inject/handle/IRET/resume) + NPT write-protection dirty-tracking (trap+grant+re-protect a guest store twice — per-epoch bitmap) + RDTSC-intercept fallback guest runs (T-6.7; the intercept itself is physical-AMD-proven only) + exception error-code re-inject (#PF/#GP via a paged guest, exact codes re-delivered, T-6.13) + bare-metal xHCI USB host controller enumerated (probe + reset + schedule + port scan, T-6.18), bare-metal NVMe init + block read/write self-test on the last LBA (T-6.19), service VM boot (privileged dom0-style domain: device-ownership table, driver assignment, management console, virtio-blk/net/console backends, NPT with RAM + MMIO identity-mapped), GOP draw observed on serial, and the ESP payload staged at boot (config.toml + per-guest OVMF CODE/VARS byte counts, T-0.6), and the milestone 6.7 chain gate (COMPLETE summary present and last — UEFI -> kernel -> service VM -> guests -> console in order)"
     exit 0
 fi
 
-echo "FAIL: not all of banner/kernel-line/heap/idt/apic/svm/hsave/vmcb/vmrun/dispatch/ioio/cpuid/stealth/msr/msrw/npf/compute/gop/nvme/service-vm/esp-payload observed (qemu rc=$QEMU_RC)"
+echo "FAIL: not all of banner/kernel-line/heap/idt/apic/svm/hsave/vmcb/vmrun/dispatch/ioio/cpuid/stealth/msr/msrw/npf/compute/gop/nvme/service-vm/esp-payload/milestone observed, or the milestone chain order is broken (qemu rc=$QEMU_RC)"
 exit 1
