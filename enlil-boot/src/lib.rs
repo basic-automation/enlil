@@ -22,6 +22,7 @@
 extern crate alloc;
 
 pub mod acpi;
+pub mod ahci;
 pub mod allocator;
 pub mod apic;
 pub mod esp;
@@ -32,7 +33,9 @@ pub mod handoff;
 pub mod idt;
 pub mod iommu;
 pub mod kernel;
+pub mod mmio;
 pub mod net;
+pub mod nvme;
 pub mod paging;
 pub mod pci;
 pub mod percpu;
