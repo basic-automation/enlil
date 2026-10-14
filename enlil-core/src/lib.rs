@@ -13,6 +13,7 @@ pub mod run_loop;
 pub mod serial;
 pub mod stealth_msr;
 pub mod timing_stealth;
+pub mod uefi_firmware;
 pub mod usb_routing;
 pub mod usb_service;
 pub mod vcpu;
