@@ -193,11 +193,11 @@
   - [x] fw_cfg device on the bus (item selector 0x510 / data 0x511) delivering ACPI+SMBIOS to a guest
   - [x] etc/table-loader bios-linker-loader command stream (ALLOCATE/ADD_POINTER/ADD_CHECKSUM/WRITE_POINTER)
   - [x] dmidecode --from-dump validation integration test
-- [ ] 5.3 CPUID stealth table + live-KVM injection (clear hypervisor bit, out-of-range leaves, vendor/topology/PMU leaves)
+- [x] 5.3 CPUID stealth table + live-KVM injection (clear hypervisor bit, out-of-range leaves, vendor/topology/PMU leaves)
   - [x] apply_topology_stealth rebuilds CPUID array (leaf 0xB topology, leaf-1 max-IDs, per-vCPU x2APIC IDs)
   - [x] PMU leaf 0xA + AMD topology triad (0x8000_0008 NC, 0x8000_001D cache sharing, 0x8000_001E SMT)
   - [x] Install the CPUID identity leaves from the stealth table (upsert_identity_leaves folds leaf-0 vendor string, leaf-1 FMS, brand 0x8000_0002-4 into apply_topology_stealth so the guest identity matches the topology/PMU/frequency view)
-  - [ ] Cross-vendor identity at runtime: presenting a different vendor (e.g. Intel-on-AMD) needs vendor-appropriate MSR emulation before it is safe — the identity install exists but the live from_host table stays same-vendor
+  - [x] Cross-vendor identity at runtime: `CpuidStealthConfig::cross_vendor` synthesizes a coherent foreign-vendor identity (synthetic retail part FMS/brand/frequencies, masked leaf-1 feature flags, vendor-correct leaves); `StealthMsrRouter::with_emulated_vendor` + `StandardPc::install_stealth_msr_routers_for_identity` + `StealthRunLoop::install_cross_vendor` emulate the presented vendor's MSR surface (filter + dispatch follow the emulated vendor), so CPUID and MSR views agree
   - [x] Guest sees Invariant TSC (CPUID 0x8000_0007 EDX[8]) preserved through stealth — CONFIRMED on real /dev/kvm: though CpuidStealthTable installs no explicit 0x8000_0007 leaf, apply_topology_stealth patches KVM's get_supported_cpuid (which carries the host's Invariant-TSC bit) rather than rebuilding from the table, so the bit survives to the guest. Verified by kvm_backend::tests::cpuid_stealth_preserves_invariant_tsc (real-mode guest reads 0x8000_0007:EDX[8] after apply_topology_stealth and sees it set; skipped only if the host itself lacks Invariant TSC). No transparency gap
 - [x] 5.4 Timing stealth — TSC offsetting, constant-time CPUID table, APERF/MPERF + PMC + LBR shadowing
   - [x] Shadow IA32_APERF/MPERF counters advancing at model rate, hiding VMEXIT overhead (VcpuTimingState)

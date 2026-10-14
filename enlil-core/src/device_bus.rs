@@ -1313,6 +1313,42 @@ impl StandardPc {
         handles
     }
 
+    /// Install `vcpu_count` independent stealth MSR routers that emulate
+    /// `presented`'s MSR surface — the MSR half of a cross-vendor identity
+    /// switch (e.g. Intel presented on an AMD host).
+    ///
+    /// Same seeding and per-vCPU independence as
+    /// [`install_stealth_msr_routers`](Self::install_stealth_msr_routers), but
+    /// each router is built with
+    /// [`StealthMsrRouter::with_emulated_vendor`](crate::stealth_msr::StealthMsrRouter::with_emulated_vendor),
+    /// so the KVM MSR filter and the read/write dispatch serve the *presented*
+    /// vendor's PMC and LBR MSR blocks rather than the physical platform's. The
+    /// [`LbrState`](enlil_devices::stealth::lbr::LbrState) takes the presented
+    /// vendor's platform shape (Intel stack vs AMD last-branch pair), since the
+    /// shadow state a guest can observe must match its apparent CPU.
+    ///
+    /// Pair with a cross-vendor CPUID table — built with
+    /// [`CpuidStealthConfig::cross_vendor`](enlil_devices::stealth::cpuid::CpuidStealthConfig::cross_vendor)
+    /// for `presented` and installed via `apply_topology_stealth` — so the
+    /// CPUID identity and the MSR surface agree; install with
+    /// [`StealthRunLoop::install_cross_vendor`](crate::run_loop::StealthRunLoop::install_cross_vendor)
+    /// to wire both at once.
+    ///
+    /// # Panics
+    /// Panics if `vcpu_count` is 0 — a bank must back at least one vCPU.
+    pub fn install_stealth_msr_routers_for_identity(
+        &mut self,
+        presented: enlil_devices::stealth::cpuid::CpuVendor,
+        vcpu_count: usize,
+    ) -> Vec<std::sync::Arc<crate::timing_stealth::VcpuTimingState>> {
+        assert!(vcpu_count > 0, "a stealth bank needs ≥1 vCPU");
+        let (routers, handles): (Vec<_>, Vec<_>) = (0..vcpu_count)
+            .map(|_| Self::seeded_stealth_router_for_identity(presented))
+            .unzip();
+        self.bus.set_stealth_msr_routers(routers);
+        handles
+    }
+
     /// Build one stealth MSR router for `platform` over a fresh timing state,
     /// seeded with a single [`STEALTH_SEED_REF_CYCLES`](Self::STEALTH_SEED_REF_CYCLES)
     /// advance at the default [`PmcRateModel`] rate, and return it together with
@@ -1328,6 +1364,36 @@ impl StandardPc {
         let timing = crate::timing_stealth::VcpuTimingState::new();
         timing.advance(Self::STEALTH_SEED_REF_CYCLES, &PmcRateModel::DEFAULT);
         let router = StealthMsrRouter::new(std::sync::Arc::clone(&timing), LbrState::new(platform));
+        (router, timing)
+    }
+
+    /// Build one stealth MSR router emulating `presented`'s MSR surface over a
+    /// fresh timing state, seeded exactly like [`seeded_stealth_router`](Self::seeded_stealth_router).
+    /// The [`LbrState`](enlil_devices::stealth::lbr::LbrState) takes the
+    /// presented vendor's platform shape so the shadow state the guest can
+    /// observe matches its apparent CPU.
+    fn seeded_stealth_router_for_identity(
+        presented: enlil_devices::stealth::cpuid::CpuVendor,
+    ) -> (
+        StealthMsrRouter,
+        std::sync::Arc<crate::timing_stealth::VcpuTimingState>,
+    ) {
+        use enlil_devices::stealth::{
+            cpuid::CpuVendor,
+            lbr::{LbrPlatform, LbrState},
+            pmc::PmcRateModel,
+        };
+        let platform = match presented {
+            CpuVendor::Intel => LbrPlatform::IntelVmx,
+            CpuVendor::Amd => LbrPlatform::AmdSvm,
+        };
+        let timing = crate::timing_stealth::VcpuTimingState::new();
+        timing.advance(Self::STEALTH_SEED_REF_CYCLES, &PmcRateModel::DEFAULT);
+        let router = StealthMsrRouter::with_emulated_vendor(
+            std::sync::Arc::clone(&timing),
+            LbrState::new(platform),
+            presented,
+        );
         (router, timing)
     }
 
@@ -4436,6 +4502,61 @@ mod tests {
         // visible through the bus's MSR read.
         timing.write_aperf(0x1_2345);
         assert_eq!(pc.bus.rdmsr(timing_msr::IA32_APERF), Some(0x1_2345));
+    }
+
+    // The cross-vendor install path emulates the *presented* vendor's MSR
+    // surface on every vCPU's router: an Intel identity installed on this
+    // (physical) platform serves the Intel PMC/LBR MSRs and refuses AMD's,
+    // with the KVM filter ranges to match — and vice versa for AMD.
+    #[test]
+    fn install_stealth_msr_routers_for_identity_emulates_the_presented_vendor() {
+        use crate::serial::{SerialOutput, SerialOutputMode};
+        use enlil_devices::stealth::cpuid::CpuVendor;
+        use enlil_devices::stealth::lbr::{amd_msr, intel_msr};
+        use enlil_devices::stealth::pmc::msr as pmc_msr;
+
+        for presented in [CpuVendor::Intel, CpuVendor::Amd] {
+            let mut pc = DeviceBus::standard_pc_complete(
+                SerialOutput::new("guest", SerialOutputMode::Null),
+                0,
+                1,
+            )
+            .expect("build standard pc");
+            let timings = pc.install_stealth_msr_routers_for_identity(presented, 2);
+            assert_eq!(timings.len(), 2);
+            assert_eq!(pc.bus.stealth_vcpu_count(), 2);
+
+            for i in 0..2 {
+                let router = pc.bus.stealth_msr_for_mut(i).expect("router installed");
+                assert_eq!(
+                    router.emulated, presented,
+                    "vCPU {i} emulates {presented:?}"
+                );
+                let ranges = router.filter_ranges();
+                let has = |msr: u32| ranges.iter().any(|&(b, c)| msr >= b && msr < b + c);
+                match presented {
+                    CpuVendor::Intel => {
+                        assert!(has(pmc_msr::IA32_PMC0));
+                        assert!(has(intel_msr::LBR_FROM_BASE));
+                        assert!(!has(pmc_msr::AMD_CORE_PERFCTR0));
+                        assert!(!has(amd_msr::LAST_BRANCH_FROM_IP));
+                        // The presented vendor's MSRs round-trip; the other's fall through.
+                        assert!(router.write_msr(pmc_msr::IA32_PERFEVTSEL0, 0x42));
+                        assert_eq!(router.read_msr(pmc_msr::IA32_PERFEVTSEL0), Some(0x42));
+                        assert_eq!(router.read_msr(amd_msr::LAST_BRANCH_FROM_IP), None);
+                    }
+                    CpuVendor::Amd => {
+                        assert!(has(pmc_msr::AMD_CORE_PERFCTR0));
+                        assert!(has(amd_msr::LAST_BRANCH_FROM_IP));
+                        assert!(!has(pmc_msr::IA32_PMC0));
+                        assert!(!has(intel_msr::LBR_FROM_BASE));
+                        assert!(router.write_msr(pmc_msr::AMD_CORE_PERFCTR0, 0x42));
+                        assert_eq!(router.read_msr(pmc_msr::AMD_CORE_PERFCTR0), Some(0x42));
+                        assert_eq!(router.read_msr(intel_msr::LBR_FROM_BASE), None);
+                    }
+                }
+            }
+        }
     }
 
     // A per-vCPU bank serves the *active* vCPU's shadow: with two routers

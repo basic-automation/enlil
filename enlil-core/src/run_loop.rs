@@ -323,19 +323,70 @@ mod linux {
         /// Panics if `vcpu_count` is 0.
         pub fn install_smp(
             backend: KvmBackend,
-            mut pc: StandardPc,
+            pc: StandardPc,
             platform: LbrPlatform,
             vcpu_count: usize,
         ) -> Result<Self> {
-            let timings = pc.install_stealth_msr_routers(platform, vcpu_count);
+            use enlil_devices::stealth::cpuid::CpuVendor;
+            let presented = match platform {
+                LbrPlatform::IntelVmx => CpuVendor::Intel,
+                LbrPlatform::AmdSvm => CpuVendor::Amd,
+            };
+            Self::install_for_identity(backend, pc, presented, vcpu_count)
+        }
+
+        /// Install the stealth stack presenting `presented`'s CPU identity at
+        /// runtime — the cross-vendor identity switch (e.g. Intel-on-AMD).
+        ///
+        /// Like [`install_smp`](Self::install_smp), but the per-vCPU MSR
+        /// routers emulate the *presented* vendor's MSR surface (Intel `IA32_*`
+        /// PMC + LBR stack vs AMD legacy/`PerfMonV2` PMC + last-branch pair) via
+        /// [`StandardPc::install_stealth_msr_routers_for_identity`], so a guest
+        /// cross-checking CPUID against `RDMSR` sees one coherent vendor.
+        ///
+        /// This installs only the MSR half. Complete the switch by building a
+        /// cross-vendor table with
+        /// [`CpuidStealthConfig::cross_vendor`](enlil_devices::stealth::cpuid::CpuidStealthConfig::cross_vendor)
+        /// for `presented` and installing it with
+        /// [`apply_topology_stealth`](Self::apply_topology_stealth) after
+        /// creating the vCPUs — the CPUID identity leaves (vendor string, FMS,
+        /// brand) must agree with the emulated MSR surface, or the masquerade
+        /// is worse than no masquerade.
+        ///
+        /// # Errors
+        /// As [`install`](Self::install).
+        ///
+        /// # Panics
+        /// Panics if `vcpu_count` is 0.
+        pub fn install_cross_vendor(
+            backend: KvmBackend,
+            pc: StandardPc,
+            presented: enlil_devices::stealth::cpuid::CpuVendor,
+            vcpu_count: usize,
+        ) -> Result<Self> {
+            Self::install_for_identity(backend, pc, presented, vcpu_count)
+        }
+
+        /// Shared body of [`install_smp`](Self::install_smp) and
+        /// [`install_cross_vendor`](Self::install_cross_vendor): install
+        /// `vcpu_count` stealth MSR routers emulating `presented`'s MSR
+        /// surface, then forward exactly their filter ranges (+
+        /// `IA32_TSC_DEADLINE`, served by the [`DeviceBus`]) to userspace.
+        fn install_for_identity(
+            backend: KvmBackend,
+            mut pc: StandardPc,
+            presented: enlil_devices::stealth::cpuid::CpuVendor,
+            vcpu_count: usize,
+        ) -> Result<Self> {
+            let timings = pc.install_stealth_msr_routers_for_identity(presented, vcpu_count);
             // One borrow of vCPU 0's freshly-installed router: take both the
             // model and the MSR ranges that must match it. All vCPUs share the
-            // platform, so the filter is identical for each.
+            // emulated vendor, so the filter is identical for each.
             let (model, mut ranges) = {
                 let router = pc
                     .bus
                     .stealth_msr_mut()
-                    .expect("routers installed by install_stealth_msr_routers");
+                    .expect("routers installed by install_stealth_msr_routers_for_identity");
                 (router.pmc.rate_model, router.filter_ranges())
             };
             // IA32_TSC_DEADLINE (0x6E0) is a LAPIC register served by the

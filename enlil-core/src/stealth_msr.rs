@@ -22,6 +22,7 @@
 //! [`VmExitHandler`]: crate::kvm_backend::VmExitHandler
 
 use crate::timing_stealth::VcpuTimingState;
+use enlil_devices::stealth::cpuid::CpuVendor;
 use enlil_devices::stealth::lbr::{amd_msr, intel_msr, LbrPlatform, LbrState, LBR_STACK_SIZE};
 use enlil_devices::stealth::pmc::{msr as pmc_msr, PmcState, MAX_FIXED_PMCS, MAX_GP_PMCS};
 use enlil_devices::stealth::timing::msr as timing_msr;
@@ -43,17 +44,49 @@ pub struct StealthMsrRouter {
     pub pmc: PmcState,
     /// Last-branch-record shadows (`IA32_DEBUGCTL` + the LBR arrays).
     pub lbr: LbrState,
+    /// The CPU vendor the *guest* believes it runs on — the vendor of the
+    /// CPUID identity install ([`CpuidStealthTable`](enlil_devices::stealth::cpuid::CpuidStealthTable)).
+    /// Usually the physical platform's vendor; differs for a cross-vendor
+    /// identity (e.g. Intel presented on an AMD host). The MSR filter and the
+    /// read/write dispatch follow this vendor, so a guest cross-checking
+    /// CPUID against `RDMSR` sees one coherent vendor instead of the physical
+    /// host's registers — presenting Intel while serving AMD's MSR block (or
+    /// vice versa) is itself a detection tell.
+    pub emulated: CpuVendor,
 }
 
 impl StealthMsrRouter {
     /// Build a router over a shared timing state and an LBR state, with a fresh
-    /// [`PmcState`].
+    /// [`PmcState`]. The emulated vendor defaults to the LBR platform's vendor
+    /// (same-vendor identity); use [`with_emulated_vendor`](Self::with_emulated_vendor)
+    /// for a cross-vendor identity.
     #[must_use]
     pub fn new(timing: Arc<VcpuTimingState>, lbr: LbrState) -> Self {
+        let emulated = match lbr.platform {
+            LbrPlatform::IntelVmx => CpuVendor::Intel,
+            LbrPlatform::AmdSvm => CpuVendor::Amd,
+        };
+        Self::with_emulated_vendor(timing, lbr, emulated)
+    }
+
+    /// Build a router that emulates `emulated`'s MSR surface — the second half
+    /// of a cross-vendor identity switch (see
+    /// [`CpuidStealthConfig::cross_vendor`](enlil_devices::stealth::cpuid::CpuidStealthConfig::cross_vendor)
+    /// for the CPUID half). The caller passes the [`LbrState`] for the
+    /// *presented* platform (its `platform` selects which LBR shadow shape the
+    /// router sanitizes); `emulated` then selects which vendor's PMC and LBR
+    /// MSR blocks the filter forwards and the dispatch serves.
+    #[must_use]
+    pub fn with_emulated_vendor(
+        timing: Arc<VcpuTimingState>,
+        lbr: LbrState,
+        emulated: CpuVendor,
+    ) -> Self {
         Self {
             timing,
             pmc: PmcState::new(),
             lbr,
+            emulated,
         }
     }
 
@@ -87,12 +120,12 @@ impl StealthMsrRouter {
         }
     }
 
-    /// Whether `msr` is one of the performance-monitoring-counter MSRs the
-    /// [`PmcState`] models — the Intel `IA32_*` block (including the write-only
-    /// `GLOBAL_STATUS_RESET`, which [`PmcState::read_msr`] cannot report) **or**
-    /// the AMD legacy / `PerfMonV2` block. Used to route writes to [`PmcState`].
+    /// Whether `msr` is one of the Intel `IA32_*` performance-monitoring-counter
+    /// MSRs the [`PmcState`] models (GP counters, event selects, fixed
+    /// counters, and the global control/status block including the write-only
+    /// `GLOBAL_STATUS_RESET`).
     #[must_use]
-    pub const fn is_pmc_msr(msr: u32) -> bool {
+    pub const fn is_intel_pmc_msr(msr: u32) -> bool {
         let gp = pmc_msr::IA32_PMC0;
         let evt = pmc_msr::IA32_PERFEVTSEL0;
         let fixed = pmc_msr::IA32_FIXED_CTR0;
@@ -106,7 +139,16 @@ impl StealthMsrRouter {
                     | pmc_msr::IA32_PERF_GLOBAL_STATUS
                     | pmc_msr::IA32_PERF_GLOBAL_STATUS_RESET
             )
-            || PmcState::is_amd_pmc_msr(msr)
+    }
+
+    /// Whether `msr` is one of the performance-monitoring-counter MSRs the
+    /// [`PmcState`] models — the Intel `IA32_*` block (including the write-only
+    /// `GLOBAL_STATUS_RESET`, which [`PmcState::read_msr`] cannot report) **or**
+    /// the AMD legacy / `PerfMonV2` block. The union across vendors: the router
+    /// only *serves* the emulated vendor's block (see [`read_msr`](Self::read_msr)).
+    #[must_use]
+    pub const fn is_pmc_msr(msr: u32) -> bool {
+        Self::is_intel_pmc_msr(msr) || PmcState::is_amd_pmc_msr(msr)
     }
 
     /// Advance both stealth time surfaces by `ref_cycles` of guest execution.
@@ -130,18 +172,19 @@ impl StealthMsrRouter {
     }
 
     /// The MSR ranges this router answers, as `(base, count)` pairs, for the
-    /// router's platform — the single source of truth to hand to
+    /// router's **emulated** vendor — the single source of truth to hand to
     /// [`KvmBackend::forward_msrs_to_userspace`] so the KVM filter and this
     /// router cover exactly the same MSRs.
     ///
     /// Timing (APERF/MPERF) and `IA32_DEBUGCTL` exist on both vendors and are
     /// always forwarded; the PMC **and** last-branch MSRs are vendor-specific.
-    /// On `IntelVmx` we forward the Intel `IA32_*` PMC block and the TOS +
-    /// FROM/TO/INFO LBR stack; on `AmdSvm` the AMD legacy / `PerfMonV2` PMC block and
-    /// the single AMD last-branch pair (0x1DB–0x1DE). Forwarding the other
-    /// vendor's PMC or LBR MSRs would make non-existent registers readable —
-    /// itself a tell — so each platform forwards only what it really exposes.
-    /// At most 11 ranges, within KVM's 16-range limit.
+    /// On an Intel-emulated identity we forward the Intel `IA32_*` PMC block
+    /// and the TOS + FROM/TO/INFO LBR stack; on an AMD-emulated identity the
+    /// AMD legacy / `PerfMonV2` PMC block and the single AMD last-branch pair
+    /// (0x1DB–0x1DE). Forwarding the other vendor's PMC or LBR MSRs would make
+    /// non-existent registers readable — itself a tell — so each identity
+    /// forwards only what it really exposes. At most 11 ranges, within KVM's
+    /// 16-range limit.
     ///
     /// [`KvmBackend::forward_msrs_to_userspace`]: crate::kvm_backend::KvmBackend::forward_msrs_to_userspace
     #[must_use]
@@ -152,8 +195,8 @@ impl StealthMsrRouter {
             (timing_msr::IA32_MPERF, 2), // 0xE7 MPERF, 0xE8 APERF
             (intel_msr::IA32_DEBUGCTL, 1),
         ];
-        match self.lbr.platform {
-            LbrPlatform::AmdSvm => {
+        match self.emulated {
+            CpuVendor::Amd => {
                 // AMD legacy (4) + interleaved core EvtSel/Ctr (12) + PerfMonV2
                 // global block (status/ctl/clr — 3 consecutive).
                 ranges.push((pmc_msr::AMD_LEGACY_PERFEVTSEL0, pmc_msr::AMD_LEGACY_PMCS));
@@ -162,7 +205,7 @@ impl StealthMsrRouter {
                 ranges.push((pmc_msr::AMD_PERF_CNTR_GLOBAL_STATUS, 3));
                 ranges.push((amd_msr::LAST_BRANCH_FROM_IP, 4)); // 0x1DB..=0x1DE
             }
-            LbrPlatform::IntelVmx => {
+            CpuVendor::Intel => {
                 ranges.push((pmc_msr::IA32_PMC0, gp));
                 ranges.push((pmc_msr::IA32_PERFEVTSEL0, gp));
                 ranges.push((pmc_msr::IA32_FIXED_CTR0, fixed));
@@ -180,32 +223,53 @@ impl StealthMsrRouter {
 
     /// Serve a guest `RDMSR`. Returns `Some(value)` for an MSR this router
     /// models, or `None` to let the caller fall through (e.g. inject `#GP`).
+    ///
+    /// The vendor-specific surfaces follow the **emulated** vendor: an
+    /// Intel-emulated identity serves the `IA32_*` PMC block and the LBR
+    /// stack; an AMD-emulated identity the AMD PMC block and the last-branch
+    /// pair. The other vendor's MSRs read as unmodelled (`None`) — exactly
+    /// like the `#GP` real hardware raises for registers it does not have.
     #[must_use]
     pub fn read_msr(&self, msr: u32) -> Option<u64> {
         match msr {
             timing_msr::IA32_APERF => Some(self.timing.read_aperf()),
             timing_msr::IA32_MPERF => Some(self.timing.read_mperf()),
+            // IA32_DEBUGCTL (0x1D9) exists on both vendors.
             intel_msr::IA32_DEBUGCTL => Some(self.lbr.read_debug_ctl()),
-            intel_msr::LBR_TOS => Some(self.lbr.read_tos()),
-            _ => {
-                if let Some(v) = self.lbr.read_amd_lbr(msr) {
-                    return Some(v);
+            _ => match self.emulated {
+                CpuVendor::Intel => {
+                    if msr == intel_msr::LBR_TOS {
+                        Some(self.lbr.read_tos())
+                    } else if let Some(i) = Self::lbr_from_index(msr) {
+                        Some(self.lbr.read_from(i))
+                    } else if let Some(i) = Self::lbr_to_index(msr) {
+                        Some(self.lbr.read_to(i))
+                    } else if let Some(i) = Self::lbr_info_index(msr) {
+                        Some(self.lbr.read_info(i))
+                    } else if Self::is_intel_pmc_msr(msr) {
+                        self.pmc.read_msr(msr)
+                    } else {
+                        None
+                    }
                 }
-                if let Some(i) = Self::lbr_from_index(msr) {
-                    Some(self.lbr.read_from(i))
-                } else if let Some(i) = Self::lbr_to_index(msr) {
-                    Some(self.lbr.read_to(i))
-                } else if let Some(i) = Self::lbr_info_index(msr) {
-                    Some(self.lbr.read_info(i))
-                } else {
-                    self.pmc.read_msr(msr)
+                CpuVendor::Amd => {
+                    if let Some(v) = self.lbr.read_amd_lbr(msr) {
+                        Some(v)
+                    } else if PmcState::is_amd_pmc_msr(msr) {
+                        self.pmc.read_msr(msr)
+                    } else {
+                        None
+                    }
                 }
-            }
+            },
         }
     }
 
     /// Serve a guest `WRMSR`. Returns `true` if this router models `msr` (and
     /// applied the write), or `false` to let the caller fall through.
+    ///
+    /// Like [`read_msr`](Self::read_msr), the vendor-specific surfaces follow
+    /// the **emulated** vendor; writes to the other vendor's MSRs fall through.
     pub fn write_msr(&mut self, msr: u32, value: u64) -> bool {
         match msr {
             timing_msr::IA32_APERF => {
@@ -216,16 +280,31 @@ impl StealthMsrRouter {
                 self.timing.write_mperf(value);
                 true
             }
+            // IA32_DEBUGCTL (0x1D9) exists on both vendors.
             intel_msr::IA32_DEBUGCTL => {
                 self.lbr.write_debug_ctl(value);
                 true
             }
-            m if self.lbr.write_amd_lbr(m, value) => true,
-            m if Self::is_pmc_msr(m) => {
-                self.pmc.write_msr(m, value);
-                true
-            }
-            _ => false,
+            m => match self.emulated {
+                CpuVendor::Intel => {
+                    if Self::is_intel_pmc_msr(m) {
+                        self.pmc.write_msr(m, value);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                CpuVendor::Amd => {
+                    if self.lbr.write_amd_lbr(m, value) {
+                        true
+                    } else if PmcState::is_amd_pmc_msr(m) {
+                        self.pmc.write_msr(m, value);
+                        true
+                    } else {
+                        false
+                    }
+                }
+            },
         }
     }
 }
@@ -244,10 +323,38 @@ mod tests {
         StealthMsrRouter::new(VcpuTimingState::new(), LbrState::new(platform))
     }
 
+    /// A router on `platform` hardware emulating `emulated`'s MSR surface —
+    /// the cross-vendor identity case (e.g. Intel presented on AMD hardware).
+    fn cross_vendor_router(platform: LbrPlatform, emulated: CpuVendor) -> StealthMsrRouter {
+        StealthMsrRouter::with_emulated_vendor(
+            VcpuTimingState::new(),
+            LbrState::new(platform),
+            emulated,
+        )
+    }
+
+    #[test]
+    fn emulated_vendor_defaults_to_the_platform_vendor() {
+        assert_eq!(router_for(LbrPlatform::IntelVmx).emulated, CpuVendor::Intel);
+        assert_eq!(router_for(LbrPlatform::AmdSvm).emulated, CpuVendor::Amd);
+        assert_eq!(
+            cross_vendor_router(LbrPlatform::AmdSvm, CpuVendor::Intel).emulated,
+            CpuVendor::Intel
+        );
+    }
+
     #[test]
     fn filter_ranges_cover_exactly_what_the_router_serves() {
-        for platform in [LbrPlatform::IntelVmx, LbrPlatform::AmdSvm] {
-            let mut r = router_for(platform);
+        // Same-vendor and both cross-vendor combinations: whatever the filter
+        // forwards, the router must answer (via read or write).
+        let combos = [
+            (LbrPlatform::IntelVmx, CpuVendor::Intel),
+            (LbrPlatform::AmdSvm, CpuVendor::Amd),
+            (LbrPlatform::AmdSvm, CpuVendor::Intel),
+            (LbrPlatform::IntelVmx, CpuVendor::Amd),
+        ];
+        for (platform, emulated) in combos {
+            let mut r = cross_vendor_router(platform, emulated);
             let ranges = r.filter_ranges();
             assert!(ranges.len() <= 16, "within KVM's 16-range limit");
             // Every MSR the filter forwards must be one the router answers
@@ -258,7 +365,7 @@ mod tests {
                     let served = r.read_msr(msr).is_some() || r.write_msr(msr, 0);
                     assert!(
                         served,
-                        "router must serve filtered MSR {msr:#x} on {platform:?}"
+                        "router must serve filtered MSR {msr:#x} on {platform:?}/{emulated:?}"
                     );
                 }
             }
@@ -385,10 +492,10 @@ mod tests {
     #[test]
     fn amd_last_branch_registers_route_through_the_lbr_state() {
         use enlil_devices::stealth::lbr::amd_msr;
-        let mut r = router();
-        // AMD's single last-branch pair (0x1DB/0x1DC) and last-interrupt pair
-        // (0x1DD/0x1DE) round-trip through the router, distinct from the Intel
-        // FROM/TO stack.
+        // An AMD-emulated router serves AMD's single last-branch pair
+        // (0x1DB/0x1DC) and last-interrupt pair (0x1DD/0x1DE), distinct from
+        // the Intel FROM/TO stack.
+        let mut r = router_for(LbrPlatform::AmdSvm);
         assert!(r.write_msr(amd_msr::LAST_BRANCH_FROM_IP, 0xAAAA));
         assert!(r.write_msr(amd_msr::LAST_BRANCH_TO_IP, 0xBBBB));
         assert!(r.write_msr(amd_msr::LAST_INT_FROM_IP, 0xCCCC));
@@ -397,6 +504,83 @@ mod tests {
         assert_eq!(r.read_msr(amd_msr::LAST_BRANCH_TO_IP), Some(0xBBBB));
         assert_eq!(r.read_msr(amd_msr::LAST_INT_FROM_IP), Some(0xCCCC));
         assert_eq!(r.read_msr(amd_msr::LAST_INT_TO_IP), Some(0xDDDD));
+    }
+
+    #[test]
+    fn cross_vendor_intel_on_amd_serves_only_the_intel_surface() {
+        use enlil_devices::stealth::lbr::{amd_msr, intel_msr};
+        // Intel presented on AMD hardware: the router emulates Intel's MSR
+        // surface even though the LBR platform is AMD.
+        let mut r = cross_vendor_router(LbrPlatform::AmdSvm, CpuVendor::Intel);
+
+        // The Intel PMC block round-trips.
+        assert!(r.write_msr(pmc_msr::IA32_PMC0, 0xCAFE));
+        assert_eq!(r.read_msr(pmc_msr::IA32_PMC0), Some(0xCAFE));
+        assert!(r.write_msr(pmc_msr::IA32_PERFEVTSEL0, 0x4300C1));
+        // The LBR stack reads through the shadow arrays (writes to the stack
+        // fall through, as on the same-vendor path — the router never claimed
+        // them).
+        r.lbr.from_addresses[3] = 0xF00D;
+        assert_eq!(r.read_msr(intel_msr::LBR_FROM_BASE + 3), Some(0xF00D));
+        assert!(!r.write_msr(intel_msr::LBR_FROM_BASE + 3, 1));
+        assert_eq!(r.read_msr(intel_msr::LBR_TOS), Some(0));
+
+        // The AMD surface is gone: reads fall through (the guest's #GP, like
+        // real Intel hardware), writes are refused.
+        for msr in [
+            amd_msr::LAST_BRANCH_FROM_IP,
+            amd_msr::LAST_INT_TO_IP,
+            pmc_msr::AMD_CORE_PERFCTR0,
+            pmc_msr::AMD_LEGACY_PERFEVTSEL0,
+            pmc_msr::AMD_PERF_CNTR_GLOBAL_CTL,
+        ] {
+            assert_eq!(r.read_msr(msr), None, "AMD MSR {msr:#x} must #GP");
+            assert!(!r.write_msr(msr, 1), "AMD MSR {msr:#x} must #GP");
+        }
+
+        // The filter follows the emulated vendor too.
+        let ranges = r.filter_ranges();
+        let has = |msr: u32| ranges.iter().any(|&(b, c)| msr >= b && msr < b + c);
+        assert!(has(pmc_msr::IA32_PMC0));
+        assert!(has(intel_msr::LBR_FROM_BASE));
+        assert!(!has(pmc_msr::AMD_CORE_PERFCTR0));
+        assert!(!has(amd_msr::LAST_BRANCH_FROM_IP));
+
+        // The vendor-neutral surfaces stay up on both identities.
+        assert!(r.write_msr(timing_msr::IA32_APERF, 11));
+        assert_eq!(r.read_msr(timing_msr::IA32_APERF), Some(11));
+        assert!(r.write_msr(intel_msr::IA32_DEBUGCTL, 1));
+        assert_eq!(r.read_msr(intel_msr::IA32_DEBUGCTL), Some(1));
+    }
+
+    #[test]
+    fn cross_vendor_amd_on_intel_serves_only_the_amd_surface() {
+        use enlil_devices::stealth::lbr::{amd_msr, intel_msr};
+        // AMD presented on Intel hardware: the mirror image.
+        let mut r = cross_vendor_router(LbrPlatform::IntelVmx, CpuVendor::Amd);
+
+        assert!(r.write_msr(pmc_msr::AMD_CORE_PERFCTR0 + 2, 0xCAFE));
+        assert_eq!(r.read_msr(pmc_msr::AMD_CORE_PERFCTR0 + 2), Some(0xCAFE));
+        assert!(r.write_msr(amd_msr::LAST_BRANCH_FROM_IP, 0xAAAA));
+        assert_eq!(r.read_msr(amd_msr::LAST_BRANCH_FROM_IP), Some(0xAAAA));
+
+        for msr in [
+            intel_msr::LBR_FROM_BASE,
+            intel_msr::LBR_TOS,
+            pmc_msr::IA32_PMC0,
+            pmc_msr::IA32_PERFEVTSEL0,
+            pmc_msr::IA32_FIXED_CTR0,
+        ] {
+            assert_eq!(r.read_msr(msr), None, "Intel MSR {msr:#x} must #GP");
+            assert!(!r.write_msr(msr, 1), "Intel MSR {msr:#x} must #GP");
+        }
+
+        let ranges = r.filter_ranges();
+        let has = |msr: u32| ranges.iter().any(|&(b, c)| msr >= b && msr < b + c);
+        assert!(has(pmc_msr::AMD_CORE_PERFCTR0));
+        assert!(has(amd_msr::LAST_BRANCH_FROM_IP));
+        assert!(!has(pmc_msr::IA32_PMC0));
+        assert!(!has(intel_msr::LBR_FROM_BASE));
     }
 
     #[test]
