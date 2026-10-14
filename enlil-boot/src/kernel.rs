@@ -530,7 +530,7 @@ mod hw {
             bring_up_scheduler_quantum(&serial, hz);
             bring_up_platform_time(&serial, hz);
         }
-        let ecam = bring_up_acpi(&serial, handoff);
+        let ecam = bring_up_acpi(&serial, handoff, highest_usable_end);
         // Needs both the MADT inventory (above) and the calibrated TSC (the
         // INIT/SIPI delays are timing-critical).
         if let Some(hz) = tsc_hz {
@@ -783,7 +783,14 @@ mod hw {
     /// [`crate::acpi`], since the full `enlil-devices` readers are `std`-only)
     /// and reports the table count and enabled-CPU count — the first real
     /// hardware discovery from firmware tables on bare metal (ROADMAP 6.3).
-    fn bring_up_acpi(serial: &SerialPort, handoff: &BootHandoff) -> Option<(u64, u8)> {
+    ///
+    /// `map_end` is one past the highest usable RAM address — the span the
+    /// IOMMU bring-up identity-maps for DMA (see [`bring_up_iommu`]).
+    fn bring_up_acpi(
+        serial: &SerialPort,
+        handoff: &BootHandoff,
+        map_end: u64,
+    ) -> Option<(u64, u8)> {
         let summary = crate::acpi::discover(handoff.acpi_rsdp)?;
         let mut t = [0u8; 20];
         let mut c = [0u8; 20];
@@ -863,6 +870,12 @@ mod hw {
                 serial.write_str("\n");
             }
         }
+        // Program the DMA-remapping tables (ROADMAP 6.4, T-6.16): root +
+        // context tables and per-guest DMA domains, then enable translation —
+        // device passthrough is confined from here on.
+        if summary.iommu == crate::acpi::IommuKind::IntelVtd && summary.remapping_unit_count > 0 {
+            bring_up_iommu(serial, &summary.remapping_units[0], map_end);
+        }
         // The NUMA topology from the SRAT: proximity domains, per-node RAM
         // ranges, and CPU→node bindings — the placement input for per-guest
         // vCPU/RAM co-location (ROADMAP 6.3). No SRAT means one implicit node.
@@ -928,6 +941,54 @@ mod hw {
         serial.write_str(format_u64(u64::from(summary.ecam_end_bus), &mut b));
         serial.write_str(" (MCFG)\n");
         Some((summary.ecam_base, summary.ecam_end_bus))
+    }
+
+    /// Program one VT-d remapping unit's DMA-remapping tables and enable
+    /// translation (T-6.16, ROADMAP 6.4).
+    ///
+    /// Builds the root table, the bus-0 context table, and two DMA domains —
+    /// the host domain (DID 1, everything the boot kernel owns) and a guest
+    /// domain (DID 2) that receives the first assignable bus-0 device — then
+    /// enables translation. A failure leaves translation however far the
+    /// sequence got and is reported honestly: the boot continues, but DMA is
+    /// not confined.
+    fn bring_up_iommu(serial: &SerialPort, unit: &crate::acpi::RemappingUnit, map_end: u64) {
+        let map_bytes = crate::iommu::identity_map_bytes(map_end);
+        // SAFETY: the unit's register block is live, identity-mapped MMIO
+        // from the DMAR, and the kernel heap is installed — the bring-up owns
+        // this unit from here on.
+        match unsafe { crate::iommu::program_unit(unit, map_bytes) } {
+            Ok(report) => {
+                let mut r = [0u8; 18];
+                let mut w = [0u8; 20];
+                serial.write_str("enlil kernel: iommu: DMA remapping enabled: root@");
+                serial.write_str(format_u64_hex(report.root_phys, &mut r));
+                serial.write_str(", ");
+                serial.write_str(format_u64(u64::from(report.address_width_bits), &mut w));
+                serial.write_str("-bit AGAW, host domain 1 + guest domain 2\n");
+                match report.guest_device {
+                    Some((device, function)) => {
+                        let mut d = [0u8; 20];
+                        let mut f = [0u8; 20];
+                        serial.write_str("enlil kernel: iommu: device 00:");
+                        serial.write_str(format_u64(u64::from(device), &mut d));
+                        serial.write_str(".");
+                        serial.write_str(format_u64(u64::from(function), &mut f));
+                        serial.write_str(" assigned to guest domain 2 (DMA confined)\n");
+                    }
+                    None => {
+                        serial.write_str(
+                            "enlil kernel: iommu: no assignable bus-0 device for the guest domain\n",
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                serial.write_str("enlil kernel: iommu: DMA remapping NOT enabled: ");
+                serial.write_str(err.name());
+                serial.write_str(" (continuing without DMA confinement)\n");
+            }
+        }
     }
 
     /// Enumerate the full PCI Express topology through the `ECAM` window (all
