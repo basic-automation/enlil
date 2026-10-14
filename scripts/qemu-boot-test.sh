@@ -117,6 +117,14 @@ DMAR_LINE="DMA-remapping unit(s):"
 # hardware the IOMMU governs, and so what can be placed in a per-guest DMA
 # domain. A device no unit covers cannot be isolated for passthrough.
 DMAR_SCOPE_LINE="scoped to"
+# Printed once the kernel programs the VT-d DMA-remapping tables (root table,
+# bus-0 context table, host + guest DMA domains) and enables translation —
+# device passthrough is confined from here on (ROADMAP 6.4, T-6.16). Read from
+# the emulated intel-iommu's real registers, not a stub.
+IOMMU_PROGRAM_LINE="iommu: DMA remapping enabled"
+# Printed once the kernel assigns a bus-0 device into the guest DMA domain —
+# the per-guest domain device-assignment path, exercised live.
+IOMMU_ASSIGN_LINE="assigned to guest domain 2 (DMA confined)"
 # Printed once the kernel enumerates PCI bus 0 via the legacy config mechanism
 # (0xCF8/0xCFC), reading the host bridge identity + present-function count.
 PCI_LINE="functions on bus 0"
@@ -499,6 +507,8 @@ if grep -q "$BANNER" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$IOMMU_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$DMAR_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$DMAR_SCOPE_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$IOMMU_PROGRAM_LINE" "$SERIAL_LOG" 2>/dev/null \
+    && grep -q "$IOMMU_ASSIGN_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PCI_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$PCI_CLASS_LINE" "$SERIAL_LOG" 2>/dev/null \
     && grep -q "$ECAM_SCAN_LINE" "$SERIAL_LOG" 2>/dev/null \
