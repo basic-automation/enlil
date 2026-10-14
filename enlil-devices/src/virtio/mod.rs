@@ -3,7 +3,6 @@
 //! Provides the core types shared across `VirtIO` device implementations
 //! and the MMIO transport layer.
 
-pub mod chain;
 pub mod transport;
 
 use bitflags::bitflags;
