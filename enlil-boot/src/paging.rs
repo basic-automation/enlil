@@ -56,6 +56,42 @@ pub const fn map_gib(bytes: u64) -> u64 {
     bytes / (1024 * 1024 * 1024)
 }
 
+/// Highest physical address (exclusive) [`map_mmio_range`] will map: the
+/// canonical lower half, so an address is always a plain PML4 index below 256.
+pub const MMIO_MAX_PHYS: u64 = 1 << 47;
+
+/// The 2 MiB-aligned span `[start, end)` covering the MMIO window
+/// `[phys, phys + len)`, or `None` if `len` is zero or the window leaves the
+/// mappable range ([`MMIO_MAX_PHYS`]).
+///
+/// Pure arithmetic split out of the (UEFI-only) page-table edit so the
+/// rounding and the range check are unit-tested on the host.
+#[must_use]
+pub const fn mmio_span(phys: u64, len: u64) -> Option<(u64, u64)> {
+    if len == 0 {
+        return None;
+    }
+    let Some(last) = phys.checked_add(len - 1) else {
+        return None;
+    };
+    if last >= MMIO_MAX_PHYS {
+        return None;
+    }
+    let start = phys & !(HUGE_2MIB - 1);
+    let end = (last | (HUGE_2MIB - 1)) + 1;
+    Some((start, end))
+}
+
+/// Page-table indices `(pml4, pdpt, pd)` of the 2 MiB page containing `addr`.
+#[must_use]
+pub const fn table_indices(addr: u64) -> (usize, usize, usize) {
+    (
+        ((addr >> 39) & 0x1FF) as usize,
+        ((addr >> 30) & 0x1FF) as usize,
+        ((addr >> 21) & 0x1FF) as usize,
+    )
+}
+
 /// Spare 4 KiB pages appended to the kernel's page-table buffer, available as
 /// page tables for later 2 MiB → 4 KiB splits ([`HostMap::split_to_4kib`]).
 ///
@@ -63,7 +99,7 @@ pub const fn map_gib(bytes: u64) -> u64 {
 pub const SPARE_TABLE_PAGES: u64 = 8;
 
 #[cfg(target_os = "uefi")]
-pub use hw::{HostMap, install_identity_map};
+pub use hw::{HostMap, install_identity_map, map_mmio_range};
 
 #[cfg(target_os = "uefi")]
 mod hw {
@@ -75,7 +111,7 @@ mod hw {
     // The CR3 install is the platform ISA seam (LOCKED PRINCIPLE 2):
     // enlil-platform::memory::host_mm owns `mov cr3`, the boot kernel just
     // calls it.
-    use enlil_platform::memory::host_mm::load_cr3;
+    use enlil_platform::memory::host_mm::{load_cr3, read_cr3};
 
     /// Table pages the kernel's identity map needs: PML4 + PDPT + one PD per GiB
     /// (`ceil(span / 1 GiB)`) + one PT for the low 2 MiB slot, which is rendered
@@ -152,6 +188,110 @@ mod hw {
             next_spare_pa: phys_base + (layout_info.table_count as u64) * 4096,
             spare_end_pa: phys_base + layout.size() as u64,
         })
+    }
+
+    /// `P` — present.
+    const PTE_P: u64 = 1 << 0;
+    /// `R/W` — writable.
+    const PTE_RW: u64 = 1 << 1;
+    /// `PWT` — write-through (with `PCD`, selects uncached).
+    const PTE_PWT: u64 = 1 << 3;
+    /// `PCD` — cache-disable.
+    const PTE_PCD: u64 = 1 << 4;
+    /// `PS` — a 2 MiB (at the PD level) / 1 GiB (at the PDPT level) leaf.
+    const PTE_PS: u64 = 1 << 7;
+    /// `NX` — no-execute (device memory is never code).
+    const PTE_NX: u64 = 1 << 63;
+    /// Physical-address bits of a table entry.
+    const PTE_ADDR: u64 = 0x000F_FFFF_FFFF_F000;
+
+    /// The next-level table `entry` points at, allocating a zeroed page for it
+    /// when the entry is empty.
+    ///
+    /// `None` when the entry is a huge leaf (already mapped, nothing to descend
+    /// into) or the allocation failed.
+    ///
+    /// # Safety
+    ///
+    /// `entry` must point at a live, writable page-table entry of the active
+    /// tables. The kernel is identity-mapped, so a table's address is its
+    /// physical address.
+    unsafe fn next_table(entry: *mut u64) -> Option<*mut u64> {
+        // SAFETY: the caller guarantees `entry` is a live table entry.
+        let e = unsafe { entry.read_volatile() };
+        if e & PTE_P != 0 {
+            if e & PTE_PS != 0 {
+                return None;
+            }
+            return Some((e & PTE_ADDR) as *mut u64);
+        }
+        // SAFETY: 4 KiB size and alignment; alloc_zeroed yields zeroed memory or
+        // null. The page is leaked: page tables live for the kernel's lifetime.
+        let page = unsafe { alloc_zeroed(Layout::from_size_align(4096, 4096).ok()?) };
+        if page.is_null() {
+            return None;
+        }
+        // SAFETY: as above; the new table is zeroed (all entries not present).
+        unsafe { entry.write_volatile((page as u64 & PTE_ADDR) | PTE_P | PTE_RW) };
+        // The page is 4096-aligned, so the cast to 8-byte-aligned entries is sound.
+        #[allow(clippy::cast_ptr_alignment)]
+        let table = page.cast::<u64>();
+        Some(table)
+    }
+
+    /// Identity-map the MMIO window `[phys, phys + len)` **uncached** into the
+    /// kernel's live page tables (virtual address = physical address).
+    ///
+    /// The kernel's initial map ([`install_identity_map`]) covers RAM, the
+    /// framebuffer and the low 4 GiB, but a 64-bit `PCI` BAR can be placed far
+    /// above all of that (OVMF puts an `NVMe` controller's `BAR0` at
+    /// `0x3800_0000_0000`), where a driver's first register read would `#PF`.
+    /// This adds 2 MiB `PCD|PWT|NX` leaves for the window, creating the `PDPT`/`PD`
+    /// pages it needs from the heap. Chunks that are already mapped (inside the
+    /// original span, or mapped by an earlier call) are left as they are.
+    ///
+    /// Returns `false` if the window is empty or out of range
+    /// ([`mmio_span`](super::mmio_span)) or a table page could not be allocated.
+    ///
+    /// # Safety
+    ///
+    /// Must run on the kernel's own tables (after [`install_identity_map`]),
+    /// single-CPU, with interrupts that could touch the same tables masked or
+    /// absent. The [`HostMap`] returned by `install_identity_map` must not be
+    /// used afterwards (this edits the tables behind its buffer); the kernel
+    /// stops using it when it switches to the guarded stack.
+    #[must_use]
+    pub unsafe fn map_mmio_range(phys: u64, len: u64) -> bool {
+        let Some((start, end)) = super::mmio_span(phys, len) else {
+            return false;
+        };
+        let pml4 = (read_cr3() & PTE_ADDR) as *mut u64;
+        let mut addr = start;
+        while addr < end {
+            let (i4, i3, i2) = super::table_indices(addr);
+            // SAFETY: the indices are < 512, inside each 4 KiB table; the tables
+            // are the live, identity-mapped, writable kernel tables.
+            unsafe {
+                let Some(pdpt) = next_table(pml4.add(i4)) else {
+                    return false;
+                };
+                // A 1 GiB leaf here means the chunk is already mapped.
+                if let Some(pd) = next_table(pdpt.add(i3)) {
+                    let pde = pd.add(i2);
+                    if pde.read_volatile() & PTE_P == 0 {
+                        pde.write_volatile(
+                            addr | PTE_P | PTE_RW | PTE_PS | PTE_PWT | PTE_PCD | PTE_NX,
+                        );
+                    }
+                }
+            }
+            addr += HUGE_2MIB;
+        }
+        // New translations never need a flush, but a stale not-present cached
+        // by an earlier probe would; reloading CR3 drops it.
+        // SAFETY: reloads the live root unchanged.
+        unsafe { load_cr3(read_cr3()) };
+        true
     }
 
     /// The kernel's own live host page tables, retained so regions can be
@@ -249,6 +389,39 @@ mod tests {
         let span = required_map_bytes(1024 * 1024, fb_base, 0x80_0000);
         assert!(span >= fb_base + 0x80_0000, "span = {span}");
         assert_eq!(span % (2 * 1024 * 1024), 0); // 2 MiB-aligned
+    }
+
+    #[test]
+    fn mmio_span_rounds_to_2mib_and_covers_the_window() {
+        // The OVMF-placed NVMe BAR: 16 KiB at 0x3800_0000_0000.
+        let (s, e) = mmio_span(0x3800_0000_0000, 0x4000).unwrap();
+        assert_eq!(s, 0x3800_0000_0000);
+        assert_eq!(e, 0x3800_0000_0000 + HUGE_2MIB);
+        // An unaligned window straddling a 2 MiB boundary needs two pages.
+        let (s, e) = mmio_span(HUGE_2MIB - 0x1000, 0x2000).unwrap();
+        assert_eq!((s, e), (0, 2 * HUGE_2MIB));
+        // Exactly one page: [0, 2 MiB).
+        assert_eq!(mmio_span(0, HUGE_2MIB), Some((0, HUGE_2MIB)));
+    }
+
+    #[test]
+    fn mmio_span_rejects_empty_and_out_of_range() {
+        assert_eq!(mmio_span(0x1000, 0), None);
+        assert_eq!(mmio_span(MMIO_MAX_PHYS, 1), None);
+        assert_eq!(mmio_span(MMIO_MAX_PHYS - 1, 2), None);
+        assert_eq!(mmio_span(u64::MAX, 2), None);
+        // The very last byte below the limit is accepted.
+        assert!(mmio_span(MMIO_MAX_PHYS - 1, 1).is_some());
+    }
+
+    #[test]
+    fn table_indices_split_an_address_into_9_bit_fields() {
+        assert_eq!(table_indices(0), (0, 0, 0));
+        assert_eq!(table_indices(HUGE_2MIB), (0, 0, 1));
+        assert_eq!(table_indices(1 << 30), (0, 1, 0));
+        assert_eq!(table_indices(1 << 39), (1, 0, 0));
+        // 0x3800_0000_0000 = PML4 slot 0x70, first PDPT/PD entry.
+        assert_eq!(table_indices(0x3800_0000_0000), (0x70, 0, 0));
     }
 
     #[test]
