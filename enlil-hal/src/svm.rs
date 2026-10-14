@@ -378,7 +378,7 @@ pub mod exit_code {
     /// CPUID instruction.
     pub const CPUID: u64 = 0x072;
     /// `RDTSC` instruction (intercepted — see [`super::set_rdtsc_intercept`]).
-    pub const RDTSC: u64 = 0x075;
+    pub const RDTSC: u64 = 0x06E;
     /// PAUSE instruction.
     pub const PAUSE: u64 = 0x077;
     /// HLT instruction.
