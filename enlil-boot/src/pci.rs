@@ -348,17 +348,66 @@ pub struct NetworkFunction {
     pub device_id: u16,
 }
 
+/// A sized memory-BAR window: the MMIO range one BAR decodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BarWindow {
+    /// The decoded base physical address.
+    pub base: u64,
+    /// The region size in bytes (from the write-probe), 0 if unsized.
+    pub size: u64,
+}
+
+/// One present function's MMIO inventory: its class code plus the sized
+/// memory BAR windows its drivers (and later, passthrough assignment) need.
+///
+/// Bounded so the boot kernel needs no allocation: up to
+/// [`MAX_BARS_PER_FUNCTION`] windows are captured per function; a function
+/// with more is truncated (the total BAR count stays exact in
+/// [`MemoryBarSummary`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FunctionMmio {
+    /// PCI device number.
+    pub device: u8,
+    /// PCI function number.
+    pub function: u8,
+    /// The class code (config `0x0B`).
+    pub class: u8,
+    /// Sized memory BAR windows captured in `bars`.
+    pub bar_count: u8,
+    /// The captured windows, in BAR-index order.
+    pub bars: [BarWindow; MAX_BARS_PER_FUNCTION],
+}
+
+/// The bus-0 MMIO inventory: every present function's sized memory BARs —
+/// the windows the service VM owns at boot (ROADMAP 6.6) before passthrough
+/// reassigns any of them to a guest.
+#[derive(Debug, Default)]
+pub struct Bus0MmioInventory {
+    /// Present functions examined (exact; may exceed `captured`).
+    pub examined: u32,
+    /// Entries used in `functions`.
+    pub captured: u8,
+    /// The captured per-function inventories.
+    pub functions: [FunctionMmio; MAX_BUS0_FUNCTIONS],
+}
+
+/// Up to this many present bus-0 functions the MMIO inventory captures.
+pub const MAX_BUS0_FUNCTIONS: usize = 16;
+/// Up to this many sized memory BAR windows captured per function.
+pub const MAX_BARS_PER_FUNCTION: usize = 4;
+
 #[cfg(target_os = "uefi")]
 pub use hw::{
     StorageController, XhciFunction, bar0_mmio_base, enable_mem_bus_master,
     find_storage_controllers, find_xhci_controllers, first_memory_bar, first_network_function,
-    scan_bar_inventory, scan_bus0, scan_ecam, scan_memory_bars,
+    scan_bar_inventory, scan_bus0, scan_bus0_mmio, scan_ecam, scan_memory_bars,
 };
 
 #[cfg(target_os = "uefi")]
 mod hw {
     use super::{
-        BAR0_OFFSET, CAP_ID_MSIX, CLASS_NETWORK, EcamScan, MemoryBar, NetworkFunction,
+        BAR0_OFFSET, BarWindow, Bus0MmioInventory, CAP_ID_MSIX, CLASS_NETWORK, EcamScan,
+        FunctionMmio, MAX_BARS_PER_FUNCTION, MAX_BUS0_FUNCTIONS, MemoryBar, NetworkFunction,
         PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA, PciScan, bar_is_io, bar_is_mem_64, bar_mem_base,
         bar_mem_base_64, bar_mem_size, bar_mem_size_64, cap_id_of, cap_next_of, class_of,
         config_address, device_of, ecam_config_address, is_ahci_class, is_nvme_class, prog_if_of,
@@ -788,6 +837,90 @@ mod hw {
             u64::from(bar_mem_base(bar))
         };
         if base == 0 { None } else { Some(base) }
+    }
+
+    /// Capture the per-function MMIO inventory of PCI bus 0: every present
+    /// function's class code plus its sized memory BAR windows.
+    ///
+    /// This is the ownership table's input (ROADMAP 6.6): the service VM owns
+    /// every discovered window at boot, and passthrough later *moves* a
+    /// function's windows to a guest. Walks each present function's BARs 0–5
+    /// (following the multifunction bit like [`scan_bus0`]), skips I/O BARs
+    /// and unimplemented (base 0) BARs, sizes each memory BAR via the
+    /// write-probe (a 64-bit BAR pairs with its high dword and counts once),
+    /// and captures up to [`MAX_BARS_PER_FUNCTION`] windows per function into
+    /// a bounded, allocation-free [`Bus0MmioInventory`]. Functions past
+    /// [`MAX_BUS0_FUNCTIONS`] are still examined (the exact count is kept) but
+    /// not captured — the kernel reports the truncation.
+    #[must_use]
+    pub fn scan_bus0_mmio() -> Bus0MmioInventory {
+        const HEADER_TYPE_OFFSET: u8 = 0x0C;
+        const HEADER_MULTIFUNCTION: u32 = 0x0080_0000;
+        /// Config offset of the class-code dword (revision/prog-if/subclass/class).
+        const CLASS_OFFSET: u8 = 0x08;
+        const BAR_COUNT: u8 = 6;
+
+        let mut inventory = Bus0MmioInventory::default();
+        for device in 0u8..32 {
+            let dword0 = config_read(0, device, 0, 0);
+            if !vendor_present(vendor_of(dword0)) {
+                continue;
+            }
+            let multifunction =
+                config_read(0, device, 0, HEADER_TYPE_OFFSET) & HEADER_MULTIFUNCTION != 0;
+            let last_fn = if multifunction { 7 } else { 0 };
+            for function in 0u8..=last_fn {
+                if function != 0 && !vendor_present(vendor_of(config_read(0, device, function, 0)))
+                {
+                    continue;
+                }
+                inventory.examined += 1;
+                if usize::from(inventory.captured) >= MAX_BUS0_FUNCTIONS {
+                    continue;
+                }
+                let class = class_of(config_read(0, device, function, CLASS_OFFSET));
+                let mut entry = FunctionMmio {
+                    device,
+                    function,
+                    class,
+                    ..FunctionMmio::default()
+                };
+                let mut i = 0u8;
+                while i < BAR_COUNT {
+                    let off = BAR0_OFFSET + i * 4;
+                    let bar = config_read(0, device, function, off);
+                    if bar_is_io(bar) {
+                        i += 1;
+                        continue;
+                    }
+                    if bar_is_mem_64(bar) {
+                        let high = config_read(0, device, function, off + 4);
+                        let base = bar_mem_base_64(bar, high);
+                        if base != 0 && usize::from(entry.bar_count) < MAX_BARS_PER_FUNCTION {
+                            entry.bars[usize::from(entry.bar_count)] = BarWindow {
+                                base,
+                                size: size_memory_bar(device, function, off, true),
+                            };
+                            entry.bar_count += 1;
+                        }
+                        i += 2; // a 64-bit BAR consumes this dword and the next
+                    } else {
+                        let base = bar_mem_base(bar);
+                        if base != 0 && usize::from(entry.bar_count) < MAX_BARS_PER_FUNCTION {
+                            entry.bars[usize::from(entry.bar_count)] = BarWindow {
+                                base: u64::from(base),
+                                size: size_memory_bar(device, function, off, false),
+                            };
+                            entry.bar_count += 1;
+                        }
+                        i += 1;
+                    }
+                }
+                inventory.functions[usize::from(inventory.captured)] = entry;
+                inventory.captured += 1;
+            }
+        }
+        inventory
     }
 
     /// Read config dword `offset` of `bus:device.function` through the ECAM
