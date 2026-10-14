@@ -279,6 +279,17 @@ mod linux {
         }
     }
 
+    /// How a guest reboots: where the boot vCPU is re-prepared after a
+    /// reset (CF9-style) exit.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ResetKind {
+        /// Re-enter at a flat real-mode entry point (direct payload boot).
+        RealMode,
+        /// Re-enter at the x86 firmware reset vector (`CS:IP = F000:FFF0`),
+        /// re-running the guest's virtual UEFI from SEC (item 5.6).
+        ResetVector,
+    }
+
     impl StealthRunLoop {
         /// Wire the stealth MSR stack onto `backend` + `pc` and take ownership
         /// of both.
@@ -846,6 +857,43 @@ mod linux {
             reset_entry: u64,
             max_entries: usize,
         ) -> Result<LoopOutcome> {
+            self.run_with_reset(index, reset_entry, max_entries, ResetKind::RealMode)
+        }
+
+        /// Drive a guest that booted through its own virtual UEFI (item 5.6):
+        /// same platform cadence as [`run_real_mode`](Self::run_real_mode),
+        /// but a reset re-enters at the firmware reset vector so OVMF runs
+        /// again from SEC instead of a flat real-mode entry point.
+        ///
+        /// # Errors
+        /// Propagates [`run_vcpu_once`](Self::run_vcpu_once) and
+        /// [`KvmBackend::prepare_reset_vector_vcpu`].
+        pub fn run_uefi(&mut self, index: usize, max_entries: usize) -> Result<LoopOutcome> {
+            self.run_with_reset(
+                index,
+                crate::uefi_firmware::RESET_VECTOR_GPA,
+                max_entries,
+                ResetKind::ResetVector,
+            )
+        }
+
+        /// Shared run-loop body: one KVM entry per iteration plus the
+        /// platform-clock cadence (PIT/HPET/ACPI PM/bus-clock LAPIC advance,
+        /// TSC-deadline firing, RTC calendar), until the guest halts, resets,
+        /// commits a sleep transition, or `max_entries` entries elapse.
+        ///
+        /// `reset` selects how the boot vCPU is re-prepared on a reset exit.
+        ///
+        /// # Errors
+        /// Propagates [`run_vcpu_once`](Self::run_vcpu_once) and the vCPU
+        /// re-preparation for `reset`.
+        fn run_with_reset(
+            &mut self,
+            index: usize,
+            reset_entry: u64,
+            max_entries: usize,
+            reset: ResetKind,
+        ) -> Result<LoopOutcome> {
             for _ in 0..max_entries {
                 let step = self.run_vcpu_once(index)?;
                 // Advance the platform timers (PIT, HPET, ACPI PM, bus-clock
@@ -883,7 +931,14 @@ mod linux {
                     }
                     Some(PlatformEvent::Reset) => {
                         // Reboot: restart the boot vCPU at its reset vector.
-                        self.backend.prepare_real_mode_vcpu(index, reset_entry)?;
+                        match reset {
+                            ResetKind::RealMode => {
+                                self.backend.prepare_real_mode_vcpu(index, reset_entry)?;
+                            }
+                            ResetKind::ResetVector => {
+                                self.backend.prepare_reset_vector_vcpu(index)?;
+                            }
+                        }
                         continue;
                     }
                     None => {}
