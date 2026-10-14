@@ -14,10 +14,11 @@ The full production picture is not finished:
 
 - The privileged service VM (ROADMAP.md Phase 6.6) and the end-to-end
   bare-metal milestone (Phase 6.7) remain open.
-- Enlil's own IOMMU DMA-remapping programming (Phase 6.4) is **not** in place:
-  DMAR/IVRS tables are discovered and parsed, but remapping tables are not
-  programmed, so **passed-through devices are not DMA-confined by Enlil on the
-  bare-metal path**.
+- Enlil's own IOMMU DMA-remapping programming (Phase 6.4) is **partially** in
+  place: the VT-d DMA-remapping tables are programmed (root + context tables,
+  per-guest domains, translation enabled), but interrupt remapping and the
+  AMD-Vi side are still pending, so treat device passthrough as **partially
+  DMA-confined on the bare-metal path**.
 - Side channels inherent to shared hardware (timing, cache/memory-bus
   contention, transient execution) are not mitigated.
 - Nothing above has been independently audited.
@@ -85,13 +86,13 @@ everything it should not reach:
 
 These are known gaps, already tracked in [`ROADMAP.md`](ROADMAP.md) rather than secrets:
 
-- Anything that requires the bare-metal production path to be finished (Phase 6.7).
-  Running the KVM-backed development VMM means you are relying on the **host kernel's**
-  isolation, not Enlil's.
-- Per-guest DMA isolation on the bare-metal path. The IOMMU (VT-d DMAR / AMD-Vi IVRS)
-  is discovered and parsed but its remapping tables are not yet programmed, so device
-  passthrough is not confined (Phase 6.4). Do not expose passthrough devices to
-  untrusted guests on bare metal.
+- Anything that requires the bare-metal production path to be finished (Phase 6.7). Running
+  the KVM-backed development VMM means you are relying on the **host kernel's** isolation,
+  not Enlil's.
+- Per-guest DMA isolation. The IOMMU (VT-d DMAR / AMD-Vi IVRS) is discovered and parsed;
+  the VT-d DMA-remapping tables are now programmed (root + context tables, per-guest domains,
+  translation enabled — ROADMAP 6.4, T-6.16), but interrupt remapping and the AMD-Vi side are
+  still pending, so treat device passthrough as partially confined.
 - Side channels inherent to sharing physical hardware (Spectre/Meltdown-class transient
   execution, cache and memory-bus contention). Mitigations are not yet implemented.
 - Findings that require host root, physical access, or modifying the hypervisor binary —

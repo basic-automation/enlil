@@ -31,6 +31,7 @@ pub mod framebuffer;
 pub mod gdt;
 pub mod handoff;
 pub mod idt;
+pub mod iommu;
 pub mod kernel;
 pub mod mmio;
 pub mod net;
