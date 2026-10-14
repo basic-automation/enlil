@@ -207,7 +207,7 @@ pub const fn bar_mem_size_64(probe_low: u32, probe_high: u32) -> u64 {
 
 /// A decoded memory BAR located on a bus scan: which function carries it, its
 /// base address, size, and whether it is a 64-bit BAR.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MemoryBar {
     /// PCI bus number.
     pub bus: u8,
@@ -245,6 +245,40 @@ impl MemoryBarSummary {
     const fn record(&mut self, size: u64) {
         self.count += 1;
         self.total_bytes = self.total_bytes.saturating_add(size);
+    }
+}
+
+/// How many memory BARs the bounded per-function [`BarInventory`] keeps.
+///
+/// Thirty-two covers every realistic bus-0 population (the q35 reference
+/// board carries six) while keeping the inventory allocation-free for the
+/// `no_std` kernel.
+pub const MAX_BAR_INVENTORY: usize = 32;
+
+/// A bounded per-function inventory of the memory BARs on PCI bus 0.
+///
+/// Each entry names the function (BDF), the BAR index, the decoded base, the
+/// write-probe size, and the width — the device-tree input passthrough claims
+/// MMIO windows from. Bounded (no heap) so the `no_std` boot kernel keeps it;
+/// entries past [`MAX_BAR_INVENTORY`] are dropped, never wrapped around.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BarInventory {
+    /// The inventoried BARs, in device/function/BAR-index walk order.
+    pub entries: [MemoryBar; MAX_BAR_INVENTORY],
+    /// How many entries of [`entries`](Self::entries) are valid
+    /// (`<= MAX_BAR_INVENTORY`).
+    pub count: usize,
+}
+
+impl BarInventory {
+    /// Record one implemented memory BAR, dropping it once the inventory is
+    /// full — the bound keeps the kernel's discovery allocation-free.
+    #[cfg(any(target_os = "uefi", test))]
+    const fn record(&mut self, bar: MemoryBar) {
+        if self.count < MAX_BAR_INVENTORY {
+            self.entries[self.count] = bar;
+            self.count += 1;
+        }
     }
 }
 
@@ -344,7 +378,7 @@ pub const MAX_BARS_PER_FUNCTION: usize = 4;
 #[cfg(target_os = "uefi")]
 pub use hw::{
     XhciFunction, bar0_mmio_base, find_xhci_controllers, first_memory_bar, first_network_function,
-    scan_bus0, scan_bus0_mmio, scan_ecam, scan_memory_bars,
+    scan_bar_inventory, scan_bus0, scan_bus0_mmio, scan_ecam, scan_memory_bars,
 };
 
 #[cfg(target_os = "uefi")]
@@ -697,6 +731,70 @@ mod hw {
             }
         }
         None
+    }
+
+    /// Build the bounded per-function inventory of the memory BARs on PCI bus 0:
+    /// every implemented memory BAR (a 64-bit BAR once, paired with its high
+    /// dword) recorded with its BDF, BAR index, decoded base, write-probe size,
+    /// and width — the device-tree input passthrough claims MMIO windows from.
+    ///
+    /// Walks each present function's BARs 0–5 (following the multifunction
+    /// bit), skips I/O BARs and unimplemented (base 0) BARs, sizes each memory
+    /// BAR via the write-probe (config space left exactly as found), and
+    /// records the first [`MAX_BAR_INVENTORY`](super::MAX_BAR_INVENTORY)
+    /// entries; the rest are dropped (the walk itself stays bounded).
+    #[must_use]
+    pub fn scan_bar_inventory() -> super::BarInventory {
+        const HEADER_TYPE_OFFSET: u8 = 0x0C;
+        const HEADER_MULTIFUNCTION: u32 = 0x0080_0000;
+        const BAR_COUNT: u8 = 6;
+
+        let mut inventory = super::BarInventory::default();
+        for device in 0u8..32 {
+            let dword0 = config_read(0, device, 0, 0);
+            if !vendor_present(vendor_of(dword0)) {
+                continue;
+            }
+            let multifunction =
+                config_read(0, device, 0, HEADER_TYPE_OFFSET) & HEADER_MULTIFUNCTION != 0;
+            let last_fn = if multifunction { 7 } else { 0 };
+            for function in 0u8..=last_fn {
+                if function != 0 && !vendor_present(vendor_of(config_read(0, device, function, 0)))
+                {
+                    continue;
+                }
+                let mut i = 0u8;
+                while i < BAR_COUNT {
+                    let off = BAR0_OFFSET + i * 4;
+                    let bar = config_read(0, device, function, off);
+                    if bar_is_io(bar) {
+                        i += 1;
+                        continue;
+                    }
+                    let is_64 = bar_is_mem_64(bar);
+                    let base = if is_64 {
+                        let high = config_read(0, device, function, off + 4);
+                        bar_mem_base_64(bar, high)
+                    } else {
+                        u64::from(bar_mem_base(bar))
+                    };
+                    if base != 0 {
+                        inventory.record(super::MemoryBar {
+                            bus: 0,
+                            device,
+                            function,
+                            index: i,
+                            base,
+                            size: size_memory_bar(device, function, off, is_64),
+                            is_64,
+                        });
+                    }
+                    // A 64-bit BAR consumes this dword and the next.
+                    i += if is_64 { 2 } else { 1 };
+                }
+            }
+        }
+        inventory
     }
 
     /// The MMIO base BAR0 of bus-0 `device.function` maps, if it is a memory
@@ -1120,5 +1218,63 @@ mod tests {
         s.record(u64::MAX);
         assert_eq!(s.total_bytes, u64::MAX);
         assert_eq!(s.count, 4);
+    }
+
+    #[test]
+    fn bar_inventory_records_bounded_entries() {
+        let mut inv = BarInventory::default();
+        assert_eq!(inv.count, 0);
+        assert_eq!(inv.entries.len(), MAX_BAR_INVENTORY);
+        // An empty inventory's first entry is the zero BAR.
+        assert_eq!(inv.entries[0], MemoryBar::default());
+
+        inv.record(MemoryBar {
+            bus: 0,
+            device: 1,
+            function: 0,
+            index: 0,
+            base: 0x8000_0000,
+            size: 0x100_0000,
+            is_64: false,
+        });
+        inv.record(MemoryBar {
+            bus: 0,
+            device: 2,
+            function: 0,
+            index: 2,
+            base: 0x1_0000_0000,
+            size: 0x2000_0000,
+            is_64: true,
+        });
+        assert_eq!(inv.count, 2);
+        assert_eq!(inv.entries[0].device, 1);
+        assert_eq!(inv.entries[0].base, 0x8000_0000);
+        assert_eq!(inv.entries[1].index, 2);
+        assert!(inv.entries[1].is_64);
+        // Untouched slots stay the zero BAR.
+        assert_eq!(inv.entries[2], MemoryBar::default());
+    }
+
+    #[test]
+    fn bar_inventory_drops_entries_past_the_bound() {
+        let mut inv = BarInventory::default();
+        for i in 0..(MAX_BAR_INVENTORY + 5) {
+            inv.record(MemoryBar {
+                bus: 0,
+                device: 0,
+                function: 0,
+                index: 0,
+                base: 0x1000 * (i as u64 + 1),
+                size: 0x1000,
+                is_64: false,
+            });
+        }
+        // The count saturates at the bound — entries never wrap around.
+        assert_eq!(inv.count, MAX_BAR_INVENTORY);
+        assert_eq!(inv.entries[0].base, 0x1000);
+        assert_eq!(
+            inv.entries[MAX_BAR_INVENTORY - 1].base,
+            0x1000 * MAX_BAR_INVENTORY as u64
+        );
     }
 }
