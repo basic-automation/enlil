@@ -617,6 +617,10 @@ mod hw {
         if net_mmio != 0 {
             bring_up_net_mac(&serial, net_mmio - 1);
         }
+        // Bare-metal storage (ROADMAP 6.5): NVMe first, AHCI fallback. Runs
+        // on the identity map with the kernel heap live — the drivers need
+        // both for BAR MMIO and DMA buffers.
+        bring_up_storage(&serial);
         bring_up_virtualization(&serial);
         if let Some(handoff) = handoff {
             bring_up_framebuffer(&serial, handoff);
@@ -1477,6 +1481,171 @@ mod hw {
         serial.write_str("enlil kernel: net: station MAC ");
         serial.write_str(crate::net::format_mac(&mac, &mut buf));
         serial.write_str("\n");
+    }
+
+    /// Report a `bus:device.function` triple on the serial console.
+    fn report_bdf(serial: &SerialPort, bus: u8, device: u8, function: u8) {
+        let mut b = [0u8; 20];
+        let mut d = [0u8; 20];
+        let mut f = [0u8; 20];
+        serial.write_str(format_u64(u64::from(bus), &mut b));
+        serial.write_str(":");
+        serial.write_str(format_u64(u64::from(device), &mut d));
+        serial.write_str(".");
+        serial.write_str(format_u64(u64::from(function), &mut f));
+    }
+
+    /// Report a driver error (Display-formatted through the heap) on serial.
+    fn report_storage_error(serial: &SerialPort, prefix: &str, e: &dyn core::fmt::Display) {
+        serial.write_str(prefix);
+        serial.write_str(&alloc::format!("{e}\n"));
+    }
+
+    /// Bring up bare-metal storage (ROADMAP 6.5, T-6.19): find `NVMe`/`AHCI`
+    /// controllers on PCI bus 0 and drive them directly from the kernel.
+    ///
+    /// `NVMe` is preferred; `AHCI` is the fallback. On the `NVMe` path the kernel
+    /// enables memory-space decoding + bus mastering, initializes the
+    /// controller, reports the namespace size, and runs a block read/write
+    /// self-test on the LAST LBA of namespace 1 -- the nightly QEMU harness
+    /// attaches a blank 64 MiB `NVMe` image, so the self-test never touches
+    /// real data there. On real hardware this write is destructive to that
+    /// one sector; a config-gated policy for production disks is a later
+    /// slice.
+    ///
+    /// On the `AHCI` path the kernel starts each port with a SATA disk and
+    /// reports its IDENTIFY model string (no destructive self-test there).
+    fn bring_up_storage(serial: &SerialPort) {
+        let (count, controllers) = crate::pci::find_storage_controllers();
+        if count == 0 {
+            serial.write_str("enlil kernel: storage: no NVMe/AHCI controller on bus 0\n");
+            return;
+        }
+        let mut nvme = None;
+        let mut ahci = None;
+        for c in controllers.iter().take(count) {
+            if c.is_nvme {
+                if nvme.is_none() {
+                    nvme = Some(*c);
+                }
+            } else if ahci.is_none() {
+                ahci = Some(*c);
+            }
+        }
+        if let Some(c) = nvme {
+            bring_up_nvme(serial, c);
+        } else if let Some(c) = ahci {
+            bring_up_ahci(serial, c);
+        }
+    }
+
+    /// Drive the first `NVMe` controller: init, report, block r/w self-test.
+    fn bring_up_nvme(serial: &SerialPort, c: crate::pci::StorageController) {
+        serial.write_str("enlil kernel: storage: NVMe controller at ");
+        report_bdf(serial, c.bus, c.device, c.function);
+        let mut base = [0u8; 18];
+        serial.write_str(", BAR0 ");
+        serial.write_str(format_u64_hex(c.bar0_base, &mut base));
+        serial.write_str("\n");
+        if c.bar0_base == 0 {
+            serial.write_str("enlil kernel: storage: nvme: no memory BAR0 — cannot drive\n");
+            return;
+        }
+        crate::pci::enable_mem_bus_master(c.bus, c.device, c.function);
+        let mmio = crate::mmio::PhysMmio::new(c.bar0_base);
+        let mut ctl = match crate::nvme::NvmeController::init(mmio, 1) {
+            Ok(ctl) => ctl,
+            Err(e) => {
+                report_storage_error(serial, "enlil kernel: storage: nvme: init failed: ", &e);
+                return;
+            }
+        };
+        let mut n = [0u8; 20];
+        serial.write_str("enlil kernel: storage: nvme: controller ready, ");
+        serial.write_str(format_u64(ctl.namespace_blocks(), &mut n));
+        serial.write_str(" 512-byte blocks\n");
+
+        // Block r/w self-test on the last LBA: write a pattern, read it back,
+        // compare, flush. Destructive to that one sector by design (see the
+        // `bring_up_storage` contract above).
+        let last = ctl.namespace_blocks() - 1;
+        let mut wbuf = [0u8; 512];
+        for (i, b) in wbuf.iter_mut().enumerate() {
+            *b = ((i ^ 0xA5) & 0xFF) as u8;
+        }
+        let mut rbuf = [0u8; 512];
+        let ok = ctl.write_blocks(last, &wbuf).is_ok()
+            && ctl.read_blocks(last, &mut rbuf).is_ok()
+            && rbuf == wbuf
+            && ctl.flush().is_ok();
+        if ok {
+            serial.write_str("enlil kernel: storage: nvme: block r/w self-test ok\n");
+        } else {
+            serial.write_str("enlil kernel: storage: nvme: block r/w self-test FAILED\n");
+        }
+    }
+
+    /// Drive the first `AHCI` controller: start SATA ports, report disks.
+    fn bring_up_ahci(serial: &SerialPort, c: crate::pci::StorageController) {
+        serial.write_str("enlil kernel: storage: AHCI controller at ");
+        report_bdf(serial, c.bus, c.device, c.function);
+        let mut base = [0u8; 18];
+        serial.write_str(", BAR0 ");
+        serial.write_str(format_u64_hex(c.bar0_base, &mut base));
+        serial.write_str("\n");
+        if c.bar0_base == 0 {
+            serial.write_str("enlil kernel: storage: ahci: no memory BAR0 — cannot drive\n");
+            return;
+        }
+        crate::pci::enable_mem_bus_master(c.bus, c.device, c.function);
+        let mmio = crate::mmio::PhysMmio::new(c.bar0_base);
+        let mut ctl = match crate::ahci::AhciController::init(mmio) {
+            Ok(ctl) => ctl,
+            Err(e) => {
+                report_storage_error(serial, "enlil kernel: storage: ahci: init failed: ", &e);
+                return;
+            }
+        };
+        let mask = ctl.implemented_ports();
+        let mut m = [0u8; 20];
+        serial.write_str("enlil kernel: storage: ahci: controller ready, ports mask ");
+        serial.write_str(format_u64(u64::from(mask), &mut m));
+        serial.write_str("\n");
+        for port in 0..32u8 {
+            if mask >> port & 1 == 0 || !ctl.device_present(port) {
+                continue;
+            }
+            match ctl.start_port(port) {
+                Ok(()) => match ctl.identify(port) {
+                    Ok(id) => {
+                        let mut p = [0u8; 20];
+                        serial.write_str("enlil kernel: storage: ahci: port ");
+                        serial.write_str(format_u64(u64::from(port), &mut p));
+                        serial.write_str(": disk ");
+                        let model = crate::ahci::identify_model(&id);
+                        for &b in &model {
+                            if b == 0 {
+                                break;
+                            }
+                            serial.write_byte(b);
+                        }
+                        serial.write_str("\n");
+                    }
+                    Err(e) => report_storage_error(
+                        serial,
+                        "enlil kernel: storage: ahci: identify failed: ",
+                        &e,
+                    ),
+                },
+                Err(e) => {
+                    report_storage_error(
+                        serial,
+                        "enlil kernel: storage: ahci: port start failed: ",
+                        &e,
+                    );
+                }
+            }
+        }
     }
 
     /// Arm the LAPIC timer once and prove it fires an interrupt into the kernel.
