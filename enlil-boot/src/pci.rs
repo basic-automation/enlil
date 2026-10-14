@@ -89,12 +89,46 @@ pub struct EcamScan {
     pub buses_in_use: u32,
 }
 
-/// PCI base class: mass-storage controller (SATA/NVMe/SCSI/IDE).
+/// PCI base class: mass-storage controller (SATA/`NVMe`/SCSI/IDE).
 pub const CLASS_STORAGE: u8 = 0x01;
 /// PCI base class: network controller.
 pub const CLASS_NETWORK: u8 = 0x02;
 /// PCI base class: display controller (VGA/GPU).
 pub const CLASS_DISPLAY: u8 = 0x03;
+
+/// Storage subclass: non-volatile memory (NVMHCI/`NVMe`) controller.
+pub const SUBCLASS_NVME: u8 = 0x08;
+/// `NVMe` programming interface: NVMHCI.
+pub const PROGIF_NVME: u8 = 0x02;
+/// Storage subclass: SATA (`AHCI`) controller.
+pub const SUBCLASS_AHCI: u8 = 0x06;
+/// `AHCI` programming interface: `AHCI` 1.0.
+pub const PROGIF_AHCI: u8 = 0x01;
+
+/// The subclass code (byte 2 of the class dword at config offset 0x08).
+#[must_use]
+pub const fn subclass_of(config_dword_at_08: u32) -> u8 {
+    ((config_dword_at_08 >> 16) & 0xFF) as u8
+}
+
+/// The programming-interface byte (byte 1 of the class dword at config
+/// offset 0x08).
+#[must_use]
+pub const fn prog_if_of(config_dword_at_08: u32) -> u8 {
+    ((config_dword_at_08 >> 8) & 0xFF) as u8
+}
+
+/// Whether class/subclass/prog-if identify an `NVMe` (NVMHCI) controller.
+#[must_use]
+pub const fn is_nvme_class(class: u8, subclass: u8, prog_if: u8) -> bool {
+    class == CLASS_STORAGE && subclass == SUBCLASS_NVME && prog_if == PROGIF_NVME
+}
+
+/// Whether class/subclass/prog-if identify an `AHCI` (SATA) controller.
+#[must_use]
+pub const fn is_ahci_class(class: u8, subclass: u8, prog_if: u8) -> bool {
+    class == CLASS_STORAGE && subclass == SUBCLASS_AHCI && prog_if == PROGIF_AHCI
+}
 
 /// Capability id: MSI-X (message-signaled interrupts, table form).
 pub const CAP_ID_MSIX: u8 = 0x11;
@@ -119,19 +153,6 @@ pub const fn cap_id_of(cap_dword: u32) -> u8 {
 #[must_use]
 pub const fn cap_next_of(cap_dword: u32) -> u8 {
     ((cap_dword >> 8) & 0xFC) as u8
-}
-
-/// The subclass byte (second byte of the class dword at config offset 0x08).
-#[must_use]
-pub const fn subclass_of(config_dword_at_08: u32) -> u8 {
-    ((config_dword_at_08 >> 16) & 0xFF) as u8
-}
-
-/// The programming-interface byte (third byte of the class dword at config
-/// offset 0x08).
-#[must_use]
-pub const fn prog_if_of(config_dword_at_08: u32) -> u8 {
-    ((config_dword_at_08 >> 8) & 0xFF) as u8
 }
 
 /// Config offset of Base Address Register 0. BARs 0–5 are the six dwords at
@@ -377,7 +398,8 @@ pub const MAX_BARS_PER_FUNCTION: usize = 4;
 
 #[cfg(target_os = "uefi")]
 pub use hw::{
-    XhciFunction, bar0_mmio_base, find_xhci_controllers, first_memory_bar, first_network_function,
+    StorageController, XhciFunction, bar0_mmio_base, enable_mem_bus_master,
+    find_storage_controllers, find_xhci_controllers, first_memory_bar, first_network_function,
     scan_bar_inventory, scan_bus0, scan_bus0_mmio, scan_ecam, scan_memory_bars,
 };
 
@@ -388,8 +410,8 @@ mod hw {
         FunctionMmio, MAX_BARS_PER_FUNCTION, MAX_BUS0_FUNCTIONS, MemoryBar, NetworkFunction,
         PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA, PciScan, bar_is_io, bar_is_mem_64, bar_mem_base,
         bar_mem_base_64, bar_mem_size, bar_mem_size_64, cap_id_of, cap_next_of, class_of,
-        config_address, device_of, ecam_config_address, prog_if_of, status_has_caps, subclass_of,
-        vendor_of, vendor_present,
+        config_address, device_of, ecam_config_address, is_ahci_class, is_nvme_class, prog_if_of,
+        status_has_caps, subclass_of, vendor_of, vendor_present,
     };
 
     /// Write a 32-bit `value` to `port`.
@@ -1055,11 +1077,160 @@ mod hw {
         }
         found
     }
+
+    /// A mass-storage controller found by the bus scan, with `BAR0` decoded --
+    /// the input to the bare-metal storage drivers (ROADMAP 6.5, T-6.19).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct StorageController {
+        /// PCI bus number.
+        pub bus: u8,
+        /// PCI device number.
+        pub device: u8,
+        /// PCI function number.
+        pub function: u8,
+        /// True for `NVMe` (NVMHCI), false for `AHCI` (SATA).
+        pub is_nvme: bool,
+        /// `BAR0` base address (0 when the function exposes no memory `BAR0`).
+        pub bar0_base: u64,
+        /// `BAR0` region size from the write-probe (0 when unimplemented).
+        pub bar0_size: u64,
+    }
+
+    /// Upper bound on storage controllers reported by one scan.
+    pub const MAX_STORAGE_CONTROLLERS: usize = 8;
+
+    /// Find the `NVMe`/`AHCI` storage controllers on bus 0 and decode each one's
+    /// `BAR0` -- the MMIO window a bare-metal driver claims.
+    ///
+    /// Enumeration follows the same multifunction rule as [`scan_bus0`]; each
+    /// `BAR0` is sized by the all-ones write-probe (config space is restored
+    /// afterwards). Returns the count and a fixed-size array -- no allocator
+    /// needed at this layer.
+    #[must_use]
+    pub fn find_storage_controllers() -> (usize, [StorageController; MAX_STORAGE_CONTROLLERS]) {
+        const HEADER_TYPE_OFFSET: u8 = 0x0C;
+        const HEADER_MULTIFUNCTION: u32 = 0x0080_0000;
+        /// Config offset of the class-code dword (rev/prog-if/subclass/class).
+        const CLASS_OFFSET: u8 = 0x08;
+
+        let mut out = [StorageController::default(); MAX_STORAGE_CONTROLLERS];
+        let mut count = 0usize;
+        for device in 0u8..32 {
+            if count >= MAX_STORAGE_CONTROLLERS {
+                break;
+            }
+            let dword0 = config_read(0, device, 0, 0);
+            if !vendor_present(vendor_of(dword0)) {
+                continue;
+            }
+            let multifunction =
+                config_read(0, device, 0, HEADER_TYPE_OFFSET) & HEADER_MULTIFUNCTION != 0;
+            let last_fn = if multifunction { 7 } else { 0 };
+            for function in 0u8..=last_fn {
+                if count >= MAX_STORAGE_CONTROLLERS {
+                    break;
+                }
+                if function != 0 && !vendor_present(vendor_of(config_read(0, device, function, 0)))
+                {
+                    continue;
+                }
+                let class_dword = config_read(0, device, function, CLASS_OFFSET);
+                let class = class_of(class_dword);
+                let subclass = subclass_of(class_dword);
+                let prog_if = prog_if_of(class_dword);
+                let is_nvme = is_nvme_class(class, subclass, prog_if);
+                if !is_nvme && !is_ahci_class(class, subclass, prog_if) {
+                    continue;
+                }
+                // Decode BAR0 (memory BARs only; an I/O BAR0 cannot hold the
+                // controller registers).
+                let bar0 = config_read(0, device, function, BAR0_OFFSET);
+                let (bar0_base, bar0_size) = if bar_is_io(bar0) || bar0 == 0 {
+                    (0, 0)
+                } else if bar_is_mem_64(bar0) {
+                    let high = config_read(0, device, function, BAR0_OFFSET + 4);
+                    let base = bar_mem_base_64(bar0, high);
+                    let size = size_memory_bar(device, function, BAR0_OFFSET, true);
+                    (base, size)
+                } else {
+                    let base = u64::from(bar_mem_base(bar0));
+                    let size = size_memory_bar(device, function, BAR0_OFFSET, false);
+                    (base, size)
+                };
+                out[count] = StorageController {
+                    bus: 0,
+                    device,
+                    function,
+                    is_nvme,
+                    bar0_base,
+                    bar0_size,
+                };
+                count += 1;
+            }
+        }
+        (count, out)
+    }
+
+    /// Enable memory-space decoding + bus mastering in a function's PCI
+    /// command register -- what a bare-metal driver needs before touching BAR
+    /// MMIO or letting the device DMA. All other command bits are left as
+    /// found.
+    pub fn enable_mem_bus_master(bus: u8, device: u8, function: u8) {
+        /// Config offset of the command/status dword (command is the low half).
+        const COMMAND_DWORD: u8 = 0x04;
+        /// Command bits: memory space (1) + bus master (2).
+        const CMD_MEM_AND_MASTER: u32 = (1 << 1) | (1 << 2);
+        let dword = config_read(bus, device, function, COMMAND_DWORD);
+        let cmd = (dword & 0xFFFF) | CMD_MEM_AND_MASTER;
+        config_write(
+            bus,
+            device,
+            function,
+            COMMAND_DWORD,
+            (dword & 0xFFFF_0000) | cmd,
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_class_codes_decode() {
+        // NVMe: class 01, subclass 08, prog-if 02.
+        let nvme = 0x0108_0200u32;
+        assert_eq!(class_of(nvme), CLASS_STORAGE);
+        assert_eq!(subclass_of(nvme), SUBCLASS_NVME);
+        assert_eq!(prog_if_of(nvme), PROGIF_NVME);
+        assert!(is_nvme_class(
+            class_of(nvme),
+            subclass_of(nvme),
+            prog_if_of(nvme)
+        ));
+        assert!(!is_ahci_class(
+            class_of(nvme),
+            subclass_of(nvme),
+            prog_if_of(nvme)
+        ));
+        // AHCI: class 01, subclass 06, prog-if 01.
+        let ahci = 0x0106_0100u32;
+        assert_eq!(subclass_of(ahci), SUBCLASS_AHCI);
+        assert_eq!(prog_if_of(ahci), PROGIF_AHCI);
+        assert!(is_ahci_class(
+            class_of(ahci),
+            subclass_of(ahci),
+            prog_if_of(ahci)
+        ));
+        assert!(!is_nvme_class(
+            class_of(ahci),
+            subclass_of(ahci),
+            prog_if_of(ahci)
+        ));
+        // IDE (01:01) is neither.
+        assert!(!is_nvme_class(0x01, 0x01, 0x00));
+        assert!(!is_ahci_class(0x01, 0x01, 0x00));
+    }
 
     #[test]
     fn config_address_matches_mechanism_1_layout() {
