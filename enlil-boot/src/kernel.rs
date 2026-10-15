@@ -1624,9 +1624,9 @@ mod hw {
     /// controller, reports the namespace size, and runs a block read/write
     /// self-test on the LAST LBA of namespace 1 -- the nightly QEMU harness
     /// attaches a blank 64 MiB `NVMe` image, so the self-test never touches
-    /// real data there. On real hardware this write is destructive to that
-    /// one sector; a config-gated policy for production disks is a later
-    /// slice.
+    /// real data there. The write only runs when the controller's Identify
+    /// model says it is emulated (`QEMU…`); on real hardware the kernel does
+    /// a read-only check of that sector instead and never writes.
     ///
     /// On the `AHCI` path the kernel starts each port with a SATA disk and
     /// reports its IDENTIFY model string (no destructive self-test there).
@@ -1709,15 +1709,36 @@ mod hw {
         serial.write_str(format_u64(ctl.namespace_blocks(), &mut n));
         serial.write_str(" 512-byte blocks\n");
 
-        // Block r/w self-test on the last LBA: write a pattern, read it back,
-        // compare, flush. Destructive to that one sector by design (see the
-        // `bring_up_storage` contract above).
+        let mut model = [0u8; crate::nvme::MODEL_LEN];
+        model.copy_from_slice(ctl.model());
+        serial.write_str("enlil kernel: storage: nvme: model ");
+        serial.write_str(core::str::from_utf8(&model).unwrap_or("?").trim());
+        serial.write_str("\n");
+
         let last = ctl.namespace_blocks() - 1;
+        let mut rbuf = [0u8; 512];
+        if !ctl.is_emulated() {
+            // Real hardware: NEVER write. The last sector of a GPT disk holds
+            // the backup partition table, and this disk may be the machine's
+            // only one. Prove the data path with a read of that sector.
+            if ctl.read_blocks(last, &mut rbuf).is_ok() {
+                serial.write_str(
+                    "enlil kernel: storage: nvme: read-only self-test ok (last block read; write self-test skipped — not an emulated controller)\n",
+                );
+            } else {
+                serial.write_str("enlil kernel: storage: nvme: read-only self-test FAILED\n");
+            }
+            return;
+        }
+
+        // Emulated controller (the QEMU harness attaches a blank 64 MiB
+        // image): block r/w self-test on the last LBA — write a pattern, read
+        // it back, compare, flush. Destructive to that one sector by design,
+        // which is why it only runs on a controller `is_emulated` accepts.
         let mut wbuf = [0u8; 512];
         for (i, b) in wbuf.iter_mut().enumerate() {
             *b = ((i ^ 0xA5) & 0xFF) as u8;
         }
-        let mut rbuf = [0u8; 512];
         let ok = ctl.write_blocks(last, &wbuf).is_ok()
             && ctl.read_blocks(last, &mut rbuf).is_ok()
             && rbuf == wbuf
