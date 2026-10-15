@@ -119,6 +119,10 @@ mod hw {
         /// Write one byte, expanding a line feed to CR+LF so serial terminals
         /// render lines correctly.
         pub fn write_byte(&self, byte: u8) {
+            // Mirror the log onto the framebuffer (and into the log ring) so
+            // it is visible on machines with no serial port. The raw byte, not
+            // the CR+LF-expanded one: the screen console handles `\n` itself.
+            crate::logmirror::mirror(byte);
             if byte == b'\n' {
                 self.wait_writable();
                 unsafe { outb(self.base + REG_DATA, b'\r') };

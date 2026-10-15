@@ -469,6 +469,12 @@ if [ -w /dev/kvm ]; then
 else
     QEMU_ARGS+=(-cpu max)
 fi
+# Extra QEMU arguments for ad-hoc debugging (e.g. a monitor socket to take a
+# screendump of the GOP framebuffer): ENLIL_QEMU_EXTRA="-monitor unix:/tmp/m,server,nowait"
+if [ -n "${ENLIL_QEMU_EXTRA:-}" ]; then
+    read -r -a _qemu_extra <<<"$ENLIL_QEMU_EXTRA"
+    QEMU_ARGS+=("${_qemu_extra[@]}")
+fi
 
 # The payload halts (hlt loop) after the milestone summary, so QEMU never exits
 # on its own: run it in the background and poll the serial log, killing QEMU as

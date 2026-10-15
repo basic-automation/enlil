@@ -33,6 +33,7 @@ pub mod handoff;
 pub mod idt;
 pub mod iommu;
 pub mod kernel;
+pub mod logmirror;
 pub mod mmio;
 pub mod net;
 pub mod nvme;
