@@ -152,6 +152,56 @@ impl GuestFirmware {
     }
 }
 
+/// A file staged from the ESP into boot-services (`LOADER_DATA`) memory.
+///
+/// The pages were allocated before `ExitBootServices()` and must be treated as
+/// reserved by the kernel, never as free conventional memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StagedFile {
+    /// Physical base of the staged bytes (`0` when not staged).
+    pub base: u64,
+    /// Valid bytes at `base`.
+    pub len: usize,
+}
+
+impl StagedFile {
+    /// An empty (unstaged) file.
+    pub const EMPTY: Self = Self { base: 0, len: 0 };
+
+    /// Whether any bytes were staged.
+    #[must_use]
+    pub const fn is_staged(&self) -> bool {
+        self.base != 0 && self.len != 0
+    }
+}
+
+/// A Linux guest staged from the ESP: its kernel image, optional initrd and
+/// optional command line (the files under `EFI/enlil/linux/`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LinuxPayload {
+    /// The `bzImage` (`vmlinuz`).
+    pub kernel: StagedFile,
+    /// The initial ramdisk (`initrd.img`), if any.
+    pub initrd: StagedFile,
+    /// The kernel command line (`cmdline.txt`, no trailing NUL), if any.
+    pub cmdline: StagedFile,
+}
+
+impl LinuxPayload {
+    /// No Linux guest staged.
+    pub const EMPTY: Self = Self {
+        kernel: StagedFile::EMPTY,
+        initrd: StagedFile::EMPTY,
+        cmdline: StagedFile::EMPTY,
+    };
+
+    /// Whether a bootable kernel image was staged.
+    #[must_use]
+    pub const fn has_kernel(&self) -> bool {
+        self.kernel.is_staged()
+    }
+}
+
 /// Maximum PCI root bridges recorded in a [`BootHandoff`].
 ///
 /// One bridge per firmware-enumerated PCI segment is the norm (usually one);
@@ -225,6 +275,9 @@ pub struct BootHandoff {
     pub pci_root_bridges: [PciRootBridge; MAX_PCI_ROOT_BRIDGES],
     /// Number of valid entries in `pci_root_bridges`.
     pub pci_root_bridge_count: u8,
+    /// A Linux guest staged from `EFI/enlil/linux/` (empty when the ESP has
+    /// none): the kernel runs it as a real guest OS when a kernel is present.
+    pub linux_guest: LinuxPayload,
 }
 
 impl BootHandoff {
@@ -362,6 +415,7 @@ mod tests {
             guest_firmware_count: 0,
             pci_root_bridges: [PciRootBridge::default(); MAX_PCI_ROOT_BRIDGES],
             pci_root_bridge_count: 0,
+            linux_guest: LinuxPayload::EMPTY,
         };
         assert_eq!(h.descriptor_count(), 10);
     }
@@ -380,6 +434,7 @@ mod tests {
             guest_firmware_count: 0,
             pci_root_bridges: [PciRootBridge::default(); MAX_PCI_ROOT_BRIDGES],
             pci_root_bridge_count: 0,
+            linux_guest: LinuxPayload::EMPTY,
         };
         assert_eq!(h.descriptor_count(), 0);
     }
@@ -398,6 +453,7 @@ mod tests {
             guest_firmware_count: 0,
             pci_root_bridges: [PciRootBridge::default(); MAX_PCI_ROOT_BRIDGES],
             pci_root_bridge_count: 0,
+            linux_guest: LinuxPayload::EMPTY,
         };
         assert!(good.is_valid());
         assert!(good.has_acpi());
@@ -450,6 +506,7 @@ mod tests {
             guest_firmware_count: 0,
             pci_root_bridges: [PciRootBridge::default(); MAX_PCI_ROOT_BRIDGES],
             pci_root_bridge_count: 0,
+            linux_guest: LinuxPayload::EMPTY,
         }
     }
 
@@ -479,6 +536,7 @@ mod tests {
             guest_firmware_count: 0,
             pci_root_bridges: bridges,
             pci_root_bridge_count: 2,
+            linux_guest: LinuxPayload::EMPTY,
         }
     }
 

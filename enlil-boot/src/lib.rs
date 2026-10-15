@@ -31,8 +31,10 @@ pub mod framebuffer;
 pub mod gdt;
 pub mod handoff;
 pub mod idt;
+pub mod insn;
 pub mod iommu;
 pub mod kernel;
+pub mod linux_guest;
 pub mod logmirror;
 pub mod mmio;
 pub mod net;
@@ -46,6 +48,7 @@ pub mod smp;
 pub mod stack;
 pub mod svm;
 pub mod tsc;
+pub mod vdev;
 pub mod xhci;
 
 /// Console/serial banner the payload emits once it has taken control.

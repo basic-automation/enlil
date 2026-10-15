@@ -32,6 +32,12 @@ pub const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 /// Largest single OVMF image the boot app will stage (16 MiB — the real
 /// images are 2–4 MiB).
 pub const MAX_FIRMWARE_BYTES: u64 = 16 * 1024 * 1024;
+/// Largest Linux guest kernel image the boot app will stage (128 MiB).
+pub const MAX_LINUX_KERNEL_BYTES: u64 = 128 * 1024 * 1024;
+/// Largest Linux guest initrd the boot app will stage (512 MiB).
+pub const MAX_LINUX_INITRD_BYTES: u64 = 512 * 1024 * 1024;
+/// Largest Linux guest command line the boot app will stage (4 KiB).
+pub const MAX_LINUX_CMDLINE_BYTES: u64 = 4096;
 
 /// Calls `f` once per distinct `[guest.<id>]` table header in `config`.
 ///
@@ -135,9 +141,12 @@ pub use hw::{EspPayload, load_esp_payload};
 /// Firmware-protocol ESP loading, alive only while boot services are up.
 #[cfg(target_os = "uefi")]
 mod hw {
-    use super::{MAX_CONFIG_BYTES, MAX_FIRMWARE_BYTES, for_each_guest_id, uefi_path_codes};
+    use super::{
+        MAX_CONFIG_BYTES, MAX_FIRMWARE_BYTES, MAX_LINUX_CMDLINE_BYTES, MAX_LINUX_INITRD_BYTES,
+        MAX_LINUX_KERNEL_BYTES, for_each_guest_id, uefi_path_codes,
+    };
     use crate::firmware::{self, FirmwareFile};
-    use crate::handoff::{GuestFirmware, MAX_BOOT_GUESTS};
+    use crate::handoff::{GuestFirmware, LinuxPayload, MAX_BOOT_GUESTS, StagedFile};
     use uefi::boot::{self, AllocateType, MemoryType};
     use uefi::data_types::CStr16;
     use uefi::proto::loaded_image::LoadedImage;
@@ -183,6 +192,9 @@ mod hw {
         pub guests: [GuestFirmware; MAX_BOOT_GUESTS],
         /// Number of valid entries in `guests` (`<= MAX_BOOT_GUESTS`).
         pub guest_count: usize,
+        /// A Linux guest (kernel / initrd / cmdline) staged from
+        /// `EFI/enlil/linux/`; empty when the ESP has none.
+        pub linux: LinuxPayload,
     }
 
     fn to_esp_error(e: Error) -> EspError {
@@ -297,6 +309,7 @@ mod hw {
             config: None,
             guests: [GuestFirmware::empty(); MAX_BOOT_GUESTS],
             guest_count: 0,
+            linux: LinuxPayload::EMPTY,
         };
         let mut loader = match EspLoader::open() {
             Ok(loader) => loader,
@@ -354,7 +367,54 @@ mod hw {
             load_guest_file(&mut loader, entry, id, FirmwareFile::Code);
             load_guest_file(&mut loader, entry, id, FirmwareFile::Vars);
         }
+
+        // 3. An optional Linux guest: kernel, initrd, command line.
+        payload.linux = load_linux_payload(&mut loader);
         payload
+    }
+
+    /// Stages the Linux guest files from `EFI/enlil/linux/`. Each file is
+    /// optional; only a staged kernel makes the payload bootable.
+    fn load_linux_payload(loader: &mut EspLoader) -> LinuxPayload {
+        let kernel = stage_optional(loader, firmware::LINUX_KERNEL_PATH, MAX_LINUX_KERNEL_BYTES);
+        if !kernel.is_staged() {
+            return LinuxPayload::EMPTY;
+        }
+        LinuxPayload {
+            kernel,
+            initrd: stage_optional(loader, firmware::LINUX_INITRD_PATH, MAX_LINUX_INITRD_BYTES),
+            cmdline: stage_optional(
+                loader,
+                firmware::LINUX_CMDLINE_PATH,
+                MAX_LINUX_CMDLINE_BYTES,
+            ),
+        }
+    }
+
+    /// Stages one optional ESP file, logging what happened. A missing file is
+    /// not an error; an unreadable or oversized one is warned about.
+    fn stage_optional(loader: &mut EspLoader, path: &str, max_bytes: u64) -> StagedFile {
+        let mut buf = [0u8; 128];
+        let bytes = path.as_bytes();
+        let Some(dst) = buf.get_mut(..bytes.len()) else {
+            log::warn!("esp: path too long: {path}");
+            return StagedFile::EMPTY;
+        };
+        dst.copy_from_slice(bytes);
+        match loader.read_file(&buf[..bytes.len()], max_bytes) {
+            Ok(file) => {
+                log::info!("esp: staged {path} ({} bytes)", file.len);
+                StagedFile {
+                    base: file.base,
+                    len: file.len,
+                }
+            }
+            Err(EspError::NotFound) => StagedFile::EMPTY,
+            Err(e) => {
+                log::warn!("esp: failed to load {path}: {e:?}");
+                StagedFile::EMPTY
+            }
+        }
     }
 
     /// Records the distinct `[guest.<id>]` headers of `config` in `payload`.

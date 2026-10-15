@@ -1,6 +1,9 @@
 pub mod acpi;
 pub mod affinity;
-pub mod bzimage;
+// The Linux boot-protocol parser is pure and `no_std`, so it lives in
+// `enlil-hal` where the bare-metal kernel can share it; re-exported so every
+// existing `crate::bzimage` path keeps working.
+pub use enlil_hal::bzimage;
 pub mod device_bus;
 pub mod ept;
 pub mod error;

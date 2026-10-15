@@ -372,7 +372,13 @@ if ! cargo build -p enlil-boot --target x86_64-unknown-uefi \
     echo "FAIL: enlil-boot did not build for x86_64-unknown-uefi"
     exit 1
 fi
-EFI="$REPO_ROOT/target/x86_64-unknown-uefi/debug/enlil-boot.efi"
+# The workspace may redirect cargo's target dir (build.target-dir, shared by
+# several checkouts); ask cargo instead of assuming $REPO_ROOT/target, which
+# could be missing or hold a stale binary from another checkout.
+TARGET_DIR="$(cargo metadata --format-version 1 --no-deps \
+    --manifest-path "$REPO_ROOT/Cargo.toml" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+EFI="$TARGET_DIR/x86_64-unknown-uefi/debug/enlil-boot.efi"
 if [ ! -f "$EFI" ]; then
     echo "FAIL: expected artifact missing: $EFI"
     exit 1

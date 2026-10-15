@@ -280,53 +280,110 @@ pub const fn boot_heap_size(region_bytes: u64) -> u64 {
 /// else claims it; this hands out disjoint slices of it, one per guest.
 ///
 /// Empty until [`kernel::bring_up_memory_plan`](kernel) publishes the plan.
+/// The calibrated TSC frequency in Hz (0 until [`bring_up_time`] measures it);
+/// the Linux guest is told it so it need not calibrate against hardware it
+/// cannot see.
+pub static TSC_HZ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Set once SVM is enabled and the host-save area is programmed — the point
+/// from which any guest can be run.
+pub static SVM_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 pub mod guest_ram {
     use core::sync::atomic::{AtomicU64, Ordering};
 
-    /// Next free system-physical address inside the carved window.
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    /// One past the last byte of the carved window (0 = no window).
-    static END: AtomicU64 = AtomicU64::new(0);
-
-    /// Publish the carved guest-RAM window so [`take`] can hand out slices.
-    pub fn publish(base: u64, size: u64) {
-        NEXT.store(base, Ordering::Release);
-        END.store(base.saturating_add(size), Ordering::Release);
+    /// A bump allocator over one carved physical window.
+    ///
+    /// Slices are disjoint and never reused, so one guest's RAM can never alias
+    /// another's.
+    pub struct RamWindow {
+        /// Next free system-physical address inside the window.
+        next: AtomicU64,
+        /// One past the last byte of the window (0 = no window).
+        end: AtomicU64,
     }
 
-    /// Bytes still available in the carved window.
-    #[must_use]
-    pub fn remaining() -> u64 {
-        END.load(Ordering::Acquire)
-            .saturating_sub(NEXT.load(Ordering::Acquire))
-    }
-
-    /// Take a slice of the carved window for one guest.
-    ///
-    /// Returns the `size`-byte, `align`-aligned slice's system-physical base, or
-    /// `None` if no window was published or too little of it is left (the caller
-    /// then falls back to the heap).
-    ///
-    /// `align` must be a power of two. Slices are disjoint and never reused, so
-    /// one guest's RAM can never alias another's.
-    #[must_use]
-    pub fn take(size: u64, align: u64) -> Option<u64> {
-        let end = END.load(Ordering::Acquire);
-        if end == 0 || size == 0 || !align.is_power_of_two() {
-            return None;
+    impl RamWindow {
+        /// An empty window.
+        #[must_use]
+        pub const fn new() -> Self {
+            Self {
+                next: AtomicU64::new(0),
+                end: AtomicU64::new(0),
+            }
         }
-        let mut cur = NEXT.load(Ordering::Acquire);
-        loop {
-            let base = cur.checked_add(align - 1)? & !(align - 1);
-            let next = base.checked_add(size)?;
-            if next > end {
+
+        /// Publish the carved window so [`take`](Self::take) can hand out slices.
+        pub fn publish(&self, base: u64, size: u64) {
+            self.next.store(base, Ordering::Release);
+            self.end.store(base.saturating_add(size), Ordering::Release);
+        }
+
+        /// Bytes still available in the window.
+        #[must_use]
+        pub fn remaining(&self) -> u64 {
+            self.end
+                .load(Ordering::Acquire)
+                .saturating_sub(self.next.load(Ordering::Acquire))
+        }
+
+        /// Take a `size`-byte, `align`-aligned slice, returning its
+        /// system-physical base, or `None` if no window was published or too
+        /// little is left. `align` must be a power of two.
+        #[must_use]
+        pub fn take(&self, size: u64, align: u64) -> Option<u64> {
+            let end = self.end.load(Ordering::Acquire);
+            if end == 0 || size == 0 || !align.is_power_of_two() {
                 return None;
             }
-            match NEXT.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => return Some(base),
-                Err(actual) => cur = actual,
+            let mut cur = self.next.load(Ordering::Acquire);
+            loop {
+                let base = cur.checked_add(align - 1)? & !(align - 1);
+                let next = base.checked_add(size)?;
+                if next > end {
+                    return None;
+                }
+                match self.next.compare_exchange_weak(
+                    cur,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return Some(base),
+                    Err(actual) => cur = actual,
+                }
             }
         }
+    }
+
+    impl Default for RamWindow {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    /// The window the small proof guests draw from.
+    static WINDOW: RamWindow = RamWindow::new();
+
+    /// The window the Linux guest's RAM is carved into (published only when a
+    /// Linux payload was staged).
+    pub static LINUX: RamWindow = RamWindow::new();
+
+    /// Publish the proof-guest window.
+    pub fn publish(base: u64, size: u64) {
+        WINDOW.publish(base, size);
+    }
+
+    /// Bytes still available in the proof-guest window.
+    #[must_use]
+    pub fn remaining() -> u64 {
+        WINDOW.remaining()
+    }
+
+    /// Take a slice of the proof-guest window for one guest.
+    #[must_use]
+    pub fn take(size: u64, align: u64) -> Option<u64> {
+        WINDOW.take(size, align)
     }
 }
 
@@ -658,6 +715,13 @@ mod hw {
         // that chain order.
         bring_up_milestone(&serial);
 
+        // A Linux guest staged on the ESP (EFI/enlil/linux/) is booted as a
+        // real guest OS — after the milestone so the chain-order proof above
+        // stays the last chain line of a plain boot.
+        if let Some(handoff) = handoff {
+            crate::linux_guest::boot(&serial, handoff);
+        }
+
         park()
     }
 
@@ -720,6 +784,7 @@ mod hw {
                 serial.write_str(format_u64(hz_to_mhz_rounded(hz), &mut buf));
                 serial.write_str(" MHz (via PIT) — monotonic clock live\n");
                 bring_up_monotonic(serial, hz);
+                crate::kernel::TSC_HZ.store(hz, core::sync::atomic::Ordering::Release);
                 Some(hz)
             }
             _ => {
@@ -2243,6 +2308,7 @@ mod hw {
                         serial.write_str("enlil kernel: svm: host-save area at ");
                         serial.write_str(format_u64_hex(pa, &mut buf));
                         serial.write_str("\n");
+                        crate::kernel::SVM_READY.store(true, core::sync::atomic::Ordering::Release);
                     }
                     None => serial.write_str("enlil kernel: svm: host-save area FAILED\n"),
                 }
@@ -3755,7 +3821,11 @@ mod hw {
         let req = MemoryPlanRequest {
             heap_size,
             dma_size: 2 * MIB,
-            guest_ram_sizes: alloc::vec![16 * MIB],
+            guest_ram_sizes: if handoff.linux_guest.has_kernel() {
+                alloc::vec![16 * MIB, crate::linux_guest::GUEST_RAM_BYTES]
+            } else {
+                alloc::vec![16 * MIB]
+            },
             align: 2 * MIB,
             preclaimed_heap,
         };
@@ -3829,6 +3899,14 @@ mod hw {
                     // image, or an MMIO window.
                     if all_clear && let Some(g0) = regions.guest_ram.first() {
                         crate::kernel::guest_ram::publish(g0.base.as_u64(), g0.size);
+                    }
+                    // The Linux guest's own carve (second region), disjoint from
+                    // the proof guests' window by the planner.
+                    if all_clear
+                        && handoff.linux_guest.has_kernel()
+                        && let Some(g1) = regions.guest_ram.get(1)
+                    {
+                        crate::kernel::guest_ram::LINUX.publish(g1.base.as_u64(), g1.size);
                     }
                 }
             }
