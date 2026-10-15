@@ -1039,6 +1039,44 @@ impl VmcbSegment {
             base: 0,
         }
     }
+
+    /// An LDT segment for the guest's `LDTR` slot (`save::LDTR`), for guests
+    /// that keep their own local descriptor table.
+    ///
+    /// Attributes `0x82`: a system descriptor (S=0), present, type `0x2` (LDT).
+    /// In 64-bit mode the LDT descriptor in the guest `GDT` is 16 bytes, but
+    /// the VMCB slot's cached copy is the plain 16-byte save-area form this
+    /// carries. `VMLOAD` loads exactly this into the guest's `LDTR` on entry;
+    /// `VMSAVE` writes the (possibly guest-mutated) register back on exit, so
+    /// the host's own `LDTR` survives in the run shell's host-save page.
+    #[must_use]
+    pub const fn ldt(selector: u16, base: u64) -> Self {
+        Self {
+            selector,
+            attrib: 0x0082,
+            limit: 0xFFFF,
+            base,
+        }
+    }
+
+    /// A busy 64-bit TSS for the guest's `TR` slot (`save::TR`), for guests
+    /// that use task gates or `IST` stacks.
+    ///
+    /// Attributes `0x8B`: a system descriptor (S=0), present, type `0xB` (busy
+    /// 32/64-bit TSS — the form `VMLOAD` accepts for the task register). Limit
+    /// `0x67` is exactly a 104-byte TSS. Like [`ldt`](Self::ldt), this is what
+    /// `VMLOAD` installs on entry and `VMSAVE` captures on exit; a guest that
+    /// never touches its task register leaves the slot a zeroed null selector
+    /// and is unaffected.
+    #[must_use]
+    pub const fn tss_busy(selector: u16, base: u64) -> Self {
+        Self {
+            selector,
+            attrib: 0x008B,
+            limit: 0x0067,
+            base,
+        }
+    }
 }
 
 /// The register state for bringing up a minimal guest that runs until it
@@ -1270,6 +1308,40 @@ pub fn read_segment(region: &[u8], offset: usize) -> VmcbSegment {
         limit: get_u32(region, offset + 4),
         base: get_u64(region, offset + 8),
     }
+}
+
+/// Program the guest's `LDTR`/`TR` save-area slots ([`save::LDTR`],
+/// [`save::TR`]) for a guest that uses an LDT and/or task gates.
+///
+/// `VMRUN` itself never loads `FS`/`GS`/`TR`/`LDTR` — only `VMLOAD` does (APM
+/// §15.5.2) — so a guest with its own LDT/TSS needs these slots populated for
+/// the run shell's entry `VMLOAD` to install the guest's registers. On
+/// `#VMEXIT` the shell's `VMSAVE` captures the (possibly guest-mutated)
+/// registers back into these slots, and the exit `VMLOAD` restores the host's
+/// `LDTR`/`TR` from the host-save page — the host's own LDT/TSS survive even
+/// when the guest rewrote them.
+///
+/// Passing the [`Default`] (zeroed) segments leaves both selectors null, which
+/// is what every existing guest does; `VMLOAD` of a null selector is a no-op
+/// and those guests are unaffected.
+///
+/// # Errors
+///
+/// Returns [`VmcbRegionError::TooSmall`] if `region` is shorter than a VMCB.
+pub fn program_guest_ldtr_tr(
+    region: &mut [u8],
+    ldtr: &VmcbSegment,
+    tr: &VmcbSegment,
+) -> Result<(), VmcbRegionError> {
+    if region.len() < VMCB_SIZE {
+        return Err(VmcbRegionError::TooSmall {
+            provided: region.len(),
+            required: VMCB_SIZE,
+        });
+    }
+    write_segment(region, save::LDTR, *ldtr);
+    write_segment(region, save::TR, *tr);
+    Ok(())
 }
 
 /// The #VMEXIT code the hardware wrote to [`control::EXIT_CODE`].
@@ -1987,6 +2059,70 @@ mod tests {
     fn long_mode_segments_set_the_l_bit() {
         assert_eq!(VmcbSegment::long_mode_code().attrib, 0x029B);
         assert_eq!(VmcbSegment::long_mode_data().attrib, 0x0093);
+    }
+
+    #[test]
+    fn ldt_and_tss_segments_carry_system_descriptor_attribs() {
+        // LDT: type 0x2, S=0 (system), P=1 → 0x82. TSS: type 0xB (busy), S=0,
+        // P=1 → 0x8B. Both are system descriptors, not code/data.
+        let ldt = VmcbSegment::ldt(0x18, 0x3000);
+        assert_eq!(ldt.selector, 0x18);
+        assert_eq!(ldt.attrib, 0x0082);
+        assert_eq!(ldt.base, 0x3000);
+        let tss = VmcbSegment::tss_busy(0x28, 0x4000);
+        assert_eq!(tss.selector, 0x28);
+        assert_eq!(tss.attrib, 0x008B);
+        assert_eq!(tss.base, 0x4000);
+        // A 64-bit TSS is exactly 104 bytes.
+        assert_eq!(tss.limit, 0x0067);
+    }
+
+    #[test]
+    fn program_guest_ldtr_tr_writes_both_save_area_slots() {
+        let mut region = [0u8; VMCB_SIZE];
+        let ldtr = VmcbSegment::ldt(0x18, 0x3000);
+        let tr = VmcbSegment::tss_busy(0x28, 0x4000);
+        program_guest_ldtr_tr(&mut region, &ldtr, &tr).expect("full page programs");
+        // Offsets land on the APM Table B-2 LDTR/TR slots.
+        assert_eq!(save::LDTR, 0x470);
+        assert_eq!(save::TR, 0x490);
+        assert_eq!(read_segment(&region, save::LDTR), ldtr);
+        assert_eq!(read_segment(&region, save::TR), tr);
+        // Raw layout: selector, attrib, limit, base — little-endian.
+        assert_eq!(get_u16(&region, save::TR), 0x28);
+        assert_eq!(get_u16(&region, save::TR + 2), 0x008B);
+        assert_eq!(get_u32(&region, save::TR + 4), 0x0067);
+        assert_eq!(get_u64(&region, save::TR + 8), 0x4000);
+        // Nothing else in the save area was touched.
+        assert_eq!(read_segment(&region, save::CS), VmcbSegment::default());
+        assert_eq!(get_u64(&region, save::RIP), 0);
+    }
+
+    #[test]
+    fn program_guest_ldtr_tr_accepts_null_selectors() {
+        // Zeroed slots = null LDTR/TR: VMLOAD treats them as a no-op, which is
+        // what every guest without an LDT/TSS keeps.
+        let mut region = [0u8; VMCB_SIZE];
+        let null = VmcbSegment::default();
+        program_guest_ldtr_tr(&mut region, &null, &null).expect("full page programs");
+        assert_eq!(read_segment(&region, save::LDTR), null);
+        assert_eq!(read_segment(&region, save::TR), null);
+        assert_eq!(get_u16(&region, save::LDTR), 0);
+        assert_eq!(get_u16(&region, save::TR), 0);
+    }
+
+    #[test]
+    fn program_guest_ldtr_tr_rejects_a_short_region() {
+        let mut region = [0u8; VMCB_SIZE - 1];
+        let ldtr = VmcbSegment::ldt(0x18, 0x3000);
+        let tr = VmcbSegment::tss_busy(0x28, 0x4000);
+        assert_eq!(
+            program_guest_ldtr_tr(&mut region, &ldtr, &tr),
+            Err(VmcbRegionError::TooSmall {
+                provided: VMCB_SIZE - 1,
+                required: VMCB_SIZE,
+            })
+        );
     }
 
     #[test]
