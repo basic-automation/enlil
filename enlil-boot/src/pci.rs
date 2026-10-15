@@ -473,6 +473,23 @@ mod hw {
     /// For a 64-bit BAR (`is_64`) both dwords are probed and combined. Config
     /// space is left exactly as found.
     fn size_memory_bar(device: u8, function: u8, off: u8, is_64: bool) -> u64 {
+        // Writing all-ones to a BAR of a function that is decoding memory makes
+        // it claim a huge bogus window until the restore — on real hardware
+        // that can shadow RAM or other devices. Turn memory decode off for the
+        // probe (as Linux does) and put the command register back afterwards.
+        // The status half of the dword is write-1-to-clear: write it as zeros
+        // so no sticky status bit is cleared by accident.
+        const COMMAND_DWORD: u8 = 0x04;
+        const CMD_MEM_SPACE: u32 = 1 << 1;
+        let command = config_read(0, device, function, COMMAND_DWORD) & 0xFFFF;
+        config_write(0, device, function, COMMAND_DWORD, command & !CMD_MEM_SPACE);
+        let size = size_memory_bar_decode_off(device, function, off, is_64);
+        config_write(0, device, function, COMMAND_DWORD, command);
+        size
+    }
+
+    /// The write-probe itself; the caller has memory decode disabled.
+    fn size_memory_bar_decode_off(device: u8, function: u8, off: u8, is_64: bool) -> u64 {
         let orig_lo = config_read(0, device, function, off);
         config_write(0, device, function, off, 0xFFFF_FFFF);
         let probe_lo = config_read(0, device, function, off);
