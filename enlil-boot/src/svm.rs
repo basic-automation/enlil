@@ -1303,6 +1303,9 @@ const fn write_rdtsc_emulate_program(ram: &mut [u8]) {
 }
 
 #[cfg(target_os = "uefi")]
+pub(crate) use hw::{host_cpuid, vmrun};
+
+#[cfg(target_os = "uefi")]
 pub use hw::{
     enable_svm, program_boot_vmcb, program_event_inj_resume_vmcb, program_event_inj_vmcb,
     program_host_save_area, program_irq_resume_vmcb, program_ldtr_tr_vmcb,
@@ -1397,7 +1400,7 @@ mod hw {
     /// guest `CPUID` (LOCKED PRINCIPLE 1), then stealths the result with
     /// [`sanitize_cpuid`](super::sanitize_cpuid) before delivering it. `rbx` is
     /// hand-preserved (LLVM-reserved) via a scratch register.
-    fn host_cpuid(leaf: u32, subleaf: u32) -> super::CpuidRegs {
+    pub(crate) fn host_cpuid(leaf: u32, subleaf: u32) -> super::CpuidRegs {
         let eax: u32;
         let ebx: u32;
         let ecx: u32;
@@ -3062,7 +3065,7 @@ mod hw {
     /// `vmcb_pa`, `host_save_pa`, and the `gprs` pointer are pushed to the stack
     /// first because the guest clobbers every GPR and `VMRUN` only restores host
     /// `RAX`/`RSP`; they are reloaded from `[rsp+N]` after `#VMEXIT`.
-    unsafe fn vmrun(vmcb_pa: u64, host_save_pa: u64, gprs: *mut super::GuestGprs) {
+    pub(crate) unsafe fn vmrun(vmcb_pa: u64, host_save_pa: u64, gprs: *mut super::GuestGprs) {
         unsafe {
             core::arch::asm!(
                 "push rbx",             // preserve host rbx (callee-saved)

@@ -78,6 +78,7 @@ fn efi_main() -> uefi::Status {
         guest_firmware_count: esp_payload.guest_count,
         pci_root_bridges,
         pci_root_bridge_count,
+        linux_guest: esp_payload.linux,
     };
     // Keep the memory-map buffer alive for the kernel: dropping the owned map
     // would call the now-defunct boot-services `FreePool`. Its base and extent
