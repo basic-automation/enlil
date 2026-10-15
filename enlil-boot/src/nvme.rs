@@ -367,6 +367,23 @@ impl QueuePair {
 // Controller driver
 // ---------------------------------------------------------------------------
 
+/// Byte offset of the model number (`MN`) in the Identify Controller data.
+const IDENTIFY_MN_OFFSET: usize = 24;
+/// Length of the model number field: 40 ASCII bytes, space padded.
+pub const MODEL_LEN: usize = 40;
+
+/// Whether an Identify Controller model number names an **emulated** device.
+///
+/// The kernel's destructive block write/read self-test is allowed only on such
+/// controllers: it overwrites one sector, which on a real disk is real data
+/// (the last sector of a GPT disk holds the backup partition table). QEMU's
+/// `NVMe` model is `QEMU NVMe Ctrl`; anything else is treated as hardware.
+#[must_use]
+pub fn model_is_emulated(model: &[u8]) -> bool {
+    let start = model.iter().position(|&b| b != b' ').unwrap_or(model.len());
+    model[start..].starts_with(b"QEMU")
+}
+
 /// A directly-driven `NVMe` controller: admin queue + one I/O queue pair with
 /// polled completions.
 ///
@@ -380,6 +397,7 @@ pub struct NvmeController<M: Mmio> {
     prp_list: DmaBuf,
     nsid: u32,
     namespace_blocks: u64,
+    model: [u8; MODEL_LEN],
 }
 
 /// Spin until `condition` holds or the budget is exhausted.
@@ -456,6 +474,7 @@ impl<M: Mmio> NvmeController<M> {
             prp_list,
             nsid,
             namespace_blocks: 0,
+            model: [0; MODEL_LEN],
         };
 
         // Program the admin queue pair: queue sizes are 0's-based in AQA, and
@@ -476,6 +495,8 @@ impl<M: Mmio> NvmeController<M> {
         // Identify the controller: how many namespaces exist.
         ctrl.identify(IDENTIFY_CNS_CONTROLLER, 0)?;
         let data = ctrl.staging.as_slice();
+        ctrl.model
+            .copy_from_slice(&data[IDENTIFY_MN_OFFSET..IDENTIFY_MN_OFFSET + MODEL_LEN]);
         let nn = u32::from_le_bytes(
             data[516..520]
                 .try_into()
@@ -530,6 +551,18 @@ impl<M: Mmio> NvmeController<M> {
         ctrl.admin_cmd(cmd)?;
 
         Ok(ctrl)
+    }
+
+    /// The controller's model number (`MN`), 40 ASCII bytes, space padded.
+    #[must_use]
+    pub const fn model(&self) -> &[u8; MODEL_LEN] {
+        &self.model
+    }
+
+    /// Whether this controller is an emulated device (see [`model_is_emulated`]).
+    #[must_use]
+    pub fn is_emulated(&self) -> bool {
+        model_is_emulated(&self.model)
     }
 
     /// Number of 512-byte blocks in the namespace.
@@ -831,6 +864,7 @@ mod tests {
                     buf.fill(0);
                     if cdw10 == IDENTIFY_CNS_CONTROLLER {
                         buf[516..520].copy_from_slice(&1u32.to_le_bytes()); // NN = 1
+                        buf[24..64].copy_from_slice(b"QEMU NVMe Ctrl                          "); // MN
                     } else {
                         buf[0..8].copy_from_slice(&FAKE_NS_BLOCKS.to_le_bytes()); // NSZE
                         buf[26] = 0; // FLBAS: format 0
@@ -1037,6 +1071,33 @@ mod tests {
 
     fn init_fake() -> NvmeController<FakeNvme> {
         NvmeController::init(FakeNvme::new(), 1).expect("fake NVMe init")
+    }
+
+    #[test]
+    fn init_captures_the_model_and_flags_qemu_as_emulated() {
+        let ctl = init_fake();
+        assert!(ctl.model().starts_with(b"QEMU NVMe Ctrl"));
+        assert!(ctl.is_emulated());
+    }
+
+    #[test]
+    fn real_hardware_models_are_not_emulated() {
+        for m in [
+            &b"Samsung SSD 990 PRO 4TB                "[..],
+            b"WDC WDS100T3X0C-00SJG0                  ",
+            b"INTEL SSDPEKNW010T8                     ",
+            b"                                        ",
+            b"",
+            b"QEM",
+        ] {
+            assert!(!model_is_emulated(m), "{:?}", core::str::from_utf8(m));
+        }
+    }
+
+    #[test]
+    fn emulated_model_tolerates_leading_padding() {
+        assert!(model_is_emulated(b"  QEMU NVMe Ctrl"));
+        assert!(model_is_emulated(b"QEMU HARDDISK"));
     }
 
     #[test]
