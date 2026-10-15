@@ -310,6 +310,7 @@ dependencies = [
  "anyhow",
  "enlil-config",
  "enlil-devices",
+ "enlil-hal",
  "enlil-mgmt-proto",
  "enlil-platform",
  "event-manager",
