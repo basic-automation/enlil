@@ -960,14 +960,17 @@ fn write_long_mode_ldt_and_tss(ram: &mut [u8]) {
 /// page tables, and the NPT, and programs the VMCB `GDTR` + `LDTR`/`TR` slots.
 #[cfg(any(target_os = "uefi", test))]
 const fn write_ldtr_tr_program(ram: &mut [u8]) {
+    // `0F 00 /r` is the group-6 opcode: the ModRM reg field picks the
+    // instruction (/0 SLDT, /1 STR, /2 LLDT, /3 LTR) — /2 and /3 *load* the
+    // register from AX and would #GP here, so the encodings matter.
     ram[0] = 0x0F; // STR AX — guest TR selector into AX
     ram[1] = 0x00;
-    ram[2] = 0xD8;
+    ram[2] = 0xC8; // ModRM 11 001 000: /1 = STR, rm = AX
     ram[3] = 0xE6; // OUT imm8, AL
     ram[4] = GUEST_LM_TR_PORT;
     ram[5] = 0x0F; // SLDT AX — guest LDTR selector into AX
     ram[6] = 0x00;
-    ram[7] = 0xD0;
+    ram[7] = 0xC0; // ModRM 11 000 000: /0 = SLDT, rm = AX
     ram[8] = 0xE6; // OUT imm8, AL
     ram[9] = GUEST_LM_LDTR_PORT;
     ram[10] = 0xB0; // MOV AL, imm8
@@ -3947,13 +3950,19 @@ mod tests {
         // STR AX; OUT TR_PORT, AL — the guest's TR selector low byte.
         assert_eq!(ram[0], 0x0F);
         assert_eq!(ram[1], 0x00);
-        assert_eq!(ram[2], 0xD8, "STR AX");
+        assert_eq!(ram[2], 0xC8, "STR AX");
+        // Group-6 (0F 00) ModRM: reg /1 = STR (store), never /3 = LTR (load).
+        assert_eq!((ram[2] >> 3) & 7, 1, "reg field selects STR");
+        assert_eq!(ram[2] >> 6, 0b11, "register-direct (AX)");
         assert_eq!(ram[3], 0xE6);
         assert_eq!(ram[4], GUEST_LM_TR_PORT);
         // SLDT AX; OUT LDTR_PORT, AL — the guest's LDTR selector low byte.
         assert_eq!(ram[5], 0x0F);
         assert_eq!(ram[6], 0x00);
-        assert_eq!(ram[7], 0xD0, "SLDT AX");
+        assert_eq!(ram[7], 0xC0, "SLDT AX");
+        // reg /0 = SLDT (store), never /2 = LLDT (load).
+        assert_eq!((ram[7] >> 3) & 7, 0, "reg field selects SLDT");
+        assert_eq!(ram[7] >> 6, 0b11, "register-direct (AX)");
         assert_eq!(ram[8], 0xE6);
         assert_eq!(ram[9], GUEST_LM_LDTR_PORT);
         // Completion OUT + HLT.
