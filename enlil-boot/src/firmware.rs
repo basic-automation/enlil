@@ -34,6 +34,9 @@ pub const LINUX_KERNEL_PATH: &str = "EFI/enlil/linux/vmlinuz";
 pub const LINUX_INITRD_PATH: &str = "EFI/enlil/linux/initrd.img";
 /// The Linux guest kernel command line (plain text), relative to the ESP root.
 pub const LINUX_CMDLINE_PATH: &str = "EFI/enlil/linux/cmdline.txt";
+/// The Linux guest's virtual-disk assignment (plain text), relative to the ESP
+/// root: which host disk it is carved from and which sector ranges it may use.
+pub const LINUX_DISK_PATH: &str = "EFI/enlil/linux/disk.txt";
 /// Root of the per-guest firmware tree on the ESP.
 pub const FIRMWARE_ROOT: &str = "EFI/enlil/firmware";
 /// File name of the read-only firmware code image in a guest's directory.

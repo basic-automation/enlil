@@ -371,6 +371,41 @@ impl QueuePair {
 const IDENTIFY_MN_OFFSET: usize = 24;
 /// Length of the model number field: 40 ASCII bytes, space padded.
 pub const MODEL_LEN: usize = 40;
+/// Byte offset of the serial number (`SN`) in the Identify Controller data.
+const IDENTIFY_SN_OFFSET: usize = 4;
+/// Length of the serial number field: 20 ASCII bytes, space padded.
+pub const SERIAL_LEN: usize = 20;
+
+/// Whether a space-padded Identify serial number equals `wanted`.
+///
+/// Both sides are trimmed of leading/trailing spaces and NULs; an empty
+/// `wanted` never matches (an unnamed disk must not be selected by accident).
+#[must_use]
+pub fn serial_matches(serial: &[u8], wanted: &str) -> bool {
+    let trim = |b: &[u8]| -> usize {
+        let start = b
+            .iter()
+            .position(|&c| c != b' ' && c != 0)
+            .unwrap_or(b.len());
+        let end = b
+            .iter()
+            .rposition(|&c| c != b' ' && c != 0)
+            .map_or(start, |i| i + 1);
+        end - start
+    };
+    let a = serial;
+    let w = wanted.as_bytes();
+    let (sa, sw) = (
+        a.iter()
+            .position(|&c| c != b' ' && c != 0)
+            .unwrap_or(a.len()),
+        w.iter()
+            .position(|&c| c != b' ' && c != 0)
+            .unwrap_or(w.len()),
+    );
+    let (la, lw) = (trim(a), trim(w));
+    lw != 0 && la == lw && a[sa..sa + la] == w[sw..sw + lw]
+}
 
 /// Whether an Identify Controller model number names an **emulated** device.
 ///
@@ -398,6 +433,7 @@ pub struct NvmeController<M: Mmio> {
     nsid: u32,
     namespace_blocks: u64,
     model: [u8; MODEL_LEN],
+    serial: [u8; SERIAL_LEN],
 }
 
 /// Spin until `condition` holds or the budget is exhausted.
@@ -475,6 +511,7 @@ impl<M: Mmio> NvmeController<M> {
             nsid,
             namespace_blocks: 0,
             model: [0; MODEL_LEN],
+            serial: [0; SERIAL_LEN],
         };
 
         // Program the admin queue pair: queue sizes are 0's-based in AQA, and
@@ -497,6 +534,8 @@ impl<M: Mmio> NvmeController<M> {
         let data = ctrl.staging.as_slice();
         ctrl.model
             .copy_from_slice(&data[IDENTIFY_MN_OFFSET..IDENTIFY_MN_OFFSET + MODEL_LEN]);
+        ctrl.serial
+            .copy_from_slice(&data[IDENTIFY_SN_OFFSET..IDENTIFY_SN_OFFSET + SERIAL_LEN]);
         let nn = u32::from_le_bytes(
             data[516..520]
                 .try_into()
@@ -557,6 +596,31 @@ impl<M: Mmio> NvmeController<M> {
     #[must_use]
     pub const fn model(&self) -> &[u8; MODEL_LEN] {
         &self.model
+    }
+
+    /// The controller's serial number (`SN`), 20 ASCII bytes, space padded.
+    #[must_use]
+    pub const fn serial(&self) -> &[u8; SERIAL_LEN] {
+        &self.serial
+    }
+
+    /// Whether this controller's serial number equals `wanted` (ignoring the
+    /// space padding the controller adds).
+    #[must_use]
+    pub fn serial_is(&self, wanted: &str) -> bool {
+        serial_matches(&self.serial, wanted)
+    }
+
+    /// Stop the controller (`CC.EN = 0`) and wait for it to report not-ready.
+    ///
+    /// Used on a controller that was opened only to read its identity and is
+    /// not going to be used: it must not be left running with queues in memory
+    /// that is about to be freed.
+    pub fn disable(&mut self) {
+        self.mmio.write32(REG_CC, 0);
+        let _ = poll_until(INIT_SPINS, "controller shutdown", || {
+            self.mmio.read32(REG_CSTS) & CSTS_RDY == 0
+        });
     }
 
     /// Whether this controller is an emulated device (see [`model_is_emulated`]).
@@ -865,6 +929,8 @@ mod tests {
                     if cdw10 == IDENTIFY_CNS_CONTROLLER {
                         buf[516..520].copy_from_slice(&1u32.to_le_bytes()); // NN = 1
                         buf[24..64].copy_from_slice(b"QEMU NVMe Ctrl                          "); // MN
+                        buf[4..24]
+                            .copy_from_slice(b"FAKESERIAL123         "[..20].try_into().unwrap()); // SN
                     } else {
                         buf[0..8].copy_from_slice(&FAKE_NS_BLOCKS.to_le_bytes()); // NSZE
                         buf[26] = 0; // FLBAS: format 0
@@ -1078,6 +1144,32 @@ mod tests {
         let ctl = init_fake();
         assert!(ctl.model().starts_with(b"QEMU NVMe Ctrl"));
         assert!(ctl.is_emulated());
+    }
+
+    #[test]
+    fn init_captures_the_serial_number() {
+        let ctl = init_fake();
+        assert_eq!(ctl.serial(), b"FAKESERIAL123       ");
+        assert!(ctl.serial_is("FAKESERIAL123"));
+        assert!(
+            ctl.serial_is("  FAKESERIAL123 "),
+            "padding is ignored on both sides"
+        );
+        assert!(!ctl.serial_is("FAKESERIAL12"), "a prefix is not a match");
+        assert!(!ctl.serial_is("fakeserial123"), "case matters");
+        assert!(!ctl.serial_is(""), "an empty name never matches");
+        assert!(!ctl.serial_is("   "), "nor does blank");
+    }
+
+    #[test]
+    fn serial_matching_handles_nuls_and_lengths() {
+        assert!(serial_matches(b"ABC\0\0\0", "ABC"));
+        assert!(serial_matches(b"  ABC  ", "ABC"));
+        assert!(!serial_matches(b"ABCD", "ABC"));
+        assert!(!serial_matches(b"ABC", "ABCD"));
+        assert!(!serial_matches(b"        ", "ABC"));
+        assert!(!serial_matches(b"", "ABC"));
+        assert!(!serial_matches(b"ABC", ""));
     }
 
     #[test]

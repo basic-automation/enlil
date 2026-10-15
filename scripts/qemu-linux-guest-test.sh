@@ -6,12 +6,19 @@
 # QEMU+OVMF with nested SVM, and waits for the guest's own console output —
 # relayed by the hypervisor as "[linux] ..." lines on serial.
 #
-# Exit codes: 0 the expected guest output appeared; 1 it did not; 2 SKIPPED
-# (no /dev/kvm, qemu, OVMF, or guest assets).
+# The guest also gets a virtual disk carved from a second (emulated) NVMe disk
+# by serial number, confined to an allow-list. After the guest exits, this
+# script checks the DISK IMAGE on the host: the writable range holds what the
+# guest wrote, and the read-only and denied sectors were never modified.
+#
+# Exit codes: 0 the expected guest output appeared and the disk checks held;
+# 1 it did not; 2 SKIPPED (no /dev/kvm, qemu, OVMF, or guest assets).
 #
 # Environment:
 #   ENLIL_LINUX_EXPECT  text that must appear in the guest console
 #                       (default: "ENLIL-GUEST-INIT-OK", i.e. init ran to the end)
+#   (the virtual-disk markers ENLIL-VDISK-OK and the host-side image checks are
+#   additionally required whenever the default expectation is used)
 #   ENLIL_GUEST_KERNEL  guest kernel (see build-test-guest.sh)
 #   ENLIL_QEMU, ENLIL_OVMF_CODE, ENLIL_OVMF_VARS   as scripts/qemu-boot-test.sh
 #   ENLIL_LINUX_TIMEOUT seconds to wait (default 240)
@@ -72,7 +79,7 @@ ESP="$OUTDIR/esp"
 rm -rf "$ESP"
 mkdir -p "$ESP/EFI/BOOT" "$ESP/EFI/enlil/linux"
 cp "$EFI" "$ESP/EFI/BOOT/BOOTX64.EFI"
-cp "$GUEST_DIR/vmlinuz" "$GUEST_DIR/initrd.img" "$GUEST_DIR/cmdline.txt" "$ESP/EFI/enlil/linux/"
+cp "$GUEST_DIR/vmlinuz" "$GUEST_DIR/initrd.img" "$GUEST_DIR/cmdline.txt" "$GUEST_DIR/disk.txt" "$ESP/EFI/enlil/linux/"
 
 SERIAL_LOG="$OUTDIR/serial.log"
 cp "$OVMF_VARS" "$OUTDIR/OVMF_VARS.fd"
@@ -84,6 +91,8 @@ echo "==> booting under QEMU+KVM (timeout ${TIMEOUT_SECS}s, waiting for: $EXPECT
     -drive "format=raw,file=fat:rw:$ESP" \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF" \
     -drive "if=pflash,format=raw,file=$OUTDIR/OVMF_VARS.fd" \
+    -drive "file=$GUEST_DIR/vdisk.img,if=none,id=vd0,format=raw,cache=writethrough" \
+    -device "nvme,drive=vd0,serial=enlilvdisk" \
     -serial "file:$SERIAL_LOG" -display none -no-reboot &
 QEMU_PID=$!
 
@@ -101,6 +110,42 @@ echo "---- guest console (lines relayed by the hypervisor) ----"
 grep -a "^\[linux\]" "$SERIAL_LOG" | cut -c1-200 | tail -60
 echo "---- hypervisor lines ----"
 grep -a "enlil kernel: linux:" "$SERIAL_LOG" | cut -c1-220 | tail -20
+# Virtual disk: the guest's own checks, then the host-side truth. The guest
+# can lie about what it wrote; the image cannot.
+if [ "$result" -eq 0 ] && [ "$EXPECT" = "ENLIL-GUEST-INIT-OK" ]; then
+    if ! grep -aq "ENLIL-VDISK-OK" "$SERIAL_LOG"; then
+        echo "FAIL: the guest's virtual-disk checks did not all pass"
+        grep -a "ENLIL-VDISK" "$SERIAL_LOG" | cut -c1-160
+        result=1
+    elif ! python3 - "$GUEST_DIR/vdisk.img" <<'PY'
+import sys
+img = open(sys.argv[1], "rb").read()
+def sector(n): return img[n * 512:(n + 1) * 512]
+ok = True
+def check(cond, what):
+    global ok
+    print(("host: ok   " if cond else "host: FAIL ") + what)
+    ok = ok and cond
+for i in range(16):  # the 16 sectors the guest wrote at 32..47
+    # the guest generated ref[k] = (k*7 + k/512 + 1) over its 16-sector buffer
+    want = bytes(((k * 7 + k // 512 + 1) & 0xFF) for k in range(i * 512, (i + 1) * 512))
+    if sector(32 + i) != want:
+        check(False, f"sector {32 + i} holds the guest's data")
+        break
+else:
+    check(True, "the 16 writable sectors hold exactly what the guest wrote")
+check(sector(0).startswith(b"ENLIL-VDISK-MAGIC"), "sector 0 (read-only) is unchanged")
+check(sector(8).startswith(b"RO-ORIGINAL") and not any(sector(8)[11:]), "read-only sector 8 was not modified")
+check(sector(64).startswith(b"DENIED-ORIGINAL") and not any(sector(64)[15:]), "denied sector 64 was not modified")
+check(not any(sector(48)) and not any(sector(100)), "sectors never assigned are still zero")
+sys.exit(0 if ok else 1)
+PY
+    then
+        echo "FAIL: the host-side disk image does not match what the policy allows"
+        result=1
+    fi
+fi
+
 # Transparency: the guest must believe it runs on real hardware. Linux logs
 # "Hypervisor detected" whenever CPUID or DMI says otherwise.
 if [ "$result" -eq 0 ] && grep -aq "Hypervisor detected" "$SERIAL_LOG"; then

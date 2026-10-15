@@ -21,8 +21,12 @@
 
 extern crate alloc;
 
+use crate::blockdev::BlockBackend;
+use crate::pci_dev::{PciFunction, pci_target};
 use crate::svm::{CpuidRegs, sanitize_cpuid};
 use crate::vdev::{PicPair, Pit8254};
+use crate::virtio_blk::VirtioBlk;
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use enlil_hal::bzimage::{BOOT_PARAMS_SIZE, parse_bzimage_header};
 
@@ -244,6 +248,10 @@ pub const fn gdt_bytes() -> [u8; 24] {
 // 16550 UART
 // ---------------------------------------------------------------------------
 
+/// PCI device number of the virtual disk on bus 0.
+pub const VIRTIO_BLK_SLOT: u8 = 3;
+/// The legacy PIC line the virtual disk interrupts on.
+pub const VIRTIO_BLK_IRQ: u8 = 10;
 /// Base I/O port of COM1.
 pub const COM1_BASE: u16 = 0x3F8;
 /// Last I/O port of COM1.
@@ -645,7 +653,6 @@ pub enum IoEvent {
 /// [`poll_devices`](Self::poll_devices), which also raises their interrupt lines
 /// on the PIC; the run loop then asks [`pending_vector`](Self::pending_vector) /
 /// [`ack`](Self::ack) what to inject.
-#[derive(Debug, Clone, Copy)]
 pub struct IoBus {
     /// COM1.
     pub uart: Uart16550,
@@ -653,6 +660,8 @@ pub struct IoBus {
     pub pic: PicPair,
     /// The system timer (channel 0 + the speaker gate port).
     pub pit: Pit8254,
+    /// The virtual disk on PCI bus 0, if the guest has one.
+    pub virtio: Option<VirtioBlk>,
     now: u64,
     cmos_index: u8,
     pci_addr: u32,
@@ -675,9 +684,27 @@ impl IoBus {
             uart: Uart16550::new(),
             pic: PicPair::new(),
             pit: Pit8254::new(tsc_hz),
+            virtio: None,
             now: 0,
             cmos_index: 0,
             pci_addr: 0,
+        }
+    }
+
+    /// Give the guest a virtual disk on PCI bus 0 (device [`VIRTIO_BLK_SLOT`],
+    /// interrupt line [`VIRTIO_BLK_IRQ`]).
+    pub fn attach_disk(&mut self, backend: Box<dyn BlockBackend>, read_only: bool) {
+        self.virtio = Some(VirtioBlk::new(backend, VIRTIO_BLK_IRQ, read_only));
+    }
+
+    /// The PCI function selected by the current `0xCF8` address, with the
+    /// register offset, if one exists there.
+    fn pci_function(&mut self) -> Option<(&mut PciFunction, usize)> {
+        let (bus, dev, func, reg) = pci_target(self.pci_addr)?;
+        if bus == 0 && dev == VIRTIO_BLK_SLOT && func == 0 {
+            self.virtio.as_mut().map(|v| (&mut v.pci, reg))
+        } else {
+            None
         }
     }
 
@@ -688,12 +715,14 @@ impl IoBus {
 
     /// Let time-driven devices run: fire the PIT's IRQ 0 if due and mirror the
     /// UART's interrupt output onto IRQ 4.
-    pub const fn poll_devices(&mut self) {
+    pub fn poll_devices(&mut self) {
         if self.pit.poll(self.now) {
             self.pic.set_irq(0, true);
             self.pic.set_irq(0, false);
         }
         self.pic.set_irq(4, self.uart.irq_line());
+        let disk_irq = self.virtio.as_ref().is_some_and(VirtioBlk::irq_line);
+        self.pic.set_irq(VIRTIO_BLK_IRQ, disk_irq);
     }
 
     /// The vector of the interrupt waiting to be delivered, if any.
@@ -742,8 +771,15 @@ impl IoBus {
             0x61 => u32::from(self.pit.read_port61(self.now)),
             0x71 => u32::from(Self::cmos(self.cmos_index)),
             0xCF8 => self.pci_addr,
-            // No PCI devices (config reads at 0xCFC..=0xCFF see an empty bus)
-            // and every other port: an absent device reads as all ones.
+            0xCFC..=0xCFF => {
+                let sub = usize::from(port - 0xCFC);
+                match self.pci_function() {
+                    Some((f, reg)) => f.read(reg + sub, size),
+                    // No device there: an empty slot reads as all ones.
+                    None => u32::MAX,
+                }
+            }
+            // Every other port: an absent device reads as all ones.
             _ => u32::MAX,
         };
         mask(v, size)
@@ -764,6 +800,12 @@ impl IoBus {
             0x61 => self.pit.write_port61((val & 0xFF) as u8),
             0x70 => self.cmos_index = (val & 0xFF) as u8,
             0xCF8 => self.pci_addr = val,
+            0xCFC..=0xCFF => {
+                let sub = usize::from(port - 0xCFC);
+                if let Some((f, reg)) = self.pci_function() {
+                    f.write(reg + sub, size, val);
+                }
+            }
             // Keyboard-controller reset pulse.
             0x64 if val & 0xFF == 0xFE => return IoEvent::Reset,
             // Reset control register: bit 2 triggers a reset.
@@ -839,11 +881,16 @@ mod hw {
         MSR_PASSTHROUGH, MmioBus, MsrRead, MsrState, MsrWrite, PT_BYTES, PT_GPA, STACK_GPA,
         cpuid_policy, e820_map, gdt_bytes, plan_layout,
     };
+    use crate::blockdev::{BlockBackend, BlockError, DiskConfig, DiskMap, SECTOR};
     use crate::handoff::{BootHandoff, StagedFile};
     use crate::insn::{AccessKind, decode_mem_access, extend, mask_to, merge_reg, translate_gva};
+    use crate::mmio::PhysMmio;
+    use crate::nvme::NvmeController;
     use crate::serial::SerialPort;
     use crate::svm::{GuestGprs, host_cpuid, vmrun};
+    use crate::virtio_blk::GuestMemory;
     use alloc::alloc::{Layout as AllocLayout, alloc_zeroed};
+    use alloc::boxed::Box;
     use alloc::collections::BTreeSet;
     use alloc::format;
     use alloc::string::String;
@@ -864,7 +911,7 @@ mod hw {
 
     /// Command line used when the ESP has no `cmdline.txt`.
     const DEFAULT_CMDLINE: &str = "console=ttyS0,115200 earlycon=uart8250,io,0x3f8 \
-         rdinit=/init acpi=off noapic nolapic nokaslr panic=-1 loglevel=7";
+         rdinit=/init acpi=off noapic nolapic pci=conf1 nokaslr panic=-1 loglevel=7";
     /// The host LAPIC-timer vector used to force a `#VMEXIT` when a device
     /// event (a PIT tick) is due while the guest is running.
     const TIMER_VECTOR: u8 = 0x40;
@@ -943,15 +990,48 @@ mod hw {
     /// compiler's back, so reads must not be cached or reordered.
     #[derive(Clone, Copy)]
     struct GuestMem {
-        base: *const u8,
+        base: *mut u8,
         len: usize,
+    }
+
+    impl GuestMem {
+        /// The in-bounds start index of `len` bytes at guest-physical `gpa`.
+        fn span(self, gpa: u64, len: usize) -> Option<usize> {
+            let start = usize::try_from(gpa).ok()?;
+            (start.checked_add(len)? <= self.len).then_some(start)
+        }
+    }
+
+    /// DMA access for the virtual devices. The guest is stopped (this runs on
+    /// the host between `VMRUN`s on a single CPU), so plain copies are sound.
+    impl GuestMemory for GuestMem {
+        fn read(&self, gpa: u64, buf: &mut [u8]) -> bool {
+            let Some(i) = self.span(gpa, buf.len()) else {
+                return false;
+            };
+            // SAFETY: `span` proved `[i, i + len)` lies inside the live,
+            // leaked guest-RAM window; `buf` is a disjoint host buffer.
+            unsafe {
+                core::ptr::copy_nonoverlapping(self.base.add(i), buf.as_mut_ptr(), buf.len());
+            }
+            true
+        }
+
+        fn write(&self, gpa: u64, data: &[u8]) -> bool {
+            let Some(i) = self.span(gpa, data.len()) else {
+                return false;
+            };
+            // SAFETY: as in `read`; `base` was derived from the mutable window.
+            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), self.base.add(i), data.len()) };
+            true
+        }
     }
 
     impl GuestMem {
         fn read_u8(self, gpa: u64) -> Option<u8> {
             let i = usize::try_from(gpa).ok().filter(|&i| i < self.len)?;
             // SAFETY: `i` is in bounds of the live, leaked guest-RAM window.
-            Some(unsafe { self.base.add(i).read_volatile() })
+            Some(unsafe { self.base.add(i).cast_const().read_volatile() })
         }
 
         fn read_u64(self, gpa: u64) -> Option<u64> {
@@ -1039,6 +1119,7 @@ mod hw {
         vmcb: &mut [u8],
         gprs: &mut GuestGprs,
         bus: &mut MmioBus,
+        io: &mut IoBus,
         gpa: u64,
     ) -> Result<(), Stop> {
         let rip = guest_rip(vmcb);
@@ -1051,7 +1132,13 @@ mod hw {
             return Err(Stop::MmioDecode(gpa));
         };
         let size = access.size;
-        let first = bus.note(gpa);
+        // Is the address inside the virtual disk's BAR (a real device)?
+        let disk_offset = io
+            .virtio
+            .as_ref()
+            .and_then(|v| v.pci.bar0())
+            .and_then(|(base, len)| gpa.checked_sub(base).filter(|&o| o < len));
+        let first = disk_offset.is_none() && bus.note(gpa);
         match access.kind {
             AccessKind::Load {
                 reg,
@@ -1059,7 +1146,11 @@ mod hw {
                 sign_extend,
                 dest_size,
             } => {
-                let value = extend(bus.read(gpa, size), size, dest_size, sign_extend);
+                let raw = match (disk_offset, io.virtio.as_mut()) {
+                    (Some(off), Some(disk)) => disk.mmio_read(off, size),
+                    _ => bus.read(gpa, size),
+                };
+                let value = extend(raw, size, dest_size, sign_extend);
                 let (target, hi) = if high8 { (reg - 4, true) } else { (reg, false) };
                 let merged = merge_reg(get_reg(vmcb, gprs, target), value, dest_size, hi);
                 set_reg(vmcb, gprs, target, merged);
@@ -1072,25 +1163,202 @@ mod hw {
             AccessKind::Store { reg, high8 } => {
                 let (source, shift) = if high8 { (reg - 4, 8) } else { (reg, 0) };
                 let value = mask_to(get_reg(vmcb, gprs, source) >> shift, size);
-                bus.write(gpa, size, value);
-                if first {
-                    serial.write_str(&format!(
-                        "enlil kernel: linux: MMIO write {size}B at {gpa:#x} = {value:#x} (ignored) from RIP {rip:#x}\n"
-                    ));
-                }
+                mmio_store(
+                    serial,
+                    mem,
+                    bus,
+                    io,
+                    disk_offset,
+                    gpa,
+                    size,
+                    value,
+                    rip,
+                    first,
+                );
             }
             AccessKind::StoreImm { value } => {
                 let value = mask_to(value, size);
-                bus.write(gpa, size, value);
-                if first {
-                    serial.write_str(&format!(
-                        "enlil kernel: linux: MMIO write {size}B at {gpa:#x} = {value:#x} (ignored) from RIP {rip:#x}\n"
-                    ));
-                }
+                mmio_store(
+                    serial,
+                    mem,
+                    bus,
+                    io,
+                    disk_offset,
+                    gpa,
+                    size,
+                    value,
+                    rip,
+                    first,
+                );
             }
         }
         set_guest_rip(vmcb, rip.wrapping_add(access.len as u64));
         Ok(())
+    }
+
+    /// Perform an MMIO store: to the virtual disk if `disk_offset` is set (a
+    /// doorbell write runs the queue against guest memory), else to the
+    /// absent-device bus.
+    #[allow(clippy::too_many_arguments)]
+    fn mmio_store(
+        serial: &SerialPort,
+        mem: GuestMem,
+        bus: &mut MmioBus,
+        io: &mut IoBus,
+        disk_offset: Option<u64>,
+        gpa: u64,
+        size: u8,
+        value: u64,
+        rip: u64,
+        first: bool,
+    ) {
+        if let (Some(off), Some(disk)) = (disk_offset, io.virtio.as_mut()) {
+            disk.mmio_write(off, size, value, &mem);
+        } else {
+            bus.write(gpa, size, value);
+            if first {
+                serial.write_str(&format!(
+                    "enlil kernel: linux: MMIO write {size}B at {gpa:#x} = {value:#x} (ignored) from RIP {rip:#x}\n"
+                ));
+            }
+        }
+    }
+
+    /// The host `NVMe` namespace backing a guest's virtual disk, in chunks the
+    /// driver's staging buffer can carry.
+    struct NvmeBackend {
+        ctl: NvmeController<PhysMmio>,
+    }
+
+    /// Bytes moved per `NVMe` command.
+    const NVME_CHUNK: usize = 256 * 1024;
+
+    impl BlockBackend for NvmeBackend {
+        fn sectors(&self) -> u64 {
+            self.ctl.namespace_blocks()
+        }
+
+        fn read(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+            if !buf.len().is_multiple_of(SECTOR) {
+                return Err(BlockError::Unaligned);
+            }
+            let mut cur = lba;
+            for chunk in buf.chunks_mut(NVME_CHUNK) {
+                self.ctl
+                    .read_blocks(cur, chunk)
+                    .map_err(|_| BlockError::Io)?;
+                cur += (chunk.len() / SECTOR) as u64;
+            }
+            Ok(())
+        }
+
+        fn write(&mut self, lba: u64, data: &[u8]) -> Result<(), BlockError> {
+            if !data.len().is_multiple_of(SECTOR) {
+                return Err(BlockError::Unaligned);
+            }
+            let mut cur = lba;
+            for chunk in data.chunks(NVME_CHUNK) {
+                self.ctl
+                    .write_blocks(cur, chunk)
+                    .map_err(|_| BlockError::Io)?;
+                cur += (chunk.len() / SECTOR) as u64;
+            }
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<(), BlockError> {
+            self.ctl.flush().map_err(|_| BlockError::Io)
+        }
+    }
+
+    /// Find the host `NVMe` disk whose serial number is `wanted`.
+    ///
+    /// Controllers are matched by *serial number*, never by position: handing a
+    /// guest the first disk the scan happens to find could expose the machine's
+    /// own system disk. Each candidate is reset and queried (no writes); those
+    /// that do not match are shut down again.
+    fn open_disk(serial: &SerialPort, wanted: &str) -> Option<NvmeBackend> {
+        let (count, controllers) = crate::pci::find_storage_controllers();
+        for c in controllers.iter().take(count) {
+            if !c.is_nvme || c.bar0_base == 0 {
+                continue;
+            }
+            crate::pci::enable_mem_bus_master(c.bus, c.device, c.function);
+            // SAFETY: runs on the kernel's own page tables, single CPU.
+            if !unsafe { crate::paging::map_mmio_range(c.bar0_base, 0x4000) } {
+                continue;
+            }
+            match NvmeController::init(PhysMmio::new(c.bar0_base), 1) {
+                Ok(mut ctl) => {
+                    let matched = ctl.serial_is(wanted);
+                    serial.write_str(&format!(
+                        "enlil kernel: linux: disk: NVMe at {}:{}.{}, {} - {}\n",
+                        c.bus,
+                        c.device,
+                        c.function,
+                        core::str::from_utf8(ctl.model()).unwrap_or("?").trim(),
+                        if matched {
+                            "selected"
+                        } else {
+                            "not assigned, shut down"
+                        }
+                    ));
+                    if matched {
+                        return Some(NvmeBackend { ctl });
+                    }
+                    ctl.disable();
+                }
+                Err(e) => serial.write_str(&format!(
+                    "enlil kernel: linux: disk: NVMe at {}:{}.{} did not initialize: {e}\n",
+                    c.bus, c.device, c.function
+                )),
+            }
+        }
+        None
+    }
+
+    /// Attach the guest's virtual disk if the ESP assigned one: parse
+    /// `disk.txt`, find the named host disk and wrap it in the allow-list.
+    fn attach_disk(serial: &SerialPort, file: StagedFile, io: &mut IoBus) {
+        // SAFETY: the extent comes from the UEFI stage's handoff.
+        let bytes = unsafe { staged(file) };
+        if bytes.is_empty() {
+            serial.write_str(
+                "enlil kernel: linux: no disk assignment (disk.txt) - the guest gets no disk\n",
+            );
+            return;
+        }
+        let cfg = match core::str::from_utf8(bytes)
+            .map_err(|_| String::from("not UTF-8"))
+            .and_then(|t| DiskConfig::parse(t).map_err(|e| format!("{e:?}")))
+        {
+            Ok(c) => c,
+            Err(e) => {
+                serial.write_str(&format!(
+                    "enlil kernel: linux: bad disk.txt ({e}) - no disk\n"
+                ));
+                return;
+            }
+        };
+        let Some(backend) = open_disk(serial, &cfg.serial) else {
+            serial.write_str(
+                "enlil kernel: linux: no NVMe disk matches the assigned serial - no disk\n",
+            );
+            return;
+        };
+        let sectors = backend.sectors();
+        let ranges = cfg.clamped(sectors);
+        let read_only = ranges.iter().all(|r| !r.writable);
+        serial.write_str(&format!(
+            "enlil kernel: linux: virtual disk: {sectors} sectors, {} allowed range(s), {}\n",
+            ranges.len(),
+            if read_only {
+                "read-only"
+            } else {
+                "partly writable"
+            }
+        ));
+        io.attach_disk(Box::new(DiskMap::new(backend, ranges)), read_only);
     }
 
     /// Clear both bits of every passthrough MSR in a fully-armed MSRPM.
@@ -1304,9 +1572,12 @@ mod hw {
         };
         let deadline = t0.saturating_add(tsc_hz.max(1).saturating_mul(RUN_SECONDS));
         let mem = GuestMem {
-            base: core::ptr::with_exposed_provenance::<u8>(ram_spa as usize),
+            base: core::ptr::with_exposed_provenance_mut::<u8>(ram_spa as usize),
             len: GUEST_RAM_BYTES as usize,
         };
+        // The guest's I/O bus, with its virtual disk if the ESP assigned one.
+        let mut io = IoBus::new(tsc_hz.max(1));
+        attach_disk(serial, payload.disk, &mut io);
         let (stop, counts) = run(
             serial,
             vmcb_pa,
@@ -1314,7 +1585,7 @@ mod hw {
             &mut gprs,
             deadline,
             mem,
-            tsc_hz.max(1),
+            io,
         );
         report(serial, vmcb_pa, stop, &counts);
     }
@@ -1371,9 +1642,8 @@ mod hw {
         gprs: &mut GuestGprs,
         deadline: u64,
         mem: GuestMem,
-        tsc_hz: u64,
+        mut bus: IoBus,
     ) -> (Stop, Counts) {
-        let mut bus = IoBus::new(tsc_hz);
         let mut mmio = MmioBus::new();
         // The host timer deadline currently armed (avoids re-arming on every exit).
         let mut armed: Option<u64> = None;
@@ -1553,7 +1823,9 @@ mod hw {
                         break Stop::Npf(gpa);
                     }
                     counts.mmio += 1;
-                    if let Err(stop) = emulate_mmio(serial, mem, vmcb, gprs, &mut mmio, gpa) {
+                    if let Err(stop) =
+                        emulate_mmio(serial, mem, vmcb, gprs, &mut mmio, &mut bus, gpa)
+                    {
                         break stop;
                     }
                 }
@@ -2125,6 +2397,81 @@ mod tests {
         bus.write(0x3F8, 1, u32::from(b'x'), &mut tx_to(&mut out));
         bus.poll_devices();
         assert_eq!(bus.pending_vector(), Some(0x24));
+    }
+
+    /// Read a PCI config register through the legacy CF8/CFC mechanism.
+    fn cfg_read(bus: &mut IoBus, dev: u8, func: u8, reg: u8, size: u8) -> u32 {
+        let mut out = Vec::new();
+        let addr =
+            0x8000_0000 | (u32::from(dev) << 11) | (u32::from(func) << 8) | u32::from(reg & 0xFC);
+        bus.write(0xCF8, 4, addr, &mut tx_to(&mut out));
+        bus.read(0xCFC + u16::from(reg & 3), size)
+    }
+
+    fn cfg_write(bus: &mut IoBus, dev: u8, reg: u8, size: u8, val: u32) {
+        let mut out = Vec::new();
+        let addr = 0x8000_0000 | (u32::from(dev) << 11) | u32::from(reg & 0xFC);
+        bus.write(0xCF8, 4, addr, &mut tx_to(&mut out));
+        bus.write(0xCFC + u16::from(reg & 3), size, val, &mut tx_to(&mut out));
+    }
+
+    #[test]
+    fn pci_bus_is_empty_until_a_disk_is_attached() {
+        let mut bus = IoBus::new(TEST_HZ);
+        assert_eq!(cfg_read(&mut bus, VIRTIO_BLK_SLOT, 0, 0, 4), u32::MAX);
+        bus.attach_disk(Box::new(crate::blockdev::RamDisk::new(8)), false);
+        assert_eq!(cfg_read(&mut bus, VIRTIO_BLK_SLOT, 0, 0, 4), 0x1042_1AF4);
+    }
+
+    #[test]
+    fn the_disk_enumerates_like_real_pci_hardware() {
+        let mut bus = IoBus::new(TEST_HZ);
+        bus.attach_disk(Box::new(crate::blockdev::RamDisk::new(8)), false);
+        let slot = VIRTIO_BLK_SLOT;
+        // Other slots and functions stay empty.
+        assert_eq!(cfg_read(&mut bus, 0, 0, 0, 4), u32::MAX);
+        assert_eq!(cfg_read(&mut bus, slot + 1, 0, 0, 4), u32::MAX);
+        assert_eq!(
+            cfg_read(&mut bus, slot, 1, 0, 4),
+            u32::MAX,
+            "single-function device"
+        );
+        // Identity, with byte and word accesses through the data port window.
+        assert_eq!(cfg_read(&mut bus, slot, 0, 0, 2), 0x1AF4);
+        assert_eq!(cfg_read(&mut bus, slot, 0, 2, 2), 0x1042);
+        assert_eq!(
+            cfg_read(&mut bus, slot, 0, 0x0B, 1),
+            0x01,
+            "mass storage class"
+        );
+        assert_eq!(
+            cfg_read(&mut bus, slot, 0, 0x3C, 1),
+            u32::from(VIRTIO_BLK_IRQ)
+        );
+        // The standard BAR sizing probe sees a 16 KiB 64-bit memory BAR.
+        cfg_write(&mut bus, slot, 0x10, 4, 0xFFFF_FFFF);
+        cfg_write(&mut bus, slot, 0x14, 4, 0xFFFF_FFFF);
+        let lo = cfg_read(&mut bus, slot, 0, 0x10, 4);
+        assert_eq!(lo & 0xF, 0x4);
+        assert_eq!(
+            lo & !0xF,
+            0xFFFF_C000,
+            "16 KiB: low 14 bits are not address bits"
+        );
+        // Program it and enable memory decoding + bus mastering.
+        cfg_write(&mut bus, slot, 0x10, 4, 0x1000_0000);
+        cfg_write(&mut bus, slot, 0x14, 4, 0);
+        assert_eq!(
+            bus.virtio.as_ref().unwrap().pci.bar0(),
+            None,
+            "not decoding yet"
+        );
+        cfg_write(&mut bus, slot, 0x04, 2, 0x0006);
+        assert_eq!(
+            bus.virtio.as_ref().unwrap().pci.bar0(),
+            Some((0x1000_0000, 0x4000))
+        );
+        assert!(bus.virtio.as_ref().unwrap().pci.bus_master());
     }
 
     #[test]
