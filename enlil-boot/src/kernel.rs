@@ -484,6 +484,17 @@ mod hw {
     pub fn kernel_entry(handoff: &BootHandoff) -> ! {
         let serial = SerialPort::com1();
         serial.write_str("enlil kernel: entered via BootHandoff\n");
+        // Mirror the log onto the GOP framebuffer from here on, so a boot on a
+        // machine without a serial port still shows progress, hangs and faults.
+        if let Some(fb) = &handoff.framebuffer {
+            // SAFETY: `fb` is the live GOP linear framebuffer the UEFI stage
+            // handed across ExitBootServices; it is mapped on the firmware's
+            // tables now and on the kernel's own (framebuffer-covering) tables
+            // after the CR3 switch.
+            if unsafe { crate::logmirror::init(fb) } {
+                serial.write_str("enlil kernel: screen: log mirrored to the GOP framebuffer\n");
+            }
+        }
         report_esp_payload(&serial, handoff);
 
         let mut highest_usable_end = 0u64;
@@ -3296,6 +3307,15 @@ mod hw {
     /// Draw the boot indicator on the GOP framebuffer (if the firmware handed
     /// one over) and self-test that the kernel can drive it.
     fn bring_up_framebuffer(serial: &SerialPort, handoff: &BootHandoff) {
+        // The self-tests below paint over the whole screen; hold the log
+        // mirror off while they run, then replay the log on top.
+        crate::logmirror::pause();
+        bring_up_framebuffer_demos(serial, handoff);
+        crate::logmirror::resume();
+    }
+
+    /// The framebuffer draw + console self-tests (they overwrite the screen).
+    fn bring_up_framebuffer_demos(serial: &SerialPort, handoff: &BootHandoff) {
         match &handoff.framebuffer {
             Some(fb) if crate::framebuffer::draw_and_selftest(fb) => {
                 serial.write_str("enlil kernel: gop: framebuffer draw ok\n");
