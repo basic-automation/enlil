@@ -377,7 +377,7 @@ pub const MODEL_LEN: usize = 40;
 /// The kernel's destructive block write/read self-test is allowed only on such
 /// controllers: it overwrites one sector, which on a real disk is real data
 /// (the last sector of a GPT disk holds the backup partition table). QEMU's
-/// NVMe model is `QEMU NVMe Ctrl`; anything else is treated as hardware.
+/// `NVMe` model is `QEMU NVMe Ctrl`; anything else is treated as hardware.
 #[must_use]
 pub fn model_is_emulated(model: &[u8]) -> bool {
     let start = model.iter().position(|&b| b != b' ').unwrap_or(model.len());
