@@ -25,6 +25,7 @@ pub mod acpi;
 pub mod ahci;
 pub mod allocator;
 pub mod apic;
+pub mod blockdev;
 pub mod esp;
 pub mod firmware;
 pub mod framebuffer;
@@ -41,6 +42,7 @@ pub mod net;
 pub mod nvme;
 pub mod paging;
 pub mod pci;
+pub mod pci_dev;
 pub mod percpu;
 pub mod serial;
 pub mod service_vm;
@@ -49,6 +51,7 @@ pub mod stack;
 pub mod svm;
 pub mod tsc;
 pub mod vdev;
+pub mod virtio_blk;
 pub mod xhci;
 
 /// Console/serial banner the payload emits once it has taken control.

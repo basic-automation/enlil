@@ -38,6 +38,8 @@ pub const MAX_LINUX_KERNEL_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_LINUX_INITRD_BYTES: u64 = 512 * 1024 * 1024;
 /// Largest Linux guest command line the boot app will stage (4 KiB).
 pub const MAX_LINUX_CMDLINE_BYTES: u64 = 4096;
+/// Largest Linux guest disk-assignment file the boot app will stage (16 KiB).
+pub const MAX_LINUX_DISK_BYTES: u64 = 16 * 1024;
 
 /// Calls `f` once per distinct `[guest.<id>]` table header in `config`.
 ///
@@ -142,8 +144,8 @@ pub use hw::{EspPayload, load_esp_payload};
 #[cfg(target_os = "uefi")]
 mod hw {
     use super::{
-        MAX_CONFIG_BYTES, MAX_FIRMWARE_BYTES, MAX_LINUX_CMDLINE_BYTES, MAX_LINUX_INITRD_BYTES,
-        MAX_LINUX_KERNEL_BYTES, for_each_guest_id, uefi_path_codes,
+        MAX_CONFIG_BYTES, MAX_FIRMWARE_BYTES, MAX_LINUX_CMDLINE_BYTES, MAX_LINUX_DISK_BYTES,
+        MAX_LINUX_INITRD_BYTES, MAX_LINUX_KERNEL_BYTES, for_each_guest_id, uefi_path_codes,
     };
     use crate::firmware::{self, FirmwareFile};
     use crate::handoff::{GuestFirmware, LinuxPayload, MAX_BOOT_GUESTS, StagedFile};
@@ -388,6 +390,7 @@ mod hw {
                 firmware::LINUX_CMDLINE_PATH,
                 MAX_LINUX_CMDLINE_BYTES,
             ),
+            disk: stage_optional(loader, firmware::LINUX_DISK_PATH, MAX_LINUX_DISK_BYTES),
         }
     }
 

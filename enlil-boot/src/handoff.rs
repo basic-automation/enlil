@@ -185,6 +185,9 @@ pub struct LinuxPayload {
     pub initrd: StagedFile,
     /// The kernel command line (`cmdline.txt`, no trailing NUL), if any.
     pub cmdline: StagedFile,
+    /// The virtual-disk assignment (`disk.txt`: which host disk, which sector
+    /// ranges), if any. Without it the guest gets no disk.
+    pub disk: StagedFile,
 }
 
 impl LinuxPayload {
@@ -193,6 +196,7 @@ impl LinuxPayload {
         kernel: StagedFile::EMPTY,
         initrd: StagedFile::EMPTY,
         cmdline: StagedFile::EMPTY,
+        disk: StagedFile::EMPTY,
     };
 
     /// Whether a bootable kernel image was staged.
