@@ -938,6 +938,12 @@ pub const fn msr_exit_is_write(exit_info_1: u64) -> bool {
 // Appendix B) so it stays host-testable — the privileged `VMRUN`/`VMSAVE`/
 // `VMLOAD` ops layer on top and are the only non-testable part.
 
+/// Ask the next `VMRUN` to flush the guest's TLB, after the host changed the
+/// guest's nested page tables (a stale translation would keep the old mapping).
+pub const fn request_tlb_flush(region: &mut [u8]) {
+    put_u8(region, control::TLB_CONTROL, TLB_CONTROL_FLUSH_ALL);
+}
+
 /// `TLB_CONTROL` value 1: flush the guest's entire TLB on the next `VMRUN`
 /// (APM §15.16.1). Used on a guest's first entry / after an ASID reuse.
 pub const TLB_CONTROL_FLUSH_ALL: u8 = 1;

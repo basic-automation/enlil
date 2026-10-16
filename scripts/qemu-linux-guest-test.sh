@@ -7,7 +7,9 @@
 # relayed by the hypervisor as "[linux] ..." lines on serial.
 #
 # The guest also gets a virtual disk carved from a second (emulated) NVMe disk
-# by serial number, confined to an allow-list. After the guest exits, this
+# by serial number, confined to an allow-list. That disk sits behind a PCIe root
+# port (bus 1), like the NVMe drive on real hardware does, so finding it needs a
+# scan beyond PCI bus 0. After the guest exits, this
 # script checks the DISK IMAGE on the host: the writable range holds what the
 # guest wrote, and the read-only and denied sectors were never modified.
 #
@@ -92,7 +94,8 @@ echo "==> booting under QEMU+KVM (timeout ${TIMEOUT_SECS}s, waiting for: $EXPECT
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF" \
     -drive "if=pflash,format=raw,file=$OUTDIR/OVMF_VARS.fd" \
     -drive "file=$GUEST_DIR/vdisk.img,if=none,id=vd0,format=raw,cache=writethrough" \
-    -device "nvme,drive=vd0,serial=enlilvdisk" \
+    -device "pcie-root-port,id=rp1,chassis=1,slot=1" \
+    -device "nvme,drive=vd0,serial=enlilvdisk,bus=rp1" \
     -serial "file:$SERIAL_LOG" -display none -no-reboot &
 QEMU_PID=$!
 

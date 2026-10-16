@@ -231,22 +231,8 @@ mod hw {
 
     /// Read `CPUID.1:ECX`.
     fn cpuid_1_ecx() -> u32 {
-        let ecx: u32;
-        // SAFETY: CPUID leaf 1 is universally available; preserves no state
-        // we depend on beyond the clobbered GPRs.
-        unsafe {
-            core::arch::asm!(
-                "push rbx",           // CPUID clobbers RBX (LLVM-reserved)
-                "mov eax, 1",
-                "cpuid",
-                "pop rbx",
-                out("ecx") ecx,
-                out("eax") _,
-                out("edx") _,
-                options(nostack, preserves_flags),
-            );
-        }
-        ecx
+        // CPUID leaf 1 is universally available.
+        core::arch::x86_64::__cpuid(1).ecx
     }
 
     /// Enable the local APIC in x2APIC mode and return the local APIC ID, or

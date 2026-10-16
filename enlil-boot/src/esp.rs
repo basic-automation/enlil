@@ -67,6 +67,72 @@ pub fn for_each_guest_id(config: &[u8], f: &mut dyn FnMut(&str)) {
     }
 }
 
+/// The value of `key` directly inside the `[guest.<id>]` table (not a sub-table
+/// such as `[guest.<id>.firmware]`), with comments and surrounding whitespace
+/// stripped, or `None` if the table or key is absent.
+///
+/// Like the id scan this is a structural subset of TOML, enough for the few
+/// keys the boot stage needs. The first occurrence of a key wins.
+#[must_use]
+pub fn guest_value<'a>(config: &'a [u8], id: &str, key: &str) -> Option<&'a [u8]> {
+    let mut in_guest = false;
+    for line in config.split(|&b| b == b'\n') {
+        let code = line
+            .iter()
+            .position(|&b| b == b'#')
+            .map_or(line, |i| &line[..i]);
+        let code = trim_ascii(code);
+        if code.first() == Some(&b'[') {
+            in_guest = guest_header_id(line) == Some(id);
+            continue;
+        }
+        if !in_guest {
+            continue;
+        }
+        if let Some(eq) = code.iter().position(|&b| b == b'=')
+            && trim_ascii(&code[..eq]) == key.as_bytes()
+        {
+            return Some(trim_ascii(&code[eq + 1..]));
+        }
+    }
+    None
+}
+
+/// Whether `[guest.<id>]` says `boot = "firmware"`: the guest runs its own
+/// firmware (OVMF) instead of being loaded by the Linux boot protocol.
+#[must_use]
+pub fn guest_boots_firmware(config: &[u8], id: &str) -> bool {
+    guest_value(config, id, "boot") == Some(b"\"firmware\"")
+}
+
+/// `run_seconds = N` in `[guest.<id>]`: how long the guest may run before the
+/// hypervisor stops it. `0` means no limit. `None` if absent or not a number.
+#[must_use]
+pub fn guest_run_seconds(config: &[u8], id: &str) -> Option<u64> {
+    core::str::from_utf8(guest_value(config, id, "run_seconds")?)
+        .ok()?
+        .parse()
+        .ok()
+}
+
+/// Smallest guest RAM the firmware path accepts (MiB).
+pub const MIN_GUEST_MEMORY_MB: u64 = 64;
+/// Largest guest RAM the firmware path accepts (MiB): the guest's PCI memory
+/// window begins at 2 GiB, so RAM must end there. More needs a split map.
+pub const MAX_GUEST_MEMORY_MB: u64 = 2048;
+
+/// `memory_mb = N` in `[guest.<id>]`: the guest's RAM in bytes, clamped to
+/// [`MIN_GUEST_MEMORY_MB`]..=[`MAX_GUEST_MEMORY_MB`] and rounded down to a whole
+/// number of 2 MiB pages. `None` if absent or not a number.
+#[must_use]
+pub fn guest_memory_bytes(config: &[u8], id: &str) -> Option<u64> {
+    let mb: u64 = core::str::from_utf8(guest_value(config, id, "memory_mb")?)
+        .ok()?
+        .parse()
+        .ok()?;
+    Some((mb.clamp(MIN_GUEST_MEMORY_MB, MAX_GUEST_MEMORY_MB) / 2 * 2) << 20)
+}
+
 /// Whether `id` is already recorded in the NUL-padded `seen` slots.
 fn is_duplicate(id: &str, seen: &[([u8; 33], bool)]) -> bool {
     seen.iter().any(|(slot, used)| {
@@ -368,6 +434,7 @@ mod hw {
             let id = core::str::from_utf8(&id_bytes[..id_len]).unwrap_or("?");
             load_guest_file(&mut loader, entry, id, FirmwareFile::Code);
             load_guest_file(&mut loader, entry, id, FirmwareFile::Vars);
+            load_guest_file(&mut loader, entry, id, FirmwareFile::Disk);
         }
 
         // 3. An optional Linux guest: kernel, initrd, command line.
@@ -466,8 +533,16 @@ mod hw {
                         entry.vars_base = loaded.base;
                         entry.vars_len = loaded.len;
                     }
+                    FirmwareFile::Disk => {
+                        entry.disk = StagedFile {
+                            base: loaded.base,
+                            len: loaded.len,
+                        };
+                    }
                 }
             }
+            // The disk assignment is optional; only the firmware images are expected.
+            Err(EspError::NotFound) if file == FirmwareFile::Disk => {}
             Err(EspError::NotFound) => {
                 log::warn!("esp: guest '{id}': {} missing on the ESP", file.file_name());
             }
@@ -500,6 +575,67 @@ mod tests {
         let mut ids = Vec::new();
         for_each_guest_id(config, &mut |id: &str| ids.push(id.to_string()));
         ids
+    }
+
+    #[test]
+    fn firmware_boot_needs_the_key_in_the_guests_own_table() {
+        let config = b"[guest.a]\nboot = \"firmware\"\n[guest.b]\ncpus = 2\n\
+            [guest.c.firmware]\nboot = \"firmware\"\n[guest.d] # x\n  boot=\"firmware\" # y\n\
+            [guest.e]\nboot = \"linux\"\n";
+        assert!(guest_boots_firmware(config, "a"));
+        assert!(!guest_boots_firmware(config, "b"));
+        assert!(!guest_boots_firmware(config, "c"));
+        assert!(guest_boots_firmware(config, "d"));
+        assert!(!guest_boots_firmware(config, "e"));
+        assert!(!guest_boots_firmware(config, "missing"));
+        assert!(!guest_boots_firmware(b"", "a"));
+    }
+
+    #[test]
+    fn a_guest_may_set_how_long_it_runs() {
+        let config =
+            b"[guest.a]\nrun_seconds = 900 # fifteen minutes\n[guest.b]\nrun_seconds = 0\n\
+            [guest.c]\nrun_seconds = \"soon\"\n[guest.d]\ncpus = 2\n[other]\nrun_seconds = 5\n";
+        assert_eq!(guest_run_seconds(config, "a"), Some(900));
+        assert_eq!(guest_run_seconds(config, "b"), Some(0), "0 means unlimited");
+        assert_eq!(guest_run_seconds(config, "c"), None, "not a number");
+        assert_eq!(guest_run_seconds(config, "d"), None, "absent");
+        assert_eq!(
+            guest_run_seconds(config, "other"),
+            None,
+            "not a guest table"
+        );
+        assert_eq!(guest_run_seconds(config, "missing"), None);
+    }
+
+    #[test]
+    fn a_guests_ram_is_clamped_and_page_aligned() {
+        let config = b"[guest.a]\nmemory_mb = 1024\n[guest.b]\nmemory_mb = 99999\n\
+            [guest.c]\nmemory_mb = 1\n[guest.d]\nmemory_mb = 513\n[guest.e]\nmemory_mb = lots\n\
+            [guest.f]\ncpus = 2\n";
+        assert_eq!(guest_memory_bytes(config, "a"), Some(1024 << 20));
+        assert_eq!(guest_memory_bytes(config, "b"), Some(2048 << 20), "capped");
+        assert_eq!(guest_memory_bytes(config, "c"), Some(64 << 20), "floored");
+        assert_eq!(
+            guest_memory_bytes(config, "d"),
+            Some(512 << 20),
+            "whole 2 MiB pages"
+        );
+        assert_eq!(guest_memory_bytes(config, "e"), None);
+        assert_eq!(guest_memory_bytes(config, "f"), None);
+    }
+
+    #[test]
+    fn guest_values_are_trimmed_and_the_first_wins() {
+        let config = b"[guest.a]\n  key   =   value   # note\nkey = second\n";
+        assert_eq!(guest_value(config, "a", "key"), Some(&b"value"[..]));
+        assert_eq!(guest_value(config, "a", "ke"), None);
+    }
+
+    #[test]
+    fn firmware_boot_is_not_triggered_by_other_tables_or_comments() {
+        let config = b"[guest.a]\n# boot = \"firmware\"\n[other]\nboot = \"firmware\"\n";
+        assert!(!guest_boots_firmware(config, "a"));
     }
 
     #[test]
