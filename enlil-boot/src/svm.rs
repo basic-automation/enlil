@@ -1374,23 +1374,9 @@ mod hw {
         }
     }
 
-    /// Read `CPUID Fn8000_0001` ECX.
+    /// Read `CPUID Fn8000_0001` ECX (the leaf exists on every x86-64 CPU).
     fn cpuid_ext_features_ecx() -> u32 {
-        let ecx: u32;
-        // SAFETY: extended leaf 0x8000_0001 exists on every x86-64 CPU.
-        unsafe {
-            core::arch::asm!(
-                "push rbx",
-                "mov eax, 0x80000001",
-                "cpuid",
-                "pop rbx",
-                out("ecx") ecx,
-                out("eax") _,
-                out("edx") _,
-                options(nostack, preserves_flags),
-            );
-        }
-        ecx
+        core::arch::x86_64::__cpuid_count(0x8000_0001, 0).ecx
     }
 
     /// Execute the host `CPUID` for `leaf`/`subleaf`, returning all four result
@@ -1398,29 +1384,19 @@ mod hw {
     ///
     /// The enlil kernel runs this on the guest's behalf when it intercepts a
     /// guest `CPUID` (LOCKED PRINCIPLE 1), then stealths the result with
-    /// [`sanitize_cpuid`](super::sanitize_cpuid) before delivering it. `rbx` is
-    /// hand-preserved (LLVM-reserved) via a scratch register.
+    /// [`sanitize_cpuid`](super::sanitize_cpuid) before delivering it. It uses
+    /// the compiler's own `CPUID` intrinsic: a hand-written `push rbx` / `pop
+    /// rbx` sequence under `nostack` returned a wrong `EBX` once the code around
+    /// it was inlined differently (every leaf's `EBX` came back as `9`, so the
+    /// guest saw no vendor string).
     pub(crate) fn host_cpuid(leaf: u32, subleaf: u32) -> super::CpuidRegs {
-        let eax: u32;
-        let ebx: u32;
-        let ecx: u32;
-        let edx: u32;
-        // SAFETY: CPUID is unprivileged and has no memory or side effects; the
-        // caller passes a leaf the guest requested.
-        unsafe {
-            core::arch::asm!(
-                "push rbx",
-                "cpuid",
-                "mov {ebx_out:e}, ebx",
-                "pop rbx",
-                inout("eax") leaf => eax,
-                inout("ecx") subleaf => ecx,
-                out("edx") edx,
-                ebx_out = out(reg) ebx,
-                options(nostack, preserves_flags),
-            );
+        let r = core::arch::x86_64::__cpuid_count(leaf, subleaf);
+        super::CpuidRegs {
+            eax: r.eax,
+            ebx: r.ebx,
+            ecx: r.ecx,
+            edx: r.edx,
         }
-        super::CpuidRegs { eax, ebx, ecx, edx }
     }
 
     /// Turn SVM on if the CPU allows it, returning the resulting status.

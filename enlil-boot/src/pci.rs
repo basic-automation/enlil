@@ -396,6 +396,131 @@ pub const MAX_BUS0_FUNCTIONS: usize = 16;
 /// Up to this many sized memory BAR windows captured per function.
 pub const MAX_BARS_PER_FUNCTION: usize = 4;
 
+/// Config offset of the dword holding the header-type byte (bits 23:16) and the
+/// cache-line / latency bytes.
+pub const HEADER_TYPE_OFFSET: u8 = 0x0C;
+/// Config offset of a bridge's bus-number dword: primary (7:0), secondary
+/// (15:8), subordinate (23:16).
+pub const BRIDGE_BUSES_OFFSET: u8 = 0x18;
+/// Config offset of the class-code dword (revision / prog-if / subclass / class).
+pub const CLASS_DWORD_OFFSET: u8 = 0x08;
+
+/// The header-type byte from the dword at [`HEADER_TYPE_OFFSET`] (bit 7 =
+/// multifunction, bits 6:0 = layout).
+#[must_use]
+pub const fn header_type_of(config_dword_at_0c: u32) -> u8 {
+    ((config_dword_at_0c >> 16) & 0xFF) as u8
+}
+
+/// Whether a header-type byte says the device has functions 1-7.
+#[must_use]
+pub const fn is_multifunction(header_type: u8) -> bool {
+    header_type & 0x80 != 0
+}
+
+/// Whether a header-type byte is a PCI-to-PCI bridge (layout 1).
+#[must_use]
+pub const fn is_pci_bridge(header_type: u8) -> bool {
+    header_type & 0x7F == 0x01
+}
+
+/// A bridge's secondary bus number from the dword at [`BRIDGE_BUSES_OFFSET`].
+#[must_use]
+pub const fn secondary_bus_of(config_dword_at_18: u32) -> u8 {
+    ((config_dword_at_18 >> 8) & 0xFF) as u8
+}
+
+/// Read access to PCI configuration space, so the topology walk below runs
+/// against real hardware in the kernel and a fake topology in tests.
+pub trait ConfigRead {
+    /// Config dword `offset` of `bus:device.function`; all-ones when nothing is
+    /// there.
+    fn read(&mut self, bus: u8, device: u8, function: u8, offset: u8) -> u32;
+}
+
+/// One PCI function found by [`walk_functions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FoundFunction {
+    /// Bus number.
+    pub bus: u8,
+    /// Device number.
+    pub device: u8,
+    /// Function number.
+    pub function: u8,
+    /// The function's header-type byte.
+    pub header_type: u8,
+    /// The dword at [`CLASS_DWORD_OFFSET`].
+    pub class_dword: u32,
+}
+
+/// Visit every PCI function reachable from the root buses `roots`, following
+/// PCI-to-PCI bridges to their secondary buses.
+///
+/// A device's functions 1-7 are probed only when function 0 says
+/// multifunction, as the specification requires. Each bus is walked once
+/// (a bridge pointing back at a bus already seen, or at bus 0, is ignored), so
+/// a malformed topology cannot loop. Firmware has already numbered the
+/// bridges by the time the kernel runs, which is what makes this work.
+///
+/// This is how an `NVMe` drive that sits behind a `PCIe` root port - as on the
+/// user's board, where it is on bus 2 behind a bridge on bus 0 - is found at
+/// all.
+pub fn walk_functions(
+    cfg: &mut impl ConfigRead,
+    roots: &[u8],
+    visit: &mut impl FnMut(FoundFunction),
+) {
+    let mut seen = [false; 256];
+    let mut pending: [u8; 256] = [0; 256];
+    let mut queued = 0usize;
+    for &root in roots {
+        if !seen[usize::from(root)] {
+            seen[usize::from(root)] = true;
+            pending[queued] = root;
+            queued += 1;
+        }
+    }
+    let mut next = 0usize;
+    while next < queued {
+        let bus = pending[next];
+        next += 1;
+        for device in 0u8..32 {
+            let dword0 = cfg.read(bus, device, 0, 0);
+            if !vendor_present(vendor_of(dword0)) {
+                continue;
+            }
+            let header = header_type_of(cfg.read(bus, device, 0, HEADER_TYPE_OFFSET));
+            let last_function = if is_multifunction(header) { 7 } else { 0 };
+            for function in 0u8..=last_function {
+                if function != 0 && !vendor_present(vendor_of(cfg.read(bus, device, function, 0))) {
+                    continue;
+                }
+                let header_type = if function == 0 {
+                    header
+                } else {
+                    header_type_of(cfg.read(bus, device, function, HEADER_TYPE_OFFSET))
+                };
+                visit(FoundFunction {
+                    bus,
+                    device,
+                    function,
+                    header_type,
+                    class_dword: cfg.read(bus, device, function, CLASS_DWORD_OFFSET),
+                });
+                if is_pci_bridge(header_type) {
+                    let secondary =
+                        secondary_bus_of(cfg.read(bus, device, function, BRIDGE_BUSES_OFFSET));
+                    if secondary != 0 && !seen[usize::from(secondary)] {
+                        seen[usize::from(secondary)] = true;
+                        pending[queued] = secondary;
+                        queued += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "uefi")]
 pub use hw::{
     StorageController, XhciFunction, bar0_mmio_base, enable_mem_bus_master,
@@ -473,6 +598,11 @@ mod hw {
     /// For a 64-bit BAR (`is_64`) both dwords are probed and combined. Config
     /// space is left exactly as found.
     fn size_memory_bar(device: u8, function: u8, off: u8, is_64: bool) -> u64 {
+        size_memory_bar_on(0, device, function, off, is_64)
+    }
+
+    /// [`size_memory_bar`] for a function on any bus.
+    fn size_memory_bar_on(bus: u8, device: u8, function: u8, off: u8, is_64: bool) -> u64 {
         // Writing all-ones to a BAR of a function that is decoding memory makes
         // it claim a huge bogus window until the restore — on real hardware
         // that can shadow RAM or other devices. Turn memory decode off for the
@@ -481,29 +611,44 @@ mod hw {
         // so no sticky status bit is cleared by accident.
         const COMMAND_DWORD: u8 = 0x04;
         const CMD_MEM_SPACE: u32 = 1 << 1;
-        let command = config_read(0, device, function, COMMAND_DWORD) & 0xFFFF;
-        config_write(0, device, function, COMMAND_DWORD, command & !CMD_MEM_SPACE);
-        let size = size_memory_bar_decode_off(device, function, off, is_64);
-        config_write(0, device, function, COMMAND_DWORD, command);
+        let command = config_read(bus, device, function, COMMAND_DWORD) & 0xFFFF;
+        config_write(
+            bus,
+            device,
+            function,
+            COMMAND_DWORD,
+            command & !CMD_MEM_SPACE,
+        );
+        let size = size_memory_bar_decode_off(bus, device, function, off, is_64);
+        config_write(bus, device, function, COMMAND_DWORD, command);
         size
     }
 
     /// The write-probe itself; the caller has memory decode disabled.
-    fn size_memory_bar_decode_off(device: u8, function: u8, off: u8, is_64: bool) -> u64 {
-        let orig_lo = config_read(0, device, function, off);
-        config_write(0, device, function, off, 0xFFFF_FFFF);
-        let probe_lo = config_read(0, device, function, off);
+    fn size_memory_bar_decode_off(bus: u8, device: u8, function: u8, off: u8, is_64: bool) -> u64 {
+        let orig_lo = config_read(bus, device, function, off);
+        config_write(bus, device, function, off, 0xFFFF_FFFF);
+        let probe_lo = config_read(bus, device, function, off);
         if is_64 {
-            let orig_hi = config_read(0, device, function, off + 4);
-            config_write(0, device, function, off + 4, 0xFFFF_FFFF);
-            let probe_hi = config_read(0, device, function, off + 4);
+            let orig_hi = config_read(bus, device, function, off + 4);
+            config_write(bus, device, function, off + 4, 0xFFFF_FFFF);
+            let probe_hi = config_read(bus, device, function, off + 4);
             // Restore both dwords.
-            config_write(0, device, function, off, orig_lo);
-            config_write(0, device, function, off + 4, orig_hi);
+            config_write(bus, device, function, off, orig_lo);
+            config_write(bus, device, function, off + 4, orig_hi);
             bar_mem_size_64(probe_lo, probe_hi)
         } else {
-            config_write(0, device, function, off, orig_lo);
+            config_write(bus, device, function, off, orig_lo);
             bar_mem_size(probe_lo)
+        }
+    }
+
+    /// Mechanism-#1 config reads as a [`ConfigRead`](super::ConfigRead).
+    struct PortConfig;
+
+    impl super::ConfigRead for PortConfig {
+        fn read(&mut self, bus: u8, device: u8, function: u8, offset: u8) -> u32 {
+            config_read(bus, device, function, offset)
         }
     }
 
@@ -1116,75 +1261,55 @@ mod hw {
     /// Upper bound on storage controllers reported by one scan.
     pub const MAX_STORAGE_CONTROLLERS: usize = 8;
 
-    /// Find the `NVMe`/`AHCI` storage controllers on bus 0 and decode each one's
-    /// `BAR0` -- the MMIO window a bare-metal driver claims.
+    /// Find the `NVMe`/`AHCI` storage controllers on any PCI bus and decode each
+    /// one's `BAR0` -- the MMIO window a bare-metal driver claims.
     ///
-    /// Enumeration follows the same multifunction rule as [`scan_bus0`]; each
-    /// `BAR0` is sized by the all-ones write-probe (config space is restored
-    /// afterwards). Returns the count and a fixed-size array -- no allocator
-    /// needed at this layer.
+    /// The walk starts at bus 0 and follows PCI-to-PCI bridges to their secondary
+    /// buses (see [`walk_functions`](super::walk_functions)), so a drive behind a
+    /// PCIe root port is found like any other. Each `BAR0` is sized by the
+    /// all-ones write-probe (config space is restored afterwards). Returns the
+    /// count and a fixed-size array -- no allocator needed at this layer.
     #[must_use]
     pub fn find_storage_controllers() -> (usize, [StorageController; MAX_STORAGE_CONTROLLERS]) {
-        const HEADER_TYPE_OFFSET: u8 = 0x0C;
-        const HEADER_MULTIFUNCTION: u32 = 0x0080_0000;
-        /// Config offset of the class-code dword (rev/prog-if/subclass/class).
-        const CLASS_OFFSET: u8 = 0x08;
-
         let mut out = [StorageController::default(); MAX_STORAGE_CONTROLLERS];
         let mut count = 0usize;
-        for device in 0u8..32 {
+        super::walk_functions(&mut PortConfig, &[0], &mut |f| {
             if count >= MAX_STORAGE_CONTROLLERS {
-                break;
+                return;
             }
-            let dword0 = config_read(0, device, 0, 0);
-            if !vendor_present(vendor_of(dword0)) {
-                continue;
+            let class = class_of(f.class_dword);
+            let subclass = subclass_of(f.class_dword);
+            let prog_if = prog_if_of(f.class_dword);
+            let is_nvme = is_nvme_class(class, subclass, prog_if);
+            if !is_nvme && !is_ahci_class(class, subclass, prog_if) {
+                return;
             }
-            let multifunction =
-                config_read(0, device, 0, HEADER_TYPE_OFFSET) & HEADER_MULTIFUNCTION != 0;
-            let last_fn = if multifunction { 7 } else { 0 };
-            for function in 0u8..=last_fn {
-                if count >= MAX_STORAGE_CONTROLLERS {
-                    break;
-                }
-                if function != 0 && !vendor_present(vendor_of(config_read(0, device, function, 0)))
-                {
-                    continue;
-                }
-                let class_dword = config_read(0, device, function, CLASS_OFFSET);
-                let class = class_of(class_dword);
-                let subclass = subclass_of(class_dword);
-                let prog_if = prog_if_of(class_dword);
-                let is_nvme = is_nvme_class(class, subclass, prog_if);
-                if !is_nvme && !is_ahci_class(class, subclass, prog_if) {
-                    continue;
-                }
-                // Decode BAR0 (memory BARs only; an I/O BAR0 cannot hold the
-                // controller registers).
-                let bar0 = config_read(0, device, function, BAR0_OFFSET);
-                let (bar0_base, bar0_size) = if bar_is_io(bar0) || bar0 == 0 {
-                    (0, 0)
-                } else if bar_is_mem_64(bar0) {
-                    let high = config_read(0, device, function, BAR0_OFFSET + 4);
-                    let base = bar_mem_base_64(bar0, high);
-                    let size = size_memory_bar(device, function, BAR0_OFFSET, true);
-                    (base, size)
-                } else {
-                    let base = u64::from(bar_mem_base(bar0));
-                    let size = size_memory_bar(device, function, BAR0_OFFSET, false);
-                    (base, size)
-                };
-                out[count] = StorageController {
-                    bus: 0,
-                    device,
-                    function,
-                    is_nvme,
-                    bar0_base,
-                    bar0_size,
-                };
-                count += 1;
-            }
-        }
+            // Decode BAR0 (memory BARs only; an I/O BAR0 cannot hold the
+            // controller registers).
+            let (bus, device, function) = (f.bus, f.device, f.function);
+            let bar0 = config_read(bus, device, function, BAR0_OFFSET);
+            let (bar0_base, bar0_size) = if bar_is_io(bar0) || bar0 == 0 {
+                (0, 0)
+            } else if bar_is_mem_64(bar0) {
+                let high = config_read(bus, device, function, BAR0_OFFSET + 4);
+                let base = bar_mem_base_64(bar0, high);
+                let size = size_memory_bar_on(bus, device, function, BAR0_OFFSET, true);
+                (base, size)
+            } else {
+                let base = u64::from(bar_mem_base(bar0));
+                let size = size_memory_bar_on(bus, device, function, BAR0_OFFSET, false);
+                (base, size)
+            };
+            out[count] = StorageController {
+                bus,
+                device,
+                function,
+                is_nvme,
+                bar0_base,
+                bar0_size,
+            };
+            count += 1;
+        });
         (count, out)
     }
 
@@ -1464,5 +1589,130 @@ mod tests {
             inv.entries[MAX_BAR_INVENTORY - 1].base,
             0x1000 * MAX_BAR_INVENTORY as u64
         );
+    }
+
+    // ---- the bridge-following walk -------------------------------------
+
+    use std::collections::BTreeMap;
+
+    /// A fake PCI topology: config dwords by (bus, device, function).
+    #[derive(Default)]
+    struct Fake {
+        funcs: BTreeMap<(u8, u8, u8), BTreeMap<u8, u32>>,
+        reads: usize,
+    }
+
+    impl Fake {
+        /// Add a function: `class` is `[base, sub, prog_if]`, `header` the
+        /// header-type byte, `secondary` a bridge's secondary bus.
+        fn add(&mut self, at: (u8, u8, u8), class: [u8; 3], header: u8, secondary: u8) {
+            let mut regs = BTreeMap::new();
+            regs.insert(0x00, 0x1234_8086);
+            regs.insert(
+                CLASS_DWORD_OFFSET,
+                (u32::from(class[0]) << 24)
+                    | (u32::from(class[1]) << 16)
+                    | (u32::from(class[2]) << 8),
+            );
+            regs.insert(HEADER_TYPE_OFFSET, u32::from(header) << 16);
+            regs.insert(BRIDGE_BUSES_OFFSET, u32::from(secondary) << 8);
+            self.funcs.insert(at, regs);
+        }
+    }
+
+    impl ConfigRead for Fake {
+        fn read(&mut self, bus: u8, device: u8, function: u8, offset: u8) -> u32 {
+            self.reads += 1;
+            self.funcs
+                .get(&(bus, device, function))
+                .and_then(|r| r.get(&offset))
+                .copied()
+                .unwrap_or(u32::MAX)
+        }
+    }
+
+    fn found(fake: &mut Fake, roots: &[u8]) -> Vec<(u8, u8, u8)> {
+        let mut out = Vec::new();
+        walk_functions(fake, roots, &mut |f| {
+            out.push((f.bus, f.device, f.function));
+        });
+        out
+    }
+
+    /// The user's board in miniature: a host bridge, a root port on bus 0 whose
+    /// secondary bus 2 holds a switch port that leads to bus 3 with the `NVMe`.
+    fn board() -> Fake {
+        let mut f = Fake::default();
+        f.add((0, 0, 0), [0x06, 0x00, 0x00], 0x00, 0);
+        f.add((0, 1, 0), [0x06, 0x04, 0x00], 0x81, 2); // root port, multifunction
+        f.add((0, 1, 2), [0x06, 0x04, 0x00], 0x01, 2);
+        f.add((2, 0, 0), [0x06, 0x04, 0x00], 0x01, 3); // switch port
+        f.add((3, 0, 0), [0x01, 0x08, 0x02], 0x00, 0); // NVMe
+        f
+    }
+
+    #[test]
+    fn the_walk_finds_a_drive_behind_bridges_on_other_buses() {
+        let got = found(&mut board(), &[0]);
+        assert!(
+            got.contains(&(3, 0, 0)),
+            "the NVMe on bus 3 is reached: {got:?}"
+        );
+        // Discovery is breadth-first: bus 0 completely before bus 2 before bus 3.
+        let buses: Vec<u8> = got.iter().map(|f| f.0).collect();
+        assert!(buses.windows(2).all(|w| w[0] <= w[1]), "{buses:?}");
+        assert_eq!(got.len(), 5);
+    }
+
+    #[test]
+    fn functions_one_to_seven_are_probed_only_for_multifunction_devices() {
+        let mut f = Fake::default();
+        f.add((0, 4, 0), [0x01, 0x08, 0x02], 0x00, 0); // single-function
+        f.add((0, 4, 3), [0x02, 0x00, 0x00], 0x00, 0); // a phantom: must be ignored
+        f.add((0, 5, 0), [0x0C, 0x03, 0x30], 0x80, 0); // multifunction
+        f.add((0, 5, 3), [0x0C, 0x03, 0x30], 0x00, 0);
+        assert_eq!(found(&mut f, &[0]), [(0, 4, 0), (0, 5, 0), (0, 5, 3)]);
+    }
+
+    #[test]
+    fn a_looping_or_self_referencing_topology_terminates() {
+        let mut f = Fake::default();
+        f.add((0, 1, 0), [0x06, 0x04, 0x00], 0x01, 1); // bus 0 -> bus 1
+        f.add((1, 0, 0), [0x06, 0x04, 0x00], 0x01, 0); // bus 1 -> back to bus 0
+        f.add((1, 1, 0), [0x06, 0x04, 0x00], 0x01, 1); // bus 1 -> itself
+        let got = found(&mut f, &[0]);
+        assert_eq!(got, [(0, 1, 0), (1, 0, 0), (1, 1, 0)]);
+    }
+
+    #[test]
+    fn a_bridge_with_no_secondary_bus_leads_nowhere() {
+        let mut f = Fake::default();
+        f.add((0, 1, 0), [0x06, 0x04, 0x00], 0x01, 0); // unconfigured: secondary 0
+        assert_eq!(found(&mut f, &[0]), [(0, 1, 0)]);
+    }
+
+    #[test]
+    fn extra_root_buses_are_walked_too_and_only_once() {
+        let mut f = Fake::default();
+        f.add((0, 0, 0), [0x06, 0x00, 0x00], 0x00, 0);
+        f.add((0x40, 0, 0), [0x06, 0x00, 0x00], 0x00, 0); // a second host bridge
+        f.add((0x40, 3, 0), [0x01, 0x08, 0x02], 0x00, 0);
+        assert_eq!(
+            found(&mut f, &[0, 0x40, 0x40, 0]),
+            [(0, 0, 0), (0x40, 0, 0), (0x40, 3, 0)]
+        );
+    }
+
+    #[test]
+    fn header_helpers_decode_the_bridge_fields() {
+        assert!(is_multifunction(0x80));
+        assert!(!is_multifunction(0x01));
+        assert!(is_pci_bridge(0x01) && is_pci_bridge(0x81));
+        assert!(
+            !is_pci_bridge(0x00) && !is_pci_bridge(0x02),
+            "endpoint / cardbus"
+        );
+        assert_eq!(header_type_of(0x0081_0000), 0x81);
+        assert_eq!(secondary_bus_of(0x00_07_02_00), 0x02);
     }
 }

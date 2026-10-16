@@ -12,7 +12,18 @@
 # Exit codes: 0 the expected guest output appeared; 1 it did not; 2 SKIPPED (no
 # /dev/kvm, qemu or OVMF).
 #
+# The outer firmware boots only the enlil ESP (bootindex=0): the guest's disk
+# holds a bootable ESP of its own, and must not be picked up by the outer VM.
+#
+# With ENLIL_OVMF_LINUX=1 the guest also gets a virtual disk holding an ESP with
+# Limine (the user's real bootloader) and the test Linux kernel + initramfs:
+# OVMF boots Limine from the disk, Limine boots Linux, and init's markers come
+# back through the guest serial console - the same path Windows' boot manager
+# takes on its own ESP.
+#
 # Environment:
+#   ENLIL_OVMF_LINUX    1: boot Linux from the guest's virtual disk (see above;
+#                       expects "ENLIL-GUEST-TICK 3" unless ENLIL_OVMF_EXPECT is set)
 #   ENLIL_OVMF_EXPECT   text that must appear in the guest console (default:
 #                       "BdsDxe: No bootable option" - OVMF ran PEI and DXE and
 #                       reached its boot manager; distro OVMF has no built-in
@@ -29,7 +40,12 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUTDIR="${1:-$(mktemp -d)}"
-EXPECT="${ENLIL_OVMF_EXPECT:-BdsDxe: No bootable option}"
+LINUX="${ENLIL_OVMF_LINUX:-0}"
+if [ "$LINUX" = 1 ]; then
+    EXPECT="${ENLIL_OVMF_EXPECT:-ENLIL-GUEST-TICK 3}"
+else
+    EXPECT="${ENLIL_OVMF_EXPECT:-BdsDxe: No bootable option}"
+fi
 TIMEOUT_SECS="${ENLIL_OVMF_TIMEOUT:-180}"
 GUEST_ID="ovmf"
 
@@ -76,7 +92,41 @@ cp "$EFI" "$ESP/EFI/BOOT/BOOTX64.EFI"
 printf '[guest.%s]\nboot = "firmware"\n' "$GUEST_ID" > "$ESP/EFI/enlil/config.toml"
 cp "$GUEST_CODE" "$ESP/EFI/enlil/firmware/$GUEST_ID/OVMF_CODE.fd"
 cp "$GUEST_VARS" "$ESP/EFI/enlil/firmware/$GUEST_ID/OVMF_VARS.fd"
-[ -f "${ENLIL_OVMF_DISK_TXT:-/nonexistent}" ] && cp "$ENLIL_OVMF_DISK_TXT" "$ESP/EFI/enlil/firmware/$GUEST_ID/disk.txt"
+DISK_ARGS=()
+if [ "$LINUX" = 1 ]; then
+    LIMINE_EFI="${ENLIL_LIMINE_EFI:-/usr/share/limine/BOOTX64.EFI}"
+    [ -f "$LIMINE_EFI" ] || { echo "SKIP: no Limine EFI binary at $LIMINE_EFI"; exit 2; }
+    command -v qemu-img >/dev/null || { echo "SKIP: qemu-img not installed"; exit 2; }
+    echo "==> building the guest assets"
+    GUEST_DIR="$OUTDIR/guest"
+    bash "$REPO_ROOT/scripts/build-test-guest.sh" "$GUEST_DIR" >/dev/null || {
+        rc=$?
+        [ "$rc" -eq 2 ] && exit 2
+        exit 1
+    }
+    # The guest's ESP: Limine as the removable-media bootloader, configured the
+    # way a real install would be (protocol linux, kernel + initramfs by path).
+    GESP="$OUTDIR/guest-esp"
+    rm -rf "$GESP"
+    mkdir -p "$GESP/EFI/BOOT"
+    cp "$LIMINE_EFI" "$GESP/EFI/BOOT/BOOTX64.EFI"
+    cp "$GUEST_DIR/vmlinuz" "$GUEST_DIR/initrd.img" "$GESP/"
+    {
+        echo "timeout: 0"
+        echo "serial: yes"
+        echo ""
+        echo "/Enlil test guest"
+        echo "    protocol: linux"
+        echo "    path: boot():/vmlinuz"
+        echo "    cmdline: $(tr -d '\n' < "$GUEST_DIR/cmdline.txt") ${ENLIL_OVMF_CMDLINE_EXTRA:-}"
+        echo "    module_path: boot():/initrd.img"
+    } > "$GESP/limine.conf"
+    # vvfat builds the FAT image from the directory with no root and no mtools.
+    qemu-img convert -f vvfat -O raw "fat:$GESP" "$OUTDIR/guest-disk.img" || { echo "FAIL: vvfat"; exit 1; }
+    printf 'nvme-serial = enlilvdisk\nallow = all rw\n' > "$ESP/EFI/enlil/firmware/$GUEST_ID/disk.txt"
+    DISK_ARGS=(-drive "file=$OUTDIR/guest-disk.img,if=none,id=vd0,format=raw,cache=writethrough"
+               -device "nvme,drive=vd0,serial=enlilvdisk")
+fi
 
 SERIAL_LOG="$OUTDIR/serial.log"
 cp "$OVMF_VARS" "$OUTDIR/OVMF_VARS.fd"
@@ -87,9 +137,11 @@ echo "==> booting under QEMU+KVM (timeout ${TIMEOUT_SECS}s, waiting for: $EXPECT
 "$QEMU" \
     -machine q35 -smp 2 -m 2G \
     -enable-kvm -cpu "host,+svm" \
-    -drive "format=raw,file=fat:rw:$ESP" \
+    -drive "format=raw,file=fat:rw:$ESP,if=none,id=espdisk" \
+    -device ahci,id=ahci -device "ide-hd,drive=espdisk,bus=ahci.0,bootindex=0" \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF" \
     -drive "if=pflash,format=raw,file=$OUTDIR/OVMF_VARS.fd" \
+    "${DISK_ARGS[@]}" \
     "${EXTRA[@]}" \
     -serial "file:$SERIAL_LOG" -display none -no-reboot &
 QEMU_PID=$!
@@ -106,8 +158,18 @@ kill "$QEMU_PID" 2>/dev/null; wait "$QEMU_PID" 2>/dev/null
 
 echo "---- guest console (lines relayed by the hypervisor) ----"
 grep -a "^\[ovmf\]" "$SERIAL_LOG" | cut -c1-200 | tail -60
+if grep -aq "^\[ovmf-dbg\]" "$SERIAL_LOG"; then
+    echo "---- firmware debug log (last ${ENLIL_OVMF_DBG_TAIL:-40} lines) ----"
+    grep -a "^\[ovmf-dbg\]" "$SERIAL_LOG" | cut -c1-200 | tail -${ENLIL_OVMF_DBG_TAIL:-40}
+fi
 echo "---- hypervisor lines ----"
 grep -a "enlil kernel: ovmf" "$SERIAL_LOG" | cut -c1-230 | tail -${ENLIL_OVMF_TAIL:-70}
+# The guest's CPUID leaf 0 must carry a real vendor string: a mis-compiled host
+# CPUID once returned EBX = 9 for every leaf, and the guest saw no vendor at all.
+if ! grep -aq "cpuid leaf 0x0\.0x0 -> 0x[0-9a-f]* 0x\(68747541\|756e6547\) " "$SERIAL_LOG"; then
+    echo "FAIL: the guest's CPUID leaf 0 has no vendor string (host CPUID broken?)"
+    result=1
+fi
 if [ "$result" -eq 0 ]; then
     echo "PASS: the guest firmware printed: $EXPECT"
 else

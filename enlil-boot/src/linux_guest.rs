@@ -29,6 +29,7 @@ use crate::vdev::{PicPair, Pit8254};
 use crate::virtio_blk::VirtioBlk;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 use enlil_hal::bzimage::{BOOT_PARAMS_SIZE, parse_bzimage_header};
 
 // ---------------------------------------------------------------------------
@@ -678,6 +679,9 @@ pub struct IoBus {
     /// booted directly into Linux, which is told about hardware by its zero
     /// page instead).
     platform: Option<Box<Platform>>,
+    /// Bytes the firmware wrote to the QEMU debug port (`0x402`), until the run
+    /// loop drains them. A DEBUG firmware build prints its log there.
+    debug_bytes: Vec<u8>,
     now: u64,
     cmos_index: u8,
     pci_addr: u32,
@@ -702,6 +706,7 @@ impl IoBus {
             pit: Pit8254::new(tsc_hz),
             virtio: None,
             platform: None,
+            debug_bytes: Vec::new(),
             now: 0,
             cmos_index: 0,
             pci_addr: 0,
@@ -719,6 +724,13 @@ impl IoBus {
     /// with `ram_bytes` of RAM.
     pub fn enable_platform(&mut self, tsc_hz: u64, ram_bytes: u64) {
         self.platform = Some(Box::new(Platform::new(tsc_hz, ram_bytes)));
+    }
+
+    /// Hand every byte written to the debug port since the last call to `f`.
+    pub fn drain_debug(&mut self, f: &mut impl FnMut(u8)) {
+        for b in self.debug_bytes.drain(..) {
+            f(b);
+        }
     }
 
     /// Whether the firmware platform is present.
@@ -739,6 +751,13 @@ impl IoBus {
         }
         let platform = self.platform.as_mut()?;
         platform.function(dev, func).map(|f| (f, reg))
+    }
+
+    /// The `(device, function, register)` the current `0xCF8` address selects, if
+    /// a function answers there.
+    pub fn pci_present(&mut self) -> Option<(u8, u8, usize)> {
+        let (_, dev, func, reg) = pci_target(self.pci_addr)?;
+        self.pci_function().map(|(_, r)| (dev, func, r.max(reg)))
     }
 
     /// Tell the bus the current host time (TSC).
@@ -865,6 +884,8 @@ impl IoBus {
             0x41 | 0x42 => 0,
             0x61 => u32::from(self.pit.read_port61(self.now)),
             0x71 => u32::from(self.cmos(self.cmos_index)),
+            // QEMU's debug port reads 0xE9 so firmware knows it can print there.
+            0x402 if self.platform.is_some() => 0xE9,
             0xCF8 => self.pci_addr,
             0xCFC..=0xCFF => {
                 let sub = usize::from(port - 0xCFC);
@@ -902,6 +923,7 @@ impl IoBus {
             0x43 => self.pit.write_control((val & 0xFF) as u8, self.now),
             0x61 => self.pit.write_port61((val & 0xFF) as u8),
             0x70 => self.cmos_index = (val & 0xFF) as u8,
+            0x402 if self.platform.is_some() => self.debug_bytes.push((val & 0xFF) as u8),
             0xCF8 => self.pci_addr = val,
             0xCFC..=0xCFF => {
                 let sub = usize::from(port - 0xCFC);
@@ -932,6 +954,8 @@ impl IoBus {
 #[derive(Debug, Clone, Default)]
 pub struct MmioBus {
     seen: BTreeMap<u64, u32>,
+    /// How many accesses to the disk's BAR have been logged so far.
+    pub disk_logged: usize,
 }
 
 impl MmioBus {
@@ -1364,6 +1388,7 @@ mod hw {
     /// destination register and advance `RIP`.
     fn emulate_mmio(
         serial: &SerialPort,
+        label: &str,
         mem: GuestMem,
         vmcb: &mut [u8],
         gprs: &mut GuestGprs,
@@ -1376,7 +1401,7 @@ mod hw {
         let (bytes, n) = fetch_insn(mem, vmcb, rip);
         let Some(access) = decode_mem_access(&bytes[..n]) else {
             serial.write_str(&format!(
-                "enlil kernel: linux: undecodable MMIO instruction at RIP {rip:#x} (gpa {gpa:#x}): {:02x?}\n",
+                "enlil kernel: {label}: undecodable MMIO instruction at RIP {rip:#x} (gpa {gpa:#x}): {:02x?}\n",
                 &bytes[..n]
             ));
             return Err(Stop::MmioDecode(gpa));
@@ -1413,8 +1438,17 @@ mod hw {
                     rip,
                 };
                 trace.push(event);
-                if lapic_offset.is_some() {
+                if lapic_offset.is_some() || disk_offset.is_some() {
                     irq_trace.push(event);
+                }
+                if let Some(off) = disk_offset
+                    && io.has_platform()
+                    && bus.disk_logged < 60
+                {
+                    bus.disk_logged += 1;
+                    serial.write_str(&format!(
+                        "enlil kernel: {label}: disk bar read  {size}B +{off:#x} -> {raw:#x} from RIP {rip:#x}\n"
+                    ));
                 }
                 let (target, hi) = if high8 { (reg - 4, true) } else { (reg, false) };
                 let merged = merge_reg(get_reg(vmcb, gprs, target), value, dest_size, hi);
@@ -1426,7 +1460,7 @@ mod hw {
                         "absent device"
                     };
                     serial.write_str(&format!(
-                        "enlil kernel: linux: MMIO read  {size}B at {gpa:#x} -> {value:#x} ({what}) from RIP {rip:#x}\n"
+                        "enlil kernel: {label}: MMIO read  {size}B at {gpa:#x} -> {value:#x} ({what}) from RIP {rip:#x}\n"
                     ));
                 }
             }
@@ -1441,11 +1475,12 @@ mod hw {
                     rip,
                 };
                 trace.push(event);
-                if lapic_offset.is_some() {
+                if lapic_offset.is_some() || disk_offset.is_some() {
                     irq_trace.push(event);
                 }
                 mmio_store(
                     serial,
+                    label,
                     mem,
                     bus,
                     io,
@@ -1468,11 +1503,12 @@ mod hw {
                     rip,
                 };
                 trace.push(event);
-                if lapic_offset.is_some() {
+                if lapic_offset.is_some() || disk_offset.is_some() {
                     irq_trace.push(event);
                 }
                 mmio_store(
                     serial,
+                    label,
                     mem,
                     bus,
                     io,
@@ -1496,6 +1532,7 @@ mod hw {
     #[allow(clippy::too_many_arguments)]
     fn mmio_store(
         serial: &SerialPort,
+        label: &str,
         mem: GuestMem,
         bus: &mut MmioBus,
         io: &mut IoBus,
@@ -1508,6 +1545,12 @@ mod hw {
         first: bool,
     ) {
         if let (Some(off), Some(disk)) = (disk_offset, io.virtio.as_mut()) {
+            if io.has_platform() && bus.disk_logged < 60 {
+                bus.disk_logged += 1;
+                serial.write_str(&format!(
+                    "enlil kernel: {label}: disk bar write {size}B +{off:#x} <- {value:#x} from RIP {rip:#x}\n"
+                ));
+            }
             disk.mmio_write(off, size, value, &mem);
         } else if let Some(off) = lapic_offset {
             io.lapic_write(off, size, value);
@@ -1515,7 +1558,7 @@ mod hw {
             bus.write(gpa, size, value);
             if first {
                 serial.write_str(&format!(
-                    "enlil kernel: linux: MMIO write {size}B at {gpa:#x} = {value:#x} (ignored) from RIP {rip:#x}\n"
+                    "enlil kernel: {label}: MMIO write {size}B at {gpa:#x} = {value:#x} (ignored) from RIP {rip:#x}\n"
                 ));
             }
         }
@@ -1574,7 +1617,7 @@ mod hw {
     /// guest the first disk the scan happens to find could expose the machine's
     /// own system disk. Each candidate is reset and queried (no writes); those
     /// that do not match are shut down again.
-    fn open_disk(serial: &SerialPort, wanted: &str) -> Option<NvmeBackend> {
+    fn open_disk(serial: &SerialPort, label: &str, wanted: &str) -> Option<NvmeBackend> {
         let (count, controllers) = crate::pci::find_storage_controllers();
         for c in controllers.iter().take(count) {
             if !c.is_nvme || c.bar0_base == 0 {
@@ -1589,7 +1632,7 @@ mod hw {
                 Ok(mut ctl) => {
                     let matched = ctl.serial_is(wanted);
                     serial.write_str(&format!(
-                        "enlil kernel: linux: disk: NVMe at {}:{}.{}, {} - {}\n",
+                        "enlil kernel: {label}: disk: NVMe at {}:{}.{}, {} - {}\n",
                         c.bus,
                         c.device,
                         c.function,
@@ -1606,7 +1649,7 @@ mod hw {
                     ctl.disable();
                 }
                 Err(e) => serial.write_str(&format!(
-                    "enlil kernel: linux: disk: NVMe at {}:{}.{} did not initialize: {e}\n",
+                    "enlil kernel: {label}: disk: NVMe at {}:{}.{} did not initialize: {e}\n",
                     c.bus, c.device, c.function
                 )),
             }
@@ -1616,13 +1659,13 @@ mod hw {
 
     /// Attach the guest's virtual disk if the ESP assigned one: parse
     /// `disk.txt`, find the named host disk and wrap it in the allow-list.
-    fn attach_disk(serial: &SerialPort, file: StagedFile, io: &mut IoBus) {
+    fn attach_disk(serial: &SerialPort, label: &str, file: StagedFile, io: &mut IoBus) {
         // SAFETY: the extent comes from the UEFI stage's handoff.
         let bytes = unsafe { staged(file) };
         if bytes.is_empty() {
-            serial.write_str(
-                "enlil kernel: linux: no disk assignment (disk.txt) - the guest gets no disk\n",
-            );
+            serial.write_str(&format!(
+                "enlil kernel: {label}: no disk assignment (disk.txt) - the guest gets no disk\n"
+            ));
             return;
         }
         let cfg = match core::str::from_utf8(bytes)
@@ -1632,22 +1675,22 @@ mod hw {
             Ok(c) => c,
             Err(e) => {
                 serial.write_str(&format!(
-                    "enlil kernel: linux: bad disk.txt ({e}) - no disk\n"
+                    "enlil kernel: {label}: bad disk.txt ({e}) - no disk\n"
                 ));
                 return;
             }
         };
-        let Some(backend) = open_disk(serial, &cfg.serial) else {
-            serial.write_str(
-                "enlil kernel: linux: no NVMe disk matches the assigned serial - no disk\n",
-            );
+        let Some(backend) = open_disk(serial, label, &cfg.serial) else {
+            serial.write_str(&format!(
+                "enlil kernel: {label}: no NVMe disk matches the assigned serial - no disk\n"
+            ));
             return;
         };
         let sectors = backend.sectors();
         let ranges = cfg.clamped(sectors);
         let read_only = ranges.iter().all(|r| !r.writable);
         serial.write_str(&format!(
-            "enlil kernel: linux: virtual disk: {sectors} sectors, {} allowed range(s), {}\n",
+            "enlil kernel: {label}: virtual disk: {sectors} sectors, {} allowed range(s), {}\n",
             ranges.len(),
             if read_only {
                 "read-only"
@@ -2108,7 +2151,7 @@ mod hw {
         if platform {
             io.enable_platform(tsc_hz.max(1), GUEST_RAM_BYTES);
         }
-        attach_disk(serial, disk, &mut io);
+        attach_disk(serial, label, disk, &mut io);
         let (stop, counts, trace, irq_trace) = run(
             serial,
             label,
@@ -2192,6 +2235,8 @@ mod hw {
         // Accesses to the interrupt and timer hardware (PIC, PIT, local APIC),
         // kept apart so the console and polling loops cannot push them out.
         let mut irq_trace = Box::new(TraceRing::new());
+        let mut pci_logged = 0usize;
+        let mut pci_read_logged = 0usize;
         let mut io_seen: BTreeSet<(bool, u16)> = BTreeSet::new();
         let mut cpuid_seen: BTreeSet<u32> = BTreeSet::new();
         // The host timer deadline currently armed (avoids re-arming on every exit).
@@ -2208,6 +2253,15 @@ mod hw {
             serial.write_str("[");
             serial.write_str(label);
             serial.write_str("] ");
+            serial.write_str(line);
+            serial.write_str("\n");
+        };
+        // The firmware's debug-port log (a DEBUG OVMF build prints here).
+        let mut debug_console = LineBuf::new();
+        let mut emit_debug = |line: &str| {
+            serial.write_str("[");
+            serial.write_str(label);
+            serial.write_str("-dbg] ");
             serial.write_str(line);
             serial.write_str("\n");
         };
@@ -2326,12 +2380,26 @@ mod hw {
                             Ok(IoEvent::None) => {}
                             Err(stop) => break stop,
                         }
+                        bus.drain_debug(&mut |b| debug_console.push(b, &mut emit_debug));
                         set_guest_rip(vmcb, exit_info_2(vmcb));
                         continue;
                     }
                     let (port, size) = (info.port(), info.access_size());
                     if info.is_in() {
                         let val = u64::from(bus.read(port, size));
+                        if platform
+                            && matches!(port, 0xCFC..=0xCFF)
+                            && pci_read_logged < 600
+                            && let Some((dev, func, reg)) = bus.pci_present()
+                            && dev == 3
+                            && reg + usize::from(port - 0xCFC) >= 0x34
+                        {
+                            pci_read_logged += 1;
+                            serial.write_str(&format!(
+                                "enlil kernel: {label}: pci cfg read  {dev}:{func} reg {:#x} {size}B -> {val:#x}\n",
+                                reg + usize::from(port - 0xCFC)
+                            ));
+                        }
                         if platform {
                             let event = TraceEvent {
                                 kind: TraceKind::IoIn,
@@ -2386,6 +2454,25 @@ mod hw {
                                 ));
                             }
                         }
+                        // Config writes that assign something (not BAR sizing probes:
+                        // all-ones, and the zero/original restore after them).
+                        let assigns = !matches!(
+                            mask_to(u64::from(data), size),
+                            0 | 0xFFFF_FFFF | 0xFFFF_FFFE
+                        );
+                        if platform
+                            && matches!(port, 0xCFC..=0xCFF)
+                            && assigns
+                            && pci_logged < DISCOVER_LIMIT * 4
+                            && let Some((dev, func, reg)) = bus.pci_present()
+                        {
+                            pci_logged += 1;
+                            serial.write_str(&format!(
+                                "enlil kernel: {label}: pci cfg write {dev}:{func} reg {:#x} {size}B <- {:#x}\n",
+                                reg + usize::from(port - 0xCFC),
+                                mask_to(u64::from(data), size)
+                            ));
+                        }
                         let event =
                             bus.write(port, size, data, &mut |b| console.push(b, &mut emit));
                         if event == IoEvent::Reset {
@@ -2395,6 +2482,7 @@ mod hw {
                             break Stop::PowerOff;
                         }
                     }
+                    bus.drain_debug(&mut |b| debug_console.push(b, &mut emit_debug));
                     set_guest_rip(vmcb, exit_info_2(vmcb));
                 }
                 RunLoopExit::Msr => {
@@ -2448,7 +2536,7 @@ mod hw {
                         let is_write = msr_exit_is_write(exit_info_1(vmcb));
                         if msr_seen.len() < MSR_LOG_LIMIT && msr_seen.insert((is_write, msr)) {
                             serial.write_str(&format!(
-                                "enlil kernel: linux: guest {} of unmodelled MSR {msr:#x} at RIP {:#x} -> #GP\n",
+                                "enlil kernel: {label}: guest {} of unmodelled MSR {msr:#x} at RIP {:#x} -> #GP\n",
                                 if is_write { "WRMSR" } else { "RDMSR" },
                                 guest_rip(vmcb)
                             ));
@@ -2490,6 +2578,7 @@ mod hw {
                     counts.mmio += 1;
                     if let Err(stop) = emulate_mmio(
                         serial,
+                        label,
                         mem,
                         vmcb,
                         gprs,
@@ -2525,6 +2614,7 @@ mod hw {
             }
         };
         console.flush(&mut emit);
+        debug_console.flush(&mut emit_debug);
         if platform {
             serial.write_str(&format!(
                 "enlil kernel: {label}: interrupt state at stop: PIC IMR master {:#04x} slave {:#04x}, pending vector {:?}, next device deadline {:?} (now {})\n",
@@ -2684,15 +2774,12 @@ mod hw {
             exit_code(vmcb).raw(),
         ));
         if let Some((trace, irq_trace)) = trace {
-            for (name, ring) in [
-                ("interrupt-hardware (PIC/PIT/APIC)", irq_trace),
-                ("all", trace),
-            ] {
+            for (name, ring) in [("device (PIC/PIT/APIC/disk)", irq_trace), ("all", trace)] {
                 // The interrupt ring can be long; the last 40 tell the story.
                 let skip =
                     ring.recent()
                         .count()
-                        .saturating_sub(if name == "all" { 192 } else { 40 });
+                        .saturating_sub(if name == "all" { 192 } else { 120 });
                 serial.write_str(&format!(
                     "enlil kernel: {label}: last {} of {} traced {name} guest events:\n",
                     ring.recent().count() - skip,
@@ -3163,6 +3250,30 @@ mod tests {
             MsrState::new().read(MSR_APIC_BASE),
             MsrRead::Value(0xFEE0_0100)
         );
+    }
+
+    #[test]
+    fn the_debug_port_collects_firmware_log_bytes_for_a_platform_guest() {
+        let mut out = Vec::new();
+        let mut bus = IoBus::new(1_000_000_000);
+        // No platform: the port is an absent device, and nothing is collected.
+        assert_eq!(bus.read(0x402, 1), 0xFF);
+        bus.write(0x402, 1, u32::from(b'x'), &mut tx_to(&mut out));
+        let mut got = Vec::new();
+        bus.drain_debug(&mut |b| got.push(b));
+        assert_eq!(got, b"");
+
+        bus.enable_platform(1_000_000_000, 256 * MIB);
+        assert_eq!(bus.read(0x402, 1), 0xE9, "QEMU's debug-port signature");
+        for b in b"DXE" {
+            bus.write(0x402, 1, u32::from(*b), &mut tx_to(&mut out));
+        }
+        bus.drain_debug(&mut |b| got.push(b));
+        assert_eq!(got, b"DXE");
+        // Drained bytes are gone, and nothing leaked to the UART transmitter.
+        let mut again = Vec::new();
+        bus.drain_debug(&mut |b| again.push(b));
+        assert!(again.is_empty() && out.is_empty());
     }
 
     #[test]
