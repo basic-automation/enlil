@@ -13,6 +13,8 @@
 //! behaviour OVMF depends on is host-tested; the run loop only routes accesses
 //! here.
 
+use crate::fwcfg::FwCfg;
+use crate::ioapic::{IOAPIC_BASE, IOAPIC_BYTES, IoApic};
 use crate::pci_dev::PciFunction;
 
 /// The PCI device number of the PIIX3/PIIX4 multi-function chip.
@@ -194,8 +196,9 @@ impl Lapic {
         u32::try_from(counts).unwrap_or(u32::MAX)
     }
 
-    /// Mark `vector` requested.
-    fn raise(&mut self, vector: u8) {
+    /// Mark `vector` requested (an interrupt arrives from an I/O APIC pin or a
+    /// self-IPI).
+    pub fn raise(&mut self, vector: u8) {
         self.irr[usize::from(vector >> 5)] |= 1 << (vector & 31);
     }
 
@@ -242,11 +245,12 @@ impl Lapic {
         Some(v)
     }
 
-    /// End of interrupt: the highest in-service vector completes.
-    fn eoi(&mut self) {
-        if let Some(v) = Self::highest(&self.isr) {
-            self.isr[usize::from(v >> 5)] &= !(1 << (v & 31));
-        }
+    /// End of interrupt: the highest in-service vector completes, and is
+    /// returned (an I/O APIC retires level-triggered interrupts on it).
+    fn eoi(&mut self) -> Option<u8> {
+        let v = Self::highest(&self.isr)?;
+        self.isr[usize::from(v >> 5)] &= !(1 << (v & 31));
+        Some(v)
     }
 
     /// Run the timer to host time `now`, requesting its vector if it expired
@@ -301,20 +305,23 @@ impl Lapic {
     /// A `size`-byte register write of `value` at `off` within the window at
     /// host time `now`. Read-only registers ignore it; a write that is not an
     /// aligned dword is ignored (the hardware requires 32-bit accesses).
-    pub fn write(&mut self, off: u64, size: u8, value: u64, now: u64) {
+    ///
+    /// Returns the vector an end-of-interrupt write retired, if it did.
+    pub fn write(&mut self, off: u64, size: u8, value: u64, now: u64) -> Option<u8> {
         if size != 4 || off & 3 != 0 {
-            return;
+            return None;
         }
         let Ok(reg) = usize::try_from(off) else {
-            return;
+            return None;
         };
+        let mut retired = None;
         #[allow(clippy::cast_possible_truncation)] // a 32-bit register write
         let v = value as u32;
         match reg {
             // ID, version, the read-only status registers and the timer's
             // current count.
             0x20 | 0x30 | 0x90..=0xA0 | 0xD0 | REG_ISR..=0x270 | REG_TIMER_CURRENT => {}
-            REG_EOI => self.eoi(),
+            REG_EOI => retired = self.eoi(),
             REG_ICR_LOW => {
                 // Delivery status always reads idle. A fixed-delivery IPI to
                 // self (shorthand 01) is the one IPI that can land.
@@ -333,6 +340,7 @@ impl Lapic {
                 }
             }
         }
+        retired
     }
 }
 
@@ -352,6 +360,9 @@ pub struct Platform {
     isa: PciFunction,
     pm: PciFunction,
     lapic: Lapic,
+    ioapic: IoApic,
+    /// The firmware-configuration device, once the machine has one to offer.
+    fwcfg: Option<FwCfg>,
     sysctl_a: u8,
     pm_io: [u8; PM_IO_BYTES as usize],
     /// The host TSC value the PM timer counts from (set on first use).
@@ -389,12 +400,19 @@ impl Platform {
             isa,
             pm,
             lapic: Lapic::new(tsc_hz),
+            ioapic: IoApic::new(),
+            fwcfg: None,
             sysctl_a: 0,
             pm_io: [0; PM_IO_BYTES as usize],
             epoch: None,
             tsc_hz: tsc_hz.max(1),
             ram_bytes,
         }
+    }
+
+    /// Give the machine a `fw_cfg` device (ports `0x510`/`0x511`).
+    pub fn set_fwcfg(&mut self, fwcfg: FwCfg) {
+        self.fwcfg = Some(fwcfg);
     }
 
     /// The local APIC.
@@ -412,6 +430,37 @@ impl Platform {
     #[must_use]
     pub fn lapic_offset(gpa: u64) -> Option<u64> {
         gpa.checked_sub(LAPIC_BASE).filter(|&o| o < LAPIC_BYTES)
+    }
+
+    /// The offset within the I/O APIC window if `gpa` is inside it.
+    #[must_use]
+    pub fn ioapic_offset(gpa: u64) -> Option<u64> {
+        gpa.checked_sub(IOAPIC_BASE).filter(|&o| o < IOAPIC_BYTES)
+    }
+
+    /// A `size`-byte local APIC register write; an end of interrupt is
+    /// broadcast to the I/O APIC so level-triggered pins become deliverable
+    /// again.
+    pub fn lapic_write(&mut self, off: u64, size: u8, value: u64, now: u64) {
+        if let Some(vector) = self.lapic.write(off, size, value, now) {
+            self.ioapic.eoi(vector, &mut self.lapic);
+        }
+    }
+
+    /// A `size`-byte I/O APIC register read.
+    #[must_use]
+    pub fn ioapic_read(&self, off: u64, size: u8) -> u64 {
+        self.ioapic.read(off, size)
+    }
+
+    /// A `size`-byte I/O APIC register write (an unmask can deliver at once).
+    pub fn ioapic_write(&mut self, off: u64, size: u8, value: u64) {
+        self.ioapic.write(off, size, value, &mut self.lapic);
+    }
+
+    /// Drive I/O APIC input `pin` (a global system interrupt) to `level`.
+    pub fn set_gsi(&mut self, pin: u8, level: bool) {
+        self.ioapic.set_irq(pin, level, &mut self.lapic);
     }
 
     /// The platform PCI function at `device`/`function` on bus 0, if any.
@@ -465,7 +514,8 @@ impl Platform {
     /// Whether the platform owns I/O port `port`.
     #[must_use]
     pub fn claims(&self, port: u16) -> bool {
-        port == PORT_SYSCTL_A
+        (self.fwcfg.is_some() && FwCfg::claims(port))
+            || port == PORT_SYSCTL_A
             || self
                 .pm_base()
                 .is_some_and(|b| port >= b && port < b + PM_IO_BYTES)
@@ -473,6 +523,11 @@ impl Platform {
 
     /// An `IN` of `size` bytes from a claimed `port` at host time `now`.
     pub fn io_read(&mut self, port: u16, size: u8, now: u64) -> u32 {
+        if let Some(fw) = self.fwcfg.as_mut()
+            && FwCfg::claims(port)
+        {
+            return fw.io_read(port, size);
+        }
         if port == PORT_SYSCTL_A {
             return u32::from(self.sysctl_a);
         }
@@ -498,6 +553,12 @@ impl Platform {
 
     /// An `OUT` of `size` bytes of `val` to a claimed `port`.
     pub fn io_write(&mut self, port: u16, size: u8, val: u32) -> PlatformEvent {
+        if let Some(fw) = self.fwcfg.as_mut()
+            && FwCfg::claims(port)
+        {
+            fw.io_write(port, size, val);
+            return PlatformEvent::None;
+        }
         if port == PORT_SYSCTL_A {
             self.sysctl_a = val.to_le_bytes()[0];
             return PlatformEvent::None;
@@ -681,6 +742,30 @@ mod tests {
         assert_eq!(p.io_read(0xB002, 2, 0), 0x0123);
         p.io_write(0xB000, 2, 0xFFFF);
         assert_eq!(p.io_read(0xB000, 2, 0), 0, "status reads zero after W1C");
+    }
+
+    #[test]
+    fn fw_cfg_answers_only_once_the_machine_has_one() {
+        use crate::fwcfg::MachineInfo;
+        let mut p = Platform::new(1_000_000_000, 256 * MIB);
+        assert!(
+            !p.claims(0x510) && !p.claims(0x511),
+            "absent: reads fall through to all-ones"
+        );
+        p.set_fwcfg(FwCfg::new(MachineInfo {
+            uuid: [7; 16],
+            ram_bytes: 256 * MIB,
+            cpus: 1,
+        }));
+        assert!(p.claims(0x510) && p.claims(0x511));
+        p.io_write(0x510, 2, 0);
+        let sig: Vec<u8> = (0..4)
+            .map(|_| u8::try_from(p.io_read(0x511, 1, 0)).unwrap())
+            .collect();
+        assert_eq!(sig, b"QEMU");
+        // The platform's own ports are unaffected.
+        p.io_write(0x92, 1, 0x02);
+        assert_eq!(p.io_read(0x92, 1, 0), 0x02);
     }
 
     #[test]

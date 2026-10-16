@@ -260,6 +260,15 @@ pub const NVME_SLOT: u8 = 4;
 /// The legacy PIC line the `NVMe` controller interrupts on.
 pub const NVME_IRQ: u8 = 11;
 
+/// A platform device's MMIO window hit, with the offset within it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlatformMmio {
+    /// The local APIC.
+    Lapic(u64),
+    /// The I/O APIC.
+    IoApic(u64),
+}
+
 /// A disk device's `BAR0` hit, with the offset within it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiskTarget {
@@ -822,10 +831,13 @@ impl IoBus {
 
     /// A `size`-byte register read from a disk device.
     pub fn disk_read(&mut self, target: DiskTarget, size: u8) -> u64 {
-        match target {
+        let value = match target {
             DiskTarget::Virtio(off) => self.virtio.as_mut().map_or(0, |v| v.mmio_read(off, size)),
             DiskTarget::Nvme(off) => self.nvme.as_ref().map_or(0, |n| n.mmio_read(off, size)),
-        }
+        };
+        // Reading the virtio ISR register clears the interrupt cause.
+        self.refresh_disk_irqs();
+        value
     }
 
     /// A `size`-byte register write to a disk device; the device may run its
@@ -848,6 +860,15 @@ impl IoBus {
                     n.mmio_write(off, size, value, mem);
                 }
             }
+        }
+        // A queue notification raises the line; an NVMe head doorbell lowers it.
+        self.refresh_disk_irqs();
+    }
+
+    /// Give a platform guest its `fw_cfg` device.
+    pub fn set_fwcfg(&mut self, fwcfg: crate::fwcfg::FwCfg) {
+        if let Some(p) = self.platform.as_mut() {
+            p.set_fwcfg(fwcfg);
         }
     }
 
@@ -909,12 +930,34 @@ impl IoBus {
         if self.pit.poll(self.now) {
             self.pic.set_irq(0, true);
             self.pic.set_irq(0, false);
+            // On the I/O APIC the PIT's IRQ 0 arrives on pin 2.
+            self.set_gsi(2, true);
+            self.set_gsi(2, false);
         }
-        self.pic.set_irq(4, self.uart.irq_line());
+        let uart_level = self.uart.irq_line();
+        self.pic.set_irq(4, uart_level);
+        self.set_gsi(4, uart_level);
+        self.refresh_disk_irqs();
+    }
+
+    /// Re-drive the disks' interrupt lines from the devices' current state.
+    ///
+    /// Called after every disk register access, not just at the next poll: a
+    /// level-triggered line must fall the moment the guest clears its cause, or
+    /// the I/O APIC delivers it again after the guest's end of interrupt and
+    /// the guest sees an interrupt nobody raised.
+    pub fn refresh_disk_irqs(&mut self) {
         let virtio_level = self.virtio.as_ref().is_some_and(VirtioBlk::irq_line);
         self.drive_disk_irq(0, VIRTIO_BLK_SLOT, VIRTIO_BLK_IRQ, virtio_level);
         let nvme_level = self.nvme.as_ref().is_some_and(|n| n.irq_line());
         self.drive_disk_irq(1, NVME_SLOT, NVME_IRQ, nvme_level);
+    }
+
+    /// Drive I/O APIC input `pin` (a platform guest's interrupt router).
+    fn set_gsi(&mut self, pin: u8, level: bool) {
+        if let Some(p) = self.platform.as_mut() {
+            p.set_gsi(pin, level);
+        }
     }
 
     /// Drive a disk device's interrupt level onto the PIC line it is routed to:
@@ -935,6 +978,9 @@ impl IoBus {
         if let Some(irq) = routed {
             self.pic.set_irq(irq, level);
         }
+        // The same line on the I/O APIC: PCI INTx of slot `s` is pin 16 + (s & 3)
+        // for INTA#, the routing the DSDT's _PRT describes.
+        self.set_gsi(16 + (slot & 3), level);
     }
 
     /// The vector of the interrupt waiting to be delivered, if any: the local
@@ -955,15 +1001,22 @@ impl IoBus {
 
     /// Acknowledge the next interrupt (INTA) and return its vector.
     pub fn ack(&mut self) -> Option<u8> {
+        self.ack_source().map(|(vector, _)| vector)
+    }
+
+    /// Acknowledge the next interrupt and say where it came from: `true` for the
+    /// local APIC (whose interrupts the guest's task priority masks), `false`
+    /// for the legacy PIC (whose `ExtINT` interrupts ignore it).
+    pub fn ack_source(&mut self) -> Option<(u8, bool)> {
         if let Some(p) = self.platform.as_mut() {
             if let Some(v) = p.lapic_mut().ack() {
-                return Some(v);
+                return Some((v, true));
             }
             if !p.lapic().extint_enabled() {
                 return None;
             }
         }
-        self.pic.ack()
+        self.pic.ack().map(|v| (v, false))
     }
 
     /// The host TSC value at which a device next needs attention.
@@ -1000,7 +1053,41 @@ impl IoBus {
     pub fn lapic_write(&mut self, off: u64, size: u8, value: u64) {
         let now = self.now;
         if let Some(p) = self.platform.as_mut() {
-            p.lapic_mut().write(off, size, value, now);
+            p.lapic_write(off, size, value, now);
+        }
+    }
+
+    /// Which platform device's MMIO window contains `gpa` (a guest without the
+    /// platform has none).
+    #[must_use]
+    pub fn platform_mmio(&self, gpa: u64) -> Option<PlatformMmio> {
+        self.platform.as_ref()?;
+        Platform::lapic_offset(gpa)
+            .map(PlatformMmio::Lapic)
+            .or_else(|| Platform::ioapic_offset(gpa).map(PlatformMmio::IoApic))
+    }
+
+    /// A `size`-byte register read from a platform device.
+    #[must_use]
+    pub fn platform_mmio_read(&self, target: PlatformMmio, size: u8) -> u64 {
+        match target {
+            PlatformMmio::Lapic(off) => self.lapic_read(off, size),
+            PlatformMmio::IoApic(off) => self
+                .platform
+                .as_ref()
+                .map_or(0, |p| p.ioapic_read(off, size)),
+        }
+    }
+
+    /// A `size`-byte register write to a platform device.
+    pub fn platform_mmio_write(&mut self, target: PlatformMmio, size: u8, value: u64) {
+        match target {
+            PlatformMmio::Lapic(off) => self.lapic_write(off, size, value),
+            PlatformMmio::IoApic(off) => {
+                if let Some(p) = self.platform.as_mut() {
+                    p.ioapic_write(off, size, value);
+                }
+            }
         }
     }
 
@@ -1264,8 +1351,8 @@ mod hw {
     use super::{
         BOOT_PARAMS_GPA, CMDLINE_GPA, DiskTarget, GDT_GPA, GUEST_RAM_BYTES, IoBus, IoEvent,
         LineBuf, MIB, MSR_PASSTHROUGH, MmioBus, MsrRead, MsrState, MsrWrite, PT_BYTES, PT_GPA,
-        STACK_GPA, TraceEvent, TraceKind, TraceRing, cpuid_policy, e820_map, gdt_bytes,
-        guest_efer_view, plan_layout, vmcb_efer_after_write,
+        PlatformMmio, STACK_GPA, TraceEvent, TraceKind, TraceRing, cpuid_policy, e820_map,
+        gdt_bytes, guest_efer_view, plan_layout, vmcb_efer_after_write,
     };
     use crate::blockdev::{BlockBackend, BlockError, DiskConfig, DiskMap, DiskModel, SECTOR};
     use crate::handoff::{BootHandoff, GuestFirmware, StagedFile};
@@ -1309,6 +1396,8 @@ mod hw {
     const TIMER_VECTOR: u8 = 0x40;
     /// `INT_CONTROL.V_IRQ`: a virtual interrupt is posted and not yet delivered.
     const V_IRQ: u64 = 1 << 8;
+    /// `INT_CONTROL.V_IGN_TPR`: the virtual interrupt ignores the guest's task priority.
+    const V_IGN_TPR: u64 = 1 << 20;
     /// `INT_CONTROL.V_INTR_MASKING`: left clear so the guest's own `IF` gates
     /// interrupts (the host runs with `IF = 0`).
     const V_INTR_MASKING: u64 = 1 << 24;
@@ -1571,7 +1660,7 @@ mod hw {
         let size = access.size;
         // Is the address inside a virtual disk's BAR (a real device)?
         let disk = io.disk_bar(gpa);
-        let lapic_offset = io.lapic_offset(gpa);
+        let plat = io.platform_mmio(gpa);
         let first = disk.is_none() && bus.note(gpa);
         match access.kind {
             AccessKind::Load {
@@ -1580,9 +1669,9 @@ mod hw {
                 sign_extend,
                 dest_size,
             } => {
-                let raw = match (disk, lapic_offset) {
+                let raw = match (disk, plat) {
                     (Some(target), _) => io.disk_read(target, size),
-                    (None, Some(off)) => io.lapic_read(off, size),
+                    (None, Some(target)) => io.platform_mmio_read(target, size),
                     (None, None) => bus.read(gpa, size),
                 };
                 let value = extend(raw, size, dest_size, sign_extend);
@@ -1594,7 +1683,7 @@ mod hw {
                     rip,
                 };
                 trace.push(event);
-                if lapic_offset.is_some() || disk.is_some() {
+                if plat.is_some() || disk.is_some() {
                     irq_trace.push(event);
                 }
                 if let Some(target) = disk
@@ -1611,10 +1700,10 @@ mod hw {
                 let merged = merge_reg(get_reg(vmcb, gprs, target), value, dest_size, hi);
                 set_reg(vmcb, gprs, target, merged);
                 if first {
-                    let what = if lapic_offset.is_some() {
-                        "local APIC"
-                    } else {
-                        "absent device"
+                    let what = match plat {
+                        Some(PlatformMmio::Lapic(_)) => "local APIC",
+                        Some(PlatformMmio::IoApic(_)) => "I/O APIC",
+                        None => "absent device",
                     };
                     serial.write_str(&format!(
                         "enlil kernel: {label}: MMIO read  {size}B at {gpa:#x} -> {value:#x} ({what}) from RIP {rip:#x}\n"
@@ -1632,22 +1721,11 @@ mod hw {
                     rip,
                 };
                 trace.push(event);
-                if lapic_offset.is_some() || disk.is_some() {
+                if plat.is_some() || disk.is_some() {
                     irq_trace.push(event);
                 }
                 mmio_store(
-                    serial,
-                    label,
-                    mem,
-                    bus,
-                    io,
-                    disk,
-                    lapic_offset,
-                    gpa,
-                    size,
-                    value,
-                    rip,
-                    first,
+                    serial, label, mem, bus, io, disk, plat, gpa, size, value, rip, first,
                 );
             }
             AccessKind::StoreImm { value } => {
@@ -1660,22 +1738,11 @@ mod hw {
                     rip,
                 };
                 trace.push(event);
-                if lapic_offset.is_some() || disk.is_some() {
+                if plat.is_some() || disk.is_some() {
                     irq_trace.push(event);
                 }
                 mmio_store(
-                    serial,
-                    label,
-                    mem,
-                    bus,
-                    io,
-                    disk,
-                    lapic_offset,
-                    gpa,
-                    size,
-                    value,
-                    rip,
-                    first,
+                    serial, label, mem, bus, io, disk, plat, gpa, size, value, rip, first,
                 );
             }
         }
@@ -1694,7 +1761,7 @@ mod hw {
         bus: &mut MmioBus,
         io: &mut IoBus,
         disk: Option<DiskTarget>,
-        lapic_offset: Option<u64>,
+        plat: Option<PlatformMmio>,
         gpa: u64,
         size: u8,
         value: u64,
@@ -1710,8 +1777,8 @@ mod hw {
                 ));
             }
             io.disk_write(target, size, value, &mem);
-        } else if let Some(off) = lapic_offset {
-            io.lapic_write(off, size, value);
+        } else if let Some(target) = plat {
+            io.platform_mmio_write(target, size, value);
         } else {
             bus.write(gpa, size, value);
             if first {
@@ -1929,7 +1996,7 @@ mod hw {
         if handoff.linux_guest.has_kernel() {
             boot_linux_direct(serial, handoff);
         } else if let Some(entry) = firmware {
-            boot_firmware(serial, entry);
+            boot_firmware(serial, handoff, entry);
         }
     }
 
@@ -1955,6 +2022,8 @@ mod hw {
         platform: bool,
         /// The firmware flash images, for instruction fetch from ROM.
         flash: [FlashSpan; 2],
+        /// The `fw_cfg` device a firmware guest reads its tables from.
+        fwcfg: Option<crate::fwcfg::FwCfg>,
     }
 
     /// Boot a Linux `bzImage` directly by the Linux boot protocol (64-bit entry,
@@ -2110,6 +2179,7 @@ mod hw {
                 ),
                 platform: false,
                 flash: [FlashSpan::NONE; 2],
+                fwcfg: None,
             },
         );
     }
@@ -2118,7 +2188,7 @@ mod hw {
     /// store and read-only code flash at the top of the 4 GiB space, and the CPU
     /// in its reset state, executing the reset vector in the last bytes of the
     /// code image - exactly what a real machine's firmware expects.
-    fn boot_firmware(serial: &SerialPort, fw: GuestFirmware) {
+    fn boot_firmware(serial: &SerialPort, handoff: &BootHandoff, fw: GuestFirmware) {
         let id = fw.id_str();
         let say = |msg: &str| serial.write_str(&format!("enlil kernel: ovmf: {id}: {msg}\n"));
         // SAFETY: the UEFI stage staged both images into `LOADER_DATA` pages
@@ -2257,6 +2327,7 @@ mod hw {
                     flash.code_len
                 ),
                 platform: true,
+                fwcfg: Some(machine_fwcfg(serial, handoff)),
                 flash: [
                     FlashSpan {
                         gpa: flash.vars_gpa,
@@ -2273,6 +2344,41 @@ mod hw {
         );
     }
 
+    /// The `fw_cfg` device for a firmware guest: the ACPI tables that describe
+    /// the machine, and the real board's SMBIOS identity when the firmware
+    /// published one.
+    fn machine_fwcfg(serial: &SerialPort, handoff: &BootHandoff) -> crate::fwcfg::FwCfg {
+        use crate::acpi_tables::{
+            AcpiParams, DSDT_AML, FILE_LOADER, FILE_RSDP, FILE_TABLES, build,
+        };
+        use crate::fwcfg::{FwCfg, MachineInfo};
+        // SAFETY: the UEFI stage staged these into `LOADER_DATA` pages (never freed).
+        let (smbios, anchor) =
+            unsafe { (staged(handoff.smbios_tables), staged(handoff.smbios_anchor)) };
+        let uuid = crate::smbios::system_uuid(smbios).unwrap_or(*b"enlil-guest-uuid");
+        let mut fw = FwCfg::new(MachineInfo {
+            uuid,
+            ram_bytes: GUEST_RAM_BYTES,
+            cpus: 1,
+        });
+        let acpi = build(&AcpiParams::default(), DSDT_AML);
+        fw.add_file(FILE_LOADER, acpi.loader);
+        fw.add_file(FILE_RSDP, acpi.rsdp);
+        fw.add_file(FILE_TABLES, acpi.tables);
+        if !smbios.is_empty() && !anchor.is_empty() {
+            serial.write_str(&format!(
+                "enlil kernel: ovmf: the guest sees the real machine's SMBIOS ({} bytes, {} structures)\n",
+                smbios.len(),
+                crate::smbios::structure_count(smbios)
+            ));
+            fw.add_file("etc/smbios/smbios-tables", smbios.to_vec());
+            fw.add_file("etc/smbios/smbios-anchor", anchor.to_vec());
+        } else {
+            serial.write_str("enlil kernel: ovmf: no SMBIOS from the firmware - the guest firmware uses its own\n");
+        }
+        fw
+    }
+
     /// Finish a prepared machine - intercepts, permission maps, timer gate, host
     /// save area - then run it until it stops and report why.
     fn launch(serial: &SerialPort, l: Launch) {
@@ -2287,6 +2393,7 @@ mod hw {
             banner,
             platform,
             flash,
+            fwcfg,
         } = l;
         let tsc_hz = crate::kernel::TSC_HZ.load(Ordering::Acquire);
         let v = vmcb.as_bytes_mut();
@@ -2341,6 +2448,9 @@ mod hw {
         let mut io = IoBus::new(tsc_hz.max(1));
         if platform {
             io.enable_platform(tsc_hz.max(1), GUEST_RAM_BYTES);
+            if let Some(f) = fwcfg {
+                io.set_fwcfg(f);
+            }
         }
         attach_disk(serial, label, disk, &mut io);
         let (stop, counts, trace, irq_trace) = run(
@@ -2469,9 +2579,17 @@ mod hw {
                 // in flight, so this exclusive view is not aliased.
                 let pre = unsafe { vmcb_view(vmcb_pa) };
                 if int_control(pre) & V_IRQ == 0
-                    && let Some(vector) = bus.ack()
+                    && let Some((vector, from_apic)) = bus.ack_source()
                 {
-                    set_int_control(pre, encode_vintr(vector, 0xF) & !V_INTR_MASKING);
+                    // A local-APIC interrupt carries its vector's priority class and
+                    // honours the guest's task priority (CR8, which Windows uses as
+                    // its IRQL): the hardware holds it back while the priority is at
+                    // or above that class. A legacy ExtINT interrupt ignores it.
+                    let mut v = encode_vintr(vector, vector >> 4) & !V_INTR_MASKING;
+                    if from_apic {
+                        v &= !V_IGN_TPR;
+                    }
+                    set_int_control(pre, v);
                     counts.injected += 1;
                 }
                 if let Some(due) = bus.next_deadline()

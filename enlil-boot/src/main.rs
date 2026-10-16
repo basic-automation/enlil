@@ -54,6 +54,9 @@ fn efi_main() -> uefi::Status {
     // (roadmap 6.3) consumes. Must be collected before ExitBootServices:
     // after exit the protocols are gone.
     let (pci_root_bridge_count, pci_root_bridges) = uefi_boot::collect_pci_root_bridges();
+    // The real machine's SMBIOS tables, copied while boot services can still
+    // allocate: firmware guests are shown the real board's identity.
+    let (smbios_tables, smbios_anchor) = uefi_boot::stage_smbios();
     if pci_root_bridge_count == 0 {
         log::warn!("pci: no root bridge inventory collected");
     }
@@ -79,6 +82,8 @@ fn efi_main() -> uefi::Status {
         pci_root_bridges,
         pci_root_bridge_count,
         linux_guest: esp_payload.linux,
+        smbios_tables,
+        smbios_anchor,
     };
     // Keep the memory-map buffer alive for the kernel: dropping the owned map
     // would call the now-defunct boot-services `FreePool`. Its base and extent
@@ -119,7 +124,9 @@ fn efi_main() -> uefi::Status {
 /// stays host-testable in `enlil_boot::handoff`.
 #[cfg(target_os = "uefi")]
 mod uefi_boot {
-    use enlil_boot::handoff::{Framebuffer, MAX_PCI_ROOT_BRIDGES, PciRootBridge, PixelFormat};
+    use enlil_boot::handoff::{
+        Framebuffer, MAX_PCI_ROOT_BRIDGES, PciRootBridge, PixelFormat, StagedFile,
+    };
 
     /// Physical address of the ACPI RSDP from the UEFI configuration table,
     /// preferring the ACPI 2.0+ (XSDT) entry over the legacy 1.0 one; `0` if
@@ -138,6 +145,79 @@ mod uefi_boot {
             }
             legacy
         })
+    }
+
+    /// Copy `bytes` into freshly allocated `LOADER_DATA` pages (which the kernel
+    /// keeps) and describe the copy; empty if the allocation fails.
+    fn stage_bytes(bytes: &[u8]) -> StagedFile {
+        use uefi::boot::{AllocateType, MemoryType};
+        let pages = bytes.len().div_ceil(4096).max(1);
+        let Ok(base) =
+            uefi::boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages)
+        else {
+            return StagedFile::EMPTY;
+        };
+        // SAFETY: `allocate_pages` just returned `pages` live, exclusively owned
+        // pages, and `bytes` is shorter than that.
+        unsafe {
+            core::ptr::write_bytes(base.as_ptr(), 0, pages * 4096);
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), base.as_ptr(), bytes.len());
+        }
+        StagedFile {
+            base: base.as_ptr() as u64,
+            len: bytes.len(),
+        }
+    }
+
+    /// Copy the firmware's SMBIOS structure table, and an entry point that
+    /// describes the copy, into memory the kernel keeps. Prefers the 64-bit
+    /// (`SMBIOS3`) entry point. Both are empty if the firmware published none.
+    pub fn stage_smbios() -> (StagedFile, StagedFile) {
+        use enlil_boot::smbios::{entry_len, rebuild_anchor, table_extent};
+        use uefi::table::cfg::{SMBIOS_GUID, SMBIOS3_GUID};
+        let entry_addr = uefi::system::with_config_table(|entries| {
+            let mut legacy = 0usize;
+            for e in entries {
+                if e.guid == SMBIOS3_GUID {
+                    return e.address as usize;
+                }
+                if e.guid == SMBIOS_GUID {
+                    legacy = e.address as usize;
+                }
+            }
+            legacy
+        });
+        if entry_addr == 0 {
+            log::warn!("no SMBIOS entry point in the UEFI configuration table");
+            return (StagedFile::EMPTY, StagedFile::EMPTY);
+        }
+        // SAFETY: the firmware's entry point and table are identity-mapped
+        // boot-services memory; the sizes come from the entry point itself and
+        // are checked by `table_extent` before use.
+        let (entry, tables) = unsafe {
+            let first = core::slice::from_raw_parts(entry_addr as *const u8, 5);
+            let Some(len) = entry_len(first) else {
+                log::warn!("SMBIOS entry point has an unknown signature");
+                return (StagedFile::EMPTY, StagedFile::EMPTY);
+            };
+            let entry = core::slice::from_raw_parts(entry_addr as *const u8, len);
+            let Some((addr, tlen)) = table_extent(entry) else {
+                log::warn!("SMBIOS entry point is malformed");
+                return (StagedFile::EMPTY, StagedFile::EMPTY);
+            };
+            (
+                entry,
+                core::slice::from_raw_parts(addr as usize as *const u8, tlen),
+            )
+        };
+        let Some(anchor) = rebuild_anchor(entry, tables.len()) else {
+            return (StagedFile::EMPTY, StagedFile::EMPTY);
+        };
+        log::info!(
+            "smbios: staged {} bytes of the real machine's tables",
+            tables.len()
+        );
+        (stage_bytes(tables), stage_bytes(&anchor))
     }
 
     /// The current GOP framebuffer, or `None` if there is no graphics output

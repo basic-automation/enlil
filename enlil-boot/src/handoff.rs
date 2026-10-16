@@ -291,6 +291,12 @@ pub struct BootHandoff {
     /// A Linux guest staged from `EFI/enlil/linux/` (empty when the ESP has
     /// none): the kernel runs it as a real guest OS when a kernel is present.
     pub linux_guest: LinuxPayload,
+    /// The real machine's SMBIOS structure table, copied into memory the kernel
+    /// keeps (empty when the firmware published none): firmware guests see the
+    /// real board's identity, not an invented one.
+    pub smbios_tables: StagedFile,
+    /// The matching SMBIOS entry point, rebuilt to describe the copy.
+    pub smbios_anchor: StagedFile,
 }
 
 impl BootHandoff {
@@ -454,6 +460,8 @@ mod tests {
             pci_root_bridges: [PciRootBridge::default(); MAX_PCI_ROOT_BRIDGES],
             pci_root_bridge_count: 0,
             linux_guest: LinuxPayload::EMPTY,
+            smbios_tables: StagedFile::EMPTY,
+            smbios_anchor: StagedFile::EMPTY,
         };
         assert_eq!(h.descriptor_count(), 10);
     }
@@ -473,6 +481,8 @@ mod tests {
             pci_root_bridges: [PciRootBridge::default(); MAX_PCI_ROOT_BRIDGES],
             pci_root_bridge_count: 0,
             linux_guest: LinuxPayload::EMPTY,
+            smbios_tables: StagedFile::EMPTY,
+            smbios_anchor: StagedFile::EMPTY,
         };
         assert_eq!(h.descriptor_count(), 0);
     }
@@ -492,6 +502,8 @@ mod tests {
             pci_root_bridges: [PciRootBridge::default(); MAX_PCI_ROOT_BRIDGES],
             pci_root_bridge_count: 0,
             linux_guest: LinuxPayload::EMPTY,
+            smbios_tables: StagedFile::EMPTY,
+            smbios_anchor: StagedFile::EMPTY,
         };
         assert!(good.is_valid());
         assert!(good.has_acpi());
@@ -545,6 +557,8 @@ mod tests {
             pci_root_bridges: [PciRootBridge::default(); MAX_PCI_ROOT_BRIDGES],
             pci_root_bridge_count: 0,
             linux_guest: LinuxPayload::EMPTY,
+            smbios_tables: StagedFile::EMPTY,
+            smbios_anchor: StagedFile::EMPTY,
         }
     }
 
@@ -604,6 +618,8 @@ mod tests {
             pci_root_bridges: bridges,
             pci_root_bridge_count: 2,
             linux_guest: LinuxPayload::EMPTY,
+            smbios_tables: StagedFile::EMPTY,
+            smbios_anchor: StagedFile::EMPTY,
         }
     }
 

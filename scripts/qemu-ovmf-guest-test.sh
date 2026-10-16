@@ -26,6 +26,8 @@
 #                       expects "ENLIL-GUEST-TICK 3" unless ENLIL_OVMF_EXPECT is set)
 #   ENLIL_OVMF_DISK_MODEL  virtio (default) or nvme: the controller the guest's
 #                       virtual disk appears on (Windows needs nvme)
+#   ENLIL_OVMF_CMDLINE  the guest kernel command line, replacing the legacy-PIC one
+#                       (acpi=off noapic nolapic) the direct-boot guest uses
 #   ENLIL_OVMF_EXPECT   text that must appear in the guest console (default:
 #                       "BdsDxe: No bootable option" - OVMF ran PEI and DXE and
 #                       reached its boot manager; distro OVMF has no built-in
@@ -122,7 +124,7 @@ if [ "$LINUX" = 1 ]; then
         echo "/Enlil test guest"
         echo "    protocol: linux"
         echo "    path: boot():/vmlinuz"
-        echo "    cmdline: $(tr -d '\n' < "$GUEST_DIR/cmdline.txt") ${ENLIL_OVMF_CMDLINE_EXTRA:-}"
+        echo "    cmdline: ${ENLIL_OVMF_CMDLINE:-$(tr -d '\n' < "$GUEST_DIR/cmdline.txt")} ${ENLIL_OVMF_CMDLINE_EXTRA:-}"
         echo "    module_path: boot():/initrd.img"
     } > "$GESP/limine.conf"
     # vvfat builds the FAT image from the directory with no root and no mtools.

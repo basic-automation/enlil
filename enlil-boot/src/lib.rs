@@ -22,6 +22,7 @@
 extern crate alloc;
 
 pub mod acpi;
+pub mod acpi_tables;
 pub mod ahci;
 pub mod allocator;
 pub mod apic;
@@ -29,10 +30,12 @@ pub mod blockdev;
 pub mod esp;
 pub mod firmware;
 pub mod framebuffer;
+pub mod fwcfg;
 pub mod gdt;
 pub mod handoff;
 pub mod idt;
 pub mod insn;
+pub mod ioapic;
 pub mod iommu;
 pub mod kernel;
 pub mod linux_guest;
@@ -48,6 +51,7 @@ pub mod percpu;
 pub mod platform;
 pub mod serial;
 pub mod service_vm;
+pub mod smbios;
 pub mod smp;
 pub mod stack;
 pub mod svm;
