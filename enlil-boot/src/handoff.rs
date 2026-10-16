@@ -328,23 +328,35 @@ impl BootHandoff {
     /// OVMF too, and must stay proofs.
     #[must_use]
     pub fn firmware_boot_guest(&self) -> Option<GuestFirmware> {
+        let config = self.config_bytes()?;
+        self.guest_firmwares
+            .iter()
+            .take(self.guest_firmware_count.min(MAX_BOOT_GUESTS))
+            .find(|g| g.has_firmware() && crate::esp::guest_boots_firmware(config, g.id_str()))
+            .copied()
+    }
+
+    /// `run-seconds` from guest `id`'s `[guest.<id>]` table, if the config sets it
+    /// (`Some(0)` is "no limit").
+    #[must_use]
+    pub fn guest_run_seconds(&self, id: &str) -> Option<u64> {
+        crate::esp::guest_run_seconds(self.config_bytes()?, id)
+    }
+
+    /// The staged `config.toml`, if there is one.
+    fn config_bytes(&self) -> Option<&[u8]> {
         if !self.has_config() {
             return None;
         }
         let base = usize::try_from(self.config_base).ok()?;
         // SAFETY: the UEFI stage staged `config_len` bytes of `LOADER_DATA` at
         // `config_base` (never freed); the kernel runs identity-mapped.
-        let config = unsafe {
+        Some(unsafe {
             core::slice::from_raw_parts(
                 core::ptr::with_exposed_provenance::<u8>(base),
                 self.config_len,
             )
-        };
-        self.guest_firmwares
-            .iter()
-            .take(self.guest_firmware_count.min(MAX_BOOT_GUESTS))
-            .find(|g| g.has_firmware() && crate::esp::guest_boots_firmware(config, g.id_str()))
-            .copied()
+        })
     }
 
     /// Whether a usable graphics framebuffer was handed over.
@@ -560,6 +572,18 @@ mod tests {
             smbios_tables: StagedFile::EMPTY,
             smbios_anchor: StagedFile::EMPTY,
         }
+    }
+
+    #[test]
+    fn a_guests_run_limit_comes_from_the_staged_config() {
+        let config = b"[guest.win]\nboot = \"firmware\"\nrun-seconds = 1800\n[guest.x]\ncpus = 1\n";
+        let mut h = empty_handoff();
+        h.config_base = config.as_ptr() as u64;
+        h.config_len = config.len();
+        assert_eq!(h.guest_run_seconds("win"), Some(1800));
+        assert_eq!(h.guest_run_seconds("x"), None);
+        h.config_base = 0;
+        assert_eq!(h.guest_run_seconds("win"), None, "no config");
     }
 
     #[test]

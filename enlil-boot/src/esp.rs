@@ -67,14 +67,14 @@ pub fn for_each_guest_id(config: &[u8], f: &mut dyn FnMut(&str)) {
     }
 }
 
-/// Whether `config` asks the guest `id` to boot its own firmware: a
-/// `boot = "firmware"` key directly inside its `[guest.<id>]` table (not a
-/// sub-table such as `[guest.<id>.firmware]`).
+/// The value of `key` directly inside the `[guest.<id>]` table (not a sub-table
+/// such as `[guest.<id>.firmware]`), with comments and surrounding whitespace
+/// stripped, or `None` if the table or key is absent.
 ///
-/// Like the id scan this is a structural subset of TOML, enough for the one
-/// key the boot stage needs.
+/// Like the id scan this is a structural subset of TOML, enough for the few
+/// keys the boot stage needs. The first occurrence of a key wins.
 #[must_use]
-pub fn guest_boots_firmware(config: &[u8], id: &str) -> bool {
+pub fn guest_value<'a>(config: &'a [u8], id: &str, key: &str) -> Option<&'a [u8]> {
     let mut in_guest = false;
     for line in config.split(|&b| b == b'\n') {
         let code = line
@@ -90,13 +90,29 @@ pub fn guest_boots_firmware(config: &[u8], id: &str) -> bool {
             continue;
         }
         if let Some(eq) = code.iter().position(|&b| b == b'=')
-            && trim_ascii(&code[..eq]) == b"boot"
-            && trim_ascii(&code[eq + 1..]) == b"\"firmware\""
+            && trim_ascii(&code[..eq]) == key.as_bytes()
         {
-            return true;
+            return Some(trim_ascii(&code[eq + 1..]));
         }
     }
-    false
+    None
+}
+
+/// Whether `[guest.<id>]` says `boot = "firmware"`: the guest runs its own
+/// firmware (OVMF) instead of being loaded by the Linux boot protocol.
+#[must_use]
+pub fn guest_boots_firmware(config: &[u8], id: &str) -> bool {
+    guest_value(config, id, "boot") == Some(b"\"firmware\"")
+}
+
+/// `run-seconds = N` in `[guest.<id>]`: how long the guest may run before the
+/// hypervisor stops it. `0` means no limit. `None` if absent or not a number.
+#[must_use]
+pub fn guest_run_seconds(config: &[u8], id: &str) -> Option<u64> {
+    core::str::from_utf8(guest_value(config, id, "run-seconds")?)
+        .ok()?
+        .parse()
+        .ok()
 }
 
 /// Whether `id` is already recorded in the NUL-padded `seen` slots.
@@ -555,6 +571,30 @@ mod tests {
         assert!(!guest_boots_firmware(config, "e"));
         assert!(!guest_boots_firmware(config, "missing"));
         assert!(!guest_boots_firmware(b"", "a"));
+    }
+
+    #[test]
+    fn a_guest_may_set_how_long_it_runs() {
+        let config =
+            b"[guest.a]\nrun-seconds = 900 # fifteen minutes\n[guest.b]\nrun-seconds = 0\n\
+            [guest.c]\nrun-seconds = \"soon\"\n[guest.d]\ncpus = 2\n[other]\nrun-seconds = 5\n";
+        assert_eq!(guest_run_seconds(config, "a"), Some(900));
+        assert_eq!(guest_run_seconds(config, "b"), Some(0), "0 means unlimited");
+        assert_eq!(guest_run_seconds(config, "c"), None, "not a number");
+        assert_eq!(guest_run_seconds(config, "d"), None, "absent");
+        assert_eq!(
+            guest_run_seconds(config, "other"),
+            None,
+            "not a guest table"
+        );
+        assert_eq!(guest_run_seconds(config, "missing"), None);
+    }
+
+    #[test]
+    fn guest_values_are_trimmed_and_the_first_wins() {
+        let config = b"[guest.a]\n  key   =   value   # note\nkey = second\n";
+        assert_eq!(guest_value(config, "a", "key"), Some(&b"value"[..]));
+        assert_eq!(guest_value(config, "a", "ke"), None);
     }
 
     #[test]

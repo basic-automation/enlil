@@ -28,6 +28,9 @@
 #                       sits at \\EFI\\limine\\limine.efi with *no* removable-media fallback,
 #                       and disk.txt names it (boot-partition/boot-loader): the guest boots
 #                       only if enlil seeded a boot entry into the firmware's variable store
+#   ENLIL_OVMF_RUN_SECONDS  the guest's `run-seconds` (default 120; 0 = no limit)
+#   ENLIL_OVMF_SCREENSHOT  path of a PNG: once the run ends, a screenshot of the (outer)
+                       screen, which is where the hypervisor shows the guest's display
 #   ENLIL_OVMF_DISK_MODEL  virtio (default) or nvme: the controller the guest's
 #                       virtual disk appears on (Windows needs nvme)
 #   ENLIL_OVMF_CMDLINE  the guest kernel command line, replacing the legacy-PIC one
@@ -100,6 +103,8 @@ rm -rf "$ESP"
 mkdir -p "$ESP/EFI/BOOT" "$ESP/EFI/enlil/firmware/$GUEST_ID"
 cp "$EFI" "$ESP/EFI/BOOT/BOOTX64.EFI"
 printf '[guest.%s]\nboot = "firmware"\n' "$GUEST_ID" > "$ESP/EFI/enlil/config.toml"
+[ -n "${ENLIL_OVMF_RUN_SECONDS:-}" ] \
+    && printf 'run-seconds = %s\n' "$ENLIL_OVMF_RUN_SECONDS" >> "$ESP/EFI/enlil/config.toml"
 cp "$GUEST_CODE" "$ESP/EFI/enlil/firmware/$GUEST_ID/OVMF_CODE.fd"
 cp "$GUEST_VARS" "$ESP/EFI/enlil/firmware/$GUEST_ID/OVMF_VARS.fd"
 DISK_ARGS=()
@@ -175,6 +180,8 @@ cp "$OVMF_VARS" "$OUTDIR/OVMF_VARS.fd"
 : > "$SERIAL_LOG"
 EXTRA=()
 [ -n "${ENLIL_QEMU_EXTRA:-}" ] && read -r -a EXTRA <<< "$ENLIL_QEMU_EXTRA"
+MONITOR_SOCK="$OUTDIR/mon.sock"
+[ -n "${ENLIL_OVMF_SCREENSHOT:-}" ] && EXTRA+=(-monitor "unix:$MONITOR_SOCK,server,nowait")
 echo "==> booting under QEMU+KVM (timeout ${TIMEOUT_SECS}s, waiting for: $EXPECT)"
 "$QEMU" \
     -machine q35 -smp 2 -m 2G \
@@ -196,6 +203,10 @@ for _ in $(seq "$TIMEOUT_SECS"); do
     kill -0 "$QEMU_PID" 2>/dev/null || break
     sleep 1
 done
+if [ -n "${ENLIL_OVMF_SCREENSHOT:-}" ]; then
+    sleep "${ENLIL_OVMF_SCREENSHOT_DELAY:-3}"
+    python3 "$REPO_ROOT/scripts/qemu-screendump.py" "$MONITOR_SOCK" "$ENLIL_OVMF_SCREENSHOT" || true
+fi
 kill "$QEMU_PID" 2>/dev/null; wait "$QEMU_PID" 2>/dev/null
 
 echo "---- guest console (lines relayed by the hypervisor) ----"

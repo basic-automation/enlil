@@ -415,6 +415,17 @@ impl Platform {
         self.fwcfg = Some(fwcfg);
     }
 
+    /// The `fw_cfg` device, if the guest has one.
+    #[must_use]
+    pub const fn fwcfg(&self) -> Option<&FwCfg> {
+        self.fwcfg.as_ref()
+    }
+
+    /// The `fw_cfg` device, mutably (to serve a DMA request).
+    pub const fn fwcfg_mut(&mut self) -> Option<&mut FwCfg> {
+        self.fwcfg.as_mut()
+    }
+
     /// The local APIC.
     #[must_use]
     pub const fn lapic(&self) -> &Lapic {

@@ -872,6 +872,27 @@ impl IoBus {
         }
     }
 
+    /// Serve the `fw_cfg` DMA request the guest just made, if there is one: the
+    /// device reads or writes the guest's memory itself.
+    pub fn service_fwcfg_dma(&mut self, mem: &dyn crate::virtio_blk::GuestMemory) {
+        if let Some(fw) = self.platform.as_mut().and_then(|p| p.fwcfg_mut())
+            && let Some(addr) = fw.take_dma()
+        {
+            fw.dma(mem, addr);
+        }
+    }
+
+    /// The display the guest firmware has configured (`ramfb`), once it has.
+    #[must_use]
+    pub fn display(&self) -> Option<crate::ramfb::Config> {
+        let file = self
+            .platform
+            .as_ref()?
+            .fwcfg()?
+            .file(crate::ramfb::FILE_NAME)?;
+        crate::ramfb::parse(file)
+    }
+
     /// Give the guest the i440FX/PIIX platform firmware probes: host bridge,
     /// ISA bridge, ACPI PM timer and the CMOS RAM-size registers, for a machine
     /// with `ram_bytes` of RAM.
@@ -1405,8 +1426,11 @@ mod hw {
     const V_INTR_MASKING: u64 = 1 << 24;
     /// Length of `HLT` (`F4`).
     const HLT_INSN_LEN: u64 = 1;
-    /// Wall-clock cap on one run so a wedged guest cannot hang the boot.
+    /// Wall-clock cap on one run so a wedged guest cannot hang the boot, unless
+    /// the guest's config sets `run-seconds` (`0` removes the cap).
     const RUN_SECONDS: u64 = 120;
+    /// How often the guest's display is copied to the host screen.
+    const MIRROR_HZ: u64 = 10;
     /// How many distinct unknown MSRs are logged before going quiet.
     const MSR_LOG_LIMIT: usize = 40;
     /// How many first-touch discovery lines a firmware guest logs per kind.
@@ -2184,6 +2208,10 @@ mod hw {
         fwcfg: Option<crate::fwcfg::FwCfg>,
         /// The guest's variable-store flash chip.
         vars: Option<VarsFlash>,
+        /// The host's screen, to show the guest's display on.
+        screen: Option<crate::handoff::Framebuffer>,
+        /// How many seconds the guest may run; `0` is no limit.
+        run_seconds: u64,
     }
 
     /// Boot a Linux `bzImage` directly by the Linux boot protocol (64-bit entry,
@@ -2341,6 +2369,8 @@ mod hw {
                 flash: [FlashSpan::NONE; 2],
                 fwcfg: None,
                 vars: None,
+                screen: None,
+                run_seconds: RUN_SECONDS,
             },
         );
     }
@@ -2504,6 +2534,8 @@ mod hw {
                 ),
                 platform: true,
                 fwcfg: Some(machine_fwcfg(serial, handoff)),
+                screen: handoff.framebuffer,
+                run_seconds: handoff.guest_run_seconds(id).unwrap_or(RUN_SECONDS),
                 vars: Some(vars),
                 flash: [
                     FlashSpan {
@@ -2542,6 +2574,12 @@ mod hw {
         fw.add_file(FILE_LOADER, acpi.loader);
         fw.add_file(FILE_RSDP, acpi.rsdp);
         fw.add_file(FILE_TABLES, acpi.tables);
+        // A display for the firmware to find: the guest writes where its
+        // framebuffer is, and the hypervisor mirrors it to the host screen.
+        fw.add_writable_file(
+            crate::ramfb::FILE_NAME,
+            alloc::vec![0; crate::ramfb::CONFIG_BYTES],
+        );
         if !smbios.is_empty() && !anchor.is_empty() {
             serial.write_str(&format!(
                 "enlil kernel: ovmf: the guest sees the real machine's SMBIOS ({} bytes, {} structures)\n",
@@ -2572,6 +2610,8 @@ mod hw {
             flash,
             fwcfg,
             vars,
+            screen,
+            run_seconds,
         } = l;
         let tsc_hz = crate::kernel::TSC_HZ.load(Ordering::Acquire);
         let v = vmcb.as_bytes_mut();
@@ -2616,7 +2656,11 @@ mod hw {
 
         serial.write_str(&format!("enlil kernel: {label}: {banner}\n"));
 
-        let deadline = t0.saturating_add(tsc_hz.max(1).saturating_mul(RUN_SECONDS));
+        let deadline = if run_seconds == 0 {
+            u64::MAX
+        } else {
+            t0.saturating_add(tsc_hz.max(1).saturating_mul(run_seconds))
+        };
         let mem = GuestMem {
             base: core::ptr::with_exposed_provenance_mut::<u8>(ram_spa as usize),
             len: GUEST_RAM_BYTES as usize,
@@ -2643,6 +2687,7 @@ mod hw {
             mem,
             io,
             vars,
+            screen.map(|f| Mirror::new(f, tsc_hz.max(1))),
         );
         report(
             serial,
@@ -2698,6 +2743,79 @@ mod hw {
         }
     }
 
+    /// Copies the guest's `ramfb` picture to the host's own screen.
+    ///
+    /// A stand-in for giving the guest a real display: until a GPU is assigned,
+    /// what the guest draws is shown on the machine's firmware framebuffer, top
+    /// left, a few times a second.
+    struct Mirror {
+        /// The host's framebuffer (live firmware memory the kernel owns).
+        screen: crate::handoff::Framebuffer,
+        /// TSC ticks between copies.
+        period: u64,
+        /// The TSC value after which the next copy is due.
+        next: u64,
+        /// Whether the first picture has been announced.
+        announced: bool,
+    }
+
+    impl Mirror {
+        fn new(screen: crate::handoff::Framebuffer, tsc_hz: u64) -> Self {
+            Self {
+                screen,
+                period: (tsc_hz / MIRROR_HZ).max(1),
+                next: 0,
+                announced: false,
+            }
+        }
+
+        /// Copy the picture if one is configured and a copy is due at `now`.
+        fn tick(&mut self, now: u64, bus: &IoBus, mem: GuestMem, serial: &SerialPort, label: &str) {
+            if now < self.next {
+                return;
+            }
+            self.next = now.saturating_add(self.period);
+            let Some(cfg) = bus.display() else { return };
+            let Some(start) = usize::try_from(cfg.address)
+                .ok()
+                .and_then(|a| mem.span(cfg.address, cfg.bytes()).map(|_| a))
+            else {
+                return;
+            };
+            if !self.announced {
+                self.announced = true;
+                serial.write_str(&format!(
+                    "enlil kernel: {label}: display: the guest's {}x{} framebuffer at {:#x} is shown on the host screen ({}x{})\n",
+                    cfg.width, cfg.height, cfg.address, self.screen.width, self.screen.height
+                ));
+            }
+            let Ok(len) = usize::try_from(self.screen.size_bytes()) else {
+                return;
+            };
+            // SAFETY: `span` proved the source lies in the live guest-RAM window; the
+            // screen is the firmware framebuffer the handoff described, which the
+            // kernel owns and has mapped; the guest is stopped.
+            let (src, dst) = unsafe {
+                (
+                    core::slice::from_raw_parts(mem.base.add(start).cast_const(), cfg.bytes()),
+                    core::slice::from_raw_parts_mut(
+                        core::ptr::with_exposed_provenance_mut::<u8>(self.screen.base as usize),
+                        len,
+                    ),
+                )
+            };
+            crate::ramfb::blit(
+                src,
+                &cfg,
+                dst,
+                self.screen.width,
+                self.screen.height,
+                self.screen.stride,
+                self.screen.pixel_format == crate::handoff::PixelFormat::Rgb,
+            );
+        }
+    }
+
     /// The `#VMEXIT` dispatch loop for the Linux guest.
     fn run(
         serial: &SerialPort,
@@ -2709,6 +2827,7 @@ mod hw {
         mem: GuestMem,
         mut bus: IoBus,
         mut vars: Option<VarsFlash>,
+        mut mirror: Option<Mirror>,
     ) -> (Stop, Counts, Box<TraceRing>, Box<TraceRing>) {
         // A firmware guest gets the platform devices around its CPU, and the
         // discovery log that shows what a silent firmware touches.
@@ -2757,6 +2876,9 @@ mod hw {
                 let now = crate::tsc::read_tsc();
                 bus.set_time(now);
                 bus.poll_devices();
+                if let Some(m) = mirror.as_mut() {
+                    m.tick(now, &bus, mem, serial, label);
+                }
                 // SAFETY: `vmcb_pa` is our live, page-sized VMCB; no VMRUN is
                 // in flight, so this exclusive view is not aliased.
                 let pre = unsafe { vmcb_view(vmcb_pa) };
@@ -2871,6 +2993,7 @@ mod hw {
                             Ok(IoEvent::None) => {}
                             Err(stop) => break stop,
                         }
+                        bus.service_fwcfg_dma(&mem);
                         bus.drain_debug(&mut |b| debug_console.push(b, &mut emit_debug));
                         set_guest_rip(vmcb, exit_info_2(vmcb));
                         continue;
@@ -2972,6 +3095,7 @@ mod hw {
                         if event == IoEvent::PowerOff {
                             break Stop::PowerOff;
                         }
+                        bus.service_fwcfg_dma(&mem);
                     }
                     bus.drain_debug(&mut |b| debug_console.push(b, &mut emit_debug));
                     set_guest_rip(vmcb, exit_info_2(vmcb));

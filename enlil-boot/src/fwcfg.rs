@@ -8,9 +8,12 @@
 //! `etc/smbios/smbios-tables`, ...). Without this OVMF installs no ACPI tables,
 //! and an OS that needs ACPI - Windows - cannot start.
 //!
-//! This is the traditional port interface only; the DMA interface is not
-//! offered (the revision register says so), and OVMF falls back to reading
-//! bytes, which it does with string I/O the run loop already emulates.
+//! Both interfaces are offered. The traditional one moves a byte at a time over
+//! the data port. The DMA one (revision bit 1) has the guest write the address
+//! of a small control block to port `0x514`/`0x518`; the device then reads,
+//! skips or *writes* the selected item straight to or from guest memory. OVMF
+//! uses DMA when it can: it is much faster for the ACPI tables, and it is the
+//! only way to write an item, which the `ramfb` display needs.
 //!
 //! Pure and host-tested.
 
@@ -19,10 +22,26 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::virtio_blk::GuestMemory;
+
 /// The selector port (16-bit writes).
 pub const PORT_SELECTOR: u16 = 0x510;
 /// The data port (byte reads).
 pub const PORT_DATA: u16 = 0x511;
+/// The DMA address register: two big-endian 32-bit halves, the low one
+/// (at `+4`) starting the transfer.
+pub const PORT_DMA: u16 = 0x514;
+/// What the DMA register reads back: `"QEMU CFG"`.
+const DMA_SIGNATURE: u64 = 0x5145_4D55_2043_4647;
+/// Largest DMA transfer accepted (a sanity bound, not a hardware limit).
+const DMA_MAX_BYTES: usize = 16 << 20;
+
+// Bits of the DMA control word.
+const DMA_ERROR: u32 = 1;
+const DMA_READ: u32 = 2;
+const DMA_SKIP: u32 = 4;
+const DMA_SELECT: u32 = 8;
+const DMA_WRITE: u32 = 16;
 
 /// Fixed items.
 const SEL_SIGNATURE: u16 = 0x00;
@@ -37,8 +56,10 @@ const SEL_FILE_DIR: u16 = 0x19;
 const SEL_FILE_FIRST: u16 = 0x20;
 /// Bytes of a file name in the directory (NUL-padded).
 const NAME_BYTES: usize = 56;
-/// `FW_CFG_ID` bit 0: the traditional interface exists (bit 1, DMA, is not offered).
+/// `FW_CFG_ID` bit 0: the traditional interface exists.
 const ID_TRADITIONAL: u32 = 1;
+/// `FW_CFG_ID` bit 1: the DMA interface exists.
+const ID_DMA: u32 = 2;
 
 /// The machine facts the fixed items report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,11 +72,12 @@ pub struct MachineInfo {
     pub cpus: u16,
 }
 
-/// A named blob the firmware can read.
+/// A named blob the firmware can read (and, if `writable`, overwrite in place).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct File {
     name: String,
     data: Vec<u8>,
+    writable: bool,
 }
 
 /// The `fw_cfg` device.
@@ -65,6 +87,10 @@ pub struct FwCfg {
     files: Vec<File>,
     selector: u16,
     offset: usize,
+    /// The high half of a DMA address, latched until the low half arrives.
+    dma_high: u32,
+    /// A DMA request the guest has made and the run loop has not served yet.
+    dma_pending: Option<u64>,
 }
 
 impl FwCfg {
@@ -73,7 +99,7 @@ impl FwCfg {
     pub fn new(machine: MachineInfo) -> Self {
         let fixed = alloc::vec![
             (SEL_SIGNATURE, b"QEMU".to_vec()),
-            (SEL_ID, ID_TRADITIONAL.to_le_bytes().to_vec()),
+            (SEL_ID, (ID_TRADITIONAL | ID_DMA).to_le_bytes().to_vec()),
             (SEL_UUID, machine.uuid.to_vec()),
             (SEL_RAM_SIZE, machine.ram_bytes.to_le_bytes().to_vec()),
             (SEL_NB_CPUS, machine.cpus.to_le_bytes().to_vec()),
@@ -84,6 +110,8 @@ impl FwCfg {
             files: Vec::new(),
             selector: 0,
             offset: 0,
+            dma_high: 0,
+            dma_pending: None,
         }
     }
 
@@ -93,10 +121,25 @@ impl FwCfg {
     ///
     /// If `name` does not fit the directory entry (55 bytes and a NUL).
     pub fn add_file(&mut self, name: &str, data: Vec<u8>) -> u16 {
+        self.push_file(name, data, false)
+    }
+
+    /// Publish `data` under `name` as a file the guest may overwrite (by DMA
+    /// write, in place and not beyond its size); returns the item number.
+    ///
+    /// # Panics
+    ///
+    /// If `name` does not fit the directory entry (55 bytes and a NUL).
+    pub fn add_writable_file(&mut self, name: &str, data: Vec<u8>) -> u16 {
+        self.push_file(name, data, true)
+    }
+
+    fn push_file(&mut self, name: &str, data: Vec<u8>, writable: bool) -> u16 {
         assert!(name.len() < NAME_BYTES, "fw_cfg file name too long: {name}");
         self.files.push(File {
             name: String::from(name),
             data,
+            writable,
         });
         SEL_FILE_FIRST + u16::try_from(self.files.len() - 1).unwrap_or(0)
     }
@@ -145,13 +188,24 @@ impl FwCfg {
     /// Whether the device owns I/O port `port`.
     #[must_use]
     pub const fn claims(port: u16) -> bool {
-        port == PORT_SELECTOR || port == PORT_SELECTOR + 1 || port == PORT_DATA
+        port == PORT_SELECTOR
+            || port == PORT_SELECTOR + 1
+            || port == PORT_DATA
+            || (port >= PORT_DMA && port < PORT_DMA + 8)
     }
 
     /// An `IN` of `size` bytes: the data port returns the next bytes of the
     /// selected item (zeros past its end, as on QEMU); the selector reads back
-    /// as the selected item number.
+    /// as the selected item number; the DMA register reads as `"QEMU CFG"`.
     pub fn io_read(&mut self, port: u16, size: u8) -> u32 {
+        if (PORT_DMA..PORT_DMA + 8).contains(&port) {
+            // The signature, as a big-endian 64-bit register: a read returns the
+            // `size` bytes at `port`, as one integer.
+            let size = u32::from(size.clamp(1, 4));
+            let shift = 8u32.saturating_sub(u32::from(port - PORT_DMA) + size) * 8;
+            #[allow(clippy::cast_possible_truncation)] // masked to the access size
+            return ((DMA_SIGNATURE >> shift) & ((1u64 << (size * 8)) - 1)) as u32;
+        }
         if port != PORT_DATA {
             return u32::from(self.selector);
         }
@@ -165,12 +219,96 @@ impl FwCfg {
         v
     }
 
-    /// An `OUT` to the selector selects an item and restarts reading it.
-    pub const fn io_write(&mut self, port: u16, size: u8, val: u32) {
+    /// An `OUT` to the selector selects an item and restarts reading it; the two
+    /// halves of the DMA register latch a request (see [`Self::take_dma`]).
+    pub fn io_write(&mut self, port: u16, size: u8, val: u32) {
+        if (PORT_DMA..PORT_DMA + 8).contains(&port) {
+            if size == 4 {
+                match port - PORT_DMA {
+                    0 => self.dma_high = val.swap_bytes(),
+                    4 => {
+                        self.dma_pending =
+                            Some(u64::from(self.dma_high) << 32 | u64::from(val.swap_bytes()));
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
         if port == PORT_SELECTOR && size >= 2 {
             self.selector = (val & 0xFFFF) as u16;
             self.offset = 0;
         }
+    }
+
+    /// The DMA request the guest just made, if any: the guest-physical address
+    /// of its control block, to pass to [`Self::dma`].
+    pub const fn take_dma(&mut self) -> Option<u64> {
+        self.dma_pending.take()
+    }
+
+    /// Serve the DMA request whose control block is at `addr`.
+    ///
+    /// The block is a big-endian control word, a length and a guest address. The
+    /// control word may select an item first, then reads (zeros past the item's
+    /// end), skips or writes `length` bytes at the current offset. The word is
+    /// replaced by `0` on success or the error bit on failure - a write to a
+    /// read-only item, past a writable one's end, or to memory that is not RAM.
+    pub fn dma(&mut self, mem: &dyn GuestMemory, addr: u64) {
+        let mut block = [0u8; 16];
+        if !mem.read(addr, &mut block) {
+            return;
+        }
+        let word = |at: usize| {
+            u32::from_be_bytes([block[at], block[at + 1], block[at + 2], block[at + 3]])
+        };
+        let (control, length) = (word(0), usize::try_from(word(4)).unwrap_or(usize::MAX));
+        let target = u64::from_be_bytes(block[8..16].try_into().unwrap_or([0; 8]));
+        if control & DMA_SELECT != 0 {
+            self.selector = (control >> 16) as u16;
+            self.offset = 0;
+        }
+        let ok = length <= DMA_MAX_BYTES
+            && if control & DMA_READ != 0 {
+                let item = self.selected();
+                let chunk: Vec<u8> = (0..length)
+                    .map(|i| item.get(self.offset + i).copied().unwrap_or(0))
+                    .collect();
+                self.offset += length;
+                mem.write(target, &chunk)
+            } else if control & DMA_WRITE != 0 {
+                let done = self.write_selected(mem, target, length);
+                self.offset += length;
+                done
+            } else {
+                // A skip, or a select with nothing to move.
+                if control & DMA_SKIP != 0 {
+                    self.offset += length;
+                }
+                true
+            };
+        let status = if ok { 0 } else { DMA_ERROR };
+        let _ = mem.write(addr, &status.to_be_bytes());
+    }
+
+    /// Overwrite the selected item with `length` bytes from guest memory at
+    /// `from`, if it is a writable file and the span lies inside it.
+    fn write_selected(&mut self, mem: &dyn GuestMemory, from: u64, length: usize) -> bool {
+        let Some(index) = usize::from(self.selector).checked_sub(usize::from(SEL_FILE_FIRST))
+        else {
+            return false;
+        };
+        let offset = self.offset;
+        let Some(file) = self.files.get_mut(index).filter(|f| f.writable) else {
+            return false;
+        };
+        let Some(span) = offset
+            .checked_add(length)
+            .and_then(|end| file.data.get_mut(offset..end))
+        else {
+            return false;
+        };
+        mem.read(from, span)
     }
 }
 
@@ -197,8 +335,8 @@ mod tests {
     fn the_signature_and_revision_identify_the_interface() {
         let mut d = FwCfg::new(machine());
         assert_eq!(read_item(&mut d, 0, 4), b"QEMU");
-        // Revision: the traditional interface only, no DMA bit.
-        assert_eq!(read_item(&mut d, 1, 4), [1, 0, 0, 0]);
+        // Revision: the traditional interface and the DMA one.
+        assert_eq!(read_item(&mut d, 1, 4), [3, 0, 0, 0]);
     }
 
     #[test]
@@ -262,9 +400,178 @@ mod tests {
     }
 
     #[test]
-    fn only_the_two_ports_are_claimed() {
+    fn only_the_selector_data_and_dma_ports_are_claimed() {
         assert!(FwCfg::claims(0x510) && FwCfg::claims(0x511));
-        assert!(!FwCfg::claims(0x50F) && !FwCfg::claims(0x514));
+        assert!(FwCfg::claims(0x514) && FwCfg::claims(0x51B));
+        assert!(!FwCfg::claims(0x50F) && !FwCfg::claims(0x512) && !FwCfg::claims(0x51C));
+    }
+
+    /// Guest RAM for DMA tests: `bytes` from guest address 0.
+    struct Ram(core::cell::RefCell<Vec<u8>>);
+
+    impl Ram {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self(core::cell::RefCell::new(bytes))
+        }
+
+        fn bytes(&self, at: usize, len: usize) -> Vec<u8> {
+            self.0.borrow()[at..at + len].to_vec()
+        }
+    }
+
+    impl GuestMemory for Ram {
+        fn read(&self, gpa: u64, buf: &mut [u8]) -> bool {
+            let Ok(at) = usize::try_from(gpa) else {
+                return false;
+            };
+            self.0
+                .borrow()
+                .get(at..at + buf.len())
+                .map(|s| buf.copy_from_slice(s))
+                .is_some()
+        }
+
+        fn write(&self, gpa: u64, data: &[u8]) -> bool {
+            let Ok(at) = usize::try_from(gpa) else {
+                return false;
+            };
+            self.0
+                .borrow_mut()
+                .get_mut(at..at + data.len())
+                .map(|s| s.copy_from_slice(data))
+                .is_some()
+        }
+    }
+
+    /// Write a DMA control block at `at` and ring the register for it.
+    fn request(d: &mut FwCfg, ram: &Ram, at: u64, control: u32, length: u32, target: u64) {
+        let mut block = Vec::new();
+        block.extend_from_slice(&control.to_be_bytes());
+        block.extend_from_slice(&length.to_be_bytes());
+        block.extend_from_slice(&target.to_be_bytes());
+        assert!(ram.write(at, &block));
+        d.io_write(PORT_DMA, 4, ((at >> 32) as u32).swap_bytes());
+        assert_eq!(d.take_dma(), None, "the low half starts the transfer");
+        d.io_write(PORT_DMA + 4, 4, (at as u32).swap_bytes());
+        let addr = d.take_dma().expect("a request is pending");
+        assert_eq!(addr, at);
+        assert_eq!(d.take_dma(), None, "taken once");
+        d.dma(ram, addr);
+    }
+
+    fn status(ram: &Ram, at: u64) -> u32 {
+        let mut s = [0u8; 4];
+        assert!(ram.read(at, &mut s));
+        u32::from_be_bytes(s)
+    }
+
+    #[test]
+    fn the_dma_register_reads_back_its_signature() {
+        let mut d = FwCfg::new(machine());
+        assert_eq!(
+            d.io_read(PORT_DMA, 4),
+            0x5145_4D55,
+            "high half, as an integer"
+        );
+        assert_eq!(d.io_read(PORT_DMA + 4, 4), 0x2043_4647);
+        assert_eq!(d.io_read(PORT_DMA, 1), 0x51);
+        assert_eq!(d.io_read(PORT_DMA + 7, 1), 0x47);
+    }
+
+    #[test]
+    fn a_dma_read_selects_and_fills_guest_memory() {
+        let mut d = FwCfg::new(machine());
+        let f = d.add_file("x", alloc::vec![10, 20, 30]);
+        let ram = Ram::new(alloc::vec![0xEE; 256]);
+        // SELECT | READ of five bytes: the file, then zeros past its end.
+        request(
+            &mut d,
+            &ram,
+            0,
+            (u32::from(f) << 16) | DMA_SELECT | DMA_READ,
+            5,
+            64,
+        );
+        assert_eq!(ram.bytes(64, 5), [10, 20, 30, 0, 0]);
+        assert_eq!(status(&ram, 0), 0, "success clears the control word");
+        assert_eq!(
+            ram.bytes(69, 1),
+            [0xEE],
+            "nothing past the length is touched"
+        );
+    }
+
+    #[test]
+    fn dma_continues_from_the_current_offset_and_can_skip() {
+        let mut d = FwCfg::new(machine());
+        let f = d.add_file("x", alloc::vec![1, 2, 3, 4, 5, 6]);
+        let ram = Ram::new(alloc::vec![0; 256]);
+        d.io_write(PORT_SELECTOR, 2, u32::from(f));
+        request(&mut d, &ram, 0, DMA_SKIP, 2, 0);
+        request(&mut d, &ram, 0, DMA_READ, 3, 100);
+        assert_eq!(ram.bytes(100, 3), [3, 4, 5]);
+        // The byte interface continues where DMA left off.
+        assert_eq!(d.io_read(PORT_DATA, 1), 6);
+    }
+
+    #[test]
+    fn a_dma_write_changes_a_writable_file_in_place() {
+        let mut d = FwCfg::new(machine());
+        let f = d.add_writable_file("etc/ramfb", alloc::vec![0; 8]);
+        let ram = Ram::new(alloc::vec![0; 256]);
+        assert!(ram.write(200, &[9, 8, 7, 6]));
+        d.io_write(PORT_SELECTOR, 2, u32::from(f));
+        request(&mut d, &ram, 0, DMA_WRITE, 4, 200);
+        assert_eq!(status(&ram, 0), 0);
+        assert_eq!(d.file("etc/ramfb"), Some(&[9u8, 8, 7, 6, 0, 0, 0, 0][..]));
+        // A write that would run past the end is refused and changes nothing.
+        d.io_write(PORT_SELECTOR, 2, u32::from(f));
+        request(&mut d, &ram, 0, DMA_WRITE, 9, 200);
+        assert_eq!(status(&ram, 0), DMA_ERROR);
+        assert_eq!(d.file("etc/ramfb"), Some(&[9u8, 8, 7, 6, 0, 0, 0, 0][..]));
+    }
+
+    #[test]
+    fn a_dma_write_to_a_read_only_or_fixed_item_is_an_error() {
+        let mut d = FwCfg::new(machine());
+        let f = d.add_file("ro", alloc::vec![1, 2]);
+        let ram = Ram::new(alloc::vec![0; 64]);
+        d.io_write(PORT_SELECTOR, 2, u32::from(f));
+        request(&mut d, &ram, 0, DMA_WRITE, 2, 32);
+        assert_eq!(status(&ram, 0), DMA_ERROR);
+        assert_eq!(d.file("ro"), Some(&[1u8, 2][..]));
+        d.io_write(PORT_SELECTOR, 2, u32::from(SEL_UUID));
+        request(&mut d, &ram, 0, DMA_WRITE, 2, 32);
+        assert_eq!(status(&ram, 0), DMA_ERROR);
+    }
+
+    #[test]
+    fn a_dma_to_memory_that_is_not_ram_is_an_error_and_oversize_is_refused() {
+        let mut d = FwCfg::new(machine());
+        let ram = Ram::new(alloc::vec![0; 64]);
+        request(&mut d, &ram, 0, DMA_SELECT | DMA_READ, 4, 1 << 40);
+        assert_eq!(status(&ram, 0), DMA_ERROR);
+        request(&mut d, &ram, 0, DMA_SELECT | DMA_READ, u32::MAX, 32);
+        assert_eq!(status(&ram, 0), DMA_ERROR);
+        // A control block outside RAM is ignored without a panic.
+        d.dma(&ram, 1 << 40);
+    }
+
+    #[test]
+    fn dma_reads_the_file_directory_like_the_byte_interface() {
+        let mut d = FwCfg::new(machine());
+        d.add_file("etc/acpi/rsdp", alloc::vec![1, 2, 3]);
+        let ram = Ram::new(alloc::vec![0; 256]);
+        let by_port = read_item(&mut d, SEL_FILE_DIR, 4 + 64);
+        request(
+            &mut d,
+            &ram,
+            0,
+            (u32::from(SEL_FILE_DIR) << 16) | DMA_SELECT | DMA_READ,
+            68,
+            64,
+        );
+        assert_eq!(ram.bytes(64, 68), by_port);
     }
 
     #[test]
