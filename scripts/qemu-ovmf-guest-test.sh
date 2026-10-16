@@ -24,6 +24,17 @@
 # Environment:
 #   ENLIL_OVMF_LINUX    1: boot Linux from the guest's virtual disk (see above;
 #                       expects "ENLIL-GUEST-TICK 3" unless ENLIL_OVMF_EXPECT is set)
+#   ENLIL_OVMF_REAL_DISK  a disk (or disk image) holding a real OS install, e.g.
+#                       /dev/nvme0n1: it is attached to the outer VM *read-only with a
+#                       throwaway write overlay* (nothing reaches it), the guest gets
+#                       the partitions in ENLIL_OVMF_REAL_PARTS (default "1 2 3", the
+#                       Windows ESP, MSR and data partitions) plus the partition
+#                       table, and boots ENLIL_OVMF_REAL_LOADER from partition
+#                       ENLIL_OVMF_REAL_BOOT_PART (defaults: Windows' boot manager on
+#                       partition 1). Needs the disk to be readable by this user.
+#   ENLIL_OVMF_SOAK_SECONDS  after the expected text appears, keep running this long
+#                       (stopping early if the guest stops), for a screenshot series
+#   ENLIL_OVMF_SCREENSHOT_EVERY  seconds between screenshots (x-0001.png ...)
 #   ENLIL_OVMF_SEEDED   1 (with ENLIL_OVMF_LINUX): the guest disk is GPT-partitioned, Limine
 #                       sits at \\EFI\\limine\\limine.efi with *no* removable-media fallback,
 #                       and disk.txt names it (boot-partition/boot-loader): the guest boots
@@ -56,7 +67,9 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUTDIR="${1:-$(mktemp -d)}"
 LINUX="${ENLIL_OVMF_LINUX:-0}"
-if [ "$LINUX" = 1 ]; then
+if [ -n "${ENLIL_OVMF_REAL_DISK:-}" ]; then
+    EXPECT="${ENLIL_OVMF_EXPECT:-BdsDxe: starting Boot0000}"
+elif [ "$LINUX" = 1 ]; then
     EXPECT="${ENLIL_OVMF_EXPECT:-ENLIL-GUEST-TICK 3}"
 else
     EXPECT="${ENLIL_OVMF_EXPECT:-BdsDxe: No bootable option}"
@@ -112,7 +125,54 @@ printf '[guest.%s]\nboot = "firmware"\n' "$GUEST_ID" > "$ESP/EFI/enlil/config.to
 cp "$GUEST_CODE" "$ESP/EFI/enlil/firmware/$GUEST_ID/OVMF_CODE.fd"
 cp "$GUEST_VARS" "$ESP/EFI/enlil/firmware/$GUEST_ID/OVMF_VARS.fd"
 DISK_ARGS=()
-if [ "$LINUX" = 1 ]; then
+REAL_DISK="${ENLIL_OVMF_REAL_DISK:-}"
+if [ -n "$REAL_DISK" ]; then
+    if [ ! -r "$REAL_DISK" ]; then
+        echo "SKIP: $REAL_DISK is not readable by $(id -un)."
+        echo "      To allow read-only access for a test run:  sudo setfacl -m u:$(id -un):r $REAL_DISK"
+        exit 2
+    fi
+    command -v sfdisk >/dev/null || { echo "SKIP: sfdisk not installed"; exit 2; }
+    # The serial number the hypervisor selects the disk by, the partitions the
+    # guest may reach, and the disk.txt that says so. Geometry comes from the
+    # partition table itself, so this works for a block device or an image.
+    REAL_SERIAL="${ENLIL_OVMF_REAL_SERIAL:-}"
+    if [ -z "$REAL_SERIAL" ] && [ -r "/sys/block/$(basename "$REAL_DISK")/device/serial" ]; then
+        REAL_SERIAL="$(tr -d ' \n' < "/sys/block/$(basename "$REAL_DISK")/device/serial")"
+    fi
+    REAL_SERIAL="${REAL_SERIAL:-enlilrealdisk}"
+    REAL_PARTS="${ENLIL_OVMF_REAL_PARTS:-1 2 3}"
+    REAL_BOOT_PART="${ENLIL_OVMF_REAL_BOOT_PART:-1}"
+    REAL_LOADER="${ENLIL_OVMF_REAL_LOADER:-\\EFI\\Microsoft\\Boot\\bootmgfw.efi}"
+    sfdisk --json "$REAL_DISK" > "$OUTDIR/real-table.json" || { echo "FAIL: sfdisk could not read $REAL_DISK"; exit 1; }
+    python3 - "$OUTDIR/real-table.json" "$REAL_SERIAL" "$REAL_PARTS" "$REAL_BOOT_PART" "$REAL_LOADER" \
+        "${ENLIL_OVMF_DISK_MODEL:-nvme}" > "$ESP/EFI/enlil/firmware/$GUEST_ID/disk.txt" <<'PY'
+import json, sys
+table, serial, parts, boot_part, loader, model = sys.argv[1:7]
+pt = json.load(open(table))["partitiontable"]
+by_number = {}
+for p in pt["partitions"]:
+    digits = "".join(c for c in p["node"].rsplit("/", 1)[-1][::-1] if c.isdigit())[::-1]
+    by_number[int(digits)] = p
+print(f"nvme-serial = {serial}")
+print(f"model = {model}")
+print("# the protective MBR, GPT header and entries, read-only")
+print(f"allow = 0-{pt.get('firstlba', 34) - 1} ro")
+for n in parts.split():
+    p = by_number[int(n)]
+    print(f"allow = {p['start']}-{p['start'] + p['size'] - 1} rw  # partition {n}")
+last = pt["lastlba"]
+print(f"allow = {last + 1}-{last + 33} ro  # the backup GPT")
+print(f"boot-partition = {boot_part}")
+print(f"boot-loader = {loader}")
+PY
+    echo "==> disk.txt for $REAL_DISK:"; sed 's/^/    /' "$ESP/EFI/enlil/firmware/$GUEST_ID/disk.txt"
+    # Reads come from the disk; every write lands in a throwaway overlay in the
+    # run directory, so the disk itself is never modified.
+    DISK_ARGS=(-drive "file=$REAL_DISK,if=none,id=vd0,format=raw,readonly=on,snapshot=on"
+               -device "nvme,drive=vd0,serial=$REAL_SERIAL")
+fi
+if [ "$LINUX" = 1 ] && [ -z "$REAL_DISK" ]; then
     LIMINE_EFI="${ENLIL_LIMINE_EFI:-/usr/share/limine/BOOTX64.EFI}"
     [ -f "$LIMINE_EFI" ] || { echo "SKIP: no Limine EFI binary at $LIMINE_EFI"; exit 2; }
     command -v qemu-img >/dev/null || { echo "SKIP: qemu-img not installed"; exit 2; }
@@ -187,7 +247,7 @@ EXTRA=()
 MONITOR_SOCK="$OUTDIR/mon.sock"
 [ -n "${ENLIL_OVMF_SCREENSHOT:-}" ] && EXTRA+=(-monitor "unix:$MONITOR_SOCK,server,nowait")
 echo "==> booting under QEMU+KVM (timeout ${TIMEOUT_SECS}s, waiting for: $EXPECT)"
-"$QEMU" \
+TMPDIR="$OUTDIR" "$QEMU" \
     -machine q35 -smp 2 -m "${ENLIL_OVMF_OUTER_MEM:-2G}" \
     -enable-kvm -cpu "host,+svm" \
     -drive "format=raw,file=fat:rw:$ESP,if=none,id=espdisk" \
@@ -200,11 +260,25 @@ echo "==> booting under QEMU+KVM (timeout ${TIMEOUT_SECS}s, waiting for: $EXPECT
 QEMU_PID=$!
 
 result=1
+SOAK="${ENLIL_OVMF_SOAK_SECONDS:-0}"
+SHOT_EVERY="${ENLIL_OVMF_SCREENSHOT_EVERY:-0}"
+seen_at=""
+tick=0
+shot=0
 for _ in $(seq "$TIMEOUT_SECS"); do
-    if grep -aqF "$EXPECT" "$SERIAL_LOG" 2>/dev/null \
-        && grep -aF "$EXPECT" "$SERIAL_LOG" | grep -aq "^\[ovmf\]"; then result=0; break; fi
+    tick=$((tick + 1))
+    if [ -z "$seen_at" ] && grep -aqF "$EXPECT" "$SERIAL_LOG" 2>/dev/null \
+        && grep -aF "$EXPECT" "$SERIAL_LOG" | grep -aq "^\[ovmf\]"; then
+        result=0; seen_at=$tick
+    fi
+    if [ -n "$seen_at" ] && [ $((tick - seen_at)) -ge "$SOAK" ]; then break; fi
     if grep -aq "ovmf: guest stopped" "$SERIAL_LOG" 2>/dev/null; then sleep 1; break; fi
     kill -0 "$QEMU_PID" 2>/dev/null || break
+    if [ "$SHOT_EVERY" -gt 0 ] && [ -n "${ENLIL_OVMF_SCREENSHOT:-}" ] && [ $((tick % SHOT_EVERY)) -eq 0 ]; then
+        shot=$((shot + 1))
+        python3 "$REPO_ROOT/scripts/qemu-screendump.py" "$MONITOR_SOCK" \
+            "${ENLIL_OVMF_SCREENSHOT%.png}-$(printf %04d "$shot").png" || true
+    fi
     sleep 1
 done
 if [ -n "${ENLIL_OVMF_SCREENSHOT:-}" ]; then
