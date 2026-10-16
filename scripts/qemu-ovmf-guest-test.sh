@@ -24,6 +24,10 @@
 # Environment:
 #   ENLIL_OVMF_LINUX    1: boot Linux from the guest's virtual disk (see above;
 #                       expects "ENLIL-GUEST-TICK 3" unless ENLIL_OVMF_EXPECT is set)
+#   ENLIL_OVMF_SEEDED   1 (with ENLIL_OVMF_LINUX): the guest disk is GPT-partitioned, Limine
+#                       sits at \\EFI\\limine\\limine.efi with *no* removable-media fallback,
+#                       and disk.txt names it (boot-partition/boot-loader): the guest boots
+#                       only if enlil seeded a boot entry into the firmware's variable store
 #   ENLIL_OVMF_DISK_MODEL  virtio (default) or nvme: the controller the guest's
 #                       virtual disk appears on (Windows needs nvme)
 #   ENLIL_OVMF_CMDLINE  the guest kernel command line, replacing the legacy-PIC one
@@ -114,8 +118,14 @@ if [ "$LINUX" = 1 ]; then
     # way a real install would be (protocol linux, kernel + initramfs by path).
     GESP="$OUTDIR/guest-esp"
     rm -rf "$GESP"
-    mkdir -p "$GESP/EFI/BOOT"
-    cp "$LIMINE_EFI" "$GESP/EFI/BOOT/BOOTX64.EFI"
+    SEEDED="${ENLIL_OVMF_SEEDED:-0}"
+    if [ "$SEEDED" = 1 ]; then
+        mkdir -p "$GESP/EFI/limine"
+        cp "$LIMINE_EFI" "$GESP/EFI/limine/limine.efi"
+    else
+        mkdir -p "$GESP/EFI/BOOT"
+        cp "$LIMINE_EFI" "$GESP/EFI/BOOT/BOOTX64.EFI"
+    fi
     cp "$GUEST_DIR/vmlinuz" "$GUEST_DIR/initrd.img" "$GESP/"
     {
         echo "timeout: 0"
@@ -127,10 +137,35 @@ if [ "$LINUX" = 1 ]; then
         echo "    cmdline: ${ENLIL_OVMF_CMDLINE:-$(tr -d '\n' < "$GUEST_DIR/cmdline.txt")} ${ENLIL_OVMF_CMDLINE_EXTRA:-}"
         echo "    module_path: boot():/initrd.img"
     } > "$GESP/limine.conf"
+    # Loaded from a boot entry, Limine looks beside its own executable first.
+    [ "$SEEDED" = 1 ] && cp "$GESP/limine.conf" "$GESP/EFI/limine/limine.conf"
     # vvfat builds the FAT image from the directory with no root and no mtools.
     qemu-img convert -f vvfat -O raw "fat:$GESP" "$OUTDIR/guest-disk.img" || { echo "FAIL: vvfat"; exit 1; }
     printf 'nvme-serial = enlilvdisk\nmodel = %s\nallow = all rw\n' "${ENLIL_OVMF_DISK_MODEL:-virtio}" \
         > "$ESP/EFI/enlil/firmware/$GUEST_ID/disk.txt"
+    if [ "$SEEDED" = 1 ]; then
+        # Put the FAT filesystem in partition 1 of a GPT disk (1 MiB aligned).
+        # vvfat's image is itself an MBR disk with one partition: pull that
+        # partition out, or the GPT partition would hold a nested partition table.
+        command -v sfdisk >/dev/null || { echo "SKIP: sfdisk not installed"; exit 2; }
+        mv "$OUTDIR/guest-disk.img" "$OUTDIR/guest-vvfat.img"
+        read -r FAT_START FAT_SECTORS < <(python3 -c '
+import struct, sys
+mbr = open(sys.argv[1], "rb").read(512)
+print(*struct.unpack_from("<II", mbr, 446 + 8))' "$OUTDIR/guest-vvfat.img")
+        dd if="$OUTDIR/guest-vvfat.img" of="$OUTDIR/guest-fat.img" bs=512 \
+            skip="$FAT_START" count="$FAT_SECTORS" status=none
+        rm -f "$OUTDIR/guest-vvfat.img"
+        FAT_BYTES=$(stat -c %s "$OUTDIR/guest-fat.img")
+        truncate -s $((FAT_BYTES + 2 * 1024 * 1024)) "$OUTDIR/guest-disk.img"
+        printf 'label: gpt\nstart=2048, size=%d, type=U\n' $((FAT_BYTES / 512)) \
+            | sfdisk --quiet "$OUTDIR/guest-disk.img" || { echo "FAIL: sfdisk"; exit 1; }
+        dd if="$OUTDIR/guest-fat.img" of="$OUTDIR/guest-disk.img" bs=512 seek=2048 \
+            conv=notrunc,sparse status=none
+        rm -f "$OUTDIR/guest-fat.img"
+        printf 'boot-partition = 1\nboot-loader = %s\n' '\EFI\limine\limine.efi' \
+            >> "$ESP/EFI/enlil/firmware/$GUEST_ID/disk.txt"
+    fi
     DISK_ARGS=(-drive "file=$OUTDIR/guest-disk.img,if=none,id=vd0,format=raw,cache=writethrough"
                -device "nvme,drive=vd0,serial=enlilvdisk")
 fi

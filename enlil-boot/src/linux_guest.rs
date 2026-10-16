@@ -1995,16 +1995,31 @@ mod hw {
         None
     }
 
+    /// A firmware guest's boot entry, resolved against its disk's partition
+    /// table: the partition and the loader file on it.
+    struct BootRequest {
+        partition: crate::gpt::Partition,
+        loader: String,
+    }
+
     /// Attach the guest's virtual disk if the ESP assigned one: parse
     /// `disk.txt`, find the named host disk and wrap it in the allow-list.
-    fn attach_disk(serial: &SerialPort, label: &str, file: StagedFile, io: &mut IoBus) {
+    ///
+    /// Returns the boot entry `disk.txt` asked for, resolved to its partition,
+    /// for the caller to seed into the firmware's variable store.
+    fn attach_disk(
+        serial: &SerialPort,
+        label: &str,
+        file: StagedFile,
+        io: &mut IoBus,
+    ) -> Option<BootRequest> {
         // SAFETY: the extent comes from the UEFI stage's handoff.
         let bytes = unsafe { staged(file) };
         if bytes.is_empty() {
             serial.write_str(&format!(
                 "enlil kernel: {label}: no disk assignment (disk.txt) - the guest gets no disk\n"
             ));
-            return;
+            return None;
         }
         let cfg = match core::str::from_utf8(bytes)
             .map_err(|_| String::from("not UTF-8"))
@@ -2015,15 +2030,32 @@ mod hw {
                 serial.write_str(&format!(
                     "enlil kernel: {label}: bad disk.txt ({e}) - no disk\n"
                 ));
-                return;
+                return None;
             }
         };
-        let Some(backend) = open_disk(serial, label, &cfg.serial) else {
+        let Some(mut backend) = open_disk(serial, label, &cfg.serial) else {
             serial.write_str(&format!(
                 "enlil kernel: {label}: no NVMe disk matches the assigned serial - no disk\n"
             ));
-            return;
+            return None;
         };
+        // Resolve the boot entry now, while the whole partition table is
+        // readable: the guest's allow-list may hide it later.
+        let boot = cfg.boot.as_ref().and_then(|b| {
+            match crate::gpt::find_partition(&mut backend, b.partition) {
+                Ok(partition) => Some(BootRequest {
+                    partition,
+                    loader: b.loader.clone(),
+                }),
+                Err(e) => {
+                    serial.write_str(&format!(
+                        "enlil kernel: {label}: boot-partition {} not found on the disk ({e:?}) - no boot entry\n",
+                        b.partition
+                    ));
+                    None
+                }
+            }
+        });
         let sectors = backend.sectors();
         let ranges = cfg.clamped(sectors);
         let read_only = ranges.iter().all(|r| !r.writable);
@@ -2049,6 +2081,40 @@ mod hw {
                 io.attach_nvme(disk, identity, read_only);
             }
         }
+        boot
+    }
+
+    /// Put the boot entry `disk.txt` asked for into the guest firmware's
+    /// variable store, before the guest runs.
+    fn seed_boot_entry(
+        serial: &SerialPort,
+        label: &str,
+        boot: Option<BootRequest>,
+        vars: Option<&mut VarsFlash>,
+    ) {
+        let Some(boot) = boot else { return };
+        let Some(vars) = vars else {
+            serial.write_str(&format!(
+                "enlil kernel: {label}: boot-partition is for firmware guests - ignored\n"
+            ));
+            return;
+        };
+        let entry = crate::efivars::BootEntry {
+            description: "Enlil guest",
+            partition: boot.partition,
+            loader: &boot.loader,
+        };
+        let msg = match crate::efivars::seed_boot_entry(vars.memory(), &entry) {
+            Ok(n) => format!(
+                "boot entry Boot{n:04X}: partition {} ({} sectors from {}), {}",
+                boot.partition.number,
+                boot.partition.sectors(),
+                boot.partition.first_lba,
+                boot.loader
+            ),
+            Err(e) => format!("could not seed a boot entry into the variable store: {e:?}"),
+        };
+        serial.write_str(&format!("enlil kernel: {label}: {msg}\n"));
     }
 
     /// Clear both bits of every passthrough MSR in a fully-armed MSRPM.
@@ -2564,7 +2630,9 @@ mod hw {
                 io.set_fwcfg(f);
             }
         }
-        attach_disk(serial, label, disk, &mut io);
+        let boot = attach_disk(serial, label, disk, &mut io);
+        let mut vars = vars;
+        seed_boot_entry(serial, label, boot, vars.as_mut());
         let (stop, counts, trace, irq_trace) = run(
             serial,
             label,

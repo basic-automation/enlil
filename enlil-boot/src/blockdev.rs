@@ -239,6 +239,9 @@ pub enum ConfigError {
     NoSerial,
     /// No `allow` range was given: nothing would be accessible.
     NoRanges,
+    /// Only one of `boot-partition` and `boot-loader` was given (a boot entry
+    /// needs both) or `boot-partition` is not a partition number.
+    BadBootEntry,
 }
 
 /// Which host disk a guest's virtual disk is carved from, and how much of it.
@@ -250,6 +253,18 @@ pub struct DiskConfig {
     pub ranges: Vec<Allow>,
     /// The controller the guest sees the disk through.
     pub model: DiskModel,
+    /// The boot entry to seed into a firmware guest's variable store, if any.
+    pub boot: Option<BootTarget>,
+}
+
+/// The loader a firmware guest should boot: a file on one of the disk's GPT
+/// partitions. The hypervisor turns this into a UEFI boot entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootTarget {
+    /// The partition holding the loader (1-based, as in `nvme0n1p1`).
+    pub partition: u32,
+    /// The loader's path on that partition, e.g. `\EFI\Microsoft\Boot\bootmgfw.efi`.
+    pub loader: String,
 }
 
 /// The kind of controller a guest's virtual disk appears on.
@@ -281,6 +296,9 @@ impl DiskConfig {
     /// allow = 0-2047 ro        # sectors 0..=2047, read-only (GPT + ESP)
     /// allow = 4096-0xFFFFF rw  # a partition, read-write
     /// allow = all ro           # the whole disk, read-only
+    /// model = nvme             # the controller the guest sees
+    /// boot-partition = 1       # a firmware guest's boot entry: GPT partition ...
+    /// boot-loader = \EFI\Microsoft\Boot\bootmgfw.efi   # ... and loader file
     /// ```
     ///
     /// Range ends are inclusive. The disk size is not known here, so `all` is
@@ -294,6 +312,8 @@ impl DiskConfig {
         let mut serial = None;
         let mut model = DiskModel::default();
         let mut ranges = Vec::new();
+        let mut boot_partition = None;
+        let mut boot_loader = None;
         for raw in text.lines() {
             let line = raw.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
@@ -313,9 +333,25 @@ impl DiskConfig {
                         _ => return Err(ConfigError::BadLine(String::from(line))),
                     };
                 }
+                "boot-partition" => {
+                    boot_partition = Some(
+                        parse_u64(value)
+                            .and_then(|n| u32::try_from(n).ok())
+                            .filter(|&n| n != 0)
+                            .ok_or(ConfigError::BadBootEntry)?,
+                    );
+                }
+                "boot-loader" => boot_loader = Some(String::from(value)),
                 _ => return Err(ConfigError::BadLine(String::from(line))),
             }
         }
+        let boot = match (boot_partition, boot_loader) {
+            (Some(partition), Some(loader)) if !loader.is_empty() => {
+                Some(BootTarget { partition, loader })
+            }
+            (None, None) => None,
+            _ => return Err(ConfigError::BadBootEntry),
+        };
         let serial = serial
             .filter(|s| !s.is_empty())
             .ok_or(ConfigError::NoSerial)?;
@@ -326,6 +362,7 @@ impl DiskConfig {
             serial,
             ranges,
             model,
+            boot,
         })
     }
 
@@ -520,6 +557,45 @@ mod tests {
             DiskConfig::parse(&format!("{base}model = ide\n")),
             Err(ConfigError::BadLine(_))
         ));
+    }
+
+    #[test]
+    fn config_names_a_boot_entry() {
+        let base = "nvme-serial = X\nallow = 0-1 ro\n";
+        assert_eq!(DiskConfig::parse(base).unwrap().boot, None);
+        let c = DiskConfig::parse(&format!(
+            "{base}boot-partition = 1 # the ESP\nboot-loader = \\EFI\\Microsoft\\Boot\\bootmgfw.efi\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            c.boot,
+            Some(BootTarget {
+                partition: 1,
+                loader: String::from("\\EFI\\Microsoft\\Boot\\bootmgfw.efi"),
+            })
+        );
+        let hex =
+            DiskConfig::parse(&format!("{base}boot-partition = 0x2\nboot-loader = /a\n")).unwrap();
+        assert_eq!(hex.boot.map(|b| b.partition), Some(2));
+    }
+
+    #[test]
+    fn a_boot_entry_needs_both_halves_and_a_real_partition() {
+        let base = "nvme-serial = X\nallow = 0-1 ro\n";
+        for bad in [
+            "boot-partition = 1\n",
+            "boot-loader = \\EFI\\x.efi\n",
+            "boot-partition = 0\nboot-loader = \\x\n",
+            "boot-partition = one\nboot-loader = \\x\n",
+            "boot-partition = 4294967296\nboot-loader = \\x\n",
+            "boot-partition = 1\nboot-loader =\n",
+        ] {
+            assert_eq!(
+                DiskConfig::parse(&format!("{base}{bad}")),
+                Err(ConfigError::BadBootEntry),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
