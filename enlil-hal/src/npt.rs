@@ -417,6 +417,77 @@ pub fn set_npt_4kib_leaf_writable(
     Ok(())
 }
 
+/// Make the 4 KiB leaf mapping `gpa` present or not present.
+///
+/// A not-present leaf keeps its address bits, so making it present again
+/// restores the same mapping. This is how memory-mapped devices whose behaviour
+/// depends on a mode (flash that reads as an array, then as a status register)
+/// switch between direct access and trapping every access. The caller must flush
+/// the guest's TLB afterwards.
+///
+/// # Errors
+///
+/// - [`NptError::UnalignedBase`] if `gpa` is not 4 KiB-aligned;
+/// - [`NptError::HugePageOnPath`] if a 2 MiB leaf covers `gpa`;
+/// - [`NptError::IntermediateNotPresent`] if a table on the path is not present
+///   or the page was never mapped (no address bits to restore).
+pub fn set_npt_4kib_leaf_present(
+    buf: &mut [u8],
+    phys_base: u64,
+    gpa: u64,
+    present: bool,
+) -> Result<(), NptError> {
+    if gpa & (PAGE_SIZE - 1) != 0 {
+        return Err(NptError::UnalignedBase);
+    }
+    let pml4_i = ((gpa >> 39) & 0x1FF) as usize;
+    let pdpt_i = ((gpa >> 30) & 0x1FF) as usize;
+    let pd_i = ((gpa >> 21) & 0x1FF) as usize;
+    let leaf_i = ((gpa >> 12) & 0x1FF) as usize;
+
+    let pdpt_off = child_offset(buf, phys_base, 0, pml4_i)?;
+    let dir_off = child_offset(buf, phys_base, pdpt_off, pdpt_i)?;
+    let table_off = child_offset(buf, phys_base, dir_off, pd_i)?;
+    let at = table_off + leaf_i * 8;
+    let entry = read_entry(buf, at)?;
+    // An entry that was never mapped has no address to bring back.
+    if entry & !(flags::PRESENT) == 0 {
+        return Err(NptError::IntermediateNotPresent);
+    }
+    let updated = if present {
+        entry | flags::PRESENT
+    } else {
+        entry & !flags::PRESENT
+    };
+    write_entry(buf, at, updated);
+    Ok(())
+}
+
+/// Make `len` bytes of 4 KiB-mapped guest-physical memory at `gpa` present or
+/// not present. See [`set_npt_4kib_leaf_present`].
+///
+/// # Errors
+///
+/// Any error from [`set_npt_4kib_leaf_present`], at the first page that fails;
+/// pages before it have already changed.
+pub fn set_npt_range_present(
+    buf: &mut [u8],
+    phys_base: u64,
+    gpa: u64,
+    len: u64,
+    present: bool,
+) -> Result<(), NptError> {
+    let end = gpa
+        .checked_add(len)
+        .ok_or(NptError::AddressOutOfRange { addr: gpa })?;
+    let mut at = gpa;
+    while at < end {
+        set_npt_4kib_leaf_present(buf, phys_base, at, present)?;
+        at += PAGE_SIZE;
+    }
+    Ok(())
+}
+
 /// Make `len` bytes of 4 KiB-mapped guest-physical memory at `gpa` read-only
 /// (or writable again). See [`set_npt_4kib_leaf_writable`].
 ///
@@ -2166,6 +2237,43 @@ mod tests {
         assert_eq!(
             leaf_entry(&buf, phys_base, gpa + PAGE_SIZE) & flags::WRITABLE,
             0
+        );
+    }
+
+    #[test]
+    fn a_page_can_be_unmapped_and_remapped_without_losing_its_address() {
+        let phys_base = 0x1_0000u64;
+        let mut buf = alloc::vec![0u8; 0x8000];
+        let mut mapper = NptMapper::new(&mut buf, phys_base).unwrap();
+        let gpa = 0xFFC0_0000u64;
+        mapper.map_range(gpa, 0x40_0000, 0x4000, &[]).unwrap();
+        assert_eq!(
+            translate_npt(&buf, phys_base, gpa + 0x1234),
+            Some(0x40_1234)
+        );
+        // Not present: every access faults, but the address bits stay.
+        set_npt_range_present(&mut buf, phys_base, gpa, 0x4000, false).unwrap();
+        assert_eq!(translate_npt(&buf, phys_base, gpa + 0x1234), None);
+        for page in 0..4 {
+            let e = leaf_entry(&buf, phys_base, gpa + page * PAGE_SIZE);
+            assert_eq!(e & flags::PRESENT, 0);
+            assert_eq!(e & 0x000F_FFFF_FFFF_F000, 0x40_0000 + page * PAGE_SIZE);
+        }
+        // Back: the same mapping returns, writability untouched.
+        set_npt_range_writable(&mut buf, phys_base, gpa, 0x4000, false).unwrap_err();
+        set_npt_range_present(&mut buf, phys_base, gpa, 0x4000, true).unwrap();
+        assert_eq!(
+            translate_npt(&buf, phys_base, gpa + 0x1234),
+            Some(0x40_1234)
+        );
+        // A page nobody ever mapped has nothing to restore.
+        assert_eq!(
+            set_npt_4kib_leaf_present(&mut buf, phys_base, gpa + 0x10000, true),
+            Err(NptError::IntermediateNotPresent)
+        );
+        assert_eq!(
+            set_npt_4kib_leaf_present(&mut buf, phys_base, gpa + 1, true),
+            Err(NptError::UnalignedBase)
         );
     }
 

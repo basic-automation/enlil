@@ -1360,6 +1360,7 @@ mod hw {
     use crate::mmio::PhysMmio;
     use crate::nvme::NvmeController;
     use crate::nvme_dev::NvmeIdentity;
+    use crate::pflash::Pflash;
     use crate::platform::{RESET_CS_BASE, RESET_RIP, flash_layout};
     use crate::serial::SerialPort;
     use crate::svm::{GuestGprs, host_cpuid, vmrun};
@@ -1374,7 +1375,8 @@ mod hw {
     use core::sync::atomic::Ordering;
     use enlil_hal::bzimage::build_boot_params;
     use enlil_hal::npt::{
-        NptMapper, build_identity_npt_2mib, build_npt_2mib, set_npt_range_writable,
+        NptMapper, build_identity_npt_2mib, build_npt_2mib, set_npt_range_present,
+        set_npt_range_writable,
     };
     use enlil_hal::region::{IoPermissionsMap, MsrPermissionsMap, Vmcb};
     use enlil_hal::svm::{
@@ -1383,9 +1385,9 @@ mod hw {
         enable_msr_intercept, encode_event_inj, encode_vintr, event_type, exit_code, exit_info_1,
         exit_info_2, guest_rax, guest_rip, int_control, intercept2, msr_exit_is_write,
         msrpm_read_bit, next_rip, program_long_mode_hlt_guest, program_minimal_hlt_guest,
-        read_save_u64, read_segment, resume_rip_after, save, set_event_inj, set_guest_rax,
-        set_guest_rip, set_int_control, set_intr_intercept, set_tsc_offset, tsc_offset,
-        write_save_u64, write_segment,
+        read_save_u64, read_segment, request_tlb_flush, resume_rip_after, save, set_event_inj,
+        set_guest_rax, set_guest_rip, set_int_control, set_intr_intercept, set_tsc_offset,
+        tsc_offset, write_save_u64, write_segment,
     };
 
     /// Command line used when the ESP has no `cmdline.txt`.
@@ -1492,6 +1494,65 @@ mod hw {
         gpa: u64,
         host: *const u8,
         len: usize,
+    }
+
+    /// The guest's variable store: a flash chip whose memory is the staged
+    /// `OVMF_VARS.fd` image. Writes to it are chip commands, and reads return the
+    /// status register while the chip is not in array mode, so its pages are
+    /// mapped read-only in array mode and not at all otherwise.
+    struct VarsFlash {
+        /// Guest-physical base and size.
+        gpa: u64,
+        len: usize,
+        /// The staged image the chip fronts.
+        host: *mut u8,
+        chip: Pflash,
+        /// The guest's nested page tables, to remap the chip's pages.
+        npt: *mut u8,
+        npt_len: usize,
+        npt_pa: u64,
+        /// How many chip commands have been logged for debugging.
+        logged: u32,
+    }
+
+    impl VarsFlash {
+        /// The offset within the chip if `gpa` is inside it.
+        fn offset(&self, gpa: u64) -> Option<usize> {
+            let off = usize::try_from(gpa.checked_sub(self.gpa)?).ok()?;
+            (off < self.len).then_some(off)
+        }
+
+        fn memory(&mut self) -> &mut [u8] {
+            // SAFETY: `host` is the staged image: `len` live, leaked bytes the
+            // kernel owns and nothing else references.
+            unsafe { core::slice::from_raw_parts_mut(self.host, self.len) }
+        }
+
+        fn read(&mut self, off: usize, size: u8) -> u64 {
+            let chip = self.chip;
+            chip.read(off, size, self.memory())
+        }
+
+        /// Run a command or data write, remapping the chip's pages when its
+        /// read mode changes.
+        fn write(&mut self, off: usize, size: u8, value: u64, vmcb: &mut [u8]) {
+            let mut chip = self.chip;
+            let changed = chip.write(off, size, value, self.memory());
+            self.chip = chip;
+            if changed {
+                // SAFETY: `npt` is the guest's leaked nested-page-table buffer.
+                let npt = unsafe { core::slice::from_raw_parts_mut(self.npt, self.npt_len) };
+                let _ = set_npt_range_present(
+                    npt,
+                    self.npt_pa,
+                    self.gpa,
+                    self.len as u64,
+                    self.chip.array_mode(),
+                );
+                // The old translation may be cached.
+                request_tlb_flush(vmcb);
+            }
+        }
     }
 
     impl FlashSpan {
@@ -1646,6 +1707,7 @@ mod hw {
         bus: &mut MmioBus,
         io: &mut IoBus,
         (trace, irq_trace): (&mut TraceRing, &mut TraceRing),
+        vars: &mut Option<VarsFlash>,
         gpa: u64,
     ) -> Result<(), Stop> {
         let rip = guest_rip(vmcb);
@@ -1661,7 +1723,8 @@ mod hw {
         // Is the address inside a virtual disk's BAR (a real device)?
         let disk = io.disk_bar(gpa);
         let plat = io.platform_mmio(gpa);
-        let first = disk.is_none() && bus.note(gpa);
+        let flash_off = vars.as_ref().and_then(|v| v.offset(gpa));
+        let first = disk.is_none() && flash_off.is_none() && bus.note(gpa);
         match access.kind {
             AccessKind::Load {
                 reg,
@@ -1669,10 +1732,11 @@ mod hw {
                 sign_extend,
                 dest_size,
             } => {
-                let raw = match (disk, plat) {
-                    (Some(target), _) => io.disk_read(target, size),
-                    (None, Some(target)) => io.platform_mmio_read(target, size),
-                    (None, None) => bus.read(gpa, size),
+                let raw = match (flash_off, disk, plat) {
+                    (Some(off), _, _) => vars.as_mut().map_or(0, |v| v.read(off, size)),
+                    (None, Some(target), _) => io.disk_read(target, size),
+                    (None, None, Some(target)) => io.platform_mmio_read(target, size),
+                    (None, None, None) => bus.read(gpa, size),
                 };
                 let value = extend(raw, size, dest_size, sign_extend);
                 let event = TraceEvent {
@@ -1724,9 +1788,13 @@ mod hw {
                 if plat.is_some() || disk.is_some() {
                     irq_trace.push(event);
                 }
-                mmio_store(
-                    serial, label, mem, bus, io, disk, plat, gpa, size, value, rip, first,
-                );
+                if let (Some(off), Some(v)) = (flash_off, vars.as_mut()) {
+                    flash_store(serial, label, v, off, size, value, vmcb);
+                } else {
+                    mmio_store(
+                        serial, label, mem, bus, io, disk, plat, gpa, size, value, rip, first,
+                    );
+                }
             }
             AccessKind::StoreImm { value } => {
                 let value = mask_to(value, size);
@@ -1741,13 +1809,37 @@ mod hw {
                 if plat.is_some() || disk.is_some() {
                     irq_trace.push(event);
                 }
-                mmio_store(
-                    serial, label, mem, bus, io, disk, plat, gpa, size, value, rip, first,
-                );
+                if let (Some(off), Some(v)) = (flash_off, vars.as_mut()) {
+                    flash_store(serial, label, v, off, size, value, vmcb);
+                } else {
+                    mmio_store(
+                        serial, label, mem, bus, io, disk, plat, gpa, size, value, rip, first,
+                    );
+                }
             }
         }
         set_guest_rip(vmcb, rip.wrapping_add(access.len as u64));
         Ok(())
+    }
+
+    /// A store to the variable-store flash: a chip command or its data. The first
+    /// few are logged, so what firmware does to its flash can be seen.
+    fn flash_store(
+        serial: &SerialPort,
+        label: &str,
+        vars: &mut VarsFlash,
+        off: usize,
+        size: u8,
+        value: u64,
+        vmcb: &mut [u8],
+    ) {
+        if vars.logged < 24 {
+            vars.logged += 1;
+            serial.write_str(&format!(
+                "enlil kernel: {label}: flash write {size}B at +{off:#x} = {value:#x}\n"
+            ));
+        }
+        vars.write(off, size, value, vmcb);
     }
 
     /// Perform an MMIO store: to the virtual disk if `disk` is set (a
@@ -2024,6 +2116,8 @@ mod hw {
         flash: [FlashSpan; 2],
         /// The `fw_cfg` device a firmware guest reads its tables from.
         fwcfg: Option<crate::fwcfg::FwCfg>,
+        /// The guest's variable-store flash chip.
+        vars: Option<VarsFlash>,
     }
 
     /// Boot a Linux `bzImage` directly by the Linux boot protocol (64-bit entry,
@@ -2180,6 +2274,7 @@ mod hw {
                 platform: false,
                 flash: [FlashSpan::NONE; 2],
                 fwcfg: None,
+                vars: None,
             },
         );
     }
@@ -2255,10 +2350,25 @@ mod hw {
             say("nested page tables did not fit");
             return;
         };
-        if set_npt_range_writable(npt_buf, npt_pa, flash.code_gpa, flash.code_len, false).is_err() {
-            say("could not write-protect the firmware code");
+        // Both images are read-only mappings: the code is ROM, and the variable
+        // store is flash, whose writes are chip commands (see `VarsFlash`).
+        if set_npt_range_writable(npt_buf, npt_pa, flash.code_gpa, flash.code_len, false).is_err()
+            || set_npt_range_writable(npt_buf, npt_pa, flash.vars_gpa, flash.vars_len, false)
+                .is_err()
+        {
+            say("could not write-protect the firmware flash");
             return;
         }
+        let vars = VarsFlash {
+            gpa: flash.vars_gpa,
+            len: usize::try_from(flash.vars_len).unwrap_or(0),
+            host: core::ptr::with_exposed_provenance_mut::<u8>(fw.vars_base as usize),
+            chip: Pflash::new(false),
+            npt: npt_buf.as_mut_ptr(),
+            npt_len: npt_buf.len(),
+            npt_pa,
+            logged: 0,
+        };
 
         // The CPU in its architectural reset state: real mode, CS = 0xF000 with
         // base 0xFFFF0000, RIP = 0xFFF0 - the reset vector, 16 bytes below 4 GiB.
@@ -2328,6 +2438,7 @@ mod hw {
                 ),
                 platform: true,
                 fwcfg: Some(machine_fwcfg(serial, handoff)),
+                vars: Some(vars),
                 flash: [
                     FlashSpan {
                         gpa: flash.vars_gpa,
@@ -2394,6 +2505,7 @@ mod hw {
             platform,
             flash,
             fwcfg,
+            vars,
         } = l;
         let tsc_hz = crate::kernel::TSC_HZ.load(Ordering::Acquire);
         let v = vmcb.as_bytes_mut();
@@ -2462,6 +2574,7 @@ mod hw {
             deadline,
             mem,
             io,
+            vars,
         );
         report(
             serial,
@@ -2527,6 +2640,7 @@ mod hw {
         deadline: u64,
         mem: GuestMem,
         mut bus: IoBus,
+        mut vars: Option<VarsFlash>,
     ) -> (Stop, Counts, Box<TraceRing>, Box<TraceRing>) {
         // A firmware guest gets the platform devices around its CPU, and the
         // discovery log that shows what a silent firmware touches.
@@ -2899,6 +3013,7 @@ mod hw {
                         &mut mmio,
                         &mut bus,
                         (&mut trace, &mut irq_trace),
+                        &mut vars,
                         gpa,
                     ) {
                         break stop;

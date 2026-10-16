@@ -48,6 +48,7 @@ pub mod paging;
 pub mod pci;
 pub mod pci_dev;
 pub mod percpu;
+pub mod pflash;
 pub mod platform;
 pub mod serial;
 pub mod service_vm;
