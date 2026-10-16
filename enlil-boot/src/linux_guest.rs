@@ -23,6 +23,7 @@ extern crate alloc;
 
 use crate::blockdev::BlockBackend;
 use crate::pci_dev::{PciFunction, pci_target};
+use crate::platform::{Platform, PlatformEvent};
 use crate::svm::{CpuidRegs, sanitize_cpuid};
 use crate::vdev::{PicPair, Pit8254};
 use crate::virtio_blk::VirtioBlk;
@@ -595,6 +596,15 @@ impl MsrState {
         Self::default()
     }
 
+    /// An MSR state for a guest with a local APIC: `IA32_APIC_BASE` reports the
+    /// APIC enabled at its architectural base, as the boot processor.
+    #[must_use]
+    pub fn with_apic() -> Self {
+        let mut m = Self::default();
+        m.shadow.insert(MSR_APIC_BASE, 0xFEE0_0900);
+        m
+    }
+
     /// What a guest `RDMSR` of `msr` returns.
     #[must_use]
     pub fn read(&self, msr: u32) -> MsrRead {
@@ -641,6 +651,8 @@ pub enum IoEvent {
     /// The guest asked the machine to reset (keyboard-controller pulse or
     /// `0xCF9`).
     Reset,
+    /// The guest entered the ACPI soft-off state: power the machine off.
+    PowerOff,
 }
 
 /// The guest's legacy I/O port space.
@@ -662,6 +674,10 @@ pub struct IoBus {
     pub pit: Pit8254,
     /// The virtual disk on PCI bus 0, if the guest has one.
     pub virtio: Option<VirtioBlk>,
+    /// The i440FX/PIIX platform a firmware guest expects (`None` for a guest
+    /// booted directly into Linux, which is told about hardware by its zero
+    /// page instead).
+    platform: Option<Box<Platform>>,
     now: u64,
     cmos_index: u8,
     pci_addr: u32,
@@ -685,6 +701,7 @@ impl IoBus {
             pic: PicPair::new(),
             pit: Pit8254::new(tsc_hz),
             virtio: None,
+            platform: None,
             now: 0,
             cmos_index: 0,
             pci_addr: 0,
@@ -697,15 +714,31 @@ impl IoBus {
         self.virtio = Some(VirtioBlk::new(backend, VIRTIO_BLK_IRQ, read_only));
     }
 
+    /// Give the guest the i440FX/PIIX platform firmware probes: host bridge,
+    /// ISA bridge, ACPI PM timer and the CMOS RAM-size registers, for a machine
+    /// with `ram_bytes` of RAM.
+    pub fn enable_platform(&mut self, tsc_hz: u64, ram_bytes: u64) {
+        self.platform = Some(Box::new(Platform::new(tsc_hz, ram_bytes)));
+    }
+
+    /// Whether the firmware platform is present.
+    #[must_use]
+    pub const fn has_platform(&self) -> bool {
+        self.platform.is_some()
+    }
+
     /// The PCI function selected by the current `0xCF8` address, with the
     /// register offset, if one exists there.
     fn pci_function(&mut self) -> Option<(&mut PciFunction, usize)> {
         let (bus, dev, func, reg) = pci_target(self.pci_addr)?;
-        if bus == 0 && dev == VIRTIO_BLK_SLOT && func == 0 {
-            self.virtio.as_mut().map(|v| (&mut v.pci, reg))
-        } else {
-            None
+        if bus != 0 {
+            return None;
         }
+        if dev == VIRTIO_BLK_SLOT && func == 0 {
+            return self.virtio.as_mut().map(|v| (&mut v.pci, reg));
+        }
+        let platform = self.platform.as_mut()?;
+        platform.function(dev, func).map(|f| (f, reg))
     }
 
     /// Tell the bus the current host time (TSC).
@@ -716,6 +749,9 @@ impl IoBus {
     /// Let time-driven devices run: fire the PIT's IRQ 0 if due and mirror the
     /// UART's interrupt output onto IRQ 4.
     pub fn poll_devices(&mut self) {
+        if let Some(p) = self.platform.as_mut() {
+            p.lapic_mut().poll(self.now);
+        }
         if self.pit.poll(self.now) {
             self.pic.set_irq(0, true);
             self.pic.set_irq(0, false);
@@ -725,26 +761,80 @@ impl IoBus {
         self.pic.set_irq(VIRTIO_BLK_IRQ, disk_irq);
     }
 
-    /// The vector of the interrupt waiting to be delivered, if any.
+    /// The vector of the interrupt waiting to be delivered, if any: the local
+    /// APIC's own (its timer) first, then the legacy PIC's, which reaches the CPU
+    /// through the APIC's `LINT0` virtual wire once an APIC is on.
     #[must_use]
-    pub const fn pending_vector(&self) -> Option<u8> {
+    pub fn pending_vector(&self) -> Option<u8> {
+        if let Some(p) = &self.platform {
+            if let Some(v) = p.lapic().pending_vector() {
+                return Some(v);
+            }
+            if !p.lapic().extint_enabled() {
+                return None;
+            }
+        }
         self.pic.pending_vector()
     }
 
     /// Acknowledge the next interrupt (INTA) and return its vector.
-    pub const fn ack(&mut self) -> Option<u8> {
+    pub fn ack(&mut self) -> Option<u8> {
+        if let Some(p) = self.platform.as_mut() {
+            if let Some(v) = p.lapic_mut().ack() {
+                return Some(v);
+            }
+            if !p.lapic().extint_enabled() {
+                return None;
+            }
+        }
         self.pic.ack()
     }
 
     /// The host TSC value at which a device next needs attention.
     #[must_use]
-    pub const fn next_deadline(&self) -> Option<u64> {
-        self.pit.next_deadline()
+    pub fn next_deadline(&self) -> Option<u64> {
+        let apic = self
+            .platform
+            .as_ref()
+            .and_then(|p| p.lapic().next_deadline());
+        match (self.pit.next_deadline(), apic) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// The offset within the local APIC window if `gpa` is inside it (and the
+    /// guest has a platform).
+    #[must_use]
+    pub fn lapic_offset(&self, gpa: u64) -> Option<u64> {
+        self.platform.as_ref()?;
+        Platform::lapic_offset(gpa)
+    }
+
+    /// A `size`-byte local APIC register read at `off`.
+    #[must_use]
+    pub fn lapic_read(&self, off: u64, size: u8) -> u64 {
+        self.platform.as_ref().map_or_else(
+            || crate::insn::mask_to(u64::MAX, size),
+            |p| p.lapic().read(off, size, self.now),
+        )
+    }
+
+    /// A `size`-byte local APIC register write of `value` at `off`.
+    pub fn lapic_write(&mut self, off: u64, size: u8, value: u64) {
+        let now = self.now;
+        if let Some(p) = self.platform.as_mut() {
+            p.lapic_mut().write(off, size, value, now);
+        }
     }
 
     /// A fixed CMOS image: 2026-10-15 00:00:00, 24-hour BCD, no update in
-    /// progress, battery good.
-    const fn cmos(index: u8) -> u8 {
+    /// progress, battery good; a firmware guest also gets the RAM-size
+    /// registers.
+    fn cmos(&self, index: u8) -> u8 {
+        if let Some(v) = self.platform.as_ref().and_then(|p| p.cmos(index)) {
+            return v;
+        }
         match index & 0x7F {
             0x06 => 0x04, // weekday
             0x07 => 0x15, // day
@@ -760,6 +850,11 @@ impl IoBus {
 
     /// Handle a guest `IN` of `size` bytes from `port`.
     pub fn read(&mut self, port: u16, size: u8) -> u32 {
+        if let Some(p) = self.platform.as_mut()
+            && p.claims(port)
+        {
+            return mask(p.io_read(port, size, self.now), size);
+        }
         let v = match port {
             COM1_BASE..=COM1_END => u32::from(self.uart.read(port - COM1_BASE)),
             0x20 | 0x21 | 0xA0 | 0xA1 | 0x4D0 | 0x4D1 => {
@@ -769,7 +864,7 @@ impl IoBus {
             // Channels 1 and 2 are not modelled; the control port is write-only.
             0x41 | 0x42 => 0,
             0x61 => u32::from(self.pit.read_port61(self.now)),
-            0x71 => u32::from(Self::cmos(self.cmos_index)),
+            0x71 => u32::from(self.cmos(self.cmos_index)),
             0xCF8 => self.pci_addr,
             0xCFC..=0xCFF => {
                 let sub = usize::from(port - 0xCFC);
@@ -788,6 +883,14 @@ impl IoBus {
     /// Handle a guest `OUT` of `size` bytes to `port`; UART output goes to `tx`.
     pub fn write(&mut self, port: u16, size: u8, val: u32, tx: &mut impl FnMut(u8)) -> IoEvent {
         let val = mask(val, size);
+        if let Some(p) = self.platform.as_mut()
+            && p.claims(port)
+        {
+            return match p.io_write(port, size, val) {
+                PlatformEvent::None => IoEvent::None,
+                PlatformEvent::PowerOff => IoEvent::PowerOff,
+            };
+        }
         match port {
             COM1_BASE..=COM1_END => {
                 self.uart.write(port - COM1_BASE, (val & 0xFF) as u8, tx);
@@ -822,10 +925,10 @@ impl IoBus {
 
 /// The guest's memory-mapped I/O space above RAM.
 ///
-/// No devices are modelled yet, so every address reads as an absent device (all
-/// ones) and ignores writes. The first touches of each distinct address are
-/// reported so that what a guest probes can be seen and the devices it needs
-/// added deliberately.
+/// Devices with state live elsewhere (the disk's BAR, the local APIC in the
+/// platform); what is left reads as an absent device (all ones) and ignores
+/// writes. The first touches of each distinct address are reported so that what
+/// a guest probes can be seen and the devices it needs added deliberately.
 #[derive(Debug, Clone, Default)]
 pub struct MmioBus {
     seen: BTreeMap<u64, u32>,
@@ -860,6 +963,105 @@ impl MmioBus {
 }
 
 // ---------------------------------------------------------------------------
+// Event trace
+// ---------------------------------------------------------------------------
+
+/// How many events the trace ring keeps.
+pub const TRACE_DEPTH: usize = 192;
+
+/// What a traced guest event was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceKind {
+    /// `IN` from an I/O port.
+    IoIn,
+    /// `OUT` to an I/O port.
+    IoOut,
+    /// A load from an MMIO address.
+    MmioRead,
+    /// A store to an MMIO address.
+    MmioWrite,
+    /// `RDMSR`.
+    Rdmsr,
+    /// `WRMSR`.
+    Wrmsr,
+    /// `CPUID` (the address is the leaf).
+    Cpuid,
+}
+
+/// One traced guest event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraceEvent {
+    /// What happened.
+    pub kind: TraceKind,
+    /// The port, MMIO address, MSR number or CPUID leaf.
+    pub addr: u64,
+    /// The value transferred.
+    pub value: u64,
+    /// The access width in bytes.
+    pub size: u8,
+    /// The guest instruction pointer at the access.
+    pub rip: u64,
+}
+
+impl TraceEvent {
+    const EMPTY: Self = Self {
+        kind: TraceKind::IoIn,
+        addr: 0,
+        value: 0,
+        size: 0,
+        rip: 0,
+    };
+}
+
+/// The most recent guest events, kept so that when a firmware guest stops the
+/// last things it touched are known. Firmware that prints nothing leaves only
+/// this to debug from.
+#[derive(Debug, Clone)]
+pub struct TraceRing {
+    events: [TraceEvent; TRACE_DEPTH],
+    next: usize,
+    total: u64,
+}
+
+impl Default for TraceRing {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TraceRing {
+    /// An empty ring.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            events: [TraceEvent::EMPTY; TRACE_DEPTH],
+            next: 0,
+            total: 0,
+        }
+    }
+
+    /// Record `event`, overwriting the oldest when full.
+    pub const fn push(&mut self, event: TraceEvent) {
+        self.events[self.next] = event;
+        self.next = (self.next + 1) % TRACE_DEPTH;
+        self.total += 1;
+    }
+
+    /// How many events were ever recorded (including overwritten ones).
+    #[must_use]
+    pub const fn total(&self) -> u64 {
+        self.total
+    }
+
+    /// The kept events, oldest first.
+    pub fn recent(&self) -> impl Iterator<Item = TraceEvent> + '_ {
+        let kept = usize::try_from(self.total).map_or(TRACE_DEPTH, |t| t.min(TRACE_DEPTH));
+        let start = (self.next + TRACE_DEPTH - kept) % TRACE_DEPTH;
+        (0..kept).map(move |i| self.events[(start + i) % TRACE_DEPTH])
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Hardware runner (uefi only)
 // ---------------------------------------------------------------------------
 
@@ -879,13 +1081,14 @@ mod hw {
     use super::{
         BOOT_PARAMS_GPA, CMDLINE_GPA, GDT_GPA, GUEST_RAM_BYTES, IoBus, IoEvent, LineBuf, MIB,
         MSR_PASSTHROUGH, MmioBus, MsrRead, MsrState, MsrWrite, PT_BYTES, PT_GPA, STACK_GPA,
-        cpuid_policy, e820_map, gdt_bytes, plan_layout,
+        TraceEvent, TraceKind, TraceRing, cpuid_policy, e820_map, gdt_bytes, plan_layout,
     };
     use crate::blockdev::{BlockBackend, BlockError, DiskConfig, DiskMap, SECTOR};
-    use crate::handoff::{BootHandoff, StagedFile};
+    use crate::handoff::{BootHandoff, GuestFirmware, StagedFile};
     use crate::insn::{AccessKind, decode_mem_access, extend, mask_to, merge_reg, translate_gva};
     use crate::mmio::PhysMmio;
     use crate::nvme::NvmeController;
+    use crate::platform::{RESET_CS_BASE, RESET_RIP, flash_layout};
     use crate::serial::SerialPort;
     use crate::svm::{GuestGprs, host_cpuid, vmrun};
     use crate::virtio_blk::GuestMemory;
@@ -897,16 +1100,19 @@ mod hw {
     use core::fmt::Write as _;
     use core::sync::atomic::Ordering;
     use enlil_hal::bzimage::build_boot_params;
-    use enlil_hal::npt::{build_identity_npt_2mib, build_npt_2mib};
+    use enlil_hal::npt::{
+        NptMapper, build_identity_npt_2mib, build_npt_2mib, set_npt_range_writable,
+    };
     use enlil_hal::region::{IoPermissionsMap, MsrPermissionsMap, Vmcb};
     use enlil_hal::svm::{
-        CPUID_INSN_LEN, IoioExitInfo, LongModeGuestSetup, MSR_INSN_LEN, RunLoopExit, VMCB_SIZE,
-        VmcbSegment, classify_run_loop_exit, control, enable_io_intercept, enable_msr_intercept,
-        encode_event_inj, encode_vintr, event_type, exit_code, exit_info_1, exit_info_2, guest_rax,
-        guest_rip, int_control, intercept2, msr_exit_is_write, msrpm_read_bit, next_rip,
-        program_long_mode_hlt_guest, read_save_u64, resume_rip_after, save, set_event_inj,
-        set_guest_rax, set_guest_rip, set_int_control, set_intr_intercept, set_tsc_offset,
-        tsc_offset, write_save_u64, write_segment,
+        CPUID_INSN_LEN, IoioExitInfo, LongModeGuestSetup, MSR_INSN_LEN, MinimalGuestSetup,
+        RunLoopExit, VMCB_SIZE, VmcbSegment, classify_run_loop_exit, control, enable_io_intercept,
+        enable_msr_intercept, encode_event_inj, encode_vintr, event_type, exit_code, exit_info_1,
+        exit_info_2, guest_rax, guest_rip, int_control, intercept2, msr_exit_is_write,
+        msrpm_read_bit, next_rip, program_long_mode_hlt_guest, program_minimal_hlt_guest,
+        read_save_u64, read_segment, resume_rip_after, save, set_event_inj, set_guest_rax,
+        set_guest_rip, set_int_control, set_intr_intercept, set_tsc_offset, tsc_offset,
+        write_save_u64, write_segment,
     };
 
     /// Command line used when the ESP has no `cmdline.txt`.
@@ -926,6 +1132,12 @@ mod hw {
     const RUN_SECONDS: u64 = 120;
     /// How many distinct unknown MSRs are logged before going quiet.
     const MSR_LOG_LIMIT: usize = 40;
+    /// How many first-touch discovery lines a firmware guest logs per kind.
+    const DISCOVER_LIMIT: usize = 90;
+    /// Size of the firmware guest's nested page tables (RAM + both flash images).
+    const FW_NPT_BYTES: usize = 16 * 4096;
+    /// `CR0.PG`.
+    const CR0_PG: u64 = 1 << 31;
 
     /// Why the guest stopped running.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -934,6 +1146,8 @@ mod hw {
         Shutdown,
         /// The guest asked the machine to reset.
         Reset,
+        /// The guest entered the ACPI soft-off state.
+        PowerOff,
         /// `HLT` with interrupts disabled: nothing can ever wake it.
         DeadHalt,
         /// `HLT` with interrupts enabled but no wake source modelled yet.
@@ -992,6 +1206,25 @@ mod hw {
     struct GuestMem {
         base: *mut u8,
         len: usize,
+        /// The firmware flash images, readable for instruction fetch (a
+        /// `len == 0` span is unused).
+        flash: [FlashSpan; 2],
+    }
+
+    /// A staged flash image as the host sees it, and where the guest does.
+    #[derive(Clone, Copy)]
+    struct FlashSpan {
+        gpa: u64,
+        host: *const u8,
+        len: usize,
+    }
+
+    impl FlashSpan {
+        const NONE: Self = Self {
+            gpa: 0,
+            host: core::ptr::null(),
+            len: 0,
+        };
     }
 
     impl GuestMem {
@@ -1029,9 +1262,18 @@ mod hw {
 
     impl GuestMem {
         fn read_u8(self, gpa: u64) -> Option<u8> {
-            let i = usize::try_from(gpa).ok().filter(|&i| i < self.len)?;
-            // SAFETY: `i` is in bounds of the live, leaked guest-RAM window.
-            Some(unsafe { self.base.add(i).cast_const().read_volatile() })
+            if let Some(i) = usize::try_from(gpa).ok().filter(|&i| i < self.len) {
+                // SAFETY: `i` is in bounds of the live, leaked guest-RAM window.
+                return Some(unsafe { self.base.add(i).cast_const().read_volatile() });
+            }
+            self.flash.iter().find_map(|f| {
+                let off = usize::try_from(gpa.checked_sub(f.gpa)?)
+                    .ok()
+                    .filter(|&o| o < f.len)?;
+                // SAFETY: `off` is inside the staged image, which is live
+                // `LOADER_DATA` the kernel never frees.
+                Some(unsafe { f.host.add(off).read_volatile() })
+            })
         }
 
         fn read_u64(self, gpa: u64) -> Option<u64> {
@@ -1087,23 +1329,30 @@ mod hw {
         }
     }
 
-    /// Fetch up to 15 instruction bytes at guest-virtual `rip`, translating each
-    /// page through the guest's own page tables. Returns the bytes and how many
-    /// were readable.
-    fn fetch_insn(mem: GuestMem, cr3: u64, rip: u64) -> ([u8; 15], usize) {
+    /// Fetch up to 15 instruction bytes at guest-virtual `rip`. With paging on,
+    /// each page is translated through the guest's own page tables; with it off
+    /// (real mode, or firmware's flat protected mode) the address is `CS.base +
+    /// RIP`. Returns the bytes and how many were readable.
+    fn fetch_insn(mem: GuestMem, vmcb: &[u8], rip: u64) -> ([u8; 15], usize) {
         let mut buf = [0u8; 15];
+        let paging = read_save_u64(vmcb, save::CR0) & CR0_PG != 0;
+        let cr3 = read_save_u64(vmcb, save::CR3);
+        let cs_base = read_segment(vmcb, save::CS).base;
         let read_entry = |gpa: u64| mem.read_u64(gpa);
         let mut n = 0;
         let mut page_gpa: Option<u64> = None;
         while n < buf.len() {
             let gva = rip.wrapping_add(n as u64);
-            if n == 0 || gva.trailing_zeros() >= 12 {
-                page_gpa = translate_gva(cr3, gva & !0xFFF, &read_entry);
-            }
-            let Some(page) = page_gpa else { break };
-            let Some(byte) = mem.read_u8(page + (gva & 0xFFF)) else {
-                break;
+            let byte = if paging {
+                if n == 0 || gva.trailing_zeros() >= 12 {
+                    page_gpa = translate_gva(cr3, gva & !0xFFF, &read_entry);
+                }
+                let Some(page) = page_gpa else { break };
+                mem.read_u8(page + (gva & 0xFFF))
+            } else {
+                mem.read_u8(cs_base.wrapping_add(gva) & 0xFFFF_FFFF)
             };
+            let Some(byte) = byte else { break };
             buf[n] = byte;
             n += 1;
         }
@@ -1120,10 +1369,11 @@ mod hw {
         gprs: &mut GuestGprs,
         bus: &mut MmioBus,
         io: &mut IoBus,
+        (trace, irq_trace): (&mut TraceRing, &mut TraceRing),
         gpa: u64,
     ) -> Result<(), Stop> {
         let rip = guest_rip(vmcb);
-        let (bytes, n) = fetch_insn(mem, read_save_u64(vmcb, save::CR3), rip);
+        let (bytes, n) = fetch_insn(mem, vmcb, rip);
         let Some(access) = decode_mem_access(&bytes[..n]) else {
             serial.write_str(&format!(
                 "enlil kernel: linux: undecodable MMIO instruction at RIP {rip:#x} (gpa {gpa:#x}): {:02x?}\n",
@@ -1138,6 +1388,7 @@ mod hw {
             .as_ref()
             .and_then(|v| v.pci.bar0())
             .and_then(|(base, len)| gpa.checked_sub(base).filter(|&o| o < len));
+        let lapic_offset = io.lapic_offset(gpa);
         let first = disk_offset.is_none() && bus.note(gpa);
         match access.kind {
             AccessKind::Load {
@@ -1148,27 +1399,58 @@ mod hw {
             } => {
                 let raw = match (disk_offset, io.virtio.as_mut()) {
                     (Some(off), Some(disk)) => disk.mmio_read(off, size),
-                    _ => bus.read(gpa, size),
+                    _ => match lapic_offset {
+                        Some(off) => io.lapic_read(off, size),
+                        None => bus.read(gpa, size),
+                    },
                 };
                 let value = extend(raw, size, dest_size, sign_extend);
+                let event = TraceEvent {
+                    kind: TraceKind::MmioRead,
+                    addr: gpa,
+                    value: raw,
+                    size,
+                    rip,
+                };
+                trace.push(event);
+                if lapic_offset.is_some() {
+                    irq_trace.push(event);
+                }
                 let (target, hi) = if high8 { (reg - 4, true) } else { (reg, false) };
                 let merged = merge_reg(get_reg(vmcb, gprs, target), value, dest_size, hi);
                 set_reg(vmcb, gprs, target, merged);
                 if first {
+                    let what = if lapic_offset.is_some() {
+                        "local APIC"
+                    } else {
+                        "absent device"
+                    };
                     serial.write_str(&format!(
-                        "enlil kernel: linux: MMIO read  {size}B at {gpa:#x} -> {value:#x} (absent device) from RIP {rip:#x}\n"
+                        "enlil kernel: linux: MMIO read  {size}B at {gpa:#x} -> {value:#x} ({what}) from RIP {rip:#x}\n"
                     ));
                 }
             }
             AccessKind::Store { reg, high8 } => {
                 let (source, shift) = if high8 { (reg - 4, 8) } else { (reg, 0) };
                 let value = mask_to(get_reg(vmcb, gprs, source) >> shift, size);
+                let event = TraceEvent {
+                    kind: TraceKind::MmioWrite,
+                    addr: gpa,
+                    value,
+                    size,
+                    rip,
+                };
+                trace.push(event);
+                if lapic_offset.is_some() {
+                    irq_trace.push(event);
+                }
                 mmio_store(
                     serial,
                     mem,
                     bus,
                     io,
                     disk_offset,
+                    lapic_offset,
                     gpa,
                     size,
                     value,
@@ -1178,12 +1460,24 @@ mod hw {
             }
             AccessKind::StoreImm { value } => {
                 let value = mask_to(value, size);
+                let event = TraceEvent {
+                    kind: TraceKind::MmioWrite,
+                    addr: gpa,
+                    value,
+                    size,
+                    rip,
+                };
+                trace.push(event);
+                if lapic_offset.is_some() {
+                    irq_trace.push(event);
+                }
                 mmio_store(
                     serial,
                     mem,
                     bus,
                     io,
                     disk_offset,
+                    lapic_offset,
                     gpa,
                     size,
                     value,
@@ -1206,6 +1500,7 @@ mod hw {
         bus: &mut MmioBus,
         io: &mut IoBus,
         disk_offset: Option<u64>,
+        lapic_offset: Option<u64>,
         gpa: u64,
         size: u8,
         value: u64,
@@ -1214,6 +1509,8 @@ mod hw {
     ) {
         if let (Some(off), Some(disk)) = (disk_offset, io.virtio.as_mut()) {
             disk.mmio_write(off, size, value, &mem);
+        } else if let Some(off) = lapic_offset {
+            io.lapic_write(off, size, value);
         } else {
             bus.write(gpa, size, value);
             if first {
@@ -1381,18 +1678,55 @@ mod hw {
         }
     }
 
-    /// Boot the staged Linux guest and run it until it stops, logging every
-    /// console line it prints as `[linux] ...`. Does nothing when no kernel was
-    /// staged or SVM is not up.
+    /// Boot the staged guest and run it until it stops, logging every console
+    /// line it prints as `[linux] ...` (or `[ovmf] ...`). A staged Linux kernel is
+    /// booted directly by the Linux boot protocol; otherwise a guest firmware
+    /// image (OVMF) the config asks to boot is run from the x86 reset vector.
+    /// Does nothing when neither was staged or SVM is not up.
     pub fn boot(serial: &SerialPort, handoff: &BootHandoff) {
-        let payload = handoff.linux_guest;
-        if !payload.has_kernel() {
+        let firmware = handoff.firmware_boot_guest();
+        if !handoff.linux_guest.has_kernel() && firmware.is_none() {
             return;
         }
         if !crate::kernel::SVM_READY.load(Ordering::Acquire) {
             serial.write_str("enlil kernel: linux: SVM is not available - cannot run a guest\n");
             return;
         }
+        if handoff.linux_guest.has_kernel() {
+            boot_linux_direct(serial, handoff);
+        } else if let Some(entry) = firmware {
+            boot_firmware(serial, entry);
+        }
+    }
+
+    /// Everything [`launch`] needs to run a prepared machine.
+    struct Launch {
+        /// Tag on console lines relayed from this guest.
+        label: &'static str,
+        /// The programmed VMCB (CPU state, nested-paging root).
+        vmcb: Vmcb,
+        /// The I/O permission map (every port intercepted).
+        iopm: IoPermissionsMap,
+        /// The MSR permission map (unarmed; `launch` arms it).
+        msrpm: MsrPermissionsMap,
+        /// System-physical base of the guest's RAM window.
+        ram_spa: u64,
+        /// Initial general-purpose registers.
+        gprs: GuestGprs,
+        /// The staged virtual-disk policy, if the ESP assigned a disk.
+        disk: StagedFile,
+        /// The "entering the guest" line.
+        banner: String,
+        /// Give the guest the i440FX/PIIX platform (a firmware guest).
+        platform: bool,
+        /// The firmware flash images, for instruction fetch from ROM.
+        flash: [FlashSpan; 2],
+    }
+
+    /// Boot a Linux `bzImage` directly by the Linux boot protocol (64-bit entry,
+    /// zero page, identity-mapped RAM): the quickest way to a real OS guest.
+    fn boot_linux_direct(serial: &SerialPort, handoff: &BootHandoff) {
+        let payload = handoff.linux_guest;
         // SAFETY: the staged extents come from the UEFI stage's handoff.
         let (image, initrd, cmdline_raw) = unsafe {
             (
@@ -1491,7 +1825,7 @@ mod hw {
         };
 
         // The VMCB: a long-mode guest entering the kernel's 64-bit entry point.
-        let (Ok(mut vmcb), Ok(iopm), Ok(mut msrpm)) = (
+        let (Ok(mut vmcb), Ok(iopm), Ok(msrpm)) = (
             Vmcb::new(),
             IoPermissionsMap::intercept_all(),
             MsrPermissionsMap::new(),
@@ -1510,9 +1844,8 @@ mod hw {
             serial.write_str("enlil kernel: linux: VMCB programming failed\n");
             return;
         }
-        let v = vmcb.as_bytes_mut();
         write_segment(
-            v,
+            vmcb.as_bytes_mut(),
             save::GDTR,
             VmcbSegment {
                 selector: 0,
@@ -1521,6 +1854,208 @@ mod hw {
                 base: GDT_GPA,
             },
         );
+        launch(
+            serial,
+            Launch {
+                label: "linux",
+                vmcb,
+                iopm,
+                msrpm,
+                ram_spa,
+                gprs: GuestGprs {
+                    rsi: BOOT_PARAMS_GPA,
+                    ..GuestGprs::default()
+                },
+                disk: payload.disk,
+                banner: format!(
+                    "entering the guest at GPA {:#x} (RAM {} MiB at {:#x}, cmdline: {})",
+                    layout.entry_gpa,
+                    GUEST_RAM_BYTES / MIB,
+                    ram_spa,
+                    cmdline
+                ),
+                platform: false,
+                flash: [FlashSpan::NONE; 2],
+            },
+        );
+    }
+
+    /// Boot a guest from its own UEFI firmware (OVMF): RAM at zero, the variable
+    /// store and read-only code flash at the top of the 4 GiB space, and the CPU
+    /// in its reset state, executing the reset vector in the last bytes of the
+    /// code image - exactly what a real machine's firmware expects.
+    fn boot_firmware(serial: &SerialPort, fw: GuestFirmware) {
+        let id = fw.id_str();
+        let say = |msg: &str| serial.write_str(&format!("enlil kernel: ovmf: {id}: {msg}\n"));
+        // SAFETY: the UEFI stage staged both images into `LOADER_DATA` pages
+        // (never freed); the kernel runs identity-mapped.
+        let (code, vars) = unsafe {
+            (
+                staged(StagedFile {
+                    base: fw.code_base,
+                    len: fw.code_len,
+                }),
+                staged(StagedFile {
+                    base: fw.vars_base,
+                    len: fw.vars_len,
+                }),
+            )
+        };
+        let Some(flash) = flash_layout(code.len() as u64, vars.len() as u64, GUEST_RAM_BYTES)
+        else {
+            say("the firmware images are not page-sized (or too large) - cannot map them");
+            return;
+        };
+        let Some(ram_spa) = crate::kernel::guest_ram::LINUX.take(GUEST_RAM_BYTES, 2 * MIB) else {
+            say("no planned guest-RAM window for the guest");
+            return;
+        };
+        // SAFETY: the planner carved this span for exactly this guest, reserved
+        // it, and `take` hands it to one caller; it is identity-mapped.
+        let ram = unsafe {
+            core::slice::from_raw_parts_mut(
+                core::ptr::with_exposed_provenance_mut::<u8>(ram_spa as usize),
+                GUEST_RAM_BYTES as usize,
+            )
+        };
+        ram.fill(0);
+
+        // Nested page tables: RAM, the variable store (read/write), and the code
+        // image (read-only: a store to ROM must not change it).
+        // SAFETY: nonzero, 4 KiB-aligned layout; the buffer is leaked below.
+        let npt_raw = unsafe {
+            alloc_zeroed(
+                AllocLayout::from_size_align(FW_NPT_BYTES, 4096)
+                    .unwrap_or(AllocLayout::new::<u8>()),
+            )
+        };
+        if npt_raw.is_null() {
+            say("no memory for the nested page tables");
+            return;
+        }
+        let npt_pa = npt_raw as u64;
+        // SAFETY: `npt_raw` owns FW_NPT_BYTES zeroed bytes, leaked for the VM's life.
+        let npt_buf = unsafe { core::slice::from_raw_parts_mut(npt_raw, FW_NPT_BYTES) };
+        // The flash is mapped a page at a time so every leaf is 4 KiB: the code
+        // must be write-protectable per page whatever its alignment in memory.
+        let map_pages = |m: &mut NptMapper<'_>, gpa: u64, spa: u64, len: u64| {
+            (0..len / 4096).try_for_each(|i| m.map_range(gpa + i * 4096, spa + i * 4096, 4096, &[]))
+        };
+        let mapped = NptMapper::new(&mut *npt_buf, npt_pa).and_then(|mut m| {
+            m.map_range(0, ram_spa, GUEST_RAM_BYTES, &[])?;
+            map_pages(&mut m, flash.vars_gpa, fw.vars_base, flash.vars_len)?;
+            map_pages(&mut m, flash.code_gpa, fw.code_base, flash.code_len)?;
+            Ok(m.ncr3())
+        });
+        let Ok(ncr3) = mapped else {
+            say("nested page tables did not fit");
+            return;
+        };
+        if set_npt_range_writable(npt_buf, npt_pa, flash.code_gpa, flash.code_len, false).is_err() {
+            say("could not write-protect the firmware code");
+            return;
+        }
+
+        // The CPU in its architectural reset state: real mode, CS = 0xF000 with
+        // base 0xFFFF0000, RIP = 0xFFF0 - the reset vector, 16 bytes below 4 GiB.
+        let (Ok(mut vmcb), Ok(iopm), Ok(msrpm)) = (
+            Vmcb::new(),
+            IoPermissionsMap::intercept_all(),
+            MsrPermissionsMap::new(),
+        ) else {
+            say("no memory for the VMCB / permission maps");
+            return;
+        };
+        let setup = MinimalGuestSetup {
+            asid: 1,
+            nested_cr3: ncr3,
+            entry_ip: RESET_RIP,
+            code_base: RESET_CS_BASE,
+            stack_pointer: 0,
+        };
+        if program_minimal_hlt_guest(vmcb.as_bytes_mut(), &setup).is_err() {
+            say("VMCB programming failed");
+            return;
+        }
+        let v = vmcb.as_bytes_mut();
+        write_segment(
+            v,
+            save::CS,
+            VmcbSegment {
+                selector: 0xF000,
+                attrib: 0x009B,
+                limit: 0xFFFF,
+                base: RESET_CS_BASE,
+            },
+        );
+        for table in [save::GDTR, save::IDTR] {
+            write_segment(
+                v,
+                table,
+                VmcbSegment {
+                    selector: 0,
+                    attrib: 0,
+                    limit: 0xFFFF,
+                    base: 0,
+                },
+            );
+        }
+        launch(
+            serial,
+            Launch {
+                label: "ovmf",
+                vmcb,
+                iopm,
+                msrpm,
+                ram_spa,
+                // At reset EDX holds the CPU's family/model/stepping.
+                gprs: GuestGprs {
+                    rdx: u64::from(host_cpuid(1, 0).eax),
+                    ..GuestGprs::default()
+                },
+                disk: fw.disk,
+                banner: format!(
+                    "{id}: entering the reset vector (RAM {} MiB at {ram_spa:#x}; flash: vars {:#x}+{:#x}, code {:#x}+{:#x})",
+                    GUEST_RAM_BYTES / MIB,
+                    flash.vars_gpa,
+                    flash.vars_len,
+                    flash.code_gpa,
+                    flash.code_len
+                ),
+                platform: true,
+                flash: [
+                    FlashSpan {
+                        gpa: flash.vars_gpa,
+                        host: core::ptr::with_exposed_provenance::<u8>(fw.vars_base as usize),
+                        len: fw.vars_len,
+                    },
+                    FlashSpan {
+                        gpa: flash.code_gpa,
+                        host: core::ptr::with_exposed_provenance::<u8>(fw.code_base as usize),
+                        len: fw.code_len,
+                    },
+                ],
+            },
+        );
+    }
+
+    /// Finish a prepared machine - intercepts, permission maps, timer gate, host
+    /// save area - then run it until it stops and report why.
+    fn launch(serial: &SerialPort, l: Launch) {
+        let Launch {
+            label,
+            mut vmcb,
+            iopm,
+            mut msrpm,
+            ram_spa,
+            mut gprs,
+            disk,
+            banner,
+            platform,
+            flash,
+        } = l;
+        let tsc_hz = crate::kernel::TSC_HZ.load(Ordering::Acquire);
+        let v = vmcb.as_bytes_mut();
         enable_io_intercept(v, iopm.base_addr());
         // A host timer interrupt must exit the guest (never be delivered into
         // it): it is how a due device event pre-empts a running guest.
@@ -1550,7 +2085,9 @@ mod hw {
             )
         };
         if host_save.is_null() {
-            serial.write_str("enlil kernel: linux: no memory for the host-save page\n");
+            serial.write_str(&format!(
+                "enlil kernel: {label}: no memory for the host-save page\n"
+            ));
             return;
         }
         let vmcb_pa = vmcb.base_addr();
@@ -1558,28 +2095,23 @@ mod hw {
         core::mem::forget(iopm);
         core::mem::forget(msrpm);
 
-        serial.write_str(&format!(
-            "enlil kernel: linux: entering the guest at GPA {:#x} (RAM {} MiB at {:#x}, cmdline: {})\n",
-            layout.entry_gpa,
-            GUEST_RAM_BYTES / MIB,
-            ram_spa,
-            cmdline
-        ));
+        serial.write_str(&format!("enlil kernel: {label}: {banner}\n"));
 
-        let mut gprs = GuestGprs {
-            rsi: BOOT_PARAMS_GPA,
-            ..GuestGprs::default()
-        };
         let deadline = t0.saturating_add(tsc_hz.max(1).saturating_mul(RUN_SECONDS));
         let mem = GuestMem {
             base: core::ptr::with_exposed_provenance_mut::<u8>(ram_spa as usize),
             len: GUEST_RAM_BYTES as usize,
+            flash,
         };
         // The guest's I/O bus, with its virtual disk if the ESP assigned one.
         let mut io = IoBus::new(tsc_hz.max(1));
-        attach_disk(serial, payload.disk, &mut io);
-        let (stop, counts) = run(
+        if platform {
+            io.enable_platform(tsc_hz.max(1), GUEST_RAM_BYTES);
+        }
+        attach_disk(serial, disk, &mut io);
+        let (stop, counts, trace, irq_trace) = run(
             serial,
+            label,
             vmcb_pa,
             host_save as u64,
             &mut gprs,
@@ -1587,7 +2119,14 @@ mod hw {
             mem,
             io,
         );
-        report(serial, vmcb_pa, stop, &counts);
+        report(
+            serial,
+            label,
+            vmcb_pa,
+            stop,
+            &counts,
+            platform.then_some((&*trace, &*irq_trace)),
+        );
     }
 
     /// An exclusive view of the VMCB page at `pa`.
@@ -1637,22 +2176,38 @@ mod hw {
     /// The `#VMEXIT` dispatch loop for the Linux guest.
     fn run(
         serial: &SerialPort,
+        label: &str,
         vmcb_pa: u64,
         host_save_pa: u64,
         gprs: &mut GuestGprs,
         deadline: u64,
         mem: GuestMem,
         mut bus: IoBus,
-    ) -> (Stop, Counts) {
+    ) -> (Stop, Counts, Box<TraceRing>, Box<TraceRing>) {
+        // A firmware guest gets the platform devices around its CPU, and the
+        // discovery log that shows what a silent firmware touches.
+        let platform = bus.has_platform();
         let mut mmio = MmioBus::new();
+        let mut trace = Box::new(TraceRing::new());
+        // Accesses to the interrupt and timer hardware (PIC, PIT, local APIC),
+        // kept apart so the console and polling loops cannot push them out.
+        let mut irq_trace = Box::new(TraceRing::new());
+        let mut io_seen: BTreeSet<(bool, u16)> = BTreeSet::new();
+        let mut cpuid_seen: BTreeSet<u32> = BTreeSet::new();
         // The host timer deadline currently armed (avoids re-arming on every exit).
         let mut armed: Option<u64> = None;
-        let mut msrs = MsrState::new();
+        let mut msrs = if platform {
+            MsrState::with_apic()
+        } else {
+            MsrState::new()
+        };
         let mut console = LineBuf::new();
         let mut counts = Counts::default();
         let mut msr_seen: BTreeSet<(bool, u32)> = BTreeSet::new();
         let mut emit = |line: &str| {
-            serial.write_str("[linux] ");
+            serial.write_str("[");
+            serial.write_str(label);
+            serial.write_str("] ");
             serial.write_str(line);
             serial.write_str("\n");
         };
@@ -1685,6 +2240,9 @@ mod hw {
             // `host_save_pa` is our owned zeroed page.
             unsafe { vmrun(vmcb_pa, host_save_pa, core::ptr::from_mut(gprs)) };
             counts.exits += 1;
+            // Devices read the clock when the guest touches them (the PM timer, the
+            // APIC timer's count): it must be now, not as of the last VMRUN.
+            bus.set_time(crate::tsc::read_tsc());
             // SAFETY: `vmcb_pa` is our live, page-sized VMCB.
             let vmcb = unsafe {
                 core::slice::from_raw_parts_mut(
@@ -1703,12 +2261,31 @@ mod hw {
                     counts.cpuid += 1;
                     let leaf = u32::try_from(guest_rax(vmcb) & 0xFFFF_FFFF).unwrap_or(0);
                     let sub = u32::try_from(gprs.rcx & 0xFFFF_FFFF).unwrap_or(0);
-                    let r = cpuid_policy(
+                    let mut r = cpuid_policy(
                         leaf,
                         sub,
                         host_cpuid(leaf, sub),
                         read_save_u64(vmcb, save::CR4),
                     );
+                    if platform {
+                        // The local APIC is modelled, so the guest may see it.
+                        if leaf == 1 {
+                            r.edx |= 1 << 9;
+                        }
+                        trace.push(TraceEvent {
+                            kind: TraceKind::Cpuid,
+                            addr: u64::from(leaf),
+                            value: u64::from(r.eax),
+                            size: 4,
+                            rip: guest_rip(vmcb),
+                        });
+                        if cpuid_seen.len() < DISCOVER_LIMIT && cpuid_seen.insert(leaf) {
+                            serial.write_str(&format!(
+                                "enlil kernel: {label}: cpuid leaf {leaf:#x}.{sub:#x} -> {:#x} {:#x} {:#x} {:#x} from RIP {:#x}\n",
+                                r.eax, r.ebx, r.ecx, r.edx, guest_rip(vmcb)
+                            ));
+                        }
+                    }
                     set_guest_rax(vmcb, u64::from(r.eax));
                     gprs.rbx = u64::from(r.ebx);
                     gprs.rcx = u64::from(r.ecx);
@@ -1722,11 +2299,60 @@ mod hw {
                     counts.io += 1;
                     let info = IoioExitInfo::from_raw(exit_info_1(vmcb));
                     if info.is_string() {
-                        break Stop::StringIo(info.port());
+                        if platform {
+                            trace.push(TraceEvent {
+                                kind: if info.is_in() {
+                                    TraceKind::IoIn
+                                } else {
+                                    TraceKind::IoOut
+                                },
+                                addr: u64::from(info.port()),
+                                value: if info.is_rep() { gprs.rcx } else { 1 },
+                                size: info.access_size(),
+                                rip: guest_rip(vmcb),
+                            });
+                        }
+                        let event = emulate_string_io(
+                            mem,
+                            vmcb,
+                            gprs,
+                            &mut bus,
+                            &mut |b| console.push(b, &mut emit),
+                            info,
+                        );
+                        match event {
+                            Ok(IoEvent::Reset) => break Stop::Reset,
+                            Ok(IoEvent::PowerOff) => break Stop::PowerOff,
+                            Ok(IoEvent::None) => {}
+                            Err(stop) => break stop,
+                        }
+                        set_guest_rip(vmcb, exit_info_2(vmcb));
+                        continue;
                     }
                     let (port, size) = (info.port(), info.access_size());
                     if info.is_in() {
                         let val = u64::from(bus.read(port, size));
+                        if platform {
+                            let event = TraceEvent {
+                                kind: TraceKind::IoIn,
+                                addr: u64::from(port),
+                                value: val,
+                                size,
+                                rip: guest_rip(vmcb),
+                            };
+                            if irq_port(port) {
+                                irq_trace.push(event);
+                            }
+                            if trace_worthy(port) {
+                                trace.push(event);
+                            }
+                            if discover_port(&mut io_seen, true, port) {
+                                serial.write_str(&format!(
+                                    "enlil kernel: {label}: io IN  {port:#x} {size}B -> {val:#x} from RIP {:#x}\n",
+                                    guest_rip(vmcb)
+                                ));
+                            }
+                        }
                         let rax = guest_rax(vmcb);
                         set_guest_rax(
                             vmcb,
@@ -1738,10 +2364,35 @@ mod hw {
                         );
                     } else {
                         let data = u32::try_from(guest_rax(vmcb) & 0xFFFF_FFFF).unwrap_or(0);
+                        if platform {
+                            let event = TraceEvent {
+                                kind: TraceKind::IoOut,
+                                addr: u64::from(port),
+                                value: u64::from(data),
+                                size,
+                                rip: guest_rip(vmcb),
+                            };
+                            if irq_port(port) {
+                                irq_trace.push(event);
+                            }
+                            if trace_worthy(port) {
+                                trace.push(event);
+                            }
+                            if discover_port(&mut io_seen, false, port) {
+                                serial.write_str(&format!(
+                                    "enlil kernel: {label}: io OUT {port:#x} {size}B <- {:#x} from RIP {:#x}\n",
+                                    mask_to(u64::from(data), size),
+                                    guest_rip(vmcb)
+                                ));
+                            }
+                        }
                         let event =
                             bus.write(port, size, data, &mut |b| console.push(b, &mut emit));
                         if event == IoEvent::Reset {
                             break Stop::Reset;
+                        }
+                        if event == IoEvent::PowerOff {
+                            break Stop::PowerOff;
                         }
                     }
                     set_guest_rip(vmcb, exit_info_2(vmcb));
@@ -1753,6 +2404,13 @@ mod hw {
                     if msr_exit_is_write(exit_info_1(vmcb)) {
                         let val =
                             ((gprs.rdx & 0xFFFF_FFFF) << 32) | (guest_rax(vmcb) & 0xFFFF_FFFF);
+                        trace.push(TraceEvent {
+                            kind: TraceKind::Wrmsr,
+                            addr: u64::from(msr),
+                            value: val,
+                            size: 8,
+                            rip: guest_rip(vmcb),
+                        });
                         match msrs.write(msr, val) {
                             MsrWrite::Ok => {}
                             MsrWrite::Tsc(t) => {
@@ -1770,6 +2428,13 @@ mod hw {
                             ),
                             MsrRead::Gp => None,
                         };
+                        trace.push(TraceEvent {
+                            kind: TraceKind::Rdmsr,
+                            addr: u64::from(msr),
+                            value: value.unwrap_or(u64::MAX),
+                            size: 8,
+                            rip: guest_rip(vmcb),
+                        });
                         match value {
                             Some(v) => {
                                 set_guest_rax(vmcb, v & 0xFFFF_FFFF);
@@ -1823,9 +2488,16 @@ mod hw {
                         break Stop::Npf(gpa);
                     }
                     counts.mmio += 1;
-                    if let Err(stop) =
-                        emulate_mmio(serial, mem, vmcb, gprs, &mut mmio, &mut bus, gpa)
-                    {
+                    if let Err(stop) = emulate_mmio(
+                        serial,
+                        mem,
+                        vmcb,
+                        gprs,
+                        &mut mmio,
+                        &mut bus,
+                        (&mut trace, &mut irq_trace),
+                        gpa,
+                    ) {
                         break stop;
                     }
                 }
@@ -1853,11 +2525,137 @@ mod hw {
             }
         };
         console.flush(&mut emit);
-        (stop, counts)
+        if platform {
+            serial.write_str(&format!(
+                "enlil kernel: {label}: interrupt state at stop: PIC IMR master {:#04x} slave {:#04x}, pending vector {:?}, next device deadline {:?} (now {})\n",
+                bus.pic.read(0x21).unwrap_or(0xFF),
+                bus.pic.read(0xA1).unwrap_or(0xFF),
+                bus.pending_vector(),
+                bus.next_deadline(),
+                crate::tsc::read_tsc(),
+            ));
+        }
+        (stop, counts, trace, irq_trace)
+    }
+
+    /// Emulate an `INS`/`OUTS` (optionally `REP`-prefixed) against the I/O bus:
+    /// each element moves between the port and the guest memory `ES:rDI` (for
+    /// `INS`) or `DS:rSI` (for `OUTS`), the index register and `rCX` are updated,
+    /// and the direction flag is honoured. The caller advances `RIP`.
+    fn emulate_string_io(
+        mem: GuestMem,
+        vmcb: &mut [u8],
+        gprs: &mut GuestGprs,
+        bus: &mut IoBus,
+        tx: &mut impl FnMut(u8),
+        info: IoioExitInfo,
+    ) -> Result<IoEvent, Stop> {
+        let raw = exit_info_1(vmcb);
+        let (port, size) = (info.port(), info.access_size());
+        let addr_mask = if raw & (1 << 9) != 0 {
+            u64::MAX
+        } else if raw & (1 << 8) != 0 {
+            0xFFFF_FFFF
+        } else {
+            0xFFFF
+        };
+        let step = u64::from(size);
+        let backwards = read_save_u64(vmcb, save::RFLAGS) & (1 << 10) != 0;
+        let paging = read_save_u64(vmcb, save::CR0) & CR0_PG != 0;
+        let cr3 = read_save_u64(vmcb, save::CR3);
+        let seg = if info.is_in() { save::ES } else { save::DS };
+        let seg_base = read_segment(vmcb, seg).base;
+        let index = if info.is_in() { gprs.rdi } else { gprs.rsi };
+        let count = if info.is_rep() {
+            gprs.rcx & addr_mask
+        } else {
+            1
+        };
+        let read_entry = |gpa: u64| mem.read_u64(gpa);
+
+        let mut addr = index & addr_mask;
+        let mut done = 0u64;
+        let mut event = IoEvent::None;
+        while done < count {
+            let linear = seg_base.wrapping_add(addr);
+            let gpa = if paging {
+                translate_gva(cr3, linear & !0xFFF, &read_entry).map(|page| page + (linear & 0xFFF))
+            } else {
+                Some(linear & 0xFFFF_FFFF)
+            };
+            let Some(gpa) = gpa else {
+                return Err(Stop::StringIo(port));
+            };
+            if info.is_in() {
+                let value = bus.read(port, size).to_le_bytes();
+                if !mem.write(gpa, &value[..usize::from(size)]) {
+                    return Err(Stop::StringIo(port));
+                }
+            } else {
+                let mut value = [0u8; 4];
+                if !mem.read(gpa, &mut value[..usize::from(size)]) {
+                    return Err(Stop::StringIo(port));
+                }
+                event = bus.write(port, size, u32::from_le_bytes(value), tx);
+            }
+            addr = if backwards {
+                addr.wrapping_sub(step)
+            } else {
+                addr.wrapping_add(step)
+            } & addr_mask;
+            done += 1;
+            if event != IoEvent::None {
+                break;
+            }
+        }
+        let merged = |old: u64, new: u64| (old & !addr_mask) | (new & addr_mask);
+        if info.is_in() {
+            gprs.rdi = merged(gprs.rdi, addr);
+        } else {
+            gprs.rsi = merged(gprs.rsi, addr);
+        }
+        if info.is_rep() {
+            gprs.rcx = merged(gprs.rcx, count - done);
+        }
+        Ok(event)
+    }
+
+    /// Whether `port` belongs to the interrupt and timer hardware.
+    const fn irq_port(port: u16) -> bool {
+        matches!(
+            port,
+            0x20 | 0x21 | 0xA0 | 0xA1 | 0x40..=0x43 | 0x4D0 | 0x4D1
+        )
+    }
+
+    /// Whether an access to `port` belongs in the trace ring: the console and the
+    /// PCI configuration mechanism run constantly and would push everything else
+    /// out of it.
+    const fn trace_worthy(port: u16) -> bool {
+        !matches!(port, 0x3F8..=0x3FF | 0xCF8 | 0xCFC..=0xCFF)
+    }
+
+    /// Whether this is the first touch of `port` in direction `read` that is
+    /// worth a discovery line: ports the model already handles every time
+    /// (console, interrupt controllers, timer, CMOS, PCI config) are not.
+    fn discover_port(seen: &mut BTreeSet<(bool, u16)>, read: bool, port: u16) -> bool {
+        let known = matches!(
+            port,
+            0x20 | 0x21 | 0xA0 | 0xA1 | 0x40..=0x43 | 0x61 | 0x70 | 0x71 | 0xCF8 | 0xCFC..=0xCFF
+                | 0x3F8..=0x3FF
+        );
+        !known && seen.len() < DISCOVER_LIMIT && seen.insert((read, port))
     }
 
     /// Log why the guest stopped, with enough VMCB state to debug it.
-    fn report(serial: &SerialPort, vmcb_pa: u64, stop: Stop, counts: &Counts) {
+    fn report(
+        serial: &SerialPort,
+        label: &str,
+        vmcb_pa: u64,
+        stop: Stop,
+        counts: &Counts,
+        trace: Option<(&TraceRing, &TraceRing)>,
+    ) {
         // SAFETY: `vmcb_pa` is our live, page-sized VMCB.
         let vmcb = unsafe {
             core::slice::from_raw_parts(
@@ -1867,14 +2665,15 @@ mod hw {
         };
         let why = match stop {
             Stop::DeadHalt => String::from("halted with interrupts off (powered off)"),
+            Stop::PowerOff => String::from("powered off (ACPI soft-off)"),
             other => format!("{other:?}"),
         };
         serial.write_str(&format!(
-            "enlil kernel: linux: guest stopped: {why} after {} exits (io {}, cpuid {}, msr {}, mmio {}, hlt {}, intr {}, irq-injected {})\n",
+            "enlil kernel: {label}: guest stopped: {why} after {} exits (io {}, cpuid {}, msr {}, mmio {}, hlt {}, intr {}, irq-injected {})\n",
             counts.exits, counts.io, counts.cpuid, counts.msr, counts.mmio, counts.hlt, counts.intr, counts.injected
         ));
         serial.write_str(&format!(
-            "enlil kernel: linux:   RIP {:#x} RSP {:#x} RFLAGS {:#x} CR0 {:#x} CR3 {:#x} CR4 {:#x} EFER {:#x} exit {:#x}\n",
+            "enlil kernel: {label}:   RIP {:#x} RSP {:#x} RFLAGS {:#x} CR0 {:#x} CR3 {:#x} CR4 {:#x} EFER {:#x} exit {:#x}\n",
             guest_rip(vmcb),
             read_save_u64(vmcb, save::RSP),
             read_save_u64(vmcb, save::RFLAGS),
@@ -1884,6 +2683,29 @@ mod hw {
             read_save_u64(vmcb, save::EFER),
             exit_code(vmcb).raw(),
         ));
+        if let Some((trace, irq_trace)) = trace {
+            for (name, ring) in [
+                ("interrupt-hardware (PIC/PIT/APIC)", irq_trace),
+                ("all", trace),
+            ] {
+                // The interrupt ring can be long; the last 40 tell the story.
+                let skip =
+                    ring.recent()
+                        .count()
+                        .saturating_sub(if name == "all" { 192 } else { 40 });
+                serial.write_str(&format!(
+                    "enlil kernel: {label}: last {} of {} traced {name} guest events:\n",
+                    ring.recent().count() - skip,
+                    ring.total()
+                ));
+                for e in ring.recent().skip(skip) {
+                    serial.write_str(&format!(
+                        "enlil kernel: {label}:   {:?} {:#x} = {:#x} ({}B) rip {:#x}\n",
+                        e.kind, e.addr, e.value, e.size, e.rip
+                    ));
+                }
+            }
+        }
     }
 }
 
@@ -2304,6 +3126,145 @@ mod tests {
         assert!(m.note(0xFED8_0400), "a new address is");
         m.write(0xFED8_03C0, 4, 0x1234);
         assert_eq!(m.read(0xFED8_03C0, 4), 0xFFFF_FFFF, "writes are ignored");
+    }
+
+    #[test]
+    fn the_trace_ring_keeps_the_latest_events_in_order() {
+        let ev = |n: u64| TraceEvent {
+            kind: TraceKind::IoOut,
+            addr: n,
+            value: 0,
+            size: 1,
+            rip: 0,
+        };
+        let mut t = TraceRing::new();
+        assert_eq!(t.recent().count(), 0);
+        for n in 0..3 {
+            t.push(ev(n));
+        }
+        assert_eq!(t.recent().map(|e| e.addr).collect::<Vec<_>>(), [0, 1, 2]);
+        // Overflow: only the last TRACE_DEPTH remain, still oldest first.
+        for n in 3..(TRACE_DEPTH as u64 + 10) {
+            t.push(ev(n));
+        }
+        let kept: Vec<u64> = t.recent().map(|e| e.addr).collect();
+        assert_eq!(kept.len(), TRACE_DEPTH);
+        assert_eq!(kept[0], 10);
+        assert_eq!(kept[TRACE_DEPTH - 1], TRACE_DEPTH as u64 + 9);
+        assert_eq!(t.total(), TRACE_DEPTH as u64 + 10);
+    }
+
+    #[test]
+    fn a_guest_with_an_apic_reads_it_enabled_at_the_architectural_base() {
+        let m = MsrState::with_apic();
+        assert_eq!(m.read(MSR_APIC_BASE), MsrRead::Value(0xFEE0_0900));
+        // Without one the APIC reads disabled, as the Linux guest expects.
+        assert_eq!(
+            MsrState::new().read(MSR_APIC_BASE),
+            MsrRead::Value(0xFEE0_0100)
+        );
+    }
+
+    #[test]
+    fn only_a_platform_guest_has_a_local_apic() {
+        let mut bus = IoBus::new(1_000_000_000);
+        assert_eq!(bus.lapic_offset(0xFEE0_0030), None);
+        assert_eq!(bus.lapic_read(0x30, 4), 0xFFFF_FFFF);
+        bus.enable_platform(1_000_000_000, 256 * MIB);
+        assert_eq!(bus.lapic_offset(0xFEE0_00F0), Some(0xF0));
+        assert_eq!(bus.lapic_offset(0xFEE0_1000), None, "past the window");
+        assert_eq!(bus.lapic_read(0x30, 4), 0x0005_0014);
+        bus.lapic_write(0xF0, 4, 0x1FF);
+        assert_eq!(bus.lapic_read(0xF0, 4), 0x1FF);
+        // The I/O APIC is not modelled yet: it still reads as an absent device.
+        assert_eq!(MmioBus::new().read(0xFEC0_0000, 4), 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn the_apic_timer_interrupts_the_guest_alongside_the_pic() {
+        let mut bus = IoBus::new(1_000_000_000);
+        bus.enable_platform(1_000_000_000, 256 * MIB);
+        // OVMF's tick: periodic, vector 0x20, 1 ms at 1 GHz.
+        bus.set_time(0);
+        bus.lapic_write(0xF0, 4, 0x1FF);
+        bus.lapic_write(0x3E0, 4, 0xB);
+        bus.lapic_write(0x320, 4, 0x20020);
+        bus.lapic_write(0x380, 4, 1_000_000);
+        assert_eq!(bus.next_deadline(), Some(1_000_000));
+        bus.set_time(1_000_000);
+        bus.poll_devices();
+        assert_eq!(bus.pending_vector(), Some(0x20));
+        assert_eq!(bus.ack(), Some(0x20));
+        bus.lapic_write(0xB0, 4, 0); // EOI
+        // A PIC interrupt is held back by the APIC's masked virtual wire...
+        let mut out = Vec::new();
+        for (port, val) in [
+            (0x20, 0x11),
+            (0x21, 0x30),
+            (0x21, 0x04),
+            (0x21, 0x01),
+            (0x21, 0x00),
+        ] {
+            bus.write(port, 1, val, &mut tx_to(&mut out));
+        }
+        bus.pic.set_irq(1, true);
+        assert_eq!(
+            bus.pending_vector(),
+            None,
+            "LINT0 is masked with the APIC on"
+        );
+        // ...and flows once firmware sets up the virtual wire.
+        bus.lapic_write(0x350, 4, 0x700);
+        assert_eq!(bus.pending_vector(), Some(0x31));
+        assert_eq!(bus.ack(), Some(0x31));
+    }
+
+    /// Select `bus:dev.func` register `reg` through the legacy PCI ports.
+    fn pci_cfg(dev: u8, func: u8, reg: u8) -> u32 {
+        0x8000_0000 | (u32::from(dev) << 11) | (u32::from(func) << 8) | u32::from(reg)
+    }
+
+    #[test]
+    fn a_firmware_platform_answers_pci_cmos_and_the_pm_timer() {
+        let mut bus = IoBus::new(1_000_000_000);
+        let mut out = Vec::new();
+        // Without the platform nothing answers on the PCI bus.
+        bus.write(0xCF8, 4, pci_cfg(0, 0, 0), &mut tx_to(&mut out));
+        assert_eq!(bus.read(0xCFC, 4), u32::MAX);
+
+        bus.enable_platform(1_000_000_000, 256 * MIB);
+        assert!(bus.has_platform());
+        // The i440FX host bridge, then the PIIX4 PM function.
+        bus.write(0xCF8, 4, pci_cfg(0, 0, 0), &mut tx_to(&mut out));
+        assert_eq!(bus.read(0xCFC, 4), 0x1237_8086);
+        bus.write(0xCF8, 4, pci_cfg(1, 3, 0), &mut tx_to(&mut out));
+        assert_eq!(bus.read(0xCFC, 4), 0x7113_8086);
+        // CMOS: 256 MiB reads back as 0x0F00 in 64 KiB units above 16 MiB.
+        bus.write(0x70, 1, 0x35, &mut tx_to(&mut out));
+        assert_eq!(bus.read(0x71, 1), 0x0F);
+        // The disk's slot still works next to the platform's.
+        bus.write(
+            0xCF8,
+            4,
+            pci_cfg(VIRTIO_BLK_SLOT, 0, 0),
+            &mut tx_to(&mut out),
+        );
+        assert_eq!(bus.read(0xCFC, 4), u32::MAX, "no disk attached");
+
+        // Firmware programs PMBA like OVMF; the timer then ticks with host time.
+        bus.write(0xCF8, 4, pci_cfg(1, 3, 0x40), &mut tx_to(&mut out));
+        bus.write(0xCFC, 4, 0xB000, &mut tx_to(&mut out));
+        bus.write(0xCF8, 4, pci_cfg(1, 3, 0x80), &mut tx_to(&mut out));
+        bus.write(0xCFC, 1, 1, &mut tx_to(&mut out));
+        bus.set_time(10_000);
+        let t0 = bus.read(0xB008, 4);
+        bus.set_time(10_000 + 1_000_000);
+        assert_eq!(bus.read(0xB008, 4) - t0, 3579, "1 ms of host time");
+        // Soft-off through PM1_CNT surfaces as a power-off event.
+        assert_eq!(
+            bus.write(0xB004, 2, 1 << 13, &mut tx_to(&mut out)),
+            IoEvent::PowerOff
+        );
     }
 
     #[test]

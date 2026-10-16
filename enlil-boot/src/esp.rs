@@ -67,6 +67,38 @@ pub fn for_each_guest_id(config: &[u8], f: &mut dyn FnMut(&str)) {
     }
 }
 
+/// Whether `config` asks the guest `id` to boot its own firmware: a
+/// `boot = "firmware"` key directly inside its `[guest.<id>]` table (not a
+/// sub-table such as `[guest.<id>.firmware]`).
+///
+/// Like the id scan this is a structural subset of TOML, enough for the one
+/// key the boot stage needs.
+#[must_use]
+pub fn guest_boots_firmware(config: &[u8], id: &str) -> bool {
+    let mut in_guest = false;
+    for line in config.split(|&b| b == b'\n') {
+        let code = line
+            .iter()
+            .position(|&b| b == b'#')
+            .map_or(line, |i| &line[..i]);
+        let code = trim_ascii(code);
+        if code.first() == Some(&b'[') {
+            in_guest = guest_header_id(line) == Some(id);
+            continue;
+        }
+        if !in_guest {
+            continue;
+        }
+        if let Some(eq) = code.iter().position(|&b| b == b'=')
+            && trim_ascii(&code[..eq]) == b"boot"
+            && trim_ascii(&code[eq + 1..]) == b"\"firmware\""
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether `id` is already recorded in the NUL-padded `seen` slots.
 fn is_duplicate(id: &str, seen: &[([u8; 33], bool)]) -> bool {
     seen.iter().any(|(slot, used)| {
@@ -368,6 +400,7 @@ mod hw {
             let id = core::str::from_utf8(&id_bytes[..id_len]).unwrap_or("?");
             load_guest_file(&mut loader, entry, id, FirmwareFile::Code);
             load_guest_file(&mut loader, entry, id, FirmwareFile::Vars);
+            load_guest_file(&mut loader, entry, id, FirmwareFile::Disk);
         }
 
         // 3. An optional Linux guest: kernel, initrd, command line.
@@ -466,8 +499,16 @@ mod hw {
                         entry.vars_base = loaded.base;
                         entry.vars_len = loaded.len;
                     }
+                    FirmwareFile::Disk => {
+                        entry.disk = StagedFile {
+                            base: loaded.base,
+                            len: loaded.len,
+                        };
+                    }
                 }
             }
+            // The disk assignment is optional; only the firmware images are expected.
+            Err(EspError::NotFound) if file == FirmwareFile::Disk => {}
             Err(EspError::NotFound) => {
                 log::warn!("esp: guest '{id}': {} missing on the ESP", file.file_name());
             }
@@ -500,6 +541,26 @@ mod tests {
         let mut ids = Vec::new();
         for_each_guest_id(config, &mut |id: &str| ids.push(id.to_string()));
         ids
+    }
+
+    #[test]
+    fn firmware_boot_needs_the_key_in_the_guests_own_table() {
+        let config = b"[guest.a]\nboot = \"firmware\"\n[guest.b]\ncpus = 2\n\
+            [guest.c.firmware]\nboot = \"firmware\"\n[guest.d] # x\n  boot=\"firmware\" # y\n\
+            [guest.e]\nboot = \"linux\"\n";
+        assert!(guest_boots_firmware(config, "a"));
+        assert!(!guest_boots_firmware(config, "b"));
+        assert!(!guest_boots_firmware(config, "c"));
+        assert!(guest_boots_firmware(config, "d"));
+        assert!(!guest_boots_firmware(config, "e"));
+        assert!(!guest_boots_firmware(config, "missing"));
+        assert!(!guest_boots_firmware(b"", "a"));
+    }
+
+    #[test]
+    fn firmware_boot_is_not_triggered_by_other_tables_or_comments() {
+        let config = b"[guest.a]\n# boot = \"firmware\"\n[other]\nboot = \"firmware\"\n";
+        assert!(!guest_boots_firmware(config, "a"));
     }
 
     #[test]

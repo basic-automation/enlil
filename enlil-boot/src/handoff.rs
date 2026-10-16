@@ -125,6 +125,8 @@ pub struct GuestFirmware {
     pub vars_base: u64,
     /// Valid bytes at `vars_base`.
     pub vars_len: usize,
+    /// The guest's virtual-disk assignment (`disk.txt`), if the ESP has one.
+    pub disk: StagedFile,
 }
 
 impl GuestFirmware {
@@ -137,7 +139,14 @@ impl GuestFirmware {
             code_len: 0,
             vars_base: 0,
             vars_len: 0,
+            disk: StagedFile::EMPTY,
         }
+    }
+
+    /// Whether both firmware images were staged.
+    #[must_use]
+    pub const fn has_firmware(&self) -> bool {
+        self.code_base != 0 && self.code_len != 0 && self.vars_base != 0 && self.vars_len != 0
     }
 
     /// The guest id as a string (bytes up to the first NUL).
@@ -305,6 +314,31 @@ impl BootHandoff {
     #[must_use]
     pub const fn has_config(&self) -> bool {
         self.config_base != 0 && self.config_len != 0
+    }
+
+    /// The guest the config asks to boot from its own firmware, if one with
+    /// both OVMF images staged says `boot = "firmware"` in its `[guest.<id>]`
+    /// table. Staged firmware alone never starts a guest: the proof runs stage
+    /// OVMF too, and must stay proofs.
+    #[must_use]
+    pub fn firmware_boot_guest(&self) -> Option<GuestFirmware> {
+        if !self.has_config() {
+            return None;
+        }
+        let base = usize::try_from(self.config_base).ok()?;
+        // SAFETY: the UEFI stage staged `config_len` bytes of `LOADER_DATA` at
+        // `config_base` (never freed); the kernel runs identity-mapped.
+        let config = unsafe {
+            core::slice::from_raw_parts(
+                core::ptr::with_exposed_provenance::<u8>(base),
+                self.config_len,
+            )
+        };
+        self.guest_firmwares
+            .iter()
+            .take(self.guest_firmware_count.min(MAX_BOOT_GUESTS))
+            .find(|g| g.has_firmware() && crate::esp::guest_boots_firmware(config, g.id_str()))
+            .copied()
     }
 
     /// Whether a usable graphics framebuffer was handed over.
@@ -512,6 +546,35 @@ mod tests {
             pci_root_bridge_count: 0,
             linux_guest: LinuxPayload::EMPTY,
         }
+    }
+
+    #[test]
+    fn firmware_boot_guest_needs_config_opt_in_and_both_images() {
+        let config = b"[guest.proof]\ncpus = 1\n[guest.win]\nboot = \"firmware\"\n";
+        let mut h = empty_handoff();
+        h.config_base = config.as_ptr() as u64;
+        h.config_len = config.len();
+        let staged = |id: &[u8], both: bool| {
+            let mut g = GuestFirmware::empty();
+            g.id[..id.len()].copy_from_slice(id);
+            g.code_base = 0x10_0000;
+            g.code_len = 4096;
+            if both {
+                g.vars_base = 0x20_0000;
+                g.vars_len = 4096;
+            }
+            g
+        };
+        h.guest_firmwares[0] = staged(b"proof", true);
+        h.guest_firmwares[1] = staged(b"win", false);
+        h.guest_firmware_count = 2;
+        // `proof` has both images but no opt-in; `win` opts in but lacks VARS.
+        assert_eq!(h.firmware_boot_guest(), None);
+        h.guest_firmwares[1] = staged(b"win", true);
+        assert_eq!(h.firmware_boot_guest().unwrap().id_str(), "win");
+        // No config: nothing boots.
+        h.config_base = 0;
+        assert_eq!(h.firmware_boot_guest(), None);
     }
 
     fn handoff_with_bridges() -> BootHandoff {

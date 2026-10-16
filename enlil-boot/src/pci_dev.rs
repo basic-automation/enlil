@@ -117,6 +117,22 @@ impl PciFunction {
         self.wmask[OFF_BAR1..OFF_BAR1 + 4].fill(0xFF);
     }
 
+    /// Make `len` bytes of configuration space from `off` writable (a chipset
+    /// register the guest programs, such as a power-management base address).
+    pub fn set_writable(&mut self, off: usize, len: usize) {
+        if let Some(mask) = self.wmask.get_mut(off..off.saturating_add(len)) {
+            mask.fill(0xFF);
+        }
+    }
+
+    /// Set a register's read-only reset value (for example the header type or a
+    /// fixed indicator bit) without making it writable.
+    pub fn preset(&mut self, off: usize, bytes: &[u8]) {
+        if let Some(cfg) = self.cfg.get_mut(off..off.saturating_add(bytes.len())) {
+            cfg.copy_from_slice(bytes);
+        }
+    }
+
     /// Set the interrupt line (the legacy PIC input the OS should use) and pin
     /// (`1` = INTA#). The line is writable, as on real hardware.
     pub const fn set_interrupt(&mut self, line: u8, pin: u8) {
@@ -250,6 +266,22 @@ mod tests {
         f.set_bar0_mem64(0x4000);
         f.set_interrupt(10, 1);
         f
+    }
+
+    #[test]
+    fn chipset_registers_can_be_made_writable_and_preset() {
+        let mut f = PciFunction::new(0x8086, 0x7113, [0x06, 0x80, 0x00], 3, (0, 0));
+        f.preset(0x0E, &[0x80]);
+        f.preset(0x40, &[0x01]);
+        f.set_writable(0x41, 1);
+        assert_eq!(f.read(0x0E, 1), 0x80);
+        f.write(0x0E, 1, 0x00);
+        assert_eq!(f.read(0x0E, 1), 0x80, "a preset register stays read-only");
+        f.write(0x40, 4, 0xB0C1);
+        assert_eq!(f.read(0x40, 4), 0xB001, "only the opened byte changed");
+        // Out-of-range requests are ignored rather than panicking.
+        f.set_writable(0xFF, 8);
+        f.preset(0xFF, &[1, 2, 3]);
     }
 
     #[test]

@@ -373,6 +373,75 @@ pub fn set_npt_2mib_leaf_writable(
     Ok(())
 }
 
+/// Set whether the 4 KiB leaf mapping `gpa` is writable.
+///
+/// The page-granular counterpart of [`set_npt_2mib_leaf_writable`], used to make
+/// a mapped range read-only (guest firmware code is ROM: writes to it must
+/// fault, not land).
+///
+/// # Errors
+///
+/// - [`NptError::UnalignedBase`] if `gpa` is not 4 KiB-aligned;
+/// - [`NptError::HugePageOnPath`] if a 2 MiB leaf covers `gpa` (no 4 KiB leaf to
+///   change);
+/// - [`NptError::IntermediateNotPresent`] if any table on the path, or the leaf
+///   itself, is not present.
+pub fn set_npt_4kib_leaf_writable(
+    buf: &mut [u8],
+    phys_base: u64,
+    gpa: u64,
+    writable: bool,
+) -> Result<(), NptError> {
+    if gpa & (PAGE_SIZE - 1) != 0 {
+        return Err(NptError::UnalignedBase);
+    }
+    let pml4_i = ((gpa >> 39) & 0x1FF) as usize;
+    let pdpt_i = ((gpa >> 30) & 0x1FF) as usize;
+    let pd_i = ((gpa >> 21) & 0x1FF) as usize;
+    let leaf_i = ((gpa >> 12) & 0x1FF) as usize;
+
+    let pdpt_off = child_offset(buf, phys_base, 0, pml4_i)?;
+    let dir_off = child_offset(buf, phys_base, pdpt_off, pdpt_i)?;
+    let table_off = child_offset(buf, phys_base, dir_off, pd_i)?;
+    let at = table_off + leaf_i * 8;
+    let entry = read_entry(buf, at)?;
+    if entry & flags::PRESENT == 0 {
+        return Err(NptError::IntermediateNotPresent);
+    }
+    let updated = if writable {
+        entry | flags::WRITABLE
+    } else {
+        entry & !flags::WRITABLE
+    };
+    write_entry(buf, at, updated);
+    Ok(())
+}
+
+/// Make `len` bytes of 4 KiB-mapped guest-physical memory at `gpa` read-only
+/// (or writable again). See [`set_npt_4kib_leaf_writable`].
+///
+/// # Errors
+///
+/// Any error from [`set_npt_4kib_leaf_writable`], at the first page that fails;
+/// pages before it have already changed.
+pub fn set_npt_range_writable(
+    buf: &mut [u8],
+    phys_base: u64,
+    gpa: u64,
+    len: u64,
+    writable: bool,
+) -> Result<(), NptError> {
+    let mut at = gpa;
+    let end = gpa
+        .checked_add(len)
+        .ok_or(NptError::AddressOutOfRange { addr: gpa })?;
+    while at < end {
+        set_npt_4kib_leaf_writable(buf, phys_base, at, writable)?;
+        at += PAGE_SIZE;
+    }
+    Ok(())
+}
+
 /// How many `u64` bitmap words an [`NptDirtyLog`] needs to track `num_pages`
 /// 2 MiB pages — one bit per page, rounded up.
 #[must_use]
@@ -2058,6 +2127,77 @@ mod tests {
                 index: 512,
                 num_pages: 512
             })
+        );
+    }
+
+    /// The raw leaf entry for 4 KiB page `gpa` (test inspection only).
+    fn leaf_entry(buf: &[u8], phys_base: u64, gpa: u64) -> u64 {
+        let pdpt = child_offset(buf, phys_base, 0, ((gpa >> 39) & 0x1FF) as usize).unwrap();
+        let pd = child_offset(buf, phys_base, pdpt, ((gpa >> 30) & 0x1FF) as usize).unwrap();
+        let pt = child_offset(buf, phys_base, pd, ((gpa >> 21) & 0x1FF) as usize).unwrap();
+        super::read_entry(buf, pt + ((gpa >> 12) & 0x1FF) as usize * 8).unwrap()
+    }
+
+    #[test]
+    fn a_4kib_range_can_be_made_read_only_and_writable_again() {
+        // A flash-like window near the top of 4 GiB, 4 KiB leaves.
+        let phys_base = 0x1_0000u64;
+        let mut buf = alloc::vec![0u8; 0x8000];
+        let mut mapper = NptMapper::new(&mut buf, phys_base).unwrap();
+        let gpa = 0xFFC8_4000u64;
+        mapper.map_range(gpa, 0x40_0000, 0x4000, &[]).unwrap();
+        for page in 0..4 {
+            let e = leaf_entry(&buf, phys_base, gpa + page * PAGE_SIZE);
+            assert_ne!(e & flags::WRITABLE, 0, "mapper's default is read-write");
+        }
+        set_npt_range_writable(&mut buf, phys_base, gpa, 0x4000, false).unwrap();
+        for page in 0..4 {
+            let e = leaf_entry(&buf, phys_base, gpa + page * PAGE_SIZE);
+            assert_eq!(e & flags::WRITABLE, 0, "page {page} is read-only");
+            assert_ne!(e & flags::PRESENT, 0, "still mapped");
+        }
+        // The translation itself is unchanged.
+        assert_eq!(
+            translate_npt(&buf, phys_base, gpa + 0x1234),
+            Some(0x40_1234)
+        );
+        set_npt_range_writable(&mut buf, phys_base, gpa, 0x1000, true).unwrap();
+        assert_ne!(leaf_entry(&buf, phys_base, gpa) & flags::WRITABLE, 0);
+        assert_eq!(
+            leaf_entry(&buf, phys_base, gpa + PAGE_SIZE) & flags::WRITABLE,
+            0
+        );
+    }
+
+    #[test]
+    fn write_protecting_reports_bad_addresses() {
+        let phys_base = 0x1_0000u64;
+        let mut buf = alloc::vec![0u8; 0x8000];
+        let mut mapper = NptMapper::new(&mut buf, phys_base).unwrap();
+        mapper
+            .map_range(0x20_0000, 0x40_0000, 0x20_0000, &[])
+            .unwrap(); // one 2 MiB leaf
+        mapper
+            .map_range(0xFFC8_4000, 0x80_0000, 0x1000, &[])
+            .unwrap();
+        assert_eq!(
+            set_npt_4kib_leaf_writable(&mut buf, phys_base, 0xFFC8_4010, false),
+            Err(NptError::UnalignedBase)
+        );
+        assert_eq!(
+            set_npt_4kib_leaf_writable(&mut buf, phys_base, 0x20_0000, false),
+            Err(NptError::HugePageOnPath),
+            "a 2 MiB leaf has no 4 KiB leaf to change"
+        );
+        assert_eq!(
+            set_npt_4kib_leaf_writable(&mut buf, phys_base, 0x1_0000_0000_0000, false),
+            Err(NptError::IntermediateNotPresent),
+            "nothing mapped there"
+        );
+        assert_eq!(
+            set_npt_4kib_leaf_writable(&mut buf, phys_base, 0xFFC8_5000, false),
+            Err(NptError::IntermediateNotPresent),
+            "a not-present leaf in a present table"
         );
     }
 
