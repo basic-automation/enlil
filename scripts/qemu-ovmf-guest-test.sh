@@ -31,7 +31,9 @@
 #                       reached its boot manager; distro OVMF has no built-in
 #                       shell, so with no disk this is where it ends up)
 #   ENLIL_OVMF_GUEST_CODE / ENLIL_OVMF_GUEST_VARS  the firmware the *guest* runs
-#                       (default: the same distro OVMF the outer VM uses)
+#                       (default: the same distro OVMF the outer VM uses; a DEBUG
+#                       build from scripts/build-ovmf-debug.sh logs on port 0x402,
+#                       shown here as "[ovmf-dbg]" lines)
 #   ENLIL_OVMF_ESP_DIR  extra files copied into the guest-visible FAT image,
 #                       if a guest ESP (EFI/BOOT/BOOTX64.EFI ...) should exist
 #   ENLIL_QEMU, ENLIL_OVMF_CODE, ENLIL_OVMF_VARS   as scripts/qemu-boot-test.sh

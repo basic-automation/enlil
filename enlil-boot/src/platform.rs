@@ -49,6 +49,8 @@ const PM_TMR: usize = 0x08;
 const PM_CNT: usize = 0x04;
 /// `PM1_CNT.SLP_EN`.
 const SLP_EN: u16 = 1 << 13;
+/// Config offset of the PIIX3 `PIRQ` route registers (`PIRQA`..`PIRQD`).
+const PIIX3_PIRQ_ROUTE: usize = 0x60;
 /// Port of the "system control A" register (fast A20).
 const PORT_SYSCTL_A: u16 = 0x92;
 
@@ -371,6 +373,8 @@ impl Platform {
         let mut isa = PciFunction::new(0x8086, 0x7000, [0x06, 0x01, 0x00], 0, (0x1AF4, 0x1100));
         isa.preset(0x0E, &[0x80]);
         isa.set_writable(0x40, 0xC0);
+        // The PCI interrupt routing registers reset to "disabled" (bit 7 set).
+        isa.preset(PIIX3_PIRQ_ROUTE, &[0x80; 4]);
         // PIIX4 power management: the I/O base, enable bit and SMBus base.
         let mut pm = PciFunction::new(0x8086, 0x7113, [0x06, 0x80, 0x00], 3, (0x1AF4, 0x1100));
         pm.preset(PIIX4_PMBA, &[0x01]);
@@ -418,6 +422,23 @@ impl Platform {
             (PIIX_DEVICE, 3) => Some(&mut self.pm),
             _ => None,
         }
+    }
+
+    /// The legacy `IRQ` a PCI device's interrupt pin reaches through the PIIX3
+    /// router, if firmware routed it.
+    ///
+    /// PCI `INTx` lines are swizzled across the four `PIRQ` inputs by device
+    /// number (`INTA#` of device `n` is `PIRQ[(n + pin - 1) % 4]`), and each input
+    /// goes to the ISA `IRQ` its route register names; bit 7 disables it. This is
+    /// what firmware programs and then writes into each device's interrupt-line
+    /// register, so a device must raise exactly this line.
+    #[must_use]
+    pub fn pirq_irq(&self, slot: u8, pin: u8) -> Option<u8> {
+        let input = usize::from(slot.wrapping_add(pin).wrapping_sub(1) & 3);
+        let route = self.isa.read(PIIX3_PIRQ_ROUTE + input, 1);
+        let irq = u8::try_from(route & 0x0F).ok()?;
+        // Bit 7 disables the route; IRQ 0, 1, 2, 8 and 13 are not routable.
+        (route & 0x80 == 0 && !matches!(irq, 0..=2 | 8 | 13)).then_some(irq)
     }
 
     /// The PM I/O block's base port, once firmware has programmed `PMBA` and set
@@ -536,6 +557,32 @@ mod tests {
         let pm = p.function(PIIX_DEVICE, 3).unwrap();
         pm.write(0x40, 4, 0xB000);
         pm.write(0x80, 1, 1);
+    }
+
+    #[test]
+    fn pci_interrupts_follow_the_piix3_routing_firmware_programs() {
+        let mut p = Platform::new(1_000_000_000, 256 * MIB);
+        // Reset: every route is disabled.
+        assert_eq!(p.pirq_irq(3, 1), None);
+        // What OVMF writes: PIRQA/B -> IRQ 10, PIRQC/D -> IRQ 11.
+        let isa = p.function(PIIX_DEVICE, 0).unwrap();
+        for (i, irq) in [10u32, 10, 11, 11].into_iter().enumerate() {
+            isa.write(0x60 + i, 1, irq);
+        }
+        // INTA# of device 3 lands on PIRQD (device number swizzled), device 4 on PIRQA.
+        assert_eq!(p.pirq_irq(3, 1), Some(11));
+        assert_eq!(p.pirq_irq(4, 1), Some(10));
+        assert_eq!(p.pirq_irq(5, 1), Some(10));
+        assert_eq!(p.pirq_irq(6, 1), Some(11));
+        // INTB# of device 3 is PIRQA.
+        assert_eq!(p.pirq_irq(3, 2), Some(10));
+        // A disabled route (bit 7) and an unroutable IRQ both mean "no interrupt".
+        let isa = p.function(PIIX_DEVICE, 0).unwrap();
+        isa.write(0x63, 1, 0x8B);
+        assert_eq!(p.pirq_irq(3, 1), None);
+        let isa = p.function(PIIX_DEVICE, 0).unwrap();
+        isa.write(0x63, 1, 2);
+        assert_eq!(p.pirq_irq(3, 1), None);
     }
 
     #[test]

@@ -67,6 +67,8 @@ pub const VENDOR_ID: u16 = 0x1AF4;
 pub const DEVICE_ID: u16 = 0x1042;
 /// Size of `BAR0`.
 pub const BAR0_SIZE: u64 = 0x4000;
+/// PCI subsystem device id (see the comment where it is used).
+pub const SUBSYSTEM_ID: u16 = 0x1100;
 
 const COMMON_OFF: usize = 0x0000;
 const NOTIFY_OFF: usize = 0x1000;
@@ -171,9 +173,12 @@ impl VirtioBlk {
         let mut pci = PciFunction::new(
             VENDOR_ID,
             DEVICE_ID,
-            [0x01, 0x80, 0x00],  // mass storage, other
-            1,                   // virtio 1.x requires revision >= 1
-            (VENDOR_ID, 0x0002), // subsystem id: virtio device type 2 (block)
+            [0x01, 0x80, 0x00], // mass storage, other
+            1,                  // virtio 1.x requires revision >= 1
+            // Subsystem id: a modern device uses 0x40 or more (OVMF's virtio 1.0
+            // driver refuses anything lower); 0x1100 is what virtio devices report
+            // on QEMU. The device type comes from the PCI device id, not this.
+            (VENDOR_ID, SUBSYSTEM_ID),
         );
         pci.set_bar0_mem64(BAR0_SIZE);
         pci.set_interrupt(irq, 1);

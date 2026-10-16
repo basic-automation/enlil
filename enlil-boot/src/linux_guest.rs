@@ -744,6 +744,9 @@ pub struct IoBus {
     pub virtio: Option<VirtioBlk>,
     /// The virtual disk, if the guest sees it as an `NVMe` controller.
     pub nvme: Option<Box<NvmeDevice>>,
+    /// The PIC line each disk device currently drives (`[virtio, nvme]`), so a
+    /// re-routed device releases the line it left.
+    disk_irq: [Option<u8>; 2],
     /// The i440FX/PIIX platform a firmware guest expects (`None` for a guest
     /// booted directly into Linux, which is told about hardware by its zero
     /// page instead).
@@ -775,6 +778,7 @@ impl IoBus {
             pit: Pit8254::new(tsc_hz),
             virtio: None,
             nvme: None,
+            disk_irq: [None; 2],
             platform: None,
             debug_bytes: Vec::new(),
             now: 0,
@@ -907,10 +911,30 @@ impl IoBus {
             self.pic.set_irq(0, false);
         }
         self.pic.set_irq(4, self.uart.irq_line());
-        let disk_irq = self.virtio.as_ref().is_some_and(VirtioBlk::irq_line);
-        self.pic.set_irq(VIRTIO_BLK_IRQ, disk_irq);
-        let nvme_irq = self.nvme.as_ref().is_some_and(|n| n.irq_line());
-        self.pic.set_irq(NVME_IRQ, nvme_irq);
+        let virtio_level = self.virtio.as_ref().is_some_and(VirtioBlk::irq_line);
+        self.drive_disk_irq(0, VIRTIO_BLK_SLOT, VIRTIO_BLK_IRQ, virtio_level);
+        let nvme_level = self.nvme.as_ref().is_some_and(|n| n.irq_line());
+        self.drive_disk_irq(1, NVME_SLOT, NVME_IRQ, nvme_level);
+    }
+
+    /// Drive a disk device's interrupt level onto the PIC line it is routed to:
+    /// the PIIX3 `PIRQ` routing firmware programmed when there is a platform,
+    /// else the fixed `default` line. A device whose route changes releases the
+    /// line it was on.
+    fn drive_disk_irq(&mut self, which: usize, slot: u8, default: u8, level: bool) {
+        let routed = self
+            .platform
+            .as_ref()
+            .map_or(Some(default), |p| p.pirq_irq(slot, 1));
+        if self.disk_irq[which] != routed
+            && let Some(old) = self.disk_irq[which]
+        {
+            self.pic.set_irq(old, false);
+        }
+        self.disk_irq[which] = routed;
+        if let Some(irq) = routed {
+            self.pic.set_irq(irq, level);
+        }
     }
 
     /// The vector of the interrupt waiting to be delivered, if any: the local

@@ -210,6 +210,13 @@ fn identity_and_capabilities_match_the_virtio_spec() {
     assert_eq!(pci.read(0, 4), 0x1042_1AF4);
     assert_eq!(pci.read(0x08, 1), 1, "revision >= 1 for modern virtio");
     assert_eq!(pci.read(0x0A, 2), 0x0180, "mass storage class");
+    // UEFI's virtio 1.0 driver (OVMF's Virtio10Dxe) only binds a modern device
+    // whose subsystem device id is at least 0x40 and which has a capability list.
+    assert!(
+        pci.read(0x2E, 2) >= 0x40,
+        "subsystem id a UEFI driver accepts"
+    );
+    assert_ne!(pci.read(0x06, 2) & (1 << 4), 0, "capability list present");
     // Walk the capability chain: types 1..=4, all in BAR 0, with sane offsets.
     let mut ptr = pci.read(0x34, 1) as usize;
     let mut types = Vec::new();
