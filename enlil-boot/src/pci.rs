@@ -523,7 +523,7 @@ pub fn walk_functions(
 
 #[cfg(target_os = "uefi")]
 pub use hw::{
-    StorageController, XhciFunction, bar0_mmio_base, enable_mem_bus_master,
+    StorageController, XhciFunction, bar0_mmio_base, config_dword, enable_mem_bus_master,
     find_storage_controllers, find_xhci_controllers, first_memory_bar, first_network_function,
     scan_bar_inventory, scan_bus0, scan_bus0_mmio, scan_ecam, scan_memory_bars,
 };
@@ -574,6 +574,13 @@ mod hw {
             );
             inl(PCI_CONFIG_DATA)
         }
+    }
+
+    /// Config dword `offset` of `bus:device.function` (for callers outside this
+    /// module, such as copying a drive's PCI identity).
+    #[must_use]
+    pub fn config_dword(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
+        config_read(bus, device, function, offset)
     }
 
     /// Write config dword `offset` of `bus:device.function` via mechanism #1.

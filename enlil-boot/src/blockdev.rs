@@ -248,6 +248,20 @@ pub struct DiskConfig {
     pub serial: String,
     /// The sector ranges the guest may access.
     pub ranges: Vec<Allow>,
+    /// The controller the guest sees the disk through.
+    pub model: DiskModel,
+}
+
+/// The kind of controller a guest's virtual disk appears on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiskModel {
+    /// A virtio-blk device: small and fast, for guests with a virtio driver
+    /// (Linux).
+    #[default]
+    Virtio,
+    /// An `NVMe` controller: what an unmodified Windows install already boots
+    /// from, with its inbox driver.
+    Nvme,
 }
 
 /// Parse `0x..` or decimal.
@@ -278,6 +292,7 @@ impl DiskConfig {
     /// range is rejected: an assignment must be explicit.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
         let mut serial = None;
+        let mut model = DiskModel::default();
         let mut ranges = Vec::new();
         for raw in text.lines() {
             let line = raw.split('#').next().unwrap_or("").trim();
@@ -291,6 +306,13 @@ impl DiskConfig {
             match key {
                 "nvme-serial" => serial = Some(String::from(value)),
                 "allow" => ranges.push(Self::parse_allow(value)?),
+                "model" => {
+                    model = match value {
+                        "virtio" => DiskModel::Virtio,
+                        "nvme" => DiskModel::Nvme,
+                        _ => return Err(ConfigError::BadLine(String::from(line))),
+                    };
+                }
                 _ => return Err(ConfigError::BadLine(String::from(line))),
             }
         }
@@ -300,7 +322,11 @@ impl DiskConfig {
         if ranges.is_empty() {
             return Err(ConfigError::NoRanges);
         }
-        Ok(Self { serial, ranges })
+        Ok(Self {
+            serial,
+            ranges,
+            model,
+        })
     }
 
     /// Parse one `allow` value: `<start>-<end> <ro|rw>` or `all <ro|rw>`.
@@ -480,6 +506,20 @@ mod tests {
         .unwrap();
         assert_eq!(c.serial, "S6XN123");
         assert_eq!(c.ranges, [allow(0, 32, false), allow(0x40, 0x80, true)]);
+    }
+
+    #[test]
+    fn config_chooses_the_controller_model() {
+        let base = "nvme-serial = X\nallow = 0-1 ro\n";
+        assert_eq!(DiskConfig::parse(base).unwrap().model, DiskModel::Virtio);
+        let nvme = DiskConfig::parse(&format!("{base}model = nvme\n")).unwrap();
+        assert_eq!(nvme.model, DiskModel::Nvme);
+        let virtio = DiskConfig::parse(&format!("model = virtio # explicit\n{base}")).unwrap();
+        assert_eq!(virtio.model, DiskModel::Virtio);
+        assert!(matches!(
+            DiskConfig::parse(&format!("{base}model = ide\n")),
+            Err(ConfigError::BadLine(_))
+        ));
     }
 
     #[test]

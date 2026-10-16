@@ -40,6 +40,7 @@ pub mod logmirror;
 pub mod mmio;
 pub mod net;
 pub mod nvme;
+pub mod nvme_dev;
 pub mod paging;
 pub mod pci;
 pub mod pci_dev;

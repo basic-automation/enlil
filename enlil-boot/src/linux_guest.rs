@@ -22,6 +22,7 @@
 extern crate alloc;
 
 use crate::blockdev::BlockBackend;
+use crate::nvme_dev::{NvmeDevice, NvmeIdentity};
 use crate::pci_dev::{PciFunction, pci_target};
 use crate::platform::{Platform, PlatformEvent};
 use crate::svm::{CpuidRegs, sanitize_cpuid};
@@ -254,6 +255,29 @@ pub const fn gdt_bytes() -> [u8; 24] {
 pub const VIRTIO_BLK_SLOT: u8 = 3;
 /// The legacy PIC line the virtual disk interrupts on.
 pub const VIRTIO_BLK_IRQ: u8 = 10;
+/// PCI device number of the virtual disk when it is an `NVMe` controller.
+pub const NVME_SLOT: u8 = 4;
+/// The legacy PIC line the `NVMe` controller interrupts on.
+pub const NVME_IRQ: u8 = 11;
+
+/// A disk device's `BAR0` hit, with the offset within it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskTarget {
+    /// The virtio-blk device.
+    Virtio(u64),
+    /// The `NVMe` controller.
+    Nvme(u64),
+}
+
+impl DiskTarget {
+    /// The offset within the device's `BAR0`.
+    #[must_use]
+    pub const fn offset(self) -> u64 {
+        match self {
+            Self::Virtio(o) | Self::Nvme(o) => o,
+        }
+    }
+}
 /// Base I/O port of COM1.
 pub const COM1_BASE: u16 = 0x3F8;
 /// Last I/O port of COM1.
@@ -523,7 +547,6 @@ pub fn cpuid_policy(leaf: u32, subleaf: u32, host: CpuidRegs, guest_cr4: u64) ->
 /// MSRs the guest reads and writes natively: the CPU virtualizes them in the
 /// VMCB save area (or, for `PAT`, as `G_PAT`), so no exit is needed.
 pub const MSR_PASSTHROUGH: &[u32] = &[
-    0xC000_0080, // EFER
     0xC000_0081, // STAR
     0xC000_0082, // LSTAR
     0xC000_0083, // CSTAR
@@ -537,6 +560,32 @@ pub const MSR_PASSTHROUGH: &[u32] = &[
     0x0000_0277, // PAT
     0x0000_01D9, // DEBUGCTL
 ];
+
+/// The `EFER` MSR. Intercepted, never passed through: the hardware needs
+/// `EFER.SVME` set in the guest state to `VMRUN` at all, so the guest's view of
+/// the register and the real one differ by that bit.
+pub const MSR_EFER: u32 = 0xC000_0080;
+/// `EFER.SVME`: SVM enabled. Hidden from the guest, forced on in the VMCB.
+pub const EFER_SVME: u64 = 1 << 12;
+/// `EFER.LMA`: long mode active. Set by the processor, not by a `WRMSR`.
+pub const EFER_LMA: u64 = 1 << 10;
+/// The `EFER` bits a guest may write: `SCE`, `LME`, `NXE` and `FFXSR`.
+pub const EFER_GUEST_WRITABLE: u64 = (1 << 0) | (1 << 8) | (1 << 11) | (1 << 14);
+
+/// What a guest reads from `EFER` when the VMCB holds `vmcb_efer`: the real
+/// value with `SVME` hidden, as on a machine that is not a host.
+#[must_use]
+pub const fn guest_efer_view(vmcb_efer: u64) -> u64 {
+    vmcb_efer & !EFER_SVME
+}
+
+/// The VMCB's `EFER` after the guest writes `written`: its writable bits take
+/// effect, `LMA` stays as the processor set it, and `SVME` stays on whatever the
+/// guest wrote - without it the next `VMRUN` is refused.
+#[must_use]
+pub const fn vmcb_efer_after_write(vmcb_efer: u64, written: u64) -> u64 {
+    (vmcb_efer & EFER_LMA) | EFER_SVME | (written & EFER_GUEST_WRITABLE)
+}
 
 /// The IA32 `TSC` MSR.
 pub const MSR_TSC: u32 = 0x10;
@@ -569,6 +618,8 @@ pub enum MsrRead {
     Value(u64),
     /// Return the guest's virtual `TSC`.
     Tsc,
+    /// Return the guest's view of `EFER` (see [`guest_efer_view`]).
+    Efer,
     /// Inject `#GP(0)`: the MSR does not exist for this guest.
     Gp,
 }
@@ -580,6 +631,8 @@ pub enum MsrWrite {
     Ok,
     /// The guest set its `TSC` to this value.
     Tsc(u64),
+    /// The guest wrote `EFER`; apply it with [`vmcb_efer_after_write`].
+    Efer(u64),
     /// Inject `#GP(0)`.
     Gp,
 }
@@ -612,6 +665,9 @@ impl MsrState {
         if msr == MSR_TSC {
             return MsrRead::Tsc;
         }
+        if msr == MSR_EFER {
+            return MsrRead::Efer;
+        }
         if let Some(&v) = self.shadow.get(&msr) {
             return MsrRead::Value(v);
         }
@@ -630,6 +686,16 @@ impl MsrState {
     pub fn write(&mut self, msr: u32, value: u64) -> MsrWrite {
         if msr == MSR_TSC {
             return MsrWrite::Tsc(value);
+        }
+        if msr == MSR_EFER {
+            // Reserved bits and the bits only the processor owns are not the
+            // guest's to set.
+            let settable = EFER_GUEST_WRITABLE | EFER_LMA | EFER_SVME;
+            return if value & !settable == 0 {
+                MsrWrite::Efer(value)
+            } else {
+                MsrWrite::Gp
+            };
         }
         if is_writable(msr) {
             self.shadow.insert(msr, value);
@@ -673,8 +739,11 @@ pub struct IoBus {
     pub pic: PicPair,
     /// The system timer (channel 0 + the speaker gate port).
     pub pit: Pit8254,
-    /// The virtual disk on PCI bus 0, if the guest has one.
+    /// The virtual disk on PCI bus 0, if the guest has one and it is a virtio
+    /// device.
     pub virtio: Option<VirtioBlk>,
+    /// The virtual disk, if the guest sees it as an `NVMe` controller.
+    pub nvme: Option<Box<NvmeDevice>>,
     /// The i440FX/PIIX platform a firmware guest expects (`None` for a guest
     /// booted directly into Linux, which is told about hardware by its zero
     /// page instead).
@@ -705,6 +774,7 @@ impl IoBus {
             pic: PicPair::new(),
             pit: Pit8254::new(tsc_hz),
             virtio: None,
+            nvme: None,
             platform: None,
             debug_bytes: Vec::new(),
             now: 0,
@@ -717,6 +787,64 @@ impl IoBus {
     /// interrupt line [`VIRTIO_BLK_IRQ`]).
     pub fn attach_disk(&mut self, backend: Box<dyn BlockBackend>, read_only: bool) {
         self.virtio = Some(VirtioBlk::new(backend, VIRTIO_BLK_IRQ, read_only));
+    }
+
+    /// Give the guest a virtual disk that appears as an `NVMe` controller on PCI
+    /// bus 0 (device [`NVME_SLOT`], interrupt line [`NVME_IRQ`]), presenting
+    /// `identity`.
+    pub fn attach_nvme(
+        &mut self,
+        backend: Box<dyn BlockBackend>,
+        identity: NvmeIdentity,
+        read_only: bool,
+    ) {
+        self.nvme = Some(Box::new(NvmeDevice::new(
+            backend, identity, NVME_IRQ, read_only,
+        )));
+    }
+
+    /// Which disk device's `BAR0` contains `gpa`, and the offset within it.
+    #[must_use]
+    pub fn disk_bar(&self, gpa: u64) -> Option<DiskTarget> {
+        let inside = |bar: Option<(u64, u64)>| {
+            let (base, len) = bar?;
+            gpa.checked_sub(base).filter(|&o| o < len)
+        };
+        if let Some(off) = inside(self.virtio.as_ref().and_then(|v| v.pci.bar0())) {
+            return Some(DiskTarget::Virtio(off));
+        }
+        inside(self.nvme.as_ref().and_then(|n| n.pci.bar0())).map(DiskTarget::Nvme)
+    }
+
+    /// A `size`-byte register read from a disk device.
+    pub fn disk_read(&mut self, target: DiskTarget, size: u8) -> u64 {
+        match target {
+            DiskTarget::Virtio(off) => self.virtio.as_mut().map_or(0, |v| v.mmio_read(off, size)),
+            DiskTarget::Nvme(off) => self.nvme.as_ref().map_or(0, |n| n.mmio_read(off, size)),
+        }
+    }
+
+    /// A `size`-byte register write to a disk device; the device may run its
+    /// queues against guest memory `mem`.
+    pub fn disk_write(
+        &mut self,
+        target: DiskTarget,
+        size: u8,
+        value: u64,
+        mem: &dyn crate::virtio_blk::GuestMemory,
+    ) {
+        match target {
+            DiskTarget::Virtio(off) => {
+                if let Some(v) = self.virtio.as_mut() {
+                    v.mmio_write(off, size, value, mem);
+                }
+            }
+            DiskTarget::Nvme(off) => {
+                if let Some(n) = self.nvme.as_mut() {
+                    n.mmio_write(off, size, value, mem);
+                }
+            }
+        }
     }
 
     /// Give the guest the i440FX/PIIX platform firmware probes: host bridge,
@@ -749,6 +877,9 @@ impl IoBus {
         if dev == VIRTIO_BLK_SLOT && func == 0 {
             return self.virtio.as_mut().map(|v| (&mut v.pci, reg));
         }
+        if dev == NVME_SLOT && func == 0 {
+            return self.nvme.as_mut().map(|n| (&mut n.pci, reg));
+        }
         let platform = self.platform.as_mut()?;
         platform.function(dev, func).map(|f| (f, reg))
     }
@@ -778,6 +909,8 @@ impl IoBus {
         self.pic.set_irq(4, self.uart.irq_line());
         let disk_irq = self.virtio.as_ref().is_some_and(VirtioBlk::irq_line);
         self.pic.set_irq(VIRTIO_BLK_IRQ, disk_irq);
+        let nvme_irq = self.nvme.as_ref().is_some_and(|n| n.irq_line());
+        self.pic.set_irq(NVME_IRQ, nvme_irq);
     }
 
     /// The vector of the interrupt waiting to be delivered, if any: the local
@@ -881,7 +1014,8 @@ impl IoBus {
             }
             0x40 => u32::from(self.pit.read_data(self.now)),
             // Channels 1 and 2 are not modelled; the control port is write-only.
-            0x41 | 0x42 => 0,
+            0x41 => 0,
+            0x42 => u32::from(self.pit.read_data2(self.now)),
             0x61 => u32::from(self.pit.read_port61(self.now)),
             0x71 => u32::from(self.cmos(self.cmos_index)),
             // QEMU's debug port reads 0xE9 so firmware knows it can print there.
@@ -921,7 +1055,8 @@ impl IoBus {
             }
             0x40 => self.pit.write_data((val & 0xFF) as u8, self.now),
             0x43 => self.pit.write_control((val & 0xFF) as u8, self.now),
-            0x61 => self.pit.write_port61((val & 0xFF) as u8),
+            0x42 => self.pit.write_data2((val & 0xFF) as u8, self.now),
+            0x61 => self.pit.write_port61((val & 0xFF) as u8, self.now),
             0x70 => self.cmos_index = (val & 0xFF) as u8,
             0x402 if self.platform.is_some() => self.debug_bytes.push((val & 0xFF) as u8),
             0xCF8 => self.pci_addr = val,
@@ -1103,15 +1238,17 @@ pub use hw::boot;
 )]
 mod hw {
     use super::{
-        BOOT_PARAMS_GPA, CMDLINE_GPA, GDT_GPA, GUEST_RAM_BYTES, IoBus, IoEvent, LineBuf, MIB,
-        MSR_PASSTHROUGH, MmioBus, MsrRead, MsrState, MsrWrite, PT_BYTES, PT_GPA, STACK_GPA,
-        TraceEvent, TraceKind, TraceRing, cpuid_policy, e820_map, gdt_bytes, plan_layout,
+        BOOT_PARAMS_GPA, CMDLINE_GPA, DiskTarget, GDT_GPA, GUEST_RAM_BYTES, IoBus, IoEvent,
+        LineBuf, MIB, MSR_PASSTHROUGH, MmioBus, MsrRead, MsrState, MsrWrite, PT_BYTES, PT_GPA,
+        STACK_GPA, TraceEvent, TraceKind, TraceRing, cpuid_policy, e820_map, gdt_bytes,
+        guest_efer_view, plan_layout, vmcb_efer_after_write,
     };
-    use crate::blockdev::{BlockBackend, BlockError, DiskConfig, DiskMap, SECTOR};
+    use crate::blockdev::{BlockBackend, BlockError, DiskConfig, DiskMap, DiskModel, SECTOR};
     use crate::handoff::{BootHandoff, GuestFirmware, StagedFile};
     use crate::insn::{AccessKind, decode_mem_access, extend, mask_to, merge_reg, translate_gva};
     use crate::mmio::PhysMmio;
     use crate::nvme::NvmeController;
+    use crate::nvme_dev::NvmeIdentity;
     use crate::platform::{RESET_CS_BASE, RESET_RIP, flash_layout};
     use crate::serial::SerialPort;
     use crate::svm::{GuestGprs, host_cpuid, vmrun};
@@ -1121,6 +1258,7 @@ mod hw {
     use alloc::collections::BTreeSet;
     use alloc::format;
     use alloc::string::String;
+    use alloc::vec::Vec;
     use core::fmt::Write as _;
     use core::sync::atomic::Ordering;
     use enlil_hal::bzimage::build_boot_params;
@@ -1407,14 +1545,10 @@ mod hw {
             return Err(Stop::MmioDecode(gpa));
         };
         let size = access.size;
-        // Is the address inside the virtual disk's BAR (a real device)?
-        let disk_offset = io
-            .virtio
-            .as_ref()
-            .and_then(|v| v.pci.bar0())
-            .and_then(|(base, len)| gpa.checked_sub(base).filter(|&o| o < len));
+        // Is the address inside a virtual disk's BAR (a real device)?
+        let disk = io.disk_bar(gpa);
         let lapic_offset = io.lapic_offset(gpa);
-        let first = disk_offset.is_none() && bus.note(gpa);
+        let first = disk.is_none() && bus.note(gpa);
         match access.kind {
             AccessKind::Load {
                 reg,
@@ -1422,12 +1556,10 @@ mod hw {
                 sign_extend,
                 dest_size,
             } => {
-                let raw = match (disk_offset, io.virtio.as_mut()) {
-                    (Some(off), Some(disk)) => disk.mmio_read(off, size),
-                    _ => match lapic_offset {
-                        Some(off) => io.lapic_read(off, size),
-                        None => bus.read(gpa, size),
-                    },
+                let raw = match (disk, lapic_offset) {
+                    (Some(target), _) => io.disk_read(target, size),
+                    (None, Some(off)) => io.lapic_read(off, size),
+                    (None, None) => bus.read(gpa, size),
                 };
                 let value = extend(raw, size, dest_size, sign_extend);
                 let event = TraceEvent {
@@ -1438,16 +1570,17 @@ mod hw {
                     rip,
                 };
                 trace.push(event);
-                if lapic_offset.is_some() || disk_offset.is_some() {
+                if lapic_offset.is_some() || disk.is_some() {
                     irq_trace.push(event);
                 }
-                if let Some(off) = disk_offset
+                if let Some(target) = disk
                     && io.has_platform()
                     && bus.disk_logged < 60
                 {
                     bus.disk_logged += 1;
                     serial.write_str(&format!(
-                        "enlil kernel: {label}: disk bar read  {size}B +{off:#x} -> {raw:#x} from RIP {rip:#x}\n"
+                        "enlil kernel: {label}: disk bar read  {size}B +{:#x} -> {raw:#x} from RIP {rip:#x}\n",
+                        target.offset()
                     ));
                 }
                 let (target, hi) = if high8 { (reg - 4, true) } else { (reg, false) };
@@ -1475,7 +1608,7 @@ mod hw {
                     rip,
                 };
                 trace.push(event);
-                if lapic_offset.is_some() || disk_offset.is_some() {
+                if lapic_offset.is_some() || disk.is_some() {
                     irq_trace.push(event);
                 }
                 mmio_store(
@@ -1484,7 +1617,7 @@ mod hw {
                     mem,
                     bus,
                     io,
-                    disk_offset,
+                    disk,
                     lapic_offset,
                     gpa,
                     size,
@@ -1503,7 +1636,7 @@ mod hw {
                     rip,
                 };
                 trace.push(event);
-                if lapic_offset.is_some() || disk_offset.is_some() {
+                if lapic_offset.is_some() || disk.is_some() {
                     irq_trace.push(event);
                 }
                 mmio_store(
@@ -1512,7 +1645,7 @@ mod hw {
                     mem,
                     bus,
                     io,
-                    disk_offset,
+                    disk,
                     lapic_offset,
                     gpa,
                     size,
@@ -1526,7 +1659,7 @@ mod hw {
         Ok(())
     }
 
-    /// Perform an MMIO store: to the virtual disk if `disk_offset` is set (a
+    /// Perform an MMIO store: to the virtual disk if `disk` is set (a
     /// doorbell write runs the queue against guest memory), else to the
     /// absent-device bus.
     #[allow(clippy::too_many_arguments)]
@@ -1536,7 +1669,7 @@ mod hw {
         mem: GuestMem,
         bus: &mut MmioBus,
         io: &mut IoBus,
-        disk_offset: Option<u64>,
+        disk: Option<DiskTarget>,
         lapic_offset: Option<u64>,
         gpa: u64,
         size: u8,
@@ -1544,14 +1677,15 @@ mod hw {
         rip: u64,
         first: bool,
     ) {
-        if let (Some(off), Some(disk)) = (disk_offset, io.virtio.as_mut()) {
+        if let Some(target) = disk {
             if io.has_platform() && bus.disk_logged < 60 {
                 bus.disk_logged += 1;
                 serial.write_str(&format!(
-                    "enlil kernel: {label}: disk bar write {size}B +{off:#x} <- {value:#x} from RIP {rip:#x}\n"
+                    "enlil kernel: {label}: disk bar write {size}B +{:#x} <- {value:#x} from RIP {rip:#x}\n",
+                    target.offset()
                 ));
             }
-            disk.mmio_write(off, size, value, &mem);
+            io.disk_write(target, size, value, &mem);
         } else if let Some(off) = lapic_offset {
             io.lapic_write(off, size, value);
         } else {
@@ -1568,6 +1702,18 @@ mod hw {
     /// driver's staging buffer can carry.
     struct NvmeBackend {
         ctl: NvmeController<PhysMmio>,
+        /// How the drive identifies itself: copied to the guest's controller so
+        /// the guest believes it owns this drive.
+        identity: NvmeIdentity,
+    }
+
+    /// An identify-structure ASCII field without its space/NUL padding.
+    fn trimmed(field: &[u8]) -> Vec<u8> {
+        let end = field
+            .iter()
+            .rposition(|&b| b != b' ' && b != 0)
+            .map_or(0, |i| i + 1);
+        field[..end].to_vec()
     }
 
     /// Bytes moved per `NVMe` command.
@@ -1644,7 +1790,16 @@ mod hw {
                         }
                     ));
                     if matched {
-                        return Some(NvmeBackend { ctl });
+                        // PCI vendor and device id of the real controller.
+                        let ids = crate::pci::config_dword(c.bus, c.device, c.function, 0);
+                        let identity = NvmeIdentity {
+                            vendor: (ids & 0xFFFF) as u16,
+                            device: (ids >> 16) as u16,
+                            serial: trimmed(ctl.serial()),
+                            model: trimmed(ctl.model()),
+                            firmware: trimmed(ctl.firmware()),
+                        };
+                        return Some(NvmeBackend { ctl, identity });
                     }
                     ctl.disable();
                 }
@@ -1698,7 +1853,19 @@ mod hw {
                 "partly writable"
             }
         ));
-        io.attach_disk(Box::new(DiskMap::new(backend, ranges)), read_only);
+        let identity = backend.identity.clone();
+        let disk = Box::new(DiskMap::new(backend, ranges));
+        match cfg.model {
+            DiskModel::Virtio => io.attach_disk(disk, read_only),
+            DiskModel::Nvme => {
+                serial.write_str(&format!(
+                    "enlil kernel: {label}: the guest's disk is an NVMe controller presenting {} ({})\n",
+                    String::from_utf8_lossy(&identity.model),
+                    String::from_utf8_lossy(&identity.serial)
+                ));
+                io.attach_nvme(disk, identity, read_only);
+            }
+        }
     }
 
     /// Clear both bits of every passthrough MSR in a fully-armed MSRPM.
@@ -2505,6 +2672,10 @@ mod hw {
                                 let offset = t.wrapping_sub(crate::tsc::read_tsc());
                                 set_tsc_offset(vmcb, offset.cast_signed());
                             }
+                            MsrWrite::Efer(v) => {
+                                let cur = read_save_u64(vmcb, save::EFER);
+                                write_save_u64(vmcb, save::EFER, vmcb_efer_after_write(cur, v));
+                            }
                             MsrWrite::Gp => fault = true,
                         }
                     } else {
@@ -2514,6 +2685,7 @@ mod hw {
                                 crate::tsc::read_tsc()
                                     .wrapping_add(tsc_offset(vmcb).cast_unsigned()),
                             ),
+                            MsrRead::Efer => Some(guest_efer_view(read_save_u64(vmcb, save::EFER))),
                             MsrRead::Gp => None,
                         };
                         trace.push(TraceEvent {
@@ -3143,6 +3315,34 @@ mod tests {
         assert_eq!(m.read(0xC001_1029), MsrRead::Value(7));
         assert_eq!(m.write(0xDEAD_BEEF, 1), MsrWrite::Gp);
         assert_eq!(m.write(MSR_TSC, 99), MsrWrite::Tsc(99));
+    }
+
+    #[test]
+    fn efer_is_emulated_so_the_guest_never_sees_or_clears_svme() {
+        // The hardware refuses to VMRUN a guest whose EFER lacks SVME; a guest
+        // that writes EFER = 0 (as a bootloader leaving long mode does) must not
+        // be able to clear it, and must not see it set either.
+        let mut m = MsrState::new();
+        assert_eq!(m.read(MSR_EFER), MsrRead::Efer);
+        assert!(!MSR_PASSTHROUGH.contains(&MSR_EFER));
+        let live = EFER_SVME | EFER_LMA | (1 << 8) | (1 << 11) | 1;
+        assert_eq!(guest_efer_view(live), live & !EFER_SVME);
+        // Writing zero (leaving long mode) keeps SVME on and drops the rest.
+        assert_eq!(m.write(MSR_EFER, 0), MsrWrite::Efer(0));
+        assert_eq!(vmcb_efer_after_write(live, 0), EFER_SVME | EFER_LMA);
+        // Setting LME and NXE (the Linux decompressor) takes effect.
+        let after = vmcb_efer_after_write(EFER_SVME, (1 << 8) | (1 << 11));
+        assert_eq!(after, EFER_SVME | (1 << 8) | (1 << 11));
+        // The processor owns LMA: a guest's attempt to set it changes nothing.
+        assert_eq!(vmcb_efer_after_write(EFER_SVME, EFER_LMA), EFER_SVME);
+        // Reserved bits are a #GP, not silently dropped.
+        assert_eq!(m.write(MSR_EFER, 1 << 40), MsrWrite::Gp);
+        assert_eq!(m.write(MSR_EFER, 1 << 9), MsrWrite::Gp);
+        // A guest that writes back exactly what it read is fine.
+        assert_eq!(
+            m.write(MSR_EFER, guest_efer_view(live)),
+            MsrWrite::Efer(live & !EFER_SVME)
+        );
     }
 
     #[test]

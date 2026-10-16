@@ -24,6 +24,8 @@
 # Environment:
 #   ENLIL_OVMF_LINUX    1: boot Linux from the guest's virtual disk (see above;
 #                       expects "ENLIL-GUEST-TICK 3" unless ENLIL_OVMF_EXPECT is set)
+#   ENLIL_OVMF_DISK_MODEL  virtio (default) or nvme: the controller the guest's
+#                       virtual disk appears on (Windows needs nvme)
 #   ENLIL_OVMF_EXPECT   text that must appear in the guest console (default:
 #                       "BdsDxe: No bootable option" - OVMF ran PEI and DXE and
 #                       reached its boot manager; distro OVMF has no built-in
@@ -123,7 +125,8 @@ if [ "$LINUX" = 1 ]; then
     } > "$GESP/limine.conf"
     # vvfat builds the FAT image from the directory with no root and no mtools.
     qemu-img convert -f vvfat -O raw "fat:$GESP" "$OUTDIR/guest-disk.img" || { echo "FAIL: vvfat"; exit 1; }
-    printf 'nvme-serial = enlilvdisk\nallow = all rw\n' > "$ESP/EFI/enlil/firmware/$GUEST_ID/disk.txt"
+    printf 'nvme-serial = enlilvdisk\nmodel = %s\nallow = all rw\n' "${ENLIL_OVMF_DISK_MODEL:-virtio}" \
+        > "$ESP/EFI/enlil/firmware/$GUEST_ID/disk.txt"
     DISK_ARGS=(-drive "file=$OUTDIR/guest-disk.img,if=none,id=vd0,format=raw,cache=writethrough"
                -device "nvme,drive=vd0,serial=enlilvdisk")
 fi
