@@ -1427,7 +1427,7 @@ mod hw {
     /// Length of `HLT` (`F4`).
     const HLT_INSN_LEN: u64 = 1;
     /// Wall-clock cap on one run so a wedged guest cannot hang the boot, unless
-    /// the guest's config sets `run-seconds` (`0` removes the cap).
+    /// the guest's config sets `run_seconds` (`0` removes the cap).
     const RUN_SECONDS: u64 = 120;
     /// How often the guest's display is copied to the host screen.
     const MIRROR_HZ: u64 = 10;
@@ -2212,6 +2212,8 @@ mod hw {
         screen: Option<crate::handoff::Framebuffer>,
         /// How many seconds the guest may run; `0` is no limit.
         run_seconds: u64,
+        /// Bytes of guest RAM (from guest-physical 0).
+        ram_bytes: u64,
     }
 
     /// Boot a Linux `bzImage` directly by the Linux boot protocol (64-bit entry,
@@ -2371,6 +2373,7 @@ mod hw {
                 vars: None,
                 screen: None,
                 run_seconds: RUN_SECONDS,
+                ram_bytes: GUEST_RAM_BYTES,
             },
         );
     }
@@ -2382,6 +2385,8 @@ mod hw {
     fn boot_firmware(serial: &SerialPort, handoff: &BootHandoff, fw: GuestFirmware) {
         let id = fw.id_str();
         let say = |msg: &str| serial.write_str(&format!("enlil kernel: ovmf: {id}: {msg}\n"));
+        // The config may give the guest more RAM than the direct-boot default.
+        let ram_bytes = handoff.guest_memory_bytes(id).unwrap_or(GUEST_RAM_BYTES);
         // SAFETY: the UEFI stage staged both images into `LOADER_DATA` pages
         // (never freed); the kernel runs identity-mapped.
         let (code, vars) = unsafe {
@@ -2396,12 +2401,11 @@ mod hw {
                 }),
             )
         };
-        let Some(flash) = flash_layout(code.len() as u64, vars.len() as u64, GUEST_RAM_BYTES)
-        else {
+        let Some(flash) = flash_layout(code.len() as u64, vars.len() as u64, ram_bytes) else {
             say("the firmware images are not page-sized (or too large) - cannot map them");
             return;
         };
-        let Some(ram_spa) = crate::kernel::guest_ram::LINUX.take(GUEST_RAM_BYTES, 2 * MIB) else {
+        let Some(ram_spa) = crate::kernel::guest_ram::LINUX.take(ram_bytes, 2 * MIB) else {
             say("no planned guest-RAM window for the guest");
             return;
         };
@@ -2410,7 +2414,7 @@ mod hw {
         let ram = unsafe {
             core::slice::from_raw_parts_mut(
                 core::ptr::with_exposed_provenance_mut::<u8>(ram_spa as usize),
-                GUEST_RAM_BYTES as usize,
+                ram_bytes as usize,
             )
         };
         ram.fill(0);
@@ -2437,7 +2441,7 @@ mod hw {
             (0..len / 4096).try_for_each(|i| m.map_range(gpa + i * 4096, spa + i * 4096, 4096, &[]))
         };
         let mapped = NptMapper::new(&mut *npt_buf, npt_pa).and_then(|mut m| {
-            m.map_range(0, ram_spa, GUEST_RAM_BYTES, &[])?;
+            m.map_range(0, ram_spa, ram_bytes, &[])?;
             map_pages(&mut m, flash.vars_gpa, fw.vars_base, flash.vars_len)?;
             map_pages(&mut m, flash.code_gpa, fw.code_base, flash.code_len)?;
             Ok(m.ncr3())
@@ -2526,16 +2530,17 @@ mod hw {
                 disk: fw.disk,
                 banner: format!(
                     "{id}: entering the reset vector (RAM {} MiB at {ram_spa:#x}; flash: vars {:#x}+{:#x}, code {:#x}+{:#x})",
-                    GUEST_RAM_BYTES / MIB,
+                    ram_bytes / MIB,
                     flash.vars_gpa,
                     flash.vars_len,
                     flash.code_gpa,
                     flash.code_len
                 ),
                 platform: true,
-                fwcfg: Some(machine_fwcfg(serial, handoff)),
+                fwcfg: Some(machine_fwcfg(serial, handoff, ram_bytes)),
                 screen: handoff.framebuffer,
                 run_seconds: handoff.guest_run_seconds(id).unwrap_or(RUN_SECONDS),
+                ram_bytes,
                 vars: Some(vars),
                 flash: [
                     FlashSpan {
@@ -2556,7 +2561,11 @@ mod hw {
     /// The `fw_cfg` device for a firmware guest: the ACPI tables that describe
     /// the machine, and the real board's SMBIOS identity when the firmware
     /// published one.
-    fn machine_fwcfg(serial: &SerialPort, handoff: &BootHandoff) -> crate::fwcfg::FwCfg {
+    fn machine_fwcfg(
+        serial: &SerialPort,
+        handoff: &BootHandoff,
+        ram_bytes: u64,
+    ) -> crate::fwcfg::FwCfg {
         use crate::acpi_tables::{
             AcpiParams, DSDT_AML, FILE_LOADER, FILE_RSDP, FILE_TABLES, build,
         };
@@ -2567,7 +2576,7 @@ mod hw {
         let uuid = crate::smbios::system_uuid(smbios).unwrap_or(*b"enlil-guest-uuid");
         let mut fw = FwCfg::new(MachineInfo {
             uuid,
-            ram_bytes: GUEST_RAM_BYTES,
+            ram_bytes,
             cpus: 1,
         });
         let acpi = build(&AcpiParams::default(), DSDT_AML);
@@ -2612,6 +2621,7 @@ mod hw {
             vars,
             screen,
             run_seconds,
+            ram_bytes,
         } = l;
         let tsc_hz = crate::kernel::TSC_HZ.load(Ordering::Acquire);
         let v = vmcb.as_bytes_mut();
@@ -2663,13 +2673,13 @@ mod hw {
         };
         let mem = GuestMem {
             base: core::ptr::with_exposed_provenance_mut::<u8>(ram_spa as usize),
-            len: GUEST_RAM_BYTES as usize,
+            len: ram_bytes as usize,
             flash,
         };
         // The guest's I/O bus, with its virtual disk if the ESP assigned one.
         let mut io = IoBus::new(tsc_hz.max(1));
         if platform {
-            io.enable_platform(tsc_hz.max(1), GUEST_RAM_BYTES);
+            io.enable_platform(tsc_hz.max(1), ram_bytes);
             if let Some(f) = fwcfg {
                 io.set_fwcfg(f);
             }
@@ -3192,7 +3202,7 @@ mod hw {
                     let gpa = exit_info_2(vmcb);
                     // Guest RAM is fully mapped, so a fault inside it is a bug;
                     // anything above it is a device access.
-                    if gpa < GUEST_RAM_BYTES {
+                    if gpa < mem.len as u64 {
                         break Stop::Npf(gpa);
                     }
                     counts.mmio += 1;

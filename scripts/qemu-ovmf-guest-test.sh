@@ -28,7 +28,9 @@
 #                       sits at \\EFI\\limine\\limine.efi with *no* removable-media fallback,
 #                       and disk.txt names it (boot-partition/boot-loader): the guest boots
 #                       only if enlil seeded a boot entry into the firmware's variable store
-#   ENLIL_OVMF_RUN_SECONDS  the guest's `run-seconds` (default 120; 0 = no limit)
+#   ENLIL_OVMF_MEMORY_MB  the guest's `memory_mb` (default 256; at most 2048 for now)
+#   ENLIL_OVMF_OUTER_MEM  the outer VM's RAM (default 2G; give it more than the guest)
+#   ENLIL_OVMF_RUN_SECONDS  the guest's `run_seconds` (default 120; 0 = no limit)
 #   ENLIL_OVMF_SCREENSHOT  path of a PNG: once the run ends, a screenshot of the (outer)
                        screen, which is where the hypervisor shows the guest's display
 #   ENLIL_OVMF_DISK_MODEL  virtio (default) or nvme: the controller the guest's
@@ -103,8 +105,10 @@ rm -rf "$ESP"
 mkdir -p "$ESP/EFI/BOOT" "$ESP/EFI/enlil/firmware/$GUEST_ID"
 cp "$EFI" "$ESP/EFI/BOOT/BOOTX64.EFI"
 printf '[guest.%s]\nboot = "firmware"\n' "$GUEST_ID" > "$ESP/EFI/enlil/config.toml"
+[ -n "${ENLIL_OVMF_MEMORY_MB:-}" ] \
+    && printf 'memory_mb = %s\n' "$ENLIL_OVMF_MEMORY_MB" >> "$ESP/EFI/enlil/config.toml"
 [ -n "${ENLIL_OVMF_RUN_SECONDS:-}" ] \
-    && printf 'run-seconds = %s\n' "$ENLIL_OVMF_RUN_SECONDS" >> "$ESP/EFI/enlil/config.toml"
+    && printf 'run_seconds = %s\n' "$ENLIL_OVMF_RUN_SECONDS" >> "$ESP/EFI/enlil/config.toml"
 cp "$GUEST_CODE" "$ESP/EFI/enlil/firmware/$GUEST_ID/OVMF_CODE.fd"
 cp "$GUEST_VARS" "$ESP/EFI/enlil/firmware/$GUEST_ID/OVMF_VARS.fd"
 DISK_ARGS=()
@@ -184,7 +188,7 @@ MONITOR_SOCK="$OUTDIR/mon.sock"
 [ -n "${ENLIL_OVMF_SCREENSHOT:-}" ] && EXTRA+=(-monitor "unix:$MONITOR_SOCK,server,nowait")
 echo "==> booting under QEMU+KVM (timeout ${TIMEOUT_SECS}s, waiting for: $EXPECT)"
 "$QEMU" \
-    -machine q35 -smp 2 -m 2G \
+    -machine q35 -smp 2 -m "${ENLIL_OVMF_OUTER_MEM:-2G}" \
     -enable-kvm -cpu "host,+svm" \
     -drive "format=raw,file=fat:rw:$ESP,if=none,id=espdisk" \
     -device ahci,id=ahci -device "ide-hd,drive=espdisk,bus=ahci.0,bootindex=0" \

@@ -3825,7 +3825,12 @@ mod hw {
             heap_size,
             dma_size: 2 * MIB,
             guest_ram_sizes: if os_guest {
-                alloc::vec![16 * MIB, crate::linux_guest::GUEST_RAM_BYTES]
+                // A firmware guest may ask for more RAM than the direct-boot default.
+                let os_ram = handoff
+                    .firmware_boot_guest()
+                    .and_then(|g| handoff.guest_memory_bytes(g.id_str()))
+                    .unwrap_or(crate::linux_guest::GUEST_RAM_BYTES);
+                alloc::vec![16 * MIB, os_ram]
             } else {
                 alloc::vec![16 * MIB]
             },

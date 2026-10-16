@@ -105,14 +105,32 @@ pub fn guest_boots_firmware(config: &[u8], id: &str) -> bool {
     guest_value(config, id, "boot") == Some(b"\"firmware\"")
 }
 
-/// `run-seconds = N` in `[guest.<id>]`: how long the guest may run before the
+/// `run_seconds = N` in `[guest.<id>]`: how long the guest may run before the
 /// hypervisor stops it. `0` means no limit. `None` if absent or not a number.
 #[must_use]
 pub fn guest_run_seconds(config: &[u8], id: &str) -> Option<u64> {
-    core::str::from_utf8(guest_value(config, id, "run-seconds")?)
+    core::str::from_utf8(guest_value(config, id, "run_seconds")?)
         .ok()?
         .parse()
         .ok()
+}
+
+/// Smallest guest RAM the firmware path accepts (MiB).
+pub const MIN_GUEST_MEMORY_MB: u64 = 64;
+/// Largest guest RAM the firmware path accepts (MiB): the guest's PCI memory
+/// window begins at 2 GiB, so RAM must end there. More needs a split map.
+pub const MAX_GUEST_MEMORY_MB: u64 = 2048;
+
+/// `memory_mb = N` in `[guest.<id>]`: the guest's RAM in bytes, clamped to
+/// [`MIN_GUEST_MEMORY_MB`]..=[`MAX_GUEST_MEMORY_MB`] and rounded down to a whole
+/// number of 2 MiB pages. `None` if absent or not a number.
+#[must_use]
+pub fn guest_memory_bytes(config: &[u8], id: &str) -> Option<u64> {
+    let mb: u64 = core::str::from_utf8(guest_value(config, id, "memory_mb")?)
+        .ok()?
+        .parse()
+        .ok()?;
+    Some((mb.clamp(MIN_GUEST_MEMORY_MB, MAX_GUEST_MEMORY_MB) / 2 * 2) << 20)
 }
 
 /// Whether `id` is already recorded in the NUL-padded `seen` slots.
@@ -576,8 +594,8 @@ mod tests {
     #[test]
     fn a_guest_may_set_how_long_it_runs() {
         let config =
-            b"[guest.a]\nrun-seconds = 900 # fifteen minutes\n[guest.b]\nrun-seconds = 0\n\
-            [guest.c]\nrun-seconds = \"soon\"\n[guest.d]\ncpus = 2\n[other]\nrun-seconds = 5\n";
+            b"[guest.a]\nrun_seconds = 900 # fifteen minutes\n[guest.b]\nrun_seconds = 0\n\
+            [guest.c]\nrun_seconds = \"soon\"\n[guest.d]\ncpus = 2\n[other]\nrun_seconds = 5\n";
         assert_eq!(guest_run_seconds(config, "a"), Some(900));
         assert_eq!(guest_run_seconds(config, "b"), Some(0), "0 means unlimited");
         assert_eq!(guest_run_seconds(config, "c"), None, "not a number");
@@ -588,6 +606,23 @@ mod tests {
             "not a guest table"
         );
         assert_eq!(guest_run_seconds(config, "missing"), None);
+    }
+
+    #[test]
+    fn a_guests_ram_is_clamped_and_page_aligned() {
+        let config = b"[guest.a]\nmemory_mb = 1024\n[guest.b]\nmemory_mb = 99999\n\
+            [guest.c]\nmemory_mb = 1\n[guest.d]\nmemory_mb = 513\n[guest.e]\nmemory_mb = lots\n\
+            [guest.f]\ncpus = 2\n";
+        assert_eq!(guest_memory_bytes(config, "a"), Some(1024 << 20));
+        assert_eq!(guest_memory_bytes(config, "b"), Some(2048 << 20), "capped");
+        assert_eq!(guest_memory_bytes(config, "c"), Some(64 << 20), "floored");
+        assert_eq!(
+            guest_memory_bytes(config, "d"),
+            Some(512 << 20),
+            "whole 2 MiB pages"
+        );
+        assert_eq!(guest_memory_bytes(config, "e"), None);
+        assert_eq!(guest_memory_bytes(config, "f"), None);
     }
 
     #[test]
