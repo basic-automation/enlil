@@ -3818,11 +3818,19 @@ mod hw {
             Some((base, size)) => (size, Some((base, size))),
             None => (8 * MIB, None),
         };
+        // A second guest window is carved for the OS-guest boot path: a staged
+        // Linux kernel, or a guest the config asks to boot from its firmware.
+        let os_guest = handoff.linux_guest.has_kernel() || handoff.firmware_boot_guest().is_some();
         let req = MemoryPlanRequest {
             heap_size,
             dma_size: 2 * MIB,
-            guest_ram_sizes: if handoff.linux_guest.has_kernel() {
-                alloc::vec![16 * MIB, crate::linux_guest::GUEST_RAM_BYTES]
+            guest_ram_sizes: if os_guest {
+                // A firmware guest may ask for more RAM than the direct-boot default.
+                let os_ram = handoff
+                    .firmware_boot_guest()
+                    .and_then(|g| handoff.guest_memory_bytes(g.id_str()))
+                    .unwrap_or(crate::linux_guest::GUEST_RAM_BYTES);
+                alloc::vec![16 * MIB, os_ram]
             } else {
                 alloc::vec![16 * MIB]
             },
@@ -3903,7 +3911,7 @@ mod hw {
                     // The Linux guest's own carve (second region), disjoint from
                     // the proof guests' window by the planner.
                     if all_clear
-                        && handoff.linux_guest.has_kernel()
+                        && os_guest
                         && let Some(g1) = regions.guest_ram.get(1)
                     {
                         crate::kernel::guest_ram::LINUX.publish(g1.base.as_u64(), g1.size);

@@ -375,6 +375,10 @@ pub const MODEL_LEN: usize = 40;
 const IDENTIFY_SN_OFFSET: usize = 4;
 /// Length of the serial number field: 20 ASCII bytes, space padded.
 pub const SERIAL_LEN: usize = 20;
+/// Length of the firmware revision (`FR`) field in the controller identify data.
+pub const FIRMWARE_LEN: usize = 8;
+/// Offset of the firmware revision in the controller identify data.
+const IDENTIFY_FR_OFFSET: usize = 64;
 
 /// Whether a space-padded Identify serial number equals `wanted`.
 ///
@@ -434,6 +438,7 @@ pub struct NvmeController<M: Mmio> {
     namespace_blocks: u64,
     model: [u8; MODEL_LEN],
     serial: [u8; SERIAL_LEN],
+    firmware: [u8; FIRMWARE_LEN],
 }
 
 /// Spin until `condition` holds or the budget is exhausted.
@@ -512,6 +517,7 @@ impl<M: Mmio> NvmeController<M> {
             namespace_blocks: 0,
             model: [0; MODEL_LEN],
             serial: [0; SERIAL_LEN],
+            firmware: [0; FIRMWARE_LEN],
         };
 
         // Program the admin queue pair: queue sizes are 0's-based in AQA, and
@@ -536,6 +542,8 @@ impl<M: Mmio> NvmeController<M> {
             .copy_from_slice(&data[IDENTIFY_MN_OFFSET..IDENTIFY_MN_OFFSET + MODEL_LEN]);
         ctrl.serial
             .copy_from_slice(&data[IDENTIFY_SN_OFFSET..IDENTIFY_SN_OFFSET + SERIAL_LEN]);
+        ctrl.firmware
+            .copy_from_slice(&data[IDENTIFY_FR_OFFSET..IDENTIFY_FR_OFFSET + FIRMWARE_LEN]);
         let nn = u32::from_le_bytes(
             data[516..520]
                 .try_into()
@@ -602,6 +610,12 @@ impl<M: Mmio> NvmeController<M> {
     #[must_use]
     pub const fn serial(&self) -> &[u8; SERIAL_LEN] {
         &self.serial
+    }
+
+    /// The controller's firmware revision (`FR`), 8 ASCII bytes, space padded.
+    #[must_use]
+    pub const fn firmware(&self) -> &[u8; FIRMWARE_LEN] {
+        &self.firmware
     }
 
     /// Whether this controller's serial number equals `wanted` (ignoring the
