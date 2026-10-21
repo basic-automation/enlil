@@ -26,6 +26,14 @@
 pub const BOOT_APP_PATH: &str = "EFI/BOOT/BOOTX64.EFI";
 /// The hypervisor config copy on the ESP.
 pub const CONFIG_PATH: &str = "EFI/enlil/config.toml";
+/// ESP directory holding the Linux guest payload.
+pub const LINUX_ROOT: &str = "EFI/enlil/linux";
+/// The Linux guest kernel image (`bzImage`), relative to the ESP root.
+pub const LINUX_KERNEL_PATH: &str = "EFI/enlil/linux/vmlinuz";
+/// The Linux guest initial ramdisk, relative to the ESP root.
+pub const LINUX_INITRD_PATH: &str = "EFI/enlil/linux/initrd.img";
+/// The Linux guest kernel command line (plain text), relative to the ESP root.
+pub const LINUX_CMDLINE_PATH: &str = "EFI/enlil/linux/cmdline.txt";
 /// Root of the per-guest firmware tree on the ESP.
 pub const FIRMWARE_ROOT: &str = "EFI/enlil/firmware";
 /// File name of the read-only firmware code image in a guest's directory.

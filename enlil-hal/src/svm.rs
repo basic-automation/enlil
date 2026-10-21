@@ -1381,6 +1381,24 @@ pub fn guest_rip(region: &[u8]) -> u64 {
     get_u64(region, save::RIP)
 }
 
+/// Read a 64-bit field of the state-save area at `offset`.
+///
+/// `offset` is one of the [`save`] offsets, e.g. [`save::RFLAGS`] or
+/// [`save::CR4`]. For run-loop policy that depends on guest state (interrupt
+/// flag, `CR4` feature bits) and for diagnostics.
+#[must_use]
+pub fn read_save_u64(region: &[u8], offset: usize) -> u64 {
+    get_u64(region, offset)
+}
+
+/// Overwrite a 64-bit field of the state-save area at `offset`.
+///
+/// For example [`save::RSP`], when an emulated instruction targets the stack
+/// pointer.
+pub fn write_save_u64(region: &mut [u8], offset: usize, value: u64) {
+    put_u64(region, offset, value);
+}
+
 /// Overwrite the guest `RAX` in the save area (e.g. an emulated `IN` result).
 pub fn set_guest_rax(region: &mut [u8], value: u64) {
     put_u64(region, save::RAX, value);

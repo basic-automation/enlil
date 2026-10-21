@@ -109,11 +109,13 @@ const MAX_E820_ENTRIES: usize = 128;
 /// `type_of_loader` value for an undefined/unregistered bootloader.
 const LOADER_TYPE_UNDEFINED: u8 = 0xFF;
 
-/// Build the `boot_params` "zero page" for a `bzImage`: copy the setup header
-/// from the image, mark an undefined bootloader, point `cmd_line_ptr` at the
-/// guest cmdline, record the initrd (`ramdisk_image`/`ramdisk_size`, both 0 for
-/// none), and write the E820 memory map. `e820` entries are `(base, size, type)`
-/// using the E820 type codes (1 usable, 2 reserved, …).
+/// Build the `boot_params` "zero page" for a `bzImage`.
+///
+/// Copies the setup header from the image, marks an undefined bootloader,
+/// points `cmd_line_ptr` at the guest cmdline, records the initrd
+/// (`ramdisk_image`/`ramdisk_size`, both 0 for none), and writes the E820 memory
+/// map. `e820` entries are `(base, size, type)` using the E820 type codes
+/// (1 usable, 2 reserved, …).
 ///
 /// This is the block the protected-mode kernel is entered with (RSI → its
 /// guest-physical address).
@@ -150,9 +152,11 @@ pub fn build_boot_params(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
 
     /// Build a minimal, valid `bzImage`-like header: boot signature, `"HdrS"`
-    /// magic, a protocol version, a `setup_sects` count, and LOADED_HIGH set (a
+    /// magic, a protocol version, a `setup_sects` count, and `LOADED_HIGH` set (a
     /// real big kernel).
     fn header(setup_sects: u8, version: u16) -> Vec<u8> {
         let mut img = vec![0u8; 0x218];
