@@ -34,22 +34,30 @@ pub const LINUX_KERNEL_PATH: &str = "EFI/enlil/linux/vmlinuz";
 pub const LINUX_INITRD_PATH: &str = "EFI/enlil/linux/initrd.img";
 /// The Linux guest kernel command line (plain text), relative to the ESP root.
 pub const LINUX_CMDLINE_PATH: &str = "EFI/enlil/linux/cmdline.txt";
+/// The Linux guest's virtual-disk assignment (plain text), relative to the ESP
+/// root: which host disk it is carved from and which sector ranges it may use.
+pub const LINUX_DISK_PATH: &str = "EFI/enlil/linux/disk.txt";
 /// Root of the per-guest firmware tree on the ESP.
 pub const FIRMWARE_ROOT: &str = "EFI/enlil/firmware";
 /// File name of the read-only firmware code image in a guest's directory.
 pub const CODE_FILE_NAME: &str = "OVMF_CODE.fd";
 /// File name of the variable-store template in a guest's directory.
 pub const VARS_FILE_NAME: &str = "OVMF_VARS.fd";
+/// File name of a firmware guest's virtual-disk assignment in its directory
+/// (same format as [`LINUX_DISK_PATH`]).
+pub const DISK_FILE_NAME: &str = "disk.txt";
 /// Longest guest id accepted as an ESP directory name.
 pub const MAX_GUEST_ID_LEN: usize = 32;
 
-/// Which of a guest's two firmware files a path names.
+/// Which of a guest's firmware-directory files a path names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirmwareFile {
     /// The read-only OVMF code image (`OVMF_CODE.fd`).
     Code,
     /// The variable-store template (`OVMF_VARS.fd`).
     Vars,
+    /// The virtual-disk assignment (`disk.txt`).
+    Disk,
 }
 
 impl FirmwareFile {
@@ -59,6 +67,7 @@ impl FirmwareFile {
         match self {
             Self::Code => CODE_FILE_NAME,
             Self::Vars => VARS_FILE_NAME,
+            Self::Disk => DISK_FILE_NAME,
         }
     }
 }
@@ -150,6 +159,8 @@ mod tests {
         assert_eq!(as_str(&buf, len), "EFI/enlil/firmware/linux1/OVMF_CODE.fd");
         let len = guest_firmware_path_into("linux1", FirmwareFile::Vars, &mut buf).unwrap();
         assert_eq!(as_str(&buf, len), "EFI/enlil/firmware/linux1/OVMF_VARS.fd");
+        let len = guest_firmware_path_into("linux1", FirmwareFile::Disk, &mut buf).unwrap();
+        assert_eq!(as_str(&buf, len), "EFI/enlil/firmware/linux1/disk.txt");
     }
 
     #[test]

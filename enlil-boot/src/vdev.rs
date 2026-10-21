@@ -313,7 +313,42 @@ enum Mode {
     Periodic,
 }
 
-/// An 8254 timer's channel 0 (the IRQ 0 system tick) plus the speaker gate port.
+/// Channel 2: the speaker timer, and the clock operating systems calibrate the
+/// TSC against (gate it, load a count, wait for its output).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Channel2 {
+    mode: u8,
+    access: u8,
+    reload: u32,
+    lo_pending: Option<u8>,
+    latched: Option<u16>,
+    read_hi_next: bool,
+    /// Whether a count was loaded since the last mode write.
+    loaded: bool,
+    /// PIT ticks already counted while the gate was high, before `since`.
+    ticks_before: u64,
+    /// The TSC value the gate last went high at, while it is high.
+    since: Option<u64>,
+}
+
+impl Channel2 {
+    const fn new() -> Self {
+        Self {
+            mode: 0,
+            access: 3,
+            reload: 0x1_0000,
+            lo_pending: None,
+            latched: None,
+            read_hi_next: false,
+            loaded: false,
+            ticks_before: 0,
+            since: None,
+        }
+    }
+}
+
+/// An 8254 timer's channel 0 (the IRQ 0 system tick), channel 2 (calibration
+/// and speaker) and the speaker/gate port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pit8254 {
     tsc_hz: u64,
@@ -326,6 +361,7 @@ pub struct Pit8254 {
     start_tsc: u64,
     next_fire: Option<u64>,
     port61: u8,
+    ch2: Channel2,
 }
 
 impl Pit8254 {
@@ -343,6 +379,7 @@ impl Pit8254 {
             start_tsc: 0,
             next_fire: None,
             port61: 0,
+            ch2: Channel2::new(),
         }
     }
 
@@ -379,8 +416,12 @@ impl Pit8254 {
     pub const fn write_control(&mut self, val: u8, now: u64) {
         let channel = val >> 6;
         let rw = (val >> 4) & 3;
+        if channel == 2 {
+            self.write_control_ch2(val, now);
+            return;
+        }
         if channel != 0 {
-            return; // channels 1 and 2 are not modelled
+            return; // channel 1 (DRAM refresh) and the read-back command are not modelled
         }
         if rw == 0 {
             // Counter latch command.
@@ -442,16 +483,135 @@ impl Pit8254 {
     }
 
     /// Read the speaker/gate port (`0x61`): bit 4 toggles with the refresh
-    /// clock, bit 5 is the (idle) channel-2 output.
+    /// clock, bit 5 is channel 2's output.
     #[must_use]
     pub const fn read_port61(&self, now: u64) -> u8 {
         let refresh = (self.tsc_to_ticks(now) / 18) & 1;
-        (self.port61 & 0x03) | ((refresh as u8) << 4)
+        (self.port61 & 0x03) | ((refresh as u8) << 4) | ((self.out2(now) as u8) << 5)
     }
 
-    /// Write the speaker/gate port (`0x61`).
-    pub const fn write_port61(&mut self, val: u8) {
+    /// Write the speaker/gate port (`0x61`). Bit 0 gates channel 2's counter:
+    /// it counts only while the gate is high.
+    pub const fn write_port61(&mut self, val: u8, now: u64) {
+        let old_gate = self.port61 & 1 != 0;
+        let new_gate = val & 1 != 0;
+        if new_gate && !old_gate {
+            // Rising edge: counting (re)starts; modes 1, 2, 3 and 5 also reload.
+            if matches!(self.ch2.mode & 0b11, 1..=3) || self.ch2.mode == 5 {
+                self.ch2.ticks_before = 0;
+            }
+            self.ch2.since = Some(now);
+        } else if !new_gate && old_gate {
+            self.ch2.ticks_before = self.ch2_elapsed(now);
+            self.ch2.since = None;
+        }
         self.port61 = val & 0x03;
+    }
+
+    /// PIT ticks channel 2 has counted since its count was loaded.
+    const fn ch2_elapsed(&self, now: u64) -> u64 {
+        let live = match self.ch2.since {
+            Some(since) => self.tsc_to_ticks(now.saturating_sub(since)),
+            None => 0,
+        };
+        self.ch2.ticks_before + live
+    }
+
+    /// Channel 2's count at `now`.
+    #[must_use]
+    pub const fn count2(&self, now: u64) -> u16 {
+        let e = self.ch2_elapsed(now);
+        let reload = self.ch2.reload as u64;
+        let left = match self.ch2.mode & 0b11 {
+            // Modes 2 and 3 reload when they reach the end.
+            2 | 3 => reload - (e % reload),
+            // Modes 0 and 4 keep counting (wrapping) past terminal count.
+            _ => reload.wrapping_sub(e),
+        };
+        (left & 0xFFFF) as u16
+    }
+
+    /// Channel 2's output at `now` (bit 5 of port `0x61`).
+    #[must_use]
+    pub const fn out2(&self, now: u64) -> bool {
+        let e = self.ch2_elapsed(now);
+        let reload = self.ch2.reload as u64;
+        match self.ch2.mode {
+            // Interrupt on terminal count: low until the count expires.
+            0 => self.ch2.loaded && e >= reload,
+            // Square wave: high for the first half of each period.
+            3 | 7 => (e % reload) < reload.div_ceil(2),
+            // The strobe modes sit high between their one-tick low pulses.
+            _ => true,
+        }
+    }
+
+    const fn write_control_ch2(&mut self, val: u8, now: u64) {
+        let rw = (val >> 4) & 3;
+        if rw == 0 {
+            // Counter latch command.
+            self.ch2.latched = Some(self.count2(now));
+            self.ch2.read_hi_next = false;
+            return;
+        }
+        self.ch2.access = rw;
+        self.ch2.lo_pending = None;
+        self.ch2.mode = (val >> 1) & 7;
+        // A mode write stops the channel until a new count is loaded.
+        self.ch2.loaded = false;
+        self.ch2.ticks_before = 0;
+        self.ch2.since = if self.port61 & 1 != 0 {
+            Some(now)
+        } else {
+            None
+        };
+    }
+
+    /// Write channel 2's data port (`0x42`): a reload count, byte by byte.
+    pub const fn write_data2(&mut self, val: u8, now: u64) {
+        let count = match self.ch2.access {
+            1 => Some(val as u16),
+            2 => Some((val as u16) << 8),
+            _ => match self.ch2.lo_pending.take() {
+                None => {
+                    self.ch2.lo_pending = Some(val);
+                    None
+                }
+                Some(lo) => Some(((val as u16) << 8) | lo as u16),
+            },
+        };
+        if let Some(c) = count {
+            self.ch2.reload = if c == 0 { 0x1_0000 } else { c as u32 };
+            self.ch2.loaded = true;
+            self.ch2.ticks_before = 0;
+            self.ch2.since = if self.port61 & 1 != 0 {
+                Some(now)
+            } else {
+                None
+            };
+        }
+    }
+
+    /// Read channel 2's data port (`0x42`): the latched count, else the live one.
+    pub const fn read_data2(&mut self, now: u64) -> u8 {
+        let value = match self.ch2.latched {
+            Some(v) => v,
+            None => self.count2(now),
+        };
+        let [lo, hi] = value.to_le_bytes();
+        let byte = match self.ch2.access {
+            1 => lo,
+            2 => hi,
+            _ => {
+                let b = if self.ch2.read_hi_next { hi } else { lo };
+                self.ch2.read_hi_next = !self.ch2.read_hi_next;
+                b
+            }
+        };
+        if self.ch2.latched.is_some() && (self.ch2.access != 3 || !self.ch2.read_hi_next) {
+            self.ch2.latched = None;
+        }
+        byte
     }
 
     /// Whether IRQ 0 is due at `now`; consumes the event. A periodic timer
@@ -787,7 +947,7 @@ mod tests {
     #[test]
     fn port61_reports_the_gate_and_a_toggling_refresh_bit() {
         let mut pit = Pit8254::new(HZ);
-        pit.write_port61(0xFF);
+        pit.write_port61(0xFF, 0);
         assert_eq!(
             pit.read_port61(0) & 0x03,
             0x03,
@@ -799,12 +959,125 @@ mod tests {
         assert_eq!(pit.read_port61(0) & 0x20, 0, "channel 2 output idle");
     }
 
+    /// Program channel 2 like Linux's `pit_calibrate_tsc`: gate on, speaker off,
+    /// mode 0, a 16-bit count.
+    fn program_ch2(pit: &mut Pit8254, count: u16, now: u64) {
+        pit.write_port61(0x01, now);
+        pit.write_control(0xB0, now);
+        let [lo, hi] = count.to_le_bytes();
+        pit.write_data2(lo, now);
+        pit.write_data2(hi, now);
+    }
+
+    /// Microseconds the PIT takes to count `ticks` (ticks / 1.193182 MHz).
+    const fn pit_us(ticks: u64) -> u64 {
+        ticks * 1_000_000 / PIT_HZ
+    }
+
+    /// PIT ticks that elapse in `micros` microseconds.
+    const fn ticks_in(micros: u64) -> u64 {
+        micros * PIT_HZ / 1_000_000
+    }
+
     #[test]
-    fn other_channels_are_ignored() {
+    fn channel_2_output_rises_when_the_count_expires_in_mode_0() {
+        // The TSC calibration loop: load ~10 ms of ticks and poll port 0x61 bit 5.
+        let mut pit = Pit8254::new(HZ);
+        program_ch2(&mut pit, 11_932, us(100));
+        assert_eq!(
+            pit.read_port61(us(100)) & 0x20,
+            0,
+            "output low while counting"
+        );
+        assert_eq!(pit.read_port61(us(100 + 5_000)) & 0x20, 0);
+        assert_eq!(
+            pit.read_port61(us(100 + 10_100)) & 0x20,
+            0x20,
+            "output high after terminal count"
+        );
+        // Reloading restarts it low.
+        program_ch2(&mut pit, 11_932, us(20_000));
+        assert_eq!(pit.read_port61(us(20_000)) & 0x20, 0);
+    }
+
+    #[test]
+    fn channel_2_count_runs_down_at_the_pit_clock_and_can_be_latched() {
+        let mut pit = Pit8254::new(HZ);
+        program_ch2(&mut pit, 0xFFFF, 0);
+        // The two-byte read Linux's quick calibration uses: low then high.
+        let t = us(1_000);
+        let expect = 0xFFFFu16 - u16::try_from(ticks_in(1_000)).unwrap();
+        let lo = pit.read_data2(t);
+        let hi = pit.read_data2(t);
+        let got = u16::from_le_bytes([lo, hi]);
+        assert!(got.abs_diff(expect) <= 1, "count {got:#x} vs {expect:#x}");
+        // A latch freezes the value across the two reads.
+        pit.write_control(0x80, us(2_000));
+        let a = pit.read_data2(us(9_000));
+        let b = pit.read_data2(us(9_000));
+        let latched = u16::from_le_bytes([a, b]);
+        assert!(latched.abs_diff(0xFFFF - u16::try_from(ticks_in(2_000)).unwrap()) <= 1);
+        // Unlatched again afterwards: a live read moves on.
+        let c = u16::from_le_bytes([pit.read_data2(us(9_000)), pit.read_data2(us(9_000))]);
+        assert!(c < latched);
+    }
+
+    #[test]
+    fn a_low_gate_pauses_channel_2() {
+        let mut pit = Pit8254::new(HZ);
+        program_ch2(&mut pit, 11_932, 0);
+        pit.write_port61(0x00, us(4_000)); // gate low: counting stops at 4 ms
+        // However long it stays low, the output does not rise.
+        assert_eq!(pit.read_port61(us(50_000)) & 0x20, 0);
+        pit.write_port61(0x01, us(50_000)); // gate high again: 6 ms to go
+        assert_eq!(pit.read_port61(us(50_000 + 5_000)) & 0x20, 0);
+        assert_eq!(pit.read_port61(us(50_000 + 6_200)) & 0x20, 0x20);
+    }
+
+    #[test]
+    fn channel_2_square_wave_mode_toggles_the_output() {
+        let mut pit = Pit8254::new(HZ);
+        pit.write_port61(0x01, 0);
+        pit.write_control(0xB6, 0); // channel 2, lobyte/hibyte, mode 3
+        pit.write_data2(0xA0, 0); // 0x0FA0 = 4000 ticks (~3.35 ms period)
+        pit.write_data2(0x0F, 0);
+        let period = pit_us(4_000);
+        assert_eq!(
+            pit.read_port61(us(10)) & 0x20,
+            0x20,
+            "high in the first half"
+        );
+        assert_eq!(
+            pit.read_port61(us(period * 3 / 4)) & 0x20,
+            0,
+            "low in the second"
+        );
+        assert_eq!(pit.read_port61(us(period + 10)) & 0x20, 0x20, "high again");
+    }
+
+    #[test]
+    fn channel_2_does_not_disturb_the_system_tick_on_channel_0() {
+        let mut pit = Pit8254::new(HZ);
+        program(&mut pit, 0x34, 11_932, 0);
+        program_ch2(&mut pit, 100, 0);
+        assert!(
+            pit.poll(us(10_100)),
+            "IRQ 0 still fires on channel 0's schedule"
+        );
+        assert_eq!(
+            pit.read_port61(us(10_100)) & 0x20,
+            0x20,
+            "channel 2 expired long ago"
+        );
+    }
+
+    #[test]
+    fn channel_1_and_the_read_back_command_are_ignored() {
         let mut pit = Pit8254::new(HZ);
         program(&mut pit, 0x34, 11932, 0);
         let before = pit;
-        pit.write_control(0xB6, 0); // channel 2
+        pit.write_control(0x74, 0); // channel 1 (DRAM refresh)
+        pit.write_control(0xC2, 0); // read-back command
         assert_eq!(pit, before);
     }
 }

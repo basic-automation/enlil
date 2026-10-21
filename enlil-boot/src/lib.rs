@@ -22,16 +22,22 @@
 extern crate alloc;
 
 pub mod acpi;
+pub mod acpi_tables;
 pub mod ahci;
 pub mod allocator;
 pub mod apic;
+pub mod blockdev;
+pub mod efivars;
 pub mod esp;
 pub mod firmware;
 pub mod framebuffer;
+pub mod fwcfg;
 pub mod gdt;
+pub mod gpt;
 pub mod handoff;
 pub mod idt;
 pub mod insn;
+pub mod ioapic;
 pub mod iommu;
 pub mod kernel;
 pub mod linux_guest;
@@ -39,16 +45,23 @@ pub mod logmirror;
 pub mod mmio;
 pub mod net;
 pub mod nvme;
+pub mod nvme_dev;
 pub mod paging;
 pub mod pci;
+pub mod pci_dev;
 pub mod percpu;
+pub mod pflash;
+pub mod platform;
+pub mod ramfb;
 pub mod serial;
 pub mod service_vm;
+pub mod smbios;
 pub mod smp;
 pub mod stack;
 pub mod svm;
 pub mod tsc;
 pub mod vdev;
+pub mod virtio_blk;
 pub mod xhci;
 
 /// Console/serial banner the payload emits once it has taken control.
